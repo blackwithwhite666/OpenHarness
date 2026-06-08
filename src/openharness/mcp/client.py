@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import os
 from contextlib import AsyncExitStack
 from typing import Any
 
@@ -21,9 +22,31 @@ from openharness.mcp.types import (
     McpToolInfo,
 )
 
+# A slow / hung MCP backend must never block a tool call forever: an unanswered
+# tool call leaves a dangling tool_use in the conversation and poisons the whole
+# session (the model API then rejects every subsequent turn with "No tool output
+# found for function call ..."). Bound every call with a timeout. Configurable
+# via OPENHARNESS_MCP_TOOL_TIMEOUT (seconds); <= 0 disables.
+_DEFAULT_MCP_TOOL_TIMEOUT = 120.0
+
+
+def _mcp_tool_timeout() -> float | None:
+    raw = os.environ.get("OPENHARNESS_MCP_TOOL_TIMEOUT")
+    if raw is None or raw.strip() == "":
+        return _DEFAULT_MCP_TOOL_TIMEOUT
+    try:
+        value = float(raw)
+    except ValueError:
+        return _DEFAULT_MCP_TOOL_TIMEOUT
+    return None if value <= 0 else value
+
 
 class McpServerNotConnectedError(Exception):
     """Raised when an MCP server is not connected or its session has been lost."""
+
+
+class McpToolTimeoutError(McpServerNotConnectedError):
+    """Raised when an MCP tool call exceeds the configured timeout."""
 
 
 class McpClientManager:
@@ -135,8 +158,19 @@ class McpClientManager:
             raise McpServerNotConnectedError(
                 f"MCP server '{server_name}' is not connected: {detail}"
             )
+        timeout = _mcp_tool_timeout()
         try:
-            result: CallToolResult = await session.call_tool(tool_name, arguments)
+            if timeout is None:
+                result: CallToolResult = await session.call_tool(tool_name, arguments)
+            else:
+                result = await asyncio.wait_for(
+                    session.call_tool(tool_name, arguments), timeout=timeout
+                )
+        except (asyncio.TimeoutError, TimeoutError) as exc:
+            raise McpToolTimeoutError(
+                f"MCP server '{server_name}' tool '{tool_name}' timed out after "
+                f"{timeout:.0f}s (set OPENHARNESS_MCP_TOOL_TIMEOUT to adjust)"
+            ) from exc
         except Exception as exc:
             raise McpServerNotConnectedError(
                 f"MCP server '{server_name}' call failed: {exc}"

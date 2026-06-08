@@ -955,18 +955,32 @@ async def _execute_tool_call(
 
     log.debug("executing %s ...", tool_name)
     t0 = time.monotonic()
-    result = await tool.execute(
-        parsed_input,
-        ToolExecutionContext(
-            cwd=context.cwd,
-            metadata={
-                "tool_registry": context.tool_registry,
-                "ask_user_prompt": context.ask_user_prompt,
-                **(context.tool_metadata or {}),
-            },
-            hook_executor=context.hook_executor,
-        ),
-    )
+    try:
+        result = await tool.execute(
+            parsed_input,
+            ToolExecutionContext(
+                cwd=context.cwd,
+                metadata={
+                    "tool_registry": context.tool_registry,
+                    "ask_user_prompt": context.ask_user_prompt,
+                    **(context.tool_metadata or {}),
+                },
+                hook_executor=context.hook_executor,
+            ),
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        # Never let a failing/timed-out tool abort the turn. The single-tool path
+        # (see caller) appends a tool_result only if this returns; a propagated
+        # exception there would leave a dangling tool_use and poison the session
+        # (model API: "No tool output found for function call ...").
+        log.exception("tool execution failed: %s id=%s", tool_name, tool_use_id)
+        return ToolResultBlock(
+            tool_use_id=tool_use_id,
+            content=f"Tool {tool_name} failed: {type(exc).__name__}: {exc}",
+            is_error=True,
+        )
     elapsed = time.monotonic() - t0
     log.debug("executed %s in %.2fs err=%s output_len=%d",
               tool_name, elapsed, result.is_error, len(result.output or ""))
