@@ -18,12 +18,30 @@ class McpStdioServerConfig(BaseModel):
     cwd: str | None = None
 
 
+class McpOAuthConfig(BaseModel):
+    """Opt-in OAuth refresh-token auth for an HTTP MCP server.
+
+    Static OAuth client params live here (in settings); the rotating tokens
+    (``refresh_token``/``access_token``/``expires_at``) live in ``token_file``
+    so rotation is persisted without rewriting settings.
+    """
+
+    token_url: str
+    client_id: str
+    client_secret: str = ""
+    token_file: str
+    resource: str | None = None
+    scope: str | None = None
+    header: str = "Authorization"
+
+
 class McpHttpServerConfig(BaseModel):
     """HTTP MCP server configuration."""
 
     type: Literal["http"] = "http"
     url: str
     headers: dict[str, str] = Field(default_factory=dict)
+    oauth: McpOAuthConfig | None = None
 
 
 class McpWebSocketServerConfig(BaseModel):

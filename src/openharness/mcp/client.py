@@ -218,8 +218,13 @@ class McpClientManager:
     async def _connect_http(self, name: str, config: McpHttpServerConfig) -> None:
         stack = AsyncExitStack()
         try:
+            headers = dict(config.headers or {})
+            if getattr(config, "oauth", None):
+                from openharness.mcp.oauth import ensure_bearer
+
+                headers[config.oauth.header] = f"Bearer {ensure_bearer(config.oauth)}"
             http_client = await stack.enter_async_context(
-                httpx.AsyncClient(headers=config.headers or None)
+                httpx.AsyncClient(headers=headers or None)
             )
             read_stream, write_stream, _get_session_id = await stack.enter_async_context(
                 streamable_http_client(config.url, http_client=http_client)
@@ -230,14 +235,14 @@ class McpClientManager:
                 stack=stack,
                 read_stream=read_stream,
                 write_stream=write_stream,
-                auth_configured=bool(config.headers),
+                auth_configured=bool(config.headers or getattr(config, "oauth", None)),
             )
         except asyncio.CancelledError as exc:
             await self._close_failed_stack(stack)
             self._mark_connection_failed(
                 name,
                 config,
-                auth_configured=bool(config.headers),
+                auth_configured=bool(config.headers or getattr(config, "oauth", None)),
                 exc=exc,
             )
         except Exception as exc:
@@ -245,7 +250,7 @@ class McpClientManager:
             self._mark_connection_failed(
                 name,
                 config,
-                auth_configured=bool(config.headers),
+                auth_configured=bool(config.headers or getattr(config, "oauth", None)),
                 exc=exc,
             )
 

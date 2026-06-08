@@ -89,9 +89,16 @@ class BaseChannel(ABC):
         if "*" in allow_list:
             return True
         sender_str = str(sender_id)
-        return sender_str in allow_list or any(
-            p in allow_list for p in sender_str.split("|") if p
-        )
+        candidates = {sender_str, *(part for part in sender_str.split("|") if part)}
+        # Accept allowlist entries written with a leading "@" (e.g. Telegram
+        # "@username"): platform sender ids never carry the "@", so normalise.
+        allowed: set[str] = set()
+        for entry in allow_list:
+            entry = str(entry)
+            allowed.add(entry)
+            if entry.startswith("@"):
+                allowed.add(entry[1:])
+        return bool(candidates & allowed)
 
     async def _handle_message(
         self,
