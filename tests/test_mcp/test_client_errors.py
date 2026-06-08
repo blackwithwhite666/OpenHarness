@@ -14,7 +14,11 @@ try:
 except NameError:  # pragma: no cover - Python < 3.11 compatibility
     from exceptiongroup import BaseExceptionGroup
 
-from openharness.mcp.client import McpClientManager, McpServerNotConnectedError
+from openharness.mcp.client import (
+    McpClientManager,
+    McpServerNotConnectedError,
+    McpToolTimeoutError,
+)
 from openharness.mcp.types import McpConnectionStatus, McpStdioServerConfig, McpToolInfo
 from openharness.tools.base import ToolExecutionContext
 from openharness.tools.mcp_tool import McpToolAdapter
@@ -62,6 +66,70 @@ async def test_call_tool_raises_when_session_errors():
 
     with pytest.raises(McpServerNotConnectedError, match="transport closed"):
         await manager.call_tool("flaky", "tool", {})
+
+
+@pytest.mark.asyncio
+async def test_call_tool_times_out_when_session_hangs(monkeypatch):
+    """A hung MCP backend must raise (not hang forever) so the turn gets a result."""
+    monkeypatch.setenv("OPENHARNESS_MCP_TOOL_TIMEOUT", "0.05")
+    manager = McpClientManager({})
+    mock_session = AsyncMock()
+
+    async def _hang(*_args, **_kwargs):
+        await asyncio.sleep(30)
+
+    mock_session.call_tool.side_effect = _hang
+    manager._sessions["slow"] = mock_session
+
+    with pytest.raises(McpToolTimeoutError, match="timed out"):
+        await manager.call_tool("slow", "tool", {})
+    # subclass of McpServerNotConnectedError so existing handlers catch it too
+    assert issubclass(McpToolTimeoutError, McpServerNotConnectedError)
+
+
+@pytest.mark.asyncio
+async def test_call_tool_timeout_disabled_with_zero(monkeypatch):
+    """OPENHARNESS_MCP_TOOL_TIMEOUT<=0 disables the timeout (call completes)."""
+    monkeypatch.setenv("OPENHARNESS_MCP_TOOL_TIMEOUT", "0")
+    manager = McpClientManager({})
+    mock_session = AsyncMock()
+    result = MagicMock()
+    text_item = MagicMock()
+    text_item.type = "text"
+    text_item.text = "ok"
+    result.content = [text_item]
+    result.structuredContent = None
+    mock_session.call_tool.return_value = result
+    manager._sessions["s"] = mock_session
+
+    assert await manager.call_tool("s", "tool", {}) == "ok"
+
+
+@pytest.mark.asyncio
+async def test_mcp_tool_adapter_returns_error_result_on_timeout(monkeypatch):
+    """End-to-end poison-safety: a hung tool surfaces as an is_error result."""
+    monkeypatch.setenv("OPENHARNESS_MCP_TOOL_TIMEOUT", "0.05")
+    manager = McpClientManager({})
+    mock_session = AsyncMock()
+
+    async def _hang(*_args, **_kwargs):
+        await asyncio.sleep(30)
+
+    mock_session.call_tool.side_effect = _hang
+    manager._sessions["slow"] = mock_session
+    tool_info = McpToolInfo(
+        server_name="slow",
+        name="hello",
+        description="test",
+        input_schema={"type": "object", "properties": {}},
+    )
+    adapter = McpToolAdapter(manager, tool_info)
+    result = await adapter.execute(
+        adapter.input_model.model_validate({}),
+        ToolExecutionContext(cwd=Path(".")),
+    )
+    assert result.is_error is True
+    assert "timed out" in result.output
 
 
 @pytest.mark.asyncio
