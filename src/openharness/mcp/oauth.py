@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -18,6 +19,10 @@ import urllib.request
 from openharness.mcp.types import McpOAuthConfig
 
 _EXPIRY_SKEW_S = 60
+
+# Refresh tokens rotate: two concurrent refreshes would consume the same token
+# and break the chain (the loser's rotated token is lost). Serialize refreshes.
+_refresh_lock = threading.Lock()
 
 
 def _read_store(path: str) -> dict:
@@ -60,21 +65,35 @@ def _refresh(oauth: McpOAuthConfig, refresh_token: str) -> dict:
 
 
 def ensure_bearer(oauth: McpOAuthConfig, *, now: float | None = None) -> str:
-    """Return a valid access token, refreshing (and persisting rotation) if needed."""
+    """Return a valid access token, refreshing (and persisting rotation) if needed.
+
+    Safe to call on every request (see ``_OAuthBearerAuth`` in ``client.py``):
+    when the cached token is still valid it is a cheap file read; only a token
+    within ``_EXPIRY_SKEW_S`` of expiry triggers a (lock-serialized) refresh.
+    """
     now = time.time() if now is None else now
     store = _read_store(oauth.token_file)
     access = store.get("access_token")
     expires_at = store.get("expires_at") or 0
     if access and expires_at - now > _EXPIRY_SKEW_S:
         return access
-    refresh_token = store.get("refresh_token")
-    if not refresh_token:
-        raise ValueError(f"No refresh_token in {oauth.token_file}; re-authenticate the MCP server.")
-    tok = _refresh(oauth, refresh_token)
-    access = tok["access_token"]
-    store["access_token"] = access
-    store["expires_at"] = now + int(tok.get("expires_in", 3600))
-    if tok.get("refresh_token"):  # rotation
-        store["refresh_token"] = tok["refresh_token"]
-    _write_store(oauth.token_file, store)
-    return access
+    with _refresh_lock:
+        # Re-read inside the lock: another caller may have refreshed while we waited.
+        store = _read_store(oauth.token_file)
+        access = store.get("access_token")
+        expires_at = store.get("expires_at") or 0
+        if access and expires_at - now > _EXPIRY_SKEW_S:
+            return access
+        refresh_token = store.get("refresh_token")
+        if not refresh_token:
+            raise ValueError(
+                f"No refresh_token in {oauth.token_file}; re-authenticate the MCP server."
+            )
+        tok = _refresh(oauth, refresh_token)
+        access = tok["access_token"]
+        store["access_token"] = access
+        store["expires_at"] = now + int(tok.get("expires_in", 3600))
+        if tok.get("refresh_token"):  # rotation
+            store["refresh_token"] = tok["refresh_token"]
+        _write_store(oauth.token_file, store)
+        return access

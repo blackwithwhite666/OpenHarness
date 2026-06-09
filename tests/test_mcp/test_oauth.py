@@ -61,3 +61,56 @@ def test_missing_refresh_token_raises(tmp_path):
     tf.write_text(json.dumps({}))
     with pytest.raises(ValueError):
         oauth_mod.ensure_bearer(_cfg(tf))
+
+
+def test_concurrent_refresh_runs_once(tmp_path, monkeypatch):
+    """Rotating refresh tokens: concurrent callers must trigger only one refresh."""
+    import threading
+
+    tf = tmp_path / "tok.json"
+    tf.write_text(json.dumps({"access_token": "OLD", "expires_at": 0, "refresh_token": "R1"}))
+    calls: list[str] = []
+    start = threading.Barrier(2)
+
+    def fake_refresh(oauth, refresh_token):
+        calls.append(refresh_token)
+        time.sleep(0.05)
+        return {"access_token": "NEW", "expires_in": 3600, "refresh_token": "R2"}
+
+    monkeypatch.setattr(oauth_mod, "_refresh", fake_refresh)
+    results: dict[int, str] = {}
+
+    def worker(i: int) -> None:
+        start.wait()
+        results[i] = oauth_mod.ensure_bearer(_cfg(tf))
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert results[0] == results[1] == "NEW"
+    assert len(calls) == 1  # lock + double-check collapses the duplicate refresh
+
+
+@pytest.mark.asyncio
+async def test_oauth_bearer_auth_injects_token_per_request(tmp_path):
+    """_OAuthBearerAuth sets a fresh bearer on each request via ensure_bearer."""
+    import httpx
+
+    from openharness.mcp.client import _OAuthBearerAuth
+
+    tf = tmp_path / "tok.json"
+    tf.write_text(
+        json.dumps(
+            {"access_token": "TKN", "expires_at": time.time() + 3600, "refresh_token": "R1"}
+        )
+    )
+    cfg = _cfg(tf)
+    auth = _OAuthBearerAuth(cfg)
+    request = httpx.Request("POST", "https://mcp.example/mcp")
+    flow = auth.async_auth_flow(request)
+    sent = await flow.__anext__()
+    assert sent.headers[cfg.header] == "Bearer TKN"
+    await flow.aclose()

@@ -49,6 +49,34 @@ class McpToolTimeoutError(McpServerNotConnectedError):
     """Raised when an MCP tool call exceeds the configured timeout."""
 
 
+class _OAuthBearerAuth(httpx.Auth):
+    """Inject a fresh OAuth bearer on every request.
+
+    The MCP streamable-HTTP transport opens one long-lived connection, so a
+    bearer set once at connect time goes stale when the (often short-lived)
+    access token expires — every later request then 401s until the process
+    restarts. Refreshing per request (a cheap file read while the token is still
+    valid; a lock-serialized refresh only near expiry) keeps the connection
+    usable across token rotations without reconnecting.
+    """
+
+    def __init__(self, oauth) -> None:
+        self._oauth = oauth
+
+    def sync_auth_flow(self, request):
+        from openharness.mcp.oauth import ensure_bearer
+
+        request.headers[self._oauth.header] = f"Bearer {ensure_bearer(self._oauth)}"
+        yield request
+
+    async def async_auth_flow(self, request):
+        from openharness.mcp.oauth import ensure_bearer
+
+        token = await asyncio.to_thread(ensure_bearer, self._oauth)
+        request.headers[self._oauth.header] = f"Bearer {token}"
+        yield request
+
+
 class McpClientManager:
     """Manage MCP connections and expose tools/resources."""
 
@@ -253,12 +281,12 @@ class McpClientManager:
         stack = AsyncExitStack()
         try:
             headers = dict(config.headers or {})
-            if getattr(config, "oauth", None):
-                from openharness.mcp.oauth import ensure_bearer
-
-                headers[config.oauth.header] = f"Bearer {ensure_bearer(config.oauth)}"
+            # OAuth bearer is injected per request (auth=) rather than as a static
+            # header, so it auto-refreshes on the long-lived connection instead of
+            # going stale and 401-ing after the access token's TTL.
+            auth = _OAuthBearerAuth(config.oauth) if getattr(config, "oauth", None) else None
             http_client = await stack.enter_async_context(
-                httpx.AsyncClient(headers=headers or None)
+                httpx.AsyncClient(headers=headers or None, auth=auth)
             )
             read_stream, write_stream, _get_session_id = await stack.enter_async_context(
                 streamable_http_client(config.url, http_client=http_client)
