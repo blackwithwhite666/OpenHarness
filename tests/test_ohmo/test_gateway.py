@@ -396,7 +396,7 @@ async def test_runtime_pool_stream_message_emits_progress_and_tool_hint(tmp_path
     updates = [u async for u in pool.stream_message(message, "feishu:c1")]
 
     assert updates[0].kind == "progress"
-    assert updates[0].text.startswith(("🤔", "🧠", "✨", "🔎", "🪄"))
+    assert updates[0].text.startswith(("🤔", "🧠", "✨", "🔎", "🪄", "🧩", "📝"))
     assert updates[1].kind == "tool_hint"
     assert updates[1].text.startswith("🛠️ ")
     assert "Web fetch" in updates[1].text  # humanized, mcp__ prefix stripped
@@ -557,7 +557,7 @@ async def test_runtime_pool_stream_message_uses_english_progress_for_english_inp
     updates = [u async for u in pool.stream_message(message, "feishu:c1")]
 
     assert updates[0].kind == "progress"
-    assert updates[0].text.startswith(("🤔", "🧠", "✨", "🔎", "🪄"))
+    assert updates[0].text.startswith(("🤔", "🧠", "✨", "🔎", "🪄", "🧩", "📝"))
     assert "Thinking" in updates[0].text or "Working" in updates[0].text or "Looking" in updates[0].text or "Following" in updates[0].text or "Pulling" in updates[0].text
     assert updates[1].kind == "tool_hint"
     assert updates[1].text.startswith("🛠️ Web fetch")
@@ -1119,7 +1119,7 @@ async def test_gateway_bridge_publishes_progress_updates():
         except asyncio.CancelledError:
             pass
 
-    assert first.content.startswith(("🤔", "🧠", "✨", "🔎", "🪄"))
+    assert first.content.startswith(("🤔", "🧠", "✨", "🔎", "🪄", "🧩", "📝"))
     assert first.metadata["_progress"] is True
     assert second.metadata["_tool_hint"] is True
     assert second.content.startswith("🛠️ ")

@@ -33,3 +33,19 @@ def test_safe_filename_rejects_empty_or_parent_segments() -> None:
 
 def test_get_data_path_is_backwards_compatible_alias() -> None:
     assert get_data_path().name == "data"
+
+
+def test_split_message_balances_code_fences() -> None:
+    body = "x" * 3000
+    text = f"intro\n```\n{body}\n{body}\n```\noutro"  # block > limit -> split inside it
+    chunks = split_message(text, 4000)
+    assert len(chunks) >= 2
+    for chunk in chunks:
+        assert chunk.count("```") % 2 == 0  # every chunk renders as balanced markdown
+
+
+def test_split_message_no_fences_unchanged_count() -> None:
+    text = "para one\n\n" + ("word " * 2000)
+    chunks = split_message(text, 4000)
+    assert "".join(c.replace("```", "") for c in chunks)  # no spurious fences added
+    assert all(c.count("```") == 0 for c in chunks)

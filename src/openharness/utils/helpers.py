@@ -57,7 +57,25 @@ def split_message(text: str, max_length: int) -> list[str]:
 
     if remaining:
         chunks.append(remaining)
-    return chunks
+    return _balance_code_fences(chunks)
+
+
+def _balance_code_fences(chunks: list[str]) -> list[str]:
+    """Close + reopen ``` fences across chunk boundaries.
+
+    A long reply split mid code-block would otherwise leave one chunk with an
+    unclosed ``` (and the next with an orphan one), which renders as broken
+    markdown. Each chunk is made self-balanced.
+    """
+    out: list[str] = []
+    inside = False
+    for chunk in chunks:
+        prefix = "```\n" if inside else ""
+        ends_inside = inside ^ (chunk.count("```") % 2 == 1)
+        suffix = "\n```" if ends_inside else ""
+        out.append(f"{prefix}{chunk}{suffix}")
+        inside = ends_inside
+    return out
 
 
 def safe_filename(value: object, *, max_length: int = 128) -> str:

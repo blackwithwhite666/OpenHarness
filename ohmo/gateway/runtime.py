@@ -52,11 +52,11 @@ _CHANNEL_THINKING_PHRASES = (
 )
 
 _CHANNEL_THINKING_PHRASES_EN = (
-    "🤔 Thinking…",
-    "🧠 Working through it…",
-    "✨ Pulling the pieces together…",
+    "🤔 Thinking it through…",
+    "🧠 Working on it…",
     "🔎 Looking into it…",
-    "🪄 Following the thread…",
+    "🧩 Following the thread…",
+    "📝 Pulling it together…",
 )
 
 _TEXT_PREVIEW_BYTES = 4096

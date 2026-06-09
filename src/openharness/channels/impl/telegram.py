@@ -20,6 +20,66 @@ logger = logging.getLogger(__name__)
 
 TELEGRAM_MAX_MESSAGE_LEN = 4000  # Telegram message character limit
 
+_TABLE_ROW_RE = re.compile(r"^\s*\|(.+)\|\s*$")
+
+
+def _split_table_row(line: str) -> list[str]:
+    inner = line.strip()
+    if inner.startswith("|"):
+        inner = inner[1:]
+    if inner.endswith("|"):
+        inner = inner[:-1]
+    return [cell.strip() for cell in inner.split("|")]
+
+
+def _is_table_separator(line: str) -> bool:
+    if not _TABLE_ROW_RE.match(line):
+        return False
+    cells = _split_table_row(line)
+    return bool(cells) and all(re.fullmatch(r":?-+:?", cell) for cell in cells)
+
+
+def _render_aligned_table(rows: list[list[str]]) -> str:
+    """Markdown table rows -> a monospace, column-aligned block (Telegram has no
+    <table>; a left raw ``| a | b |`` reads as garbage)."""
+    ncols = max(len(r) for r in rows)
+    rows = [r + [""] * (ncols - len(r)) for r in rows]
+    widths = [max(len(r[c]) for r in rows) for c in range(ncols)]
+
+    def fmt(r: list[str]) -> str:
+        return " | ".join(r[c].ljust(widths[c]) for c in range(ncols)).rstrip()
+
+    sep = "-+-".join("-" * widths[c] for c in range(ncols))
+    return "\n".join([fmt(rows[0]), sep, *(fmt(r) for r in rows[1:])])
+
+
+def _convert_md_tables(text: str, save_block) -> str:
+    lines = text.split("\n")
+    out: list[str] = []
+    i = 0
+    while i < len(lines):
+        if (
+            i + 1 < len(lines)
+            and _TABLE_ROW_RE.match(lines[i])
+            and not _is_table_separator(lines[i])
+            and _is_table_separator(lines[i + 1])
+        ):
+            rows = [_split_table_row(lines[i])]
+            j = i + 2
+            while (
+                j < len(lines)
+                and _TABLE_ROW_RE.match(lines[j])
+                and not _is_table_separator(lines[j])
+            ):
+                rows.append(_split_table_row(lines[j]))
+                j += 1
+            out.append(save_block(_render_aligned_table(rows)))
+            i = j
+        else:
+            out.append(lines[i])
+            i += 1
+    return "\n".join(out)
+
 
 def _markdown_to_telegram_html(text: str) -> str:
     """
@@ -35,6 +95,13 @@ def _markdown_to_telegram_html(text: str) -> str:
         return f"\x00CB{len(code_blocks) - 1}\x00"
 
     text = re.sub(r'```[\w]*\n?([\s\S]*?)```', save_code_block, text)
+
+    # 1b. Markdown tables -> aligned monospace block (protected like a code block)
+    def save_table(aligned: str) -> str:
+        code_blocks.append(aligned)
+        return f"\x00CB{len(code_blocks) - 1}\x00"
+
+    text = _convert_md_tables(text, save_table)
 
     # 2. Extract and protect inline code
     inline_codes: list[str] = []
