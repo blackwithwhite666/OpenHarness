@@ -1473,3 +1473,40 @@ async def test_submit_message_repairs_dangling_tool_use_from_interrupt(tmp_path:
 
     assert not _has_dangling(engine.messages)          # repaired in the live history
     assert not _has_dangling(client.requests[0].messages)  # and never sent to the provider
+
+
+@pytest.mark.asyncio
+async def test_execute_tool_call_unknown_tool_returns_error(tmp_path: Path):
+    result = await _execute_tool_call(
+        _tool_context(tmp_path, ToolRegistry(), PermissionSettings(mode=PermissionMode.FULL_AUTO)),
+        "no_such_tool", "id1", {},
+    )
+    assert result.is_error is True
+    assert "Unknown tool" in result.content
+
+
+@pytest.mark.asyncio
+async def test_execute_tool_call_invalid_input_returns_error(tmp_path: Path):
+    registry = ToolRegistry()
+    registry.register(GrepTool())
+    result = await _execute_tool_call(
+        _tool_context(tmp_path, registry, PermissionSettings(mode=PermissionMode.FULL_AUTO)),
+        "grep", "id2", {},  # missing required 'pattern'
+    )
+    assert result.is_error is True
+    assert "Invalid input" in result.content
+
+
+@pytest.mark.asyncio
+async def test_execute_tool_call_swallows_tool_exception_as_error_result(tmp_path: Path):
+    """Poison-safety: a raising tool yields an is_error result, never propagates —
+    else the single-tool path leaves a dangling tool_use and poisons the session."""
+    registry = ToolRegistry()
+    registry.register(_BoomTool())
+    result = await _execute_tool_call(
+        _tool_context(tmp_path, registry, PermissionSettings(mode=PermissionMode.FULL_AUTO)),
+        "boom_tool", "id3", {},
+    )
+    assert result.is_error is True
+    assert result.tool_use_id == "id3"
+    assert "boom" in result.content or "RuntimeError" in result.content

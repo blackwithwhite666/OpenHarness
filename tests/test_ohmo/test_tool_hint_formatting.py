@@ -1,6 +1,11 @@
 from __future__ import annotations
 
-from ohmo.gateway.runtime import _format_tool_args_block, _pretty_tool_name
+from ohmo.gateway.runtime import (
+    _CHANNEL_THINKING_PHRASES_EN,
+    _format_channel_progress,
+    _format_tool_args_block,
+    _pretty_tool_name,
+)
 from openharness.channels.impl.telegram import _markdown_to_telegram_html
 
 
@@ -38,3 +43,25 @@ def test_rendered_hint_does_not_mangle_underscores():
     assert "<pre><code>" in html  # args rendered as a code block
     assert "a__b__c=1" in html  # underscores preserved inside the code
     assert "<b>" not in html  # nothing got bolded by the __ regex
+
+
+def _progress(kind, text, content="can you help"):
+    return _format_channel_progress(
+        channel="telegram", kind=kind, text=text, session_key="s", content=content
+    )
+
+
+def test_format_channel_progress_tool_hint_adds_wrench():
+    assert _progress("tool_hint", "Read file") == "🛠️ Read file"
+
+
+def test_format_channel_progress_status_adds_bubble():
+    assert _progress("status", "syncing") == "🫧 syncing"
+
+
+def test_format_channel_progress_thinking_picks_english_phrase():
+    assert _progress("thinking", "") in _CHANNEL_THINKING_PHRASES_EN
+
+
+def test_format_channel_progress_image_fallback_has_icon():
+    assert "🖼️" in _progress("image_fallback", "")
