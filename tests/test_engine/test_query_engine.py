@@ -1432,3 +1432,44 @@ async def test_query_engine_drops_empty_assistant_messages(tmp_path: Path):
     assert not any(isinstance(event, AssistantTurnComplete) for event in events)
     assert len(engine.messages) == 1
     assert engine.messages[0].role == "user"
+
+
+@pytest.mark.asyncio
+async def test_submit_message_repairs_dangling_tool_use_from_interrupt(tmp_path: Path, monkeypatch):
+    """A turn cancelled by a newer user message can leave a dangling assistant
+    tool_use in the *live* in-memory history (the persisted snapshot is
+    sanitized, the live one was not). submit_message must repair it before
+    querying, else the provider rejects the next request with
+    'No tool output found for function call ...'."""
+    monkeypatch.delenv("CLAUDE_CODE_COORDINATOR_MODE", raising=False)
+    client = RecordingApiClient()
+    engine = QueryEngine(
+        api_client=client,
+        tool_registry=create_default_tool_registry(),
+        permission_checker=PermissionChecker(PermissionSettings(mode=PermissionMode.FULL_AUTO)),
+        cwd=tmp_path,
+        model="openai-compatible-model",
+        system_prompt="system",
+        max_tokens=120_000,
+        max_turns=1,
+    )
+    # Interrupted turn: assistant tool_use with no following tool_result.
+    engine._messages = [
+        ConversationMessage.from_user_text("remember this about me"),
+        ConversationMessage(
+            role="assistant",
+            content=[ToolUseBlock(id="call_dangling", name="read_file", input={"path": "x"})],
+        ),
+    ]
+
+    _ = [event async for event in engine.submit_message("a newer message")]
+
+    def _has_dangling(messages):
+        return any(
+            isinstance(b, ToolUseBlock) and b.id == "call_dangling"
+            for m in messages
+            for b in m.content
+        )
+
+    assert not _has_dangling(engine.messages)          # repaired in the live history
+    assert not _has_dangling(client.requests[0].messages)  # and never sent to the provider
