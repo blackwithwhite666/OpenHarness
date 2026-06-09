@@ -123,7 +123,7 @@ class OhmoGatewayBridge:
                 notify=OutboundMessage(
                     channel=message.channel,
                     chat_id=message.chat_id,
-                    content="⏹️ 已停止上一条正在处理的任务，继续看你的最新消息。",
+                    content="⏹️ Остановил предыдущую задачу, перехожу к новому сообщению.",
                     metadata={"_progress": True, "_session_key": session_key},
                 ),
             )
@@ -145,7 +145,7 @@ class OhmoGatewayBridge:
             session_key,
             reason="stopped by user command",
         )
-        content = "⏹️ 已停止当前正在运行的任务。" if stopped else "当前没有正在运行的任务。"
+        content = "⏹️ Остановил текущую задачу." if stopped else "Сейчас нет активной задачи."
         await self._bus.publish_outbound(
             OutboundMessage(
                 channel=message.channel,
