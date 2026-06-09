@@ -399,7 +399,8 @@ async def test_runtime_pool_stream_message_emits_progress_and_tool_hint(tmp_path
     assert updates[0].text.startswith(("🤔", "🧠", "✨", "🔎", "🪄"))
     assert updates[1].kind == "tool_hint"
     assert updates[1].text.startswith("🛠️ ")
-    assert "web_fetch" in updates[1].text
+    assert "Web fetch" in updates[1].text  # humanized, mcp__ prefix stripped
+    assert "```" in updates[1].text  # args rendered as a code block
     assert updates[-1].kind == "final"
     assert updates[-1].text == "done"
 
@@ -559,7 +560,7 @@ async def test_runtime_pool_stream_message_uses_english_progress_for_english_inp
     assert updates[0].text.startswith(("🤔", "🧠", "✨", "🔎", "🪄"))
     assert "Thinking" in updates[0].text or "Working" in updates[0].text or "Looking" in updates[0].text or "Following" in updates[0].text or "Pulling" in updates[0].text
     assert updates[1].kind == "tool_hint"
-    assert updates[1].text.startswith("🛠️ Using web_fetch")
+    assert updates[1].text.startswith("🛠️ Web fetch")
 
 
 @pytest.mark.asyncio

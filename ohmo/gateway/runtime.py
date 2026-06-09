@@ -549,9 +549,10 @@ class OhmoSessionRuntimePool:
                 event.tool_name,
                 summary,
             )
-            hint = f"Using {event.tool_name}"
-            if summary:
-                hint = f"{hint}: {summary}"
+            hint = _pretty_tool_name(event.tool_name)
+            args_block = _format_tool_args_block(event.tool_input)
+            if args_block:
+                hint = f"{hint}\n{args_block}"
             yield GatewayStreamUpdate(
                 kind="tool_hint",
                 text=_format_channel_progress(
@@ -836,6 +837,46 @@ def _summarize_tool_input(tool_name: str, tool_input: dict[str, object]) -> str:
     except TypeError:
         raw = str(tool_input)
     return raw if len(raw) <= 120 else raw[:120] + "..."
+
+
+def _pretty_tool_name(tool_name: str) -> str:
+    """Human-facing tool label: drop the noisy ``mcp__<server>__`` prefix and turn
+    ``read_calendar_event`` into ``Read calendar event``."""
+    name = tool_name
+    if name.startswith("mcp__"):
+        parts = name.split("__")
+        if len(parts) >= 3:
+            name = parts[-1]
+    label = name.replace("_", " ").strip()
+    if not label:
+        return tool_name
+    return label[0].upper() + label[1:]
+
+
+def _format_tool_args_block(tool_input: dict[str, object]) -> str:
+    """Render tool args as a fenced code block (so the chat renders monospace and
+    Telegram's markdown can't mangle ``__name__`` etc.). Empty string for no args.
+
+    A lone string arg (a command, a url, a path) is shown as-is; anything richer
+    is pretty-printed JSON.
+    """
+    if not tool_input:
+        return ""
+    if len(tool_input) == 1:
+        (key, value), = tuple(tool_input.items())
+        if isinstance(value, str) and value.strip():
+            body = value.strip()
+            if len(body) > 600:
+                body = body[:600] + "\n…"
+            lang = "bash" if key in ("command", "code") else ""
+            return f"```{lang}\n{body}\n```"
+    try:
+        pretty = json.dumps(tool_input, ensure_ascii=False, indent=2, sort_keys=True)
+    except TypeError:
+        pretty = str(tool_input)
+    if len(pretty) > 1200:
+        pretty = pretty[:1200] + "\n…"
+    return f"```json\n{pretty}\n```"
 
 
 def _format_channel_progress(
