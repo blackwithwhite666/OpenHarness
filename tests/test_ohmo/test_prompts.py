@@ -63,3 +63,14 @@ def test_ohmo_prompt_nudges_todo_write(tmp_path: Path):
     prompt = build_ohmo_system_prompt(tmp_path, workspace=workspace)
     assert "todo_write" in prompt
     assert "Staying on track" in prompt
+
+
+def test_ohmo_prompt_has_telegram_formatting_rules(tmp_path: Path):
+    """Telegram has no native tables and code-blocks kill links — the prompt
+    must steer the model to markdown tables + links outside code/cells."""
+    workspace = tmp_path / ".ohmo-home"
+    initialize_workspace(workspace)
+    prompt = build_ohmo_system_prompt(tmp_path, workspace=workspace)
+    assert "Telegram formatting" in prompt
+    assert "MARKDOWN" in prompt
+    assert "[label](url)" in prompt

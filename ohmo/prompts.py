@@ -72,6 +72,21 @@ def build_ohmo_system_prompt(
 
     sections.extend(
         [
+            "# Telegram formatting",
+            (
+                "Replies render in Telegram. For tabular data, emit a MARKDOWN "
+                "table (`| a | b |` then `|---|---|`) — the gateway aligns it into "
+                "a monospace block. Never hand-draw ASCII tables (`---+---`); they "
+                "don't align. Clickable links MUST be in normal text as "
+                "`[label](url)` — links inside code/monospace/table blocks are NOT "
+                "clickable, so put any open/buy links in a short list UNDER the "
+                "table (e.g. `🔗 [754А](url) · [756А](url)`), never in table cells."
+            ),
+        ]
+    )
+
+    sections.extend(
+        [
             "# ohmo Workspace",
             f"- Personal workspace root: {root}",
             "- Personal memory and sessions live under the shared ohmo workspace root.",
