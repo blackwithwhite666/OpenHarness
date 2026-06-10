@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import os
 from contextlib import AsyncExitStack
 from typing import Any
@@ -39,6 +38,13 @@ def _mcp_tool_timeout() -> float | None:
     except ValueError:
         return _DEFAULT_MCP_TOOL_TIMEOUT
     return None if value <= 0 else value
+
+
+def _auth_configured_for(config: object) -> bool:
+    """Whether a server config carries any auth (for status reporting)."""
+    if isinstance(config, McpStdioServerConfig):
+        return bool(config.env)
+    return bool(getattr(config, "headers", None) or getattr(config, "oauth", None))
 
 
 class McpServerNotConnectedError(Exception):
@@ -91,15 +97,30 @@ class McpClientManager:
             for name, config in server_configs.items()
         }
         self._sessions: dict[str, ClientSession] = {}
-        self._stacks: dict[str, AsyncExitStack] = {}
+        # Each connection's transport (stdio/http) and ClientSession open an anyio
+        # task group / cancel scope, which anyio requires to be entered and exited
+        # in the SAME task. So each connection is owned by one dedicated task that
+        # enters the stack, waits on its shutdown event, then closes the stack —
+        # never across tasks. The old design closed stacks from whatever task ran
+        # close()/interrupt (or the async-generator GC), raising "Attempted to exit
+        # cancel scope in a different task" and crashing the whole gateway.
+        self._conn_tasks: dict[str, asyncio.Task] = {}
+        self._shutdown_events: dict[str, asyncio.Event] = {}
 
     async def connect_all(self) -> None:
         """Connect all configured MCP servers supported by the current build."""
         for name, config in self._server_configs.items():
-            if isinstance(config, McpStdioServerConfig):
-                await self._connect_stdio(name, config)
-            elif isinstance(config, McpHttpServerConfig):
-                await self._connect_http(name, config)
+            if isinstance(config, (McpStdioServerConfig, McpHttpServerConfig)):
+                shutdown = asyncio.Event()
+                ready = asyncio.Event()
+                self._shutdown_events[name] = shutdown
+                self._conn_tasks[name] = asyncio.create_task(
+                    self._serve(name, config, shutdown, ready),
+                    name=f"mcp-conn:{name}",
+                )
+                # Wait for this connection's connect attempt to finish (success or
+                # failure) before the next, preserving sequential-connect order.
+                await ready.wait()
             else:
                 self._statuses[name] = McpConnectionStatus(
                     name=name,
@@ -152,11 +173,18 @@ class McpClientManager:
         )
 
     async def close(self) -> None:
-        """Close all active MCP sessions."""
-        for stack in list(self._stacks.values()):
-            with contextlib.suppress(RuntimeError, asyncio.CancelledError):
-                await stack.aclose()
-        self._stacks.clear()
+        """Close all active MCP sessions.
+
+        Signal every owner task to shut down, then await them so each
+        ``AsyncExitStack`` is closed inside the same task that opened it.
+        """
+        for event in self._shutdown_events.values():
+            event.set()
+        tasks = list(self._conn_tasks.values())
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._conn_tasks.clear()
+        self._shutdown_events.clear()
         self._sessions.clear()
 
     def list_statuses(self) -> list[McpConnectionStatus]:
@@ -239,82 +267,76 @@ class McpClientManager:
                 parts.append(str(getattr(item, "blob", "")))
         return "\n".join(parts).strip()
 
-    async def _connect_stdio(self, name: str, config: McpStdioServerConfig) -> None:
+    async def _serve(
+        self,
+        name: str,
+        config: object,
+        shutdown: asyncio.Event,
+        ready: asyncio.Event,
+    ) -> None:
+        """Own one MCP connection for its whole lifetime in a single task.
+
+        Opens the transport + ClientSession, signals ``ready``, then holds the
+        stack open until ``shutdown`` is set — so each anyio task group / cancel
+        scope is entered and exited in this one task, never across tasks.
+        """
         stack = AsyncExitStack()
         try:
-            read_stream, write_stream = await stack.enter_async_context(
-                stdio_client(
-                    StdioServerParameters(
-                        command=config.command,
-                        args=config.args,
-                        env=config.env,
-                        cwd=config.cwd,
+            if isinstance(config, McpStdioServerConfig):
+                read_stream, write_stream = await stack.enter_async_context(
+                    stdio_client(
+                        StdioServerParameters(
+                            command=config.command,
+                            args=config.args,
+                            env=config.env,
+                            cwd=config.cwd,
+                        )
                     )
                 )
-            )
+                auth_configured = bool(config.env)
+            else:  # McpHttpServerConfig
+                headers = dict(config.headers or {})
+                # OAuth bearer is injected per request (auth=) rather than as a
+                # static header, so it auto-refreshes on the long-lived connection
+                # instead of going stale and 401-ing after the access token's TTL.
+                auth = _OAuthBearerAuth(config.oauth) if getattr(config, "oauth", None) else None
+                http_client = await stack.enter_async_context(
+                    httpx.AsyncClient(headers=headers or None, auth=auth)
+                )
+                read_stream, write_stream, _get_session_id = await stack.enter_async_context(
+                    streamable_http_client(config.url, http_client=http_client)
+                )
+                auth_configured = bool(config.headers or getattr(config, "oauth", None))
             await self._register_connected_session(
                 name=name,
                 config=config,
                 stack=stack,
                 read_stream=read_stream,
                 write_stream=write_stream,
-                auth_configured=bool(config.env),
+                auth_configured=auth_configured,
             )
-        except asyncio.CancelledError as exc:
+        except (KeyboardInterrupt, SystemExit):
             await self._close_failed_stack(stack)
+            ready.set()
+            raise
+        except BaseException as exc:
             self._mark_connection_failed(
                 name,
                 config,
-                auth_configured=bool(config.env),
+                auth_configured=_auth_configured_for(config),
                 exc=exc,
             )
-        except Exception as exc:
             await self._close_failed_stack(stack)
-            self._mark_connection_failed(
-                name,
-                config,
-                auth_configured=bool(config.env),
-                exc=exc,
-            )
-
-    async def _connect_http(self, name: str, config: McpHttpServerConfig) -> None:
-        stack = AsyncExitStack()
+            ready.set()
+            return
+        # Connected. Unblock connect_all, then keep the stack open in THIS task
+        # until shutdown so the transport/session cancel scopes exit where they
+        # were entered.
+        ready.set()
         try:
-            headers = dict(config.headers or {})
-            # OAuth bearer is injected per request (auth=) rather than as a static
-            # header, so it auto-refreshes on the long-lived connection instead of
-            # going stale and 401-ing after the access token's TTL.
-            auth = _OAuthBearerAuth(config.oauth) if getattr(config, "oauth", None) else None
-            http_client = await stack.enter_async_context(
-                httpx.AsyncClient(headers=headers or None, auth=auth)
-            )
-            read_stream, write_stream, _get_session_id = await stack.enter_async_context(
-                streamable_http_client(config.url, http_client=http_client)
-            )
-            await self._register_connected_session(
-                name=name,
-                config=config,
-                stack=stack,
-                read_stream=read_stream,
-                write_stream=write_stream,
-                auth_configured=bool(config.headers or getattr(config, "oauth", None)),
-            )
-        except asyncio.CancelledError as exc:
+            await shutdown.wait()
+        finally:
             await self._close_failed_stack(stack)
-            self._mark_connection_failed(
-                name,
-                config,
-                auth_configured=bool(config.headers or getattr(config, "oauth", None)),
-                exc=exc,
-            )
-        except Exception as exc:
-            await self._close_failed_stack(stack)
-            self._mark_connection_failed(
-                name,
-                config,
-                auth_configured=bool(config.headers or getattr(config, "oauth", None)),
-                exc=exc,
-            )
 
     async def _register_connected_session(
         self,
@@ -354,7 +376,6 @@ class McpClientManager:
             for resource in (resource_result.resources if resource_result is not None else [])
         ]
         self._sessions[name] = session
-        self._stacks[name] = stack
         self._statuses[name] = McpConnectionStatus(
             name=name,
             state="connected",

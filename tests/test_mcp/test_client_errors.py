@@ -186,31 +186,52 @@ async def test_register_connected_session_tolerates_missing_resources_list():
 
 
 @pytest.mark.asyncio
-async def test_close_suppresses_known_runtime_error_from_stdio_cleanup():
+async def test_close_signals_owner_tasks_and_clears_state():
+    """close() must set each connection's shutdown event, await its owner task
+    (so the AsyncExitStack is closed in the task that opened it), and clear all
+    per-connection state."""
     manager = McpClientManager({})
-    stack = MagicMock()
-    stack.aclose = AsyncMock(side_effect=RuntimeError("Attempted to exit cancel scope in a different task than it was entered in"))
-    manager._stacks["context7"] = stack
+    shutdown = asyncio.Event()
+    closed: dict[str, bool] = {}
+
+    async def fake_owner() -> None:
+        await shutdown.wait()
+        closed["done"] = True
+
+    task = asyncio.create_task(fake_owner())
+    await asyncio.sleep(0)  # let the owner task start and block on the event
+    manager._shutdown_events["context7"] = shutdown
+    manager._conn_tasks["context7"] = task
     manager._sessions["context7"] = AsyncMock()
 
     await manager.close()
 
-    assert manager._stacks == {}
+    assert closed.get("done") is True  # owner task ran to completion (in-task close)
+    assert manager._conn_tasks == {}
+    assert manager._shutdown_events == {}
     assert manager._sessions == {}
 
 
 @pytest.mark.asyncio
-async def test_close_suppresses_cancelled_error_from_stdio_cleanup():
+async def test_close_failed_stack_suppresses_cross_task_runtime_error():
+    """The cancel-scope RuntimeError (now raised inside the owner task during
+    aclose) must be swallowed, never crash the gateway."""
+    manager = McpClientManager({})
+    stack = MagicMock()
+    stack.aclose = AsyncMock(
+        side_effect=RuntimeError(
+            "Attempted to exit cancel scope in a different task than it was entered in"
+        )
+    )
+    await manager._close_failed_stack(stack)  # must not raise
+
+
+@pytest.mark.asyncio
+async def test_close_failed_stack_suppresses_cancelled_error():
     manager = McpClientManager({})
     stack = MagicMock()
     stack.aclose = AsyncMock(side_effect=asyncio.CancelledError())
-    manager._stacks["context7"] = stack
-    manager._sessions["context7"] = AsyncMock()
-
-    await manager.close()
-
-    assert manager._stacks == {}
-    assert manager._sessions == {}
+    await manager._close_failed_stack(stack)  # must not raise
 
 
 @pytest.mark.asyncio
