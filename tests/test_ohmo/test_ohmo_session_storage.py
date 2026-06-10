@@ -87,3 +87,28 @@ def test_ohmo_session_backend_sanitizes_legacy_empty_assistant_messages(tmp_path
     assert loaded is not None
     assert loaded["message_count"] == 1
     assert loaded["messages"][0]["role"] == "user"
+
+
+def test_clear_session_key_drops_latest_pointer(tmp_path: Path):
+    """/new relies on clear_session_key removing the per-session-key 'latest'
+    pointer so the next message starts a fresh conversation (the old session-id
+    snapshots stay on disk for history)."""
+    workspace = tmp_path / ".ohmo-home"
+    initialize_workspace(workspace)
+    backend = OhmoSessionBackend(workspace)
+    backend.save_snapshot(
+        cwd=tmp_path,
+        model="gpt-5.5",
+        system_prompt="system",
+        messages=[ConversationMessage.from_user_text("hi")],
+        usage=UsageSnapshot(),
+        session_id="sid1",
+        session_key="telegram:42",
+    )
+    assert backend.load_latest_for_session_key("telegram:42") is not None
+
+    backend.clear_session_key("telegram:42")
+
+    assert backend.load_latest_for_session_key("telegram:42") is None
+    backend.clear_session_key("telegram:42")  # idempotent / safe when already gone
+    assert backend.load_by_id(tmp_path, "sid1") is not None  # history preserved

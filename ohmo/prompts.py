@@ -56,6 +56,22 @@ def build_ohmo_system_prompt(
 
     sections.extend(
         [
+            "# Staying on track (multi-step work)",
+            (
+                "For any task that needs more than ~2 tool calls (browser flows, "
+                "multi-train checks, research, multi-file edits): FIRST call the "
+                "`todo_write` tool to lay out the concrete steps, then mark each one "
+                "`completed` as you finish it, keeping exactly one `in_progress`. The "
+                "todo list is your working memory across tool calls — it stops you "
+                "from losing the plan, re-doing steps, sequencing wrong, or stopping "
+                "early. Re-read it before deciding the next action. Skip it only for "
+                "trivial one-shot answers."
+            ),
+        ]
+    )
+
+    sections.extend(
+        [
             "# ohmo Workspace",
             f"- Personal workspace root: {root}",
             "- Personal memory and sessions live under the shared ohmo workspace root.",

@@ -53,3 +53,13 @@ def test_ohmo_runtime_prompt_can_exclude_project_memory(tmp_path: Path, monkeypa
 
     assert "ohmo-only personal fact" in runtime_prompt
     assert "project memory should not leak" not in runtime_prompt
+
+
+def test_ohmo_prompt_nudges_todo_write(tmp_path: Path):
+    """The system prompt must tell the model to drive multi-step work via the
+    todo_write tool, so it stops losing the plan / sequencing wrong."""
+    workspace = tmp_path / ".ohmo-home"
+    initialize_workspace(workspace)
+    prompt = build_ohmo_system_prompt(tmp_path, workspace=workspace)
+    assert "todo_write" in prompt
+    assert "Staying on track" in prompt

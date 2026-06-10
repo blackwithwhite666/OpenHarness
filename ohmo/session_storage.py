@@ -38,6 +38,17 @@ def _session_key_latest_path(workspace: str | Path | None, session_key: str) -> 
     return session_dir / f"latest-{token}.json"
 
 
+def clear_session_key(workspace: str | Path | None, session_key: str) -> None:
+    """Drop the per-session-key 'latest' pointer so the next message for this
+    session starts a brand-new conversation (used by /new). The historical
+    session-<id>.json snapshots are left on disk; only the 'resume here' pointer
+    is removed."""
+    try:
+        _session_key_latest_path(workspace, session_key).unlink()
+    except FileNotFoundError:
+        pass
+
+
 def save_session_snapshot(
     *,
     cwd: str | Path,
@@ -192,6 +203,9 @@ class OhmoSessionBackend(SessionBackend):
 
     def load_latest_for_session_key(self, session_key: str) -> dict[str, Any] | None:
         return load_latest_for_session_key(self._workspace, session_key)
+
+    def clear_session_key(self, session_key: str) -> None:
+        clear_session_key(self._workspace, session_key)
 
     def export_markdown(
         self,

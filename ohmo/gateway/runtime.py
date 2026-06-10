@@ -209,6 +209,33 @@ class OhmoSessionRuntimePool:
         self._bundles[session_key] = bundle
         return bundle
 
+    async def reset_session(self, session_key: str) -> bool:
+        """Hard-reset a session for /new: drop the in-memory bundle and the
+        persisted per-session-key 'latest' pointer, so the next message starts a
+        brand-new conversation (new session_id, empty history). Returns True when
+        there was a live bundle to drop."""
+        bundle = self._bundles.pop(session_key, None)
+        had_bundle = bundle is not None
+        if bundle is not None:
+            try:
+                await close_runtime(bundle)
+            except Exception:  # noqa: BLE001 — reset must never fail
+                logger.warning(
+                    "ohmo runtime reset close failed session_key=%s", session_key, exc_info=True
+                )
+        clear = getattr(self._session_backend, "clear_session_key", None)
+        if clear is not None:
+            try:
+                clear(session_key)
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "ohmo runtime reset clear-snapshot failed session_key=%s",
+                    session_key,
+                    exc_info=True,
+                )
+        logger.info("ohmo runtime session reset session_key=%s had_bundle=%s", session_key, had_bundle)
+        return had_bundle
+
     async def stream_message(self, message: InboundMessage, session_key: str):
         """Submit an inbound channel message and yield progress + final reply updates."""
         user_message = _build_inbound_user_message(message)

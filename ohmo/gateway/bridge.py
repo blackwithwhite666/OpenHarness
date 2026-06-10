@@ -110,6 +110,9 @@ class OhmoGatewayBridge:
             if message.content.strip() == "/restart":
                 await self._handle_restart(message, session_key)
                 continue
+            if message.content.strip() in ("/new", "/clear"):
+                await self._handle_new(message, session_key)
+                continue
             group_args = _parse_group_command(message.content)
             if group_args is not None:
                 prepared = await self._prepare_group_prompt_message(message, session_key, group_args)
@@ -153,6 +156,21 @@ class OhmoGatewayBridge:
                 content=content,
                 metadata={"_session_key": session_key},
             )
+        )
+
+    async def _handle_new(self, message, session_key: str) -> None:
+        """/new (alias /clear): cancel the in-flight turn and HARD-reset the
+        session so the next message starts a fresh conversation.
+
+        Previously /new was not a recognized command — it fell through to the
+        model, which only *said* "Контекст сброшен" while the accumulated history
+        (and session_id) stayed intact. So context never actually reset and the
+        model kept anchoring on its own past mistakes.
+        """
+        await self._interrupt_session(session_key, reason="reset by /new")
+        await self._runtime_pool.reset_session(session_key)
+        await self._publish_command_reply(
+            message, session_key, "🧹 Контекст сброшен — начинаю новую сессию."
         )
 
     async def _handle_restart(self, message, session_key: str) -> None:

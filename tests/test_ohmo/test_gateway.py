@@ -2442,3 +2442,72 @@ async def test_runtime_pool_stream_message_handles_ohmo_skill_slash_command(tmp_
     assert f"Base directory for this skill: {skill_dir.resolve()}" in submitted[0]
     assert "Summarize this: hello" in submitted[0]
     assert updates[-1].text == "skill-done"
+
+
+@pytest.mark.asyncio
+async def test_reset_session_pops_bundle_and_clears_pointer(tmp_path, monkeypatch):
+    import ohmo.gateway.runtime as rt
+
+    workspace = tmp_path / ".ohmo-home"
+    initialize_workspace(workspace)
+    pool = OhmoSessionRuntimePool(cwd=tmp_path, workspace=workspace, provider_profile="codex")
+    pool._session_backend.save_snapshot(
+        cwd=tmp_path,
+        model="gpt-5.5",
+        system_prompt="s",
+        messages=[ConversationMessage.from_user_text("hi")],
+        usage=UsageSnapshot(),
+        session_id="sid",
+        session_key="telegram:7",
+    )
+    assert pool._session_backend.load_latest_for_session_key("telegram:7") is not None
+
+    closed = {}
+
+    async def fake_close(bundle):
+        closed["bundle"] = bundle
+
+    monkeypatch.setattr(rt, "close_runtime", fake_close)
+    sentinel = object()
+    pool._bundles["telegram:7"] = sentinel
+
+    had = await pool.reset_session("telegram:7")
+
+    assert had is True
+    assert closed["bundle"] is sentinel               # bundle closed in-task
+    assert "telegram:7" not in pool._bundles          # dropped from memory
+    assert pool._session_backend.load_latest_for_session_key("telegram:7") is None  # pointer gone
+    assert await pool.reset_session("telegram:absent") is False  # unknown session is safe
+
+
+@pytest.mark.asyncio
+async def test_gateway_bridge_new_command_resets_session():
+    bus = MessageBus()
+
+    class FakeRuntimePool:
+        def __init__(self):
+            self.reset_calls = []
+
+        async def reset_session(self, session_key):
+            self.reset_calls.append(session_key)
+            return True
+
+        async def stream_message(self, message, session_key):
+            yield SimpleNamespace(kind="final", text="SHOULD-NOT-RUN", metadata={})
+
+    pool = FakeRuntimePool()
+    bridge = OhmoGatewayBridge(bus=bus, runtime_pool=pool)
+    task = asyncio.create_task(bridge.run())
+    try:
+        await bus.publish_inbound(
+            InboundMessage(channel="telegram", sender_id="u1", chat_id="c1", content="/new")
+        )
+        reply = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
+    finally:
+        bridge.stop()
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    assert pool.reset_calls            # /new actually invoked reset_session...
+    assert "сброшен" in reply.content.lower()  # ...and confirmed, not run through the model
