@@ -2511,3 +2511,36 @@ async def test_gateway_bridge_new_command_resets_session():
 
     assert pool.reset_calls            # /new actually invoked reset_session...
     assert "сброшен" in reply.content.lower()  # ...and confirmed, not run through the model
+
+
+def test_extract_attachments_strips_markers_and_keeps_existing_files(tmp_path):
+    from ohmo.gateway.bridge import _extract_attachments
+
+    existing = tmp_path / "report.html"
+    existing.write_text("<html></html>")
+    missing = tmp_path / "nope.html"
+    text = f"Готово, отчёт во вложении.\n[[attach: {existing}]] хвост [[attach:{missing}]]"
+
+    clean, media = _extract_attachments(text)
+
+    assert media == [str(existing)]          # only the existing file is attached
+    assert "[[attach" not in clean           # every marker stripped (incl. the missing one)
+    assert "Готово" in clean and "хвост" in clean
+
+
+def test_extract_attachments_passthrough_without_markers():
+    from ohmo.gateway.bridge import _extract_attachments
+
+    clean, media = _extract_attachments("just text, no files")
+    assert clean == "just text, no files"
+    assert media == []
+
+
+def test_extract_attachments_dedupes_same_file(tmp_path):
+    from ohmo.gateway.bridge import _extract_attachments
+
+    f = tmp_path / "a.html"
+    f.write_text("x")
+    clean, media = _extract_attachments(f"[[attach:{f}]] [[attach:  {f} ]]")
+    assert media == [str(f)]                 # same path referenced twice -> one attachment
+    assert clean == ""

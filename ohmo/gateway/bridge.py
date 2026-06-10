@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import re
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 
@@ -24,6 +26,33 @@ def _content_snippet(text: str, *, limit: int = 160) -> str:
     if len(normalized) <= limit:
         return normalized
     return normalized[: limit - 3] + "..."
+
+
+_ATTACH_RE = re.compile(r"\[\[\s*attach\s*:\s*([^\]]+?)\s*\]\]", re.IGNORECASE)
+
+
+def _extract_attachments(text: str) -> tuple[str, list[str]]:
+    """Pull ``[[attach: <path>]]`` markers out of an agent reply.
+
+    Returns ``(text_without_markers, [existing_file_paths])``. The agent writes a
+    file (e.g. an HTML report) and references it with the marker; the gateway
+    strips the marker from the visible text and attaches the file to the outbound
+    message (``OutboundMessage.media`` → Telegram ``send_document``). Only paths
+    that resolve to an existing readable file are attached; every marker is
+    stripped from the text regardless (so a typo'd path never leaks raw).
+    """
+    if not text or "[[" not in text:
+        return text, []
+    paths: list[str] = []
+    seen: set[str] = set()
+    for match in _ATTACH_RE.finditer(text):
+        raw = match.group(1).strip().strip("'\"")
+        path = os.path.expanduser(raw)
+        if path and path not in seen and os.path.isfile(path):
+            seen.add(path)
+            paths.append(path)
+    clean = _ATTACH_RE.sub("", text).strip()
+    return clean, paths
 
 
 def _format_gateway_error(exc: Exception) -> str:
@@ -324,18 +353,21 @@ class OhmoGatewayBridge:
                 session_key,
             )
             return
+        content, media = _extract_attachments(reply)
         logger.info(
-            "ohmo outbound final channel=%s chat_id=%s session_key=%s content=%r",
+            "ohmo outbound final channel=%s chat_id=%s session_key=%s media=%d content=%r",
             message.channel,
             message.chat_id,
             session_key,
-            _content_snippet(reply),
+            len(media),
+            _content_snippet(content),
         )
         await self._bus.publish_outbound(
             OutboundMessage(
                 channel=message.channel,
                 chat_id=message.chat_id,
-                content=reply,
+                content=content,
+                media=media,
                 metadata={**inbound_meta, "_session_key": session_key},
             )
         )
