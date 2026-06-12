@@ -55,6 +55,35 @@ def _extract_attachments(text: str) -> tuple[str, list[str]]:
     return clean, paths
 
 
+_ASK_RE = re.compile(r"\[\[\s*ask\s*:\s*([^\]]+?)\s*\]\]", re.IGNORECASE)
+
+
+def _extract_ask(text: str) -> tuple[str, str, list[str]]:
+    """Pull a ``[[ask: <question> | <option> | <option> …]]`` marker out of an
+    agent reply (the Telegram counterpart of Claude Code's AskUserQuestion).
+
+    Returns ``(text_without_marker, question, options)``. The agent ends its
+    reply with the marker to offer tappable answer buttons; the gateway strips
+    it, shows ``question`` above the buttons, and a tap sends the chosen option
+    back as the user's next message. Only the FIRST marker is honored (one
+    question per reply). With fewer than 2 options the marker is still stripped
+    but no buttons are produced — a "question" with no real choices isn't a
+    button prompt.
+    """
+    if not text or "[[" not in text:
+        return text, "", []
+    match = _ASK_RE.search(text)
+    if not match:
+        return text, "", []
+    clean = _ASK_RE.sub("", text).strip()
+    parts = [p.strip() for p in match.group(1).split("|")]
+    parts = [p for p in parts if p]
+    if len(parts) < 3:  # need a question + at least two options
+        return clean, "", []
+    question, *options = parts
+    return clean, question, options[:8]  # Telegram keyboards: keep it sane
+
+
 def _format_gateway_error(exc: Exception) -> str:
     """Return a short, user-facing gateway error message."""
     message = str(exc).strip() or exc.__class__.__name__
@@ -354,12 +383,18 @@ class OhmoGatewayBridge:
             )
             return
         content, media = _extract_attachments(reply)
+        content, question, options = _extract_ask(content)
+        if options:
+            # Show the question above the buttons (the visible text may already
+            # carry context; append the question so the choices read clearly).
+            content = (content + ("\n\n" if content else "") + question).strip()
         logger.info(
-            "ohmo outbound final channel=%s chat_id=%s session_key=%s media=%d content=%r",
+            "ohmo outbound final channel=%s chat_id=%s session_key=%s media=%d buttons=%d content=%r",
             message.channel,
             message.chat_id,
             session_key,
             len(media),
+            len(options),
             _content_snippet(content),
         )
         await self._bus.publish_outbound(
@@ -368,6 +403,7 @@ class OhmoGatewayBridge:
                 chat_id=message.chat_id,
                 content=content,
                 media=media,
+                buttons=options,
                 metadata={**inbound_meta, "_session_key": session_key},
             )
         )

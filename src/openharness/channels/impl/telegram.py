@@ -6,8 +6,21 @@ import asyncio
 import re
 
 import logging
-from telegram import BotCommand, ReplyParameters, Update
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram import (
+    BotCommand,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ReplyParameters,
+    Update,
+)
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 from telegram.request import HTTPXRequest
 
 from openharness.channels.bus.events import OutboundMessage
@@ -213,6 +226,9 @@ class TelegramChannel(BaseChannel):
             )
         )
 
+        # Inline-button taps (the `[[ask: …]]` quick-reply keyboard).
+        self._app.add_handler(CallbackQueryHandler(self._on_callback))
+
         logger.info("Starting Telegram bot (polling mode)...")
 
         # Initialize and start polling
@@ -231,7 +247,7 @@ class TelegramChannel(BaseChannel):
 
         # Start polling (this runs until stopped)
         await self._app.updater.start_polling(
-            allowed_updates=["message"],
+            allowed_updates=["message", "callback_query"],
             drop_pending_updates=True  # Ignore old messages on startup
         )
 
@@ -258,6 +274,19 @@ class TelegramChannel(BaseChannel):
             await self._app.stop()
             await self._app.shutdown()
             self._app = None
+
+    @staticmethod
+    def _build_keyboard(buttons: list[str]) -> InlineKeyboardMarkup | None:
+        """One vertical inline button per ``[[ask: …]]`` option. The callback
+        carries the index; the chosen label is recovered from the keyboard on
+        tap (so no option text has to be squeezed into 64-byte callback_data)."""
+        options = [b for b in (buttons or []) if b and b.strip()]
+        if not options:
+            return None
+        return InlineKeyboardMarkup(
+            [[InlineKeyboardButton(text=opt[:60], callback_data=f"ask:{i}")]
+             for i, opt in enumerate(options)]
+        )
 
     @staticmethod
     def _get_media_type(path: str) -> str:
@@ -325,8 +354,13 @@ class TelegramChannel(BaseChannel):
         if msg.content and msg.content != "[empty message]":
             is_progress = msg.metadata.get("_progress", False)
             draft_id = msg.metadata.get("message_id")
+            keyboard = self._build_keyboard(msg.buttons)  # [[ask: …]] quick-reply buttons
+            chunks = split_message(msg.content, TELEGRAM_MAX_MESSAGE_LEN)
 
-            for chunk in split_message(msg.content, TELEGRAM_MAX_MESSAGE_LEN):
+            for ci, chunk in enumerate(chunks):
+                # Attach the keyboard only to the LAST chunk (buttons sit under
+                # the whole message). Progress drafts never carry buttons.
+                markup = keyboard if ci == len(chunks) - 1 else None
                 try:
                     html = _markdown_to_telegram_html(chunk)
                     if is_progress and draft_id:
@@ -341,7 +375,8 @@ class TelegramChannel(BaseChannel):
                             chat_id=chat_id,
                             text=html,
                             parse_mode="HTML",
-                            reply_parameters=reply_params
+                            reply_parameters=reply_params,
+                            reply_markup=markup,
                         )
                 except Exception as e:
                     logger.warning("HTML parse failed, falling back to plain text: %s", e)
@@ -356,7 +391,8 @@ class TelegramChannel(BaseChannel):
                             await self._app.bot.send_message(
                                 chat_id=chat_id,
                                 text=chunk,
-                                reply_parameters=reply_params
+                                reply_parameters=reply_params,
+                                reply_markup=markup,
                             )
                     except Exception as e2:
                         logger.error("Error sending Telegram message: %s", e2)
@@ -398,6 +434,69 @@ class TelegramChannel(BaseChannel):
             sender_id=self._sender_id(update.effective_user),
             chat_id=str(update.message.chat_id),
             content=update.message.text,
+        )
+
+    async def _on_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle an inline-button tap from a ``[[ask: …]]`` keyboard: ack it,
+        reflect the pick + strip the keyboard, and feed the chosen label back as
+        the user's next message (so the agent continues on its next turn). ACL is
+        applied downstream, same as a typed message."""
+        query = update.callback_query
+        if not query:
+            return
+        try:
+            await query.answer()  # stop the button's loading spinner
+        except Exception as e:  # noqa: BLE001
+            logger.debug("callback answer failed: %s", e)
+
+        data = query.data or ""
+        message = query.message
+        user = update.effective_user
+        if not data.startswith("ask:") or message is None or user is None:
+            return
+        try:
+            idx = int(data.split(":", 1)[1])
+        except ValueError:
+            return
+
+        # Recover the chosen label from the message's own keyboard.
+        option = None
+        markup = getattr(message, "reply_markup", None)
+        if markup:
+            flat = [btn for row in markup.inline_keyboard for btn in row]
+            if 0 <= idx < len(flat):
+                option = flat[idx].text
+        if not option:
+            return
+
+        chat_id = message.chat_id
+        # Reflect the pick + remove the keyboard so it can't be tapped twice.
+        try:
+            base = message.text_html if message.text else ""
+            picked = option.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            new_text = (base + f"\n\n✅ {picked}").strip() if base else f"✅ {picked}"
+            await query.edit_message_text(text=new_text, parse_mode="HTML")
+        except Exception as e:  # noqa: BLE001 — best-effort; at least drop the keyboard
+            logger.debug("callback edit failed: %s", e)
+            try:
+                await query.edit_message_reply_markup(reply_markup=None)
+            except Exception:  # noqa: BLE001
+                pass
+
+        sender_id = self._sender_id(user)
+        self._chat_ids[sender_id] = chat_id
+        self._start_typing(str(chat_id))
+        await self._handle_message(
+            sender_id=sender_id,
+            chat_id=str(chat_id),
+            content=option,
+            metadata={
+                "message_id": message.message_id,
+                "user_id": user.id,
+                "username": user.username,
+                "first_name": user.first_name,
+                "is_group": message.chat.type != "private",
+            },
         )
 
     async def _on_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

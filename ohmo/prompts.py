@@ -129,6 +129,24 @@ def build_ohmo_system_prompt(
 
     sections.extend(
         [
+            "# Asking with buttons",
+            (
+                "When you need the user to pick between a few concrete options "
+                "(a choice, a confirmation), END your reply with a marker on its "
+                "own line: `[[ask: <your question> | <option 1> | <option 2> | "
+                "…]]`. The gateway shows the question with TAPPABLE buttons, and "
+                "the tap arrives as the user's next message — so just continue "
+                "from their choice on your next turn. Put the question only in the "
+                "marker (don't also repeat it in prose), keep each option SHORT "
+                "(a few words), and give 2–6 options. Use it for genuine forks "
+                "(`[[ask: Куда едем в выходные? | Питер | Москва | Дома]]`), not "
+                "for open-ended questions — for those just ask in plain text."
+            ),
+        ]
+    )
+
+    sections.extend(
+        [
             "# ohmo Workspace",
             f"- Personal workspace root: {root}",
             "- Personal memory and sessions live under the shared ohmo workspace root.",

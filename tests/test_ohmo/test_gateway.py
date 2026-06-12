@@ -2548,6 +2548,52 @@ def test_extract_attachments_dedupes_same_file(tmp_path):
     assert clean == ""
 
 
+def test_extract_ask_parses_question_and_options():
+    from ohmo.gateway.bridge import _extract_ask
+
+    clean, question, options = _extract_ask(
+        "Прикинул варианты.\n[[ask: Куда едем? | Питер | Москва | Дома]]"
+    )
+    assert clean == "Прикинул варианты."          # marker stripped from visible text
+    assert question == "Куда едем?"
+    assert options == ["Питер", "Москва", "Дома"]
+
+
+def test_extract_ask_without_marker_is_passthrough():
+    from ohmo.gateway.bridge import _extract_ask
+
+    clean, question, options = _extract_ask("just a normal reply")
+    assert clean == "just a normal reply"
+    assert question == "" and options == []
+
+
+def test_extract_ask_needs_at_least_two_options():
+    from ohmo.gateway.bridge import _extract_ask
+
+    # A "question" with <2 options is no button prompt — strip it, no buttons.
+    clean, question, options = _extract_ask("text [[ask: Точно? | Ок]]")
+    assert "[[ask" not in clean
+    assert options == [] and question == ""
+
+
+def test_extract_ask_caps_option_count():
+    from ohmo.gateway.bridge import _extract_ask
+
+    inner = " | ".join(["Q"] + [f"o{i}" for i in range(12)])
+    _, _, options = _extract_ask(f"[[ask: {inner}]]")
+    assert len(options) == 8  # keyboard kept sane
+
+
+def test_build_keyboard_one_button_per_option():
+    from openharness.channels.impl.telegram import TelegramChannel
+
+    assert TelegramChannel._build_keyboard([]) is None
+    kb = TelegramChannel._build_keyboard(["Питер", "Москва"])
+    flat = [b for row in kb.inline_keyboard for b in row]
+    assert [b.text for b in flat] == ["Питер", "Москва"]
+    assert [b.callback_data for b in flat] == ["ask:0", "ask:1"]
+
+
 def test_render_todo_checklist(tmp_path):
     from ohmo.gateway.runtime import _render_todo_checklist
 
