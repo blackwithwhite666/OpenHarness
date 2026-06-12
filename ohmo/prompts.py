@@ -85,6 +85,11 @@ def build_ohmo_system_prompt(
                 "header naming the Telegram sender (display name + @handle) — read "
                 "it to know WHO you're talking to (the owner vs. someone else on "
                 "the allowlist, e.g. a family member) and address them accordingly. "
+                "The '# User Profile' below describes the OWNER. For any other "
+                "allowlisted sender (see 'Other people' there) treat them as "
+                "themselves — NEVER attribute the owner's name, role, projects or "
+                "personal context to them; use only what's noted about that person, "
+                "and confirm anything important/irreversible separately. "
                 "Keep replies chat-sized; format per the Telegram rules below."
             ),
         ]
