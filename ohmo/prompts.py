@@ -65,13 +65,12 @@ def build_ohmo_system_prompt(
                 "todo list is your working memory across tool calls — it stops you "
                 "from losing the plan, re-doing steps, sequencing wrong, or stopping "
                 "early. Re-read it before deciding the next action. Skip it only for "
-                "trivial one-shot answers. The todo file PERSISTS across requests, so "
-                "it may hold leftovers from earlier, unrelated tasks: at the start of "
-                "a NEW request run `todo_write clear_completed=true` to drop finished "
-                "items, and do NOT resume an unfinished todo that belongs to a "
-                "DIFFERENT task (remove it with `remove=true` or just ignore it) "
-                "unless the user explicitly asks to continue it. Keep the list scoped "
-                "to the current request."
+                "trivial one-shot answers. Each chat has its OWN list. When you move "
+                "on to a NEW, UNRELATED task, call `todo_write new_list=true` to start "
+                "a clean list (the previous one is archived to its own file) instead of "
+                "carrying another task's items forward; within a single task, "
+                "`clear_completed=true` prunes finished items and `remove=true` drops a "
+                "single one. Keep the list scoped to the current request."
             ),
         ]
     )

@@ -39,6 +39,8 @@ from ohmo.group_registry import load_managed_group_record, normalize_cwd
 from ohmo.memory import create_memory_command_backend
 from ohmo.prompts import build_ohmo_system_prompt
 from ohmo.session_storage import OhmoSessionBackend
+from ohmo.todo_store import TodoStore
+from ohmo.todo_write_tool import OhmoTodoWriteTool
 from ohmo.workspace import get_plugins_dir, get_skills_dir, initialize_workspace
 
 logger = logging.getLogger(__name__)
@@ -112,6 +114,7 @@ class OhmoSessionRuntimePool:
         self._workspace = initialize_workspace(workspace)
         self._gateway_config = load_gateway_config(self._workspace)
         self._session_backend = OhmoSessionBackend(self._workspace)
+        self._todo_store = TodoStore(self._workspace)
         self._bundles: dict[str, RuntimeBundle] = {}
 
     @property
@@ -233,17 +236,10 @@ class OhmoSessionRuntimePool:
                     session_key,
                     exc_info=True,
                 )
-        # Wipe the TODO scratch file too — it persists across conversations, so
-        # /new must clear it or the next chat inherits (and resurrects) stale todos.
-        todo_cwd = getattr(bundle, "cwd", None) or self._cwd
-        try:
-            (Path(todo_cwd) / "TODO.md").unlink()
-        except FileNotFoundError:
-            pass
-        except Exception:  # noqa: BLE001
-            logger.warning(
-                "ohmo runtime reset clear-todo failed session_key=%s", session_key, exc_info=True
-            )
+        # No TODO file to wipe: to-do lists are per-session_id (see TodoStore),
+        # and clearing the snapshot above means the next message mints a FRESH
+        # session_id → a brand-new empty list. The previous conversation's list
+        # file is kept on disk (the agent can still be pointed back at it).
         logger.info("ohmo runtime session reset session_key=%s had_bundle=%s", session_key, had_bundle)
         return had_bundle
 
@@ -619,9 +615,11 @@ class OhmoSessionRuntimePool:
                 event.tool_name,
             )
             if event.tool_name == "todo_write":
-                # Render the updated TODO.md as a compact checklist (like a
-                # Claude-Code todo panel) instead of the per-item JSON.
-                checklist = _render_todo_checklist(getattr(bundle, "cwd", None))
+                # Render the updated per-session list as a compact checklist
+                # (Claude-Code todo panel) instead of the per-item JSON.
+                checklist = _render_todo_checklist(
+                    self._todo_store.active_path(bundle.session_id)
+                )
                 if checklist:
                     yield GatewayStreamUpdate(
                         kind="tool_hint",
@@ -752,6 +750,18 @@ class OhmoSessionRuntimePool:
 
     def _register_gateway_tools(self, bundle: RuntimeBundle) -> None:
         self._unregister_group_tool(bundle)
+        self._register_todo_tool(bundle)
+
+    def _register_todo_tool(self, bundle: RuntimeBundle) -> None:
+        """Override the default ``todo_write`` with a per-session one — the list
+        lives in ``TodoStore`` keyed by this bundle's live ``session_id`` (read
+        lazily so it tracks ``/new``), so chats never share a TODO file."""
+        registry = getattr(bundle, "tool_registry", None)
+        if registry is None:
+            return
+        registry.register(
+            OhmoTodoWriteTool(self._todo_store, lambda: bundle.session_id)
+        )
 
     def _register_group_tool(self, bundle: RuntimeBundle) -> None:
         if self._create_feishu_group is None or not hasattr(bundle, "tool_registry"):
@@ -895,17 +905,18 @@ def _summarize_tool_input(tool_name: str, tool_input: dict[str, object]) -> str:
     return raw if len(raw) <= 120 else raw[:120] + "..."
 
 
-def _render_todo_checklist(cwd: str | Path | None) -> str | None:
-    """Render the current ``TODO.md`` as a compact chat checklist (a Claude-Code
-    style todo panel) — ``📋 To-do`` then one ``⬜``/``✅`` line per item.
+def _render_todo_checklist(path: str | Path | None) -> str | None:
+    """Render a to-do list file as a compact chat checklist (a Claude-Code style
+    todo panel) — ``📋 To-do`` then one ``⬜``/``✅`` line per item.
 
+    Takes the path to the session's active list (resolved by ``TodoStore``).
     Returns ``None`` when there is no list (so nothing is shown). Used after a
     ``todo_write`` call instead of echoing the raw per-item JSON.
     """
-    if not cwd:
+    if not path:
         return None
     try:
-        text = (Path(cwd) / "TODO.md").read_text(encoding="utf-8")
+        text = Path(path).read_text(encoding="utf-8")
     except OSError:
         return None
     rows: list[str] = []

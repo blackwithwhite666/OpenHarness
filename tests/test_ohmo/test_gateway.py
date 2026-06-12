@@ -2470,7 +2470,6 @@ async def test_reset_session_pops_bundle_and_clears_pointer(tmp_path, monkeypatc
     monkeypatch.setattr(rt, "close_runtime", fake_close)
     sentinel = object()
     pool._bundles["telegram:7"] = sentinel
-    (tmp_path / "TODO.md").write_text("# TODO\n- [ ] stale from a previous chat\n")
 
     had = await pool.reset_session("telegram:7")
 
@@ -2478,7 +2477,8 @@ async def test_reset_session_pops_bundle_and_clears_pointer(tmp_path, monkeypatc
     assert closed["bundle"] is sentinel               # bundle closed in-task
     assert "telegram:7" not in pool._bundles          # dropped from memory
     assert pool._session_backend.load_latest_for_session_key("telegram:7") is None  # pointer gone
-    assert not (tmp_path / "TODO.md").exists()         # /new also wipes the todo scratch
+    # NB: /new no longer wipes a shared TODO.md — lists are per-session_id, so the
+    # next message's fresh session_id starts a clean list (old file kept on disk).
     assert await pool.reset_session("telegram:absent") is False  # unknown session is safe
 
 
@@ -2551,11 +2551,12 @@ def test_extract_attachments_dedupes_same_file(tmp_path):
 def test_render_todo_checklist(tmp_path):
     from ohmo.gateway.runtime import _render_todo_checklist
 
+    todo = tmp_path / "list.md"  # now takes the path to the session's active list
     assert _render_todo_checklist(None) is None
-    assert _render_todo_checklist(tmp_path) is None  # no TODO.md yet
-    (tmp_path / "TODO.md").write_text("# TODO\n- [ ] step one\n- [x] step two\n")
+    assert _render_todo_checklist(todo) is None  # file doesn't exist yet
+    todo.write_text("# TODO\n- [ ] step one\n- [x] step two\n")
 
-    out = _render_todo_checklist(tmp_path)
+    out = _render_todo_checklist(todo)
     assert out.startswith("📋 To-do")
     assert "⬜ step one" in out
     assert "✅ step two" in out
