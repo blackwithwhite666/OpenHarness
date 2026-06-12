@@ -324,3 +324,43 @@ async def test_cron_and_remote_trigger_tools(tmp_path: Path, monkeypatch):
         context,
     )
     assert delete_result.is_error is False
+
+
+@pytest.mark.asyncio
+async def test_todo_write_remove_item(tmp_path: Path):
+    tool = TodoWriteTool()
+    ctx = ToolExecutionContext(cwd=tmp_path)
+    await tool.execute(TodoWriteToolInput(item="task A"), ctx)
+    await tool.execute(TodoWriteToolInput(item="task B"), ctx)
+
+    res = await tool.execute(TodoWriteToolInput(item="task A", remove=True), ctx)
+    assert res.is_error is False
+    body = (tmp_path / "TODO.md").read_text(encoding="utf-8")
+    assert "task A" not in body
+    assert "task B" in body
+
+    miss = await tool.execute(TodoWriteToolInput(item="task A", remove=True), ctx)
+    assert "not found" in miss.output.lower()  # removing a missing item is a clean no-op
+
+
+@pytest.mark.asyncio
+async def test_todo_write_clear_completed_prunes_done(tmp_path: Path):
+    tool = TodoWriteTool()
+    ctx = ToolExecutionContext(cwd=tmp_path)
+    await tool.execute(TodoWriteToolInput(item="old done"), ctx)
+    await tool.execute(TodoWriteToolInput(item="old done", checked=True), ctx)
+    await tool.execute(TodoWriteToolInput(item="still open"), ctx)
+
+    res = await tool.execute(TodoWriteToolInput(item="", clear_completed=True), ctx)
+    assert res.is_error is False
+    body = (tmp_path / "TODO.md").read_text(encoding="utf-8")
+    assert "old done" not in body   # completed item pruned (leftover from a prior task)
+    assert "still open" in body     # open item kept
+
+
+@pytest.mark.asyncio
+async def test_todo_write_requires_item_without_clear(tmp_path: Path):
+    res = await TodoWriteTool().execute(
+        TodoWriteToolInput(item=""), ToolExecutionContext(cwd=tmp_path)
+    )
+    assert res.is_error is True

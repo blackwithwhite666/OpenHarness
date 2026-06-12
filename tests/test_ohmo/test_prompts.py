@@ -63,6 +63,7 @@ def test_ohmo_prompt_nudges_todo_write(tmp_path: Path):
     prompt = build_ohmo_system_prompt(tmp_path, workspace=workspace)
     assert "todo_write" in prompt
     assert "Staying on track" in prompt
+    assert "clear_completed" in prompt  # prune leftovers from prior tasks
 
 
 def test_ohmo_prompt_has_telegram_formatting_rules(tmp_path: Path):

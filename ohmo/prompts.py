@@ -65,7 +65,13 @@ def build_ohmo_system_prompt(
                 "todo list is your working memory across tool calls — it stops you "
                 "from losing the plan, re-doing steps, sequencing wrong, or stopping "
                 "early. Re-read it before deciding the next action. Skip it only for "
-                "trivial one-shot answers."
+                "trivial one-shot answers. The todo file PERSISTS across requests, so "
+                "it may hold leftovers from earlier, unrelated tasks: at the start of "
+                "a NEW request run `todo_write clear_completed=true` to drop finished "
+                "items, and do NOT resume an unfinished todo that belongs to a "
+                "DIFFERENT task (remove it with `remove=true` or just ignore it) "
+                "unless the user explicitly asks to continue it. Keep the list scoped "
+                "to the current request."
             ),
         ]
     )
