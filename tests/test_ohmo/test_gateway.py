@@ -2559,3 +2559,34 @@ def test_render_todo_checklist(tmp_path):
     assert out.startswith("📋 To-do")
     assert "⬜ step one" in out
     assert "✅ step two" in out
+
+
+def test_speaker_context_direct_chat_carries_telegram_handle():
+    from ohmo.gateway.runtime import _build_speaker_context
+
+    msg = InboundMessage(
+        channel="telegram",
+        sender_id="116870365|blackwithwhite",
+        chat_id="116870365",
+        content="привет",
+        metadata={"chat_type": "private", "username": "blackwithwhite", "first_name": "Дмитрий"},
+    )
+    ctx = _build_speaker_context(msg)
+    assert "Direct message from" in ctx
+    assert "Дмитрий" in ctx and "@blackwithwhite" in ctx
+    assert "116870365|blackwithwhite" in ctx
+
+
+def test_speaker_context_group_still_labeled_as_group():
+    from ohmo.gateway.runtime import _build_speaker_context
+
+    msg = InboundMessage(
+        channel="feishu",
+        sender_id="ou_123",
+        chat_id="c1",
+        content="hi",
+        metadata={"chat_type": "group", "sender_display_name": "Tang Jiabin"},
+    )
+    ctx = _build_speaker_context(msg)
+    assert ctx.startswith("[Channel speaker]")
+    assert "group chat" in ctx and "Tang Jiabin" in ctx

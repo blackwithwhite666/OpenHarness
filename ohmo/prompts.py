@@ -78,6 +78,20 @@ def build_ohmo_system_prompt(
 
     sections.extend(
         [
+            "# Channel",
+            (
+                "You talk to your human(s) over Telegram (a chat app), one message "
+                "at a time. Every incoming message is prefixed with a [Speaker] "
+                "header naming the Telegram sender (display name + @handle) — read "
+                "it to know WHO you're talking to (the owner vs. someone else on "
+                "the allowlist, e.g. a family member) and address them accordingly. "
+                "Keep replies chat-sized; format per the Telegram rules below."
+            ),
+        ]
+    )
+
+    sections.extend(
+        [
             "# Telegram formatting",
             (
                 "Replies render in Telegram. For tabular data, emit a MARKDOWN "

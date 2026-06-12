@@ -75,3 +75,4 @@ def test_ohmo_prompt_has_telegram_formatting_rules(tmp_path: Path):
     assert "Telegram formatting" in prompt
     assert "MARKDOWN" in prompt
     assert "[label](url)" in prompt
+    assert "# Channel" in prompt and "[Speaker]" in prompt  # knows it talks via Telegram + who

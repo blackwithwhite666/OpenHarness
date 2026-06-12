@@ -1132,21 +1132,35 @@ def _strip_image_blocks_from_message(message: ConversationMessage) -> Conversati
 
 
 def _build_speaker_context(message: InboundMessage) -> str:
-    """Return a lightweight speaker header for group-chat messages."""
+    """Tell the agent who sent the message — in BOTH group and direct chats — so
+    it can recognise the owner vs. e.g. a family member on the allowlist.
+
+    Previously only group messages carried a speaker header, so in a 1:1 chat the
+    agent never saw the sender's Telegram handle and couldn't tell who it was
+    talking to.
+    """
     metadata = message.metadata or {}
     chat_type = str(metadata.get("chat_type") or "").strip().lower()
-    sender_label = (
+    username = str(metadata.get("username") or "").strip()
+    first_name = str(metadata.get("first_name") or "").strip()
+    label = (
         str(metadata.get("sender_display_name") or "").strip()
         or str(metadata.get("sender_label") or "").strip()
+        or first_name
+        or username
         or str(message.sender_id).strip()
+        or "unknown"
     )
-    if chat_type != "group":
-        return ""
-    if not sender_label:
-        sender_label = "unknown"
+    handle = f" (@{username})" if username else ""
+    if chat_type == "group":
+        return (
+            "[Channel speaker]\n"
+            f"This message was sent in a group chat by: {label}{handle}\n"
+            f"Sender id: {message.sender_id}"
+        )
     return (
-        "[Channel speaker]\n"
-        f"This message was sent in a group chat by: {sender_label}\n"
+        "[Speaker]\n"
+        f"Direct message from: {label}{handle}\n"
         f"Sender id: {message.sender_id}"
     )
 
