@@ -76,3 +76,15 @@ def test_ohmo_prompt_has_telegram_formatting_rules(tmp_path: Path):
     assert "MARKDOWN" in prompt
     assert "[label](url)" in prompt
     assert "# Channel" in prompt and "[Speaker]" in prompt  # knows it talks via Telegram + who
+
+
+def test_ohmo_prompt_explains_file_attachment(tmp_path: Path):
+    """The [[attach:]] marker is the only way the bot can send a file to
+    Telegram; if the prompt omits it the model thinks it has no attach tool
+    and offers Dropbox workarounds instead (regression seen 2026-06-12)."""
+    workspace = tmp_path / ".ohmo-home"
+    initialize_workspace(workspace)
+    prompt = build_ohmo_system_prompt(tmp_path, workspace=workspace)
+    assert "Attaching files" in prompt
+    assert "[[attach:" in prompt  # exact marker the bridge regex strips
+    assert "Dropbox" in prompt  # explicitly steers away from the wrong fallback

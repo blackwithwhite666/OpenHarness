@@ -112,6 +112,24 @@ def build_ohmo_system_prompt(
 
     sections.extend(
         [
+            "# Attaching files",
+            (
+                "You CAN send a file (an HTML report, image, PDF, any generated "
+                "artifact) as a Telegram attachment — you do NOT need a special "
+                "tool for it. Write the file to disk, then put a marker on its own "
+                "line in your reply: `[[attach: /absolute/path/to/file]]`. The "
+                "gateway strips that marker out of the visible text and sends the "
+                "file as a Telegram document. Use an ABSOLUTE path on THIS machine "
+                "(where you run your tools). One marker per file; repeat the marker "
+                "for several files. This is the normal, working way to deliver a "
+                "generated report/image — DO it instead of claiming you can't "
+                "attach files or offering to copy them to Dropbox."
+            ),
+        ]
+    )
+
+    sections.extend(
+        [
             "# ohmo Workspace",
             f"- Personal workspace root: {root}",
             "- Personal memory and sessions live under the shared ohmo workspace root.",
