@@ -1,0 +1,42 @@
+# GAIA dev split manifest (SCHEMA + placeholder rows — ADR §4, component #2).
+#
+# DEV split: seen during prompt tuning. Iterate here; gate on gate.yaml.
+# Target shape (ADR §1, §4): 30 rows, L1=10 / L2=15 / L3=5, and per-split
+# capability coverage: >=2 web-browsing, >=2 multi-hop, >=2 file-attachment,
+# >=1 multimodal, >=1 pure-reasoning. dev and gate MUST be DISJOINT (no shared
+# task_id) — anti-overfit.
+#
+# task_id == TODO below: real GAIA validation task_ids are populated from
+# loader.load_validation_tasks() once HF access (HF_TOKEN + accepted terms) is
+# configured (PR2). The rows here are SCHEMA placeholders that fix the column
+# contract; capability/level/needs_file/file_name show the intended spread.
+#
+# Row schema:
+#   task_id:    GAIA validation task id (string; "TODO" until populated)
+#   level:      1 | 2 | 3
+#   capability: web-browsing | multi-hop | file-attachment | multimodal | pure-reasoning
+#   needs_file: bool — does the task carry an attachment in cwd?
+#   file_name:  attachment basename (null when needs_file: false)
+
+split: dev
+target_counts: { level_1: 10, level_2: 15, level_3: 5 }
+coverage_min: { web-browsing: 2, multi-hop: 2, file-attachment: 2, multimodal: 1, pure-reasoning: 1 }
+
+tasks:
+  - task_id: TODO          # -> populated from loader (PR2)
+    level: 1
+    capability: web-browsing
+    needs_file: false
+    file_name: null
+
+  - task_id: TODO
+    level: 2
+    capability: file-attachment
+    needs_file: true
+    file_name: TODO.xlsx    # -> real attachment basename from the snapshot
+
+  - task_id: TODO
+    level: 3
+    capability: multi-hop
+    needs_file: false
+    file_name: null

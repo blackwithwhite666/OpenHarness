@@ -75,6 +75,9 @@ exclude = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+markers = [
+    "eval: live-web GAIA eval runner (needs HF_TOKEN + web; excluded from the default gate)",
+]
 
 [tool.ruff]
 line-length = 100

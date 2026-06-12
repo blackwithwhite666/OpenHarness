@@ -1,0 +1,45 @@
+# GAIA gate split manifest (SCHEMA + placeholder rows — ADR §4, component #2).
+#
+# GATE split: HELD OUT — only run at milestone boundaries, never seen during
+# prompt tuning. This is the primary-metric split (gate-split accuracy, per
+# level + overall, Wilson 95% CIs; gate passes only when the lower CI bound
+# clears the bar — ADR §1).
+#
+# Target shape (ADR §1, §4): 30 rows, L1=10 / L2=15 / L3=5, and per-split
+# capability coverage: >=2 web-browsing, >=2 multi-hop, >=2 file-attachment,
+# >=1 multimodal, >=1 pure-reasoning. dev and gate MUST be DISJOINT (no shared
+# task_id) — anti-overfit.
+#
+# task_id == TODO below: real GAIA validation task_ids are populated from
+# loader.load_validation_tasks() once HF access (HF_TOKEN + accepted terms) is
+# configured (PR2). Rows here are SCHEMA placeholders.
+#
+# Row schema:
+#   task_id:    GAIA validation task id (string; "TODO" until populated)
+#   level:      1 | 2 | 3
+#   capability: web-browsing | multi-hop | file-attachment | multimodal | pure-reasoning
+#   needs_file: bool — does the task carry an attachment in cwd?
+#   file_name:  attachment basename (null when needs_file: false)
+
+split: gate
+target_counts: { level_1: 10, level_2: 15, level_3: 5 }
+coverage_min: { web-browsing: 2, multi-hop: 2, file-attachment: 2, multimodal: 1, pure-reasoning: 1 }
+
+tasks:
+  - task_id: TODO          # -> populated from loader (PR2); MUST be disjoint from dev.yaml
+    level: 1
+    capability: pure-reasoning
+    needs_file: false
+    file_name: null
+
+  - task_id: TODO
+    level: 2
+    capability: multimodal
+    needs_file: true
+    file_name: TODO.png     # -> real attachment basename from the snapshot
+
+  - task_id: TODO
+    level: 3
+    capability: multi-hop
+    needs_file: false
+    file_name: null
