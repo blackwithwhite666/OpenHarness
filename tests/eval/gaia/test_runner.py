@@ -43,7 +43,7 @@ async def test_run_subset_good_sentinel_passes(tmp_path):
     task = _task("t-good", "Paris", 1, tmp_path)
 
     async def good_spawn(t, model):
-        assert model == "claude-opus-4-8"
+        assert model == "gpt-5.5"
         return f"Reasoning...\n<final_answer>{t.ground_truth}</final_answer>"
 
     report = await run_subset_fn(

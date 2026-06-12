@@ -45,7 +45,7 @@ DEFAULT_K = 3
 _Z_95 = 1.959963984540054
 
 # Default pinned model for the eval path (ADR §7: never "inherit").
-DEFAULT_MODEL = "claude-opus-4-8"
+DEFAULT_MODEL = "gpt-5.5"
 
 # How long to wait for one spawned agent before tagging an infra failure.
 DEFAULT_TIMEOUT_S = 600.0

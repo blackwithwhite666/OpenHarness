@@ -25,7 +25,7 @@ from openharness.skills.bundled import get_bundled_skills
 
 #: Concrete model id the eval runner pins (tests/eval/gaia/run_subset.py
 #: DEFAULT_MODEL). The deep-research defs must pin the same kind of concrete id.
-_EXPECTED_MODEL = "claude-opus-4-8"
+_EXPECTED_MODEL = "gpt-5.5"  # deployed gateway model (Codex); pinned, not "inherit"
 
 #: Provider-specific aliases / inherit sentinels that are NOT deterministic for
 #: evals — the deep-research defs must avoid all of these (ADR §5/§7).

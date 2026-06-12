@@ -376,7 +376,7 @@ _WORKER_SYSTEM_PROMPT = (
 #: "inherit"/None here: build_inherited_cli_flags() (swarm/spawn_utils.py:152)
 #: drops the --model flag for "inherit", so the worker would fall back to the
 #: parent/OPENHARNESS_MODEL env model — non-deterministic for evals (ADR §5).
-_DEEP_RESEARCH_MODEL = "claude-opus-4-8"
+_DEEP_RESEARCH_MODEL = "gpt-5.5"
 
 _RESEARCH_VERIFICATION_SYSTEM_PROMPT = """You are a research citation verifier. Your job is NOT to confirm a draft answer is right — it is to adversarially re-check every claim in a draft research answer against the source it cites, and reject anything the source does not actually support.
 

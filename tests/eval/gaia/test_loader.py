@@ -28,12 +28,25 @@ from tests.eval.gaia.loader import (
 
 
 def _write_fake_snapshot(root: Path, rows: list[dict], *, attachments: dict[str, str] | None = None) -> Path:
-    """Materialize a fake GAIA snapshot: 2023/validation/{metadata.jsonl, files}."""
+    """Materialize a fake GAIA snapshot: 2023/validation/{metadata.parquet, files}.
+
+    The real GAIA repo ships metadata as parquet (all keys present per row, Level
+    as a string), so the fixture writes parquet via pyarrow to match.
+    """
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
     vdir = root / GAIA_CONFIG / GAIA_SPLIT
     vdir.mkdir(parents=True, exist_ok=True)
-    with (vdir / "metadata.jsonl").open("w", encoding="utf-8") as fh:
-        for row in rows:
-            fh.write(json.dumps(row) + "\n")
+    # Normalize to a uniform schema (parquet is columnar — every row needs every
+    # key); Level is a string in the real dataset.
+    cols = ["task_id", "Question", "Level", "Final answer", "file_name", "file_path"]
+    norm = [
+        {c: ("" if row.get(c) is None else (str(row[c]) if c == "Level" else row.get(c, ""))) for c in cols}
+        for row in rows
+    ]
+    table = pa.Table.from_pylist(norm) if norm else pa.table({c: pa.array([], pa.string()) for c in cols})
+    pq.write_table(table, vdir / "metadata.parquet")
     for name, content in (attachments or {}).items():
         (vdir / name).write_text(content, encoding="utf-8")
     return root
@@ -118,14 +131,10 @@ def test_absolutize_joins_under_split_dir(tmp_path):
     assert p == (tmp_path / GAIA_CONFIG / GAIA_SPLIT / "foo.csv").resolve()
 
 
-def test_blank_lines_in_metadata_are_skipped(tmp_path):
-    vdir = tmp_path / GAIA_CONFIG / GAIA_SPLIT
-    vdir.mkdir(parents=True)
-    lines = [json.dumps(NOFILE_ROW), "", "   ", json.dumps(FILE_ROW)]
-    (vdir / "metadata.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
-    (vdir / FILE_ROW["file_name"]).write_text("x", encoding="utf-8")
-    tasks = load_validation_tasks(tmp_path)
-    assert len(tasks) == 2
+def test_multiple_rows_load(tmp_path):
+    # parquet is columnar (no blank-line concept); a 2-row table -> 2 tasks.
+    _write_fake_snapshot(tmp_path, [NOFILE_ROW, FILE_ROW], attachments={FILE_ROW["file_name"]: "x"})
+    assert len(load_validation_tasks(tmp_path)) == 2
 
 
 def test_missing_metadata_raises_filenotfound(tmp_path):

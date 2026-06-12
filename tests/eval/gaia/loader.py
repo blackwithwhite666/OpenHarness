@@ -49,7 +49,7 @@ GAIA_REPO_ID = "gaia-benchmark/GAIA"
 GAIA_CONFIG = "2023"
 GAIA_SPLIT = "validation"
 
-_METADATA_FILE = "metadata.jsonl"
+_METADATA_FILE = "metadata.parquet"
 
 
 @dataclass(frozen=True)
@@ -150,19 +150,24 @@ def load_validation_tasks(
     *,
     split: str = GAIA_SPLIT,
 ) -> list[Task]:
-    """Read ``2023/<split>/metadata.jsonl`` into :class:`Task` records.
+    """Read ``2023/<split>/metadata.parquet`` into :class:`Task` records.
 
-    Pure / offline (no network, no HF token). For each JSONL row:
+    Pure / offline (no network, no HF token). The current GAIA HF repo ships the
+    metadata as **parquet** (``metadata.parquet`` + per-level
+    ``metadata.level{1,2,3}.parquet``), not the older ``metadata.jsonl``. For each
+    row:
 
-    * skip blank lines and the sentinel ``task_id == "0-0-0-0-0"`` (the GAIA
-      demo task — owl ``continue``s on it);
+    * skip the sentinel ``task_id == "0-0-0-0-0"`` (the GAIA demo task);
     * map ``Question`` / ``Final answer`` / ``Level`` / ``file_name``;
     * absolutize a bare ``file_name`` into an absolute ``file_path`` under the
       split dir (``None`` when the row has no attachment).
 
     ``Final answer`` is blank on the ``test`` split (private); on ``validation``
-    it is the ground truth. ``Level`` is coerced to ``int`` (1/2/3).
+    it is the ground truth. ``Level`` is stored as a string ("1"/"2"/"3") and is
+    coerced to ``int``.
     """
+    import pyarrow.parquet as pq  # noqa: PLC0415 — heavy, dev-only eval dep
+
     metadata_path = split_dir(snapshot_root, split) / _METADATA_FILE
     if not metadata_path.exists():
         raise FileNotFoundError(
@@ -171,23 +176,18 @@ def load_validation_tasks(
         )
 
     tasks: list[Task] = []
-    with metadata_path.open("r", encoding="utf-8") as fh:
-        for line in fh:
-            line = line.strip()
-            if not line:
-                continue
-            data = json.loads(line)
-            if data.get("task_id") == EXAMPLE_TASK_ID:
-                continue
-            tasks.append(
-                Task(
-                    task_id=data["task_id"],
-                    question=data["Question"],
-                    answer=data.get("Final answer", ""),
-                    level=int(data["Level"]),
-                    file_path=absolutize_file_path(
-                        snapshot_root, data.get("file_name"), split=split
-                    ),
-                )
+    for data in pq.read_table(metadata_path).to_pylist():
+        if data.get("task_id") == EXAMPLE_TASK_ID:
+            continue
+        tasks.append(
+            Task(
+                task_id=data["task_id"],
+                question=data["Question"],
+                answer=data.get("Final answer") or "",
+                level=int(data["Level"]),
+                file_path=absolutize_file_path(
+                    snapshot_root, data.get("file_name"), split=split
+                ),
             )
+        )
     return tasks
