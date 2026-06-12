@@ -233,6 +233,17 @@ class OhmoSessionRuntimePool:
                     session_key,
                     exc_info=True,
                 )
+        # Wipe the TODO scratch file too — it persists across conversations, so
+        # /new must clear it or the next chat inherits (and resurrects) stale todos.
+        todo_cwd = getattr(bundle, "cwd", None) or self._cwd
+        try:
+            (Path(todo_cwd) / "TODO.md").unlink()
+        except FileNotFoundError:
+            pass
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "ohmo runtime reset clear-todo failed session_key=%s", session_key, exc_info=True
+            )
         logger.info("ohmo runtime session reset session_key=%s had_bundle=%s", session_key, had_bundle)
         return had_bundle
 
@@ -576,6 +587,10 @@ class OhmoSessionRuntimePool:
                 event.tool_name,
                 summary,
             )
+            if event.tool_name == "todo_write":
+                # Don't show the raw per-item JSON — the full checklist is
+                # rendered (post-write) on completion instead, like a todo panel.
+                return
             hint = _pretty_tool_name(event.tool_name)
             args_block = _format_tool_args_block(event.tool_input)
             if args_block:
@@ -603,6 +618,20 @@ class OhmoSessionRuntimePool:
                 bundle.session_id,
                 event.tool_name,
             )
+            if event.tool_name == "todo_write":
+                # Render the updated TODO.md as a compact checklist (like a
+                # Claude-Code todo panel) instead of the per-item JSON.
+                checklist = _render_todo_checklist(getattr(bundle, "cwd", None))
+                if checklist:
+                    yield GatewayStreamUpdate(
+                        kind="tool_hint",
+                        text=checklist,
+                        metadata={
+                            "_progress": True,
+                            "_tool_hint": True,
+                            "_session_key": session_key,
+                        },
+                    )
             return
         if isinstance(event, ErrorEvent):
             logger.error(
@@ -864,6 +893,31 @@ def _summarize_tool_input(tool_name: str, tool_input: dict[str, object]) -> str:
     except TypeError:
         raw = str(tool_input)
     return raw if len(raw) <= 120 else raw[:120] + "..."
+
+
+def _render_todo_checklist(cwd: str | Path | None) -> str | None:
+    """Render the current ``TODO.md`` as a compact chat checklist (a Claude-Code
+    style todo panel) — ``📋 To-do`` then one ``⬜``/``✅`` line per item.
+
+    Returns ``None`` when there is no list (so nothing is shown). Used after a
+    ``todo_write`` call instead of echoing the raw per-item JSON.
+    """
+    if not cwd:
+        return None
+    try:
+        text = (Path(cwd) / "TODO.md").read_text(encoding="utf-8")
+    except OSError:
+        return None
+    rows: list[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("- [x]"):
+            rows.append("✅ " + stripped[5:].strip())
+        elif stripped.startswith("- [ ]"):
+            rows.append("⬜ " + stripped[5:].strip())
+    if not rows:
+        return None
+    return "📋 To-do\n" + "\n".join(rows)
 
 
 def _pretty_tool_name(tool_name: str) -> str:
