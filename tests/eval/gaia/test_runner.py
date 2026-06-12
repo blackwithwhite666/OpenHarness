@@ -302,3 +302,41 @@ def test_build_prompt_no_files(tmp_path):
 # --------------------------------------------------------------------------- #
 def test_default_model_is_pinned_not_inherit():
     assert run_subset.DEFAULT_MODEL not in (None, "", "inherit")
+
+
+def test_parse_usage_strips_marker_and_sums():
+    from tests.eval.gaia.run_subset import _parse_usage
+
+    clean, tok = _parse_usage("answer here\n[[USAGE input_tokens=1200 output_tokens=300]]")
+    assert tok == 1500
+    assert "[[USAGE" not in clean and clean.strip() == "answer here"
+    assert _parse_usage("no marker") == ("no marker", None)
+    assert _parse_usage(None) == (None, None)
+
+
+@pytest.mark.asyncio
+async def test_run_subset_records_tokens_from_usage_marker(tmp_path):
+    # The worker (opt-in OPENHARNESS_EMIT_USAGE) appends a [[USAGE …]] marker; the
+    # runner must parse it into row["tokens"] AND strip it so the scorer still
+    # extracts the answer (the marker must never be mistaken for the answer).
+    task = _task("t-usage", "Paris", 1, tmp_path)
+
+    async def spawn_with_usage(t, model):
+        return (
+            f"Reasoning...\n<final_answer>{t.ground_truth}</final_answer>\n"
+            "[[USAGE input_tokens=1200 output_tokens=300]]"
+        )
+
+    await run_subset_fn(
+        [task],
+        spawn_fn=spawn_with_usage,
+        results_dir=tmp_path / "results",
+        git_sha="sha-usage",
+        k=1,
+    )
+    (row,) = [
+        json.loads(line)
+        for line in (tmp_path / "results" / "sha-usage.jsonl").read_text().splitlines()
+    ]
+    assert row["score"] == 1.0   # marker stripped -> answer still extracted
+    assert row["tokens"] == 1500  # input+output summed and recorded

@@ -28,6 +28,8 @@ import argparse
 import asyncio
 import json
 import math
+import os
+import re
 import shutil
 import statistics
 import sys
@@ -392,6 +394,26 @@ async def _spawn_agent(
 # --------------------------------------------------------------------------- #
 # K=3 orchestration (REAL — wiring spawn -> score -> JSONL + REPORT)
 # --------------------------------------------------------------------------- #
+_USAGE_RE = re.compile(r"\[\[USAGE input_tokens=(\d+) output_tokens=(\d+)\]\]")
+
+
+def _parse_usage(transcript: str | None) -> tuple[str | None, int | None]:
+    """Pull the eval-only ``[[USAGE …]]`` marker the worker emits (opt-in via
+    ``OPENHARNESS_EMIT_USAGE``) out of the transcript.
+
+    Returns ``(clean_transcript, total_tokens)``. The marker is stripped so the
+    scorer's extractor never mistakes it for the answer; ``tokens`` is ``None``
+    when the marker is absent (prod sub-agents / older workers don't emit it).
+    """
+    if not transcript:
+        return transcript, None
+    match = _USAGE_RE.search(transcript)
+    if not match:
+        return transcript, None
+    tokens = int(match.group(1)) + int(match.group(2))
+    return _USAGE_RE.sub("", transcript).rstrip(), tokens
+
+
 async def _run_one_task(
     task: TaskRun,
     *,
@@ -413,6 +435,7 @@ async def _run_one_task(
     infra_failures = 0
     answers: list[str | None] = []
     latencies: list[float] = []
+    token_runs: list[int] = []
 
     for _ in range(k):
         t0 = time.monotonic()
@@ -425,6 +448,9 @@ async def _run_one_task(
             latencies.append(time.monotonic() - t0)
             continue
         latencies.append(time.monotonic() - t0)
+        transcript, run_tokens = _parse_usage(transcript)
+        if run_tokens is not None:
+            token_runs.append(run_tokens)
         scored = score_run(transcript, task.ground_truth, strict=strict)
         scores.append(scored["score"])
         answers.append(scored["answer"])
@@ -446,6 +472,7 @@ async def _run_one_task(
         "extraction_failure_runs": extraction_failures,
         "infra_failure_runs": infra_failures,
         "latency_s": statistics.median(latencies) if latencies else None,
+        "tokens": statistics.median(token_runs) if token_runs else None,
         "needs_file": bool(task.attachments),
     }
 
@@ -578,6 +605,11 @@ def main(argv: Sequence[str] | None = None) -> int:  # pragma: no cover - CLI
         help="Run only the first N manifest tasks (smoke/debug; default: all).",
     )
     args = parser.parse_args(argv)
+
+    # Workers inherit os.environ (tasks/manager.py merges env with os.environ),
+    # so this opt-in flag makes each spawned worker emit a [[USAGE …]] marker we
+    # parse + strip per run. Prod sub-agents (no flag) are unaffected.
+    os.environ.setdefault("OPENHARNESS_EMIT_USAGE", "1")
 
     from tests.eval.gaia.loader import download_gaia_snapshot  # noqa: PLC0415
 

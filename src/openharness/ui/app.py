@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
 
 from openharness.coordinator.coordinator_mode import is_coordinator_mode
@@ -174,6 +175,16 @@ async def run_task_worker(
             # needs to send a follow-up later, BackgroundTaskManager already
             # knows how to restart the task and write the next stdin payload.
             break
+        if os.environ.get("OPENHARNESS_EMIT_USAGE"):
+            # Eval-only token telemetry: emit the engine's usage so the GAIA
+            # runner can record tokens/task. Opt-in — prod sub-agents (no flag)
+            # never see this marker in their output.
+            usage = getattr(bundle.engine, "total_usage", None)
+            if usage is not None:
+                print(
+                    f"[[USAGE input_tokens={usage.input_tokens} output_tokens={usage.output_tokens}]]",
+                    flush=True,
+                )
     finally:
         await close_runtime(bundle)
 
