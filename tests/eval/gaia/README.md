@@ -47,30 +47,50 @@ The live-web runner is gated behind `@pytest.mark.eval` (see *Conventions*) and
 is **excluded** from the default gate — it needs an `HF_TOKEN`, the gated GAIA
 dataset, and live web/Serper access, none of which run in CI.
 
-## What this PR (PR1 / M0, scorer-only) ships
+## What ships (PR1 scorer + PR2 loader/runner/manifests)
 
-- **`scorer.py`** — `question_scorer(model_answer, ground_truth, strict=…)`
+- **`scorer.py`** (PR1) — `question_scorer(model_answer, ground_truth, strict=…)`
   (number / list / string dispatch) + tolerant `extract_answer(text)`.
   Faithful port of the canonical HF leaderboard scorer; `strict=True` (default)
   is bit-for-bit official, `strict=False` is our EU-comma / units / safe-list
   extension (each divergence behind the flag, separately tested).
-- **`test_scorer.py`** — adversarial cases (empty/None, reasoning-prefix, the
-  EU-comma trio, comma-inside-a-list-element, trailing units, sentinel-absent
-  extraction, commentary-wrapped, case/whitespace), the canonical reference
-  pairs, OWL-derived fixtures, and the offline runner helpers
-  (`wilson_ci`, JSONL/REPORT writers). Runs in the default gate.
+- **`loader.py`** (PR2) — `download_gaia_snapshot(token)` (the one HF-gated
+  network call; `huggingface_hub` imported lazily) + offline
+  `load_validation_tasks(snapshot_root) -> list[Task]` reading
+  `2023/validation/metadata.jsonl`, skipping `0-0-0-0-0`, absolutizing
+  `file_name`. `Task = {task_id, question, answer, level, file_path|None}`.
+- **`run_subset.py`** (PR2) — runnable
+  `python -m tests.eval.gaia.run_subset --split {dev,gate} --agent <subagent_type> --k 3`.
+  Per task: per-task working dir + attachment copy (ADR §2(c)), spawn via the
+  REAL subprocess boundary (`get_backend_registry().get_executor("subprocess").spawn(TeammateSpawnConfig(...))`
+  with a PINNED `model`, never `inherit` — ADR §7), poll to terminal,
+  `read_task_output`, K=3, score, write per-sha JSONL + `REPORT.md` (per-level
+  acc + Wilson CIs + median tokens/latency + extraction-/infra-failure rates,
+  tagged distinctly). For M0 `--agent` is the current general worker
+  (`general-purpose`); `deep-research` ships in PR3.
+- **`build_manifests.py`** (PR2) — stratified disjoint dev+gate selection
+  (30 each, L1=10/L2=15/L3=5) by a FIXED seed →
+  `python -m tests.eval.gaia.build_manifests --snapshot <root>`.
+- **`test_scorer.py` / `test_loader.py` / `test_build_manifests.py` /
+  `test_runner.py`** — all offline (zero network/model/subprocess). The loader
+  is tested against a FAKE snapshot dir; the selector against a SYNTHETIC task
+  list; the runner end-to-end by monkeypatching the spawn to return canned
+  transcripts (good / sentinel-less / spawn-failure) and asserting the REPORT
+  math + failure tagging. Run in the default gate.
 
-## What is stubbed (pending HF access + the agent)
+## What still needs HF_TOKEN / a live model (deferred to a real run)
 
-| Stub | Where | Why |
+| Deferred | Where | Why |
 |---|---|---|
-| GAIA snapshot download | `loader.py` `download_gaia_snapshot` / `load_validation_tasks` | GAIA is HF-gated (`HF_TOKEN` + accepted terms; un-gated call 401s — ADR §7). Not configured in PR1. |
-| The deep-research agent spawn | `run_subset.py` `_spawn_deep_research` / `run_subset` | The `deep-research` `AgentDefinition` does not exist yet — it ships in PR3 / M1. The spawn call is a clearly-marked TODO at the exact subprocess boundary. |
-| Real `task_id`s in the manifests | `dev.yaml` / `gate.yaml` | Populated from `loader.load_validation_tasks()` once HF access is configured (PR2). Current rows are SCHEMA placeholders fixing the column contract + intended level/capability spread. |
+| GAIA snapshot download | `loader.download_gaia_snapshot` | HF-gated (`HF_TOKEN` + accepted terms; un-gated call 401s — ADR §7). Gated behind the token; never invoked by the unit suite. |
+| Real `task_id`s frozen into the manifests | `build_manifests.main` → `dev.yaml` / `gate.yaml` | Needs the dataset to enumerate tasks. Current manifest rows are SCHEMA placeholders (`task_id: TODO`) until `build_manifests` is run with a token. |
+| The actual agent run (spawn → live model) | `run_subset._spawn_agent` / `run_subset.main` | Spawning the worker invokes a live model (`ANTHROPIC_API_KEY`) and live web/Serper. Offline tests inject `spawn_fn`; the M0 baseline `REPORT.md` is produced by a real `run_subset` run. |
+| `deep-research` AgentDefinition | `src/openharness/coordinator/agent_definitions.py` | Ships in PR3 / M1. M0 runs `--agent general-purpose`. |
 
-**Real and tested now** (offline): the scorer, the answer extractor, and the
-runner's `wilson_ci` / `aggregate` / `write_jsonl` / `write_report` / `score_run`
-helpers.
+**Real and tested now** (offline): the scorer, the answer extractor, the loader
+parsing/skip/absolutize, the manifest selector, and the runner's K=3
+orchestration + `wilson_ci` / `aggregate` / `write_jsonl` / `write_report` /
+`score_run` / `prepare_task_dir` / `build_prompt` helpers.
 
 ## The `@pytest.mark.eval` convention
 

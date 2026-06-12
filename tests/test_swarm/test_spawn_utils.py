@@ -77,3 +77,42 @@ def test_build_inherited_cli_flags_forwards_system_prompt_as_append():
     idx = flags.index("--append-system-prompt")
     assert "Extra worker instructions." in flags[idx + 1]
     assert "--system-prompt" not in flags
+
+
+# ---------------------------------------------------------------------------
+# build_inherited_cli_flags – tool partition propagation (deep-research routing)
+# ---------------------------------------------------------------------------
+
+
+def test_build_inherited_cli_flags_forwards_allowed_tools():
+    flags = build_inherited_cli_flags(
+        allowed_tools=["mcp__google_search__search", "web_fetch", "bash"],
+    )
+    # One --allowed-tools flag per tool name, values shell-quoted.
+    assert flags.count("--allowed-tools") == 3
+    joined = " ".join(flags)
+    assert "mcp__google_search__search" in joined
+    assert "web_fetch" in joined
+    assert "bash" in joined
+
+
+def test_build_inherited_cli_flags_star_allowlist_emits_no_flag():
+    # ["*"] (and None) mean "all tools" — no allowlist restriction forwarded.
+    assert "--allowed-tools" not in build_inherited_cli_flags(allowed_tools=["*"])
+    assert "--allowed-tools" not in build_inherited_cli_flags(allowed_tools=None)
+
+
+def test_build_inherited_cli_flags_forwards_disallowed_tools():
+    flags = build_inherited_cli_flags(
+        disallowed_tools=["agent", "file_write", "notebook_edit"],
+    )
+    assert flags.count("--disallowed-tools") == 3
+    joined = " ".join(flags)
+    assert "agent" in joined
+    assert "file_write" in joined
+
+
+def test_build_inherited_cli_flags_no_tool_flags_by_default():
+    flags = build_inherited_cli_flags(model="claude-opus-4-8")
+    assert "--allowed-tools" not in flags
+    assert "--disallowed-tools" not in flags

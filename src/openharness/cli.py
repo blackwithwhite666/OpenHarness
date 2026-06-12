@@ -49,6 +49,26 @@ def _safe_short(text: str, *, limit: int = 140) -> str:
     return normalized[: limit - 3] + "..."
 
 
+def _normalize_tool_names(raw: Optional[list[str]]) -> Optional[list[str]]:
+    """Normalize ``--allowed-tools`` / ``--disallowed-tools`` into a flat list.
+
+    The CLI accepts either repeated flags (``--allowed-tools a --allowed-tools b``)
+    or a single comma/space-separated value (``--allowed-tools "a, b"``). Returns
+    ``None`` when nothing was passed so the registry filter is a no-op (all tools
+    allowed), matching ``AgentDefinition.tools=None``.
+    """
+    if not raw:
+        return None
+    names: list[str] = []
+    for entry in raw:
+        if not entry:
+            continue
+        for token in re.split(r"[,\s]+", entry.strip()):
+            if token:
+                names.append(token)
+    return names or None
+
+
 def _schema_argument_preview(tool_schema: dict[str, object]) -> dict[str, object]:
     input_schema = tool_schema.get("input_schema")
     if not isinstance(input_schema, dict):
@@ -2449,6 +2469,8 @@ def main(
                 api_key=api_key,
                 api_format=api_format,
                 permission_mode=permission_mode,
+                allowed_tools=_normalize_tool_names(allowed_tools),
+                disallowed_tools=_normalize_tool_names(disallowed_tools),
             )
         )
         return

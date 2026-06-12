@@ -75,6 +75,38 @@ class ToolRegistry:
         """Return all registered tools."""
         return list(self._tools.values())
 
+    def apply_tool_filter(
+        self,
+        allowed: list[str] | None = None,
+        disallowed: list[str] | None = None,
+    ) -> None:
+        """Restrict the registry to a sub-agent's partitioned toolset, in place.
+
+        Mirrors the ``AgentDefinition`` semantics:
+
+        * ``allowed`` — allowlist. ``None`` or ``["*"]`` means "all tools" (no
+          allowlist restriction). Otherwise only tools whose name is in the list
+          survive. Names match exactly, including MCP tool names of the form
+          ``mcp__<server>__<tool>`` produced by :class:`McpToolAdapter`.
+        * ``disallowed`` — denylist, applied after the allowlist. Any tool whose
+          name is in this list is removed.
+
+        Used at the subprocess-teammate boundary so a spawned sub-agent only
+        sees the tools its definition declares (the def's ``tools`` /
+        ``disallowed_tools`` are otherwise dropped when crossing the worker
+        subprocess — see ``swarm/spawn_utils.build_inherited_cli_flags``).
+        """
+        if allowed is not None and allowed != ["*"]:
+            allow_set = set(allowed)
+            self._tools = {
+                name: tool for name, tool in self._tools.items() if name in allow_set
+            }
+        if disallowed:
+            deny_set = set(disallowed)
+            self._tools = {
+                name: tool for name, tool in self._tools.items() if name not in deny_set
+            }
+
     def to_api_schema(self) -> list[dict[str, Any]]:
         """Return all tool schemas in API format."""
         return [tool.to_api_schema() for tool in self._tools.values()]

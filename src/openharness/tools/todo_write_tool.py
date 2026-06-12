@@ -41,8 +41,13 @@ class TodoWriteTool(BaseTool):
     )
     input_model = TodoWriteToolInput
 
+    def _resolve_path(self, arguments: TodoWriteToolInput, context: ToolExecutionContext) -> Path:
+        """Where this write lands. Subclasses (e.g. ohmo's per-session store)
+        override to route the list somewhere other than ``<cwd>/<path>``."""
+        return Path(context.cwd) / arguments.path
+
     async def execute(self, arguments: TodoWriteToolInput, context: ToolExecutionContext) -> ToolResult:
-        path = Path(context.cwd) / arguments.path
+        path = self._resolve_path(arguments, context)
         existing = path.read_text(encoding="utf-8") if path.exists() else "# TODO\n"
 
         # Housekeeping: drop every completed item (e.g. leftovers from a prior task).

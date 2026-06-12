@@ -225,8 +225,16 @@ async def build_runtime(
     extra_plugin_roots: Iterable[str | Path] | None = None,
     memory_backend: MemoryCommandBackend | None = None,
     include_project_memory: bool = True,
+    allowed_tools: list[str] | None = None,
+    disallowed_tools: list[str] | None = None,
 ) -> RuntimeBundle:
-    """Build the shared runtime for an OpenHarness session."""
+    """Build the shared runtime for an OpenHarness session.
+
+    ``allowed_tools`` / ``disallowed_tools`` partition the tool registry the
+    same way an ``AgentDefinition`` does (allowlist with ``["*"]``/None = all,
+    then denylist). Subprocess teammates pass their definition's toolset here so
+    a spawned sub-agent only sees the tools it is allowed to use.
+    """
     settings_overrides: dict[str, Any] = {
         "model": model,
         "max_turns": max_turns,
@@ -254,6 +262,11 @@ async def build_runtime(
         if plugin.enabled and plugin.tools:
             for tool in plugin.tools:
                 tool_registry.register(tool)
+    # Restrict to the spawned sub-agent's partitioned toolset (if any). Applied
+    # after plugin/MCP tools register so MCP tool names (mcp__<server>__<tool>)
+    # are present to match against an allowlist.
+    if allowed_tools is not None or disallowed_tools is not None:
+        tool_registry.apply_tool_filter(allowed_tools, disallowed_tools)
     provider = detect_provider(settings)
     bridge_manager = get_bridge_manager()
     app_state = AppStateStore(

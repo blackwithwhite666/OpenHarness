@@ -75,6 +75,12 @@ class AgentTool(BaseTool):
             command=arguments.command,
             system_prompt=agent_def.system_prompt if agent_def else None,
             permissions=agent_def.permissions if agent_def else [],
+            # Forward the definition's tool partition so the spawned sub-agent
+            # only sees its allowed toolset (e.g. deep-research's Serper-MCP +
+            # fetch + bash + agent set). Without this the worker would inherit
+            # the full default tool registry.
+            allowed_tools=agent_def.tools if agent_def else None,
+            disallowed_tools=agent_def.disallowed_tools if agent_def else None,
             task_type=arguments.mode,
         )
 

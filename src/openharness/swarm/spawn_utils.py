@@ -103,6 +103,8 @@ def build_inherited_cli_flags(
     settings_path: str | None = None,
     teammate_mode: str | None = None,
     plugin_dirs: list[str] | None = None,
+    allowed_tools: list[str] | None = None,
+    disallowed_tools: list[str] | None = None,
     extra_flags: list[str] | None = None,
 ) -> list[str]:
     """Build CLI flags to propagate from the current session to spawned teammates.
@@ -131,6 +133,11 @@ def build_inherited_cli_flags(
         plugin_dirs: List of plugin directory paths.  Each is forwarded as a
             separate ``--plugin-dir <path>`` flag so inline plugins are
             visible inside teammate processes.
+        allowed_tools: Tool allowlist from the spawning agent definition.
+            ``None`` or ``["*"]`` (all tools) emits no flag; otherwise each name
+            is forwarded as a separate ``--allowed-tools <name>`` flag so the
+            worker restricts its tool registry to the definition's toolset.
+        disallowed_tools: Tool denylist, forwarded as ``--disallowed-tools``.
         extra_flags: Additional pre-built flag strings to append verbatim.
             Callers are responsible for quoting any values in these strings.
 
@@ -175,6 +182,17 @@ def build_inherited_cli_flags(
     # not re-detect the mode independently and possibly choose a different one.
     if teammate_mode:
         flags.extend(["--teammate-mode", shlex.quote(teammate_mode)])
+
+    # --- Tool partition propagation ---------------------------------------
+    # The agent definition's tools / disallowed_tools restrict which tools the
+    # spawned sub-agent may see. Without forwarding these, the worker would get
+    # the full default tool registry (the partition would be silently dropped).
+    # ``["*"]`` (or None) means "all tools" → emit no allowlist flag.
+    if allowed_tools is not None and allowed_tools != ["*"]:
+        for tool_name in allowed_tools:
+            flags.extend(["--allowed-tools", shlex.quote(tool_name)])
+    for tool_name in disallowed_tools or []:
+        flags.extend(["--disallowed-tools", shlex.quote(tool_name)])
 
     if extra_flags:
         flags.extend(extra_flags)

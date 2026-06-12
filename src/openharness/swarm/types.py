@@ -294,6 +294,16 @@ class TeammateSpawnConfig:
     permissions: list[str] = field(default_factory=list)
     """Tool permissions to grant this teammate."""
 
+    allowed_tools: list[str] | None = None
+    """Tool allowlist from the agent definition (None / ``["*"]`` = all tools).
+
+    Forwarded to the worker as ``--allowed-tools`` so the spawned sub-agent only
+    sees its partitioned toolset (e.g. the deep-research Serper-MCP + fetch set).
+    """
+
+    disallowed_tools: list[str] | None = None
+    """Tool denylist from the agent definition. Forwarded as ``--disallowed-tools``."""
+
     plan_mode_required: bool = False
     """Whether this teammate must enter plan mode before implementing."""
 

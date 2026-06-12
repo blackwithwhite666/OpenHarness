@@ -97,12 +97,19 @@ async def run_task_worker(
     api_format: str | None = None,
     api_client: SupportsStreamingMessages | None = None,
     permission_mode: str | None = None,
+    allowed_tools: list[str] | None = None,
+    disallowed_tools: list[str] | None = None,
 ) -> None:
     """Run a stdin-driven headless worker for background agent tasks.
 
     This mode exists for subprocess teammates and other task-manager managed
     agent processes. It intentionally avoids the React TUI / Ink path so it
     can run without a controlling TTY.
+
+    ``allowed_tools`` / ``disallowed_tools`` carry the spawning sub-agent
+    definition's partitioned toolset so the worker only exposes the tools the
+    definition declares (e.g. the deep-research agent's Serper-MCP + fetch +
+    bash + agent set).
     """
 
     async def _noop_permission(_tool_name: str, _reason: str) -> bool:
@@ -144,6 +151,8 @@ async def run_task_worker(
         ask_user_prompt=_noop_ask,
         enforce_max_turns=max_turns is not None,
         permission_mode=permission_mode,
+        allowed_tools=allowed_tools,
+        disallowed_tools=disallowed_tools,
     )
     await start_runtime(bundle)
     try:
