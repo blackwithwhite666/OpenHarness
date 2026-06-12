@@ -571,6 +571,12 @@ def main(argv: Sequence[str] | None = None) -> int:  # pragma: no cover - CLI
         help="Where to make per-task dirs (default: a temp dir).",
     )
     parser.add_argument("--timeout-s", type=float, default=DEFAULT_TIMEOUT_S)
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Run only the first N manifest tasks (smoke/debug; default: all).",
+    )
     args = parser.parse_args(argv)
 
     from tests.eval.gaia.loader import download_gaia_snapshot  # noqa: PLC0415
@@ -592,6 +598,8 @@ def main(argv: Sequence[str] | None = None) -> int:  # pragma: no cover - CLI
         work_root=work_root,
         manifest_dir=manifest_dir,
     )
+    if args.limit is not None:
+        tasks = tasks[: args.limit]
     if not tasks:
         print(
             f"No runnable tasks for split={args.split}: the manifest still has "
