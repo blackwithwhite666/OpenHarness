@@ -412,3 +412,37 @@ async def test_spawn_agent_kills_worker_on_timeout(monkeypatch):
             task, "gpt-5.5", subagent_type="deep-research", timeout_s=0.05
         )
     assert stopped == ["t-leak"]  # the leaked worker was killed
+
+
+@pytest.mark.asyncio
+async def test_wait_terminal_kills_on_low_memory(monkeypatch):
+    # Free memory below the floor -> InfraFailure immediately (host protection),
+    # before the (large) timeout would fire. A ballooning worker must not OOM the box.
+    monkeypatch.setattr(run_subset, "_free_mem_mb", lambda: 100.0)
+
+    class _Rec:
+        status = "running"
+
+    class _Mgr:
+        def get_task(self, tid):
+            return _Rec()
+
+    with pytest.raises(InfraFailure) as exc:
+        await run_subset._wait_terminal(_Mgr(), "t1", timeout_s=999, min_free_mem_mb=800)
+    assert "free memory" in str(exc.value).lower()
+
+
+@pytest.mark.asyncio
+async def test_wait_terminal_no_mem_guard_when_unavailable(monkeypatch):
+    # _free_mem_mb -> None (non-Linux / CI): the guard is a no-op; a terminal task
+    # still returns normally.
+    monkeypatch.setattr(run_subset, "_free_mem_mb", lambda: None)
+
+    class _Rec:
+        status = "completed"
+
+    class _Mgr:
+        def get_task(self, tid):
+            return _Rec()
+
+    assert await run_subset._wait_terminal(_Mgr(), "t1", timeout_s=5) == "completed"

@@ -276,6 +276,11 @@ class TeammateSpawnConfig:
     model: str | None = None
     """Model override for this teammate."""
 
+    max_turns: int | None = None
+    """Hard ceiling on agent turns, forwarded to the worker as ``--max-turns``.
+    Bounds a worker's context growth (and thus its memory footprint) so one runaway
+    task cannot OOM the host. ``None`` = no cap (inherit default behaviour)."""
+
     command: str | None = None
     """Optional explicit command override for subprocess-backed teammates."""
 

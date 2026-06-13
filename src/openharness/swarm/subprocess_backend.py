@@ -52,6 +52,13 @@ class SubprocessBackend:
         """
         agent_id = f"{config.name}@{config.team}"
 
+        # A turn cap bounds the worker's context growth (and memory) so one runaway
+        # task cannot OOM the host — forwarded verbatim as ``--max-turns N``.
+        extra_flags = (
+            ["--max-turns", str(int(config.max_turns))]
+            if config.max_turns is not None
+            else None
+        )
         flags = build_inherited_cli_flags(
             model=config.model,
             system_prompt=config.system_prompt,
@@ -59,6 +66,7 @@ class SubprocessBackend:
             plan_mode_required=config.plan_mode_required,
             allowed_tools=config.allowed_tools,
             disallowed_tools=config.disallowed_tools,
+            extra_flags=extra_flags,
         )
         # Only inject the inherited teammate env vars when we are also
         # building the command ourselves. If the caller supplied a custom

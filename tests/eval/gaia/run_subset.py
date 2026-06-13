@@ -51,6 +51,10 @@ DEFAULT_MODEL = "gpt-5.5"
 
 # How long to wait for one spawned agent before tagging an infra failure.
 DEFAULT_TIMEOUT_S = 600.0
+# Hard ceiling on agent turns per run (forwarded as --max-turns). The prompt asks
+# for <=12; this enforced backstop stops 96-turn runaways whose huge context would
+# OOM a small host. Pairs with the in-loop free-memory guard in _wait_terminal.
+DEFAULT_MAX_TURNS = 16
 # read_task_output tail cap — large so long transcripts aren't truncated before
 # extract_answer runs (the manager default is 12000).
 _READ_MAX_BYTES = 2_000_000
@@ -313,17 +317,44 @@ def build_prompt(task: TaskRun) -> str:
 # --------------------------------------------------------------------------- #
 # Spawn boundary (REAL — the SAME subprocess boundary the main agent uses)
 # --------------------------------------------------------------------------- #
+# A single deep-research worker can balloon its context (millions of tokens of
+# message history + tool outputs, or one huge web_fetch download) to multiple GB.
+# On a small host (e.g. 8 GB) that OOM-thrashes the box until sshd starves. The
+# runner self-protects: if free memory drops below this floor mid-task, the worker
+# is killed (-> InfraFailure -> the task is tagged infra and the sweep continues),
+# instead of letting one task take down the whole host.
+_MIN_FREE_MEM_MB = 800.0
+
+
+def _free_mem_mb() -> float | None:
+    """Return MemAvailable in MB (Linux ``/proc/meminfo``), or ``None`` elsewhere.
+
+    Returns ``None`` on non-Linux (e.g. the macOS dev box / CI) so the memory
+    guard is a no-op there — the offline tests never trip it.
+    """
+    try:
+        with open("/proc/meminfo", encoding="ascii") as fh:
+            for line in fh:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) / 1024.0
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
 async def _wait_terminal(
     manager: Any,
     task_id: str,
     *,
     timeout_s: float,
     poll_interval_s: float = 0.5,
+    min_free_mem_mb: float | None = _MIN_FREE_MEM_MB,
 ) -> str:
     """Poll ``manager.get_task(task_id).status`` until terminal, return status.
 
     Terminal statuses are ``completed | failed | killed`` (manager.py). Raises
-    :class:`InfraFailure` on timeout.
+    :class:`InfraFailure` on timeout OR when free memory drops below
+    ``min_free_mem_mb`` (host-protection — a ballooning worker would OOM the box).
     """
     deadline = time.monotonic() + timeout_s
     terminal = {"completed", "failed", "killed"}
@@ -332,6 +363,13 @@ async def _wait_terminal(
         status = getattr(record, "status", None) if record is not None else None
         if status in terminal:
             return status
+        if min_free_mem_mb is not None:
+            free = _free_mem_mb()
+            if free is not None and free < min_free_mem_mb:
+                raise InfraFailure(
+                    f"agent task {task_id} killed: host free memory {free:.0f}MB "
+                    f"< {min_free_mem_mb:.0f}MB floor (ballooning worker)"
+                )
         if time.monotonic() >= deadline:
             raise InfraFailure(
                 f"agent task {task_id} did not finish within {timeout_s}s"
@@ -345,6 +383,7 @@ async def _spawn_agent(
     *,
     subagent_type: str,
     timeout_s: float = DEFAULT_TIMEOUT_S,
+    max_turns: int | None = DEFAULT_MAX_TURNS,
 ) -> str:
     """Run one agent on (prompt, cwd) -> transcript string.
 
@@ -373,6 +412,9 @@ async def _spawn_agent(
         cwd=str(task.cwd),
         parent_session_id="gaia-eval",
         model=model,  # PINNED — never "inherit" / None (ADR §7).
+        # Hard turn ceiling -> bounds context growth/memory so one runaway task
+        # can't OOM the host (the prompt asks for <=12; this is the backstop).
+        max_turns=max_turns,
         system_prompt=agent_def.system_prompt if agent_def else None,
         permissions=agent_def.permissions if agent_def else [],
         # Forward the def's tool partition (deep-research: Serper-MCP + fetch +
@@ -501,6 +543,7 @@ async def run_subset(
     strict: bool = True,
     prev_sha: str | None = None,
     timeout_s: float = DEFAULT_TIMEOUT_S,
+    max_turns: int | None = DEFAULT_MAX_TURNS,
 ) -> Path:
     """K=3 orchestration: spawn -> score -> JSONL + REPORT.
 
@@ -517,7 +560,11 @@ async def run_subset(
 
         async def spawn_fn(task: TaskRun, model: str) -> str:  # noqa: F811
             return await _spawn_agent(
-                task, model, subagent_type=subagent_type, timeout_s=timeout_s
+                task,
+                model,
+                subagent_type=subagent_type,
+                timeout_s=timeout_s,
+                max_turns=max_turns,
             )
 
     results_dir = Path(results_dir)
@@ -621,6 +668,12 @@ def main(argv: Sequence[str] | None = None) -> int:  # pragma: no cover - CLI
     )
     parser.add_argument("--timeout-s", type=float, default=DEFAULT_TIMEOUT_S)
     parser.add_argument(
+        "--max-turns",
+        type=int,
+        default=DEFAULT_MAX_TURNS,
+        help="Hard per-run agent turn ceiling (bounds memory; 0 = no cap).",
+    )
+    parser.add_argument(
         "--limit",
         type=int,
         default=None,
@@ -671,6 +724,7 @@ def main(argv: Sequence[str] | None = None) -> int:  # pragma: no cover - CLI
             subagent_type=args.agent,
             prev_sha=args.prev_sha,
             timeout_s=args.timeout_s,
+            max_turns=(args.max_turns if args.max_turns and args.max_turns > 0 else None),
         )
     )
     print(f"wrote {report}")
