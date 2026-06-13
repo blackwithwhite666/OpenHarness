@@ -4,9 +4,35 @@ from ohmo.gateway.runtime import (
     _CHANNEL_THINKING_PHRASES_EN,
     _format_channel_progress,
     _format_tool_args_block,
+    _format_tool_done,
+    _format_tool_result_block,
     _pretty_tool_name,
 )
 from openharness.channels.impl.telegram import _markdown_to_telegram_html
+
+
+def test_format_tool_result_block_truncates_like_params():
+    assert _format_tool_result_block("") == ""
+    assert _format_tool_result_block("  ") == ""
+    assert _format_tool_result_block("ok") == "```\nok\n```"
+    long = "x" * 700
+    block = _format_tool_result_block(long)
+    assert block.endswith("\n…\n```")
+    assert "x" * 600 in block and "x" * 601 not in block  # clipped at 600
+
+
+def test_format_tool_done_success_and_error():
+    ok = _format_tool_done("bash", "hello\nworld", is_error=False)
+    assert ok.startswith("Bash ✅")
+    assert "```\nhello\nworld\n```" in ok
+
+    bad = _format_tool_done("mcp__worfalomey__get_time", "boom", is_error=True)
+    assert bad.startswith("Get time ❌")
+    assert "boom" in bad
+
+
+def test_format_tool_done_no_output_is_just_name_and_mark():
+    assert _format_tool_done("bash", "", is_error=False) == "Bash ✅"
 
 
 def test_pretty_tool_name_strips_mcp_prefix_and_humanizes():

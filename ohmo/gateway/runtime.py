@@ -609,10 +609,11 @@ class OhmoSessionRuntimePool:
             return
         if isinstance(event, ToolExecutionCompleted):
             logger.info(
-                "ohmo runtime tool complete session_key=%s session_id=%s tool=%s",
+                "ohmo runtime tool complete session_key=%s session_id=%s tool=%s is_error=%s",
                 session_key,
                 bundle.session_id,
                 event.tool_name,
+                event.is_error,
             )
             if event.tool_name == "todo_write":
                 # Render the updated per-session list as a compact checklist
@@ -630,6 +631,24 @@ class OhmoSessionRuntimePool:
                             "_session_key": session_key,
                         },
                     )
+                return
+            # Edit the in-flight progress message to show the OUTCOME: ✅/❌ plus a
+            # truncated output — the completion-side mirror of the params hint.
+            yield GatewayStreamUpdate(
+                kind="tool_hint",
+                text=_format_channel_progress(
+                    channel=message.channel,
+                    kind="tool_hint",
+                    text=_format_tool_done(event.tool_name, event.output, event.is_error),
+                    session_key=session_key,
+                    content=content,
+                ),
+                metadata={
+                    "_progress": True,
+                    "_tool_hint": True,
+                    "_session_key": session_key,
+                },
+            )
             return
         if isinstance(event, ErrorEvent):
             logger.error(
@@ -969,6 +988,29 @@ def _format_tool_args_block(tool_input: dict[str, object]) -> str:
     if len(pretty) > 1200:
         pretty = pretty[:1200] + "\n…"
     return f"```json\n{pretty}\n```"
+
+
+def _format_tool_result_block(output: str) -> str:
+    """Render a tool's output as a truncated fenced block — the completion-side
+    mirror of ``_format_tool_args_block`` (params). Empty string for no output."""
+    body = (output or "").strip()
+    if not body:
+        return ""
+    if len(body) > 600:
+        body = body[:600] + "\n…"
+    return f"```\n{body}\n```"
+
+
+def _format_tool_done(tool_name: str, output: str, is_error: bool) -> str:
+    """A tool-completion hint: the pretty name + ✅/❌ + a truncated output block.
+    Used to EDIT the in-flight progress message once a tool returns, so the user
+    sees the OUTCOME (success + a clipped result), not just the call + params."""
+    mark = "❌" if is_error else "✅"
+    hint = f"{_pretty_tool_name(tool_name)} {mark}"
+    block = _format_tool_result_block(output)
+    if block:
+        hint = f"{hint}\n{block}"
+    return hint
 
 
 def _format_channel_progress(
