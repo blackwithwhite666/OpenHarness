@@ -86,12 +86,12 @@ def test_build_inherited_cli_flags_forwards_system_prompt_as_append():
 
 def test_build_inherited_cli_flags_forwards_allowed_tools():
     flags = build_inherited_cli_flags(
-        allowed_tools=["mcp__google_search__search", "web_fetch", "bash"],
+        allowed_tools=["mcp__google_search__google_search", "web_fetch", "bash"],
     )
     # One --allowed-tools flag per tool name, values shell-quoted.
     assert flags.count("--allowed-tools") == 3
     joined = " ".join(flags)
-    assert "mcp__google_search__search" in joined
+    assert "mcp__google_search__google_search" in joined
     assert "web_fetch" in joined
     assert "bash" in joined
 

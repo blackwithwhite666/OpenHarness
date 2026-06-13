@@ -72,24 +72,24 @@ def test_allowlist_then_denylist_compose():
         "read_file",
         "web_fetch",
         "bash",
-        "mcp__google_search__search",
+        "mcp__google_search__google_search",
         "agent",
         "file_write",
         "file_edit",
         "notebook_edit",
     )
     reg.apply_tool_filter(
-        ["read_file", "web_fetch", "bash", "mcp__google_search__search"],
+        ["read_file", "web_fetch", "bash", "mcp__google_search__google_search"],
         ["agent", "exit_plan_mode", "file_edit", "file_write", "notebook_edit"],
     )
-    assert _names(reg) == {"read_file", "web_fetch", "bash", "mcp__google_search__search"}
+    assert _names(reg) == {"read_file", "web_fetch", "bash", "mcp__google_search__google_search"}
 
 
 def test_mcp_tool_name_survives_allowlist():
-    # The Serper MCP tool name (mcp__google_search__search) must match exactly.
-    reg = _registry("mcp__google_search__search", "web_fetch", "mcp__other__thing")
-    reg.apply_tool_filter(["mcp__google_search__search", "web_fetch"], None)
-    assert _names(reg) == {"mcp__google_search__search", "web_fetch"}
+    # The Serper MCP tool name (mcp__google_search__google_search) must match exactly.
+    reg = _registry("mcp__google_search__google_search", "web_fetch", "mcp__other__thing")
+    reg.apply_tool_filter(["mcp__google_search__google_search", "web_fetch"], None)
+    assert _names(reg) == {"mcp__google_search__google_search", "web_fetch"}
 
 
 def test_deep_research_def_toolset_round_trips_through_filter():

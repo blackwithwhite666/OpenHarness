@@ -58,7 +58,7 @@ def test_deep_research_toolset_partition():
     assert agent.tools is not None
     tools = set(agent.tools)
     # Serper search MCP (mcp__<server>__<tool> for the google_search server).
-    assert "mcp__google_search__search" in tools
+    assert "mcp__google_search__google_search" in tools
     # Breadth/triage fetch + bash (drives `browser-cli md` for depth).
     assert "web_fetch" in tools
     assert "bash" in tools
@@ -81,7 +81,7 @@ def test_deep_research_prompt_has_loop_and_final_answer():
     prompt = agent.system_prompt or ""
     # The parallel-ReAct loop + the <final_answer> sentinel (ADR §2f).
     assert "<final_answer>" in prompt
-    assert "mcp__google_search__search" in prompt
+    assert "mcp__google_search__google_search" in prompt
     assert "browser-cli md" in prompt
     assert "research-verification" in prompt
     assert "cwd" in prompt  # attachment contract
@@ -111,7 +111,7 @@ def test_research_verification_is_read_fetch_only():
     agent = get_agent_definition("research-verification")
     # Allowed: read + fetch + bash + search. No write / spawn.
     assert agent.tools is not None
-    assert set(agent.tools) == {"read_file", "web_fetch", "bash", "mcp__google_search__search"}
+    assert set(agent.tools) == {"read_file", "web_fetch", "bash", "mcp__google_search__google_search"}
     # Denylist blocks mutation + recursive agent spawning + plan exit.
     assert agent.disallowed_tools is not None
     deny = set(agent.disallowed_tools)
@@ -192,7 +192,7 @@ def test_deep_research_noverify_drops_agent_tool():
     tools = set(agent.tools or [])
     assert "agent" not in tools  # the whole point — no verifier spawn
     # The rest of the research loop is intact.
-    for kept in ("mcp__google_search__search", "web_fetch", "bash", "todo_write", "read_file"):
+    for kept in ("mcp__google_search__google_search", "web_fetch", "bash", "todo_write", "read_file"):
         assert kept in tools
 
 
@@ -204,7 +204,7 @@ def test_deep_research_noverify_prompt_has_no_verify_step():
     assert "VERIFY / CITE" not in noverify
     # But it is still the deep-research loop with the sentinel + parallel search.
     assert "<final_answer>" in noverify
-    assert "mcp__google_search__search" in noverify
+    assert "mcp__google_search__google_search" in noverify
     assert "ANSWER." in noverify
 
 
@@ -213,6 +213,43 @@ def test_deep_research_keeps_its_verify_step_unchanged():
     verifying = get_agent_definition("deep-research").system_prompt or ""
     assert "VERIFY / CITE" in verifying
     assert "research-verification" in verifying
+
+
+# ---------------------------------------------------------------------------
+# M1-regression fixes (ADR §5 iteration 1): correct tool name, hard budget,
+# browser demoted to last-resort, terse exact-match answer format.
+# ---------------------------------------------------------------------------
+
+
+def test_deep_research_prompt_has_budget_and_terse_format():
+    prompt = get_agent_definition("deep-research").system_prompt or ""
+    # #1 correct Serper tool name + web_search fallback documented.
+    assert "mcp__google_search__google_search" in prompt
+    assert "web_search" in prompt
+    # #2 hard budget on turns/waves/fetches so runs stop instead of timing out.
+    assert "HARD BUDGET" in prompt
+    assert "12 assistant turns" in prompt
+    assert "2 search waves" in prompt
+    # #3 browser demoted to a last resort (default is web_fetch).
+    assert "LAST-RESORT" in prompt
+    # #6 terse, exact answer; banned qualifier words listed.
+    assert "MINIMAL exact value" in prompt
+    assert "number of" in prompt
+
+
+def test_deep_research_tools_include_web_search_fallback():
+    for name in ("deep-research", "deep-research-noverify"):
+        tools = set(get_agent_definition(name).tools or [])
+        assert "web_search" in tools
+        assert "mcp__google_search__google_search" in tools
+
+
+def test_deep_research_noverify_inherits_budget_and_terse_format():
+    # The fixes live in the shared base prompt -> the noverify arm gets them too.
+    noverify = get_agent_definition("deep-research-noverify").system_prompt or ""
+    assert "HARD BUDGET" in noverify
+    assert "MINIMAL exact value" in noverify
+    assert "LAST-RESORT" in noverify
 
 
 # ---------------------------------------------------------------------------
@@ -235,7 +272,7 @@ def test_deep_research_skill_body_documents_loop_and_tools():
     skills = {s.name: s for s in get_bundled_skills()}
     body = skills["deep-research"].content
     # Loop + the real tool names + the <final_answer> sentinel.
-    assert "mcp__google_search__search" in body
+    assert "mcp__google_search__google_search" in body
     assert "browser-cli md" in body
     assert "web_fetch" in body
     assert "<final_answer>" in body

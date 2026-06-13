@@ -37,7 +37,7 @@ codebase exploration (use `Explore`).
 
 ## Tools
 
-- **Search:** `mcp__google_search__search` — real Google via the Serper MCP
+- **Search:** `mcp__google_search__google_search` — real Google via the Serper MCP
   server (named `google_search`). This is the primary search backend, not the
   built-in DuckDuckGo `web_search`.
 - **Fetch (breadth/triage):** `web_fetch` — cheap httpx HTML->text. Run many in
@@ -58,7 +58,7 @@ codebase exploration (use `Explore`).
    cwd FIRST (`ls -la`); read any attached files before searching and state the
    explicit path(s). Decompose into 3-6 focused sub-queries.
 2. **Parallel retrieve.** In ONE turn, emit N parallel
-   `mcp__google_search__search` calls (one per sub-query). The host runs the
+   `mcp__google_search__google_search` calls (one per sub-query). The host runs the
    tool calls in a turn concurrently — do not search one-at-a-time. Dedupe the
    returned URLs.
 3. **Parallel fetch.** Breadth: in ONE turn, emit parallel `web_fetch` calls on
