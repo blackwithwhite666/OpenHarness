@@ -387,7 +387,19 @@ async def _spawn_agent(
         raise InfraFailure(result.error or f"spawn failed for {subagent_type}")
 
     manager = get_task_manager()
-    await _wait_terminal(manager, result.task_id, timeout_s=timeout_s)
+    try:
+        await _wait_terminal(manager, result.task_id, timeout_s=timeout_s)
+    except InfraFailure:
+        # A timed-out deep-research worker holds a very large context (hundreds of
+        # KB-MB of session) and keeps running its model/fetch loop. If we just
+        # raise and move on, those workers LEAK and pile up across a 90-run sweep
+        # until they saturate the host (sshd starves; the box becomes unreachable).
+        # Kill the worker before propagating so each timeout frees its resources.
+        try:
+            await manager.stop_task(result.task_id)
+        except Exception:
+            pass
+        raise
     return manager.read_task_output(result.task_id, max_bytes=_READ_MAX_BYTES)
 
 

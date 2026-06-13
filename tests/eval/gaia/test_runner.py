@@ -364,3 +364,51 @@ async def test_run_subset_records_tokens_from_usage_marker(tmp_path):
     ]
     assert row["score"] == 1.0   # marker stripped -> answer still extracted
     assert row["tokens"] == 1500  # input+output summed and recorded
+
+
+@pytest.mark.asyncio
+async def test_spawn_agent_kills_worker_on_timeout(monkeypatch):
+    # A timed-out worker must be killed (manager.stop_task) before InfraFailure
+    # propagates — otherwise heavy deep-research workers leak and saturate the host.
+    stopped: list[str] = []
+
+    class _Rec:
+        status = "running"  # never terminal -> _wait_terminal times out
+
+    class _Mgr:
+        def get_task(self, tid):
+            return _Rec()
+
+        async def stop_task(self, tid):
+            stopped.append(tid)
+
+        def read_task_output(self, tid, max_bytes=0):
+            return ""
+
+    class _Res:
+        success = True
+        task_id = "t-leak"
+        error = None
+
+    class _Exec:
+        async def spawn(self, config):
+            return _Res()
+
+    class _Reg:
+        def get_executor(self, name):
+            return _Exec()
+
+    monkeypatch.setattr("openharness.tasks.get_task_manager", lambda: _Mgr())
+    monkeypatch.setattr("openharness.swarm.registry.get_backend_registry", lambda: _Reg())
+    monkeypatch.setattr(
+        "openharness.coordinator.agent_definitions.get_agent_definition", lambda name: None
+    )
+
+    task = run_subset.TaskRun(
+        task_id="x", question="q", ground_truth="a", level=1, cwd="/tmp"
+    )
+    with pytest.raises(InfraFailure):
+        await run_subset._spawn_agent(
+            task, "gpt-5.5", subagent_type="deep-research", timeout_s=0.05
+        )
+    assert stopped == ["t-leak"]  # the leaked worker was killed
