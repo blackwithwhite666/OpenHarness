@@ -123,3 +123,35 @@ async def test_web_search_tool_rejects_non_public_search_backends(tmp_path):
 
     assert result.is_error is True
     assert "non-public" in result.output
+
+
+@pytest.mark.asyncio
+async def test_get_capped_truncates_large_body():
+    # An unbounded download would buffer the whole body into RAM (OOM on small
+    # hosts). _get_capped must stop after max_bytes, yet still expose .text/.content.
+    from openharness.utils.network_guard import _get_capped
+
+    async def _chunks():
+        for _ in range(100):  # 100 x 64KB = 6.4MB delivered in chunks (like a socket)
+            yield b"x" * 64_000
+
+    transport = httpx.MockTransport(lambda req: httpx.Response(200, content=_chunks()))
+    async with httpx.AsyncClient(transport=transport) as client:
+        resp = await _get_capped(client, "http://example.com/big", None, None, 1_000_000)
+    assert len(resp.content) == 1_000_000  # capped at max_bytes, not the full 6.4MB
+    assert resp.text  # .text works after the manual _content materialisation
+
+
+@pytest.mark.asyncio
+async def test_get_capped_redirect_body_not_read():
+    # A redirect must be returned WITHOUT reading the body so the caller can follow
+    # the Location header (the body of a 3xx is useless and may be large).
+    from openharness.utils.network_guard import _get_capped
+
+    transport = httpx.MockTransport(
+        lambda req: httpx.Response(302, headers={"location": "http://example.com/next"})
+    )
+    async with httpx.AsyncClient(transport=transport) as client:
+        resp = await _get_capped(client, "http://example.com/r", None, None, 1000)
+    assert resp.has_redirect_location
+    assert resp.headers["location"] == "http://example.com/next"

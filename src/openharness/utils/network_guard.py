@@ -50,6 +50,37 @@ async def ensure_public_http_url(url: str) -> None:
         raise NetworkGuardError(f"target resolves to non-public address(es): {rendered}")
 
 
+async def _get_capped(
+    client: httpx.AsyncClient,
+    url: str,
+    params: dict[str, str] | None,
+    headers: dict[str, str] | None,
+    max_bytes: int,
+) -> httpx.Response:
+    """GET ``url`` but stop reading the body after ``max_bytes`` decoded bytes.
+
+    ``client.get`` buffers the ENTIRE response body into RAM before any caller can
+    truncate it, so a single fetch of a large resource (a big PDF / dataset / page)
+    spikes the process to GBs and OOMs a small host. Streaming + an early break
+    bounds the peak. The body is materialised into ``response._content`` exactly the
+    way ``httpx.Response.read`` does, so ``.text`` / ``.json`` work downstream.
+    """
+    request = client.build_request("GET", url, params=params, headers=headers)
+    response = await client.send(request, stream=True)
+    try:
+        if response.has_redirect_location:
+            return response  # redirect: don't read the body, the loop follows it
+        buffer = bytearray()
+        async for chunk in response.aiter_bytes():
+            buffer.extend(chunk)
+            if len(buffer) >= max_bytes:
+                break  # stop pulling from the socket — real httpx reads in chunks
+        response._content = bytes(buffer[:max_bytes])  # precise cap on stored body
+        return response
+    finally:
+        await response.aclose()
+
+
 async def fetch_public_http_response(
     url: str,
     *,
@@ -57,8 +88,14 @@ async def fetch_public_http_response(
     params: dict[str, str] | None = None,
     timeout: float = 15.0,
     max_redirects: int = 5,
+    max_bytes: int | None = None,
 ) -> httpx.Response:
-    """Fetch one HTTP resource while validating every redirect hop."""
+    """Fetch one HTTP resource while validating every redirect hop.
+
+    When ``max_bytes`` is set, the body is streamed and capped at that many bytes
+    (host-OOM protection — see :func:`_get_capped`); when ``None`` the full body is
+    buffered (legacy behaviour).
+    """
     current_url = url
     current_params = params
 
@@ -69,11 +106,16 @@ async def fetch_public_http_response(
     ) as client:
         for redirect_count in range(max_redirects + 1):
             await ensure_public_http_url(current_url)
-            response = await client.get(
-                current_url,
-                params=current_params,
-                headers=headers,
-            )
+            if max_bytes is None:
+                response = await client.get(
+                    current_url,
+                    params=current_params,
+                    headers=headers,
+                )
+            else:
+                response = await _get_capped(
+                    client, current_url, current_params, headers, max_bytes
+                )
             if not response.has_redirect_location:
                 return response
 

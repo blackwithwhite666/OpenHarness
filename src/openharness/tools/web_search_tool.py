@@ -48,6 +48,7 @@ class WebSearchTool(BaseTool):
                 params={"q": arguments.query},
                 headers={"User-Agent": "OpenHarness/0.1"},
                 timeout=20.0,
+                max_bytes=8_000_000,
             )
             response.raise_for_status()
         except (httpx.HTTPError, NetworkGuardError) as exc:

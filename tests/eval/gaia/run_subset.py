@@ -52,9 +52,10 @@ DEFAULT_MODEL = "gpt-5.5"
 # How long to wait for one spawned agent before tagging an infra failure.
 DEFAULT_TIMEOUT_S = 600.0
 # Hard ceiling on agent turns per run (forwarded as --max-turns). The prompt asks
-# for <=12; this enforced backstop stops 96-turn runaways whose huge context would
-# OOM a small host. Pairs with the in-loop free-memory guard in _wait_terminal.
-DEFAULT_MAX_TURNS = 16
+# for <=12; this enforced backstop stops 96-turn runaways. With per-fetch download
+# caps (web_fetch/web_search max_bytes) closing the real OOM path, 24 is safe on an
+# 8GB host and gives hard L2/L3 tasks room. Pairs with the _wait_terminal mem guard.
+DEFAULT_MAX_TURNS = 24
 # read_task_output tail cap — large so long transcripts aren't truncated before
 # extract_answer runs (the manager default is 12000).
 _READ_MAX_BYTES = 2_000_000
