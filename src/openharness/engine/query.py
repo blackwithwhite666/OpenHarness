@@ -819,18 +819,19 @@ async def run_query(
         if len(tool_calls) == 1:
             # Single tool: sequential (stream events immediately)
             tc = tool_calls[0]
-            yield ToolExecutionStarted(tool_name=tc.name, tool_input=tc.input), None
+            yield ToolExecutionStarted(tool_name=tc.name, tool_input=tc.input, tool_call_id=tc.id), None
             result = await _execute_tool_call(context, tc.name, tc.id, tc.input)
             yield ToolExecutionCompleted(
                 tool_name=tc.name,
                 output=result.content,
                 is_error=result.is_error,
+                tool_call_id=tc.id,
             ), None
             tool_results = [result]
         else:
             # Multiple tools: execute concurrently, emit events after
             for tc in tool_calls:
-                yield ToolExecutionStarted(tool_name=tc.name, tool_input=tc.input), None
+                yield ToolExecutionStarted(tool_name=tc.name, tool_input=tc.input, tool_call_id=tc.id), None
 
             async def _run(tc):
                 return await _execute_tool_call(context, tc.name, tc.id, tc.input)
@@ -863,6 +864,7 @@ async def run_query(
                     tool_name=tc.name,
                     output=result.content,
                     is_error=result.is_error,
+                    tool_call_id=tc.id,
                 ), None
 
         messages.append(ConversationMessage(role="user", content=tool_results))

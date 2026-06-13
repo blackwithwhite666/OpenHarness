@@ -30,6 +30,7 @@ class ToolExecutionStarted:
 
     tool_name: str
     tool_input: dict[str, Any]
+    tool_call_id: str = ""  # Anthropic tool_use id — matches the Completed event
 
 
 @dataclass(frozen=True)
@@ -39,6 +40,7 @@ class ToolExecutionCompleted:
     tool_name: str
     output: str
     is_error: bool = False
+    tool_call_id: str = ""  # same id as the matching Started event
 
 
 @dataclass(frozen=True)

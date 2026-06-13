@@ -588,6 +588,9 @@ class OhmoSessionRuntimePool:
                 # rendered (post-write) on completion instead, like a todo panel.
                 return
             hint = _pretty_tool_name(event.tool_name)
+            cid = _short_call_id(event.tool_call_id)
+            if cid:
+                hint = f"{hint} — {cid}"  # short tool_use id to match the result hint
             args_block = _format_tool_args_block(event.tool_input)
             if args_block:
                 hint = f"{hint}\n{args_block}"
@@ -639,7 +642,9 @@ class OhmoSessionRuntimePool:
                 text=_format_channel_progress(
                     channel=message.channel,
                     kind="tool_hint",
-                    text=_format_tool_done(event.tool_name, event.output, event.is_error),
+                    text=_format_tool_done(
+                        event.tool_name, event.output, event.is_error, event.tool_call_id
+                    ),
                     session_key=session_key,
                     content=content,
                 ),
@@ -990,6 +995,18 @@ def _format_tool_args_block(tool_input: dict[str, object]) -> str:
     return f"```json\n{pretty}\n```"
 
 
+def _short_call_id(call_id: str) -> str:
+    """A short, stable tag to pair a tool call's start hint (`🛠️ Bash — a1b2`)
+    with its result hint (`Bash — a1b2 ✅`). Both events carry the same Anthropic
+    tool_use id; we show its tail so the two messages can be matched even when
+    they arrive as separate messages. Empty string for no id."""
+    cid = (call_id or "").strip()
+    if not cid:
+        return ""
+    tail = cid.rsplit("_", 1)[-1]  # drop the 'toolu_' prefix, keep the random part
+    return (tail or cid)[-4:]
+
+
 def _format_tool_result_block(output: str) -> str:
     """Render a tool's output as a truncated fenced block — the completion-side
     mirror of ``_format_tool_args_block`` (params). Empty string for no output."""
@@ -1001,16 +1018,16 @@ def _format_tool_result_block(output: str) -> str:
     return f"```\n{body}\n```"
 
 
-def _format_tool_done(tool_name: str, output: str, is_error: bool) -> str:
-    """A tool-completion hint: the pretty name + ✅/❌ + a truncated output block.
-    Used to EDIT the in-flight progress message once a tool returns, so the user
-    sees the OUTCOME (success + a clipped result), not just the call + params."""
+def _format_tool_done(tool_name: str, output: str, is_error: bool, call_id: str = "") -> str:
+    """A tool-completion hint: the pretty name + a short call-id (to match the
+    start hint) + ✅/❌ + a truncated output block. Used once a tool returns so the
+    user sees the OUTCOME (which call it was + success + a clipped result)."""
     mark = "❌" if is_error else "✅"
-    hint = f"{_pretty_tool_name(tool_name)} {mark}"
+    name = _pretty_tool_name(tool_name)
+    cid = _short_call_id(call_id)
+    head = f"{name} — {cid} {mark}" if cid else f"{name} {mark}"
     block = _format_tool_result_block(output)
-    if block:
-        hint = f"{hint}\n{block}"
-    return hint
+    return f"{head}\n{block}" if block else head
 
 
 def _format_channel_progress(

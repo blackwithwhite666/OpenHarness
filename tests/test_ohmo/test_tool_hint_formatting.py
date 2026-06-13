@@ -7,8 +7,25 @@ from ohmo.gateway.runtime import (
     _format_tool_done,
     _format_tool_result_block,
     _pretty_tool_name,
+    _short_call_id,
 )
 from openharness.channels.impl.telegram import _markdown_to_telegram_html
+
+
+def test_short_call_id_pairs_start_and_result():
+    # Same tool_use id -> same short tag on the start hint and the result hint.
+    cid = _short_call_id("toolu_01AbCdEfGh")
+    assert cid == "EfGh"
+    assert _short_call_id("toolu_01AbCdEfGh") == cid  # stable
+    assert _short_call_id("") == ""
+    assert _short_call_id(None) == ""  # type: ignore[arg-type]
+
+
+def test_format_tool_done_includes_call_id_to_match_start():
+    done = _format_tool_done("bash", "ok", is_error=False, call_id="toolu_zzzzWXYZ")
+    assert done.startswith("Bash — WXYZ ✅")  # name — id mark, matches '🛠️ Bash — WXYZ'
+    no_id = _format_tool_done("bash", "ok", is_error=False)
+    assert no_id.startswith("Bash ✅")  # unchanged when no id
 
 
 def test_format_tool_result_block_truncates_like_params():
