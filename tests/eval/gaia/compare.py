@@ -72,16 +72,26 @@ def compare(baseline_path: Path | str, candidate_path: Path | str) -> dict:
     base = load_scores(baseline_path)
     cand = load_scores(candidate_path)
     common = sorted(set(base) & set(cand))
+    # Everything is computed over the COMMON task set so a partial candidate run
+    # (e.g. a crashed sweep that only wrote 18/30 rows) compares fairly against the
+    # baseline on the SAME tasks — never a 18-row acc vs a 30-row acc (different
+    # denominators silently read as a regression).
+    base_c = {t: base[t] for t in common}
+    cand_c = {t: cand[t] for t in common}
     b = sum(1 for t in common if base[t][0] and not cand[t][0])  # only baseline pass
     c = sum(1 for t in common if not base[t][0] and cand[t][0])  # only candidate pass
     both = sum(1 for t in common if base[t][0] and cand[t][0])
     neither = sum(1 for t in common if not base[t][0] and not cand[t][0])
     p_two, p_one = mcnemar_exact(b, c)
-    l12_base, l12_cand = _l12_passes(base), _l12_passes(cand)
+    l12_base, l12_cand = _l12_passes(base_c), _l12_passes(cand_c)
+    n = max(len(common), 1)
     return {
         "n_common": len(common),
-        "baseline_acc": round(sum(p for p, _ in base.values()) / max(len(base), 1), 3),
-        "candidate_acc": round(sum(p for p, _ in cand.values()) / max(len(cand), 1), 3),
+        "n_baseline_total": len(base),
+        "n_candidate_total": len(cand),
+        "partial": len(cand) < len(base),
+        "baseline_acc": round(sum(p for p, _ in base_c.values()) / n, 3),
+        "candidate_acc": round(sum(p for p, _ in cand_c.values()) / n, 3),
         "only_baseline_pass_b": b,
         "only_candidate_pass_c": c,
         "both_pass": both,

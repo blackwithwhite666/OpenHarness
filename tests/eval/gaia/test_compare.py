@@ -70,3 +70,21 @@ def test_compare_flags_l12_regression(tmp_path):
     assert res["l12_pass_baseline"] == 2
     assert res["l12_pass_candidate"] == 0
     assert res["l12_no_regression"] is False  # gate FAIL on regression
+
+
+def test_compare_partial_candidate_uses_common_tasks(tmp_path):
+    # Baseline = 4 tasks; candidate only completed the first 2 (crashed sweep).
+    # acc/l12 must be over the 2 COMMON tasks, not 2-vs-4 denominators (which would
+    # read a partial run as a regression).
+    base = [_row("t0", 1.0, 1), _row("t1", 0.0, 1), _row("t2", 1.0, 2), _row("t3", 1.0, 2)]
+    cand = [_row("t0", 1.0, 1), _row("t1", 0.0, 1)]
+    _write_jsonl(tmp_path / "m0.jsonl", base)
+    _write_jsonl(tmp_path / "m1.jsonl", cand)
+    res = compare(tmp_path / "m0.jsonl", tmp_path / "m1.jsonl")
+    assert res["n_common"] == 2
+    assert res["partial"] is True
+    # On the 2 common tasks both pass t0 and fail t1 -> identical, no regression.
+    assert res["baseline_acc"] == res["candidate_acc"] == 0.5
+    assert res["l12_pass_baseline"] == res["l12_pass_candidate"] == 1
+    assert res["l12_no_regression"] is True
+    assert res["only_baseline_pass_b"] == res["only_candidate_pass_c"] == 0
