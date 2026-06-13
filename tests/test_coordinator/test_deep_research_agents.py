@@ -163,9 +163,56 @@ def test_both_deep_research_defs_are_builtin():
     names = {a.name for a in get_builtin_agent_definitions()}
     assert "deep-research" in names
     assert "research-verification" in names
+    assert "deep-research-noverify" in names
     # The original built-ins are all still present.
     for original in ("general-purpose", "Explore", "Plan", "worker", "verification"):
         assert original in names
+
+
+# ---------------------------------------------------------------------------
+# deep-research-noverify — research-only ablation arm (no in-loop verifier)
+# ---------------------------------------------------------------------------
+
+
+def test_deep_research_noverify_def_loads_and_model_pinned():
+    agent = get_agent_definition("deep-research-noverify")
+    assert agent is not None
+    assert agent.name == "deep-research-noverify"
+    assert agent.subagent_type == "deep-research-noverify"
+    assert agent.source == "builtin"
+    assert agent.system_prompt
+    assert agent.model == _EXPECTED_MODEL
+    assert agent.model not in _NON_PINNED_MODELS
+    assert agent.required_mcp_servers == ["google_search"]
+
+
+def test_deep_research_noverify_drops_agent_tool():
+    """Same research partition as deep-research MINUS `agent` (cannot spawn the verifier)."""
+    agent = get_agent_definition("deep-research-noverify")
+    tools = set(agent.tools or [])
+    assert "agent" not in tools  # the whole point — no verifier spawn
+    # The rest of the research loop is intact.
+    for kept in ("mcp__google_search__search", "web_fetch", "bash", "todo_write", "read_file"):
+        assert kept in tools
+
+
+def test_deep_research_noverify_prompt_has_no_verify_step():
+    """The verify step (6) is actually gone — guards against a no-op .replace that
+    would silently ship verification in the 'noverify' arm."""
+    noverify = get_agent_definition("deep-research-noverify").system_prompt or ""
+    assert "research-verification" not in noverify
+    assert "VERIFY / CITE" not in noverify
+    # But it is still the deep-research loop with the sentinel + parallel search.
+    assert "<final_answer>" in noverify
+    assert "mcp__google_search__search" in noverify
+    assert "ANSWER." in noverify
+
+
+def test_deep_research_keeps_its_verify_step_unchanged():
+    """Regression guard: deriving noverify via .replace must NOT mutate the original."""
+    verifying = get_agent_definition("deep-research").system_prompt or ""
+    assert "VERIFY / CITE" in verifying
+    assert "research-verification" in verifying
 
 
 # ---------------------------------------------------------------------------

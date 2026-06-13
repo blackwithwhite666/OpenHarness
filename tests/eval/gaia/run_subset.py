@@ -508,15 +508,25 @@ async def run_subset(
                 task, model, subagent_type=subagent_type, timeout_s=timeout_s
             )
 
+    results_dir = Path(results_dir)
+    jsonl_path = results_dir / f"{git_sha}.jsonl"
+    total = len(tasks)
     rows: list[dict[str, Any]] = []
-    for task in tasks:
+    for i, task in enumerate(tasks, 1):
         row = await _run_one_task(
             task, spawn_fn=spawn_fn, model=model, k=k, strict=strict
         )
         rows.append(row)
+        # Persist after EVERY task (not just at the end): a crash mid-run keeps the
+        # prior results, and progress is observable live (a 90-run deep-research
+        # sweep is long — `wc -l <sha>.jsonl` should track it, not sit empty).
+        write_jsonl(jsonl_path, rows)
+        print(
+            f"[{i}/{total}] {task.task_id} L{task.level} score={row['score']:.2f} "
+            f"infra={row['infra_failure']} extract={row['extraction_failure']}",
+            flush=True,
+        )
 
-    results_dir = Path(results_dir)
-    write_jsonl(results_dir / f"{git_sha}.jsonl", rows)
     return write_report(
         results_dir / "REPORT.md", rows, git_sha=git_sha, prev_sha=prev_sha
     )

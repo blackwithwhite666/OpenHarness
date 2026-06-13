@@ -465,6 +465,27 @@ Your retrieval is rich: search runs against real Google via the `mcp__google_sea
 - Always finish with a single `<final_answer>…</final_answer>` block."""
 
 
+# Research-only ablation arm: the same loop with the in-loop verification step (6)
+# removed and the `agent` tool dropped, so it never spawns the `research-verification`
+# sub-agent. Built by transforming the canonical prompt so the two stay in lockstep;
+# `test_deep_research_agents` asserts the verify step is actually gone (a no-op
+# replace would silently ship verification). Two uses: a FAST mode, and the ablation
+# that measures how much the verifier actually buys on a benchmark (verify-per-run vs
+# none). For a prod-faithful "verify once per task", run `deep-research` at K=1.
+_DEEP_RESEARCH_NOVERIFY_SYSTEM_PROMPT = _DEEP_RESEARCH_SYSTEM_PROMPT.replace(
+    "adaptive query planning, and an explicit verify/cite step — never a one-shot web search.",
+    "adaptive query planning, and rigorous self-checking of every load-bearing fact "
+    "against its source — never a one-shot web search.",
+).replace(
+    """6. VERIFY / CITE.
+   - Spawn the `research-verification` sub-agent via the `agent` tool (it is a background agent — spawn it, then poll for its result). Pass it the question, your draft answer, and the list of (claim, cited source) pairs.
+   - When it returns, drop or correct every claim it marks UNSUPPORTED/UNVERIFIABLE. Do not ship a claim the verifier rejected.
+
+7. ANSWER.""",
+    """6. ANSWER.""",
+)
+
+
 def _deep_research_builtin_defs() -> list["AgentDefinition"]:
     """Return the two built-in deep-research agent definitions.
 
@@ -520,6 +541,31 @@ def _deep_research_builtin_defs() -> list["AgentDefinition"]:
             color="cyan",
             model=_DEEP_RESEARCH_MODEL,
             subagent_type="deep-research",
+            source="builtin",
+            base_dir="built-in",
+        ),
+        AgentDefinition(
+            name="deep-research-noverify",
+            description=(
+                "Deep research WITHOUT the citation-verification pass — same parallel "
+                "plan -> search -> fetch -> re-plan -> synthesize -> answer loop as `deep-research`, "
+                "minus step 6 (it never spawns the `research-verification` sub-agent). Use it as a "
+                "FAST mode and as the ablation arm that measures how much the verifier actually "
+                "buys on a benchmark (GAIA). For verification, prefer `deep-research`."
+            ),
+            # Same partition as deep-research MINUS `agent`: it must not spawn the verifier.
+            tools=[
+                "mcp__google_search__search",
+                "web_fetch",
+                "bash",
+                "todo_write",
+                "read_file",
+            ],
+            required_mcp_servers=["google_search"],
+            system_prompt=_DEEP_RESEARCH_NOVERIFY_SYSTEM_PROMPT,
+            color="cyan",
+            model=_DEEP_RESEARCH_MODEL,
+            subagent_type="deep-research-noverify",
             source="builtin",
             base_dir="built-in",
         ),

@@ -304,6 +304,30 @@ def test_default_model_is_pinned_not_inherit():
     assert run_subset.DEFAULT_MODEL not in (None, "", "inherit")
 
 
+@pytest.mark.asyncio
+async def test_run_subset_writes_jsonl_incrementally(tmp_path):
+    # Each task's row must be persisted BEFORE the next task runs — crash-safety +
+    # live progress on a long (90-run) sweep. The spawn_fn observes the on-disk row
+    # count as each task starts.
+    results = tmp_path / "results"
+    jsonl = results / "shaX.jsonl"
+    tasks = [_task(f"t{i}", "Paris", 1, tmp_path) for i in range(3)]
+    rows_on_disk_at_start: dict[str, int] = {}
+
+    async def spawn(t, model):
+        rows_on_disk_at_start[t.task_id] = (
+            len(jsonl.read_text().splitlines()) if jsonl.exists() else 0
+        )
+        return "<final_answer>Paris</final_answer>"
+
+    await run_subset_fn(
+        tasks, spawn_fn=spawn, results_dir=results, git_sha="shaX", k=1
+    )
+    # t0 sees nothing yet; t1 sees t0's row; t2 sees t0+t1.
+    assert rows_on_disk_at_start == {"t0": 0, "t1": 1, "t2": 2}
+    assert len(jsonl.read_text().splitlines()) == 3
+
+
 def test_parse_usage_strips_marker_and_sums():
     from tests.eval.gaia.run_subset import _parse_usage
 
