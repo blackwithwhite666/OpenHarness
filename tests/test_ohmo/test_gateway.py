@@ -1162,6 +1162,43 @@ async def test_gateway_bridge_does_not_thread_private_feishu_replies():
 
 
 @pytest.mark.asyncio
+async def test_gateway_bridge_threads_private_telegram_replies():
+    """Telegram DMs DO carry the inbound message_id (unlike Feishu p2p) so the
+    bot's reply threads under the user's message — the user asked for it; the
+    actual reply is still gated by the channel's reply_to_message config."""
+    bus = MessageBus()
+
+    class FakeRuntimePool:
+        async def stream_message(self, message, session_key):
+            yield SimpleNamespace(kind="progress", text="🤔…", metadata={"_progress": True})
+            yield SimpleNamespace(kind="final", text="Done", metadata={})
+
+    bridge = OhmoGatewayBridge(bus=bus, runtime_pool=FakeRuntimePool())
+    task = asyncio.create_task(bridge.run())
+    try:
+        await bus.publish_inbound(
+            InboundMessage(
+                channel="telegram",
+                sender_id="116870365|blackwithwhite",
+                chat_id="116870365",
+                content="который час?",
+                metadata={"chat_type": "private", "message_id": 4242},
+            )
+        )
+        progress = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
+        final = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
+    finally:
+        bridge.stop()
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    assert final.metadata["message_id"] == 4242  # final threads under the user's message
+    assert "message_id" not in progress.metadata  # progress stays a plain message (no draft path)
+    assert final.metadata["_session_key"] == "telegram:116870365"
+
+
+@pytest.mark.asyncio
 async def test_gateway_bridge_threads_group_feishu_replies():
     bus = MessageBus()
 

@@ -397,6 +397,14 @@ class OhmoGatewayBridge:
             len(options),
             _content_snippet(content),
         )
+        # Reply-thread the FINAL answer under the user's message on Telegram
+        # (gated by the channel's reply_to_message). Scoped to the final send —
+        # it goes via send_message, where reply_parameters works. Progress is
+        # left untouched: carrying message_id there would route it to the draft
+        # API, which this non-business bot can't use.
+        final_meta = {**inbound_meta, "_session_key": session_key}
+        if message.channel == "telegram" and "message_id" in message.metadata:
+            final_meta["message_id"] = message.metadata["message_id"]
         await self._bus.publish_outbound(
             OutboundMessage(
                 channel=message.channel,
@@ -404,7 +412,7 @@ class OhmoGatewayBridge:
                 content=content,
                 media=media,
                 buttons=options,
-                metadata={**inbound_meta, "_session_key": session_key},
+                metadata=final_meta,
             )
         )
 
