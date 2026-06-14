@@ -463,3 +463,38 @@ async def test_gateway_bridge_coalesce_disabled_matches_legacy_interrupts():
 
     # N=3 messages → N-1 = 2 stop notices, exactly the legacy behavior.
     assert stop_notices == 2
+
+
+@pytest.mark.asyncio
+async def test_flush_due_isolates_per_session_failures():
+    # A flush that raises for one session must NOT propagate out of _flush_due
+    # (which would kill the run loop) and must NOT strand other due sessions.
+    import time
+
+    bus = MessageBus()
+    bridge = _make_bridge(bus, SimpleNamespace(), message_coalesce_window=0.05)
+    past = time.monotonic() - 1.0
+    for key in ("s-bad", "s-good"):
+        bridge._pending[key] = [
+            InboundMessage(channel="feishu", sender_id=key, chat_id="1", content="x")
+        ]
+        bridge._pending_deadline[key] = past
+
+    flushed: list[str] = []
+
+    async def flaky(session_key, *, wait=False):
+        # Mirror the real _flush_pending: pop buffer+deadline first, then work.
+        bridge._pending.pop(session_key, None)
+        bridge._pending_deadline.pop(session_key, None)
+        if session_key == "s-bad":
+            raise RuntimeError("boom")
+        flushed.append(session_key)
+
+    bridge._flush_pending = flaky
+
+    # Must not raise despite s-bad failing.
+    await bridge._flush_due()
+
+    assert flushed == ["s-good"]  # sibling still flushed, not stranded
+    assert not bridge._pending  # both sessions cleared
+    assert not bridge._pending_deadline

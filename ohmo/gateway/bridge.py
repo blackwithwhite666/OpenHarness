@@ -255,7 +255,16 @@ class OhmoGatewayBridge:
         now = time.monotonic()
         for session_key, deadline in list(self._pending_deadline.items()):
             if now >= deadline:
-                await self._flush_pending(session_key)
+                # Isolate each flush: a dispatch failure for one session must not
+                # kill the run loop or strand other sessions' buffered messages.
+                # ``_flush_pending`` already popped the buffer+deadline, so a
+                # faulted session is not retried in a tight loop.
+                try:
+                    await self._flush_pending(session_key)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception("ohmo reminder flush failed session_key=%s", session_key)
 
     async def _flush_pending(self, session_key: str, *, wait: bool = False) -> None:
         buffer = self._pending.pop(session_key, None)
