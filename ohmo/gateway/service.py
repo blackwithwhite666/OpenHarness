@@ -24,6 +24,7 @@ from ohmo.gateway.bridge import OhmoGatewayBridge
 from ohmo.gateway.config import build_channel_manager_config, load_gateway_config
 from ohmo.gateway.models import GatewayState
 from ohmo.gateway.runtime import OhmoSessionRuntimePool
+from ohmo.reminders.scheduler import ReminderScheduler
 from ohmo.workspace import (
     get_gateway_restart_notice_path,
     get_logs_dir,
@@ -59,9 +60,17 @@ class OhmoGatewayService:
             provider_profile=self._config.provider_profile,
             create_feishu_group=self.create_group_for_user,
             publish_group_welcome=self.publish_group_welcome,
+            default_tz=self._config.default_tz,
+            reminder_max_per_chat=self._config.reminder_max_per_chat,
         )
         self._stop_event: asyncio.Event | None = None
         self._restart_requested = False
+        self._reminder_scheduler = ReminderScheduler(
+            bus=self._bus,
+            store=self._runtime_pool._reminder_store,
+            lock=self._runtime_pool._reminder_lock,
+            catchup=self._config.reminder_catchup,
+        )
         self._bridge = OhmoGatewayBridge(
             bus=self._bus,
             runtime_pool=self._runtime_pool,
@@ -197,6 +206,10 @@ class OhmoGatewayService:
             self._publish_pending_restart_notice(),
             name="ohmo-gateway-restart-notice",
         )
+        scheduler_task = asyncio.create_task(
+            self._reminder_scheduler.run(),
+            name="ohmo-gateway-reminder-scheduler",
+        )
         stop_event = asyncio.Event()
         self._stop_event = stop_event
         self._restart_requested = False
@@ -223,6 +236,10 @@ class OhmoGatewayService:
                 restart_notice_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await restart_notice_task
+            if not scheduler_task.done():
+                scheduler_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await scheduler_task
             await self._manager.stop_all()
             self.write_state(running=False)
             self.pid_file.unlink(missing_ok=True)

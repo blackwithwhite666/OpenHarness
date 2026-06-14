@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 import hashlib
 import logging
@@ -38,6 +39,8 @@ from ohmo.gateway.provider_commands import handle_gateway_model_command, handle_
 from ohmo.group_registry import load_managed_group_record, normalize_cwd
 from ohmo.memory import create_memory_command_backend
 from ohmo.prompts import build_ohmo_system_prompt
+from ohmo.reminders.store import ReminderStore
+from ohmo.reminders.tool import RemindCancelTool, RemindCreateTool, RemindListTool
 from ohmo.session_storage import OhmoSessionBackend
 from ohmo.todo_store import TodoStore
 from ohmo.todo_write_tool import OhmoTodoWriteTool
@@ -103,6 +106,8 @@ class OhmoSessionRuntimePool:
         max_turns: int | None = None,
         create_feishu_group: CreateFeishuGroup | None = None,
         publish_group_welcome: PublishGroupWelcome | None = None,
+        default_tz: str = "Europe/Moscow",
+        reminder_max_per_chat: int = 50,
     ) -> None:
         self._cwd = str(Path(cwd).resolve())
         self._workspace = workspace
@@ -111,10 +116,14 @@ class OhmoSessionRuntimePool:
         self._max_turns = max_turns
         self._create_feishu_group = create_feishu_group
         self._publish_group_welcome = publish_group_welcome
+        self._default_tz = default_tz
+        self._reminder_max_per_chat = reminder_max_per_chat
         self._workspace = initialize_workspace(workspace)
         self._gateway_config = load_gateway_config(self._workspace)
         self._session_backend = OhmoSessionBackend(self._workspace)
         self._todo_store = TodoStore(self._workspace)
+        self._reminder_store = ReminderStore(workspace=self._workspace)
+        self._reminder_lock = asyncio.Lock()
         self._bundles: dict[str, RuntimeBundle] = {}
 
     @property
@@ -250,6 +259,16 @@ class OhmoSessionRuntimePool:
         command_prompt = (message.content or "").strip()
         session_cwd = self._cwd_for_message(message)
         bundle = await self.get_bundle(session_key, latest_user_prompt=user_prompt, cwd=session_cwd)
+        engine_metadata = getattr(bundle.engine, "tool_metadata", None)
+        if isinstance(engine_metadata, dict):
+            engine_metadata["ohmo_reminder_ctx"] = {
+                "channel": message.channel,
+                "chat_id": str(message.chat_id),
+                "session_key": session_key,
+                "sender_id": str(message.sender_id),
+                "chat_type": str(message.metadata.get("chat_type") or "").strip().lower(),
+                "tz": message.metadata.get("tz") or "",
+            }
         logger.info(
             "ohmo runtime processing start channel=%s chat_id=%s session_key=%s session_id=%s content=%r",
             message.channel,
@@ -495,12 +514,15 @@ class OhmoSessionRuntimePool:
                 metadata={"_session_key": session_key},
             )
             self._restore_group_request_context(bundle, previous_group_request)
+            self._clear_reminder_context(bundle)
             await self._save_snapshot(bundle, session_key, user_prompt)
             return
         except Exception:
             self._restore_group_request_context(bundle, previous_group_request)
+            self._clear_reminder_context(bundle)
             raise
         self._restore_group_request_context(bundle, previous_group_request)
+        self._clear_reminder_context(bundle)
         await self._save_snapshot(bundle, session_key, user_prompt)
         reply = "".join(reply_parts).strip()
         if reply:
@@ -775,6 +797,7 @@ class OhmoSessionRuntimePool:
     def _register_gateway_tools(self, bundle: RuntimeBundle) -> None:
         self._unregister_group_tool(bundle)
         self._register_todo_tool(bundle)
+        self._register_reminder_tools(bundle)
 
     def _register_todo_tool(self, bundle: RuntimeBundle) -> None:
         """Override the default ``todo_write`` with a per-session one — the list
@@ -786,6 +809,24 @@ class OhmoSessionRuntimePool:
         registry.register(
             OhmoTodoWriteTool(self._todo_store, lambda: bundle.session_id)
         )
+
+    def _register_reminder_tools(self, bundle: RuntimeBundle) -> None:
+        """Register the per-session reminder tools (create/list/cancel). They
+        share one ReminderStore + asyncio.Lock with the scheduler; delivery
+        context is read from engine.tool_metadata['ohmo_reminder_ctx']."""
+        registry = getattr(bundle, "tool_registry", None)
+        if registry is None:
+            return
+        registry.register(
+            RemindCreateTool(
+                self._reminder_store,
+                self._reminder_lock,
+                default_tz=self._default_tz,
+                max_per_chat=self._reminder_max_per_chat,
+            )
+        )
+        registry.register(RemindListTool(self._reminder_store, self._reminder_lock))
+        registry.register(RemindCancelTool(self._reminder_store, self._reminder_lock))
 
     def _register_group_tool(self, bundle: RuntimeBundle) -> None:
         if self._create_feishu_group is None or not hasattr(bundle, "tool_registry"):
@@ -841,6 +882,14 @@ class OhmoSessionRuntimePool:
         metadata.pop("ohmo_group_request", None)
         metadata.pop("_suppress_next_user_goal", None)
         OhmoSessionRuntimePool._unregister_group_tool(bundle)
+
+    @staticmethod
+    def _clear_reminder_context(bundle: RuntimeBundle) -> None:
+        """Drop the per-message reminder delivery context after a turn so a stale
+        chat_id can't leak into an unrelated synthetic agentic turn."""
+        metadata = getattr(bundle.engine, "tool_metadata", None)
+        if isinstance(metadata, dict):
+            metadata.pop("ohmo_reminder_ctx", None)
 
 
 def _content_snippet(text: str, *, limit: int = 160) -> str:

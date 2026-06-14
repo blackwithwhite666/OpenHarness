@@ -19,6 +19,9 @@ class GatewayConfig(BaseModel):
     allowed_remote_admin_commands: list[str] = Field(default_factory=list)
     log_level: str = "INFO"
     channel_configs: dict[str, dict] = Field(default_factory=dict)
+    default_tz: str = "Europe/Moscow"
+    reminder_max_per_chat: int = 50
+    reminder_catchup: str = "once"  # "once" | "none"
 
 
 class GatewayState(BaseModel):
