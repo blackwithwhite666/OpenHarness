@@ -228,7 +228,7 @@ def test_deep_research_prompt_has_budget_and_terse_format():
     assert "web_search" in prompt
     # #2 hard budget on turns/waves/fetches so runs stop instead of timing out.
     assert "HARD BUDGET" in prompt
-    assert "12 assistant turns" in prompt
+    assert "14 assistant turns" in prompt
     assert "2 search waves" in prompt
     # #3 browser demoted to a last resort (default is web_fetch).
     assert "LAST-RESORT" in prompt
