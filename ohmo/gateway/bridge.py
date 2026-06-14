@@ -423,6 +423,13 @@ class OhmoGatewayBridge:
         self._session_cancel_reasons.pop(session_key, None)
 
     def _should_process_message(self, message: InboundMessage) -> bool:
+        # Scheduler-originated synthetic reminders bypass the channel-layer ACL
+        # by design: they come from a stored, owner-created reminder, not from an
+        # arbitrary group member. Without this, an agentic reminder for a Feishu
+        # group under a mention/managed group_policy would be silently dropped at
+        # fire time (and the occurrence already consumed by mark_fired).
+        if message.metadata.get("_synthetic"):
+            return True
         if message.channel != "feishu":
             return True
         chat_type = str(message.metadata.get("chat_type") or "").strip().lower()

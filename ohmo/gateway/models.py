@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 
@@ -19,6 +21,9 @@ class GatewayConfig(BaseModel):
     allowed_remote_admin_commands: list[str] = Field(default_factory=list)
     log_level: str = "INFO"
     channel_configs: dict[str, dict] = Field(default_factory=dict)
+    default_tz: str = "Europe/Moscow"
+    reminder_max_per_chat: int = 50
+    reminder_catchup: Literal["once", "none"] = "once"
 
 
 class GatewayState(BaseModel):

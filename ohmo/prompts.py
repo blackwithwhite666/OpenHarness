@@ -154,6 +154,26 @@ def build_ohmo_system_prompt(
         ]
     )
 
+    sections.extend(
+        [
+            "# Reminders",
+            (
+                "You can set persistent proactive reminders that fire even after a "
+                "restart, using `remind_create` / `remind_list` / `remind_cancel`. "
+                "When the user asks to be reminded ('напомни … в 18:00', 'каждый "
+                "будний день в 9 присылай погоду'), YOU resolve the natural-language "
+                "time into an absolute tz-aware `dtstart` and, for repeats, an iCal "
+                "`RRULE` — the tool does not parse free-form text. Ground relative "
+                "phrases ('через 2 часа', 'завтра в 9') against the current time, "
+                "which every reminder-tool result echoes back. Use `mode='static'` "
+                "to deliver the text verbatim, or `mode='agentic'` when the reminder "
+                "should run a full agent action at fire time (e.g. fetch and send "
+                "the weather). Never pass chat_id — delivery targets this chat "
+                "automatically."
+            ),
+        ]
+    )
+
     if ohmo_memory := load_ohmo_memory_prompt(root):
         sections.append(ohmo_memory)
 

@@ -24,6 +24,7 @@ from ohmo.gateway.bridge import OhmoGatewayBridge
 from ohmo.gateway.config import build_channel_manager_config, load_gateway_config
 from ohmo.gateway.models import GatewayState
 from ohmo.gateway.runtime import OhmoSessionRuntimePool
+from ohmo.reminders.scheduler import ReminderScheduler
 from ohmo.workspace import (
     get_gateway_restart_notice_path,
     get_logs_dir,
@@ -52,16 +53,28 @@ class OhmoGatewayService:
                 ",".join(self._config.allowed_remote_admin_commands),
             )
         self._bus = MessageBus()
-        self._manager = ChannelManager(build_channel_manager_config(self._config), self._bus)
+        self._manager = ChannelManager(
+            build_channel_manager_config(self._config),
+            self._bus,
+            on_send_failure=self._on_outbound_send_failure,
+        )
         self._runtime_pool = OhmoSessionRuntimePool(
             cwd=self._cwd,
             workspace=self._workspace,
             provider_profile=self._config.provider_profile,
             create_feishu_group=self.create_group_for_user,
             publish_group_welcome=self.publish_group_welcome,
+            default_tz=self._config.default_tz,
+            reminder_max_per_chat=self._config.reminder_max_per_chat,
         )
         self._stop_event: asyncio.Event | None = None
         self._restart_requested = False
+        self._reminder_scheduler = ReminderScheduler(
+            bus=self._bus,
+            store=self._runtime_pool._reminder_store,
+            lock=self._runtime_pool._reminder_lock,
+            catchup=self._config.reminder_catchup,
+        )
         self._bridge = OhmoGatewayBridge(
             bus=self._bus,
             runtime_pool=self._runtime_pool,
@@ -142,6 +155,19 @@ class OhmoGatewayService:
             )
         )
 
+    async def _on_outbound_send_failure(self, msg: OutboundMessage, error: BaseException) -> None:
+        """Route a failed channel send back to the reminder scheduler.
+
+        Bus publish only enqueues; the real Telegram send (and any Forbidden/
+        blocked error) happens later in the channel dispatcher. Scheduler-fired
+        messages carry ``_reminder_id`` in metadata — when one of those fails to
+        send, hand it to the scheduler so a blocked target pauses the reminder
+        (per the locked design) instead of re-firing every occurrence forever."""
+        reminder_id = (msg.metadata or {}).get("_reminder_id")
+        if not reminder_id:
+            return
+        await self._reminder_scheduler.handle_delivery_failure(str(reminder_id), error)
+
     def _exec_restart(self) -> None:
         root = str(get_workspace_root(self._workspace))
         argv = [
@@ -197,6 +223,10 @@ class OhmoGatewayService:
             self._publish_pending_restart_notice(),
             name="ohmo-gateway-restart-notice",
         )
+        scheduler_task = asyncio.create_task(
+            self._reminder_scheduler.run(),
+            name="ohmo-gateway-reminder-scheduler",
+        )
         stop_event = asyncio.Event()
         self._stop_event = stop_event
         self._restart_requested = False
@@ -223,6 +253,10 @@ class OhmoGatewayService:
                 restart_notice_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await restart_notice_task
+            if not scheduler_task.done():
+                scheduler_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await scheduler_task
             await self._manager.stop_all()
             self.write_state(running=False)
             self.pid_file.unlink(missing_ok=True)
