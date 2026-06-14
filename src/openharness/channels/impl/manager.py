@@ -4,14 +4,18 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 
+from openharness.channels.bus.events import OutboundMessage
 from openharness.channels.bus.queue import MessageBus
 from openharness.channels.impl.base import BaseChannel
 from openharness.config.schema import Config
 
 logger = logging.getLogger(__name__)
+
+SendFailureHook = Callable[[OutboundMessage, BaseException], Awaitable[None] | None]
 
 
 class ChannelManager:
@@ -24,11 +28,21 @@ class ChannelManager:
     - Route outbound messages
     """
 
-    def __init__(self, config: Config, bus: MessageBus):
+    def __init__(
+        self,
+        config: Config,
+        bus: MessageBus,
+        on_send_failure: SendFailureHook | None = None,
+    ):
         self.config = config
         self.bus = bus
         self.channels: dict[str, BaseChannel] = {}
         self._dispatch_task: asyncio.Task | None = None
+        # Optional hook invoked when a channel.send() raises. The bus only
+        # enqueues (publish_* never raises), so a real send failure — e.g. a
+        # Telegram Forbidden/blocked — surfaces ONLY here. Lets a producer
+        # (e.g. the reminder scheduler) react to a failed delivery it queued.
+        self._on_send_failure = on_send_failure
 
         self._init_channels()
 
@@ -228,6 +242,7 @@ class ChannelManager:
                         await channel.send(msg)
                     except Exception as e:
                         logger.error("Error sending to %s: %s", msg.channel, e)
+                        await self._notify_send_failure(msg, e)
                 else:
                     logger.warning("Unknown channel: %s", msg.channel)
 
@@ -235,6 +250,18 @@ class ChannelManager:
                 continue
             except asyncio.CancelledError:
                 break
+
+    async def _notify_send_failure(self, msg: OutboundMessage, error: BaseException) -> None:
+        """Invoke the optional send-failure hook, swallowing hook errors so a
+        misbehaving hook can never break the outbound dispatcher loop."""
+        if self._on_send_failure is None:
+            return
+        try:
+            result = self._on_send_failure(msg, error)
+            if asyncio.iscoroutine(result):
+                await result
+        except Exception as hook_error:  # noqa: BLE001 — never break dispatch
+            logger.error("Send-failure hook raised: %s", hook_error)
 
     def get_channel(self, name: str) -> BaseChannel | None:
         """Get a channel by name."""

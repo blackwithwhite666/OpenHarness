@@ -267,6 +267,10 @@ class OhmoSessionRuntimePool:
                 "session_key": session_key,
                 "sender_id": str(message.sender_id),
                 "chat_type": str(message.metadata.get("chat_type") or "").strip().lower(),
+                # Group signal for the creator-only cancel ACL. Telegram emits
+                # only ``is_group`` (bool), never ``chat_type``; Feishu sets
+                # ``chat_type``. Accept either so the ACL works on both.
+                "is_group": _is_group_message(message),
                 "tz": message.metadata.get("tz") or "",
             }
         logger.info(
@@ -890,6 +894,22 @@ class OhmoSessionRuntimePool:
         metadata = getattr(bundle.engine, "tool_metadata", None)
         if isinstance(metadata, dict):
             metadata.pop("ohmo_reminder_ctx", None)
+
+
+_GROUP_CHAT_TYPES = frozenset({"group", "supergroup", "chat", "channel", "room"})
+
+
+def _is_group_message(message: InboundMessage) -> bool:
+    """True when an inbound message originates from a shared/group chat.
+
+    Telegram emits only ``is_group`` (bool); Feishu/others set ``chat_type``.
+    Accept either so a group-only ACL (e.g. creator-only reminder cancel) is
+    enforced on every channel, not just the ones that happen to set chat_type.
+    """
+    metadata = message.metadata or {}
+    if bool(metadata.get("is_group")):
+        return True
+    return str(metadata.get("chat_type") or "").strip().lower() in _GROUP_CHAT_TYPES
 
 
 def _content_snippet(text: str, *, limit: int = 160) -> str:

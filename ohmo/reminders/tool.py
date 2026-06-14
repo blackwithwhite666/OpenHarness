@@ -228,7 +228,11 @@ class RemindListTool(BaseTool):
         if not ctx:
             return _missing_ctx()
         tz = ctx.get("tz") or "Europe/Moscow"
-        reminders = self._store.list_for_chat(ctx["channel"], ctx["chat_id"], status="active")
+        # Include paused reminders (marked) so a reminder paused by a blocked
+        # delivery stays visible and the user can cancel it — otherwise it would
+        # be silently invisible with no recovery path.
+        all_reminders = self._store.list_for_chat(ctx["channel"], ctx["chat_id"], status=None)
+        reminders = [r for r in all_reminders if r.status in ("active", "paused")]
         if not reminders:
             return ToolResult(
                 output=f"{_now_local_line(tz)}\nNo active reminders in this chat."
@@ -237,7 +241,10 @@ class RemindListTool(BaseTool):
         for reminder in reminders:
             kind = "recurring" if reminder.rrule else "one-shot"
             fire = _fmt_local(reminder.next_fire_at, reminder.tz)
-            lines.append(f"- {reminder.id} • {fire} • {reminder.summary} • [{kind}]")
+            paused = " • ⏸ paused" if reminder.status == "paused" else ""
+            lines.append(
+                f"- {reminder.id} • {fire} • {reminder.summary} • [{kind}]{paused}"
+            )
         return ToolResult(output=_now_local_line(tz) + "\n" + "\n".join(lines))
 
 
@@ -271,7 +278,8 @@ class RemindCancelTool(BaseTool):
             or reminder.chat_id != ctx["chat_id"]
         ):
             return ToolResult(output="No such reminder in this chat.", is_error=True)
-        if ctx.get("chat_type") == "group" and reminder.created_by != ctx["sender_id"]:
+        is_group = bool(ctx.get("is_group")) or ctx.get("chat_type") == "group"
+        if is_group and reminder.created_by != ctx["sender_id"]:
             return ToolResult(
                 output="Only the person who created this reminder can cancel it.",
                 is_error=True,

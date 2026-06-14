@@ -27,7 +27,13 @@ def _ctx(metadata: dict | None, tmp_path: Path) -> ToolExecutionContext:
     return ToolExecutionContext(cwd=tmp_path, metadata=metadata or {})
 
 
-def _reminder_ctx(*, chat_id: str = "100", sender_id: str = "42", chat_type: str = "private") -> dict:
+def _reminder_ctx(
+    *,
+    chat_id: str = "100",
+    sender_id: str = "42",
+    chat_type: str = "private",
+    is_group: bool = False,
+) -> dict:
     return {
         "ohmo_reminder_ctx": {
             "channel": "telegram",
@@ -35,6 +41,7 @@ def _reminder_ctx(*, chat_id: str = "100", sender_id: str = "42", chat_type: str
             "session_key": f"telegram:{chat_id}",
             "sender_id": sender_id,
             "chat_type": chat_type,
+            "is_group": is_group,
             "tz": "Europe/Moscow",
         }
     }
@@ -123,12 +130,15 @@ async def test_list_scoped_to_chat(tmp_path: Path) -> None:
 
 
 async def test_cancel_creator_only_in_group(tmp_path: Path) -> None:
+    # Telegram-realistic context: the channel emits ``is_group`` (bool) and NEVER
+    # ``chat_type``. The ACL must key off ``is_group`` — keying off ``chat_type``
+    # alone made this dead code on Telegram (any group member could cancel).
     store = ReminderStore()
     lock = asyncio.Lock()
     create = RemindCreateTool(store, lock, default_tz="Europe/Moscow", max_per_chat=50)
     res = await create.execute(
         RemindCreateInput(summary="owned", dtstart=_future_iso()),
-        _ctx(_reminder_ctx(chat_id="500", sender_id="owner", chat_type="group"), tmp_path),
+        _ctx(_reminder_ctx(chat_id="500", sender_id="owner", is_group=True), tmp_path),
     )
     assert not res.is_error
     reminder_id = store.list_for_chat("telegram", "500")[0].id
@@ -137,7 +147,7 @@ async def test_cancel_creator_only_in_group(tmp_path: Path) -> None:
     # A different group member cannot cancel.
     denied = await cancel.execute(
         RemindCancelInput(id=reminder_id),
-        _ctx(_reminder_ctx(chat_id="500", sender_id="intruder", chat_type="group"), tmp_path),
+        _ctx(_reminder_ctx(chat_id="500", sender_id="intruder", is_group=True), tmp_path),
     )
     assert denied.is_error
     assert store.get(reminder_id).status == "active"
@@ -145,10 +155,31 @@ async def test_cancel_creator_only_in_group(tmp_path: Path) -> None:
     # The creator can.
     allowed = await cancel.execute(
         RemindCancelInput(id=reminder_id),
-        _ctx(_reminder_ctx(chat_id="500", sender_id="owner", chat_type="group"), tmp_path),
+        _ctx(_reminder_ctx(chat_id="500", sender_id="owner", is_group=True), tmp_path),
     )
     assert not allowed.is_error
     assert store.get(reminder_id).status == "done"
+
+
+async def test_cancel_creator_only_feishu_chat_type(tmp_path: Path) -> None:
+    # Feishu emits ``chat_type='group'`` (no ``is_group``). The ACL must still
+    # apply via the chat_type fallback.
+    store = ReminderStore()
+    lock = asyncio.Lock()
+    create = RemindCreateTool(store, lock, default_tz="Europe/Moscow", max_per_chat=50)
+    await create.execute(
+        RemindCreateInput(summary="owned", dtstart=_future_iso()),
+        _ctx(_reminder_ctx(chat_id="700", sender_id="owner", chat_type="group"), tmp_path),
+    )
+    reminder_id = store.list_for_chat("telegram", "700")[0].id
+
+    cancel = RemindCancelTool(store, lock)
+    denied = await cancel.execute(
+        RemindCancelInput(id=reminder_id),
+        _ctx(_reminder_ctx(chat_id="700", sender_id="intruder", chat_type="group"), tmp_path),
+    )
+    assert denied.is_error
+    assert store.get(reminder_id).status == "active"
 
 
 async def test_cancel_wrong_chat_errors(tmp_path: Path) -> None:

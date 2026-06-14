@@ -53,7 +53,11 @@ class OhmoGatewayService:
                 ",".join(self._config.allowed_remote_admin_commands),
             )
         self._bus = MessageBus()
-        self._manager = ChannelManager(build_channel_manager_config(self._config), self._bus)
+        self._manager = ChannelManager(
+            build_channel_manager_config(self._config),
+            self._bus,
+            on_send_failure=self._on_outbound_send_failure,
+        )
         self._runtime_pool = OhmoSessionRuntimePool(
             cwd=self._cwd,
             workspace=self._workspace,
@@ -150,6 +154,19 @@ class OhmoGatewayService:
                 metadata={"chat_type": "group", "_session_key": f"feishu:{chat_id}:{owner_open_id}"},
             )
         )
+
+    async def _on_outbound_send_failure(self, msg: OutboundMessage, error: BaseException) -> None:
+        """Route a failed channel send back to the reminder scheduler.
+
+        Bus publish only enqueues; the real Telegram send (and any Forbidden/
+        blocked error) happens later in the channel dispatcher. Scheduler-fired
+        messages carry ``_reminder_id`` in metadata — when one of those fails to
+        send, hand it to the scheduler so a blocked target pauses the reminder
+        (per the locked design) instead of re-firing every occurrence forever."""
+        reminder_id = (msg.metadata or {}).get("_reminder_id")
+        if not reminder_id:
+            return
+        await self._reminder_scheduler.handle_delivery_failure(str(reminder_id), error)
 
     def _exec_restart(self) -> None:
         root = str(get_workspace_root(self._workspace))

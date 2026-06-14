@@ -14,16 +14,19 @@ NOW = 1_000_000.0
 
 
 class FakeBus:
-    """Minimal MessageBus stand-in capturing published messages."""
+    """Minimal MessageBus stand-in capturing published messages.
+
+    Mirrors the real :class:`MessageBus`: ``publish_*`` only enqueues and never
+    raises (a real Telegram Forbidden surfaces later in the channel dispatcher,
+    not at publish time). The blocked-delivery path is exercised via the
+    scheduler's ``handle_delivery_failure`` instead — see
+    ``test_blocked_delivery_pauses_via_send_failure``."""
 
     def __init__(self) -> None:
         self.outbound: list = []
         self.inbound: list = []
-        self.raise_on_outbound = False
 
     async def publish_outbound(self, msg) -> None:
-        if self.raise_on_outbound:
-            raise RuntimeError("Forbidden: bot was blocked by the user")
         self.outbound.append(msg)
 
     async def publish_inbound(self, msg) -> None:
@@ -99,18 +102,76 @@ async def test_persist_before_deliver_idempotent() -> None:
     store = ReminderStore()
     store.add(_reminder("r1"))
     bus = FakeBus()
-    bus.raise_on_outbound = True
     sched = _make_scheduler(bus, store)
 
-    # Forbidden -> paused, no crash.
+    # First tick fires once (one-shot -> done) and persists BEFORE delivery.
     await sched.fire_due()
-    assert store.get("r1").status == "paused"
-    assert len(bus.outbound) == 0
+    assert store.get("r1").status == "done"
+    assert store.get("r1").fire_count == 1
+    assert len(bus.outbound) == 1
 
-    # Second tick must not re-deliver (paused is excluded).
-    bus.raise_on_outbound = False
+    # Second tick must not re-deliver (done is excluded).
     await sched.fire_due()
-    assert len(bus.outbound) == 0
+    assert len(bus.outbound) == 1
+
+
+async def test_blocked_delivery_pauses_via_send_failure() -> None:
+    # The real bus never raises on publish_outbound; a Telegram Forbidden surfaces
+    # later in the channel dispatcher, which calls back into the scheduler. A
+    # blocked recurring reminder must end up paused (per the locked design).
+    store = ReminderStore()
+    store.add(_reminder("r1", rrule="FREQ=DAILY"))
+    bus = FakeBus()
+    sched = _make_scheduler(bus, store)
+
+    await sched.fire_due()
+    assert len(bus.outbound) == 1  # delivery enqueued; it does not raise here
+    assert store.get("r1").status == "active"
+
+    # Channel dispatcher reports the send failed because the bot was blocked.
+    await sched.handle_delivery_failure("r1", RuntimeError("Forbidden: bot was blocked by the user"))
+    assert store.get("r1").status == "paused"
+
+    # Paused is excluded from the due-list, so it won't re-fire.
+    await sched.fire_due()
+    assert len(bus.outbound) == 1
+
+
+async def test_transient_send_failure_leaves_active() -> None:
+    # A non-blocked (transient) send error must NOT pause — the reminder stays
+    # active so the next occurrence retries instead of being silently dropped.
+    store = ReminderStore()
+    store.add(_reminder("r1", rrule="FREQ=DAILY"))
+    bus = FakeBus()
+    sched = _make_scheduler(bus, store)
+
+    await sched.fire_due()
+    await sched.handle_delivery_failure("r1", RuntimeError("temporary network error 503"))
+    assert store.get("r1").status == "active"
+
+
+async def test_cancel_between_snapshot_and_fire_is_not_delivered() -> None:
+    # TOCTOU: a reminder cancelled (status -> done) in the window between the
+    # due-list snapshot and the firing write must NOT deliver and must NOT have
+    # its done record mutated.
+    store = ReminderStore()
+    store.add(_reminder("r1", rrule="FREQ=DAILY"))
+    bus = FakeBus()
+    sched = _make_scheduler(bus, store)
+
+    # Snapshot the due reminder the way fire_due() does, then cancel it before
+    # _fire_one runs (simulating remind_cancel landing mid-tick).
+    due = [r for r in store.load() if r.status == "active" and r.next_fire_at <= NOW]
+    assert due
+    store.cancel("r1")  # status -> done
+
+    await sched._fire_one(due[0], NOW)
+
+    assert len(bus.outbound) == 0  # no spurious delivery
+    r = store.get("r1")
+    assert r.status == "done"
+    assert r.fire_count == 0  # done record untouched
+    assert r.next_fire_at == due[0].next_fire_at  # not advanced
 
 
 async def test_agentic_publishes_inbound() -> None:

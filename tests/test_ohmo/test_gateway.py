@@ -1271,6 +1271,50 @@ async def test_gateway_bridge_ignores_unmentioned_unmanaged_feishu_group(tmp_pat
 
 
 @pytest.mark.asyncio
+async def test_gateway_bridge_runs_synthetic_reminder_in_feishu_group_under_mention_policy(tmp_path):
+    # A scheduler-originated agentic reminder publishes a synthetic InboundMessage
+    # into a Feishu group. Even under a mention/managed group_policy (and with no
+    # mentions_bot flag) it must still run an agent turn — the synthetic message
+    # bypasses the channel-layer ACL by design (it came from a stored, owner-
+    # created reminder). Without the bypass the occurrence is silently dropped.
+    bus = MessageBus()
+    calls: list[InboundMessage] = []
+
+    class FakeRuntimePool:
+        async def stream_message(self, message, session_key):
+            calls.append(message)
+            yield SimpleNamespace(kind="final", text="reminder ran", metadata={"_session_key": session_key})
+
+    bridge = OhmoGatewayBridge(
+        bus=bus,
+        runtime_pool=FakeRuntimePool(),
+        workspace=tmp_path,
+        feishu_group_policy="mention",
+    )
+    task = asyncio.create_task(bridge.run())
+    try:
+        await bus.publish_inbound(
+            InboundMessage(
+                channel="feishu",
+                sender_id="__scheduler__",
+                chat_id="oc_unmanaged",
+                content="send the weather",
+                session_key_override="feishu:oc_unmanaged",
+                metadata={"chat_type": "group", "_synthetic": True, "_reminder_id": "rem-1"},
+            )
+        )
+        final = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
+    finally:
+        bridge.stop()
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    assert len(calls) == 1
+    assert final.content == "reminder ran"
+
+
+@pytest.mark.asyncio
 async def test_gateway_bridge_processes_managed_feishu_group_without_mention(tmp_path):
     bus = MessageBus()
     save_managed_group_record(

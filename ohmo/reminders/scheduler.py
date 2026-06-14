@@ -106,26 +106,64 @@ class ReminderScheduler:
     async def _fire_one(self, reminder: Reminder, now: float) -> None:
         next_fire_at = self._next_after(reminder, now)
         # Persist BEFORE delivery — idempotency across crash / overlapping tick.
+        # ``mark_fired`` re-reads under the lock and returns False if the reminder
+        # was cancelled (status != active) between the due-list snapshot and now;
+        # in that case we must NOT deliver (closes the cancel-vs-fire race).
         async with self._lock:
-            self._store.mark_fired(
+            fired = self._store.mark_fired(
                 reminder.id, next_fire_at=next_fire_at, fired_at=now
             )
+        if not fired:
+            logger.info(
+                "ohmo reminder skipped (no longer active) id=%s", reminder.id
+            )
+            return
         try:
             if reminder.mode == "agentic":
                 await self._deliver_agentic(reminder)
             else:
                 await self._deliver_static(reminder)
         except Exception as exc:  # noqa: BLE001 — never crash the loop on delivery
+            # Only a genuine blocked/Forbidden signal is terminal (-> paused, per
+            # design). Delivery over the real bus is fire-and-forget (queue.put),
+            # so a blocked send surfaces later via ``handle_delivery_failure``,
+            # not here; an exception that DOES reach this point is treated as
+            # transient — log and leave the reminder active so the next
+            # occurrence retries instead of silently dropping a recurring one.
             if _looks_blocked(exc):
                 logger.warning(
                     "ohmo reminder delivery blocked, pausing id=%s error=%s",
                     reminder.id,
                     exc,
                 )
+                async with self._lock:
+                    self._store.set_status(reminder.id, "paused")
             else:
-                logger.exception("ohmo reminder delivery failed id=%s", reminder.id)
-            async with self._lock:
-                self._store.set_status(reminder.id, "paused")
+                logger.exception(
+                    "ohmo reminder delivery failed (left active for retry) id=%s",
+                    reminder.id,
+                )
+
+    async def handle_delivery_failure(self, reminder_id: str, error: BaseException) -> None:
+        """Pause a reminder whose actual channel send failed because the target
+        blocked the bot. Wired from the channel dispatcher: bus publish only
+        enqueues, so a Telegram Forbidden/blocked error surfaces at send time in
+        ``ChannelManager._dispatch_outbound`` — never at ``publish_*``. Other
+        (transient) send errors leave the reminder active to retry next tick."""
+        if not _looks_blocked(error):
+            logger.warning(
+                "ohmo reminder delivery failed at send (left active for retry) id=%s error=%s",
+                reminder_id,
+                error,
+            )
+            return
+        logger.warning(
+            "ohmo reminder delivery blocked at send, pausing id=%s error=%s",
+            reminder_id,
+            error,
+        )
+        async with self._lock:
+            self._store.set_status(reminder_id, "paused")
 
     def _next_after(self, reminder: Reminder, now: float) -> float | None:
         """Next fire AFTER this firing. ``last_fired_at=now`` so a one-shot is

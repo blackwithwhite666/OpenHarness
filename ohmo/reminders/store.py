@@ -118,18 +118,32 @@ class ReminderStore:
         return False
 
     def mark_fired(
-        self, reminder_id: str, *, next_fire_at: float | None, fired_at: float
+        self,
+        reminder_id: str,
+        *,
+        next_fire_at: float | None,
+        fired_at: float,
+        require_active: bool = True,
     ) -> bool:
         """Idempotency-critical write: persist firing BEFORE delivery.
 
         Sets ``last_fired_at`` + bumps ``fire_count``; when ``next_fire_at`` is
         ``None`` the reminder is exhausted (one-shot or rule end) -> ``done``,
         otherwise ``next_fire_at`` advances and the reminder stays active.
+
+        Re-reads the record under the file lock. With ``require_active`` (the
+        default) it no-ops and returns ``False`` when the reloaded record is no
+        longer ``active`` — this closes the cancel-vs-fire race: a reminder
+        cancelled (status -> ``done``) between the due-list snapshot and this
+        write is NOT fired and its ``done`` record is not mutated. Returns
+        ``True`` only when the firing was actually recorded.
         """
         with exclusive_file_lock(self._lock_path()):
             reminders = self.load()
             for reminder in reminders:
                 if reminder.id == reminder_id:
+                    if require_active and reminder.status != "active":
+                        return False
                     reminder.last_fired_at = fired_at
                     reminder.fire_count += 1
                     if next_fire_at is None:
