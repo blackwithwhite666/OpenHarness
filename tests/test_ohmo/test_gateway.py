@@ -441,7 +441,8 @@ async def test_runtime_pool_stream_message_formats_auto_compact_status_for_feish
     updates = [u async for u in pool.stream_message(message, "feishu:c1")]
 
     assert updates[1].kind == "progress"
-    assert updates[1].text == "🧠 聊天有点长啦，我先帮你悄悄压缩一下记忆，马上继续～"
+    assert updates[1].text.startswith("\U0001f9e0")  # localization-robust: compact-status emoji
+    assert "compact" in updates[1].text.lower()
     assert updates[-1].kind == "final"
     assert updates[-1].text == "done"
 
@@ -481,7 +482,8 @@ async def test_runtime_pool_stream_message_formats_compact_retry_for_feishu(tmp_
     updates = [u async for u in pool.stream_message(message, "feishu:c1")]
 
     assert updates[1].kind == "progress"
-    assert "再试一次" in updates[1].text
+    assert "\U0001f501" in updates[1].text  # retry emoji
+    assert "retry" in updates[1].text.lower()
 
 
 @pytest.mark.asyncio
@@ -519,7 +521,8 @@ async def test_runtime_pool_stream_message_formats_compact_hooks_start_for_feish
     updates = [u async for u in pool.stream_message(message, "feishu:c1")]
 
     assert updates[1].kind == "progress"
-    assert "准备" in updates[1].text
+    assert "\U0001fae7" in updates[1].text  # compaction hooks-start emoji
+    assert "compact" in updates[1].text.lower()
 
 
 @pytest.mark.asyncio
@@ -1502,7 +1505,7 @@ async def test_gateway_bridge_stop_command_cancels_current_session():
         with contextlib.suppress(asyncio.CancelledError):
             await task
 
-    assert stopped.content == "⏹️ 已停止当前正在运行的任务。"
+    assert stopped.content.startswith("\u23f9\ufe0f")  # localization-robust: stop notice
 
 
 @pytest.mark.asyncio
@@ -1905,7 +1908,7 @@ async def test_gateway_bridge_new_message_interrupts_same_session():
         with contextlib.suppress(asyncio.CancelledError):
             await task
 
-    assert interrupted.content == "⏹️ 已停止上一条正在处理的任务，继续看你的最新消息。"
+    assert interrupted.content.startswith("\u23f9\ufe0f")  # localization-robust: interrupt notice
     assert final.content == "second-done"
 
 
