@@ -16,7 +16,7 @@ import pytest
 from openharness.channels.bus.events import InboundMessage
 from openharness.channels.bus.queue import MessageBus
 
-from ohmo.gateway.bridge import OhmoGatewayBridge
+from ohmo.gateway.bridge import OhmoGatewayBridge, _coalesce
 
 INTERRUPT_NOTICE = "⏹️ Остановил предыдущую задачу, перехожу к новому сообщению."
 RESET_NOTICE = "🧹 Контекст сброшен — начинаю новую сессию."
@@ -72,9 +72,83 @@ async def test_gateway_bridge_coalesces_burst_into_single_turn():
     # Exactly one coalesced turn covering all 4 texts in order.
     assert len(calls) == 1
     assert calls[0][0] == "m1\n\nm2\n\nm3\n\nm4"
-    # At most one stop notice (here zero, since no prior task was running).
+    # Exactly zero stop notices here: no prior task was running, so the single
+    # coalesced dispatch had nothing to interrupt. (The in-flight interrupt case
+    # — exactly ONE notice — is covered by the dedicated test above.)
     stop_notices = [m for m in outbounds if m.content == INTERRUPT_NOTICE]
-    assert len(stop_notices) <= 1
+    assert len(stop_notices) == 0
+
+
+@pytest.mark.asyncio
+async def test_gateway_bridge_coalesced_burst_interrupts_inflight_with_one_notice():
+    # The headline UX guarantee: with coalescing ON, a burst that arrives while a
+    # turn is already in flight interrupts it with EXACTLY ONE stop notice (not
+    # zero, not N-1) — the coalesced burst is a single dispatch, so a single
+    # interrupt. This is the positive mirror of the window=0 legacy test below,
+    # which proves N messages → N-1 notices.
+    bus = MessageBus()
+    calls: list[str] = []
+    first_running = asyncio.Event()
+    release_first = asyncio.Event()
+
+    class FakeRuntimePool:
+        async def stream_message(self, message, session_key):
+            calls.append(message.content)
+            if message.content == "first":
+                yield SimpleNamespace(kind="progress", text="🤔", metadata={"_progress": True, "_session_key": session_key})
+                first_running.set()
+                await release_first.wait()  # stay in flight until interrupted
+                yield SimpleNamespace(kind="final", text="first-final", metadata={"_session_key": session_key})
+            else:
+                yield SimpleNamespace(kind="final", text="burst-final", metadata={"_session_key": session_key})
+
+    bridge = _make_bridge(bus, FakeRuntimePool(), message_coalesce_window=0.05, message_coalesce_max=20)
+    task = asyncio.create_task(bridge.run())
+    try:
+        # First message → its turn flushes and goes in flight.
+        await bus.publish_inbound(
+            InboundMessage(channel="feishu", sender_id="u1", chat_id="c1", content="first")
+        )
+        await asyncio.wait_for(bus.consume_outbound(), timeout=2.0)  # first progress
+        await asyncio.wait_for(first_running.wait(), timeout=2.0)
+        # Now a 3-message burst within the window interrupts the in-flight turn.
+        for i in range(1, 4):
+            await bus.publish_inbound(
+                InboundMessage(channel="feishu", sender_id="u1", chat_id="c1", content=f"b{i}")
+            )
+        outbounds = await _drain_until_final(bus, final_text="burst-final")
+    finally:
+        release_first.set()
+        bridge.stop()
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    # The burst was coalesced into ONE turn covering all three texts in order.
+    assert calls == ["first", "b1\n\nb2\n\nb3"]
+    # And interrupting the in-flight first turn emitted EXACTLY ONE stop notice.
+    stop_notices = [m for m in outbounds if m.content == INTERRUPT_NOTICE]
+    assert len(stop_notices) == 1
+
+
+def test_coalesce_merges_media_across_burst_in_order():
+    # The design mandates _coalesce merge/concatenate media so nothing is dropped
+    # (forwarding a media block is a primary trigger for this feature). A
+    # regression to media=last.media would silently lose attachments and pass the
+    # text-only tests, so assert the merge directly.
+    m1 = InboundMessage(channel="telegram", sender_id="u1", chat_id="c1", content="see this", media=["a.jpg", "b.jpg"])
+    m2 = InboundMessage(channel="telegram", sender_id="u1", chat_id="c1", content="and this", media=["c.pdf"])
+    coalesced = _coalesce([m1, m2])
+    assert coalesced.content == "see this\n\nand this"
+    assert coalesced.media == ["a.jpg", "b.jpg", "c.pdf"]
+    # Threaded under the LAST message; the merged media is a fresh list.
+    assert coalesced.media is not m1.media
+    assert coalesced.media is not m2.media
+
+
+def test_coalesce_single_message_passes_through_unchanged():
+    only = InboundMessage(channel="telegram", sender_id="u1", chat_id="c1", content="solo", media=["x.png"])
+    assert _coalesce([only]) is only
 
 
 @pytest.mark.asyncio
@@ -225,54 +299,107 @@ async def test_gateway_bridge_new_command_flushes_pending_then_resets():
 
 
 @pytest.mark.asyncio
-async def test_gateway_bridge_special_dispatches_buffer_before_handling():
-    # Direct check of the invariant: when a special message arrives with plain
-    # messages still buffered, _flush_pending dispatches the buffer (coalesced
-    # into one task, in arrival order) BEFORE the special handler runs. Driven
-    # via the public methods so it is deterministic without loop timing.
+async def test_gateway_bridge_synthetic_reminder_flushes_buffer_through_run_loop():
+    # Real-loop check of the no-data-loss invariant. Two plain messages are
+    # buffered, then a synthetic reminder for the SAME session arrives before the
+    # debounce window elapses. The reminder path dispatches its own turn right
+    # after flushing, so unless the run loop waits for the just-flushed buffered
+    # turn to actually run, that not-yet-started task gets cancelled and the
+    # buffered messages are silently dropped. Drive everything through run()/the
+    # bus with the production-default window so the test reflects real scheduling
+    # (the earlier direct-method test inserted an artificial yield the loop does
+    # not have, masking exactly this bug).
     bus = MessageBus()
-    coalesced_content: list[str] = []
-    started = asyncio.Event()
+    streamed: list[str] = []
 
     class FakeRuntimePool:
         async def stream_message(self, message, session_key):
-            coalesced_content.append(message.content)
-            started.set()
-            await asyncio.Event().wait()  # block so the turn is "in flight"
-            yield SimpleNamespace(kind="final", text="ok", metadata={"_session_key": session_key})
+            streamed.append(message.content)
+            yield SimpleNamespace(
+                kind="final", text=f"reply:{message.content}", metadata={"_session_key": session_key}
+            )
 
-        async def reset_session(self, session_key):
-            coalesced_content.append(f"reset:{session_key}")
+        async def reset_session(self, session_key):  # pragma: no cover - unused here
+            streamed.append(f"reset:{session_key}")
 
-    bridge = _make_bridge(bus, FakeRuntimePool(), message_coalesce_window=10.0, message_coalesce_max=20)
-    # Seed the pending buffer as the run loop would for two plain messages.
-    bridge._pending["feishu:c1"] = [
-        InboundMessage(channel="feishu", sender_id="u1", chat_id="c1", content="q1"),
-        InboundMessage(channel="feishu", sender_id="u1", chat_id="c1", content="q2"),
-    ]
-    bridge._pending_deadline["feishu:c1"] = 0.0
+    bridge = _make_bridge(bus, FakeRuntimePool(), message_coalesce_window=0.8, message_coalesce_max=20)
+    task = asyncio.create_task(bridge.run())
     try:
-        # Special path step 1: flush pending so the buffer dispatches first.
-        await bridge._flush_pending("feishu:c1")
-        # The coalesced burst became the in-flight task for this session.
-        assert "feishu:c1" in bridge._session_tasks
-        await asyncio.wait_for(started.wait(), timeout=1.0)
-        # Buffer was emptied; the coalesced (q1+q2) turn is what got dispatched.
-        assert bridge._pending == {}
-        assert coalesced_content == ["q1\n\nq2"]
-        # Step 2: now the special handler runs and interrupts that turn + resets.
-        await bridge._handle_new(
-            InboundMessage(channel="feishu", sender_id="u1", chat_id="c1", content="/new"),
-            "feishu:c1",
+        await bus.publish_inbound(
+            InboundMessage(channel="telegram", sender_id="u1", chat_id="c1", content="p1")
         )
+        await bus.publish_inbound(
+            InboundMessage(channel="telegram", sender_id="u1", chat_id="c1", content="p2")
+        )
+        # Synthetic reminder, same session, BEFORE the 0.8s window elapses.
+        await bus.publish_inbound(
+            InboundMessage(
+                channel="telegram",
+                sender_id="__scheduler__",
+                chat_id="c1",
+                content="reminder!",
+                session_key_override="telegram:c1",
+                metadata={"_synthetic": True},
+            )
+        )
+        await _drain_until_final(bus, final_text="reply:reminder!")
     finally:
         bridge.stop()
-        for _ in range(5):
-            await asyncio.sleep(0)
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
 
-    # Flush-then-handle order is honored: the coalesced burst was dispatched
-    # before the reset ran (no data lost, no reordering).
-    assert coalesced_content == ["q1\n\nq2", "reset:feishu:c1"]
+    # Both turns ran, coalesced burst FIRST then the reminder, in arrival order.
+    assert streamed == ["p1\n\np2", "reminder!"]
+
+
+@pytest.mark.asyncio
+async def test_gateway_bridge_control_command_flushes_buffer_through_run_loop():
+    # Companion to the reminder case for a control command (/new). The buffered
+    # burst must still be dispatched (no data loss) before the reset runs, driven
+    # end-to-end through run()/the bus. Unlike the synthetic path, /new is allowed
+    # to cancel the just-flushed turn — but it is dispatched, so its interrupt
+    # (and at most one stop notice) is exercised, and the reset follows it.
+    bus = MessageBus()
+    events: list[str] = []
+    burst_streaming = asyncio.Event()
+    burst_seen = asyncio.Event()
+
+    class FakeRuntimePool:
+        async def stream_message(self, message, session_key):
+            events.append(f"stream:{message.content}")
+            burst_seen.set()
+            yield SimpleNamespace(kind="progress", text="🤔", metadata={"_progress": True})
+            await burst_streaming.wait()  # keep the turn in flight until released
+            yield SimpleNamespace(kind="final", text="burst-final", metadata={"_session_key": session_key})
+
+        async def reset_session(self, session_key):
+            events.append(f"reset:{session_key}")
+
+    bridge = _make_bridge(bus, FakeRuntimePool(), message_coalesce_window=0.05, message_coalesce_max=20)
+    task = asyncio.create_task(bridge.run())
+    try:
+        await bus.publish_inbound(
+            InboundMessage(channel="feishu", sender_id="u1", chat_id="c1", content="p1")
+        )
+        await bus.publish_inbound(
+            InboundMessage(channel="feishu", sender_id="u1", chat_id="c1", content="p2")
+        )
+        # Wait until the coalesced burst turn is genuinely in flight, then /new.
+        await asyncio.wait_for(burst_seen.wait(), timeout=2.0)
+        await bus.publish_inbound(
+            InboundMessage(channel="feishu", sender_id="u1", chat_id="c1", content="/new")
+        )
+        burst_streaming.set()  # let the burst turn complete/cancel
+        await _drain_until_final(bus, final_text=RESET_NOTICE)
+    finally:
+        bridge.stop()
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    # The buffered burst was streamed exactly once (coalesced) before the reset.
+    assert events == ["stream:p1\n\np2", "reset:feishu:c1"]
 
 
 @pytest.mark.asyncio

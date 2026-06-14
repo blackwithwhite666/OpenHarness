@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import re
@@ -184,9 +185,15 @@ class OhmoGatewayBridge:
             )
 
             if is_special:
-                # Dispatch any buffered plain messages first so nothing is
-                # reordered or lost, THEN handle the special message verbatim.
-                await self._flush_pending(session_key)
+                is_control = stripped in ("/stop", "/restart", "/new", "/clear")
+                # Dispatch any buffered plain messages first (arrival order, no
+                # loss), THEN handle the special message verbatim. Control
+                # commands stop/reset the session, so cancelling the just-flushed
+                # turn is benign — flush without waiting. Synthetic-reminder and
+                # /group paths dispatch their OWN turn right after, which would
+                # else cancel the not-yet-started buffered task before its stream
+                # runs (data loss); wait for that turn to finish first.
+                await self._flush_pending(session_key, wait=not is_control)
                 if stripped == "/stop":
                     await self._handle_stop(message, session_key)
                     continue
@@ -250,13 +257,23 @@ class OhmoGatewayBridge:
             if now >= deadline:
                 await self._flush_pending(session_key)
 
-    async def _flush_pending(self, session_key: str) -> None:
+    async def _flush_pending(self, session_key: str, *, wait: bool = False) -> None:
         buffer = self._pending.pop(session_key, None)
         self._pending_deadline.pop(session_key, None)
         if not buffer:
             return
         message = _coalesce(buffer)
         await self._dispatch(message, session_key)
+        if wait:
+            # Run the just-dispatched buffered turn to completion before
+            # returning, so a special handler that dispatches its own turn next
+            # does not cancel this not-yet-started task and drop the buffered
+            # messages. Shield it so awaiting here never cancels the turn; its
+            # own failures are already logged inside _process_message.
+            task = self._session_tasks.get(session_key)
+            if task is not None:
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await asyncio.shield(task)
 
     def stop(self) -> None:
         self._running = False
