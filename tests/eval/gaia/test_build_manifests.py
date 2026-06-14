@@ -136,3 +136,29 @@ def test_manifest_payload_capability_tags():
     assert caps["a"] == "web-browsing"
     assert caps["b"] == "multi-hop"
     assert caps["c"] == "file-attachment"
+
+
+def test_select_single_split_shape_and_determinism():
+    from tests.eval.gaia.build_manifests import select_single_split
+
+    tasks = _synthetic_tasks({1: 10, 2: 35, 3: 15})  # 2x each -> enough
+    per = {1: 10, 2: 35, 3: 15}
+    rows = select_single_split(tasks, per_level=per, seed=2027)
+    counts = {1: 0, 2: 0, 3: 0}
+    for r in rows:
+        counts[r.level] += 1
+    assert counts == per
+    assert len(rows) == 60
+    # Deterministic by seed; different seed shifts selection.
+    again = select_single_split(tasks, per_level=per, seed=2027)
+    assert [r.task_id for r in rows] == [r.task_id for r in again]
+    other = select_single_split(tasks, per_level=per, seed=99)
+    assert [r.task_id for r in rows] != [r.task_id for r in other]
+
+
+def test_select_single_split_raises_when_too_few():
+    from tests.eval.gaia.build_manifests import select_single_split
+
+    tasks = _synthetic_tasks({1: 3, 2: 3, 3: 3})  # only 6 per level
+    with pytest.raises(ValueError):
+        select_single_split(tasks, per_level={1: 10, 2: 10, 3: 10}, seed=1)

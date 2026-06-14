@@ -644,7 +644,11 @@ def main(argv: Sequence[str] | None = None) -> int:  # pragma: no cover - CLI
             --agent general-purpose --k 3
     """
     parser = argparse.ArgumentParser(description="Run a GAIA subset + score it.")
-    parser.add_argument("--split", choices=["dev", "gate"], default="dev")
+    parser.add_argument(
+        "--split",
+        default="dev",
+        help="Manifest split name -> reads <split>.yaml (dev/gate/bench60/...).",
+    )
     parser.add_argument(
         "--agent",
         default="general-purpose",

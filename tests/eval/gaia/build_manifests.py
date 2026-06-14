@@ -105,6 +105,37 @@ def select_splits(
     return dev, gate
 
 
+def select_single_split(
+    tasks: Sequence[Task],
+    *,
+    per_level: dict[int, int],
+    seed: int = DEFAULT_SEED,
+) -> list[ManifestRow]:
+    """Pick ONE stratified split of ``per_level`` tasks per level, by a fixed seed.
+
+    Same deterministic (sort by task_id -> seeded shuffle -> take first N) selection
+    as :func:`select_splits`, but for a single split with an arbitrary per-level shape
+    (e.g. a hard-weighted ``bench60`` = L1 10 / L2 35 / L3 15). Raises ``ValueError``
+    if a level lacks enough tasks.
+    """
+    rng = random.Random(seed)
+    by_level: dict[int, list[Task]] = {}
+    for task in tasks:
+        by_level.setdefault(task.level, []).append(task)
+
+    rows: list[ManifestRow] = []
+    for level, want in sorted(per_level.items()):
+        pool = list(by_level.get(level, []))
+        if len(pool) < want:
+            raise ValueError(
+                f"Level {level}: need {want} tasks, only {len(pool)} available."
+            )
+        pool.sort(key=lambda t: t.task_id)
+        rng.shuffle(pool)
+        rows.extend(_to_row(t) for t in pool[:want])
+    return rows
+
+
 def _classify_capability(row: ManifestRow) -> str:
     """Heuristic capability tag for the manifest (display/coverage only).
 
@@ -196,11 +227,34 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--out-dir", default=str(_HERE), help="Where to write dev.yaml / gate.yaml."
     )
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
+    parser.add_argument(
+        "--single-name",
+        default=None,
+        help="Emit ONE split with this name (<name>.yaml) instead of dev/gate.",
+    )
+    parser.add_argument(
+        "--per-level",
+        default=None,
+        help="Comma L1,L2,L3 counts for --single-name, e.g. '10,35,15'.",
+    )
     args = parser.parse_args(argv)
 
     snapshot_root = (
         Path(args.snapshot) if args.snapshot else download_gaia_snapshot()
     )
+
+    if args.single_name:
+        l1, l2, l3 = (int(x) for x in (args.per_level or "10,35,15").split(","))
+        tasks = load_validation_tasks(snapshot_root)
+        rows = select_single_split(
+            tasks, per_level={1: l1, 2: l2, 3: l3}, seed=args.seed
+        )
+        path = write_manifest(
+            Path(args.out_dir) / f"{args.single_name}.yaml", args.single_name, rows
+        )
+        print(f"wrote {path} ({len(rows)} tasks: L1={l1} L2={l2} L3={l3}, seed={args.seed})")
+        return 0
+
     dev_path, gate_path = build_and_write(
         snapshot_root, out_dir=args.out_dir, seed=args.seed
     )
