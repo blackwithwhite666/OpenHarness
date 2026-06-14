@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import re
+import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 
@@ -122,6 +124,8 @@ class OhmoGatewayBridge:
         restart_gateway: Callable[[object, str], Awaitable[None] | None] | None = None,
         workspace: str | Path | None = None,
         feishu_group_policy: str = "open",
+        message_coalesce_window: float = 0.0,
+        message_coalesce_max: int = 20,
     ) -> None:
         self._bus = bus
         self._runtime_pool = runtime_pool
@@ -131,13 +135,21 @@ class OhmoGatewayBridge:
         self._running = False
         self._session_tasks: dict[str, asyncio.Task[None]] = {}
         self._session_cancel_reasons: dict[str, str] = {}
+        self._coalesce_window = float(message_coalesce_window)
+        self._coalesce_max = int(message_coalesce_max)
+        self._pending: dict[str, list[InboundMessage]] = {}
+        self._pending_deadline: dict[str, float] = {}
 
     async def run(self) -> None:
         self._running = True
         while self._running:
             try:
-                message = await asyncio.wait_for(self._bus.consume_inbound(), timeout=1.0)
+                message = await asyncio.wait_for(
+                    self._bus.consume_inbound(), timeout=self._next_flush_timeout()
+                )
             except asyncio.TimeoutError:
+                # Flush tick: a buffered burst whose debounce window elapsed.
+                await self._flush_due()
                 continue
             except asyncio.CancelledError:
                 break
@@ -162,38 +174,115 @@ class OhmoGatewayBridge:
                 session_key,
                 _content_snippet(message.content),
             )
-            if message.content.strip() == "/stop":
-                await self._handle_stop(message, session_key)
-                continue
-            if message.content.strip() == "/restart":
-                await self._handle_restart(message, session_key)
-                continue
-            if message.content.strip() in ("/new", "/clear"):
-                await self._handle_new(message, session_key)
-                continue
+
+            stripped = message.content.strip()
             group_args = _parse_group_command(message.content)
-            if group_args is not None:
-                prepared = await self._prepare_group_prompt_message(message, session_key, group_args)
-                if prepared is None:
+            is_synthetic = bool(message.metadata.get("_synthetic")) or message.sender_id == "__scheduler__"
+            is_special = (
+                stripped in ("/stop", "/restart", "/new", "/clear")
+                or group_args is not None
+                or is_synthetic
+            )
+
+            if is_special:
+                is_control = stripped in ("/stop", "/restart", "/new", "/clear")
+                # Dispatch any buffered plain messages first (arrival order, no
+                # loss), THEN handle the special message verbatim. Control
+                # commands stop/reset the session, so cancelling the just-flushed
+                # turn is benign — flush without waiting. Synthetic-reminder and
+                # /group paths dispatch their OWN turn right after, which would
+                # else cancel the not-yet-started buffered task before its stream
+                # runs (data loss); wait for that turn to finish first.
+                await self._flush_pending(session_key, wait=not is_control)
+                if stripped == "/stop":
+                    await self._handle_stop(message, session_key)
                     continue
-                message = prepared
-                session_key = session_key_for_message(message)
-            await self._interrupt_session(
-                session_key,
-                reason="replaced by a newer user message",
-                notify=OutboundMessage(
-                    channel=message.channel,
-                    chat_id=message.chat_id,
-                    content="⏹️ Остановил предыдущую задачу, перехожу к новому сообщению.",
-                    metadata={"_progress": True, "_session_key": session_key},
-                ),
-            )
-            task = asyncio.create_task(
-                self._process_message(message, session_key),
-                name=f"ohmo-session:{session_key}",
-            )
-            self._session_tasks[session_key] = task
-            task.add_done_callback(lambda finished, key=session_key: self._cleanup_task(key, finished))
+                if stripped == "/restart":
+                    await self._handle_restart(message, session_key)
+                    continue
+                if stripped in ("/new", "/clear"):
+                    await self._handle_new(message, session_key)
+                    continue
+                if group_args is not None:
+                    prepared = await self._prepare_group_prompt_message(message, session_key, group_args)
+                    if prepared is None:
+                        continue
+                    message = prepared
+                    session_key = session_key_for_message(message)
+                await self._dispatch(message, session_key)
+                await self._flush_due()
+                continue
+
+            if self._coalesce_window <= 0:
+                # OFF switch: behave exactly like the pre-coalescer code.
+                await self._dispatch(message, session_key)
+                await self._flush_due()
+                continue
+
+            buffer = self._pending.setdefault(session_key, [])
+            buffer.append(message)
+            self._pending_deadline[session_key] = time.monotonic() + self._coalesce_window
+            if len(buffer) >= self._coalesce_max:
+                await self._flush_pending(session_key)
+            await self._flush_due()
+
+    async def _dispatch(self, message: InboundMessage, session_key: str) -> None:
+        await self._interrupt_session(
+            session_key,
+            reason="replaced by a newer user message",
+            notify=OutboundMessage(
+                channel=message.channel,
+                chat_id=message.chat_id,
+                content="⏹️ Остановил предыдущую задачу, перехожу к новому сообщению.",
+                metadata={"_progress": True, "_session_key": session_key},
+            ),
+        )
+        task = asyncio.create_task(
+            self._process_message(message, session_key),
+            name=f"ohmo-session:{session_key}",
+        )
+        self._session_tasks[session_key] = task
+        task.add_done_callback(lambda finished, key=session_key: self._cleanup_task(key, finished))
+
+    def _next_flush_timeout(self) -> float:
+        if not self._pending_deadline:
+            return 1.0
+        now = time.monotonic()
+        remaining = min(deadline - now for deadline in self._pending_deadline.values())
+        return max(0.05, min(remaining, 1.0))
+
+    async def _flush_due(self) -> None:
+        now = time.monotonic()
+        for session_key, deadline in list(self._pending_deadline.items()):
+            if now >= deadline:
+                # Isolate each flush: a dispatch failure for one session must not
+                # kill the run loop or strand other sessions' buffered messages.
+                # ``_flush_pending`` already popped the buffer+deadline, so a
+                # faulted session is not retried in a tight loop.
+                try:
+                    await self._flush_pending(session_key)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception("ohmo reminder flush failed session_key=%s", session_key)
+
+    async def _flush_pending(self, session_key: str, *, wait: bool = False) -> None:
+        buffer = self._pending.pop(session_key, None)
+        self._pending_deadline.pop(session_key, None)
+        if not buffer:
+            return
+        message = _coalesce(buffer)
+        await self._dispatch(message, session_key)
+        if wait:
+            # Run the just-dispatched buffered turn to completion before
+            # returning, so a special handler that dispatches its own turn next
+            # does not cancel this not-yet-started task and drop the buffered
+            # messages. Shield it so awaiting here never cancels the turn; its
+            # own failures are already logged inside _process_message.
+            task = self._session_tasks.get(session_key)
+            if task is not None:
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await asyncio.shield(task)
 
     def stop(self) -> None:
         self._running = False
@@ -467,6 +556,34 @@ def _parse_group_command(content: str) -> str | None:
     if len(parts) == 1:
         return ""
     return parts[1].strip()
+
+
+def _coalesce(messages: list[InboundMessage]) -> InboundMessage:
+    """Merge a burst of same-session plain messages into one turn.
+
+    A single message passes through unchanged. For multiple, text is joined in
+    arrival order; ``media`` (URLs/paths) is concatenated so nothing is dropped;
+    channel/chat/sender/metadata are taken from the LAST message so the reply
+    threads under the most recent one. All messages share a ``session_key``
+    (which encodes sender for shared chats), so senders are never merged.
+    """
+    if len(messages) == 1:
+        return messages[0]
+    last = messages[-1]
+    content = "\n\n".join(m.content for m in messages)
+    media: list[str] = []
+    for m in messages:
+        media.extend(m.media)
+    return InboundMessage(
+        channel=last.channel,
+        sender_id=last.sender_id,
+        chat_id=last.chat_id,
+        content=content,
+        timestamp=last.timestamp,
+        media=media,
+        metadata=dict(last.metadata),
+        session_key_override=last.session_key_override,
+    )
 
 
 def _build_group_agent_prompt(raw_request: str) -> str:
