@@ -89,6 +89,13 @@ class ReminderScheduler:
         next_fire_at = self._next_after(reminder, now)
         async with self._lock:
             if next_fire_at is None:
+                if reminder.rrule is None and reminder.last_fired_at is None:
+                    logger.warning(
+                        "ohmo reminder one-shot missed during downtime and dropped "
+                        "without delivery (catchup=none) id=%s summary=%r",
+                        reminder.id,
+                        reminder.summary,
+                    )
                 self._store.set_status(reminder.id, "done")
             else:
                 refreshed = self._store.get(reminder.id)

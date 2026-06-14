@@ -144,17 +144,35 @@ class TestHelpers:
         assert parsed.utcoffset() == timedelta(hours=5)
 
     def test_next_fire_times_returns_three(self) -> None:
+        after = datetime(2026, 6, 14, 10, 0, tzinfo=MSK)
         reminder = _reminder(rrule="FREQ=DAILY")
-        times = next_fire_times(reminder, 3)
+        times = next_fire_times(reminder, 3, after=after)
         assert len(times) == 3
         assert times == sorted(times)
+        assert all(dt > after for dt in times)
         for dt in times:
             assert (dt.hour, dt.minute) == (9, 0)
 
-    def test_next_fire_times_one_shot(self) -> None:
+    def test_next_fire_times_skips_past_recurring(self) -> None:
+        # dtstart well in the past: confirmation must only show FUTURE occurrences,
+        # staying consistent with the stored next_fire_at (no past times leaked).
+        after = datetime(2026, 6, 14, 10, 0, tzinfo=MSK)
+        reminder = _reminder(rrule="FREQ=DAILY", dtstart="2026-06-01T09:00:00+03:00")
+        times = next_fire_times(reminder, 3, after=after)
+        assert len(times) == 3
+        assert all(dt > after for dt in times)
+
+    def test_next_fire_times_one_shot_future(self) -> None:
+        after = datetime(2026, 6, 14, 8, 0, tzinfo=MSK)  # before the 09:00 dtstart
         reminder = _reminder(rrule=None)
-        times = next_fire_times(reminder, 3)
+        times = next_fire_times(reminder, 3, after=after)
         assert len(times) == 1
+
+    def test_next_fire_times_one_shot_past_empty(self) -> None:
+        after = datetime(2026, 6, 14, 10, 0, tzinfo=MSK)  # after the 09:00 dtstart
+        reminder = _reminder(rrule=None)
+        times = next_fire_times(reminder, 3, after=after)
+        assert times == []
 
 
 class TestValidation:

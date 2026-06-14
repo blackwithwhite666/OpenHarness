@@ -113,18 +113,22 @@ def compute_next_fire(
     return occurrence.timestamp()
 
 
-def next_fire_times(reminder: Reminder, count: int = 3) -> list[datetime]:
-    """Return up to ``count`` upcoming local-tz fire datetimes (for confirmations)."""
+def next_fire_times(
+    reminder: Reminder, count: int = 3, *, after: datetime | None = None
+) -> list[datetime]:
+    """Return up to ``count`` upcoming local-tz fire datetimes (for confirmations).
+
+    Only occurrences strictly after ``after`` (default: now) are returned, so the
+    confirmation never shows a fire time that is already in the past and stays
+    consistent with the stored ``next_fire_at`` (which the scheduler computes the
+    same way, after=now). A one-shot already in the past yields ``[]``.
+    """
     if count <= 0:
         return []
     tzinfo = ZoneInfo(reminder.tz)
+    after_local = (after or datetime.now(tzinfo)).astimezone(tzinfo)
     dtstart_local = parse_dtstart(reminder.dtstart, reminder.tz).astimezone(tzinfo)
     if reminder.rrule is None:
-        return [dtstart_local]
+        return [dtstart_local] if dtstart_local > after_local else []
     rule = rrulestr(reminder.rrule, dtstart=dtstart_local)
-    times: list[datetime] = []
-    for occurrence in rule:
-        times.append(occurrence.astimezone(tzinfo))
-        if len(times) >= count:
-            break
-    return times
+    return [occ.astimezone(tzinfo) for occ in rule.xafter(after_local, count=count, inc=False)]

@@ -829,7 +829,9 @@ class OhmoSessionRuntimePool:
                 max_per_chat=self._reminder_max_per_chat,
             )
         )
-        registry.register(RemindListTool(self._reminder_store, self._reminder_lock))
+        registry.register(
+            RemindListTool(self._reminder_store, self._reminder_lock, default_tz=self._default_tz)
+        )
         registry.register(RemindCancelTool(self._reminder_store, self._reminder_lock))
 
     def _register_group_tool(self, bundle: RuntimeBundle) -> None:

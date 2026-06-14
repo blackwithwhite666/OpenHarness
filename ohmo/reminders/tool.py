@@ -192,7 +192,7 @@ class RemindCreateTool(BaseTool):
             )
             self._store.add(reminder)
 
-        upcoming = next_fire_times(reminder, 3)
+        upcoming = next_fire_times(reminder, 3, after=now)
         fire_lines = "\n".join(f"  - {dt.isoformat()}" for dt in upcoming) or "  (none)"
         kind = "recurring" if reminder.rrule else "one-shot"
         return ToolResult(
@@ -212,9 +212,10 @@ class RemindListTool(BaseTool):
     )
     input_model = RemindListInput
 
-    def __init__(self, store: ReminderStore, lock: asyncio.Lock) -> None:
+    def __init__(self, store: ReminderStore, lock: asyncio.Lock, *, default_tz: str) -> None:
         self._store = store
         self._lock = lock
+        self._default_tz = default_tz
 
     def is_read_only(self, arguments: BaseModel) -> bool:
         del arguments
@@ -227,7 +228,7 @@ class RemindListTool(BaseTool):
         ctx = context.metadata.get(_CTX_KEY)
         if not ctx:
             return _missing_ctx()
-        tz = ctx.get("tz") or "Europe/Moscow"
+        tz = ctx.get("tz") or self._default_tz
         # Include paused reminders (marked) so a reminder paused by a blocked
         # delivery stays visible and the user can cancel it — otherwise it would
         # be silently invisible with no recovery path.

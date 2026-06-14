@@ -232,3 +232,32 @@ async def test_catchup_oneshot_past_fires_once_done() -> None:
     r = store.get("r1")
     assert r.status == "done"
     assert r.fire_count == 1
+
+
+async def test_catchup_none_oneshot_dropped_without_delivery() -> None:
+    # A one-shot missed during downtime under catchup='none' is dropped (-> done)
+    # without ever firing; it must not be delivered and never counts as fired.
+    store = ReminderStore()
+    store.add(_reminder("r1", rrule=None, next_fire_at=NOW - 3600))
+    bus = FakeBus()
+    sched = _make_scheduler(bus, store, catchup="none")
+
+    await sched._catchup()
+
+    assert len(bus.outbound) == 0
+    r = store.get("r1")
+    assert r.status == "done"
+    assert r.fire_count == 0
+
+
+def test_invalid_reminder_catchup_rejected() -> None:
+    # GatewayConfig fails fast on an unknown catchup mode instead of silently
+    # degrading to no-catch-up.
+    from pydantic import ValidationError
+
+    from ohmo.gateway.models import GatewayConfig
+
+    GatewayConfig(reminder_catchup="once")  # valid
+    GatewayConfig(reminder_catchup="none")  # valid
+    with pytest.raises(ValidationError):
+        GatewayConfig(reminder_catchup="always")

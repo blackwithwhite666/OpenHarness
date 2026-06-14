@@ -123,7 +123,7 @@ async def test_list_scoped_to_chat(tmp_path: Path) -> None:
         RemindCreateInput(summary="chat-200", dtstart=_future_iso()),
         _ctx(_reminder_ctx(chat_id="200"), tmp_path),
     )
-    list_tool = RemindListTool(store, lock)
+    list_tool = RemindListTool(store, lock, default_tz="Europe/Moscow")
     result = await list_tool.execute(RemindListInput(), _ctx(_reminder_ctx(chat_id="100"), tmp_path))
     assert "chat-100" in result.output
     assert "chat-200" not in result.output
