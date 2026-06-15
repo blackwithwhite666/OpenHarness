@@ -571,7 +571,11 @@ def memory_add_cmd(
     content: str = typer.Argument(...),
     workspace: str | None = typer.Option(None, "--workspace", help=_WORKSPACE_HELP),
 ) -> None:
-    path = add_memory_entry(workspace, title, content)
+    try:
+        path = add_memory_entry(workspace, title, content)
+    except ValueError as exc:  # safety-scan / size refusal
+        print(str(exc), file=sys.stderr)
+        raise typer.Exit(1)
     print(f"Added memory entry {path.name}")
 
 

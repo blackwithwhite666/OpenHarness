@@ -8,6 +8,7 @@ from openharness.memory import load_memory_prompt as load_project_memory_prompt
 from openharness.prompts.system_prompt import get_base_system_prompt
 
 from ohmo.memory import load_memory_prompt as load_ohmo_memory_prompt
+from ohmo.threat_patterns import scan_for_threats
 from ohmo.workspace import (
     get_bootstrap_path,
     get_identity_path,
@@ -24,6 +25,25 @@ def _read_text(path: Path) -> str | None:
     return content or None
 
 
+def _read_text_scanned(path: Path, label: str) -> str | None:
+    """Read a persona/context file, replacing it with a placeholder if it carries
+    an injection/exfil payload — these go verbatim into the always-on system
+    prompt, so a file poisoned on disk (compromised tool / sister session) must
+    not pass through. Scope "all" is the low-FP subset, so legitimate persona
+    phrasings ("you are ohmo, …") are not falsely blanked. The file is left intact.
+    """
+    content = _read_text(path)
+    if content is None:
+        return None
+    findings = scan_for_threats(content, scope="all")
+    if findings:
+        return (
+            f"[BLOCKED: {label} contained threat pattern(s): {', '.join(findings)}. "
+            f"Edit the file to remove it.]"
+        )
+    return content
+
+
 def build_ohmo_system_prompt(
     cwd: str | Path,
     *,
@@ -38,19 +58,19 @@ def build_ohmo_system_prompt(
     if extra_prompt:
         sections.extend(["# Additional Instructions", extra_prompt.strip()])
 
-    soul = _read_text(get_soul_path(root))
+    soul = _read_text_scanned(get_soul_path(root), "soul.md")
     if soul:
         sections.extend(["# ohmo Soul", soul])
 
-    identity = _read_text(get_identity_path(root))
+    identity = _read_text_scanned(get_identity_path(root), "identity.md")
     if identity:
         sections.extend(["# ohmo Identity", identity])
 
-    user = _read_text(get_user_path(root))
+    user = _read_text_scanned(get_user_path(root), "user.md")
     if user:
         sections.extend(["# User Profile", user])
 
-    bootstrap = _read_text(get_bootstrap_path(root))
+    bootstrap = _read_text_scanned(get_bootstrap_path(root), "BOOTSTRAP.md")
     if bootstrap:
         sections.extend(["# First-Run Bootstrap", bootstrap])
 

@@ -29,6 +29,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
+from ohmo.threat_patterns import first_threat_message
 from ohmo.workspace import get_memory_dir, get_memory_index_path
 
 # Defaults are env-tunable. The per-entry cap matches the 4000-char body
@@ -40,6 +41,7 @@ DEFAULT_ENTRY_CHAR_LIMIT = 4000
 DEFAULT_STORE_CHAR_BUDGET = 24000
 _INDEX_HEADER = "# Memory Index"
 _MAX_SLUG_LEN = 80
+_MAX_TITLE_CHARS = 256  # bound the (otherwise unbounded) title fed to the scanner
 # The index basename (MEMORY.md) is reserved — never treat it as an entry. Compared
 # case-insensitively so a "Memory"-titled entry can't collide with it on a
 # case-insensitive filesystem (macOS).
@@ -196,13 +198,21 @@ class MemoryStore:
         if not content:
             return MemoryOpResult(False, "Content cannot be empty.")
 
+        # Bound the inputs BEFORE scanning (the scanner is O(n^2) on hostile input).
         limit = self._entry_char_limit
+        if len(title) > _MAX_TITLE_CHARS:
+            return MemoryOpResult(False, f"Title is too long ({len(title)} chars; max {_MAX_TITLE_CHARS}).")
         if len(content) > limit:
             return MemoryOpResult(
                 False,
                 f"Entry is {len(content):,} chars, over the {limit:,}-char per-entry limit. "
                 f"Split it into focused entries or shorten it.",
             )
+
+        # Safety scan (inputs bounded above) before anything reaches disk / the prompt.
+        threat = first_threat_message(f"{title}\n{content}", scope="strict")
+        if threat:
+            return MemoryOpResult(False, threat)
 
         slug = slugify(title)
         name = f"{slug}.md"
@@ -250,17 +260,22 @@ class MemoryStore:
         content = (content or "").strip()
         if not content:
             return MemoryOpResult(False, "Content cannot be empty.")
-        path = self._resolve_path(name)
-        if path is None or not path.exists():
-            return MemoryOpResult(False, f"No memory entry {name!r}. Use action='add' to create it.")
-
+        # Bound inputs BEFORE scanning (ReDoS guard).
         limit = self._entry_char_limit
+        if title and len(title) > _MAX_TITLE_CHARS:
+            return MemoryOpResult(False, f"Title is too long ({len(title)} chars; max {_MAX_TITLE_CHARS}).")
         if len(content) > limit:
             return MemoryOpResult(
                 False,
                 f"Entry is {len(content):,} chars, over the {limit:,}-char per-entry limit. "
                 f"Shorten it or split into focused entries.",
             )
+        threat = first_threat_message(f"{title or ''}\n{content}", scope="strict")
+        if threat:
+            return MemoryOpResult(False, threat)
+        path = self._resolve_path(name)
+        if path is None or not path.exists():
+            return MemoryOpResult(False, f"No memory entry {name!r}. Use action='add' to create it.")
 
         # Budget check on the delta (the new content replaces the old).
         old_len = len(path.read_text(encoding="utf-8", errors="replace").strip())
@@ -299,6 +314,16 @@ class MemoryStore:
         """
         title = (title or "").strip()
         content = (content or "").strip()
+        if len(title) > _MAX_TITLE_CHARS or len(content) > self._entry_char_limit:
+            raise ValueError(
+                f"Memory entry too large (title <= {_MAX_TITLE_CHARS}, content <= "
+                f"{self._entry_char_limit} chars)."
+            )
+        # Human path (/memory + CLI) — trusted owner; scan the low-FP "all" subset
+        # (classic injection + exfiltration) rather than the aggressive "strict" set.
+        threat = first_threat_message(f"{title}\n{content}", scope="all")
+        if threat:
+            raise ValueError(threat)
         slug = slugify(title)
         if f"{slug}.md".lower() in _RESERVED_NAMES:
             slug = f"{slug}_note"

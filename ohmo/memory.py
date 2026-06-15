@@ -7,6 +7,7 @@ from pathlib import Path
 from openharness.commands import MemoryCommandBackend
 
 from ohmo.memory_store import MemoryStore
+from ohmo.threat_patterns import scan_for_threats
 from ohmo.workspace import get_memory_dir, get_memory_index_path
 
 
@@ -44,14 +45,36 @@ def load_memory_prompt(workspace: str | Path | None = None, *, max_files: int = 
     ]
 
     if index_path.exists():
-        index_lines = index_path.read_text(encoding="utf-8").splitlines()[:200]
+        # Render scope is "all" (classic injection + exfil): it is <= every write
+        # scope (model tool=strict, /memory=all), so an accepted entry always
+        # renders (no accepted-but-hidden), while persona-style phrasings that
+        # only trip the broader "strict"/"context" sets are not falsely blanked.
+        index_lines = [
+            "[BLOCKED: index line contained a threat pattern]"
+            if scan_for_threats(ln, scope="all")
+            else ln
+            for ln in index_path.read_text(encoding="utf-8").splitlines()[:200]
+        ]
         lines.extend(["", "## MEMORY.md", "```md", *index_lines, "```"])
 
+    # Snapshot-time defense-in-depth: a memory entry written on disk by a
+    # compromised tool / sister session (bypassing the write-time scan) must not
+    # be injected verbatim. Replace a tripped entry with a placeholder; the
+    # on-disk file is left intact so the agent can read/remove it via the tool.
     for path in list_memory_files(workspace)[:max_files]:
         content = path.read_text(encoding="utf-8", errors="replace").strip()
         if not content:
             continue
-        lines.extend(["", f"## {path.name}", "```md", content[:4000], "```"])
+        findings = scan_for_threats(content, scope="all")
+        if findings:
+            body = (
+                f"[BLOCKED: {path.name} contained threat pattern(s): "
+                f"{', '.join(findings)}. Removed from the prompt; use the memory tool "
+                f"(action='get'/'remove') to inspect or delete it.]"
+            )
+        else:
+            body = content[:4000]
+        lines.extend(["", f"## {path.name}", "```md", body, "```"])
 
     return "\n".join(lines)
 
