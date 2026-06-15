@@ -157,3 +157,59 @@ async def test_tool_unknown_action_errors(tmp_path: Path):
     tool = OhmoMemoryTool(MemoryStore(tmp_path))
     res = await tool.execute(OhmoMemoryToolInput(action="frobnicate"), _ctx(tmp_path))
     assert res.is_error and "unknown action" in res.output.lower()
+
+
+async def test_tool_update_forwards_title_relabels_index(tmp_path: Path):
+    tool = OhmoMemoryTool(MemoryStore(tmp_path))
+    await tool.execute(OhmoMemoryToolInput(action="add", title="tz", content="UTC"), _ctx(tmp_path))
+    await tool.execute(
+        OhmoMemoryToolInput(action="update", name="tz", title="TZ MSK", content="MSK"), _ctx(tmp_path)
+    )
+    index = (tmp_path / "memory" / "MEMORY.md").read_text()
+    assert "[TZ MSK](tz.md)" in index and index.count("(tz.md)") == 1
+
+
+# ---------------------- legacy /memory + CLI path (routed via store) ---------
+def test_legacy_add_substring_names_both_get_index_lines(tmp_path: Path):
+    # Regression: naive substring dedup dropped 'a.md' when '(ba.md)' was indexed.
+    add_memory_entry(tmp_path, "ba", "x")
+    add_memory_entry(tmp_path, "a", "y")
+    index = (tmp_path / "memory" / "MEMORY.md").read_text()
+    assert index.count("(ba.md)") == 1
+    assert index.count("(a.md)") == 1
+
+
+def test_legacy_add_memory_title_does_not_clobber_index(tmp_path: Path):
+    # Regression: a "Memory" title slugged to memory.md ≡ MEMORY.md (case-insensitive
+    # FS) and overwrote the index. Now it falls back to memory_note.md.
+    add_memory_entry(tmp_path, "tz", "UTC")
+    add_memory_entry(tmp_path, "Memory", "should not clobber the index")
+    index = (tmp_path / "memory" / "MEMORY.md").read_text()
+    assert "# Memory Index" in index  # header intact
+    assert "(tz.md)" in index  # prior link intact
+    assert "should not clobber the index" not in index  # body not written into the index
+    assert (tmp_path / "memory" / "memory_note.md").exists()
+
+
+def test_store_update_relabels_index(tmp_path: Path):
+    store = MemoryStore(tmp_path)
+    store.add("tz", "UTC")
+    assert store.update("tz", "MSK", title="Timezone (MSK)").ok
+    index = (tmp_path / "memory" / "MEMORY.md").read_text()
+    assert "[Timezone (MSK)](tz.md)" in index and index.count("(tz.md)") == 1
+
+
+def test_store_update_budget_overflow(tmp_path: Path):
+    store = MemoryStore(tmp_path, entry_char_limit=1000, store_char_budget=30)
+    store.add("a", "x" * 20)
+    r = store.update("a", "y" * 40)  # 40 > 30 budget
+    assert not r.ok and "this turn" in r.message.lower()
+
+
+def test_entry_paths_skips_symlinks(tmp_path: Path):
+    store = MemoryStore(tmp_path)
+    store.add("real", "content")
+    memory_dir = tmp_path / "memory"
+    (memory_dir / "evil.md").symlink_to(tmp_path / "outside.md")
+    names = {p.name for p in store.entry_paths()}
+    assert "real.md" in names and "evil.md" not in names

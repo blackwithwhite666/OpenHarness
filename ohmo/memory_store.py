@@ -54,8 +54,8 @@ def slugify(title: str) -> str:
 
     ``\\w`` is Unicode-aware for ``str`` patterns in Python 3, so Cyrillic /
     accented letters survive (``"Café заметки"`` → ``café_заметки``) instead of
-    collapsing to the ``"memory"`` fallback. Empty/symbol-only titles fall back
-    to ``"memory"``.
+    collapsing to a single fallback slug. Empty/symbol-only titles fall back to
+    ``"note"`` (not ``"memory"`` — that would collide with the reserved index).
     """
     slug = re.sub(r"[^\w]+", "_", title.strip().lower()).strip("_")
     # Fallback is "note", NOT "memory", so a degenerate title can't collide with
@@ -116,16 +116,23 @@ class MemoryStore:
                     titles[m.group("name").strip()] = m.group("title").strip()
         return titles
 
-    def _entry_files(self) -> list[Path]:
+    def entry_paths(self) -> list[Path]:
+        """Entry file paths — excludes the MEMORY.md index and symlinks (a symlink
+        planted in the dir must not be read/injected into the system prompt)."""
         memory_dir = self._dir()
         if not memory_dir.exists():
             return []
-        return sorted(p for p in memory_dir.glob("*.md") if p.name.lower() not in _RESERVED_NAMES)
+        files = [
+            p
+            for p in memory_dir.glob("*.md")
+            if p.name.lower() not in _RESERVED_NAMES and not p.is_symlink()
+        ]
+        return sorted(files)
 
     def list(self) -> list[MemoryEntry]:
         titles = self._index_titles()
         entries: list[MemoryEntry] = []
-        for path in self._entry_files():
+        for path in self.entry_paths():
             content = path.read_text(encoding="utf-8", errors="replace").strip()
             entries.append(
                 MemoryEntry(
@@ -280,6 +287,29 @@ class MemoryStore:
         self._drop_index(filename)
         return MemoryOpResult(True, f"Removed memory {filename}.")
 
+    def add_legacy(self, title: str, content: str) -> Path:
+        """Permissive writer for the ``/memory`` slash command + CLI.
+
+        Unlike :meth:`add`, it always writes and returns the path (no dedup or
+        budget refusal — a human asked for it), but it is unicode-safe and never
+        clobbers the reserved ``MEMORY.md`` index (a reserved slug falls back to
+        ``<slug>_note``), and the index link is upserted per-line (correct label
+        on re-add). This keeps ``/memory`` on the same disciplined index path as
+        the model tool, eliminating the legacy substring-dedup / clobber bugs.
+        """
+        title = (title or "").strip()
+        content = (content or "").strip()
+        slug = slugify(title)
+        if f"{slug}.md".lower() in _RESERVED_NAMES:
+            slug = f"{slug}_note"
+        name = f"{slug}.md"
+        memory_dir = self._dir()
+        memory_dir.mkdir(parents=True, exist_ok=True)
+        path = memory_dir / name
+        path.write_text(content + "\n", encoding="utf-8")
+        self._upsert_index(name, title or slug)
+        return path
+
     # -- index management ---------------------------------------------------
     def _read_index_lines(self) -> list[str]:
         index = self._index_path()
@@ -306,12 +336,12 @@ class MemoryStore:
         self._write_index_lines(lines)
 
     def _drop_index(self, name: str) -> None:
-        lines = self._read_index_lines()
-        kept = [
-            line
-            for line in lines
-            if not (_LINK_RE.match(line) and _LINK_RE.match(line).group("name").strip() == name)  # type: ignore[union-attr]
-        ]
+        kept: list[str] = []
+        for line in self._read_index_lines():
+            m = _LINK_RE.match(line)
+            if m and m.group("name").strip() == name:
+                continue
+            kept.append(line)
         self._write_index_lines(kept)
 
 

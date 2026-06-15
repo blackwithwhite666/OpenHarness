@@ -6,46 +6,28 @@ from pathlib import Path
 
 from openharness.commands import MemoryCommandBackend
 
-from ohmo.memory_store import slugify
+from ohmo.memory_store import MemoryStore
 from ohmo.workspace import get_memory_dir, get_memory_index_path
 
 
 def list_memory_files(workspace: str | Path | None = None) -> list[Path]:
-    """List ``.ohmo`` memory markdown files."""
-    memory_dir = get_memory_dir(workspace)
-    return sorted(path for path in memory_dir.glob("*.md") if path.name != "MEMORY.md")
+    """List ``.ohmo`` memory markdown files (excludes the index + symlinks)."""
+    return MemoryStore(workspace).entry_paths()
 
 
 def add_memory_entry(workspace: str | Path | None, title: str, content: str) -> Path:
-    """Create a personal memory file and append it to ``MEMORY.md``."""
-    memory_dir = get_memory_dir(workspace)
-    memory_dir.mkdir(parents=True, exist_ok=True)
-    slug = slugify(title)
-    path = memory_dir / f"{slug}.md"
-    path.write_text(content.strip() + "\n", encoding="utf-8")
+    """Create/overwrite a personal memory file and upsert it in ``MEMORY.md``.
 
-    index_path = get_memory_index_path(workspace)
-    existing = index_path.read_text(encoding="utf-8") if index_path.exists() else "# Memory Index\n"
-    if path.name not in existing:
-        existing = existing.rstrip() + f"\n- [{title}]({path.name})\n"
-        index_path.write_text(existing, encoding="utf-8")
-    return path
+    Routed through :class:`MemoryStore` so the ``/memory`` slash command + CLI
+    share its discipline: unicode-safe slug, per-line index upsert (no naive
+    substring dedup), and no clobbering of the reserved ``MEMORY.md`` index.
+    """
+    return MemoryStore(workspace).add_legacy(title, content)
 
 
 def remove_memory_entry(workspace: str | Path | None, name: str) -> bool:
     """Delete a memory file and remove its index entry."""
-    memory_dir = get_memory_dir(workspace)
-    matches = [path for path in memory_dir.glob("*.md") if path.stem == name or path.name == name]
-    if not matches:
-        return False
-    path = matches[0]
-    path.unlink(missing_ok=True)
-
-    index_path = get_memory_index_path(workspace)
-    if index_path.exists():
-        lines = [line for line in index_path.read_text(encoding="utf-8").splitlines() if path.name not in line]
-        index_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
-    return True
+    return MemoryStore(workspace).remove(name).ok
 
 
 def load_memory_prompt(workspace: str | Path | None = None, *, max_files: int = 5) -> str | None:

@@ -31,7 +31,10 @@ class OhmoMemoryToolInput(BaseModel):
     )
     title: str = Field(
         default="",
-        description="For action='add': a short title; it also names the entry file.",
+        description=(
+            "For action='add': a short title that also names the entry file. "
+            "For action='update': optional new index label for the entry."
+        ),
     )
     name: str = Field(
         default="",
@@ -93,7 +96,9 @@ class OhmoMemoryTool(BaseTool):
         if action == "update":
             if not arguments.name.strip():
                 return ToolResult(output="Provide 'name' for action='update'.", is_error=True)
-            return self._result(self._store.update(arguments.name, arguments.content))
+            return self._result(
+                self._store.update(arguments.name, arguments.content, title=arguments.title or None)
+            )
 
         if action == "remove":
             if not arguments.name.strip():
