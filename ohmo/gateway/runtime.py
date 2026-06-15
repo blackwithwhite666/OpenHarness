@@ -601,6 +601,30 @@ class OhmoSessionRuntimePool:
             )
             return
         if isinstance(event, ToolExecutionStarted):
+            # The assistant text accumulated so far is THIS turn's interstitial
+            # narration (a preamble said right before the tool call), not the
+            # final answer. Surface it live as a "reasoning" (🧠) progress
+            # message and drop it from reply_parts. Without this, consecutive
+            # tool-using turns' narration concatenated into the final reply with
+            # no separator ("…tickets_info.Сейчас…"); now reply_parts is left
+            # holding only the last, tool-free turn — the actual answer. Engine
+            # order guarantees AssistantTurnComplete is yielded before the first
+            # ToolExecutionStarted (see engine/query.py), so the
+            # `and not reply_parts` fallback below has already run for this turn.
+            pending_reasoning = "".join(reply_parts).strip()
+            if pending_reasoning:
+                reply_parts.clear()
+                yield GatewayStreamUpdate(
+                    kind="progress",
+                    text=_format_channel_progress(
+                        channel=message.channel,
+                        kind="reasoning",
+                        text=pending_reasoning,
+                        session_key=session_key,
+                        content=content,
+                    ),
+                    metadata={"_progress": True, "_session_key": session_key},
+                )
             summary = _summarize_tool_input(event.tool_name, event.tool_input)
             logger.info(
                 "ohmo runtime tool start session_key=%s session_id=%s tool=%s summary=%r",
@@ -1131,6 +1155,13 @@ def _format_channel_progress(
         phrases = _CHANNEL_THINKING_PHRASES if prefers_chinese else _CHANNEL_THINKING_PHRASES_EN
         idx = int(hashlib.sha256(seed).hexdigest(), 16) % len(phrases)
         return phrases[idx]
+    if kind == "reasoning":
+        # The model's own interstitial narration before a tool call, shown live
+        # with a thinking marker. Unlike "thinking" (a canned placeholder), the
+        # text is the model's real words — pass it through verbatim (it is
+        # already in the user's language) under a single 🧠 prefix.
+        normalized = text.strip()
+        return normalized if normalized.startswith("🧠") else f"🧠 {normalized}"
     if kind == "tool_hint":
         if prefers_chinese:
             if text.startswith("Using "):
