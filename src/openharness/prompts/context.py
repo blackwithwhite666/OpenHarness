@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Iterable
 
@@ -16,7 +17,41 @@ from openharness.memory import find_relevant_memories, load_memory_prompt
 from openharness.personalization.rules import load_local_rules
 from openharness.prompts.claudemd import load_claude_md_prompt
 from openharness.prompts.system_prompt import build_system_prompt
+from openharness.services.token_estimation import estimate_tokens
 from openharness.skills.loader import load_skill_registry
+
+
+# The local environment rules file (~/.openharness/local_rules/rules.md) is
+# auto-generated from session history and can grow without bound (tool-artifact
+# paths, harvested IPs, scheduled-job dumps, etc.), dominating the system prompt
+# — a runaway 354 KB / ~97k-token rules.md once left a long session no room and
+# triggered context_length_exceeded. Cap how much of it is injected. Tunable via
+# OPENHARNESS_LOCAL_RULES_MAX_TOKENS; <= 0 disables the cap.
+DEFAULT_LOCAL_RULES_MAX_TOKENS = 10_000
+
+
+def _local_rules_token_budget() -> int:
+    raw = os.environ.get("OPENHARNESS_LOCAL_RULES_MAX_TOKENS")
+    if raw is None:
+        return DEFAULT_LOCAL_RULES_MAX_TOKENS
+    try:
+        return int(raw)
+    except ValueError:
+        return DEFAULT_LOCAL_RULES_MAX_TOKENS
+
+
+def _truncate_to_token_budget(text: str, max_tokens: int) -> str:
+    """Head-truncate ``text`` to ~``max_tokens`` (estimate_tokens == ceil(utf8_bytes / 4))."""
+    if max_tokens <= 0 or estimate_tokens(text) <= max_tokens:
+        return text
+    clipped = text.encode("utf-8")[: max_tokens * 4].decode("utf-8", errors="ignore")
+    newline = clipped.rfind("\n")
+    if newline > 0:
+        clipped = clipped[:newline]
+    return clipped.rstrip() + (
+        f"\n\n… [truncated to ~{max_tokens} tokens — local environment rules are "
+        "auto-generated from session history and exceeded the budget]"
+    )
 
 
 def _build_skills_section(
@@ -122,6 +157,7 @@ def build_runtime_system_prompt(
 
     local_rules = load_local_rules()
     if local_rules:
+        local_rules = _truncate_to_token_budget(local_rules, _local_rules_token_budget())
         sections.append(f"# Local Environment Rules\n\n{local_rules}")
 
     for title, path in (
