@@ -635,3 +635,86 @@ def test_should_autocompact_uses_custom_context_window():
         AutoCompactState(),
         context_window_tokens=4000,
     ) is True
+
+
+def test_token_estimation_counts_cyrillic_by_bytes():
+    # ASCII is 1 byte/char, so the ~4 chars/token heuristic is unchanged.
+    assert estimate_tokens("abcd") == 1
+    # Cyrillic is 2 UTF-8 bytes/char — it must NOT be under-counted as chars/4,
+    # or Russian sessions blow past the context window before compaction fires.
+    assert estimate_tokens("привет") == 3        # 12 bytes -> (12+3)//4
+    assert estimate_tokens("я" * 100) == 50      # 200 bytes -> (200+3)//4
+    russian = "контекстное окно" * 100
+    assert estimate_tokens(russian) > (len(russian) + 3) // 4  # denser than chars/4
+
+
+def _mcp_snapshot_pairs(count: int) -> list[ConversationMessage]:
+    messages: list[ConversationMessage] = []
+    for index in range(count):
+        tool_id = f"toolu_snapshot_{index}"
+        messages.extend(
+            [
+                ConversationMessage(
+                    role="assistant",
+                    content=[ToolUseBlock(id=tool_id, name="mcp__playwright__browser_snapshot", input={})],
+                ),
+                ConversationMessage(
+                    role="user",
+                    content=[ToolResultBlock(tool_use_id=tool_id, content=f"snapshot {index} " * 600, is_error=False)],
+                ),
+            ]
+        )
+    return messages
+
+
+@pytest.mark.asyncio
+async def test_auto_compact_reactive_force_escalates_past_microcompact(monkeypatch):
+    # Reactive run (force=True — the provider already rejected the prompt as too
+    # long). Even when the (under-counting) estimator says we're under threshold,
+    # a small microcompact saving must NOT short-circuit: we must escalate to the
+    # full LLM compaction, or the retry hits a hard context_length_exceeded.
+    monkeypatch.setattr("openharness.services.compact.try_session_memory_compaction", lambda *args, **kwargs: None)
+    monkeypatch.setattr("openharness.services.compact.should_autocompact", lambda *args, **kwargs: False)
+
+    messages = _mcp_snapshot_pairs(8)  # > DEFAULT_KEEP_RECENT so microcompact frees > 0
+
+    result, was_compacted = await auto_compact_if_needed(
+        messages,
+        api_client=_CompactApiClient(["<summary>condensed</summary>"]),
+        model="claude-sonnet-4-6",
+        state=AutoCompactState(),
+        force=True,
+    )
+
+    assert was_compacted is True
+    # full compaction ran (boundary marker prepended), not just microcompact
+    assert result[0].text.startswith("[Compact boundary marker]")
+
+
+@pytest.mark.asyncio
+async def test_auto_compact_proactive_still_stops_after_microcompact(monkeypatch):
+    # Counterpart guard: a PROACTIVE run (force=False) must still short-circuit
+    # after a successful microcompact so we don't pay for an unneeded LLM
+    # compaction. should_autocompact: True to enter, False after microcompact.
+    monkeypatch.setattr("openharness.services.compact.try_session_memory_compaction", lambda *args, **kwargs: None)
+    calls = {"n": 0}
+
+    def _should(*args, **kwargs):
+        calls["n"] += 1
+        return calls["n"] == 1  # over threshold on entry, under after microcompact
+
+    monkeypatch.setattr("openharness.services.compact.should_autocompact", _should)
+
+    messages = _mcp_snapshot_pairs(8)
+
+    result, was_compacted = await auto_compact_if_needed(
+        messages,
+        api_client=_CompactApiClient(["<summary>condensed</summary>"]),
+        model="claude-sonnet-4-6",
+        state=AutoCompactState(),
+        force=False,
+    )
+
+    assert was_compacted is True
+    # microcompact handled it — no full-compaction boundary marker
+    assert not result[0].text.startswith("[Compact boundary marker]")
