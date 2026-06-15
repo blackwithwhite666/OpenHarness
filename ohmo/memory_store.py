@@ -29,6 +29,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
+from ohmo.threat_patterns import first_threat_message
 from ohmo.workspace import get_memory_dir, get_memory_index_path
 
 # Defaults are env-tunable. The per-entry cap matches the 4000-char body
@@ -196,6 +197,11 @@ class MemoryStore:
         if not content:
             return MemoryOpResult(False, "Content cannot be empty.")
 
+        # Safety scan before anything reaches disk / the system prompt.
+        threat = first_threat_message(f"{title}\n{content}", scope="strict")
+        if threat:
+            return MemoryOpResult(False, threat)
+
         limit = self._entry_char_limit
         if len(content) > limit:
             return MemoryOpResult(
@@ -250,6 +256,9 @@ class MemoryStore:
         content = (content or "").strip()
         if not content:
             return MemoryOpResult(False, "Content cannot be empty.")
+        threat = first_threat_message(f"{title or ''}\n{content}", scope="strict")
+        if threat:
+            return MemoryOpResult(False, threat)
         path = self._resolve_path(name)
         if path is None or not path.exists():
             return MemoryOpResult(False, f"No memory entry {name!r}. Use action='add' to create it.")
@@ -299,6 +308,9 @@ class MemoryStore:
         """
         title = (title or "").strip()
         content = (content or "").strip()
+        threat = first_threat_message(f"{title}\n{content}", scope="strict")
+        if threat:
+            raise ValueError(threat)
         slug = slugify(title)
         if f"{slug}.md".lower() in _RESERVED_NAMES:
             slug = f"{slug}_note"
