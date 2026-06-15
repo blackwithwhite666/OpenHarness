@@ -1507,7 +1507,13 @@ async def auto_compact_if_needed(
         token_count=estimate_message_tokens(messages),
         details={"tokens_freed": tokens_freed},
     )
-    if tokens_freed > 0 and not should_autocompact(
+    # Microcompact only clears *tool results*. On a reactive run (force=True,
+    # i.e. the provider already rejected the prompt as too long) the bloat is
+    # usually the conversation history itself, so a small microcompact saving
+    # must NOT short-circuit the full LLM compaction — otherwise we retry the
+    # same oversized prompt and hit a hard context_length_exceeded. Honour the
+    # early-exit only for proactive (force=False) runs.
+    if not force and tokens_freed > 0 and not should_autocompact(
         messages,
         model,
         state,
