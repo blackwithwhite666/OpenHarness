@@ -38,6 +38,8 @@ from ohmo.gateway.group_tool import CreateFeishuGroup, OhmoCreateFeishuGroupTool
 from ohmo.gateway.provider_commands import handle_gateway_model_command, handle_gateway_provider_command
 from ohmo.group_registry import load_managed_group_record, normalize_cwd
 from ohmo.memory import create_memory_command_backend
+from ohmo.memory_store import MemoryStore
+from ohmo.memory_tool import OhmoMemoryTool
 from ohmo.prompts import build_ohmo_system_prompt
 from ohmo.reminders.store import ReminderStore
 from ohmo.reminders.tool import RemindCancelTool, RemindCreateTool, RemindListTool
@@ -122,6 +124,7 @@ class OhmoSessionRuntimePool:
         self._gateway_config = load_gateway_config(self._workspace)
         self._session_backend = OhmoSessionBackend(self._workspace)
         self._todo_store = TodoStore(self._workspace)
+        self._memory_store = MemoryStore(self._workspace)
         self._reminder_store = ReminderStore(workspace=self._workspace)
         self._reminder_lock = asyncio.Lock()
         self._bundles: dict[str, RuntimeBundle] = {}
@@ -825,7 +828,18 @@ class OhmoSessionRuntimePool:
     def _register_gateway_tools(self, bundle: RuntimeBundle) -> None:
         self._unregister_group_tool(bundle)
         self._register_todo_tool(bundle)
+        self._register_memory_tool(bundle)
         self._register_reminder_tools(bundle)
+
+    def _register_memory_tool(self, bundle: RuntimeBundle) -> None:
+        """Register the model-callable ``memory`` tool — disciplined curation
+        (unicode-safe slugs, dedup, per-entry + store char bounds with
+        consolidate-on-overflow) over the workspace-shared ``~/.ohmo/memory``
+        store, so the agent self-curates instead of writing memory files by hand."""
+        registry = getattr(bundle, "tool_registry", None)
+        if registry is None:
+            return
+        registry.register(OhmoMemoryTool(self._memory_store))
 
     def _register_todo_tool(self, bundle: RuntimeBundle) -> None:
         """Override the default ``todo_write`` with a per-session one — the list

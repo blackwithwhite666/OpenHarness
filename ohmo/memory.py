@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 from pathlib import Path
-from re import sub
 
 from openharness.commands import MemoryCommandBackend
 
+from ohmo.memory_store import slugify
 from ohmo.workspace import get_memory_dir, get_memory_index_path
 
 
@@ -20,7 +20,7 @@ def add_memory_entry(workspace: str | Path | None, title: str, content: str) -> 
     """Create a personal memory file and append it to ``MEMORY.md``."""
     memory_dir = get_memory_dir(workspace)
     memory_dir.mkdir(parents=True, exist_ok=True)
-    slug = sub(r"[^a-zA-Z0-9]+", "_", title.strip().lower()).strip("_") or "memory"
+    slug = slugify(title)
     path = memory_dir / f"{slug}.md"
     path.write_text(content.strip() + "\n", encoding="utf-8")
 
@@ -56,6 +56,9 @@ def load_memory_prompt(workspace: str | Path | None = None, *, max_files: int = 
         "# ohmo Memory",
         f"- Personal memory directory: {memory_dir}",
         "- Use this memory for stable user preferences and durable personal context.",
+        "- Curate it with the `memory` tool (add/update/remove/list/get) — do NOT write "
+        'memory files by hand. Save DECLARATIVE facts ("User prefers UTC"), not '
+        "self-instructions; skip transient progress, raw data dumps (paths/listings), and secrets.",
     ]
 
     if index_path.exists():
