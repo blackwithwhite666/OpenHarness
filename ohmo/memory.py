@@ -45,9 +45,13 @@ def load_memory_prompt(workspace: str | Path | None = None, *, max_files: int = 
     ]
 
     if index_path.exists():
+        # Render scope is "all" (classic injection + exfil): it is <= every write
+        # scope (model tool=strict, /memory=all), so an accepted entry always
+        # renders (no accepted-but-hidden), while persona-style phrasings that
+        # only trip the broader "strict"/"context" sets are not falsely blanked.
         index_lines = [
             "[BLOCKED: index line contained a threat pattern]"
-            if scan_for_threats(ln, scope="strict")
+            if scan_for_threats(ln, scope="all")
             else ln
             for ln in index_path.read_text(encoding="utf-8").splitlines()[:200]
         ]
@@ -61,7 +65,7 @@ def load_memory_prompt(workspace: str | Path | None = None, *, max_files: int = 
         content = path.read_text(encoding="utf-8", errors="replace").strip()
         if not content:
             continue
-        findings = scan_for_threats(content, scope="strict")
+        findings = scan_for_threats(content, scope="all")
         if findings:
             body = (
                 f"[BLOCKED: {path.name} contained threat pattern(s): "

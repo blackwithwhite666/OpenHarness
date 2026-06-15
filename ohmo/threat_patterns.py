@@ -122,14 +122,24 @@ def _compile() -> None:
 _compile()
 
 
+# Defensive input cap: a couple of patterns have overlapping quantifiers that are
+# O(n^2) in the input length, so an unbounded hostile string (model- or
+# disk-supplied) could stall the single-threaded gateway. Scanning only the first
+# 16k chars bounds the cost; this MUST stay >= any slice that is actually injected
+# (memory bodies inject content[:4000]) so the injected portion is always scanned.
+_SCAN_MAX_CHARS = 16384
+
+
 def scan_for_threats(content: str, scope: str = "strict") -> List[str]:
     """Return matched pattern IDs (+ ``invisible_unicode_U+XXXX``) in ``content``.
 
     Empty content -> []. ``scope`` selects the cumulative pattern set
-    (all/context/strict). Memory uses ``strict``.
+    (all/context/strict). Memory uses ``strict``. The input is capped to
+    ``_SCAN_MAX_CHARS`` to bound the O(n^2) patterns on hostile input.
     """
     if not content:
         return []
+    content = content[:_SCAN_MAX_CHARS]
     findings: List[str] = []
     for ch in set(content) & INVISIBLE_CHARS:
         findings.append(f"invisible_unicode_U+{ord(ch):04X}")

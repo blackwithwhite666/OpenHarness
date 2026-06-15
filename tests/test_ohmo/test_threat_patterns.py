@@ -51,3 +51,11 @@ def test_first_threat_message_unicode_phrasing():
 def test_unknown_scope_raises():
     with pytest.raises(ValueError):
         scan_for_threats("x", "bogus")
+
+
+def test_scan_input_is_capped_to_bound_redos():
+    # A ZWSP past the 16384-char cap is not scanned; within the cap it is. This
+    # both proves the cap is applied (the O(n^2) ReDoS guard) and that the cap
+    # stays well above the 4000-char injected slice.
+    assert scan_for_threats("a" * 20000 + ZWSP, "all") == []
+    assert "invisible_unicode_U+200B" in scan_for_threats(ZWSP + "a" * 100, "all")

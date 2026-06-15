@@ -575,7 +575,13 @@ def create_default_command_registry(
             title, separator, content = rest.partition("::")
             if not separator or not title.strip() or not content.strip():
                 return CommandResult(message="Usage: /memory add TITLE :: CONTENT")
-            path = backend.add_entry(title.strip(), content.strip())
+            try:
+                # A backend may refuse a write (e.g. the ohmo backend scans for
+                # injection/exfil and raises ValueError); surface it in-band
+                # instead of crashing the command dispatch.
+                path = backend.add_entry(title.strip(), content.strip())
+            except ValueError as exc:
+                return CommandResult(message=str(exc))
             return CommandResult(message=f"Added memory entry {path.name}")
         if action == "remove" and rest:
             if backend.remove_entry(rest.strip()):
