@@ -361,6 +361,66 @@ async def test_runtime_pool_does_not_restore_other_group_sender_session_key(tmp_
 
 
 @pytest.mark.asyncio
+async def test_runtime_pool_splits_per_turn_narration_into_reasoning(tmp_path, monkeypatch):
+    """A tool-using turn's interstitial narration is surfaced live as a 🧠
+    reasoning message, and the final reply holds ONLY the last (tool-free)
+    turn's text — earlier turns' narration is no longer concatenated into the
+    final message with no separator."""
+    workspace = tmp_path / ".ohmo-home"
+    initialize_workspace(workspace)
+
+    async def fake_build_runtime(**kwargs):
+        class FakeEngine:
+            messages = []
+            total_usage = UsageSnapshot()
+
+            def set_system_prompt(self, prompt):
+                return None
+
+            async def submit_message(self, content):
+                # turn 1: narration preamble, then a tool call
+                yield AssistantTextDelta(text="Проверю через travel-cli.")
+                yield ToolExecutionStarted(tool_name="bash", tool_input={"command": "ls"})
+                yield ToolExecutionCompleted(tool_name="bash", output="ok", is_error=False)
+                # turn 2: the actual answer (no tool call after it)
+                yield AssistantTextDelta(text="Готово: купе есть.")
+
+        return SimpleNamespace(
+            engine=FakeEngine(),
+            cwd=str(tmp_path),
+            session_id="sess-multiturn",
+            current_settings=lambda: SimpleNamespace(model="gpt-5.5"),
+            commands=SimpleNamespace(lookup=lambda raw: None),
+        )
+
+    async def fake_start_runtime(bundle):
+        return None
+
+    monkeypatch.setattr("ohmo.gateway.runtime.build_runtime", fake_build_runtime)
+    monkeypatch.setattr("ohmo.gateway.runtime.start_runtime", fake_start_runtime)
+
+    pool = OhmoSessionRuntimePool(cwd=tmp_path, workspace=workspace, provider_profile="codex")
+    message = InboundMessage(channel="telegram", sender_id="u1", chat_id="c1", content="купе в Тамбов")
+    updates = [u async for u in pool.stream_message(message, "telegram:c1")]
+
+    # turn-1 narration is surfaced live as a 🧠 reasoning progress message
+    reasoning = [u for u in updates if u.kind == "progress" and "Проверю через travel-cli." in u.text]
+    assert reasoning, [(u.kind, u.text) for u in updates]
+    assert reasoning[0].text == "🧠 Проверю через travel-cli."
+
+    # the reasoning message precedes the tool hint
+    reasoning_idx = updates.index(reasoning[0])
+    tool_hint_idx = next(i for i, u in enumerate(updates) if u.kind == "tool_hint")
+    assert reasoning_idx < tool_hint_idx
+
+    # the final reply is ONLY the last turn — earlier narration is not glued in
+    final = updates[-1]
+    assert final.kind == "final"
+    assert final.text == "Готово: купе есть."
+    assert "Проверю через travel-cli" not in final.text
+
+
+@pytest.mark.asyncio
 async def test_runtime_pool_stream_message_emits_progress_and_tool_hint(tmp_path, monkeypatch):
     workspace = tmp_path / ".ohmo-home"
     initialize_workspace(workspace)
