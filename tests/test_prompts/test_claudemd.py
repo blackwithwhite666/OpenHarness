@@ -123,6 +123,7 @@ def test_build_runtime_system_prompt_skips_coordinator_context_when_disabled(tmp
 
 def test_build_runtime_system_prompt_does_not_reinject_exported_secret_values(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("OPENHARNESS_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("OPENHARNESS_PERSONALIZATION", "1")  # harvester is opt-in now
     monkeypatch.delenv("CLAUDE_CODE_COORDINATOR_MODE", raising=False)
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -145,3 +146,26 @@ def test_build_runtime_system_prompt_does_not_reinject_exported_secret_values(tm
 
     assert "OPENAI_API_KEY" in prompt
     assert secret not in prompt
+
+
+def test_update_rules_from_session_is_noop_by_default(tmp_path: Path, monkeypatch):
+    """The regex local-rules harvester is opt-in: with OPENHARNESS_PERSONALIZATION
+    unset it must extract nothing and never write rules.md / facts.json."""
+    monkeypatch.delenv("OPENHARNESS_PERSONALIZATION", raising=False)
+    rules_dir = tmp_path / "local_rules"
+    monkeypatch.setattr(personalization_rules, "_RULES_DIR", rules_dir)
+    monkeypatch.setattr(personalization_rules, "_RULES_FILE", rules_dir / "rules.md")
+    monkeypatch.setattr(personalization_rules, "_FACTS_FILE", rules_dir / "facts.json")
+
+    count = update_rules_from_session(
+        [
+            ConversationMessage(
+                role="user",
+                content=[TextBlock(text="ssh deploy@10.0.0.1 then export FOO=bar")],
+            )
+        ]
+    )
+
+    assert count == 0
+    assert not (rules_dir / "rules.md").exists()
+    assert not (rules_dir / "facts.json").exists()

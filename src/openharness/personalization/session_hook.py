@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 
 from openharness.engine.messages import ConversationMessage
 from openharness.personalization.extractor import (
@@ -19,10 +20,29 @@ from openharness.personalization.rules import (
 log = logging.getLogger(__name__)
 
 
+def _personalization_enabled() -> bool:
+    """Opt-in flag for the legacy regex local-rules harvester (default OFF).
+
+    The regex extractor accumulated junk — every tool-artifact path, unvalidated
+    "IP"-like strings, any 5 numbers as a "cron" — into an unbounded
+    ``~/.openharness/local_rules/rules.md`` that grew to ~97k tokens and
+    dominated the system prompt. It also duplicates ohmo's curated memory
+    (soul.md / user.md / ~/.ohmo/memory + the memory tool). Disabled by default;
+    set ``OPENHARNESS_PERSONALIZATION=1`` to re-enable.
+    """
+    return os.environ.get("OPENHARNESS_PERSONALIZATION", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
 def update_rules_from_session(messages: list[ConversationMessage]) -> int:
     """Extract local facts from session messages and update rules.
 
-    Called at session end. Returns the number of new facts extracted.
+    Called at session end. Returns the number of new facts extracted (0 when the
+    harvester is disabled, which is the default — see ``_personalization_enabled``).
 
     Args:
         messages: The conversation messages from the session.
@@ -30,6 +50,9 @@ def update_rules_from_session(messages: list[ConversationMessage]) -> int:
     Returns:
         Number of new facts found and persisted.
     """
+    if not _personalization_enabled():
+        return 0
+
     # Collect all text from messages
     all_text = []
     for msg in messages:
