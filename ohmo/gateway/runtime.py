@@ -860,6 +860,11 @@ class OhmoSessionRuntimePool:
         self._judge_turn_counts[session_key] = count
         if count % judge_interval() != 0:
             return
+        # Skip if a judge for this session is still running — never overlap two
+        # judges on the shared store, and never orphan a tracked task.
+        inflight = self._judge_tasks.get(session_key)
+        if inflight is not None and not inflight.done():
+            return
         try:
             # Snapshot inputs NOW — the live bundle is reused by the next turn.
             messages = list(bundle.engine.messages)
@@ -875,7 +880,13 @@ class OhmoSessionRuntimePool:
             name=f"ohmo-memory-judge:{session_key}",
         )
         self._judge_tasks[session_key] = task
-        task.add_done_callback(lambda finished, key=session_key: self._judge_tasks.pop(key, None))
+
+        def _pop(finished: asyncio.Task, key: str = session_key, this: asyncio.Task = task) -> None:
+            # Identity-checked: a finishing task must not evict a newer one.
+            if self._judge_tasks.get(key) is this:
+                self._judge_tasks.pop(key, None)
+
+        task.add_done_callback(_pop)
 
     async def _run_memory_judge_task(self, session_key, api_client, model, messages, timeout) -> None:
         try:

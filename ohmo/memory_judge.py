@@ -6,7 +6,8 @@ result through :class:`ohmo.memory_store.MemoryStore` — so every write still g
 through P0 discipline (unicode slug, dedup, char bounds) and P1 safety (threat
 scan). Mirrors Hermes' ``_spawn_background_review`` but as a single ``stream_message``
 call that emits a structured op-list (no forked agent / tool loop), Mem0-shaped
-(ADD / UPDATE / REMOVE).
+ADD / UPDATE. Autonomous REMOVE is intentionally excluded — deletion stays a
+human / foreground decision (the Cursor auto-memory cautionary tale).
 
 Disabled by default — the Cursor cautionary tale (auto-memories were removed for
 noise) says autonomous memory must be opt-in and high-precision. Enable with
@@ -43,7 +44,8 @@ JUDGE_SYSTEM_PROMPT = (
     "SAVE (add) only lasting, declarative facts: stable user preferences & communication "
     "style, environment facts, project/workflow conventions, corrections & workarounds, "
     "stable identities of people/services. UPDATE an existing entry when the conversation "
-    "revises it. REMOVE only when an entry is clearly obsolete/contradicted.\n\n"
+    "revises it (use update to merge or shrink an overlapping entry). Do NOT delete entries "
+    "— removal is a human decision.\n\n"
     "DO NOT save: transient progress ('fixed X today', run logs), raw data dumps "
     "(file/artifact paths, listings), web-searchable trivia, secrets/tokens, one-off task "
     "narratives, or anything already in CURRENT MEMORY (avoid duplicates). Write DECLARATIVE "
@@ -51,8 +53,8 @@ JUDGE_SYSTEM_PROMPT = (
     "most turns need NO change.\n\n"
     "Respond with ONLY a JSON object, no prose, no markdown fences:\n"
     '{"ops": [{"action": "add", "title": "...", "content": "..."}, '
-    '{"action": "update", "name": "<entry-name>", "content": "...", "title": "..."}, '
-    '{"action": "remove", "name": "<entry-name>"}], "reason": "<short>"}\n'
+    '{"action": "update", "name": "<entry-name>", "content": "...", "title": "..."}], '
+    '"reason": "<short>"}\n'
     'If nothing is worth changing, respond exactly: {"ops": [], "reason": "nothing to save"}'
 )
 
@@ -154,7 +156,12 @@ def apply_judge_ops(store: MemoryStore, ops: list[dict], *, max_ops: int = _MAX_
                     title=(str(op["title"]) if op.get("title") else None),
                 )
             elif action == "remove":
-                r = store.remove(str(op.get("name", "")))
+                # Autonomous deletion is intentionally NOT applied — removal stays a
+                # human / foreground (model tool, /memory) decision. The judge can only
+                # add or update; this avoids the auto-memory loop silently shrinking the
+                # corpus (the Cursor cautionary tale).
+                outcome.skipped.append(f"remove {op.get('name', '?')}: not auto-applied (human-only)")
+                continue
             else:
                 outcome.skipped.append(f"unknown action {action!r}")
                 continue
