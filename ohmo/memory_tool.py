@@ -88,7 +88,13 @@ class OhmoMemoryTool(BaseTool):
             entry = self._store.get(arguments.name)
             if entry is None:
                 return ToolResult(output=f"No memory entry {arguments.name!r}.", is_error=True)
-            return ToolResult(output=f"# {entry.title} ({entry.name})\n\n{entry.content}")
+            # The agent pulled this fact → it was useful. Bump its access count so
+            # load_memory_prompt injects it ahead of cold entries next time.
+            self._store.record_use(entry.name)
+            return ToolResult(
+                output=f"# {entry.title} ({entry.name})\n\n{entry.content}",
+                metadata={"memory_used": entry.name},
+            )
 
         if action == "add":
             return self._result(self._store.add(arguments.title, arguments.content))

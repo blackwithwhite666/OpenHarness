@@ -24,6 +24,7 @@ command keep reading the same files, so this store is drop-in compatible.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 from dataclasses import dataclass
@@ -46,6 +47,7 @@ _MAX_TITLE_CHARS = 256  # bound the (otherwise unbounded) title fed to the scann
 # case-insensitively so a "Memory"-titled entry can't collide with it on a
 # case-insensitive filesystem (macOS).
 _RESERVED_NAMES = {"memory.md"}
+_USAGE_FILE = ".usage.json"  # per-entry access counts (frequency signal for injection ranking)
 
 # Matches an index link line: "- [Title](slug.md)" (tolerant of bullet/space).
 _LINK_RE = re.compile(r"^\s*[-*]\s*\[(?P<title>.*?)\]\((?P<name>[^)]+)\)\s*$")
@@ -189,6 +191,76 @@ class MemoryStore:
     def total_chars(self) -> int:
         return sum(len(e.content) for e in self.list())
 
+    # -- usage telemetry ----------------------------------------------------
+    # A per-entry access counter (a "which facts get used" debug signal) kept in
+    # a JSON sidecar next to the entries. It is NOT a memory entry (`.json`, so
+    # entry_paths()'s `*.md` glob skips it) and never enters the prompt. Its sole
+    # job is to rank injection: load_memory_prompt orders entries by this count so
+    # the facts the agent actually pulls survive the inject char budget.
+    def _usage_path(self) -> Path:
+        return self._dir() / _USAGE_FILE
+
+    def usage(self) -> dict[str, int]:
+        """Read the access-count sidecar as ``{entry_name: count}`` (``{}`` on miss)."""
+        path = self._usage_path()
+        if not path.exists():
+            return {}
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+        if not isinstance(data, dict):
+            return {}
+        return {
+            str(k): int(v)
+            for k, v in data.items()
+            if isinstance(v, (int, float)) and not isinstance(v, bool)
+        }
+
+    def record_use(self, name: str) -> None:
+        """Bump the access counter for the entry resolved from NAME (best-effort).
+
+        Called when the agent reads an entry (``memory action='get'``) — i.e. it
+        needed that fact. Counts rank injection so frequently-used entries are
+        injected ahead of cold ones once the corpus exceeds the prompt budget.
+        No-op for unknown names; never raises (telemetry must not break a read).
+        """
+        path = self._resolve_path(name)
+        if path is None or not path.exists():
+            return
+        # Canonicalize to the real on-disk entry name: a case-insensitive
+        # filesystem resolves e.g. "Timezone.md" to timezone.md but reports the
+        # requested casing, which would split the counter across keys (and miss the
+        # match against entry_paths() at injection ranking time).
+        canonical = next(
+            (p.name for p in self._dir().glob("*.md") if p.name.lower() == path.name.lower()),
+            path.name,
+        )
+        counts = self.usage()
+        counts[canonical] = counts.get(canonical, 0) + 1
+        self._write_usage(counts)
+
+    def _drop_usage(self, filename: str) -> None:
+        """Prune an entry's counter on removal so a recreated slug does not inherit
+        a dead entry's hot count (and the sidecar does not accrue orphan keys)."""
+        counts = self.usage()
+        stale = [k for k in counts if k.lower() == filename.lower()]
+        if not stale:
+            return
+        for k in stale:
+            counts.pop(k, None)
+        self._write_usage(counts)
+
+    def _write_usage(self, counts: dict[str, int]) -> None:
+        try:
+            usage_path = self._usage_path()
+            usage_path.parent.mkdir(parents=True, exist_ok=True)
+            usage_path.write_text(
+                json.dumps(counts, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+            )
+        except OSError:
+            pass
+
     # -- writes -------------------------------------------------------------
     def add(self, title: str, content: str) -> MemoryOpResult:
         content = (content or "").strip()
@@ -300,6 +372,7 @@ class MemoryStore:
         filename = path.name
         path.unlink(missing_ok=True)
         self._drop_index(filename)
+        self._drop_usage(filename)
         return MemoryOpResult(True, f"Removed memory {filename}.")
 
     def add_legacy(self, title: str, content: str) -> Path:

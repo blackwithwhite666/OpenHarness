@@ -95,7 +95,16 @@ def load_memory_prompt(
     # be injected verbatim. Replace a tripped entry with a placeholder; the
     # on-disk file is left intact so the agent can read/remove it via the tool.
     budget = max_chars if max_chars is not None else _inject_char_budget()
-    entries = list_memory_files(workspace)
+    # Rank by access frequency (then name, for stability): the facts the agent
+    # actually pulls (recorded on `memory action='get'`) are injected ahead of cold
+    # ones, so when the corpus overflows the char budget the important entries stay
+    # in-context and the unused tail drops to the index. A small corpus fits whole,
+    # so the order is invisible; it only matters once memory exceeds the budget.
+    usage = MemoryStore(workspace).usage()
+    entries = sorted(
+        list_memory_files(workspace),
+        key=lambda p: (-usage.get(p.name, 0), p.name),
+    )
     used = 0
     shown = 0
     for index, path in enumerate(entries):
