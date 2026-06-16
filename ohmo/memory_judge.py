@@ -9,9 +9,10 @@ call that emits a structured op-list (no forked agent / tool loop), Mem0-shaped
 ADD / UPDATE. Autonomous REMOVE is intentionally excluded — deletion stays a
 human / foreground decision (the Cursor auto-memory cautionary tale).
 
-Disabled by default — the Cursor cautionary tale (auto-memories were removed for
-noise) says autonomous memory must be opt-in and high-precision. Enable with
-``OHMO_MEMORY_JUDGE=1``; tune cadence with ``OHMO_MEMORY_JUDGE_INTERVAL`` (turns).
+Enabled by default; set ``OHMO_MEMORY_JUDGE=0`` (or false/no/off) to disable.
+Tune cadence with ``OHMO_MEMORY_JUDGE_INTERVAL`` (turns). Precision rests on the
+conservative prompt, add/update-only ops (no autonomous delete), and the fact
+that every write still passes the disciplined store's dedup/bounds/safety gates.
 """
 
 from __future__ import annotations
@@ -36,7 +37,7 @@ _MAX_TRANSCRIPT_CHARS = 8000  # trim the conversation fed to the judge
 _MAX_MEMORY_CTX_CHARS = 4000  # trim the current-memory context fed to the judge
 _JUDGE_MAX_TOKENS = 800
 _DEFAULT_TIMEOUT = 30.0
-_TRUE = {"1", "true", "yes", "on"}
+_FALSE = {"0", "false", "no", "off"}
 
 JUDGE_SYSTEM_PROMPT = (
     "You curate an AI assistant's long-term memory about its owner. Review the recent "
@@ -68,7 +69,8 @@ class JudgeOutcome:
 
 
 def judge_enabled() -> bool:
-    return os.environ.get("OHMO_MEMORY_JUDGE", "").strip().lower() in _TRUE
+    """On by default; set OHMO_MEMORY_JUDGE=0/false/no/off to disable."""
+    return os.environ.get("OHMO_MEMORY_JUDGE", "").strip().lower() not in _FALSE
 
 
 def judge_interval() -> int:

@@ -124,13 +124,15 @@ async def test_run_memory_judge_call_failure_is_best_effort(tmp_path: Path, monk
 
 
 # ----------------------------- gating ---------------------------------------
-def test_judge_disabled_by_default(monkeypatch):
+def test_judge_enabled_by_default(monkeypatch):
     monkeypatch.delenv("OHMO_MEMORY_JUDGE", raising=False)
+    assert judge_enabled() is True  # on by default
+    monkeypatch.setenv("OHMO_MEMORY_JUDGE", "0")
+    assert judge_enabled() is False
+    monkeypatch.setenv("OHMO_MEMORY_JUDGE", "off")
     assert judge_enabled() is False
     monkeypatch.setenv("OHMO_MEMORY_JUDGE", "1")
     assert judge_enabled() is True
-    monkeypatch.setenv("OHMO_MEMORY_JUDGE", "off")
-    assert judge_enabled() is False
 
 
 def test_judge_interval_env(monkeypatch):
@@ -168,7 +170,7 @@ def _fake_bundle() -> SimpleNamespace:
 
 
 async def test_hook_does_not_fire_when_disabled(tmp_path: Path, monkeypatch):
-    monkeypatch.delenv("OHMO_MEMORY_JUDGE", raising=False)
+    monkeypatch.setenv("OHMO_MEMORY_JUDGE", "0")  # explicit opt-out
     pool = _judge_pool(tmp_path)
     for _ in range(25):
         pool._maybe_schedule_memory_judge(_fake_bundle(), "k")
