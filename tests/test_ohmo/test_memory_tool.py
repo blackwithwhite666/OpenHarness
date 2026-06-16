@@ -352,3 +352,76 @@ def test_snapshot_blocks_poisoned_index_line(tmp_path: Path):
     prompt = load_memory_prompt(tmp_path)
     assert "ignore all previous instructions" not in prompt
     assert "[BLOCKED: index line" in prompt
+
+
+# ----------------------------- usage telemetry ------------------------------
+def test_record_use_counts_and_resolves_name_forms(tmp_path: Path):
+    store = MemoryStore(tmp_path)
+    store.add("Timezone", "User prefers UTC.")  # -> timezone.md
+    assert store.usage() == {}  # no reads yet
+    store.record_use("timezone")
+    store.record_use("timezone.md")  # .md suffix resolves to the same entry
+    store.record_use("Timezone")  # title form too
+    assert store.usage() == {"timezone.md": 3}
+
+
+def test_record_use_ignores_unknown_entry(tmp_path: Path):
+    store = MemoryStore(tmp_path)
+    store.record_use("does-not-exist")  # no crash, no phantom counter
+    assert store.usage() == {}
+
+
+def test_usage_tolerates_corrupt_sidecar(tmp_path: Path):
+    store = MemoryStore(tmp_path)
+    store.add("tz", "UTC")
+    (tmp_path / "memory" / ".usage.json").write_text("not json{", encoding="utf-8")
+    assert store.usage() == {}  # corrupt -> empty, not a crash
+    store.record_use("tz")  # still records (overwrites the junk)
+    assert store.usage() == {"tz.md": 1}
+
+
+def test_usage_sidecar_is_not_a_memory_entry(tmp_path: Path):
+    store = MemoryStore(tmp_path)
+    store.add("tz", "UTC")
+    store.record_use("tz")
+    names = [p.name for p in store.entry_paths()]
+    assert ".usage.json" not in names  # the .json sidecar is never an entry
+    assert store.get(".usage") is None  # and not resolvable as one
+
+
+def test_remove_prunes_usage_so_recreated_slug_starts_cold(tmp_path: Path):
+    store = MemoryStore(tmp_path)
+    store.add("Timezone", "User prefers UTC.")
+    for _ in range(5):
+        store.record_use("timezone")
+    assert store.usage() == {"timezone.md": 5}
+    store.remove("timezone")
+    assert store.usage() == {}  # counter pruned on removal
+    store.add("Timezone", "User prefers Moscow time now.")  # same slug, new fact
+    assert store.usage().get("timezone.md", 0) == 0  # does NOT inherit the old hot count
+
+
+async def test_tool_get_records_use(tmp_path: Path):
+    store = MemoryStore(tmp_path)
+    tool = OhmoMemoryTool(store)
+    await tool.execute(OhmoMemoryToolInput(action="add", title="tz", content="UTC"), _ctx(tmp_path))
+    res = await tool.execute(OhmoMemoryToolInput(action="get", name="tz"), _ctx(tmp_path))
+    assert res.metadata.get("memory_used") == "tz.md"  # debug signal surfaced
+    assert store.usage() == {"tz.md": 1}
+    await tool.execute(OhmoMemoryToolInput(action="get", name="tz"), _ctx(tmp_path))
+    assert store.usage() == {"tz.md": 2}
+
+
+def test_inject_ranks_used_entries_first_under_budget(tmp_path: Path):
+    # The whole point: when memory overflows the budget, the entries the agent
+    # actually pulled win the limited slots over cold, alphabetically-earlier ones.
+    store = MemoryStore(tmp_path, entry_char_limit=4000)
+    for i in range(6):
+        store.add(f"e{i}", f"distinct body {i} " + "x" * 1000)
+    # e5 sorts LAST alphabetically and would normally drop first; make it hot.
+    for _ in range(3):
+        store.record_use("e5")
+    prompt = load_memory_prompt(tmp_path, max_chars=1500)  # only ~1 body fits
+    assert "distinct body 5" in prompt  # the hot entry is injected despite its name
+    assert "distinct body 0" not in prompt  # the cold first-sorted one drops to index
+    assert "more memory entr" in prompt
