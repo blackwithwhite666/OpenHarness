@@ -39,6 +39,7 @@ from ohmo.gateway.provider_commands import handle_gateway_model_command, handle_
 from ohmo.group_registry import load_managed_group_record, normalize_cwd
 from ohmo.memory import create_memory_command_backend
 from ohmo.memory_store import MemoryStore
+from ohmo.memory_judge import judge_enabled, judge_interval, run_memory_judge
 from ohmo.memory_tool import OhmoMemoryTool
 from ohmo.prompts import build_ohmo_system_prompt
 from ohmo.reminders.store import ReminderStore
@@ -125,6 +126,8 @@ class OhmoSessionRuntimePool:
         self._session_backend = OhmoSessionBackend(self._workspace)
         self._todo_store = TodoStore(self._workspace)
         self._memory_store = MemoryStore(self._workspace)
+        self._judge_turn_counts: dict[str, int] = {}
+        self._judge_tasks: dict[str, asyncio.Task] = {}
         self._reminder_store = ReminderStore(workspace=self._workspace)
         self._reminder_lock = asyncio.Lock()
         self._bundles: dict[str, RuntimeBundle] = {}
@@ -231,6 +234,11 @@ class OhmoSessionRuntimePool:
         there was a live bundle to drop."""
         bundle = self._bundles.pop(session_key, None)
         had_bundle = bundle is not None
+        # Reset the judge cadence + cancel any in-flight judge for this session.
+        self._judge_turn_counts.pop(session_key, None)
+        judge_task = self._judge_tasks.pop(session_key, None)
+        if judge_task is not None:
+            judge_task.cancel()
         if bundle is not None:
             try:
                 await close_runtime(bundle)
@@ -531,6 +539,7 @@ class OhmoSessionRuntimePool:
         self._restore_group_request_context(bundle, previous_group_request)
         self._clear_reminder_context(bundle)
         await self._save_snapshot(bundle, session_key, user_prompt)
+        self._maybe_schedule_memory_judge(bundle, session_key)
         reply = "".join(reply_parts).strip()
         if reply:
             logger.info(
@@ -840,6 +849,66 @@ class OhmoSessionRuntimePool:
         if registry is None:
             return
         registry.register(OhmoMemoryTool(self._memory_store))
+
+    def _maybe_schedule_memory_judge(self, bundle: RuntimeBundle, session_key: str) -> None:
+        """Schedule the background memory judge off the hot path, on a per-session
+        turn cadence. Opt-in via OHMO_MEMORY_JUDGE; never blocks the reply (the
+        snapshot of inputs is taken now, the LLM call runs in a tracked task)."""
+        if not judge_enabled():
+            return
+        count = self._judge_turn_counts.get(session_key, 0) + 1
+        self._judge_turn_counts[session_key] = count
+        if count % judge_interval() != 0:
+            return
+        # Skip if a judge for this session is still running — never overlap two
+        # judges on the shared store, and never orphan a tracked task.
+        inflight = self._judge_tasks.get(session_key)
+        if inflight is not None and not inflight.done():
+            return
+        try:
+            # Snapshot inputs NOW — the live bundle is reused by the next turn.
+            messages = list(bundle.engine.messages)
+            api_client = bundle.engine.api_client
+            settings = bundle.current_settings()
+            model = settings.model
+            timeout = float(getattr(settings, "timeout", None) or 30.0)
+        except Exception:  # noqa: BLE001 — never break the turn
+            logger.warning("ohmo memory judge schedule failed session_key=%s", session_key, exc_info=True)
+            return
+        task = asyncio.create_task(
+            self._run_memory_judge_task(session_key, api_client, model, messages, timeout),
+            name=f"ohmo-memory-judge:{session_key}",
+        )
+        self._judge_tasks[session_key] = task
+
+        def _pop(finished: asyncio.Task, key: str = session_key, this: asyncio.Task = task) -> None:
+            # Identity-checked: a finishing task must not evict a newer one.
+            if self._judge_tasks.get(key) is this:
+                self._judge_tasks.pop(key, None)
+
+        task.add_done_callback(_pop)
+
+    async def _run_memory_judge_task(self, session_key, api_client, model, messages, timeout) -> None:
+        try:
+            outcome = await run_memory_judge(
+                api_client=api_client,
+                model=model,
+                messages=messages,
+                store=self._memory_store,
+                timeout=timeout,
+            )
+            if outcome.applied or outcome.skipped:
+                logger.info(
+                    "ohmo memory judge session_key=%s applied=%s skipped=%s reason=%r",
+                    session_key,
+                    outcome.applied,
+                    outcome.skipped,
+                    outcome.reason,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 — best-effort
+            logger.exception("ohmo memory judge crashed session_key=%s", session_key)
 
     def _register_todo_tool(self, bundle: RuntimeBundle) -> None:
         """Override the default ``todo_write`` with a per-session one — the list
