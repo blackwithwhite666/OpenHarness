@@ -52,8 +52,11 @@ def _refresh(oauth: McpOAuthConfig, refresh_token: str) -> dict:
         form["client_secret"] = oauth.client_secret
     if oauth.resource:
         form["resource"] = oauth.resource
-    if oauth.scope:
-        form["scope"] = oauth.scope
+    # NOTE: deliberately omit `scope` on the refresh grant. RFC 6749 §6 makes it
+    # optional and forbids broadening; strict auth servers (e.g. auth.worfalomey.cc)
+    # return 400 when `scope` is present on a refresh, which silently kills the
+    # rotating refresh chain. `oauth.scope` is still used at authorization time
+    # (outside this client). Re-add here only if a server is found that requires it.
     req = urllib.request.Request(
         oauth.token_url,
         data=urllib.parse.urlencode(form).encode(),
