@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import pytest
@@ -10,6 +11,7 @@ from openharness.engine.messages import ConversationMessage
 
 import ohmo.memory_judge as mj
 from ohmo.memory_judge import (
+    JudgeOutcome,
     apply_judge_ops,
     judge_enabled,
     judge_interval,
@@ -137,11 +139,11 @@ def test_judge_enabled_by_default(monkeypatch):
 
 def test_judge_interval_env(monkeypatch):
     monkeypatch.delenv("OHMO_MEMORY_JUDGE_INTERVAL", raising=False)
-    assert judge_interval() == 10
-    monkeypatch.setenv("OHMO_MEMORY_JUDGE_INTERVAL", "3")
-    assert judge_interval() == 3
+    assert judge_interval() == 3  # chat-tuned default (was 10; rarely fired)
+    monkeypatch.setenv("OHMO_MEMORY_JUDGE_INTERVAL", "7")
+    assert judge_interval() == 7
     monkeypatch.setenv("OHMO_MEMORY_JUDGE_INTERVAL", "0")  # invalid -> default
-    assert judge_interval() == 10
+    assert judge_interval() == 3
 
 
 # ----------------------- gateway hook (scheduling) --------------------------
@@ -214,6 +216,23 @@ async def test_hook_inflight_guard_skips_overlap(tmp_path: Path, monkeypatch):
     pool._maybe_schedule_memory_judge(_fake_bundle(), "k")  # task1 in-flight -> skipped
     assert pool._judge_tasks["k"] is t1  # not replaced/orphaned
     await t1
+
+
+async def test_judge_run_logs_even_on_noop(tmp_path: Path, monkeypatch, caplog):
+    # A fired-but-no-op run ("nothing to save") must still be logged, else a quiet
+    # judge is indistinguishable from one that never fired.
+    monkeypatch.setenv("OHMO_MEMORY_JUDGE", "1")
+
+    async def noop_run(**kwargs):
+        return JudgeOutcome(reason="nothing to save")
+
+    monkeypatch.setattr("ohmo.gateway.runtime.run_memory_judge", noop_run)
+    pool = _judge_pool(tmp_path)
+    msgs = [ConversationMessage.from_user_text("hi there")]
+    with caplog.at_level(logging.INFO, logger="ohmo.gateway.runtime"):
+        await pool._run_memory_judge_task("k", object(), "m", msgs, 30.0)
+    logged = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
+    assert any("memory judge ran" in m and "nothing to save" in m for m in logged), logged
 
 
 async def test_reset_session_clears_counter_and_cancels_judge(tmp_path: Path, monkeypatch):

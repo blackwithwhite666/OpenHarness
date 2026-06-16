@@ -31,7 +31,12 @@ from ohmo.memory_store import MemoryStore
 
 log = logging.getLogger(__name__)
 
-DEFAULT_JUDGE_INTERVAL = 10  # run every N user turns (Hermes default)
+# Run every N user turns *within one session*. Hermes uses 10, but ohmo is a
+# Telegram bot whose sessions are short bursts that rarely reach 10 turns (and a
+# gateway restart / `/new` resets the per-session counter), so 10 meant the judge
+# almost never fired. 3 makes it fire within a realistic chat. Off-hot-path, so
+# the extra LLM calls don't affect latency. Override with OHMO_MEMORY_JUDGE_INTERVAL.
+DEFAULT_JUDGE_INTERVAL = 3
 _MAX_OPS = 5  # cap ops applied per run
 _MAX_TRANSCRIPT_CHARS = 8000  # trim the conversation fed to the judge
 _MAX_MEMORY_CTX_CHARS = 4000  # trim the current-memory context fed to the judge

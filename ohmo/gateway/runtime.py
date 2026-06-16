@@ -897,14 +897,16 @@ class OhmoSessionRuntimePool:
                 store=self._memory_store,
                 timeout=timeout,
             )
-            if outcome.applied or outcome.skipped:
-                logger.info(
-                    "ohmo memory judge session_key=%s applied=%s skipped=%s reason=%r",
-                    session_key,
-                    outcome.applied,
-                    outcome.skipped,
-                    outcome.reason,
-                )
+            # Always log a fired run — even a no-op ("nothing to save") — so the
+            # judge's liveness is observable in journald (otherwise a quiet judge
+            # is indistinguishable from one that never fired).
+            logger.info(
+                "ohmo memory judge ran session_key=%s applied=%s skipped=%s reason=%r",
+                session_key,
+                outcome.applied,
+                outcome.skipped,
+                outcome.reason,
+            )
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001 — best-effort
