@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 from contextlib import AsyncExitStack
 from typing import Any
@@ -20,6 +21,8 @@ from openharness.mcp.types import (
     McpStdioServerConfig,
     McpToolInfo,
 )
+
+log = logging.getLogger(__name__)
 
 # A slow / hung MCP backend must never block a tool call forever: an unanswered
 # tool call leaves a dangling tool_use in the conversation and poisons the whole
@@ -122,12 +125,14 @@ class McpClientManager:
                 # failure) before the next, preserving sequential-connect order.
                 await ready.wait()
             else:
+                detail = f"Unsupported MCP transport in current build: {config.type}"
+                log.warning("MCP server %r not connected: %s", name, detail)
                 self._statuses[name] = McpConnectionStatus(
                     name=name,
                     state="failed",
                     transport=config.type,
                     auth_configured=bool(getattr(config, "headers", None)),
-                    detail=f"Unsupported MCP transport in current build: {config.type}",
+                    detail=detail,
                 )
 
     async def reconnect_all(self) -> None:
@@ -164,12 +169,23 @@ class McpClientManager:
         exc: BaseException,
     ) -> None:
         """Record one MCP connection failure without aborting startup."""
+        detail = str(exc) or exc.__class__.__name__
+        # Log it: the status detail is otherwise in-memory only (surfaced via
+        # mcp_status), so a failed connect — e.g. an expired OAuth bearer 401-ing
+        # at initialize — is invisible in journald. One warning turns a silent
+        # "no tools" into a one-line diagnosis.
+        log.warning(
+            "MCP server %r failed to connect (%s): %s",
+            name,
+            getattr(config, "type", "unknown"),
+            detail,
+        )
         self._statuses[name] = McpConnectionStatus(
             name=name,
             state="failed",
             transport=getattr(config, "type", "unknown"),
             auth_configured=auth_configured,
-            detail=str(exc) or exc.__class__.__name__,
+            detail=detail,
         )
 
     async def close(self) -> None:
@@ -383,4 +399,11 @@ class McpClientManager:
             auth_configured=auth_configured,
             tools=tools,
             resources=resources,
+        )
+        log.info(
+            "MCP server %r connected (%s): %d tools, %d resources",
+            name,
+            getattr(config, "type", "unknown"),
+            len(tools),
+            len(resources),
         )
