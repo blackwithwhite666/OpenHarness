@@ -56,6 +56,38 @@ def test_near_expiry_triggers_refresh(tmp_path, monkeypatch):
     assert oauth_mod.ensure_bearer(_cfg(tf)) == "NEW"
 
 
+def test_refresh_omits_scope_but_keeps_resource(tmp_path, monkeypatch):
+    """`scope` must NOT be sent on the refresh grant (RFC 6749 §6 optional; strict
+    servers 400 on it, silently killing the rotating chain). `resource` is kept."""
+    import urllib.parse
+
+    captured: dict[str, str] = {}
+
+    class _FakeResp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return json.dumps({"access_token": "NEW", "expires_in": 3600}).encode()
+
+    def fake_urlopen(req, timeout=None):
+        captured["data"] = req.data.decode()
+        return _FakeResp()
+
+    monkeypatch.setattr(oauth_mod.urllib.request, "urlopen", fake_urlopen)
+    out = oauth_mod._refresh(_cfg(tmp_path / "tok.json"), "R1")  # cfg has scope="user"
+    assert out["access_token"] == "NEW"
+    form = dict(urllib.parse.parse_qsl(captured["data"]))
+    assert "scope" not in form  # the bug being fixed
+    assert form["resource"] == "https://mcp.example/mcp"
+    assert form["grant_type"] == "refresh_token"
+    assert form["refresh_token"] == "R1"
+    assert form["client_id"] == "cid"
+
+
 def test_missing_refresh_token_raises(tmp_path):
     tf = tmp_path / "tok.json"
     tf.write_text(json.dumps({}))
