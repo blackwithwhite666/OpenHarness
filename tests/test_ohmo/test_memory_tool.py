@@ -308,6 +308,40 @@ def test_snapshot_blocks_poisoned_on_disk_entry(tmp_path: Path):
     assert "User prefers UTC." in prompt  # clean entry still rendered
 
 
+def test_all_small_entries_injected_under_budget(tmp_path: Path):
+    # Regression for the weather case: an alphabetically-last entry used to be
+    # dropped by the fixed first-5 cap; under the char budget the whole small
+    # corpus is injected, so every rule is in-context.
+    store = MemoryStore(tmp_path)
+    titles = ["aaa", "bbb", "ccc", "ddd", "eee", "fff", "ggg", "zzz weather rule"]
+    for t in titles:
+        store.add(t, f"durable fact {t}")
+    prompt = load_memory_prompt(tmp_path)
+    for t in titles:
+        assert f"durable fact {t}" in prompt  # every body, incl. the last-sorted one
+    assert "more memory entr" not in prompt  # nothing dropped
+
+
+def test_inject_budget_caps_large_corpus(tmp_path: Path):
+    store = MemoryStore(tmp_path, entry_char_limit=4000)
+    for i in range(6):
+        store.add(f"e{i}", f"distinct body {i} " + "x" * 1000)  # distinct -> not deduped
+    prompt = load_memory_prompt(tmp_path, max_chars=2500)  # ~2 bodies fit
+    assert "more memory entr" in prompt  # overflow noted
+    assert prompt.count("```md") <= 3  # index block + at most ~2 entry blocks (not 6)
+
+
+def test_inject_char_budget_env(monkeypatch):
+    from ohmo.memory import DEFAULT_MEMORY_INJECT_CHARS, _inject_char_budget
+
+    monkeypatch.delenv("OHMO_MEMORY_INJECT_CHARS", raising=False)
+    assert _inject_char_budget() == DEFAULT_MEMORY_INJECT_CHARS
+    monkeypatch.setenv("OHMO_MEMORY_INJECT_CHARS", "500")
+    assert _inject_char_budget() == 500
+    monkeypatch.setenv("OHMO_MEMORY_INJECT_CHARS", "0")  # invalid -> default
+    assert _inject_char_budget() == DEFAULT_MEMORY_INJECT_CHARS
+
+
 def test_snapshot_blocks_poisoned_index_line(tmp_path: Path):
     store = MemoryStore(tmp_path)
     store.add("clean", "fine")
