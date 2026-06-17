@@ -106,7 +106,8 @@ def auth_status(settings: Settings) -> str:
             return f"configured (enterprise: {auth_info.enterprise_url})"
         return "configured"
     try:
-        resolved = settings.resolve_auth()
+        # Status display must not perform a network token refresh / rotation.
+        resolved = settings.resolve_auth(refresh=False)
     except ValueError as exc:
         if settings.provider == "openai_codex":
             return "missing (run 'oh auth codex-login')"
