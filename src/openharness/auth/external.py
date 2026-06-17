@@ -9,7 +9,9 @@ import platform
 import re
 import subprocess
 import time
+import threading
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from dataclasses import dataclass
@@ -21,6 +23,19 @@ from openharness.utils.fs import atomic_write_text
 
 CODEX_PROVIDER = "openai_codex"
 CLAUDE_PROVIDER = "anthropic_claude"
+# ChatGPT/Codex subscription OAuth: refresh the short-lived access token in
+# ~/.codex/auth.json with its (rotating) refresh_token, so a long-running gateway
+# self-heals instead of 401-ing until restart. client_id = the codex app audience
+# from the id_token; endpoint = the OpenAI OAuth token endpoint.
+CODEX_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
+CODEX_OAUTH_TOKEN_ENDPOINT = "https://auth.openai.com/oauth/token"
+# Codex refresh tokens are single-use/rotating: two concurrent refreshes would
+# consume the same token and brick the chain (the loser 400s). Serialize the
+# whole check→refresh→persist section in-process, with a double-checked re-read.
+_CODEX_REFRESH_LOCK = threading.Lock()
+# Refresh slightly BEFORE expiry so a request never goes out on a just-expired
+# token (codex 401s aren't retried) — proactive instead of after a visible 401.
+_CODEX_REFRESH_SKEW_MS = 60_000
 CLAUDE_CODE_VERSION_FALLBACK = "2.1.92"
 CLAUDE_OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 CLAUDE_OAUTH_TOKEN_ENDPOINTS = (
@@ -127,7 +142,9 @@ def load_external_credential(
             payload = json.loads(source_path.read_text(encoding="utf-8"))
         except json.JSONDecodeError as exc:
             raise ValueError(f"Invalid JSON in external auth source: {source_path}") from exc
-        return _load_codex_credential(payload, source_path, binding)
+        return _load_codex_credential(
+            payload, source_path, binding, refresh_if_needed=refresh_if_needed
+        )
     if binding.provider == CLAUDE_PROVIDER:
         payload, source_path, keychain_service, keychain_account = _load_claude_payload(binding)
         return _load_claude_credential(
@@ -145,6 +162,8 @@ def _load_codex_credential(
     payload: dict[str, Any],
     source_path: Path,
     binding: ExternalAuthBinding,
+    *,
+    refresh_if_needed: bool = False,
 ) -> ExternalAuthCredential:
     tokens = payload.get("tokens")
     access_token = ""
@@ -157,18 +176,136 @@ def _load_codex_credential(
     if not access_token:
         raise ValueError("Codex auth source does not contain an access token.")
 
-    email = _decode_json_web_token_claim(access_token, ["https://api.openai.com/profile", "email"])
-    expires_at_ms = _decode_jwt_expiry(access_token)
-    return ExternalAuthCredential(
-        provider=CODEX_PROVIDER,
-        value=access_token,
-        auth_kind="api_key",
-        source_path=source_path,
-        managed_by=binding.managed_by,
-        profile_label=email or binding.profile_label,
-        refresh_token=refresh_token,
-        expires_at_ms=expires_at_ms,
+    def _build(token: str, rtoken: str) -> ExternalAuthCredential:
+        return ExternalAuthCredential(
+            provider=CODEX_PROVIDER,
+            value=token,
+            auth_kind="api_key",
+            source_path=source_path,
+            managed_by=binding.managed_by,
+            profile_label=(
+                _decode_json_web_token_claim(token, ["https://api.openai.com/profile", "email"])
+                or binding.profile_label
+            ),
+            refresh_token=rtoken,
+            expires_at_ms=_decode_jwt_expiry(token),
+        )
+
+    credential = _build(access_token, refresh_token)
+    # Self-heal an expired ChatGPT/Codex access token: a long-running gateway
+    # captures the token once and the codex CLI only refreshes auth.json when it is
+    # run, so without this the gateway 401s until a manual restart. Refresh with the
+    # rotating refresh_token and persist (incl. the rotated refresh_token) so the
+    # chain survives across runs.
+    if refresh_if_needed and _codex_should_refresh(credential):
+        if not refresh_token:
+            raise ValueError(
+                f"Codex credentials at {source_path} are expired and cannot be refreshed "
+                "(no refresh_token). Run `codex login` to re-authenticate."
+            )
+        with _CODEX_REFRESH_LOCK:
+            # Re-read inside the lock: a concurrent task (e.g. another teammate, or
+            # the codex CLI) may have rotated the single-use refresh_token while we
+            # waited. Refreshing again with the now-consumed token would 400 and
+            # brick the chain — so if it's already fresh, just use it.
+            try:
+                cur_payload = json.loads(source_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                cur_payload = payload
+            cur_tokens = cur_payload.get("tokens") if isinstance(cur_payload.get("tokens"), dict) else {}
+            cur_access = str((cur_tokens or {}).get("access_token", "") or "")
+            cur_refresh = str((cur_tokens or {}).get("refresh_token", "") or refresh_token)
+            if cur_access:
+                cur_cred = _build(cur_access, cur_refresh)
+                if not _codex_should_refresh(cur_cred):
+                    return cur_cred  # another task already refreshed
+            refreshed = refresh_codex_oauth_credential(cur_refresh)
+            _write_codex_auth_json(source_path, cur_payload, refreshed)
+            credential = _build(
+                str(refreshed["access_token"]),
+                str(refreshed.get("refresh_token", cur_refresh) or cur_refresh),
+            )
+    return credential
+
+
+def _codex_should_refresh(credential: ExternalAuthCredential, *, now_ms: int | None = None) -> bool:
+    """True when the codex access token is expired or within the refresh skew."""
+    if credential.expires_at_ms is None:
+        return False
+    if now_ms is None:
+        now_ms = int(time.time() * 1000)
+    return credential.expires_at_ms - now_ms <= _CODEX_REFRESH_SKEW_MS
+
+
+def refresh_codex_oauth_credential(refresh_token: str) -> dict[str, Any]:
+    """Refresh a ChatGPT/Codex OAuth access token via its rotating refresh_token.
+
+    Form-encoded ``refresh_token`` grant against the OpenAI token endpoint (verified
+    request shape). Returns the new ``access_token``, the (rotated) ``refresh_token``,
+    the fresh ``id_token`` if present, and ``expires_at_ms``. Does not write files.
+    """
+    if not refresh_token:
+        raise ValueError("refresh_token is required")
+    data = urllib.parse.urlencode(
+        {
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+            "client_id": CODEX_OAUTH_CLIENT_ID,
+        }
+    ).encode("utf-8")
+    request = urllib.request.Request(
+        CODEX_OAUTH_TOKEN_ENDPOINT,
+        data=data,
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json",
+        },
+        method="POST",
     )
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            result = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        body = ""
+        try:
+            body = exc.read().decode("utf-8", errors="replace").strip()
+        except Exception:
+            body = ""
+        if "invalid_grant" in body:
+            raise ValueError(
+                "Codex OAuth refresh token is invalid or expired. "
+                "Run `codex login` to re-authenticate the Codex CLI."
+            ) from exc
+        detail = f"{exc.code} {exc.reason}" + (f": {body}" if body else "")
+        raise ValueError(f"Codex OAuth refresh failed: {detail}") from exc
+    access_token = str(result.get("access_token", "") or "")
+    if not access_token:
+        raise ValueError("Codex OAuth refresh response missing access_token")
+    expires_at_ms = _decode_jwt_expiry(access_token)
+    if expires_at_ms is None:
+        expires_at_ms = int(time.time() * 1000) + int(result.get("expires_in", 3600) or 3600) * 1000
+    return {
+        "access_token": access_token,
+        "refresh_token": str(result.get("refresh_token", refresh_token) or refresh_token),
+        "id_token": str(result.get("id_token", "") or ""),
+        "expires_at_ms": expires_at_ms,
+    }
+
+
+def _write_codex_auth_json(
+    source_path: Path, payload: dict[str, Any], refreshed: dict[str, Any]
+) -> None:
+    """Persist refreshed codex tokens back to auth.json (preserving other fields)."""
+    updated = dict(payload)
+    tokens = dict(updated.get("tokens") or {})
+    tokens["access_token"] = str(refreshed["access_token"])
+    if refreshed.get("refresh_token"):
+        tokens["refresh_token"] = str(refreshed["refresh_token"])
+    if refreshed.get("id_token"):
+        tokens["id_token"] = str(refreshed["id_token"])
+    updated["tokens"] = tokens
+    updated["last_refresh"] = time.strftime("%Y-%m-%dT%H:%M:%S.000000000Z", time.gmtime())
+    atomic_write_text(source_path, json.dumps(updated, indent=2))
 
 
 def _load_claude_credential(

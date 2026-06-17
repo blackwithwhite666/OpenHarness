@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
+import logging
 import platform
+from collections.abc import Callable
 from typing import Any, AsyncIterator
 
 import httpx
@@ -19,6 +22,8 @@ from openharness.api.client import (
 from openharness.api.errors import AuthenticationFailure, OpenHarnessApiError, RateLimitFailure, RequestFailure
 from openharness.api.usage import UsageSnapshot
 from openharness.engine.messages import ConversationMessage, ImageBlock, TextBlock, ToolResultBlock, ToolUseBlock
+
+log = logging.getLogger(__name__)
 
 DEFAULT_CODEX_BASE_URL = "https://chatgpt.com/backend-api"
 JWT_CLAIM_PATH = "https://api.openai.com/auth"
@@ -208,15 +213,43 @@ def _translate_status_error(status_code: int, message: str) -> OpenHarnessApiErr
 class CodexApiClient:
     """Client for ChatGPT/Codex subscription-backed Codex Responses."""
 
-    def __init__(self, auth_token: str, *, base_url: str | None = None) -> None:
+    def __init__(
+        self,
+        auth_token: str,
+        *,
+        base_url: str | None = None,
+        auth_token_resolver: Callable[[], str] | None = None,
+    ) -> None:
         self._auth_token = auth_token
         self._base_url = base_url
         self._url = _resolve_codex_url(base_url)
+        self._auth_token_resolver = auth_token_resolver
+
+    def _refresh_client_auth(self) -> None:
+        """Re-resolve the access token before a request so a long-running client
+        picks up a refreshed/rotated ChatGPT/Codex token (the resolver re-reads
+        ~/.codex/auth.json and refreshes it when expired) instead of sending a
+        stale captured token and 401-ing until process restart. Best-effort: a
+        resolver failure leaves the previous token in place."""
+        if self._auth_token_resolver is None:
+            return
+        try:
+            next_token = self._auth_token_resolver()
+        except Exception as exc:
+            # Best-effort: keep the previous token (degrade to an eventual 401 the
+            # next call self-heals) rather than crash. Log so a genuinely dead
+            # refresh chain ("run codex login") is visible, not just a bare 401.
+            log.warning("codex token refresh failed, using previous token: %s", exc)
+            return
+        if next_token and next_token != self._auth_token:
+            self._auth_token = next_token
 
     async def stream_message(self, request: ApiMessageRequest) -> AsyncIterator[ApiStreamEvent]:
         last_error: Exception | None = None
         for attempt in range(MAX_RETRIES + 1):
             try:
+                # Off the event loop: the resolver may do a blocking HTTPS refresh.
+                await asyncio.to_thread(self._refresh_client_auth)
                 async for event in self._stream_once(request):
                     yield event
                 return
@@ -225,8 +258,6 @@ class CodexApiClient:
                 if attempt >= MAX_RETRIES or not self._is_retryable(exc):
                     raise self._translate_error(exc) from exc
                 delay = min(BASE_DELAY_SECONDS * (2 ** attempt), MAX_DELAY_SECONDS)
-                import asyncio
-
                 yield ApiRetryEvent(
                     message=str(exc),
                     attempt=attempt + 1,

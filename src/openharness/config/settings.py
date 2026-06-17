@@ -676,8 +676,13 @@ class Settings(BaseModel):
             "~/.openharness/settings.json"
         )
 
-    def resolve_auth(self) -> ResolvedAuth:
-        """Resolve auth for the current provider, including subscription bridges."""
+    def resolve_auth(self, *, refresh: bool = True) -> ResolvedAuth:
+        """Resolve auth for the current provider, including subscription bridges.
+
+        ``refresh=False`` resolves WITHOUT a network token refresh — for status /
+        display paths (e.g. ``auth_status``) that must not perform I/O or rotate a
+        single-use refresh token just to paint a status line.
+        """
         profile_name, profile = self.resolve_profile()
         provider = profile.provider.strip()
         auth_source = profile.auth_source.strip() or default_auth_source_for_provider(provider, profile.api_format)
@@ -701,7 +706,8 @@ class Settings(BaseModel):
                 )
             credential = load_external_credential(
                 binding,
-                refresh_if_needed=(auth_source == "claude_subscription"),
+                refresh_if_needed=refresh
+                and auth_source in {"claude_subscription", "codex_subscription"},
             )
             return ResolvedAuth(
                 provider=provider,

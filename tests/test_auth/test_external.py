@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import io
 import json
 import urllib.error
 from pathlib import Path
@@ -15,8 +16,10 @@ from openharness.auth.external import (
     describe_external_binding,
     default_binding_for_provider,
     get_claude_code_version,
+    _load_codex_credential,
     load_external_credential,
     refresh_claude_oauth_credential,
+    refresh_codex_oauth_credential,
 )
 from openharness.auth.storage import ExternalAuthBinding, load_external_binding, store_external_binding
 from openharness.cli import app
@@ -64,6 +67,138 @@ def test_load_codex_external_credential(monkeypatch, tmp_path: Path):
     assert credential.refresh_token == "refresh-token"
     assert credential.profile_label == "dev@example.com"
     assert credential.expires_at_ms == 4_102_444_800_000
+
+
+def test_refresh_codex_oauth_credential_builds_form_request(monkeypatch):
+    captured: dict[str, str] = {}
+    new_token = _fake_jwt({"exp": 5_000_000_000})
+
+    class _Resp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return json.dumps(
+                {"access_token": new_token, "refresh_token": "rt2", "id_token": "id2", "expires_in": 864000}
+            ).encode()
+
+    def fake_urlopen(req, timeout=None):
+        captured["url"] = req.full_url
+        captured["data"] = req.data.decode()
+        return _Resp()
+
+    monkeypatch.setattr("openharness.auth.external.urllib.request.urlopen", fake_urlopen)
+    out = refresh_codex_oauth_credential("rt1")
+
+    import urllib.parse
+
+    form = dict(urllib.parse.parse_qsl(captured["data"]))
+    assert "auth.openai.com" in captured["url"]
+    assert form["grant_type"] == "refresh_token"
+    assert form["refresh_token"] == "rt1"
+    assert form["client_id"]  # codex app client_id present
+    assert out["access_token"] == new_token
+    assert out["refresh_token"] == "rt2"  # rotation surfaced
+    assert out["id_token"] == "id2"
+    assert out["expires_at_ms"] == 5_000_000_000_000  # from the JWT exp
+
+
+def test_refresh_codex_invalid_grant_raises(monkeypatch):
+    def fake_urlopen(req, timeout=None):
+        raise urllib.error.HTTPError(
+            req.full_url, 400, "Bad Request", {}, io.BytesIO(b'{"error":"invalid_grant"}')
+        )
+
+    monkeypatch.setattr("openharness.auth.external.urllib.request.urlopen", fake_urlopen)
+    with pytest.raises(ValueError, match="codex login"):
+        refresh_codex_oauth_credential("rt-dead")
+
+
+def test_load_codex_credential_refreshes_and_persists_when_expired(monkeypatch, tmp_path: Path):
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    expired = _fake_jwt({"exp": 1})  # 1970 → expired
+    fresh = _fake_jwt({"exp": 5_000_000_000})
+    auth_path = codex_home / "auth.json"
+    auth_path.write_text(
+        json.dumps(
+            {"auth_mode": "chatgpt", "tokens": {"access_token": expired, "refresh_token": "rt1", "id_token": "id1"}}
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    monkeypatch.setattr(
+        "openharness.auth.external.refresh_codex_oauth_credential",
+        lambda rt: {
+            "access_token": fresh,
+            "refresh_token": "rt2",
+            "id_token": "id2",
+            "expires_at_ms": 5_000_000_000_000,
+        },
+    )
+    binding = default_binding_for_provider(CODEX_PROVIDER)
+    credential = load_external_credential(binding, refresh_if_needed=True)
+    assert credential.value == fresh
+    assert credential.refresh_token == "rt2"
+    # rotation persisted back to auth.json (incl. id_token + last_refresh)
+    saved = json.loads(auth_path.read_text())
+    assert saved["tokens"]["access_token"] == fresh
+    assert saved["tokens"]["refresh_token"] == "rt2"
+    assert saved["tokens"]["id_token"] == "id2"
+    assert saved["last_refresh"]
+
+
+def test_load_codex_credential_does_not_refresh_when_not_requested(monkeypatch, tmp_path: Path):
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    expired = _fake_jwt({"exp": 1})
+    (codex_home / "auth.json").write_text(
+        json.dumps({"auth_mode": "chatgpt", "tokens": {"access_token": expired, "refresh_token": "rt1"}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    calls = {"n": 0}
+
+    def _should_not_run(rt):
+        calls["n"] += 1
+        return {}
+
+    monkeypatch.setattr("openharness.auth.external.refresh_codex_oauth_credential", _should_not_run)
+    binding = default_binding_for_provider(CODEX_PROVIDER)
+    credential = load_external_credential(binding, refresh_if_needed=False)
+    assert credential.value == expired and calls["n"] == 0
+
+
+def test_load_codex_double_check_skips_refresh_when_already_rotated(monkeypatch, tmp_path: Path):
+    # Race guard: caller read a stale token, but another task already refreshed the
+    # file before we took the lock → re-read inside the lock returns the fresh token
+    # WITHOUT consuming the (now-rotated) refresh_token again.
+    auth_path = tmp_path / "auth.json"
+    fresh = _fake_jwt({"exp": 4_102_444_800})
+    auth_path.write_text(
+        json.dumps({"tokens": {"access_token": fresh, "refresh_token": "rt-new"}}), encoding="utf-8"
+    )
+    stale = _fake_jwt({"exp": 1})
+    stale_payload = {"tokens": {"access_token": stale, "refresh_token": "rt-old"}}
+    binding = ExternalAuthBinding(
+        provider=CODEX_PROVIDER,
+        source_path=str(auth_path),
+        source_kind="codex_auth_json",
+        managed_by="codex-cli",
+        profile_label="Codex CLI",
+    )
+    calls = {"n": 0}
+
+    def _should_not_run(rt):
+        calls["n"] += 1
+        return {}
+
+    monkeypatch.setattr("openharness.auth.external.refresh_codex_oauth_credential", _should_not_run)
+    credential = _load_codex_credential(stale_payload, auth_path, binding, refresh_if_needed=True)
+    assert credential.value == fresh and calls["n"] == 0
 
 
 def test_load_claude_external_credential(monkeypatch, tmp_path: Path):

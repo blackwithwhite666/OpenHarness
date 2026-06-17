@@ -180,6 +180,10 @@ def _resolve_api_client_from_settings(settings) -> SupportsStreamingMessages:
         return CodexApiClient(
             auth_token=auth.value,
             base_url=settings.base_url,
+            # Re-resolve before each request so a long-running gateway picks up a
+            # refreshed/rotated codex token (resolve_auth refreshes on expiry) —
+            # otherwise it 401s on the captured token until restart.
+            auth_token_resolver=lambda: settings.resolve_auth().value,
         )
     if settings.provider == "anthropic_claude":
         return AnthropicApiClient(

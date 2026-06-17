@@ -219,3 +219,54 @@ async def test_codex_client_emits_tool_use(monkeypatch):
     assert tool_use.name == "glob"
     assert tool_use.input == {"pattern": "src/**/*.py"}
     assert sink["json"]["tools"][0]["name"] == "glob"
+
+
+# ---- token refresh (long-running gateway self-heals expired codex tokens) ----
+def test_codex_refresh_client_auth_updates_token():
+    client = CodexApiClient("stale", auth_token_resolver=lambda: "fresh")
+    client._refresh_client_auth()
+    assert client._auth_token == "fresh"
+
+
+def test_codex_refresh_client_auth_is_best_effort_on_resolver_error():
+    def boom() -> str:
+        raise RuntimeError("resolver down")
+
+    client = CodexApiClient("stale", auth_token_resolver=boom)
+    client._refresh_client_auth()
+    assert client._auth_token == "stale"  # keeps the previous token, never raises
+
+
+def test_codex_no_resolver_keeps_captured_token():
+    client = CodexApiClient("tok")
+    client._refresh_client_auth()
+    assert client._auth_token == "tok"
+
+
+@pytest.mark.asyncio
+async def test_codex_client_sends_resolved_token_not_captured(monkeypatch):
+    sink: dict[str, Any] = {}
+    response = _FakeStreamResponse(
+        lines=[
+            'event: response.output_item.done',
+            'data: {"type":"response.output_item.done","item":{"id":"m","type":"message","content":[{"type":"output_text","text":"ok","annotations":[]}]}}',
+            "",
+            'event: response.completed',
+            'data: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":1,"output_tokens":1}}}',
+            "",
+        ]
+    )
+    monkeypatch.setattr(
+        "openharness.api.codex_client.httpx.AsyncClient",
+        lambda *args, **kwargs: _FakeAsyncClient(response, sink),
+    )
+    fresh = _fake_codex_token()
+    client = CodexApiClient("stale-captured-token", auth_token_resolver=lambda: fresh)
+    request = ApiMessageRequest(
+        model="gpt-5.4",
+        messages=[ConversationMessage.from_user_text("hi")],
+        system_prompt="x",
+    )
+    [event async for event in client.stream_message(request)]
+    # the request carried the resolver's fresh token, not the stale captured one
+    assert sink["headers"]["Authorization"] == f"Bearer {fresh}"
