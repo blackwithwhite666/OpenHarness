@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 import hashlib
 import logging
@@ -12,7 +13,7 @@ import json
 import os
 import string
 
-from openharness.channels.bus.events import InboundMessage
+from openharness.channels.bus.events import InboundMessage, OutboundMessage
 from openharness.commands import CommandContext, CommandResult, lookup_skill_slash_command
 from openharness.engine.messages import (
     ConversationMessage,
@@ -36,7 +37,9 @@ from openharness.ui.runtime import RuntimeBundle, _last_user_text, build_runtime
 from ohmo.gateway.config import load_gateway_config
 from ohmo.gateway.group_tool import CreateFeishuGroup, OhmoCreateFeishuGroupTool, PublishGroupWelcome
 from ohmo.gateway.provider_commands import handle_gateway_model_command, handle_gateway_provider_command
+from ohmo.gateway.send_message_tool import SendTelegramMessageTool
 from ohmo.group_registry import load_managed_group_record, normalize_cwd
+from ohmo.contact_registry import ContactStore
 from ohmo.memory import create_memory_command_backend
 from ohmo.memory_store import MemoryStore
 from ohmo.memory_judge import judge_enabled, judge_interval, run_memory_judge
@@ -109,6 +112,8 @@ class OhmoSessionRuntimePool:
         max_turns: int | None = None,
         create_feishu_group: CreateFeishuGroup | None = None,
         publish_group_welcome: PublishGroupWelcome | None = None,
+        contact_store: ContactStore | None = None,
+        send_outbound: Callable[[OutboundMessage], Awaitable[None]] | None = None,
         default_tz: str = "Europe/Moscow",
         reminder_max_per_chat: int = 50,
     ) -> None:
@@ -119,6 +124,8 @@ class OhmoSessionRuntimePool:
         self._max_turns = max_turns
         self._create_feishu_group = create_feishu_group
         self._publish_group_welcome = publish_group_welcome
+        self._contact_store = contact_store
+        self._send_outbound = send_outbound
         self._default_tz = default_tz
         self._reminder_max_per_chat = reminder_max_per_chat
         self._workspace = initialize_workspace(workspace)
@@ -160,6 +167,29 @@ class OhmoSessionRuntimePool:
             self._gateway_config = load_gateway_config(self._workspace)
             self._provider_profile = self._gateway_config.provider_profile
         return result
+
+    def _is_send_owner(self, message: InboundMessage) -> bool:
+        owners = {
+            str(o).strip().lstrip("@").lower()
+            for o in (self._gateway_config.message_send_owners or [])
+            if str(o).strip()
+        }
+        if not owners:
+            return False
+        md = message.metadata or {}
+        candidates: set[str] = set()
+        sid = str(message.sender_id or "")
+        for part in [sid, *sid.split("|")]:
+            part = part.strip().lstrip("@").lower()
+            if part:
+                candidates.add(part)
+        for key in ("username", "user_id"):
+            value = md.get(key)
+            if value is not None and str(value).strip():
+                candidates.add(str(value).strip().lstrip("@").lower())
+        if str(message.chat_id).strip():
+            candidates.add(str(message.chat_id).strip().lstrip("@").lower())
+        return bool(candidates & owners)
 
     async def get_bundle(
         self,
@@ -283,6 +313,10 @@ class OhmoSessionRuntimePool:
                 # ``chat_type``. Accept either so the ACL works on both.
                 "is_group": _is_group_message(message),
                 "tz": message.metadata.get("tz") or "",
+            }
+            engine_metadata["ohmo_send_ctx"] = {
+                "is_owner": self._is_send_owner(message),
+                "sender_id": str(message.sender_id),
             }
         logger.info(
             "ohmo runtime processing start channel=%s chat_id=%s session_key=%s session_id=%s content=%r",
@@ -839,6 +873,7 @@ class OhmoSessionRuntimePool:
         self._register_todo_tool(bundle)
         self._register_memory_tool(bundle)
         self._register_reminder_tools(bundle)
+        self._register_send_message_tool(bundle)
 
     def _register_memory_tool(self, bundle: RuntimeBundle) -> None:
         """Register the model-callable ``memory`` tool — disciplined curation
@@ -943,6 +978,20 @@ class OhmoSessionRuntimePool:
         )
         registry.register(RemindCancelTool(self._reminder_store, self._reminder_lock))
 
+    def _register_send_message_tool(self, bundle: RuntimeBundle) -> None:
+        """Register send_telegram_message when the gateway provided a contact store
+        and an outbound publisher (i.e. running inside the real gateway service)."""
+        if (
+            self._contact_store is None
+            or self._send_outbound is None
+            or not (self._gateway_config.message_send_owners or [])
+        ):
+            return
+        registry = getattr(bundle, "tool_registry", None)
+        if registry is None:
+            return
+        registry.register(SendTelegramMessageTool(self._contact_store, self._send_outbound))
+
     def _register_group_tool(self, bundle: RuntimeBundle) -> None:
         if self._create_feishu_group is None or not hasattr(bundle, "tool_registry"):
             return
@@ -1005,6 +1054,7 @@ class OhmoSessionRuntimePool:
         metadata = getattr(bundle.engine, "tool_metadata", None)
         if isinstance(metadata, dict):
             metadata.pop("ohmo_reminder_ctx", None)
+            metadata.pop("ohmo_send_ctx", None)
 
 
 _GROUP_CHAT_TYPES = frozenset({"group", "supergroup", "chat", "channel", "room"})
