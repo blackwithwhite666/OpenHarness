@@ -20,6 +20,7 @@ from openharness.channels.bus.events import OutboundMessage
 from openharness.channels.bus.queue import MessageBus
 from openharness.channels.impl.manager import ChannelManager
 
+from ohmo.contact_registry import ContactStore
 from ohmo.gateway.bridge import OhmoGatewayBridge
 from ohmo.gateway.config import build_channel_manager_config, load_gateway_config
 from ohmo.gateway.models import GatewayState
@@ -53,6 +54,7 @@ class OhmoGatewayService:
                 ",".join(self._config.allowed_remote_admin_commands),
             )
         self._bus = MessageBus()
+        self._contact_store = ContactStore(root)
         self._manager = ChannelManager(
             build_channel_manager_config(self._config),
             self._bus,
@@ -64,6 +66,8 @@ class OhmoGatewayService:
             provider_profile=self._config.provider_profile,
             create_feishu_group=self.create_group_for_user,
             publish_group_welcome=self.publish_group_welcome,
+            contact_store=self._contact_store,
+            send_outbound=self._bus.publish_outbound,
             default_tz=self._config.default_tz,
             reminder_max_per_chat=self._config.reminder_max_per_chat,
         )
@@ -85,6 +89,7 @@ class OhmoGatewayService:
             ),
             message_coalesce_window=self._config.message_coalesce_window,
             message_coalesce_max=self._config.message_coalesce_max,
+            contact_store=self._contact_store,
         )
 
     @property

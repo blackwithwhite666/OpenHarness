@@ -15,6 +15,7 @@ from openharness.channels.bus.events import InboundMessage
 from openharness.channels.bus.events import OutboundMessage
 from openharness.channels.bus.queue import MessageBus
 
+from ohmo.contact_registry import ContactStore
 from ohmo.group_registry import load_managed_group_record
 from ohmo.gateway.router import session_key_for_message
 from ohmo.gateway.runtime import OhmoSessionRuntimePool
@@ -126,6 +127,7 @@ class OhmoGatewayBridge:
         feishu_group_policy: str = "open",
         message_coalesce_window: float = 0.0,
         message_coalesce_max: int = 20,
+        contact_store: ContactStore | None = None,
     ) -> None:
         self._bus = bus
         self._runtime_pool = runtime_pool
@@ -139,6 +141,7 @@ class OhmoGatewayBridge:
         self._coalesce_max = int(message_coalesce_max)
         self._pending: dict[str, list[InboundMessage]] = {}
         self._pending_deadline: dict[str, float] = {}
+        self._contact_store = contact_store
 
     async def run(self) -> None:
         self._running = True
@@ -174,6 +177,7 @@ class OhmoGatewayBridge:
                 session_key,
                 _content_snippet(message.content),
             )
+            self._record_contact(message)
 
             stripped = message.content.strip()
             group_args = _parse_group_command(message.content)
@@ -225,6 +229,42 @@ class OhmoGatewayBridge:
             if len(buffer) >= self._coalesce_max:
                 await self._flush_pending(session_key)
             await self._flush_due()
+
+    def _record_contact(self, message: InboundMessage) -> None:
+        if self._contact_store is None:
+            return
+        md = message.metadata or {}
+        if md.get("_synthetic") or message.sender_id == "__scheduler__":
+            return
+        is_group = bool(md.get("is_group")) or str(md.get("chat_type") or "").strip().lower() in {
+            "group",
+            "supergroup",
+            "channel",
+            "chat",
+            "room",
+        }
+        if is_group:
+            return
+        try:
+            self._contact_store.record_inbound(
+                channel=message.channel,
+                chat_id=str(message.chat_id),
+                user_id=(str(md["user_id"]) if md.get("user_id") is not None else None),
+                username=(str(md["username"]) if md.get("username") else None),
+                first_name=(str(md["first_name"]) if md.get("first_name") else None),
+                display_name=(
+                    str(md["sender_display_name"])
+                    if md.get("sender_display_name")
+                    else None
+                ),
+            )
+        except Exception:
+            logger.warning(
+                "ohmo contact record failed channel=%s chat_id=%s",
+                message.channel,
+                message.chat_id,
+                exc_info=True,
+            )
 
     async def _dispatch(self, message: InboundMessage, session_key: str) -> None:
         await self._interrupt_session(
