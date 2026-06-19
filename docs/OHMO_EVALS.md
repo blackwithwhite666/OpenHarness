@@ -95,10 +95,15 @@ Triggers for adding a broader SQLite projection:
 7. Compare execution reports before promoting a candidate run:
 
    ```bash
+   ohmo evals baseline save --workspace <workspace> --from-report eval_report.json --name main
+   ohmo evals baseline list --workspace <workspace>
    ohmo evals compare --workspace <workspace> --baseline baseline_eval_report.json --candidate eval_report.json
+   ohmo evals compare --workspace <workspace> --baseline baselines/main.json --candidate eval_report.json
    ```
 
-   Relative report paths are resolved under `evals/reports/`. The command writes
+   Named baselines are execution reports saved under
+   `evals/reports/baselines/<name>.json`. Relative compare paths are resolved
+   under `evals/reports/`. The compare command writes
    `evals/reports/eval_compare.json` and exits non-zero when a baseline case
    regresses or disappears from the candidate report. Use `--report-only` to
    collect the comparison without failing the command.

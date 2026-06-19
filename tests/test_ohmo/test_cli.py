@@ -1262,3 +1262,127 @@ def test_ohmo_evals_compare_command_fails_on_regressions_and_supports_report_onl
             "report_only": True,
         },
     ]
+
+
+def test_ohmo_evals_baseline_save_command(tmp_path: Path, monkeypatch):
+    runner = CliRunner()
+    workspace = tmp_path / ".ohmo-home"
+    calls: list[dict[str, object]] = []
+
+    def fake_save_ohmo_eval_baseline(
+        *,
+        workspace: str | Path | None = None,
+        source_report: str | Path = "eval_report.json",
+        name: str = "main",
+        overwrite: bool = False,
+    ):
+        calls.append(
+            {
+                "workspace": workspace,
+                "source_report": source_report,
+                "name": name,
+                "overwrite": overwrite,
+            }
+        )
+        return SimpleNamespace(
+            name="main",
+            path=Path(workspace) / "evals" / "reports" / "baselines" / "main.json",
+            relative_path="reports/baselines/main.json",
+            report_id="report-1",
+            case_count=3,
+            passed_count=2,
+            non_passed_count=1,
+        )
+
+    monkeypatch.setattr("ohmo.cli.save_ohmo_eval_baseline", fake_save_ohmo_eval_baseline)
+
+    result = runner.invoke(
+        app,
+        [
+            "evals",
+            "baseline",
+            "save",
+            "--workspace",
+            str(workspace),
+            "--from-report",
+            "candidate.json",
+            "--name",
+            "main",
+            "--overwrite",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert calls == [
+        {
+            "workspace": workspace.resolve(),
+            "source_report": "candidate.json",
+            "name": "main",
+            "overwrite": True,
+        }
+    ]
+    assert "Saved eval baseline:" in result.output
+    assert "Baseline main: cases=3 passed=2 non_passed=1" in result.output
+    assert "ohmo evals compare --baseline baselines/main.json" in result.output
+
+
+def test_ohmo_evals_baseline_list_command(tmp_path: Path, monkeypatch):
+    runner = CliRunner()
+    workspace = tmp_path / ".ohmo-home"
+
+    def fake_list_ohmo_eval_baselines(*, workspace: str | Path | None = None):
+        return SimpleNamespace(
+            baselines=[
+                SimpleNamespace(
+                    name="main",
+                    case_count=3,
+                    passed_count=2,
+                    failed_count=1,
+                    blocked_count=0,
+                    error_count=0,
+                    relative_path="reports/baselines/main.json",
+                )
+            ]
+        )
+
+    monkeypatch.setattr("ohmo.cli.list_ohmo_eval_baselines", fake_list_ohmo_eval_baselines)
+
+    result = runner.invoke(
+        app,
+        [
+            "evals",
+            "baseline",
+            "list",
+            "--workspace",
+            str(workspace),
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert "Eval baselines:" in result.output
+    assert "- main cases=3 passed=2 failed=1 blocked=0 error=0" in result.output
+    assert "path=reports/baselines/main.json" in result.output
+
+
+def test_ohmo_evals_baseline_list_command_empty(tmp_path: Path, monkeypatch):
+    runner = CliRunner()
+    workspace = tmp_path / ".ohmo-home"
+
+    monkeypatch.setattr(
+        "ohmo.cli.list_ohmo_eval_baselines",
+        lambda *, workspace=None: SimpleNamespace(baselines=[]),
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "evals",
+            "baseline",
+            "list",
+            "--workspace",
+            str(workspace),
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert "No eval baselines saved." in result.output

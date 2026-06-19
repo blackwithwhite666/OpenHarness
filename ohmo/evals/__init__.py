@@ -2,7 +2,15 @@
 
 from ohmo.evals.adapter import get_eval_store
 from ohmo.evals.candidates import OhmoEvalMineWrite, write_ohmo_eval_mine
-from ohmo.evals.compare import OhmoEvalCompareResult, compare_ohmo_eval_reports
+from ohmo.evals.compare import (
+    OhmoEvalBaselineListItem,
+    OhmoEvalBaselineListResult,
+    OhmoEvalBaselineSaveResult,
+    OhmoEvalCompareResult,
+    compare_ohmo_eval_reports,
+    list_ohmo_eval_baselines,
+    save_ohmo_eval_baseline,
+)
 from ohmo.evals.embeddings import write_ohmo_embedding_index
 from ohmo.evals.pack import (
     OhmoEvalPackResult,
@@ -39,6 +47,9 @@ __all__ = [
     "OhmoEvalMineWrite",
     "OhmoEvalPackResult",
     "OhmoEvalCompareResult",
+    "OhmoEvalBaselineListItem",
+    "OhmoEvalBaselineListResult",
+    "OhmoEvalBaselineSaveResult",
     "OhmoEvalPromoteResult",
     "OhmoEvalReviewItem",
     "OhmoEvalReviewManifestWrite",
@@ -53,10 +64,12 @@ __all__ = [
     "compare_ohmo_eval_reports",
     "check_ohmo_eval_run_config",
     "get_eval_store",
+    "list_ohmo_eval_baselines",
     "promote_ohmo_eval_case_drafts",
     "review_ohmo_eval_case_drafts",
     "run_ohmo_eval_report",
     "run_ohmo_eval_smoke",
+    "save_ohmo_eval_baseline",
     "validate_ohmo_eval_review_manifest",
     "write_ohmo_embedding_index",
     "write_ohmo_eval_mine",

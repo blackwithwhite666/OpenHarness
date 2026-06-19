@@ -24,10 +24,12 @@ from ohmo.evals import (
     build_ohmo_eval_pack,
     check_ohmo_eval_run_config,
     compare_ohmo_eval_reports,
+    list_ohmo_eval_baselines,
     promote_ohmo_eval_case_drafts,
     review_ohmo_eval_case_drafts,
     run_ohmo_eval_report,
     run_ohmo_eval_smoke,
+    save_ohmo_eval_baseline,
     validate_ohmo_eval_review_manifest,
     write_ohmo_embedding_index,
     write_ohmo_eval_mine,
@@ -58,12 +60,14 @@ soul_app = typer.Typer(name="soul", help="Inspect or edit soul.md")
 user_app = typer.Typer(name="user", help="Inspect or edit user.md")
 gateway_app = typer.Typer(name="gateway", help="Run the ohmo gateway")
 evals_app = typer.Typer(name="evals", help="Build ohmo eval/data-flywheel artifacts")
+evals_baseline_app = typer.Typer(name="baseline", help="Manage ohmo eval baselines")
 
 app.add_typer(memory_app)
 app.add_typer(soul_app)
 app.add_typer(user_app)
 app.add_typer(gateway_app)
 app.add_typer(evals_app)
+evals_app.add_typer(evals_baseline_app)
 
 _INTERACTIVE_CHANNELS = ("telegram", "slack", "discord", "feishu")
 _WORKSPACE_HELP = "Path to the ohmo workspace (defaults to ~/.ohmo)"
@@ -1114,3 +1118,70 @@ def evals_compare_cmd(
         return
     if report.regression_count:
         raise typer.Exit(1)
+
+
+@evals_baseline_app.command("save")
+def evals_baseline_save_cmd(
+    workspace: str | None = typer.Option(None, "--workspace", help=_WORKSPACE_HELP),
+    source_report: str = typer.Option(
+        "eval_report.json",
+        "--from-report",
+        help="Execution report filename under evals/reports, or an absolute path",
+    ),
+    name: str = typer.Option(
+        "main",
+        "--name",
+        help="Baseline name saved under evals/reports/baselines/<name>.json",
+    ),
+    overwrite: bool = typer.Option(
+        False,
+        "--overwrite",
+        help="Replace an existing baseline with the same name",
+    ),
+) -> None:
+    """Save an execution report as a named comparison baseline."""
+    workspace_root = initialize_workspace(workspace)
+    try:
+        result = save_ohmo_eval_baseline(
+            workspace=workspace_root,
+            source_report=source_report,
+            name=name,
+            overwrite=overwrite,
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        print(str(exc), file=sys.stderr)
+        raise typer.Exit(1)
+
+    compare_path = result.relative_path.removeprefix("reports/")
+    print(f"Saved eval baseline: {result.path}")
+    print(
+        "Baseline "
+        f"{result.name}: cases={result.case_count} "
+        f"passed={result.passed_count} non_passed={result.non_passed_count}"
+    )
+    print(f"Compare with: ohmo evals compare --baseline {compare_path}")
+
+
+@evals_baseline_app.command("list")
+def evals_baseline_list_cmd(
+    workspace: str | None = typer.Option(None, "--workspace", help=_WORKSPACE_HELP),
+) -> None:
+    """List saved eval report baselines."""
+    workspace_root = initialize_workspace(workspace)
+    try:
+        result = list_ohmo_eval_baselines(workspace=workspace_root)
+    except (FileNotFoundError, ValueError) as exc:
+        print(str(exc), file=sys.stderr)
+        raise typer.Exit(1)
+
+    if not result.baselines:
+        print("No eval baselines saved.")
+        return
+    print("Eval baselines:")
+    for baseline in result.baselines:
+        print(
+            f"- {baseline.name} cases={baseline.case_count} "
+            f"passed={baseline.passed_count} failed={baseline.failed_count} "
+            f"blocked={baseline.blocked_count} error={baseline.error_count} "
+            f"path={baseline.relative_path}"
+        )
