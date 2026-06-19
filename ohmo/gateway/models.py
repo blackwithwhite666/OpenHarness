@@ -26,6 +26,7 @@ class GatewayConfig(BaseModel):
     reminder_catchup: Literal["once", "none"] = "once"
     message_coalesce_window: float = 0.8
     message_coalesce_max: int = 20
+    evals_capture: bool = True
 
 
 class GatewayState(BaseModel):

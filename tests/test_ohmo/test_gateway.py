@@ -39,6 +39,7 @@ from ohmo.gateway.provider_commands import handle_gateway_model_command, handle_
 from ohmo.gateway.runtime import (
     OhmoSessionRuntimePool,
     _build_inbound_user_message,
+    _evals_capture_enabled,
     _format_channel_progress,
     _sanitize_group_command_metadata,
     _sanitize_group_command_prompts,
@@ -577,6 +578,129 @@ async def test_runtime_pool_records_eval_episode_for_tool_turn(tmp_path, monkeyp
     assert events[3].payload["output"] == "ok"
     assert events[4].payload["text"] == "done"
     assert events[5].payload == {"status": "completed"}
+
+
+def _install_fake_tool_turn(monkeypatch, tmp_path, *, session_id):
+    """Patch build/start runtime with a fake one-tool-then-final turn."""
+
+    async def fake_build_runtime(**kwargs):
+        class FakeEngine:
+            messages = []
+            total_usage = UsageSnapshot()
+
+            def set_system_prompt(self, prompt):
+                return None
+
+            async def submit_message(self, content):
+                yield ToolExecutionStarted(
+                    tool_name="web_fetch",
+                    tool_input={"url": "https://example.com"},
+                    tool_call_id="toolu_x",
+                )
+                yield ToolExecutionCompleted(
+                    tool_name="web_fetch", output="ok", is_error=False, tool_call_id="toolu_x"
+                )
+                yield AssistantTextDelta(text="done")
+
+        return SimpleNamespace(
+            engine=FakeEngine(),
+            cwd=str(tmp_path),
+            session_id=session_id,
+            current_settings=lambda: SimpleNamespace(model="gpt-5.4"),
+            commands=SimpleNamespace(lookup=lambda raw: None),
+        )
+
+    async def fake_start_runtime(bundle):
+        return None
+
+    monkeypatch.setattr("ohmo.gateway.runtime.build_runtime", fake_build_runtime)
+    monkeypatch.setattr("ohmo.gateway.runtime.start_runtime", fake_start_runtime)
+
+
+@pytest.mark.asyncio
+async def test_runtime_pool_skips_eval_capture_when_disabled_via_env(tmp_path, monkeypatch):
+    workspace = tmp_path / ".ohmo-home"
+    initialize_workspace(workspace)
+    monkeypatch.setenv("OHMO_EVALS_CAPTURE", "0")
+    _install_fake_tool_turn(monkeypatch, tmp_path, session_id="sess-env-off")
+
+    pool = OhmoSessionRuntimePool(cwd=tmp_path, workspace=workspace, provider_profile="codex")
+    message = InboundMessage(channel="feishu", sender_id="u1", chat_id="c1", content="check")
+    updates = [u async for u in pool.stream_message(message, "feishu:c1")]
+
+    # The turn still completes normally...
+    assert updates[-1].kind == "final"
+    assert updates[-1].text == "done"
+    # ...but nothing is captured.
+    assert get_eval_store(workspace).list_episode_ids() == []
+
+
+@pytest.mark.asyncio
+async def test_runtime_pool_skips_eval_capture_when_disabled_via_config(tmp_path, monkeypatch):
+    workspace = tmp_path / ".ohmo-home"
+    initialize_workspace(workspace)
+    monkeypatch.delenv("OHMO_EVALS_CAPTURE", raising=False)
+    config = load_gateway_config(workspace)
+    config.evals_capture = False
+    save_gateway_config(config, workspace)
+    _install_fake_tool_turn(monkeypatch, tmp_path, session_id="sess-cfg-off")
+
+    pool = OhmoSessionRuntimePool(cwd=tmp_path, workspace=workspace, provider_profile="codex")
+    message = InboundMessage(channel="feishu", sender_id="u1", chat_id="c1", content="check")
+    updates = [u async for u in pool.stream_message(message, "feishu:c1")]
+
+    assert updates[-1].text == "done"
+    assert get_eval_store(workspace).list_episode_ids() == []
+
+
+@pytest.mark.asyncio
+async def test_runtime_pool_captures_by_default(tmp_path, monkeypatch):
+    workspace = tmp_path / ".ohmo-home"
+    initialize_workspace(workspace)
+    monkeypatch.delenv("OHMO_EVALS_CAPTURE", raising=False)
+    _install_fake_tool_turn(monkeypatch, tmp_path, session_id="sess-default-on")
+
+    pool = OhmoSessionRuntimePool(cwd=tmp_path, workspace=workspace, provider_profile="codex")
+    message = InboundMessage(channel="feishu", sender_id="u1", chat_id="c1", content="check")
+    _ = [u async for u in pool.stream_message(message, "feishu:c1")]
+
+    # Default config has evals_capture=True -> exactly one episode captured.
+    assert len(get_eval_store(workspace).list_episode_ids()) == 1
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        ("0", False),
+        ("false", False),
+        ("FALSE", False),
+        ("no", False),
+        ("off", False),
+        ("1", True),
+        ("true", True),
+        ("yes", True),
+        ("on", True),
+    ],
+)
+def test_evals_capture_enabled_env_overrides_config(monkeypatch, raw, expected):
+    monkeypatch.setenv("OHMO_EVALS_CAPTURE", raw)
+    # Env wins over the config flag in both directions.
+    assert _evals_capture_enabled(GatewayConfig(evals_capture=True)) is expected
+    assert _evals_capture_enabled(GatewayConfig(evals_capture=False)) is expected
+
+
+def test_evals_capture_enabled_follows_config_without_env(monkeypatch):
+    monkeypatch.delenv("OHMO_EVALS_CAPTURE", raising=False)
+    assert _evals_capture_enabled(GatewayConfig(evals_capture=True)) is True
+    assert _evals_capture_enabled(GatewayConfig(evals_capture=False)) is False
+    # Default config captures.
+    assert _evals_capture_enabled(GatewayConfig()) is True
+
+
+def test_evals_capture_enabled_blank_env_falls_back_to_config(monkeypatch):
+    monkeypatch.setenv("OHMO_EVALS_CAPTURE", "   ")
+    assert _evals_capture_enabled(GatewayConfig(evals_capture=False)) is False
+    assert _evals_capture_enabled(GatewayConfig(evals_capture=True)) is True
 
 
 @pytest.mark.asyncio
