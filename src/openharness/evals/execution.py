@@ -97,6 +97,88 @@ class ExactMatchEvalScorer:
         )
 
 
+class ToolTraceOracleV1:
+    """Capability-agnostic trace/policy oracle.
+
+    Scores a run by whether its tool trace is well-formed against the case's
+    expected tool set — independent of the final wording or any world state.
+    This is the one oracle family that works for *every* capability, including
+    read-only / browser cases that have no ``world_after``: it asks "did the
+    agent use tools sanely", not "is some store correct". Checks:
+
+    - ``no_unexpected_tools``: every observed tool is in the case's expected set;
+    - ``no_tool_errors``: no observed tool call returned an error;
+    - ``within_call_budget``: total calls stay within a loop-guard budget;
+    - ``used_tools_when_expected``: when the case expects tools, the run made at
+      least one call (no answer-without-retrieval / hallucinated grounding).
+
+    Under the scripted runner the observed trace equals the recorded one, so
+    this acts as a golden-sanity check (e.g. flags a promoted case whose
+    captured turn contained a tool error); it becomes a model-regression gate
+    under the query-engine runner.
+    """
+
+    name = "tool_trace_oracle_v1"
+
+    def __init__(self, *, max_calls_factor: int = 2, max_calls_floor: int = 3) -> None:
+        self._max_calls_factor = max_calls_factor
+        self._max_calls_floor = max_calls_floor
+
+    def score(
+        self,
+        *,
+        context: EvalExecutionContext,
+        executor_result: EvalExecutorResult,
+    ) -> EvalExecutionScorerResult:
+        expected = list(context.case.tool_names)
+        expected_set = set(expected)
+        calls = list(executor_result.tool_calls)
+        unexpected = sorted(
+            {
+                call.tool_name
+                for call in calls
+                if expected_set and call.tool_name not in expected_set
+            }
+        )
+        error_count = sum(1 for call in calls if call.is_error)
+        budget = max(len(expected) * self._max_calls_factor, self._max_calls_floor)
+        checks = {
+            "no_unexpected_tools": not unexpected,
+            "no_tool_errors": error_count == 0,
+            "within_call_budget": len(calls) <= budget,
+            "used_tools_when_expected": (not expected) or bool(calls),
+        }
+        passed = all(checks.values())
+        return EvalExecutionScorerResult(
+            passed=passed,
+            score=1.0 if passed else 0.0,
+            scorer_name=self.name,
+            metadata={
+                "observed_call_count": len(calls),
+                "expected_tool_count": len(expected),
+                "unexpected_tool_count": len(unexpected),
+                "tool_error_count": error_count,
+                "call_budget": budget,
+                **{f"check.{name}": value for name, value in checks.items()},
+            },
+        )
+
+
+EVAL_EXECUTION_SCORERS: dict[str, EvalExecutionScorer] = {
+    ExactMatchEvalScorer.name: ExactMatchEvalScorer(),
+    ToolTraceOracleV1.name: ToolTraceOracleV1(),
+}
+
+
+def resolve_execution_scorer(name: str) -> EvalExecutionScorer:
+    """Resolve a registered execution scorer by name (raises on unknown)."""
+    scorer = EVAL_EXECUTION_SCORERS.get(name)
+    if scorer is None:
+        supported = ", ".join(sorted(EVAL_EXECUTION_SCORERS))
+        raise ValueError(f"unknown eval scorer: {name}. Supported scorers: {supported}")
+    return scorer
+
+
 def run_execution_report(
     store: EvalStore,
     *,
@@ -117,6 +199,20 @@ def run_execution_report(
     cases = payload.cases[:limit] if limit is not None else payload.cases
     if not cases:
         raise ValueError("eval pack must contain cases")
+
+    unknown_scorers = sorted(
+        {
+            case.scorer
+            for case in cases
+            if getattr(case, "scorer", None) and case.scorer not in EVAL_EXECUTION_SCORERS
+        }
+    )
+    if unknown_scorers:
+        supported = ", ".join(sorted(EVAL_EXECUTION_SCORERS))
+        raise ValueError(
+            f"unknown eval scorer(s): {', '.join(unknown_scorers)}. "
+            f"Supported scorers: {supported}"
+        )
 
     facet_inputs_by_id = {
         item.facet.facet_id: item for item in collect_text_facets(store)
@@ -175,7 +271,7 @@ def _execute_case(
     case: EvalRunPackCase,
     facet_inputs_by_id: dict[str, EvalTextFacetInput],
     executor: EvalExecutor,
-    scorer: EvalExecutionScorer,
+    default_scorer: EvalExecutionScorer,
 ) -> EvalExecutionReportCase:
     episode = store.get_episode(case.episode_id)
     events = list(store.iter_events(case.episode_id)) if episode is not None else []
@@ -255,7 +351,12 @@ def _execute_case(
         )
 
     observed_tool_path = [_sanitize_label(value, prefix="tool") for value in executor_result.tool_path]
-    scorer_result = scorer.score(
+    selected_scorer = (
+        EVAL_EXECUTION_SCORERS.get(case.scorer, default_scorer)
+        if getattr(case, "scorer", None)
+        else default_scorer
+    )
+    scorer_result = selected_scorer.score(
         context=execution_context,
         executor_result=executor_result,
     )

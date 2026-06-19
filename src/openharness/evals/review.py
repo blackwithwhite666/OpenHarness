@@ -138,6 +138,7 @@ def _gold_from_draft(
         expected_facet_ids=draft.expected_facet_ids,
         tool_names=draft.tool_names,
         rubric=draft.rubric,
+        scorer=draft.scorer,
         review_status="approved",
         reviewer=reviewer,
         metadata=metadata,

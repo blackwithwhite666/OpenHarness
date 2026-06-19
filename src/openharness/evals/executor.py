@@ -74,12 +74,27 @@ class EvalExecutionContext:
 
 
 @dataclass(frozen=True)
+class EvalObservedCall:
+    """One observed tool call from an eval run.
+
+    Transient: carries the raw arguments the run actually passed so trace/
+    policy oracles can inspect them. Must never be persisted directly — the
+    execution report only keeps sanitized, metadata-only tool labels.
+    """
+
+    tool_name: str
+    arguments: dict[str, Any] = field(default_factory=dict)
+    is_error: bool = False
+
+
+@dataclass(frozen=True)
 class EvalExecutorResult:
     """Transient result returned by an eval executor."""
 
     final_text: str = ""
     tool_path: tuple[str, ...] = ()
     event_kind_path: tuple[str, ...] = ()
+    tool_calls: tuple[EvalObservedCall, ...] = ()
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
@@ -271,6 +286,7 @@ async def _run_scripted_replay(
     context: EvalExecutionContext,
 ) -> EvalExecutorResult:
     tool_path: list[str] = []
+    observed_calls: list[EvalObservedCall] = []
     event_kind_path = ["execution_started"]
     for fixture in context.tool_fixtures:
         tool = tool_registry.get(fixture.tool_name)
@@ -283,17 +299,41 @@ async def _run_scripted_replay(
             ToolExecutionContext(cwd=context.store.root),
         )
         tool_path.append(fixture.tool_name)
+        observed_calls.append(
+            EvalObservedCall(
+                tool_name=fixture.tool_name,
+                arguments=_fixture_arguments(context, fixture),
+                is_error=result.is_error,
+            )
+        )
         event_kind_path.append("tool_completed_error" if result.is_error else "tool_completed")
     event_kind_path.append("execution_completed")
     return EvalExecutorResult(
         final_text=context.expected_final_text,
         tool_path=tuple(tool_path),
         event_kind_path=tuple(event_kind_path),
+        tool_calls=tuple(observed_calls),
         metadata={
             "agent_runner": ReplayScriptAgentRunner.name,
             "fixture_count": len(context.tool_fixtures),
         },
     )
+
+
+def _fixture_arguments(
+    context: EvalExecutionContext, fixture: EvalToolFixture
+) -> dict[str, Any]:
+    """Recover the structured tool input recorded for a replayed fixture.
+
+    For the scripted runner the observed call equals the captured one, so the
+    arguments come from the originating ``tool_started`` event payload.
+    """
+    idx = fixture.start_event_index
+    if idx is None or idx < 0 or idx >= len(context.events):
+        return {}
+    payload = context.events[idx].payload or {}
+    arguments = payload.get("input")
+    return dict(arguments) if isinstance(arguments, dict) else {}
 
 
 async def _run_query_engine_replay(
@@ -321,13 +361,26 @@ async def _run_query_engine_replay(
         max_tokens=max_tokens,
     )
     tool_path: list[str] = []
+    observed_calls: list[dict[str, Any]] = []
+    calls_by_id: dict[str, dict[str, Any]] = {}
     event_kind_path: list[str] = ["execution_started"]
     final_text = ""
     async for event in engine.submit_message(prompt):
         if isinstance(event, ToolExecutionStarted):
             tool_path.append(event.tool_name)
+            entry = {
+                "tool_name": event.tool_name,
+                "arguments": dict(event.tool_input or {}),
+                "is_error": False,
+            }
+            observed_calls.append(entry)
+            if event.tool_call_id:
+                calls_by_id[event.tool_call_id] = entry
             event_kind_path.append("tool_started")
         elif isinstance(event, ToolExecutionCompleted):
+            entry = calls_by_id.get(event.tool_call_id)
+            if entry is not None:
+                entry["is_error"] = event.is_error
             event_kind_path.append(
                 "tool_completed_error" if event.is_error else "tool_completed"
             )
@@ -341,6 +394,7 @@ async def _run_query_engine_replay(
         final_text=final_text,
         tool_path=tuple(tool_path),
         event_kind_path=tuple(event_kind_path),
+        tool_calls=tuple(EvalObservedCall(**entry) for entry in observed_calls),
         metadata={
             "agent_runner": QueryEngineEvalAgentRunner.name,
             "engine_message_count": len(engine.messages),
