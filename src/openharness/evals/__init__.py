@@ -7,6 +7,12 @@ from openharness.evals.candidates import (
     write_candidate_pack,
     write_case_draft_pack,
 )
+from openharness.evals.compare import (
+    EvalReportComparisonWrite,
+    compare_execution_reports,
+    read_execution_report,
+    write_execution_report_comparison,
+)
 from openharness.evals.embeddings import EvalEmbeddingIndexWrite, write_embedding_index
 from openharness.evals.execution import EvalExecutionReportWrite, run_execution_report
 from openharness.evals.executor import (
@@ -43,6 +49,8 @@ from openharness.evals.models import (
     EvalReplayContext,
     EvalReplayReport,
     EvalReplayReportCase,
+    EvalReportComparison,
+    EvalReportComparisonCase,
     EvalRunPack,
     EvalRunPackCase,
     EvalSmokeReport,
@@ -98,6 +106,9 @@ __all__ = [
     "EvalReplayReport",
     "EvalReplayReportCase",
     "EvalReplayReportWrite",
+    "EvalReportComparison",
+    "EvalReportComparisonCase",
+    "EvalReportComparisonWrite",
     "EvalRunPack",
     "EvalRunPackCase",
     "EvalRunPackWrite",
@@ -124,9 +135,11 @@ __all__ = [
     "build_case_drafts",
     "build_run_pack",
     "build_usage_graph",
+    "compare_execution_reports",
     "collect_text_facets",
     "promote_case_drafts",
     "read_case_drafts",
+    "read_execution_report",
     "read_gold_cases",
     "read_run_pack",
     "run_smoke_report",
@@ -136,6 +149,7 @@ __all__ = [
     "write_candidate_pack",
     "write_case_draft_pack",
     "write_embedding_index",
+    "write_execution_report_comparison",
     "write_run_pack",
     "write_usage_graph",
 ]

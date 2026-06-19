@@ -22,6 +22,7 @@ from ohmo.gateway.service import (
 )
 from ohmo.evals import (
     build_ohmo_eval_pack,
+    compare_ohmo_eval_reports,
     promote_ohmo_eval_case_drafts,
     review_ohmo_eval_case_drafts,
     run_ohmo_eval_report,
@@ -980,4 +981,65 @@ def evals_run_cmd(
         + getattr(report, "blocked_count", 0)
         + getattr(report, "error_count", 0)
     ):
+        raise typer.Exit(1)
+
+
+@evals_app.command("compare")
+def evals_compare_cmd(
+    workspace: str | None = typer.Option(None, "--workspace", help=_WORKSPACE_HELP),
+    baseline_report: str = typer.Option(
+        ...,
+        "--baseline",
+        help="Baseline execution report filename under evals/reports, or an absolute path",
+    ),
+    candidate_report: str = typer.Option(
+        "eval_report.json",
+        "--candidate",
+        help="Candidate execution report filename under evals/reports, or an absolute path",
+    ),
+    report_filename: str = typer.Option(
+        "eval_compare.json",
+        "--output",
+        help="Comparison report filename under evals/reports",
+    ),
+    score_tolerance: float = typer.Option(
+        0.0,
+        "--score-tolerance",
+        min=0.0,
+        help="Allowed per-case score drop before same-status cases regress",
+    ),
+    report_only: bool = typer.Option(
+        False,
+        "--report-only",
+        help="Exit 0 after writing the comparison even when regressions are found",
+    ),
+) -> None:
+    """Compare two execution reports and fail on regressions."""
+    workspace_root = initialize_workspace(workspace)
+    try:
+        result = compare_ohmo_eval_reports(
+            workspace=workspace_root,
+            baseline_report=baseline_report,
+            candidate_report=candidate_report,
+            report_filename=report_filename,
+            score_tolerance=score_tolerance,
+            report_only=report_only,
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        print(str(exc), file=sys.stderr)
+        raise typer.Exit(1)
+
+    report = result.write.report
+    print(f"Wrote eval comparison report: {result.write.path}")
+    print(
+        "Compared eval reports: "
+        f"cases={report.case_count} compared={report.compared_count} "
+        f"unchanged={report.unchanged_count} improved={report.improvement_count} "
+        f"regressed={report.regression_count} added={report.added_count} "
+        f"removed={report.removed_count} score_delta={report.score_delta:.3f}"
+    )
+    if result.report_only:
+        print("Report-only mode: regressions did not fail the command")
+        return
+    if report.regression_count:
         raise typer.Exit(1)

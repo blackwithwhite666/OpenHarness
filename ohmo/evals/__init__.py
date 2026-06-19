@@ -2,6 +2,7 @@
 
 from ohmo.evals.adapter import get_eval_store
 from ohmo.evals.candidates import OhmoEvalMineWrite, write_ohmo_eval_mine
+from ohmo.evals.compare import OhmoEvalCompareResult, compare_ohmo_eval_reports
 from ohmo.evals.embeddings import write_ohmo_embedding_index
 from ohmo.evals.pack import (
     OhmoEvalPackResult,
@@ -30,6 +31,7 @@ __all__ = [
     "GatewayEvalRecorder",
     "OhmoEvalMineWrite",
     "OhmoEvalPackResult",
+    "OhmoEvalCompareResult",
     "OhmoEvalPromoteResult",
     "OhmoEvalReviewItem",
     "OhmoEvalReviewManifestWrite",
@@ -39,6 +41,7 @@ __all__ = [
     "ResourceSnapshotWrite",
     "build_ohmo_eval_pack",
     "build_ohmo_resource_snapshot",
+    "compare_ohmo_eval_reports",
     "get_eval_store",
     "promote_ohmo_eval_case_drafts",
     "review_ohmo_eval_case_drafts",

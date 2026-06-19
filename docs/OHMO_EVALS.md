@@ -4,6 +4,29 @@ Ohmo evals keep private conversation text in the local eval store, but write
 mined cases, review manifests, run packs, and reports as metadata-only
 artifacts.
 
+## Storage contract
+
+The current source of truth is the workspace-local JSON/JSONL store:
+
+- episodes and event streams live under `evals/episodes/`
+- resource snapshots live under `evals/states/`
+- candidates, draft cases, gold cases, packs, and reports are written as
+  explicit JSON/JSONL artifacts with manifests
+
+`EvalStore` keeps a small local `evals.sqlite` lookup index for JSONL offsets
+and embedding metadata, but that database is not the source of truth. Do not
+add a broader SQLite projection/cache for candidates, review, packs, reports,
+or comparisons until there is a concrete performance or concurrency need.
+
+Triggers for adding a broader SQLite projection:
+
+- mining or pack building becomes noticeably slow for a normal workspace
+- the store grows to tens or hundreds of thousands of events/facets
+- review needs fast filters over tool name, case kind, review status, or
+  embedding/content hashes
+- multiple gateway/eval processes need coordinated concurrent writes
+- embedding lookup cost starts to dominate and content-hash caching is needed
+
 ## Flow
 
 1. Capture gateway episodes while using Ohmo. Captured state lives under
@@ -56,6 +79,17 @@ artifacts.
    the normal `QueryEngine` model loop while tool calls are still served by
    recorded outputs only. The default report is `evals/reports/eval_report.json`.
 
+7. Compare execution reports before promoting a candidate run:
+
+   ```bash
+   ohmo evals compare --workspace <workspace> --baseline baseline_eval_report.json --candidate eval_report.json
+   ```
+
+   Relative report paths are resolved under `evals/reports/`. The command writes
+   `evals/reports/eval_compare.json` and exits non-zero when a baseline case
+   regresses or disappears from the candidate report. Use `--report-only` to
+   collect the comparison without failing the command.
+
 ## Report contract
 
 Reports include `schema_version` and `report_kind`:
@@ -63,6 +97,7 @@ Reports include `schema_version` and `report_kind`:
 - `smoke_report` for `ohmo evals smoke`
 - `metadata_replay_report` for the generic metadata replay runner
 - `execution_report` for `ohmo evals run`
+- `execution_comparison_report` for `ohmo evals compare`
 
 Execution reports split statuses into `passed`, `failed`, `blocked`, and
 `error`. The CLI exits non-zero for any non-passed status unless
@@ -71,3 +106,7 @@ Execution reports split statuses into `passed`, `failed`, `blocked`, and
 `observed_trace` is metadata-only. Executor outputs are treated as untrusted:
 event and tool labels are sanitized, final output is stored as hash and length,
 and executor metadata values are not copied into reports.
+
+Comparison reports are also metadata-only. They compare case ids, statuses,
+scores, and aggregate counts. They do not read or persist raw prompts, tool
+inputs, tool outputs, or final answers.

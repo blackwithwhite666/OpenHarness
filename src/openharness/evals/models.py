@@ -617,3 +617,64 @@ class EvalExecutionReport(BaseModel):
     @classmethod
     def _metadata_is_json(cls, value: dict[str, Any]) -> dict[str, Any]:
         return _validate_json_mapping(value)
+
+
+class EvalReportComparisonCase(BaseModel):
+    """Metadata-only comparison for one eval case across two execution reports."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    gold_case_id: str
+    case_id: str
+    status: str
+    baseline_status: str = ""
+    candidate_status: str = ""
+    baseline_score: float = 0.0
+    candidate_score: float = 0.0
+    score_delta: float = 0.0
+    warnings: list[str] = Field(default_factory=list)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("metadata")
+    @classmethod
+    def _metadata_is_json(cls, value: dict[str, Any]) -> dict[str, Any]:
+        return _validate_json_mapping(value)
+
+
+class EvalReportComparison(BaseModel):
+    """Metadata-only regression comparison between two execution reports."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: int = 1
+    report_kind: str = "execution_comparison_report"
+    report_id: str
+    baseline_report_id: str
+    candidate_report_id: str
+    baseline_pack_id: str
+    candidate_pack_id: str
+    created_at: datetime = Field(default_factory=_utc_now)
+    case_count: int
+    compared_count: int
+    unchanged_count: int
+    improvement_count: int
+    regression_count: int
+    added_count: int
+    removed_count: int
+    baseline_passed_count: int
+    candidate_passed_count: int
+    baseline_non_passed_count: int
+    candidate_non_passed_count: int
+    score_delta: float = 0.0
+    cases: list[EvalReportComparisonCase] = Field(default_factory=list)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("created_at")
+    @classmethod
+    def _created_at_is_utc(cls, value: datetime) -> datetime:
+        return _normalize_timestamp(value)
+
+    @field_validator("metadata")
+    @classmethod
+    def _metadata_is_json(cls, value: dict[str, Any]) -> dict[str, Any]:
+        return _validate_json_mapping(value)

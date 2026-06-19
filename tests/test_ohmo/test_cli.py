@@ -907,3 +907,104 @@ def test_ohmo_evals_run_command_rejects_unknown_executor(tmp_path: Path):
 
     assert result.exit_code == 1
     assert "unknown eval executor: live-agent" in result.stderr
+
+
+def test_ohmo_evals_compare_command_fails_on_regressions_and_supports_report_only(
+    tmp_path: Path,
+    monkeypatch,
+):
+    runner = CliRunner()
+    workspace = tmp_path / ".ohmo-home"
+    calls: list[dict[str, object]] = []
+
+    def fake_compare_ohmo_eval_reports(
+        *,
+        workspace: str | Path | None = None,
+        baseline_report: str | Path,
+        candidate_report: str | Path = "eval_report.json",
+        report_filename: str = "eval_compare.json",
+        score_tolerance: float = 0.0,
+        report_only: bool = False,
+    ):
+        calls.append(
+            {
+                "workspace": workspace,
+                "baseline_report": baseline_report,
+                "candidate_report": candidate_report,
+                "report_filename": report_filename,
+                "score_tolerance": score_tolerance,
+                "report_only": report_only,
+            }
+        )
+        return SimpleNamespace(
+            report_only=report_only,
+            write=SimpleNamespace(
+                path=Path(workspace) / "evals" / "reports" / report_filename,
+                report=SimpleNamespace(
+                    case_count=2,
+                    compared_count=2,
+                    unchanged_count=0,
+                    improvement_count=1,
+                    regression_count=1,
+                    added_count=0,
+                    removed_count=0,
+                    score_delta=-0.25,
+                ),
+            ),
+        )
+
+    monkeypatch.setattr("ohmo.cli.compare_ohmo_eval_reports", fake_compare_ohmo_eval_reports)
+
+    failed = runner.invoke(
+        app,
+        [
+            "evals",
+            "compare",
+            "--workspace",
+            str(workspace),
+            "--baseline",
+            "baseline.json",
+            "--candidate",
+            "candidate.json",
+            "--output",
+            "compare.json",
+            "--score-tolerance",
+            "0.1",
+        ],
+    )
+    report_only = runner.invoke(
+        app,
+        [
+            "evals",
+            "compare",
+            "--workspace",
+            str(workspace),
+            "--baseline",
+            "baseline.json",
+            "--report-only",
+        ],
+    )
+
+    assert failed.exit_code == 1
+    assert "Wrote eval comparison report:" in failed.output
+    assert "regressed=1" in failed.output
+    assert report_only.exit_code == 0
+    assert "Report-only mode: regressions did not fail the command" in report_only.output
+    assert calls == [
+        {
+            "workspace": workspace.resolve(),
+            "baseline_report": "baseline.json",
+            "candidate_report": "candidate.json",
+            "report_filename": "compare.json",
+            "score_tolerance": 0.1,
+            "report_only": False,
+        },
+        {
+            "workspace": workspace.resolve(),
+            "baseline_report": "baseline.json",
+            "candidate_report": "eval_report.json",
+            "report_filename": "eval_compare.json",
+            "score_tolerance": 0.0,
+            "report_only": True,
+        },
+    ]
