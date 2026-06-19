@@ -30,6 +30,7 @@ from openharness.memory import list_memory_files as list_project_memory_files
 from openharness.permissions import PermissionChecker, PermissionMode
 from openharness.tools.base import ToolExecutionContext, ToolRegistry
 
+from ohmo.evals import get_eval_store
 from ohmo.gateway.bridge import OhmoGatewayBridge, _format_gateway_error
 from ohmo.gateway.config import load_gateway_config, save_gateway_config
 from ohmo.gateway.group_tool import OhmoCreateFeishuGroupInput, OhmoCreateFeishuGroupTool
@@ -49,6 +50,34 @@ from ohmo.memory import list_memory_files as list_ohmo_memory_files
 from ohmo.gateway.router import session_key_for_message
 from ohmo.session_storage import save_session_snapshot
 from ohmo.workspace import get_gateway_restart_notice_path, get_skills_dir, initialize_workspace
+
+
+def _single_eval_episode(workspace: Path):
+    store = get_eval_store(workspace)
+    episode_ids = store.list_episode_ids()
+    assert len(episode_ids) == 1
+    episode = store.get_episode(episode_ids[0])
+    assert episode is not None
+    return episode, list(store.iter_events(episode_ids[0]))
+
+
+def _assert_resource_snapshot_event(workspace: Path, episode, event, *, tool_count: int):
+    assert event.kind == "resource_snapshot"
+    assert event.payload["path"] == f"states/{episode.episode_id}/resource_snapshot.json"
+    assert event.payload["resource_count"] >= event.payload["local_resource_count"]
+    assert event.payload["local_resource_count"] >= 16
+    assert event.payload["tool_count"] == tool_count
+
+    manifest_path = get_eval_store(workspace).root / event.payload["path"]
+    assert manifest_path.is_file()
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["episode_id"] == episode.episode_id
+    assert len(manifest["resources"]) == event.payload["resource_count"]
+    resource_ids = {resource["resource_id"] for resource in manifest["resources"]}
+    assert "ohmo.workspace.soul_md" in resource_ids
+    assert "ohmo.workspace.user_md" in resource_ids
+    assert "ohmo.workspace.logs_dir" not in resource_ids
+    return manifest
 
 
 def test_gateway_router_uses_thread_and_sender_for_group_when_present():
@@ -463,6 +492,146 @@ async def test_runtime_pool_stream_message_emits_progress_and_tool_hint(tmp_path
     assert "```" in updates[1].text  # args rendered as a code block
     assert updates[-1].kind == "final"
     assert updates[-1].text == "done"
+
+
+@pytest.mark.asyncio
+async def test_runtime_pool_records_eval_episode_for_tool_turn(tmp_path, monkeypatch):
+    workspace = tmp_path / ".ohmo-home"
+    initialize_workspace(workspace)
+
+    async def fake_build_runtime(**kwargs):
+        class FakeEngine:
+            messages = []
+            total_usage = UsageSnapshot()
+
+            def set_system_prompt(self, prompt):
+                return None
+
+            async def submit_message(self, content):
+                yield ToolExecutionStarted(
+                    tool_name="web_fetch",
+                    tool_input={"url": "https://example.com", "limit": 3},
+                    tool_call_id="toolu_abc123",
+                )
+                yield ToolExecutionCompleted(
+                    tool_name="web_fetch",
+                    output="ok",
+                    is_error=False,
+                    tool_call_id="toolu_abc123",
+                )
+                yield AssistantTextDelta(text="done")
+
+        return SimpleNamespace(
+            engine=FakeEngine(),
+            cwd=str(tmp_path),
+            session_id="sess-eval-tool",
+            current_settings=lambda: SimpleNamespace(model="gpt-5.4"),
+            commands=SimpleNamespace(lookup=lambda raw: None),
+        )
+
+    async def fake_start_runtime(bundle):
+        return None
+
+    monkeypatch.setattr("ohmo.gateway.runtime.build_runtime", fake_build_runtime)
+    monkeypatch.setattr("ohmo.gateway.runtime.start_runtime", fake_start_runtime)
+
+    pool = OhmoSessionRuntimePool(cwd=tmp_path, workspace=workspace, provider_profile="codex")
+    message = InboundMessage(
+        channel="feishu",
+        sender_id="u1",
+        chat_id="c1",
+        content="check",
+        timestamp=datetime(2026, 1, 2, 3, 4, 5),
+        metadata={"chat_type": "p2p", "sent_at": datetime(2026, 1, 2, 3, 4, 5)},
+    )
+    updates = [u async for u in pool.stream_message(message, "feishu:c1")]
+
+    assert updates[-1].kind == "final"
+    assert updates[-1].text == "done"
+
+    episode, events = _single_eval_episode(workspace)
+    assert episode.source == "gateway"
+    assert episode.app == "ohmo"
+    assert episode.session_id == "sess-eval-tool"
+    assert episode.user_text == "check"
+    assert episode.metadata["session_key"] == "feishu:c1"
+    assert episode.metadata["cwd"] == str(tmp_path)
+    assert episode.metadata["model"] == "gpt-5.4"
+    assert episode.metadata["inbound"]["metadata"]["sent_at"] == "2026-01-02T03:04:05"
+    assert [event.kind for event in events] == [
+        "inbound_message",
+        "resource_snapshot",
+        "tool_started",
+        "tool_completed",
+        "gateway_final",
+        "episode_finished",
+    ]
+    _assert_resource_snapshot_event(workspace, episode, events[1], tool_count=0)
+    assert events[2].tool_name == "web_fetch"
+    assert events[2].tool_call_id == "toolu_abc123"
+    assert events[2].payload["input"]["url"] == "https://example.com"
+    assert "https://example.com" in events[2].payload["input_summary"]
+    assert events[3].tool_name == "web_fetch"
+    assert events[3].tool_call_id == "toolu_abc123"
+    assert events[3].is_error is False
+    assert events[3].payload["output"] == "ok"
+    assert events[4].payload["text"] == "done"
+    assert events[5].payload == {"status": "completed"}
+
+
+@pytest.mark.asyncio
+async def test_runtime_pool_records_eval_episode_for_command_only_final(tmp_path, monkeypatch):
+    workspace = tmp_path / ".ohmo-home"
+    initialize_workspace(workspace)
+
+    async def command_handler(args, context):
+        assert args == ""
+        return CommandResult(message="pong")
+
+    async def fake_build_runtime(**kwargs):
+        class FakeEngine:
+            messages = []
+            total_usage = UsageSnapshot()
+
+            def set_system_prompt(self, prompt):
+                return None
+
+        command = SlashCommand("hello", "Say hello", command_handler)
+        return SimpleNamespace(
+            engine=FakeEngine(),
+            cwd=str(tmp_path),
+            session_id="sess-eval-command",
+            current_settings=lambda: SimpleNamespace(model="gpt-5.4"),
+            commands=SimpleNamespace(
+                lookup=lambda raw: (command, "") if raw == "/hello" else None
+            ),
+        )
+
+    async def fake_start_runtime(bundle):
+        return None
+
+    monkeypatch.setattr("ohmo.gateway.runtime.build_runtime", fake_build_runtime)
+    monkeypatch.setattr("ohmo.gateway.runtime.start_runtime", fake_start_runtime)
+
+    pool = OhmoSessionRuntimePool(cwd=tmp_path, workspace=workspace, provider_profile="codex")
+    message = InboundMessage(channel="telegram", sender_id="u1", chat_id="c1", content="/hello")
+    updates = [u async for u in pool.stream_message(message, "telegram:c1")]
+
+    assert [(update.kind, update.text) for update in updates] == [("final", "pong")]
+
+    episode, events = _single_eval_episode(workspace)
+    assert episode.session_id == "sess-eval-command"
+    assert episode.user_text == "/hello"
+    assert [event.kind for event in events] == [
+        "inbound_message",
+        "resource_snapshot",
+        "gateway_final",
+        "episode_finished",
+    ]
+    _assert_resource_snapshot_event(workspace, episode, events[1], tool_count=0)
+    assert events[2].payload["text"] == "pong"
+    assert events[2].payload["metadata"]["_command"] is True
+    assert events[3].payload == {"status": "completed"}
 
 
 @pytest.mark.asyncio

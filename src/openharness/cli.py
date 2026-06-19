@@ -434,7 +434,7 @@ def _build_dry_run_preview(
     from openharness.prompts.context import build_runtime_system_prompt
     from openharness.skills import load_skill_registry
     from openharness.tools import create_default_tool_registry
-    from openharness.ui.runtime import _resolve_api_client_from_settings
+    from openharness.api.resolver import resolve_api_client_from_settings
 
     resolved_cwd = str(Path(cwd).expanduser().resolve())
     settings = load_settings().merge_cli_overrides(
@@ -477,7 +477,7 @@ def _build_dry_run_preview(
     client_validation = {"status": "ok", "detail": ""}
     try:
         with redirect_stderr(StringIO()):
-            _resolve_api_client_from_settings(settings)
+            resolve_api_client_from_settings(settings)
     except SystemExit:
         client_validation = {"status": "error", "detail": "runtime client could not be resolved with current auth/config"}
     except Exception as exc:  # pragma: no cover - defensive diagnostic path

@@ -223,6 +223,10 @@ def get_attachments_dir(workspace: str | Path | None = None) -> Path:
     return get_workspace_root(workspace) / "attachments"
 
 
+def get_evals_dir(workspace: str | Path | None = None) -> Path:
+    return get_workspace_root(workspace) / "evals"
+
+
 def get_state_path(workspace: str | Path | None = None) -> Path:
     return get_workspace_root(workspace) / "state.json"
 

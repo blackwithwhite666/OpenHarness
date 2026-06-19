@@ -20,6 +20,16 @@ from ohmo.gateway.service import (
     start_gateway_process,
     stop_gateway_process,
 )
+from ohmo.evals import (
+    build_ohmo_eval_pack,
+    promote_ohmo_eval_case_drafts,
+    review_ohmo_eval_case_drafts,
+    run_ohmo_eval_report,
+    run_ohmo_eval_smoke,
+    write_ohmo_embedding_index,
+    write_ohmo_eval_mine,
+    write_ohmo_eval_review_manifest,
+)
 from ohmo.memory import add_memory_entry, list_memory_files, remove_memory_entry
 from ohmo.runtime import launch_ohmo_react_tui, run_ohmo_backend, run_ohmo_print_mode
 from ohmo.session_storage import OhmoSessionBackend
@@ -44,11 +54,13 @@ memory_app = typer.Typer(name="memory", help="Manage .ohmo memory")
 soul_app = typer.Typer(name="soul", help="Inspect or edit soul.md")
 user_app = typer.Typer(name="user", help="Inspect or edit user.md")
 gateway_app = typer.Typer(name="gateway", help="Run the ohmo gateway")
+evals_app = typer.Typer(name="evals", help="Build ohmo eval/data-flywheel artifacts")
 
 app.add_typer(memory_app)
 app.add_typer(soul_app)
 app.add_typer(user_app)
 app.add_typer(gateway_app)
+app.add_typer(evals_app)
 
 _INTERACTIVE_CHANNELS = ("telegram", "slack", "discord", "feishu")
 _WORKSPACE_HELP = "Path to the ohmo workspace (defaults to ~/.ohmo)"
@@ -677,3 +689,295 @@ def gateway_status_cmd(
 ) -> None:
     state = gateway_status(cwd, workspace)
     print(state.model_dump_json(indent=2))
+
+
+@evals_app.command("embed")
+def evals_embed_cmd(
+    workspace: str | None = typer.Option(None, "--workspace", help=_WORKSPACE_HELP),
+    batch_size: int = typer.Option(32, "--batch-size", min=1, help="Texts per inference batch"),
+    inference_url: str | None = typer.Option(
+        None,
+        "--inference-url",
+        help="Override INFERENCE_URL for the telegent-style inference service",
+    ),
+) -> None:
+    """Build a dense embedding index for captured ohmo eval episodes."""
+    workspace_root = initialize_workspace(workspace)
+    result = asyncio.run(
+        write_ohmo_embedding_index(
+            workspace=workspace_root,
+            inference_url=inference_url,
+            batch_size=batch_size,
+        )
+    )
+    print(f"Wrote embedding manifest: {result.manifest_path}")
+    print(f"Wrote embedding records: {result.records_path}")
+    print(
+        "Indexed "
+        f"{result.manifest.embedding_count}/{result.manifest.facet_count} facets "
+        f"with dimensions={result.manifest.dimensions}"
+    )
+
+
+@evals_app.command("mine")
+def evals_mine_cmd(
+    workspace: str | None = typer.Option(None, "--workspace", help=_WORKSPACE_HELP),
+) -> None:
+    """Mine metadata-only eval candidates and draft cases."""
+    workspace_root = initialize_workspace(workspace)
+    result = write_ohmo_eval_mine(workspace=workspace_root)
+    print(f"Wrote candidate manifest: {result.candidates.manifest_path}")
+    print(f"Wrote candidate records: {result.candidates.records_path}")
+    print(f"Wrote case manifest: {result.cases.manifest_path}")
+    print(f"Wrote case records: {result.cases.records_path}")
+    print(
+        "Mined "
+        f"{result.candidates.manifest.record_count} candidates and "
+        f"{result.cases.manifest.record_count} draft cases"
+    )
+
+
+@evals_app.command("review")
+def evals_review_cmd(
+    workspace: str | None = typer.Option(None, "--workspace", help=_WORKSPACE_HELP),
+    case_id: str | None = typer.Option(None, "--case-id", help="Show one draft case"),
+    limit: int = typer.Option(20, "--limit", min=1, help="Maximum draft cases to show"),
+    manifest_filename: str | None = typer.Option(
+        None,
+        "--manifest",
+        help="Write a metadata-only review manifest under evals/cases",
+    ),
+) -> None:
+    """Review metadata-only draft eval cases."""
+    workspace_root = initialize_workspace(workspace)
+    try:
+        result = review_ohmo_eval_case_drafts(
+            workspace=workspace_root,
+            case_id=case_id,
+            limit=limit,
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        print(str(exc), file=sys.stderr)
+        raise typer.Exit(1)
+
+    manifest_write = None
+    if manifest_filename:
+        try:
+            manifest_write = write_ohmo_eval_review_manifest(
+                workspace=workspace_root,
+                case_id=case_id,
+                limit=limit,
+                filename=manifest_filename,
+            )
+        except (FileNotFoundError, ValueError) as exc:
+            print(str(exc), file=sys.stderr)
+            raise typer.Exit(1)
+
+    if case_id:
+        if not result.shown:
+            print(f"Draft eval case not found: {case_id}", file=sys.stderr)
+            raise typer.Exit(1)
+        item = result.shown[0]
+        print(f"Draft eval case: {item.case_id}")
+        print(f"- kind: {item.case_kind}")
+        print(f"- episode: {item.episode_id}")
+        print(f"- status: {item.review_status}")
+        print(f"- input_facets: {item.input_facet_count}")
+        print(f"- expected_facets: {item.expected_facet_count}")
+        print(f"- tools: {', '.join(item.tool_names) if item.tool_names else '-'}")
+        if manifest_write is not None:
+            print(f"Wrote review manifest: {manifest_write.path}")
+        print(f"Promote with: ohmo evals promote --case-id {item.case_id}")
+        return
+
+    print("Draft eval cases:")
+    for item in result.shown:
+        tools = ",".join(item.tool_names) if item.tool_names else "-"
+        print(
+            f"- {item.case_id} {item.case_kind} "
+            f"episode={item.episode_id} "
+            f"facets={item.input_facet_count}/{item.expected_facet_count} "
+            f"tools={tools}"
+        )
+    print(f"Showing {len(result.shown)}/{result.total_count} draft cases.")
+    if manifest_write is not None:
+        print(f"Wrote review manifest: {manifest_write.path}")
+    print("Promote with: ohmo evals promote --case-id <id>")
+
+
+@evals_app.command("promote")
+def evals_promote_cmd(
+    workspace: str | None = typer.Option(None, "--workspace", help=_WORKSPACE_HELP),
+    case_ids: list[str] = typer.Option(
+        [],
+        "--case-id",
+        help="Draft case id to promote; repeat for multiple cases",
+    ),
+    promote_all: bool = typer.Option(False, "--all", help="Promote all draft cases"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Show selected cases without writing"),
+    reviewer: str = typer.Option("", "--reviewer", help="Reviewer id to store in gold cases"),
+) -> None:
+    """Promote reviewed draft eval cases into the gold pack."""
+    workspace_root = initialize_workspace(workspace)
+    try:
+        result = promote_ohmo_eval_case_drafts(
+            workspace=workspace_root,
+            case_ids=case_ids or None,
+            promote_all=promote_all,
+            dry_run=dry_run,
+            reviewer=reviewer,
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        print(str(exc), file=sys.stderr)
+        raise typer.Exit(1)
+
+    if result.dry_run:
+        print(f"Would promote {result.promoted_count} draft cases:")
+        for selected_case_id in result.selected_case_ids:
+            print(f"- {selected_case_id}")
+        print("No files written.")
+        return
+
+    print(f"Promoted {result.promoted_count} draft cases.")
+    print(f"Wrote gold manifest: {result.manifest_path}")
+    print(f"Wrote gold records: {result.records_path}")
+    print(f"Remaining unpromoted draft cases: {result.remaining_unpromoted_count}")
+
+
+@evals_app.command("pack")
+def evals_pack_cmd(
+    workspace: str | None = typer.Option(None, "--workspace", help=_WORKSPACE_HELP),
+) -> None:
+    """Build a runnable eval pack from reviewed gold cases."""
+    workspace_root = initialize_workspace(workspace)
+    try:
+        result = build_ohmo_eval_pack(workspace=workspace_root)
+    except (FileNotFoundError, ValueError) as exc:
+        print(str(exc), file=sys.stderr)
+        raise typer.Exit(1)
+
+    print(f"Wrote runnable pack: {result.write.path}")
+    print(
+        "Built runnable pack with "
+        f"{result.case_count} cases from {result.gold_case_count} gold cases"
+    )
+
+
+@evals_app.command("smoke")
+def evals_smoke_cmd(
+    workspace: str | None = typer.Option(None, "--workspace", help=_WORKSPACE_HELP),
+    pack_filename: str = typer.Option(
+        "eval_pack.json",
+        "--pack",
+        help="Runnable pack filename under evals/packs",
+    ),
+    limit: int | None = typer.Option(None, "--limit", min=1, help="Smoke subset size"),
+    report_only: bool = typer.Option(
+        False,
+        "--report-only",
+        help="Exit 0 after writing the report even when smoke checks fail",
+    ),
+) -> None:
+    """Run metadata-only smoke checks over a runnable eval pack."""
+    workspace_root = initialize_workspace(workspace)
+    try:
+        result = run_ohmo_eval_smoke(
+            workspace=workspace_root,
+            pack_filename=pack_filename,
+            limit=limit,
+            report_only=report_only,
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        print(str(exc), file=sys.stderr)
+        raise typer.Exit(1)
+
+    report = result.write.report
+    print(f"Wrote smoke report: {result.write.path}")
+    print(
+        "Smoke evaluated "
+        f"{report.case_count} cases: "
+        f"passed={report.passed_count} failed={report.failed_count}"
+    )
+    if result.report_only:
+        print("Report-only mode: failures did not fail the command")
+        return
+    if report.failed_count:
+        raise typer.Exit(1)
+
+
+@evals_app.command("run")
+def evals_run_cmd(
+    workspace: str | None = typer.Option(None, "--workspace", help=_WORKSPACE_HELP),
+    pack_filename: str = typer.Option(
+        "eval_pack.json",
+        "--pack",
+        help="Runnable pack filename under evals/packs",
+    ),
+    limit: int | None = typer.Option(None, "--limit", min=1, help="Eval subset size"),
+    executor_name: str = typer.Option(
+        "replay-tools",
+        "--executor",
+        help="Eval executor to use: replay-tools",
+    ),
+    agent_runner_name: str = typer.Option(
+        "scripted",
+        "--agent-runner",
+        help="Agent runner to use inside the executor: scripted or query-engine",
+    ),
+    model: str | None = typer.Option(
+        None,
+        "--model",
+        help="Model override for --agent-runner query-engine",
+    ),
+    provider_profile: str | None = typer.Option(
+        None,
+        "--profile",
+        help="Provider profile override for --agent-runner query-engine",
+    ),
+    system_prompt: str = typer.Option(
+        "You are running an Ohmo replay-only eval.",
+        "--system-prompt",
+        help="System prompt for --agent-runner query-engine",
+    ),
+    report_only: bool = typer.Option(
+        False,
+        "--report-only",
+        help="Exit 0 after writing the report even when eval cases fail",
+    ),
+) -> None:
+    """Run deterministic replay-tools eval checks over a runnable eval pack."""
+    workspace_root = initialize_workspace(workspace)
+    try:
+        result = run_ohmo_eval_report(
+            workspace=workspace_root,
+            pack_filename=pack_filename,
+            limit=limit,
+            report_only=report_only,
+            executor_name=executor_name,
+            agent_runner_name=agent_runner_name,
+            model=model,
+            provider_profile=provider_profile,
+            system_prompt=system_prompt,
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        print(str(exc), file=sys.stderr)
+        raise typer.Exit(1)
+
+    report = result.write.report
+    print(f"Wrote eval report: {result.write.path}")
+    print(
+        "Eval run evaluated "
+        f"{report.case_count} cases: "
+        f"passed={report.passed_count} failed={report.failed_count} "
+        f"blocked={getattr(report, 'blocked_count', 0)} "
+        f"error={getattr(report, 'error_count', 0)}"
+    )
+    if result.report_only:
+        print("Report-only mode: failures did not fail the command")
+        return
+    if (
+        report.failed_count
+        + getattr(report, "blocked_count", 0)
+        + getattr(report, "error_count", 0)
+    ):
+        raise typer.Exit(1)

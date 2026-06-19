@@ -1,0 +1,84 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+from openharness.evals import EvalEpisode, EvalEvent, promote_case_drafts
+from ohmo.evals import (
+    build_ohmo_eval_pack,
+    get_eval_store,
+    run_ohmo_eval_report,
+    write_ohmo_eval_mine,
+)
+
+
+def test_run_ohmo_eval_report_writes_metadata_replay_report(tmp_path: Path):
+    workspace = tmp_path / "workspace"
+    store = get_eval_store(workspace)
+    store.append_episode(
+        EvalEpisode(
+            episode_id="ep-1",
+            source="gateway",
+            app="ohmo",
+            session_id="session-1",
+            user_text="private ohmo eval request",
+        )
+    )
+    store.append_event(
+        EvalEvent(
+            episode_id="ep-1",
+            kind="gateway_final",
+            payload={"text": "private ohmo eval answer"},
+        )
+    )
+    write_ohmo_eval_mine(workspace=workspace)
+    promote_case_drafts(store)
+    build_ohmo_eval_pack(workspace=workspace)
+
+    result = run_ohmo_eval_report(workspace=workspace, limit=1, report_only=True)
+
+    assert result.report_only is True
+    assert result.write.path == workspace.resolve() / "evals" / "reports" / "eval_report.json"
+    assert result.write.report.metadata["executor_name"] == "replay-tools"
+    assert result.write.report.case_count == 1
+    assert result.write.report.passed_count == 1
+    assert result.write.report.failed_count == 0
+    serialized = result.write.path.read_text(encoding="utf-8")
+    assert "private ohmo eval request" not in serialized
+    assert "private ohmo eval answer" not in serialized
+
+
+def test_run_ohmo_eval_report_rejects_unknown_executor(tmp_path: Path):
+    with pytest.raises(ValueError, match="unknown eval executor"):
+        run_ohmo_eval_report(
+            workspace=tmp_path / "workspace",
+            executor_name="live-agent",
+        )
+
+
+def test_run_ohmo_eval_report_rejects_unknown_agent_runner(tmp_path: Path):
+    with pytest.raises(ValueError, match="unknown eval agent runner"):
+        run_ohmo_eval_report(
+            workspace=tmp_path / "workspace",
+            agent_runner_name="live-tools",
+        )
+
+
+def test_run_ohmo_eval_report_query_engine_auth_error_is_value_error(
+    tmp_path: Path,
+    monkeypatch,
+):
+    def fake_resolve_api_client(settings):
+        raise SystemExit(1)
+
+    monkeypatch.setattr(
+        "ohmo.evals.runner.resolve_api_client_from_settings",
+        fake_resolve_api_client,
+    )
+
+    with pytest.raises(ValueError, match="query-engine eval runner requires configured API authentication"):
+        run_ohmo_eval_report(
+            workspace=tmp_path / "workspace",
+            agent_runner_name="query-engine",
+        )

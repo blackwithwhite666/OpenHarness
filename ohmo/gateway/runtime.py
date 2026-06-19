@@ -34,6 +34,7 @@ from openharness.engine.stream_events import (
 from openharness.prompts import build_runtime_system_prompt
 from openharness.ui.runtime import RuntimeBundle, _last_user_text, build_runtime, close_runtime, start_runtime
 
+from ohmo.evals import GatewayEvalRecorder
 from ohmo.gateway.config import load_gateway_config
 from ohmo.gateway.group_tool import CreateFeishuGroup, OhmoCreateFeishuGroupTool, PublishGroupWelcome
 from ohmo.gateway.provider_commands import handle_gateway_model_command, handle_gateway_provider_command
@@ -306,92 +307,131 @@ class OhmoSessionRuntimePool:
             _content_snippet(user_prompt),
         )
 
-        command_context: CommandContext | None = None
-
-        def get_command_context() -> CommandContext:
-            nonlocal command_context
-            if command_context is None:
-                command_context = CommandContext(
-                    engine=bundle.engine,
-                    hooks_summary=getattr(bundle, "hook_summary", lambda: "")(),
-                    mcp_summary=getattr(bundle, "mcp_summary", lambda: "")(),
-                    plugin_summary=getattr(bundle, "plugin_summary", lambda: "")(),
-                    cwd=getattr(bundle, "cwd", str(self._cwd)),
-                    tool_registry=getattr(bundle, "tool_registry", None),
-                    app_state=getattr(bundle, "app_state", None),
-                    session_backend=getattr(bundle, "session_backend", self._session_backend),
-                    session_id=getattr(bundle, "session_id", None),
-                    extra_skill_dirs=getattr(bundle, "extra_skill_dirs", ()),
-                    extra_plugin_roots=getattr(bundle, "extra_plugin_roots", ()),
-                    memory_backend=create_memory_command_backend(self._workspace),
-                    include_project_memory=False,
-                )
-            return command_context
-
-        parsed = bundle.commands.lookup(command_prompt)
-        if parsed is None and not message.media:
-            parsed = lookup_skill_slash_command(command_prompt, get_command_context())
-        if parsed is not None and not message.media:
-            command, args = parsed
-            command_name = str(getattr(command, "name", "") or "")
-            gateway_result = self._handle_gateway_scoped_command(command_name, args)
-            if gateway_result is not None:
-                message_text, refresh_runtime = gateway_result
-                result = CommandResult(message=message_text, refresh_runtime=refresh_runtime)
-                async for update in self._stream_command_result(
-                    bundle=bundle,
-                    message=message,
-                    session_key=session_key,
-                    user_prompt=user_prompt,
-                    result=result,
-                ):
-                    yield update
-                return
-            remote_allowed = getattr(command, "remote_invocable", True)
-            if not remote_allowed and self._remote_admin_allowed(command):
-                remote_allowed = True
-                logger.warning(
-                    "ohmo gateway remote administrative command accepted channel=%s chat_id=%s sender_id=%s command=%s",
-                    message.channel,
-                    message.chat_id,
-                    message.sender_id,
-                    command_name,
-                )
-            if not remote_allowed:
-                result = CommandResult(
-                    message=f"/{command_name} is only available in the local OpenHarness UI."
-                )
-                async for update in self._stream_command_result(
-                    bundle=bundle,
-                    message=message,
-                    session_key=session_key,
-                    user_prompt=user_prompt,
-                    result=result,
-                ):
-                    yield update
-                return
-            result = await command.handler(
-                args,
-                get_command_context(),
-            )
-            async for update in self._stream_command_result(
-                bundle=bundle,
-                message=message,
-                session_key=session_key,
-                user_prompt=user_prompt,
-                result=result,
-            ):
-                yield update
-            return
-
-        async for update in self._stream_engine_message(
+        recorder = GatewayEvalRecorder.start(
+            workspace=self._workspace,
             bundle=bundle,
             message=message,
             session_key=session_key,
-            user_prompt=user_prompt,
-            user_message=user_message,
-        ):
-            yield update
+            user_text=command_prompt,
+            user_goal=user_prompt,
+        )
+        episode_status = "completed"
+
+        async def record_updates(updates):
+            nonlocal episode_status
+            async for update in updates:
+                if update.kind == "final":
+                    recorder.record_gateway_final(text=update.text, metadata=update.metadata)
+                elif update.kind == "error":
+                    episode_status = "error"
+                    recorder.record_gateway_error(text=update.text, metadata=update.metadata)
+                yield update
+
+        try:
+            command_context: CommandContext | None = None
+
+            def get_command_context() -> CommandContext:
+                nonlocal command_context
+                if command_context is None:
+                    command_context = CommandContext(
+                        engine=bundle.engine,
+                        hooks_summary=getattr(bundle, "hook_summary", lambda: "")(),
+                        mcp_summary=getattr(bundle, "mcp_summary", lambda: "")(),
+                        plugin_summary=getattr(bundle, "plugin_summary", lambda: "")(),
+                        cwd=getattr(bundle, "cwd", str(self._cwd)),
+                        tool_registry=getattr(bundle, "tool_registry", None),
+                        app_state=getattr(bundle, "app_state", None),
+                        session_backend=getattr(bundle, "session_backend", self._session_backend),
+                        session_id=getattr(bundle, "session_id", None),
+                        extra_skill_dirs=getattr(bundle, "extra_skill_dirs", ()),
+                        extra_plugin_roots=getattr(bundle, "extra_plugin_roots", ()),
+                        memory_backend=create_memory_command_backend(self._workspace),
+                        include_project_memory=False,
+                    )
+                return command_context
+
+            parsed = bundle.commands.lookup(command_prompt)
+            if parsed is None and not message.media:
+                parsed = lookup_skill_slash_command(command_prompt, get_command_context())
+            if parsed is not None and not message.media:
+                command, args = parsed
+                command_name = str(getattr(command, "name", "") or "")
+                gateway_result = self._handle_gateway_scoped_command(command_name, args)
+                if gateway_result is not None:
+                    message_text, refresh_runtime = gateway_result
+                    result = CommandResult(message=message_text, refresh_runtime=refresh_runtime)
+                    async for update in record_updates(
+                        self._stream_command_result(
+                            bundle=bundle,
+                            message=message,
+                            session_key=session_key,
+                            user_prompt=user_prompt,
+                            result=result,
+                            recorder=recorder,
+                        )
+                    ):
+                        yield update
+                    return
+                remote_allowed = getattr(command, "remote_invocable", True)
+                if not remote_allowed and self._remote_admin_allowed(command):
+                    remote_allowed = True
+                    logger.warning(
+                        "ohmo gateway remote administrative command accepted channel=%s chat_id=%s sender_id=%s command=%s",
+                        message.channel,
+                        message.chat_id,
+                        message.sender_id,
+                        command_name,
+                    )
+                if not remote_allowed:
+                    result = CommandResult(
+                        message=f"/{command_name} is only available in the local OpenHarness UI."
+                    )
+                    async for update in record_updates(
+                        self._stream_command_result(
+                            bundle=bundle,
+                            message=message,
+                            session_key=session_key,
+                            user_prompt=user_prompt,
+                            result=result,
+                            recorder=recorder,
+                        )
+                    ):
+                        yield update
+                    return
+                result = await command.handler(
+                    args,
+                    get_command_context(),
+                )
+                async for update in record_updates(
+                    self._stream_command_result(
+                        bundle=bundle,
+                        message=message,
+                        session_key=session_key,
+                        user_prompt=user_prompt,
+                        result=result,
+                        recorder=recorder,
+                    )
+                ):
+                    yield update
+                return
+
+            async for update in record_updates(
+                self._stream_engine_message(
+                    bundle=bundle,
+                    message=message,
+                    session_key=session_key,
+                    user_prompt=user_prompt,
+                    user_message=user_message,
+                    recorder=recorder,
+                )
+            ):
+                yield update
+        except Exception as exc:
+            episode_status = "exception"
+            recorder.record_exception(exc)
+            raise
+        finally:
+            recorder.finish(status=episode_status)
 
     async def _stream_command_result(
         self,
@@ -401,6 +441,7 @@ class OhmoSessionRuntimePool:
         session_key: str,
         user_prompt: str,
         result,
+        recorder: GatewayEvalRecorder | None = None,
     ):
         if result.refresh_runtime:
             bundle = await self._refresh_bundle(session_key, bundle, user_prompt)
@@ -423,6 +464,7 @@ class OhmoSessionRuntimePool:
                     session_key=session_key,
                     user_prompt=result.submit_prompt,
                     user_message=result.submit_prompt,
+                    recorder=recorder,
                 ):
                     yield update
             finally:
@@ -448,6 +490,7 @@ class OhmoSessionRuntimePool:
                         session_key=session_key,
                         content=user_prompt,
                         reply_parts=reply_parts,
+                        recorder=recorder,
                     ):
                         yield update
             except MaxTurnsExceeded as exc:
@@ -476,6 +519,7 @@ class OhmoSessionRuntimePool:
         session_key: str,
         user_prompt: str,
         user_message: ConversationMessage | str,
+        recorder: GatewayEvalRecorder | None = None,
     ):
         bundle.engine.set_system_prompt(self._runtime_system_prompt(bundle, user_prompt))
         reply_parts: list[str] = []
@@ -497,6 +541,8 @@ class OhmoSessionRuntimePool:
                     event.message,
                     bundle.engine.messages,
                 ):
+                    if recorder is not None:
+                        recorder.record_engine_error(event)
                     logger.warning(
                         "ohmo runtime image input rejected; retrying without image blocks session_key=%s session_id=%s message=%r",
                         session_key,
@@ -523,6 +569,7 @@ class OhmoSessionRuntimePool:
                             session_key=session_key,
                             content=user_prompt,
                             reply_parts=reply_parts,
+                            recorder=recorder,
                         ):
                             yield update
                     break
@@ -533,6 +580,7 @@ class OhmoSessionRuntimePool:
                     session_key=session_key,
                     content=user_prompt,
                     reply_parts=reply_parts,
+                    recorder=recorder,
                 ):
                     yield update
         except MaxTurnsExceeded as exc:
@@ -576,6 +624,7 @@ class OhmoSessionRuntimePool:
         session_key: str,
         content: str,
         reply_parts: list[str],
+        recorder: GatewayEvalRecorder | None = None,
     ):
         if isinstance(event, AssistantTextDelta):
             reply_parts.append(event.text)
@@ -626,6 +675,8 @@ class OhmoSessionRuntimePool:
             )
             return
         if isinstance(event, ToolExecutionStarted):
+            if recorder is not None:
+                recorder.record_tool_started(event)
             # The assistant text accumulated so far is THIS turn's interstitial
             # narration (a preamble said right before the tool call), not the
             # final answer. Surface it live as a "reasoning" (🧠) progress
@@ -686,6 +737,8 @@ class OhmoSessionRuntimePool:
             )
             return
         if isinstance(event, ToolExecutionCompleted):
+            if recorder is not None:
+                recorder.record_tool_completed(event)
             logger.info(
                 "ohmo runtime tool complete session_key=%s session_id=%s tool=%s is_error=%s",
                 session_key,
@@ -731,6 +784,8 @@ class OhmoSessionRuntimePool:
             )
             return
         if isinstance(event, ErrorEvent):
+            if recorder is not None:
+                recorder.record_engine_error(event)
             logger.error(
                 "ohmo runtime error session_key=%s session_id=%s message=%r",
                 session_key,
