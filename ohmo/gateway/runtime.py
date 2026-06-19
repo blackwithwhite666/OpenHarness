@@ -100,6 +100,20 @@ class GatewayStreamUpdate:
     metadata: dict[str, object]
 
 
+def _evals_capture_enabled(config) -> bool:
+    """Whether to capture an eval episode for this turn.
+
+    The ``OHMO_EVALS_CAPTURE`` env var, when set to a non-empty value,
+    overrides the persistent ``gateway.json`` ``evals_capture`` flag
+    (default on): ``0``/``false``/``no``/``off`` disable capture, anything
+    else enables it. Lets ops flip capture without editing config.
+    """
+    raw = os.getenv("OHMO_EVALS_CAPTURE")
+    if raw is not None and raw.strip():
+        return raw.strip().lower() not in {"0", "false", "no", "off"}
+    return bool(getattr(config, "evals_capture", True))
+
+
 class OhmoSessionRuntimePool:
     """Maintain one runtime bundle per chat/thread session."""
 
@@ -307,13 +321,17 @@ class OhmoSessionRuntimePool:
             _content_snippet(user_prompt),
         )
 
-        recorder = GatewayEvalRecorder.start(
-            workspace=self._workspace,
-            bundle=bundle,
-            message=message,
-            session_key=session_key,
-            user_text=command_prompt,
-            user_goal=user_prompt,
+        recorder = (
+            GatewayEvalRecorder.start(
+                workspace=self._workspace,
+                bundle=bundle,
+                message=message,
+                session_key=session_key,
+                user_text=command_prompt,
+                user_goal=user_prompt,
+            )
+            if _evals_capture_enabled(self._gateway_config)
+            else None
         )
         episode_status = "completed"
 
@@ -321,10 +339,12 @@ class OhmoSessionRuntimePool:
             nonlocal episode_status
             async for update in updates:
                 if update.kind == "final":
-                    recorder.record_gateway_final(text=update.text, metadata=update.metadata)
+                    if recorder is not None:
+                        recorder.record_gateway_final(text=update.text, metadata=update.metadata)
                 elif update.kind == "error":
                     episode_status = "error"
-                    recorder.record_gateway_error(text=update.text, metadata=update.metadata)
+                    if recorder is not None:
+                        recorder.record_gateway_error(text=update.text, metadata=update.metadata)
                 yield update
 
         try:
@@ -428,10 +448,12 @@ class OhmoSessionRuntimePool:
                 yield update
         except Exception as exc:
             episode_status = "exception"
-            recorder.record_exception(exc)
+            if recorder is not None:
+                recorder.record_exception(exc)
             raise
         finally:
-            recorder.finish(status=episode_status)
+            if recorder is not None:
+                recorder.finish(status=episode_status)
 
     async def _stream_command_result(
         self,
