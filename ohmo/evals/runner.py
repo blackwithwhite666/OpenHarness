@@ -16,6 +16,7 @@ from openharness.evals import (
     ReplayScriptAgentRunner,
     ReplayToolsExecutor,
     read_run_pack,
+    resolve_execution_scorer,
     run_execution_report,
 )
 
@@ -74,10 +75,12 @@ def run_ohmo_eval_report(
     model: str | None = None,
     provider_profile: str | None = None,
     system_prompt: str = _DEFAULT_QUERY_ENGINE_SYSTEM_PROMPT,
+    scorer: str | None = None,
 ) -> OhmoEvalRunResult:
     """Run deterministic replay-tools execution checks over an Ohmo eval pack."""
     if limit is not None and limit <= 0:
         raise ValueError("limit must be positive")
+    selected_scorer = resolve_execution_scorer(scorer) if scorer else None
     workspace_root = Path(workspace).expanduser().resolve() if workspace else None
     agent_runner_config = _build_agent_runner_config(
         agent_runner_name,
@@ -98,6 +101,7 @@ def run_ohmo_eval_report(
         report_filename=report_filename,
         limit=limit,
         executor=executor,
+        scorer=selected_scorer,
     )
     return OhmoEvalRunResult(write=write, report_only=report_only)
 
@@ -112,10 +116,13 @@ def check_ohmo_eval_run_config(
     model: str | None = None,
     provider_profile: str | None = None,
     system_prompt: str = _DEFAULT_QUERY_ENGINE_SYSTEM_PROMPT,
+    scorer: str | None = None,
 ) -> OhmoEvalRunConfigCheckResult:
     """Validate an eval run configuration without executing eval cases."""
     if limit is not None and limit <= 0:
         raise ValueError("limit must be positive")
+    if scorer:
+        resolve_execution_scorer(scorer)
     workspace_root = Path(workspace).expanduser().resolve() if workspace else None
     agent_runner_config = _build_agent_runner_config(
         agent_runner_name,

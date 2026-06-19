@@ -300,6 +300,7 @@ class EvalCaseDraft(BaseModel):
     expected_facet_ids: list[str] = Field(default_factory=list)
     tool_names: list[str] = Field(default_factory=list)
     rubric: list[str] = Field(default_factory=list)
+    scorer: str | None = None
     review_status: str = "draft"
     metadata: dict[str, Any] = Field(default_factory=dict)
 
@@ -323,6 +324,7 @@ class EvalGoldCase(BaseModel):
     expected_facet_ids: list[str] = Field(default_factory=list)
     tool_names: list[str] = Field(default_factory=list)
     rubric: list[str] = Field(default_factory=list)
+    scorer: str | None = None
     review_status: str = "approved"
     reviewer: str = ""
     promoted_at: datetime = Field(default_factory=_utc_now)
@@ -375,6 +377,7 @@ class EvalRunPackCase(BaseModel):
     expected_facet_ids: list[str] = Field(default_factory=list)
     tool_names: list[str] = Field(default_factory=list)
     rubric: list[str] = Field(default_factory=list)
+    scorer: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("metadata")

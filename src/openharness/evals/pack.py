@@ -142,6 +142,7 @@ def _pack_case(gold: EvalGoldCase) -> EvalRunPackCase:
         expected_facet_ids=gold.expected_facet_ids,
         tool_names=gold.tool_names,
         rubric=gold.rubric,
+        scorer=gold.scorer,
         metadata={
             "review_status": gold.review_status,
             "source_review_status": gold.metadata.get("source_review_status", ""),

@@ -1261,6 +1261,7 @@ def test_ohmo_evals_run_command_runs_eval_report(tmp_path: Path, monkeypatch):
         model: str | None = None,
         provider_profile: str | None = None,
         system_prompt: str = "You are running an Ohmo replay-only eval.",
+        scorer: str | None = None,
     ):
         calls.append(
             {
@@ -1367,6 +1368,7 @@ def test_ohmo_evals_run_command_passes_output_filename(tmp_path: Path, monkeypat
         model: str | None = None,
         provider_profile: str | None = None,
         system_prompt: str = "You are running an Ohmo replay-only eval.",
+        scorer: str | None = None,
     ):
         calls.append(
             {
@@ -1444,6 +1446,7 @@ def test_ohmo_evals_run_command_outputs_json_summary(tmp_path: Path, monkeypatch
         model: str | None = None,
         provider_profile: str | None = None,
         system_prompt: str = "You are running an Ohmo replay-only eval.",
+        scorer: str | None = None,
     ):
         del pack_filename, limit, executor_name, agent_runner_name
         del model, provider_profile, system_prompt
@@ -1521,6 +1524,7 @@ def test_ohmo_evals_run_command_passes_query_engine_runner_options(
         model: str | None = None,
         provider_profile: str | None = None,
         system_prompt: str = "You are running an Ohmo replay-only eval.",
+        scorer: str | None = None,
     ):
         calls.append(
             {
@@ -1605,6 +1609,7 @@ def test_ohmo_evals_run_command_check_config_does_not_run_eval(
         model: str | None = None,
         provider_profile: str | None = None,
         system_prompt: str = "You are running an Ohmo replay-only eval.",
+        scorer: str | None = None,
     ):
         check_calls.append(
             {
@@ -1696,6 +1701,7 @@ def test_ohmo_evals_run_command_check_config_outputs_json(
         model: str | None = None,
         provider_profile: str | None = None,
         system_prompt: str = "You are running an Ohmo replay-only eval.",
+        scorer: str | None = None,
     ):
         del workspace, pack_filename, limit, executor_name, agent_runner_name
         del model, provider_profile, system_prompt
@@ -1786,6 +1792,7 @@ def test_ohmo_evals_run_command_reports_blocked_and_error_counts(
         model: str | None = None,
         provider_profile: str | None = None,
         system_prompt: str = "You are running an Ohmo replay-only eval.",
+        scorer: str | None = None,
     ):
         del pack_filename, report_filename
         del agent_runner_name, model, provider_profile, system_prompt

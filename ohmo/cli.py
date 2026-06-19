@@ -1278,6 +1278,11 @@ def evals_run_cmd(
         "--agent-runner",
         help=_EVAL_AGENT_RUNNER_HELP,
     ),
+    scorer: str | None = typer.Option(
+        None,
+        "--scorer",
+        help="Scorer name applied to cases without their own (default exact-final-text); e.g. tool_trace_oracle_v1",
+    ),
     model: str | None = typer.Option(
         None,
         "--model",
@@ -1318,6 +1323,7 @@ def evals_run_cmd(
                 model=model,
                 provider_profile=provider_profile,
                 system_prompt=system_prompt,
+                scorer=scorer,
             )
             if json_output:
                 _print_json_summary(_eval_run_config_summary(check))
@@ -1348,6 +1354,7 @@ def evals_run_cmd(
             model=model,
             provider_profile=provider_profile,
             system_prompt=system_prompt,
+            scorer=scorer,
         )
     except (FileNotFoundError, ValueError) as exc:
         print(str(exc), file=sys.stderr)

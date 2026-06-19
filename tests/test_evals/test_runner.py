@@ -578,6 +578,60 @@ def test_execution_report_rejects_symlinked_report_dir(tmp_path: Path):
         run_execution_report(store, pack=pack)
 
 
+def test_execution_report_per_case_scorer_overrides_default(tmp_path: Path):
+    store = EvalStore(tmp_path / "evals")
+    _add_episode(
+        store,
+        episode_id="ep-1",
+        user_text="private req",
+        final_text="private ans",
+        tool_name="web_fetch",
+    )
+    drafts = build_case_drafts(store, build_case_candidates(store))
+    write_case_draft_pack(store, drafts)
+    promote_case_drafts(store, case_ids=[drafts[0].case_id])
+    pack = write_run_pack(store).pack
+    pack = pack.model_copy(
+        update={
+            "cases": [
+                case.model_copy(update={"scorer": "tool_trace_oracle_v1"})
+                for case in pack.cases
+            ]
+        }
+    )
+
+    result = run_execution_report(store, pack=pack)
+
+    assert result.report.passed_count == 1
+    case = result.report.cases[0]
+    assert case.observed_trace is not None
+    assert case.observed_trace.metadata["scorer_name"] == "tool_trace_oracle_v1"
+    assert case.checks["final_output_matches"] is True
+
+
+def test_execution_report_rejects_unknown_per_case_scorer(tmp_path: Path):
+    store = EvalStore(tmp_path / "evals")
+    _add_episode(
+        store,
+        episode_id="ep-1",
+        user_text="private req",
+        final_text="private ans",
+        tool_name="web_fetch",
+    )
+    drafts = build_case_drafts(store, build_case_candidates(store))
+    write_case_draft_pack(store, drafts)
+    promote_case_drafts(store, case_ids=[drafts[0].case_id])
+    pack = write_run_pack(store).pack
+    pack = pack.model_copy(
+        update={
+            "cases": [case.model_copy(update={"scorer": "nope"}) for case in pack.cases]
+        }
+    )
+
+    with pytest.raises(ValueError, match="unknown eval scorer"):
+        run_execution_report(store, pack=pack)
+
+
 class _CapturingExecutor:
     name = "capture"
 

@@ -15,10 +15,13 @@ from openharness.evals.compare import (
 )
 from openharness.evals.embeddings import EvalEmbeddingIndexWrite, write_embedding_index
 from openharness.evals.execution import (
+    EVAL_EXECUTION_SCORERS,
     EvalExecutionReportWrite,
     EvalExecutionScorer,
     EvalExecutionScorerResult,
     ExactMatchEvalScorer,
+    ToolTraceOracleV1,
+    resolve_execution_scorer,
     run_execution_report,
 )
 from openharness.evals.executor import (
@@ -26,6 +29,7 @@ from openharness.evals.executor import (
     EvalExecutionContext,
     EvalExecutor,
     EvalExecutorResult,
+    EvalObservedCall,
     EvalToolFixture,
     QueryEngineEvalAgentRunner,
     ReplayFixtureTool,
@@ -102,7 +106,11 @@ __all__ = [
     "EvalExecutionScorerResult",
     "EvalExecutor",
     "EvalExecutorResult",
+    "EvalObservedCall",
     "ExactMatchEvalScorer",
+    "ToolTraceOracleV1",
+    "EVAL_EXECUTION_SCORERS",
+    "resolve_execution_scorer",
     "EvalAgentRunner",
     "EvalGoldCase",
     "EvalObservedToolCall",
