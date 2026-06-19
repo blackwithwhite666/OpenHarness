@@ -7,6 +7,7 @@ import pytest
 from openharness.evals import EvalEpisode, EvalEvent, promote_case_drafts
 from ohmo.evals import (
     build_ohmo_eval_pack,
+    check_ohmo_eval_run_config,
     get_eval_store,
     run_ohmo_eval_report,
     write_ohmo_eval_mine,
@@ -62,6 +63,60 @@ def test_run_ohmo_eval_report_rejects_unknown_agent_runner(tmp_path: Path):
         run_ohmo_eval_report(
             workspace=tmp_path / "workspace",
             agent_runner_name="live-tools",
+        )
+
+
+def test_check_ohmo_eval_run_config_validates_pack_without_running(tmp_path: Path):
+    workspace = tmp_path / "workspace"
+    store = get_eval_store(workspace)
+    store.append_episode(
+        EvalEpisode(
+            episode_id="ep-1",
+            source="gateway",
+            app="ohmo",
+            session_id="session-1",
+            user_text="private ohmo eval request",
+        )
+    )
+    store.append_event(
+        EvalEvent(
+            episode_id="ep-1",
+            kind="gateway_final",
+            payload={"text": "private ohmo eval answer"},
+        )
+    )
+    write_ohmo_eval_mine(workspace=workspace)
+    promote_case_drafts(store)
+    build_ohmo_eval_pack(workspace=workspace)
+
+    result = check_ohmo_eval_run_config(workspace=workspace, limit=1)
+
+    assert result.pack_case_count == 1
+    assert result.selected_case_count == 1
+    assert result.executor_name == "replay-tools"
+    assert result.agent_runner_name == "scripted"
+    assert result.model == ""
+    assert result.provider_profile == ""
+    assert result.replay_tools_only is True
+    assert not (workspace / "evals" / "reports" / "eval_report.json").exists()
+
+
+def test_check_ohmo_eval_run_config_query_engine_auth_error_is_value_error(
+    tmp_path: Path,
+    monkeypatch,
+):
+    def fake_resolve_api_client(settings):
+        raise SystemExit(1)
+
+    monkeypatch.setattr(
+        "ohmo.evals.runner.resolve_api_client_from_settings",
+        fake_resolve_api_client,
+    )
+
+    with pytest.raises(ValueError, match="query-engine eval runner requires configured API authentication"):
+        check_ohmo_eval_run_config(
+            workspace=tmp_path / "workspace",
+            agent_runner_name="query-engine",
         )
 
 

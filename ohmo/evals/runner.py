@@ -30,6 +30,28 @@ class OhmoEvalRunResult:
     report_only: bool
 
 
+@dataclass(frozen=True)
+class OhmoEvalRunConfigCheckResult:
+    """Metadata returned after validating an Ohmo eval run configuration."""
+
+    pack_id: str
+    pack_case_count: int
+    selected_case_count: int
+    executor_name: str
+    agent_runner_name: str
+    model: str
+    provider_profile: str
+    replay_tools_only: bool
+
+
+@dataclass(frozen=True)
+class _AgentRunnerConfig:
+    agent_runner: ReplayScriptAgentRunner | QueryEngineEvalAgentRunner
+    agent_runner_name: str
+    model: str
+    provider_profile: str
+
+
 _SUPPORTED_EXECUTORS = {
     "replay-tools": ReplayToolsExecutor,
     "replay_tools": ReplayToolsExecutor,
@@ -54,18 +76,64 @@ def run_ohmo_eval_report(
     if limit is not None and limit <= 0:
         raise ValueError("limit must be positive")
     workspace_root = Path(workspace).expanduser().resolve() if workspace else None
-    agent_runner = _build_agent_runner(
+    agent_runner_config = _build_agent_runner_config(
         agent_runner_name,
         workspace=workspace_root,
         model=model,
         provider_profile=provider_profile,
         system_prompt=system_prompt,
     )
-    executor = _build_executor(executor_name, agent_runner=agent_runner)
+    executor = _build_executor(
+        executor_name,
+        agent_runner=agent_runner_config.agent_runner,
+    )
     store = get_eval_store(workspace)
     pack = read_run_pack(store, pack_filename=pack_filename)
     write = run_execution_report(store, pack=pack, limit=limit, executor=executor)
     return OhmoEvalRunResult(write=write, report_only=report_only)
+
+
+def check_ohmo_eval_run_config(
+    *,
+    workspace: str | Path | None = None,
+    pack_filename: str = "eval_pack.json",
+    limit: int | None = None,
+    executor_name: str = "replay-tools",
+    agent_runner_name: str = "scripted",
+    model: str | None = None,
+    provider_profile: str | None = None,
+    system_prompt: str = _DEFAULT_QUERY_ENGINE_SYSTEM_PROMPT,
+) -> OhmoEvalRunConfigCheckResult:
+    """Validate an eval run configuration without executing eval cases."""
+    if limit is not None and limit <= 0:
+        raise ValueError("limit must be positive")
+    workspace_root = Path(workspace).expanduser().resolve() if workspace else None
+    agent_runner_config = _build_agent_runner_config(
+        agent_runner_name,
+        workspace=workspace_root,
+        model=model,
+        provider_profile=provider_profile,
+        system_prompt=system_prompt,
+    )
+    executor = _build_executor(
+        executor_name,
+        agent_runner=agent_runner_config.agent_runner,
+    )
+    store = get_eval_store(workspace)
+    pack = read_run_pack(store, pack_filename=pack_filename)
+    selected_case_count = len(pack.cases[:limit] if limit is not None else pack.cases)
+    if selected_case_count == 0:
+        raise ValueError("eval pack must contain cases")
+    return OhmoEvalRunConfigCheckResult(
+        pack_id=pack.pack_id,
+        pack_case_count=len(pack.cases),
+        selected_case_count=selected_case_count,
+        executor_name=executor.name,
+        agent_runner_name=agent_runner_config.agent_runner_name,
+        model=agent_runner_config.model,
+        provider_profile=agent_runner_config.provider_profile,
+        replay_tools_only=True,
+    )
 
 
 def _build_executor(
@@ -91,6 +159,23 @@ def _build_agent_runner(
     provider_profile: str | None,
     system_prompt: str,
 ) -> ReplayScriptAgentRunner | QueryEngineEvalAgentRunner:
+    return _build_agent_runner_config(
+        agent_runner_name,
+        workspace=workspace,
+        model=model,
+        provider_profile=provider_profile,
+        system_prompt=system_prompt,
+    ).agent_runner
+
+
+def _build_agent_runner_config(
+    agent_runner_name: str,
+    *,
+    workspace: Path | None,
+    model: str | None,
+    provider_profile: str | None,
+    system_prompt: str,
+) -> _AgentRunnerConfig:
     normalized = agent_runner_name.strip().lower()
     if normalized not in _SUPPORTED_AGENT_RUNNERS:
         supported = ", ".join(sorted(_SUPPORTED_AGENT_RUNNERS))
@@ -98,7 +183,12 @@ def _build_agent_runner(
             f"unknown eval agent runner: {agent_runner_name}. Supported runners: {supported}"
         )
     if normalized == "scripted":
-        return ReplayScriptAgentRunner()
+        return _AgentRunnerConfig(
+            agent_runner=ReplayScriptAgentRunner(),
+            agent_runner_name="scripted",
+            model="",
+            provider_profile="",
+        )
 
     settings = load_settings().merge_cli_overrides(
         model=model,
@@ -111,9 +201,14 @@ def _build_agent_runner(
         raise ValueError(
             "query-engine eval runner requires configured API authentication"
         ) from exc
-    return QueryEngineEvalAgentRunner(
-        api_client=api_client,
+    return _AgentRunnerConfig(
+        agent_runner=QueryEngineEvalAgentRunner(
+            api_client=api_client,
+            model=settings.model,
+            system_prompt=system_prompt,
+            cwd=workspace,
+        ),
+        agent_runner_name="query-engine",
         model=settings.model,
-        system_prompt=system_prompt,
-        cwd=workspace,
+        provider_profile=settings.active_profile,
     )

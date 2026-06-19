@@ -25,7 +25,12 @@ from ohmo.evals.review import (
     review_ohmo_eval_case_drafts,
     write_ohmo_eval_review_manifest,
 )
-from ohmo.evals.runner import OhmoEvalRunResult, run_ohmo_eval_report
+from ohmo.evals.runner import (
+    OhmoEvalRunConfigCheckResult,
+    OhmoEvalRunResult,
+    check_ohmo_eval_run_config,
+    run_ohmo_eval_report,
+)
 
 __all__ = [
     "GatewayEvalRecorder",
@@ -36,12 +41,14 @@ __all__ = [
     "OhmoEvalReviewItem",
     "OhmoEvalReviewManifestWrite",
     "OhmoEvalReviewResult",
+    "OhmoEvalRunConfigCheckResult",
     "OhmoEvalRunResult",
     "OhmoEvalSmokeResult",
     "ResourceSnapshotWrite",
     "build_ohmo_eval_pack",
     "build_ohmo_resource_snapshot",
     "compare_ohmo_eval_reports",
+    "check_ohmo_eval_run_config",
     "get_eval_store",
     "promote_ohmo_eval_case_drafts",
     "review_ohmo_eval_case_drafts",

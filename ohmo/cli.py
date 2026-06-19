@@ -22,6 +22,7 @@ from ohmo.gateway.service import (
 )
 from ohmo.evals import (
     build_ohmo_eval_pack,
+    check_ohmo_eval_run_config,
     compare_ohmo_eval_reports,
     promote_ohmo_eval_case_drafts,
     review_ohmo_eval_case_drafts,
@@ -951,10 +952,41 @@ def evals_run_cmd(
         "--report-only",
         help="Exit 0 after writing the report even when eval cases fail",
     ),
+    check_config: bool = typer.Option(
+        False,
+        "--check-config",
+        help="Validate pack/auth/executor setup without executing eval cases",
+    ),
 ) -> None:
     """Run deterministic replay-tools eval checks over a runnable eval pack."""
     workspace_root = initialize_workspace(workspace)
     try:
+        if check_config:
+            check = check_ohmo_eval_run_config(
+                workspace=workspace_root,
+                pack_filename=pack_filename,
+                limit=limit,
+                executor_name=executor_name,
+                agent_runner_name=agent_runner_name,
+                model=model,
+                provider_profile=provider_profile,
+                system_prompt=system_prompt,
+            )
+            print("Eval run configuration is valid.")
+            print(
+                "Pack "
+                f"{check.pack_id}: "
+                f"selected={check.selected_case_count}/{check.pack_case_count} "
+                f"executor={check.executor_name} "
+                f"agent_runner={check.agent_runner_name} "
+                f"replay_tools_only={str(check.replay_tools_only).lower()}"
+            )
+            if check.model:
+                print(
+                    "Query engine "
+                    f"profile={check.provider_profile or '-'} model={check.model}"
+                )
+            return
         result = run_ohmo_eval_report(
             workspace=workspace_root,
             pack_filename=pack_filename,

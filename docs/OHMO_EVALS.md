@@ -76,6 +76,7 @@ Triggers for adding a broader SQLite projection:
 
    ```bash
    ohmo evals run --workspace <workspace> --executor replay-tools
+   ohmo evals run --workspace <workspace> --executor replay-tools --check-config
    ohmo evals run --workspace <workspace> --executor replay-tools --agent-runner query-engine --model <model>
    ```
 
@@ -85,6 +86,9 @@ Triggers for adding a broader SQLite projection:
    Use `--agent-runner query-engine` to run the reconstructed prompt through
    the normal `QueryEngine` model loop while tool calls are still served by
    recorded outputs only. The default report is `evals/reports/eval_report.json`.
+   Use `--check-config` before a real run to validate the pack, executor,
+   selected case count, and query-engine auth/profile without executing model
+   turns or writing a report.
 
 7. Compare execution reports before promoting a candidate run:
 

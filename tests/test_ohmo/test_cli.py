@@ -900,6 +900,98 @@ def test_ohmo_evals_run_command_passes_query_engine_runner_options(
     ]
 
 
+def test_ohmo_evals_run_command_check_config_does_not_run_eval(
+    tmp_path: Path,
+    monkeypatch,
+):
+    runner = CliRunner()
+    workspace = tmp_path / ".ohmo-home"
+    check_calls: list[dict[str, object]] = []
+
+    def fake_check_ohmo_eval_run_config(
+        *,
+        workspace: str | Path | None = None,
+        pack_filename: str = "eval_pack.json",
+        limit: int | None = None,
+        executor_name: str = "replay-tools",
+        agent_runner_name: str = "scripted",
+        model: str | None = None,
+        provider_profile: str | None = None,
+        system_prompt: str = "You are running an Ohmo replay-only eval.",
+    ):
+        check_calls.append(
+            {
+                "workspace": workspace,
+                "pack_filename": pack_filename,
+                "limit": limit,
+                "executor_name": executor_name,
+                "agent_runner_name": agent_runner_name,
+                "model": model,
+                "provider_profile": provider_profile,
+                "system_prompt": system_prompt,
+            }
+        )
+        return SimpleNamespace(
+            pack_id="pack-1",
+            pack_case_count=5,
+            selected_case_count=2,
+            executor_name="replay-tools",
+            agent_runner_name="query-engine",
+            model="eval-model",
+            provider_profile="openai-compatible",
+            replay_tools_only=True,
+        )
+
+    monkeypatch.setattr(
+        "ohmo.cli.check_ohmo_eval_run_config",
+        fake_check_ohmo_eval_run_config,
+    )
+
+    def fail_run_ohmo_eval_report(**kwargs):
+        raise AssertionError("eval run should not execute in --check-config mode")
+
+    monkeypatch.setattr("ohmo.cli.run_ohmo_eval_report", fail_run_ohmo_eval_report)
+
+    result = runner.invoke(
+        app,
+        [
+            "evals",
+            "run",
+            "--workspace",
+            str(workspace),
+            "--pack",
+            "custom_pack.json",
+            "--limit",
+            "2",
+            "--agent-runner",
+            "query-engine",
+            "--model",
+            "eval-model",
+            "--profile",
+            "openai-compatible",
+            "--check-config",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert check_calls == [
+        {
+            "workspace": workspace.resolve(),
+            "pack_filename": "custom_pack.json",
+            "limit": 2,
+            "executor_name": "replay-tools",
+            "agent_runner_name": "query-engine",
+            "model": "eval-model",
+            "provider_profile": "openai-compatible",
+            "system_prompt": "You are running an Ohmo replay-only eval.",
+        }
+    ]
+    assert "Eval run configuration is valid." in result.output
+    assert "selected=2/5" in result.output
+    assert "agent_runner=query-engine" in result.output
+    assert "profile=openai-compatible model=eval-model" in result.output
+
+
 def test_ohmo_evals_run_command_reports_blocked_and_error_counts(
     tmp_path: Path,
     monkeypatch,
