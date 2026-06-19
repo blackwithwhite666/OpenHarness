@@ -16,8 +16,10 @@ from ohmo.gateway.send_message_tool import (
 )
 
 
-def _ctx(tmp_path: Path) -> ToolExecutionContext:
-    return ToolExecutionContext(cwd=tmp_path, metadata={"ohmo_send_ctx": {"is_owner": True}})
+def _ctx(tmp_path: Path, **send_ctx) -> ToolExecutionContext:
+    ctx = {"sender_id": "1|owner", "first_name": "Owner", "username": "owner"}
+    ctx.update(send_ctx)
+    return ToolExecutionContext(cwd=tmp_path, metadata={"ohmo_send_ctx": ctx})
 
 
 @pytest.mark.asyncio
@@ -48,7 +50,7 @@ async def test_send_telegram_message_success(tmp_path: Path):
     message = published[0]
     assert message.channel == "telegram"
     assert message.chat_id == "123"
-    assert message.content == "Hello Alice"
+    assert "Hello Alice" in message.content
     assert message.metadata == {
         "_session_key": "telegram:123",
         "_origin": "send_telegram_message",
@@ -130,7 +132,7 @@ async def test_send_telegram_message_empty_text_errors(tmp_path: Path):
 
 
 @pytest.mark.asyncio
-async def test_send_telegram_message_non_owner_errors(tmp_path: Path):
+async def test_send_telegram_message_requires_sender_ctx(tmp_path: Path):
     published: list[OutboundMessage] = []
 
     async def send_outbound(message: OutboundMessage) -> None:
@@ -140,18 +142,70 @@ async def test_send_telegram_message_non_owner_errors(tmp_path: Path):
     store.record_inbound(channel="telegram", chat_id="123", username="alice")
     tool = SendTelegramMessageTool(store, send_outbound)
 
-    for context in (
-        ToolExecutionContext(cwd=tmp_path, metadata={"ohmo_send_ctx": {"is_owner": False}}),
+    result = await tool.execute(
+        SendTelegramMessageInput(recipient="@alice", text="Hello"),
         ToolExecutionContext(cwd=tmp_path),
-    ):
-        result = await tool.execute(
-            SendTelegramMessageInput(recipient="@alice", text="Hello"),
-            context,
-        )
+    )
 
-        assert result.is_error
-        assert "owner" in result.output
+    assert result.is_error
+    assert "sender context" in result.output or "live chat" in result.output
     assert published == []
+
+
+@pytest.mark.asyncio
+async def test_send_telegram_message_refuses_non_human_sender(tmp_path: Path):
+    published: list[OutboundMessage] = []
+
+    async def send_outbound(message: OutboundMessage) -> None:
+        published.append(message)
+
+    store = ContactStore(tmp_path)
+    store.record_inbound(channel="telegram", chat_id="123", username="alice")
+    tool = SendTelegramMessageTool(store, send_outbound)
+
+    result = await tool.execute(
+        SendTelegramMessageInput(recipient="@alice", text="Hello"),
+        ToolExecutionContext(
+            cwd=tmp_path,
+            metadata={
+                "ohmo_send_ctx": {
+                    "sender_id": "__scheduler__",
+                    "username": "",
+                    "first_name": "",
+                    "display_name": "",
+                }
+            },
+        ),
+    )
+
+    assert result.is_error
+    assert "human" in result.output or "reminder" in result.output
+    assert published == []
+
+
+@pytest.mark.asyncio
+async def test_send_telegram_message_signs_with_sender(tmp_path: Path):
+    published: list[OutboundMessage] = []
+
+    async def send_outbound(message: OutboundMessage) -> None:
+        published.append(message)
+
+    store = ContactStore(tmp_path)
+    store.record_inbound(channel="telegram", chat_id="123", username="alice")
+    tool = SendTelegramMessageTool(store, send_outbound)
+
+    result = await tool.execute(
+        SendTelegramMessageInput(recipient="@alice", text="Hello Alice"),
+        _ctx(tmp_path, first_name="Dmitrii", username="blackwithwhite"),
+    )
+
+    assert not result.is_error
+    assert len(published) == 1
+    content = published[0].content
+    assert "Hello Alice" in content
+    assert "Dmitrii" in content
+    assert "@blackwithwhite" in content
+    assert "через бота" in content
 
 
 @pytest.mark.asyncio

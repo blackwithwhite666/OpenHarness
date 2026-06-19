@@ -25,13 +25,15 @@ class SendTelegramMessageInput(BaseModel):
 class SendTelegramMessageTool(BaseTool):
     name = "send_telegram_message"
     description = (
-        "Send a Telegram message to another person as the ohmo bot, not as the user. "
-        "It can only reach known contacts: people who have already written to ohmo. "
-        "It cannot message strangers or arbitrary phone numbers / ids, and refuses "
-        "unknown recipients. Confirm the recipient and exact text with the user before "
-        "sending unless the user already gave both explicitly; this is an outward-facing "
-        "action, so never send half-baked or speculative messages and never invent a "
-        "chat_id. `recipient` accepts an @username, a known contact's name, or a numeric "
+        "Send a Telegram message to another person on the user's behalf, relayed by "
+        "the bot. Anyone allowed to chat with the bot may use it, but it can only "
+        "reach known contacts: people who have already written to ohmo; it refuses "
+        "unknown recipients. The message is automatically signed with the sender's "
+        "name, so do not add your own signature or \"via bot\" note. Confirm the "
+        "recipient and exact text with the user before sending unless the user "
+        "already gave both explicitly; this is an outward-facing action, so never "
+        "send half-baked or speculative messages and never invent a chat_id. "
+        "`recipient` accepts an @username, a known contact's name, or a numeric "
         "chat_id; `text` is the body. On success the message is queued to Telegram; "
         "a delivery failure (e.g. the recipient blocked the bot) is logged "
         "server-side, not returned here."
@@ -54,9 +56,19 @@ class SendTelegramMessageTool(BaseTool):
         self, arguments: SendTelegramMessageInput, context: ToolExecutionContext
     ) -> ToolResult:
         send_ctx = context.metadata.get("ohmo_send_ctx")
-        if not isinstance(send_ctx, dict) or not send_ctx.get("is_owner"):
+        if not isinstance(send_ctx, dict):
             return ToolResult(
-                output="Only the bot owner can send messages to other people.",
+                output="No sender context; this tool can only be used from a live chat.",
+                is_error=True,
+            )
+        sender_label = _sender_label(send_ctx)
+        if sender_label is None:
+            return ToolResult(
+                output=(
+                    "Refusing to send: this turn has no identifiable human sender to sign "
+                    "the message (e.g. a background or reminder turn). Messages can only be "
+                    "sent from a live human chat."
+                ),
                 is_error=True,
             )
         if not arguments.text.strip():
@@ -72,7 +84,7 @@ class SendTelegramMessageTool(BaseTool):
                 OutboundMessage(
                     channel="telegram",
                     chat_id=contact.chat_id,
-                    content=arguments.text,
+                    content=_signed_text(arguments.text, sender_label),
                     metadata={
                         "_session_key": f"telegram:{contact.chat_id}",
                         "_origin": "send_telegram_message",
@@ -156,3 +168,30 @@ def _success_name(contact: ContactRecord) -> str:
     if contact.username:
         return f"@{contact.username}"
     return contact.chat_id
+
+
+def _sender_label(send_ctx: dict) -> str | None:
+    """Human-readable label for whoever asked the bot to send the message,
+    or None when the turn has no identifiable human sender (e.g. a background
+    or reminder turn whose sender_id is the scheduler sentinel).
+    """
+    name = str(send_ctx.get("first_name") or "").strip() or str(
+        send_ctx.get("display_name") or ""
+    ).strip()
+    username = str(send_ctx.get("username") or "").strip().lstrip("@")
+    if name and username:
+        return f"{name} (@{username})"
+    if username:
+        return f"@{username}"
+    if name:
+        return name
+    sid = str(send_ctx.get("sender_id") or "").strip()
+    if "|" in sid:  # Telegram sender_id is "<id>|<username>"
+        uname = sid.partition("|")[2].strip()
+        if uname:
+            return f"@{uname}"
+    return None
+
+
+def _signed_text(text: str, sender_label: str) -> str:
+    return f"{text}\n\n— {sender_label} (отправлено через бота)"
