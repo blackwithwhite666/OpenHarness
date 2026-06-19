@@ -38,6 +38,8 @@ from ohmo.evals.review import (
 from ohmo.evals.runner import (
     OhmoEvalRunConfigCheckResult,
     OhmoEvalRunResult,
+    SUPPORTED_EVAL_AGENT_RUNNER_NAMES,
+    SUPPORTED_EVAL_EXECUTOR_NAMES,
     check_ohmo_eval_run_config,
     run_ohmo_eval_report,
 )
@@ -59,6 +61,8 @@ __all__ = [
     "OhmoEvalRunResult",
     "OhmoEvalSmokeResult",
     "ResourceSnapshotWrite",
+    "SUPPORTED_EVAL_AGENT_RUNNER_NAMES",
+    "SUPPORTED_EVAL_EXECUTOR_NAMES",
     "build_ohmo_eval_pack",
     "build_ohmo_resource_snapshot",
     "compare_ohmo_eval_reports",

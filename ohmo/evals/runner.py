@@ -52,11 +52,13 @@ class _AgentRunnerConfig:
     provider_profile: str
 
 
+SUPPORTED_EVAL_EXECUTOR_NAMES = ("replay-tools",)
+SUPPORTED_EVAL_AGENT_RUNNER_NAMES = ("scripted", "query-engine")
 _SUPPORTED_EXECUTORS = {
     "replay-tools": ReplayToolsExecutor,
     "replay_tools": ReplayToolsExecutor,
 }
-_SUPPORTED_AGENT_RUNNERS = {"scripted", "query-engine"}
+_SUPPORTED_AGENT_RUNNERS = set(SUPPORTED_EVAL_AGENT_RUNNER_NAMES)
 _DEFAULT_QUERY_ENGINE_SYSTEM_PROMPT = "You are running an Ohmo replay-only eval."
 
 
@@ -144,7 +146,7 @@ def _build_executor(
     normalized = executor_name.strip().lower()
     executor_factory = _SUPPORTED_EXECUTORS.get(normalized)
     if executor_factory is None:
-        supported = ", ".join(sorted({"replay-tools"}))
+        supported = ", ".join(SUPPORTED_EVAL_EXECUTOR_NAMES)
         raise ValueError(
             f"unknown eval executor: {executor_name}. Supported executors: {supported}"
         )
@@ -178,7 +180,7 @@ def _build_agent_runner_config(
 ) -> _AgentRunnerConfig:
     normalized = agent_runner_name.strip().lower()
     if normalized not in _SUPPORTED_AGENT_RUNNERS:
-        supported = ", ".join(sorted(_SUPPORTED_AGENT_RUNNERS))
+        supported = ", ".join(SUPPORTED_EVAL_AGENT_RUNNER_NAMES)
         raise ValueError(
             f"unknown eval agent runner: {agent_runner_name}. Supported runners: {supported}"
         )

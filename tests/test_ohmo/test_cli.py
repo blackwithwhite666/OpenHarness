@@ -1081,6 +1081,22 @@ def test_ohmo_evals_run_command_check_config_does_not_run_eval(
     assert "profile=openai-compatible model=eval-model" in result.output
 
 
+def test_ohmo_evals_run_command_help_lists_supported_executor_and_runner_ids():
+    runner = CliRunner()
+
+    result = runner.invoke(app, ["evals", "run", "--help"])
+
+    assert result.exit_code == 0
+    output = " ".join(result.output.split())
+    assert "--executor" in output
+    assert "Eval executor to use:" in output
+    assert "replay-tools" in output
+    assert "--agent-runner" in output
+    assert "Agent runner to use inside the" in output
+    assert "executor: scripted," in output
+    assert "query-engine" in output
+
+
 def test_ohmo_evals_run_command_reports_blocked_and_error_counts(
     tmp_path: Path,
     monkeypatch,
@@ -1106,9 +1122,9 @@ def test_ohmo_evals_run_command_reports_blocked_and_error_counts(
             write=SimpleNamespace(
                 path=Path(workspace) / "evals" / "reports" / "eval_report.json",
                 report=SimpleNamespace(
-                    case_count=3,
+                    case_count=4,
                     passed_count=1,
-                    failed_count=0,
+                    failed_count=1,
                     blocked_count=1,
                     error_count=1,
                 ),
@@ -1137,15 +1153,24 @@ def test_ohmo_evals_run_command_reports_blocked_and_error_counts(
         ],
     )
 
-    assert failed.exit_code == 1
-    assert "Eval run evaluated 3 cases: passed=1 failed=0 blocked=1 error=1" in failed.output
+    assert failed.exit_code != 0
+    assert "Eval run evaluated 4 cases: passed=1 failed=1 blocked=1 error=1" in failed.output
     assert report_only.exit_code == 0
+    assert "Eval run evaluated 4 cases: passed=1 failed=1 blocked=1 error=1" in report_only.output
     assert "Report-only mode: failures did not fail the command" in report_only.output
 
 
-def test_ohmo_evals_run_command_rejects_unknown_executor(tmp_path: Path):
+def test_ohmo_evals_run_command_surfaces_unknown_executor_errors(
+    tmp_path: Path,
+    monkeypatch,
+):
     runner = CliRunner()
     workspace = tmp_path / ".ohmo-home"
+
+    def fake_run_ohmo_eval_report(**kwargs):
+        raise ValueError("unknown eval executor: live-agent")
+
+    monkeypatch.setattr("ohmo.cli.run_ohmo_eval_report", fake_run_ohmo_eval_report)
 
     result = runner.invoke(
         app,
@@ -1161,6 +1186,42 @@ def test_ohmo_evals_run_command_rejects_unknown_executor(tmp_path: Path):
 
     assert result.exit_code == 1
     assert "unknown eval executor: live-agent" in result.stderr
+
+
+def test_ohmo_evals_run_command_surfaces_unknown_runner_errors_from_check_config(
+    tmp_path: Path,
+    monkeypatch,
+):
+    runner = CliRunner()
+    workspace = tmp_path / ".ohmo-home"
+
+    def fake_check_ohmo_eval_run_config(**kwargs):
+        raise ValueError("unknown eval agent runner: live-agent")
+
+    def fail_run_ohmo_eval_report(**kwargs):
+        raise AssertionError("eval run should not execute in --check-config mode")
+
+    monkeypatch.setattr(
+        "ohmo.cli.check_ohmo_eval_run_config",
+        fake_check_ohmo_eval_run_config,
+    )
+    monkeypatch.setattr("ohmo.cli.run_ohmo_eval_report", fail_run_ohmo_eval_report)
+
+    result = runner.invoke(
+        app,
+        [
+            "evals",
+            "run",
+            "--workspace",
+            str(workspace),
+            "--agent-runner",
+            "live-agent",
+            "--check-config",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "unknown eval agent runner: live-agent" in result.stderr
 
 
 def test_ohmo_evals_compare_command_fails_on_regressions_and_supports_report_only(

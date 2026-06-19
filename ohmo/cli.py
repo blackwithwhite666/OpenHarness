@@ -21,6 +21,8 @@ from ohmo.gateway.service import (
     stop_gateway_process,
 )
 from ohmo.evals import (
+    SUPPORTED_EVAL_AGENT_RUNNER_NAMES,
+    SUPPORTED_EVAL_EXECUTOR_NAMES,
     build_ohmo_eval_pack,
     check_ohmo_eval_run_config,
     compare_ohmo_eval_reports,
@@ -71,6 +73,13 @@ evals_app.add_typer(evals_baseline_app)
 
 _INTERACTIVE_CHANNELS = ("telegram", "slack", "discord", "feishu")
 _WORKSPACE_HELP = "Path to the ohmo workspace (defaults to ~/.ohmo)"
+_EVAL_EXECUTOR_HELP = (
+    "Eval executor to use: " + ", ".join(SUPPORTED_EVAL_EXECUTOR_NAMES)
+)
+_EVAL_AGENT_RUNNER_HELP = (
+    "Agent runner to use inside the executor: "
+    + ", ".join(SUPPORTED_EVAL_AGENT_RUNNER_NAMES)
+)
 
 
 def _can_use_questionary() -> bool:
@@ -962,12 +971,12 @@ def evals_run_cmd(
     executor_name: str = typer.Option(
         "replay-tools",
         "--executor",
-        help="Eval executor to use: replay-tools",
+        help=_EVAL_EXECUTOR_HELP,
     ),
     agent_runner_name: str = typer.Option(
         "scripted",
         "--agent-runner",
-        help="Agent runner to use inside the executor: scripted or query-engine",
+        help=_EVAL_AGENT_RUNNER_HELP,
     ),
     model: str | None = typer.Option(
         None,
