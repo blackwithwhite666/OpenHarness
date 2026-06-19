@@ -91,6 +91,36 @@ def test_promote_case_drafts_is_idempotent_for_existing_same_gold(tmp_path: Path
     assert second_gold.reviewer == "first"
 
 
+def test_promote_case_drafts_copies_metadata_only_review_metadata(tmp_path: Path):
+    store = EvalStore(tmp_path / "evals")
+    _add_episode(
+        store,
+        episode_id="ep-1",
+        user_text="private request body",
+        final_text="private final answer",
+    )
+    drafts = build_case_drafts(store, build_case_candidates(store))
+    write_case_draft_pack(store, drafts)
+
+    promote_case_drafts(
+        store,
+        case_ids=[drafts[0].case_id],
+        reviewer="reviewer-1",
+        review_metadata_by_case={
+            drafts[0].case_id: {
+                "review_decision": "approved",
+                "review_comment_hash": "hash-only",
+                "review_comment_length": 12,
+            }
+        },
+    )
+
+    gold = read_gold_cases(store)[0]
+    assert gold.metadata["review_decision"] == "approved"
+    assert gold.metadata["review_comment_hash"] == "hash-only"
+    assert gold.metadata["review_comment_length"] == 12
+
+
 def test_promote_case_drafts_validates_selection_and_paths(tmp_path: Path):
     store = EvalStore(tmp_path / "evals")
     _add_episode(

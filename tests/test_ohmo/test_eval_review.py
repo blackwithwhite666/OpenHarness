@@ -92,9 +92,84 @@ def test_write_ohmo_eval_review_manifest_is_metadata_only(tmp_path: Path):
         "limit": 20,
     }
     assert payload["items"][0]["episode_id"] == "ep-1"
+    assert payload["items"][0]["decision"] == "pending"
+    assert payload["items"][0]["reviewer"] == ""
+    assert payload["items"][0]["comment"] == ""
     serialized = result.path.read_text(encoding="utf-8")
     assert "private review manifest request" not in serialized
     assert "private final" not in serialized
+
+
+def test_promote_ohmo_eval_case_drafts_from_review_manifest(tmp_path: Path):
+    workspace = tmp_path / "workspace"
+    store = _add_episode(workspace, episode_id="ep-1", user_text="private first")
+    _add_episode(workspace, episode_id="ep-2", user_text="private second")
+    write_ohmo_eval_mine(workspace=workspace)
+    manifest = write_ohmo_eval_review_manifest(
+        workspace=workspace,
+        filename="batch_review.json",
+    )
+    payload = json.loads(manifest.path.read_text(encoding="utf-8"))
+    payload["items"][0]["decision"] = "approved"
+    payload["items"][0]["reviewer"] = "manifest-reviewer"
+    payload["items"][0]["comment"] = "keep this case"
+    payload["items"][1]["decision"] = "rejected"
+    manifest.path.write_text(json.dumps(payload), encoding="utf-8")
+
+    result = promote_ohmo_eval_case_drafts(
+        workspace=workspace,
+        manifest_filename="batch_review.json",
+        reviewer="reviewer-1",
+    )
+
+    assert result.promoted_count == 1
+    assert result.selected_case_ids == [payload["items"][0]["case_id"]]
+    gold_cases = read_gold_cases(store)
+    assert len(gold_cases) == 1
+    gold = gold_cases[0]
+    assert gold.case_id == payload["items"][0]["case_id"]
+    assert gold.reviewer == "reviewer-1"
+    assert gold.metadata["review_decision"] == "approved"
+    assert gold.metadata["reviewer"] == "manifest-reviewer"
+    assert gold.metadata["review_manifest"] == "batch_review.json"
+    assert gold.metadata["review_comment_length"] == len("keep this case")
+    serialized = result.records_path.read_text(encoding="utf-8")
+    assert "keep this case" not in serialized
+    assert "private first" not in serialized
+    assert "private second" not in serialized
+
+
+def test_promote_ohmo_eval_case_drafts_from_manifest_validates_selection(
+    tmp_path: Path,
+):
+    workspace = tmp_path / "workspace"
+    _add_episode(workspace, episode_id="ep-1", user_text="private first")
+    write_ohmo_eval_mine(workspace=workspace)
+    manifest = write_ohmo_eval_review_manifest(
+        workspace=workspace,
+        filename="batch_review.json",
+    )
+
+    with pytest.raises(ValueError, match="choose either manifest"):
+        promote_ohmo_eval_case_drafts(
+            workspace=workspace,
+            manifest_filename="batch_review.json",
+            promote_all=True,
+        )
+    with pytest.raises(ValueError, match="no approved cases"):
+        promote_ohmo_eval_case_drafts(
+            workspace=workspace,
+            manifest_filename="batch_review.json",
+        )
+
+    payload = json.loads(manifest.path.read_text(encoding="utf-8"))
+    payload["items"][0]["decision"] = "maybe"
+    manifest.path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ValueError, match="unknown review decision"):
+        promote_ohmo_eval_case_drafts(
+            workspace=workspace,
+            manifest_filename="batch_review.json",
+        )
 
 
 def test_write_ohmo_eval_review_manifest_validates_paths(tmp_path: Path):

@@ -46,15 +46,22 @@ Triggers for adding a broader SQLite projection:
    ```
 
    Review manifests are written under `evals/cases/` and contain case ids,
-   facet counts, tool names, and review metadata. They do not contain raw
-   prompts, tool inputs, tool outputs, or final answers.
+   facet counts, tool names, and review metadata. Edit each item with
+   `decision: "approved"` or `decision: "rejected"` before batch promotion.
+   They do not contain raw prompts, tool inputs, tool outputs, or final
+   answers.
 
 4. Promote reviewed drafts into the gold set:
 
    ```bash
    ohmo evals promote --workspace <workspace> --case-id <case-id> --reviewer <id>
    ohmo evals promote --workspace <workspace> --all --reviewer <id>
+   ohmo evals promote --workspace <workspace> --manifest review_manifest.json --reviewer <id>
    ```
+
+   Manifest promotion only promotes items marked `approved`. Rejected and
+   pending items stay as drafts. Review comments are not copied as raw text into
+   gold cases; gold metadata stores only comment hash and length.
 
 5. Build and smoke-check a runnable pack:
 

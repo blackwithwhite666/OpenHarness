@@ -427,6 +427,7 @@ def test_ohmo_evals_promote_command_promotes_selected_case_drafts(
         workspace: str | Path | None = None,
         case_ids: list[str] | None = None,
         promote_all: bool = False,
+        manifest_filename: str | None = None,
         dry_run: bool = False,
         reviewer: str = "",
     ):
@@ -435,6 +436,7 @@ def test_ohmo_evals_promote_command_promotes_selected_case_drafts(
                 "workspace": workspace,
                 "case_ids": case_ids,
                 "promote_all": promote_all,
+                "manifest_filename": manifest_filename,
                 "dry_run": dry_run,
                 "reviewer": reviewer,
             }
@@ -475,6 +477,7 @@ def test_ohmo_evals_promote_command_promotes_selected_case_drafts(
             "workspace": workspace.resolve(),
             "case_ids": ["case_001", "case_002"],
             "promote_all": False,
+            "manifest_filename": None,
             "dry_run": False,
             "reviewer": "reviewer-1",
         }
@@ -494,6 +497,7 @@ def test_ohmo_evals_promote_command_supports_dry_run(tmp_path: Path, monkeypatch
         workspace: str | Path | None = None,
         case_ids: list[str] | None = None,
         promote_all: bool = False,
+        manifest_filename: str | None = None,
         dry_run: bool = False,
         reviewer: str = "",
     ):
@@ -528,6 +532,75 @@ def test_ohmo_evals_promote_command_supports_dry_run(tmp_path: Path, monkeypatch
     assert "Would promote 1 draft cases:" in result.output
     assert "- case_001" in result.output
     assert "No files written." in result.output
+
+
+def test_ohmo_evals_promote_command_supports_review_manifest(
+    tmp_path: Path,
+    monkeypatch,
+):
+    runner = CliRunner()
+    workspace = tmp_path / ".ohmo-home"
+    calls: list[dict[str, object]] = []
+
+    def fake_promote_ohmo_eval_case_drafts(
+        *,
+        workspace: str | Path | None = None,
+        case_ids: list[str] | None = None,
+        promote_all: bool = False,
+        manifest_filename: str | None = None,
+        dry_run: bool = False,
+        reviewer: str = "",
+    ):
+        calls.append(
+            {
+                "workspace": workspace,
+                "case_ids": case_ids,
+                "promote_all": promote_all,
+                "manifest_filename": manifest_filename,
+                "dry_run": dry_run,
+                "reviewer": reviewer,
+            }
+        )
+        return SimpleNamespace(
+            promoted_count=1,
+            remaining_unpromoted_count=4,
+            selected_case_ids=["case_001"],
+            dry_run=False,
+            manifest_path=Path(workspace) / "evals" / "cases" / "gold_manifest.json",
+            records_path=Path(workspace) / "evals" / "cases" / "gold_cases.jsonl",
+        )
+
+    monkeypatch.setattr(
+        "ohmo.cli.promote_ohmo_eval_case_drafts",
+        fake_promote_ohmo_eval_case_drafts,
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "evals",
+            "promote",
+            "--workspace",
+            str(workspace),
+            "--manifest",
+            "review_manifest.json",
+            "--reviewer",
+            "reviewer-1",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert calls == [
+        {
+            "workspace": workspace.resolve(),
+            "case_ids": None,
+            "promote_all": False,
+            "manifest_filename": "review_manifest.json",
+            "dry_run": False,
+            "reviewer": "reviewer-1",
+        }
+    ]
+    assert "Promoted 1 draft cases." in result.output
 
 
 def test_ohmo_evals_pack_command_builds_runnable_pack(tmp_path: Path, monkeypatch):

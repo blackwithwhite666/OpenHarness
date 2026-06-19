@@ -815,6 +815,11 @@ def evals_promote_cmd(
         help="Draft case id to promote; repeat for multiple cases",
     ),
     promote_all: bool = typer.Option(False, "--all", help="Promote all draft cases"),
+    manifest_filename: str | None = typer.Option(
+        None,
+        "--manifest",
+        help="Promote cases marked approved in a review manifest under evals/cases",
+    ),
     dry_run: bool = typer.Option(False, "--dry-run", help="Show selected cases without writing"),
     reviewer: str = typer.Option("", "--reviewer", help="Reviewer id to store in gold cases"),
 ) -> None:
@@ -825,6 +830,7 @@ def evals_promote_cmd(
             workspace=workspace_root,
             case_ids=case_ids or None,
             promote_all=promote_all,
+            manifest_filename=manifest_filename,
             dry_run=dry_run,
             reviewer=reviewer,
         )

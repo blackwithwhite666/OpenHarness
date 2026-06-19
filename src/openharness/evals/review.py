@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 from collections.abc import Sequence
 from pathlib import Path
-from typing import TypeVar
+from typing import Mapping, TypeVar
 
 from pydantic import BaseModel, ValidationError
 
@@ -48,6 +48,7 @@ def promote_case_drafts(
     *,
     case_ids: Sequence[str] | None = None,
     reviewer: str = "",
+    review_metadata_by_case: Mapping[str, Mapping[str, object]] | None = None,
     draft_records_filename: str = "case_drafts.jsonl",
     records_filename: str = "gold_cases.jsonl",
     manifest_filename: str = "gold_manifest.json",
@@ -56,8 +57,13 @@ def promote_case_drafts(
     drafts = read_case_drafts(store, records_filename=draft_records_filename)
     selected = select_case_drafts(drafts, case_ids)
     existing = {gold.case_id: gold for gold in read_gold_cases(store, records_filename=records_filename)}
+    review_metadata = review_metadata_by_case or {}
     for draft in selected:
-        candidate = _gold_from_draft(draft, reviewer=reviewer)
+        candidate = _gold_from_draft(
+            draft,
+            reviewer=reviewer,
+            review_metadata=review_metadata.get(draft.case_id),
+        )
         current = existing.get(draft.case_id)
         if current is not None and _gold_content_fingerprint(current) == _gold_content_fingerprint(
             candidate
@@ -108,7 +114,20 @@ def select_case_drafts(
     return [by_id[case_id] for case_id in requested]
 
 
-def _gold_from_draft(draft: EvalCaseDraft, *, reviewer: str) -> EvalGoldCase:
+def _gold_from_draft(
+    draft: EvalCaseDraft,
+    *,
+    reviewer: str,
+    review_metadata: Mapping[str, object] | None = None,
+) -> EvalGoldCase:
+    metadata = {
+        "source_review_status": draft.review_status,
+        "candidate_score": draft.metadata.get("candidate_score", 0),
+        "signals": draft.metadata.get("signals", []),
+        "event_count": draft.metadata.get("event_count", 0),
+    }
+    if review_metadata:
+        metadata.update(dict(review_metadata))
     return EvalGoldCase(
         gold_case_id=_stable_id("gold", draft.case_id),
         case_id=draft.case_id,
@@ -121,12 +140,7 @@ def _gold_from_draft(draft: EvalCaseDraft, *, reviewer: str) -> EvalGoldCase:
         rubric=draft.rubric,
         review_status="approved",
         reviewer=reviewer,
-        metadata={
-            "source_review_status": draft.review_status,
-            "candidate_score": draft.metadata.get("candidate_score", 0),
-            "signals": draft.metadata.get("signals", []),
-            "event_count": draft.metadata.get("event_count", 0),
-        },
+        metadata=metadata,
     )
 
 
