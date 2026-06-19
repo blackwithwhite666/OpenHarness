@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import threading
+from collections.abc import Coroutine
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
@@ -134,7 +136,7 @@ class ReplayScriptAgentRunner:
         context: EvalExecutionContext,
     ) -> EvalExecutorResult:
         del prompt
-        return asyncio.run(_run_scripted_replay(tool_registry, context))
+        return _run_eval_coroutine(_run_scripted_replay(tool_registry, context))
 
 
 class QueryEngineEvalAgentRunner:
@@ -166,7 +168,7 @@ class QueryEngineEvalAgentRunner:
         tool_registry: ToolRegistry,
         context: EvalExecutionContext,
     ) -> EvalExecutorResult:
-        return asyncio.run(
+        return _run_eval_coroutine(
             _run_query_engine_replay(
                 api_client=self._api_client,
                 model=self._model,
@@ -233,6 +235,35 @@ def build_replay_tool_registry(fixtures: tuple[EvalToolFixture, ...]) -> ToolReg
             )
         )
     return registry
+
+
+def _run_eval_coroutine(
+    coro: Coroutine[Any, Any, EvalExecutorResult],
+) -> EvalExecutorResult:
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+
+    result: dict[str, EvalExecutorResult] = {}
+    errors: list[BaseException] = []
+
+    def run_in_thread() -> None:
+        try:
+            result["value"] = asyncio.run(coro)
+        except BaseException as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(
+        target=run_in_thread,
+        name="openharness-eval-runner",
+        daemon=True,
+    )
+    thread.start()
+    thread.join()
+    if errors:
+        raise errors[0]
+    return result["value"]
 
 
 async def _run_scripted_replay(
