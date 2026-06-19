@@ -38,6 +38,7 @@ _EXPECTED_FACET_KINDS = {"assistant_final", "gateway_error", "tool_output"}
 def build_case_candidates(store: EvalStore) -> list[EvalCaseCandidate]:
     """Build metadata-only case candidates from captured episodes."""
     facets_by_episode = _facet_ids_by_episode(store)
+    embedded_facet_ids = store.list_embedding_facet_ids()
     candidates: list[EvalCaseCandidate] = []
     for episode_id in store.list_episode_ids():
         episode = store.get_episode(episode_id)
@@ -46,7 +47,13 @@ def build_case_candidates(store: EvalStore) -> list[EvalCaseCandidate]:
         events = list(store.iter_events(episode_id))
         event_kind_path = [event.kind for event in events]
         tool_path = _tool_path(events)
-        signals = _signals(events, tool_path)
+        facet_ids = facets_by_episode.get(episode_id, [])
+        embedded_facet_count = sum(1 for facet_id in facet_ids if facet_id in embedded_facet_ids)
+        signals = _signals(
+            events,
+            tool_path,
+            embedded_facet_count=embedded_facet_count,
+        )
         candidate_kind = _candidate_kind(signals)
         score = _score(signals, tool_path)
         candidates.append(
@@ -56,7 +63,7 @@ def build_case_candidates(store: EvalStore) -> list[EvalCaseCandidate]:
                 candidate_kind=candidate_kind,
                 score=score,
                 signals=signals,
-                facet_ids=facets_by_episode.get(episode_id, []),
+                facet_ids=facet_ids,
                 event_kind_path=event_kind_path,
                 tool_path=tool_path,
                 metadata={
@@ -66,6 +73,9 @@ def build_case_candidates(store: EvalStore) -> list[EvalCaseCandidate]:
                     "event_count": len(events),
                     "tool_count": len(tool_path),
                     "error_count": sum(1 for event in events if event.is_error),
+                    "facet_count": len(facet_ids),
+                    "embedded_facet_count": embedded_facet_count,
+                    "graph_motif_key": _motif_key(event_kind_path, tool_path),
                 },
             )
         )
@@ -191,7 +201,12 @@ def _facet_ids_by_episode(store: EvalStore) -> dict[str, list[str]]:
     return facets
 
 
-def _signals(events: Sequence[EvalEvent], tool_path: Sequence[str]) -> list[str]:
+def _signals(
+    events: Sequence[EvalEvent],
+    tool_path: Sequence[str],
+    *,
+    embedded_facet_count: int,
+) -> list[str]:
     signals: list[str] = []
     if any(event.is_error for event in events):
         signals.append("has_error")
@@ -201,6 +216,10 @@ def _signals(events: Sequence[EvalEvent], tool_path: Sequence[str]) -> list[str]
         signals.append("has_resource_snapshot")
     if any(event.kind == "gateway_final" for event in events):
         signals.append("has_final_response")
+    if embedded_facet_count:
+        signals.append("has_embeddings")
+    if len({event.kind for event in events}) > 1 or tool_path:
+        signals.append("has_graph_motif")
     if not signals:
         signals.append("conversation_only")
     return signals
@@ -224,6 +243,10 @@ def _score(signals: Sequence[str], tool_path: Sequence[str]) -> float:
         score += 1.0
     if "has_final_response" in signals:
         score += 1.0
+    if "has_embeddings" in signals:
+        score += 0.5
+    if "has_graph_motif" in signals:
+        score += 0.5
     return score + min(len(tool_path), 3) * 0.25
 
 
@@ -259,6 +282,10 @@ def _rubric(candidate: EvalCaseCandidate) -> list[str]:
     if candidate.candidate_kind == "error_recovery":
         rubric.append("handle the error path without hiding the failure")
     return rubric
+
+
+def _motif_key(event_kind_path: Sequence[str], tool_path: Sequence[str]) -> str:
+    return "|".join(event_kind_path) + "::" + "|".join(tool_path)
 
 
 def _write_records(path: Path, records: Sequence[BaseModel]) -> None:

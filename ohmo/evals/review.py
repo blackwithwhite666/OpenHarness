@@ -145,16 +145,8 @@ def validate_ohmo_eval_review_manifest(
     """Validate a metadata-only review manifest against current draft cases."""
     store = get_eval_store(workspace)
     drafts = read_case_drafts(store)
-    draft_case_ids = {draft.case_id for draft in drafts}
     manifest = _read_review_manifest(store.root, filename)
-    missing_case_ids = [
-        item.case_id
-        for item in manifest.items
-        if item.case_id not in draft_case_ids
-    ]
-    if missing_case_ids:
-        missing = ", ".join(missing_case_ids)
-        raise ValueError(f"review manifest references missing draft cases: {missing}")
+    _validate_review_manifest_against_drafts(manifest, drafts)
     return OhmoEvalReviewManifestValidation(
         path=manifest.path,
         relative_path=manifest.path.relative_to(store.root).as_posix(),
@@ -195,6 +187,7 @@ def promote_ohmo_eval_case_drafts(
         manifest_selection = _approved_cases_from_review_manifest(
             store.root,
             manifest_filename,
+            drafts,
         )
         case_ids = manifest_selection.case_ids
         review_metadata_by_case = manifest_selection.review_metadata_by_case
@@ -271,6 +264,11 @@ class _ReviewManifestItem:
     decision: str
     reviewer: str
     comment: str
+    episode_id: str
+    case_kind: str
+    input_facet_count: int | None
+    expected_facet_count: int | None
+    tool_names: list[str] | None
 
 
 @dataclass(frozen=True)
@@ -317,6 +315,23 @@ def _read_review_manifest(
                 decision=_normalize_review_decision(raw_item.get("decision", "pending")),
                 reviewer=str(raw_item.get("reviewer") or "").strip(),
                 comment=str(raw_item.get("comment") or ""),
+                episode_id=str(raw_item.get("episode_id") or "").strip(),
+                case_kind=str(raw_item.get("case_kind") or "").strip(),
+                input_facet_count=_optional_non_negative_int(
+                    raw_item.get("input_facet_count"),
+                    index=index,
+                    field_name="input_facet_count",
+                ),
+                expected_facet_count=_optional_non_negative_int(
+                    raw_item.get("expected_facet_count"),
+                    index=index,
+                    field_name="expected_facet_count",
+                ),
+                tool_names=_optional_string_list(
+                    raw_item.get("tool_names"),
+                    index=index,
+                    field_name="tool_names",
+                ),
             )
         )
     return _ReviewManifest(path=path, items=items)
@@ -325,8 +340,10 @@ def _read_review_manifest(
 def _approved_cases_from_review_manifest(
     store_root: Path,
     filename: str,
+    drafts: list[EvalCaseDraft],
 ) -> _ReviewManifestSelection:
     manifest = _read_review_manifest(store_root, filename)
+    _validate_review_manifest_against_drafts(manifest, drafts)
     case_ids: list[str] = []
     metadata_by_case: dict[str, dict[str, object]] = {}
     for item in manifest.items:
@@ -346,6 +363,88 @@ def _approved_cases_from_review_manifest(
         case_ids=case_ids,
         review_metadata_by_case=metadata_by_case,
     )
+
+
+def _validate_review_manifest_against_drafts(
+    manifest: _ReviewManifest,
+    drafts: list[EvalCaseDraft],
+) -> None:
+    drafts_by_case_id = {draft.case_id: draft for draft in drafts}
+    missing_case_ids = [
+        item.case_id
+        for item in manifest.items
+        if item.case_id not in drafts_by_case_id
+    ]
+    if missing_case_ids:
+        missing = ", ".join(missing_case_ids)
+        raise ValueError(f"review manifest references missing draft cases: {missing}")
+
+    stale_rows: list[str] = []
+    for item in manifest.items:
+        if item.decision != "approved":
+            continue
+        draft = drafts_by_case_id[item.case_id]
+        mismatched_fields = _review_manifest_mismatches(item, draft)
+        if mismatched_fields:
+            stale_rows.append(f"{item.case_id} ({', '.join(mismatched_fields)})")
+    if stale_rows:
+        stale = "; ".join(stale_rows)
+        raise ValueError(f"stale approved review manifest rows: {stale}")
+
+
+def _review_manifest_mismatches(
+    item: _ReviewManifestItem,
+    draft: EvalCaseDraft,
+) -> list[str]:
+    expected = {
+        "episode_id": draft.episode_id,
+        "case_kind": draft.case_kind,
+        "input_facet_count": len(draft.input_facet_ids),
+        "expected_facet_count": len(draft.expected_facet_ids),
+        "tool_names": draft.tool_names,
+    }
+    actual = {
+        "episode_id": item.episode_id,
+        "case_kind": item.case_kind,
+        "input_facet_count": item.input_facet_count,
+        "expected_facet_count": item.expected_facet_count,
+        "tool_names": item.tool_names,
+    }
+    return [
+        field
+        for field, expected_value in expected.items()
+        if actual[field] != expected_value
+    ]
+
+
+def _optional_non_negative_int(
+    value: object,
+    *,
+    index: int,
+    field_name: str,
+) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(
+            f"review manifest item {index} {field_name} must be a non-negative integer"
+        )
+    return value
+
+
+def _optional_string_list(
+    value: object,
+    *,
+    index: int,
+    field_name: str,
+) -> list[str] | None:
+    if value is None:
+        return None
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise ValueError(
+            f"review manifest item {index} {field_name} must be a string list"
+        )
+    return value
 
 
 def _normalize_review_decision(value: object) -> str:

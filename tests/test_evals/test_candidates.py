@@ -6,11 +6,13 @@ from pathlib import Path
 import pytest
 
 from openharness.evals import (
+    EvalEmbeddingRecord,
     EvalEpisode,
     EvalEvent,
     EvalStore,
     build_case_candidates,
     build_case_drafts,
+    collect_text_facets,
     write_candidate_pack,
     write_case_draft_pack,
 )
@@ -82,9 +84,13 @@ def test_case_candidates_and_drafts_are_metadata_only(tmp_path: Path):
         "uses_tools",
         "has_resource_snapshot",
         "has_final_response",
+        "has_graph_motif",
     ]
     assert candidates[1].tool_path == ["web_fetch"]
     assert candidates[1].metadata["event_count"] == 4
+    assert candidates[1].metadata["graph_motif_key"] == (
+        "resource_snapshot|tool_started|tool_completed|gateway_final::web_fetch"
+    )
 
     drafts_by_episode = {draft.episode_id: draft for draft in drafts}
     assert drafts_by_episode["ep-1"].review_status == "draft"
@@ -125,6 +131,41 @@ def test_case_candidates_and_drafts_are_metadata_only(tmp_path: Path):
         "private error body",
     ):
         assert sensitive_fragment not in serialized
+
+
+def test_case_candidates_include_embedding_signals_from_lookup_index(tmp_path: Path):
+    store = EvalStore(tmp_path / "evals")
+    _add_episode(
+        store,
+        episode_id="ep-1",
+        user_goal="Secret embedding goal",
+        user_text="Please inspect private embedding",
+        events=[
+            EvalEvent(
+                episode_id="ep-1",
+                kind="gateway_final",
+                payload={"text": "private embedding final"},
+            ),
+        ],
+    )
+    facet = collect_text_facets(store)[0].facet
+    store.replace_embedding_index(
+        [
+            EvalEmbeddingRecord(
+                facet=facet,
+                model="BAAI/bge-m3",
+                dimensions=2,
+                vector=[0.1, 0.2],
+            )
+        ],
+        jsonl_path="embeddings/embedding_records.jsonl",
+    )
+
+    candidate = build_case_candidates(store)[0]
+
+    assert "has_embeddings" in candidate.signals
+    assert candidate.metadata["embedded_facet_count"] == 1
+    assert candidate.metadata["facet_count"] == 3
 
 
 def test_candidate_and_case_pack_reject_escaped_output_paths(tmp_path: Path):

@@ -50,6 +50,41 @@ def test_run_ohmo_eval_report_writes_metadata_replay_report(tmp_path: Path):
     assert "private ohmo eval answer" not in serialized
 
 
+def test_run_ohmo_eval_report_accepts_custom_report_filename(tmp_path: Path):
+    workspace = tmp_path / "workspace"
+    store = get_eval_store(workspace)
+    store.append_episode(
+        EvalEpisode(
+            episode_id="ep-1",
+            source="gateway",
+            app="ohmo",
+            session_id="session-1",
+            user_text="private ohmo eval request",
+        )
+    )
+    store.append_event(
+        EvalEvent(
+            episode_id="ep-1",
+            kind="gateway_final",
+            payload={"text": "private ohmo eval answer"},
+        )
+    )
+    write_ohmo_eval_mine(workspace=workspace)
+    promote_case_drafts(store)
+    build_ohmo_eval_pack(workspace=workspace)
+
+    result = run_ohmo_eval_report(
+        workspace=workspace,
+        report_filename="custom_eval_report.json",
+    )
+
+    assert result.write.path == workspace.resolve() / "evals" / "reports" / (
+        "custom_eval_report.json"
+    )
+    assert result.write.report.case_count == 1
+    assert result.write.path.exists()
+
+
 def test_run_ohmo_eval_report_rejects_unknown_executor(tmp_path: Path):
     with pytest.raises(ValueError, match="unknown eval executor"):
         run_ohmo_eval_report(

@@ -141,6 +141,12 @@ def _build_manifest(
     records_relative_path: str,
     facet_count: int,
 ) -> EvalEmbeddingManifest:
+    metadata = {
+        "provider": "telegent_inference",
+        "rebuild": True,
+        "embedded_facet_count": len(records),
+        "reused_embedding_count": 0,
+    }
     if not records:
         return EvalEmbeddingManifest(
             model="",
@@ -149,7 +155,7 @@ def _build_manifest(
             facet_count=facet_count,
             embedding_count=0,
             skipped_count=facet_count,
-            metadata={"provider": "telegent_inference"},
+            metadata=metadata,
         )
     first = records[0]
     return EvalEmbeddingManifest(
@@ -159,7 +165,7 @@ def _build_manifest(
         facet_count=facet_count,
         embedding_count=len(records),
         skipped_count=facet_count - len(records),
-        metadata={"provider": "telegent_inference"},
+        metadata=metadata,
     )
 
 

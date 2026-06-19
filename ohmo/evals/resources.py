@@ -8,6 +8,7 @@ from datetime import date, datetime
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
 import re
 import stat
@@ -37,6 +38,7 @@ from ohmo.workspace import (
 )
 
 _RESOURCE_ID_SAFE = re.compile(r"[^A-Za-z0-9_.:-]+")
+_DIRECTORY_AGGREGATE_ENTRY_LIMIT = 5000
 
 
 @dataclass(frozen=True)
@@ -206,22 +208,48 @@ def _directory_aggregate(path: Path, root_stat: object) -> dict[str, Any]:
     dir_count = 0
     total_size_bytes = 0
     newest_mtime_ns = int(getattr(root_stat, "st_mtime_ns"))
-    for child in path.rglob("*"):
+    visited_count = 0
+    truncated = False
+    pending_dirs = [path]
+
+    while pending_dirs and visited_count < _DIRECTORY_AGGREGATE_ENTRY_LIMIT:
+        current_dir = pending_dirs.pop()
         try:
-            child_stat = child.lstat()
+            entries = os.scandir(current_dir)
         except OSError:
             continue
-        newest_mtime_ns = max(newest_mtime_ns, child_stat.st_mtime_ns)
-        if stat.S_ISDIR(child_stat.st_mode):
-            dir_count += 1
-        elif stat.S_ISREG(child_stat.st_mode):
-            file_count += 1
-            total_size_bytes += child_stat.st_size
+
+        with entries:
+            for entry in entries:
+                if visited_count >= _DIRECTORY_AGGREGATE_ENTRY_LIMIT:
+                    truncated = True
+                    break
+                visited_count += 1
+                try:
+                    child_stat = entry.stat(follow_symlinks=False)
+                except OSError:
+                    continue
+                newest_mtime_ns = max(newest_mtime_ns, child_stat.st_mtime_ns)
+                if stat.S_ISDIR(child_stat.st_mode):
+                    dir_count += 1
+                    pending_dirs.append(Path(entry.path))
+                elif stat.S_ISREG(child_stat.st_mode):
+                    file_count += 1
+                    total_size_bytes += child_stat.st_size
+        if truncated:
+            break
+
+    if pending_dirs and visited_count >= _DIRECTORY_AGGREGATE_ENTRY_LIMIT:
+        truncated = True
+
     return {
         "file_count": file_count,
         "dir_count": dir_count,
         "total_size_bytes": total_size_bytes,
         "newest_mtime_ns": newest_mtime_ns,
+        "truncated": truncated,
+        "entry_limit": _DIRECTORY_AGGREGATE_ENTRY_LIMIT,
+        "visited_count": visited_count,
     }
 
 

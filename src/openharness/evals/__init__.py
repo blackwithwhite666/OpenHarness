@@ -14,7 +14,13 @@ from openharness.evals.compare import (
     write_execution_report_comparison,
 )
 from openharness.evals.embeddings import EvalEmbeddingIndexWrite, write_embedding_index
-from openharness.evals.execution import EvalExecutionReportWrite, run_execution_report
+from openharness.evals.execution import (
+    EvalExecutionReportWrite,
+    EvalExecutionScorer,
+    EvalExecutionScorerResult,
+    ExactMatchEvalScorer,
+    run_execution_report,
+)
 from openharness.evals.executor import (
     EvalAgentRunner,
     EvalExecutionContext,
@@ -92,8 +98,11 @@ __all__ = [
     "EvalExecutionReport",
     "EvalExecutionReportCase",
     "EvalExecutionReportWrite",
+    "EvalExecutionScorer",
+    "EvalExecutionScorerResult",
     "EvalExecutor",
     "EvalExecutorResult",
+    "ExactMatchEvalScorer",
     "EvalAgentRunner",
     "EvalGoldCase",
     "EvalObservedToolCall",

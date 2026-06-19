@@ -324,6 +324,140 @@ def test_ohmo_evals_mine_command_runs_candidate_mining(tmp_path: Path, monkeypat
     assert "Mined 2 candidates and 2 draft cases" in result.output
 
 
+def test_ohmo_evals_cases_list_command_outputs_metadata_json(
+    tmp_path: Path,
+    monkeypatch,
+):
+    runner = CliRunner()
+    workspace = tmp_path / ".ohmo-home"
+    calls: list[dict[str, object]] = []
+
+    def fake_review_ohmo_eval_case_drafts(
+        *,
+        workspace: str | Path | None = None,
+        case_id: str | None = None,
+        limit: int = 20,
+    ):
+        calls.append({"workspace": workspace, "case_id": case_id, "limit": limit})
+        return SimpleNamespace(
+            total_count=2,
+            shown=[
+                SimpleNamespace(
+                    case_id="case_001",
+                    case_kind="tool_workflow",
+                    episode_id="ep-1",
+                    review_status="draft",
+                    input_facet_count=1,
+                    expected_facet_count=2,
+                    tool_names=["web_fetch"],
+                    raw_prompt_text="SECRET PROMPT",
+                )
+            ],
+        )
+
+    monkeypatch.setattr(
+        "ohmo.cli.review_ohmo_eval_case_drafts",
+        fake_review_ohmo_eval_case_drafts,
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "evals",
+            "cases",
+            "list",
+            "--workspace",
+            str(workspace),
+            "--limit",
+            "1",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert calls == [{"workspace": workspace.resolve(), "case_id": None, "limit": 1}]
+    payload = json.loads(result.output)
+    assert payload == {
+        "privacy": "metadata_only",
+        "action": "cases_list",
+        "total_count": 2,
+        "shown_count": 1,
+        "limit": 1,
+        "cases": [
+            {
+                "case_id": "case_001",
+                "case_kind": "tool_workflow",
+                "episode_id": "ep-1",
+                "review_status": "draft",
+                "input_facet_count": 1,
+                "expected_facet_count": 2,
+                "tool_names": ["web_fetch"],
+            }
+        ],
+    }
+    assert "SECRET PROMPT" not in result.output
+
+
+def test_ohmo_evals_cases_show_command_outputs_metadata_json(
+    tmp_path: Path,
+    monkeypatch,
+):
+    runner = CliRunner()
+    workspace = tmp_path / ".ohmo-home"
+    calls: list[dict[str, object]] = []
+
+    def fake_review_ohmo_eval_case_drafts(
+        *,
+        workspace: str | Path | None = None,
+        case_id: str | None = None,
+        limit: int = 20,
+    ):
+        calls.append({"workspace": workspace, "case_id": case_id, "limit": limit})
+        return SimpleNamespace(
+            total_count=2,
+            shown=[
+                SimpleNamespace(
+                    case_id="case_001",
+                    case_kind="tool_workflow",
+                    episode_id="ep-1",
+                    review_status="draft",
+                    input_facet_count=1,
+                    expected_facet_count=2,
+                    tool_names=["web_fetch"],
+                    raw_final_text="SECRET FINAL",
+                )
+            ],
+        )
+
+    monkeypatch.setattr(
+        "ohmo.cli.review_ohmo_eval_case_drafts",
+        fake_review_ohmo_eval_case_drafts,
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "evals",
+            "cases",
+            "show",
+            "case_001",
+            "--workspace",
+            str(workspace),
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert calls == [{"workspace": workspace.resolve(), "case_id": "case_001", "limit": 1}]
+    payload = json.loads(result.output)
+    assert payload["privacy"] == "metadata_only"
+    assert payload["action"] == "cases_show"
+    assert payload["case_id"] == "case_001"
+    assert payload["shown_count"] == 1
+    assert payload["cases"][0]["tool_names"] == ["web_fetch"]
+    assert "SECRET FINAL" not in result.output
+
+
 def test_ohmo_evals_review_command_lists_case_drafts(tmp_path: Path, monkeypatch):
     runner = CliRunner()
     workspace = tmp_path / ".ohmo-home"
@@ -414,6 +548,85 @@ def test_ohmo_evals_review_command_lists_case_drafts(tmp_path: Path, monkeypatch
     assert "Wrote review manifest:" in result.output
 
 
+def test_ohmo_evals_review_command_outputs_json_summary(tmp_path: Path, monkeypatch):
+    runner = CliRunner()
+    workspace = tmp_path / ".ohmo-home"
+
+    def fake_review_ohmo_eval_case_drafts(
+        *,
+        workspace: str | Path | None = None,
+        case_id: str | None = None,
+        limit: int = 20,
+    ):
+        del workspace, case_id, limit
+        return SimpleNamespace(
+            total_count=17,
+            shown=[
+                SimpleNamespace(
+                    case_id="case_001",
+                    case_kind="tool_workflow",
+                    episode_id="ep-1",
+                    review_status="draft",
+                    input_facet_count=1,
+                    expected_facet_count=2,
+                    tool_names=["web_fetch"],
+                    raw_tool_text="SECRET TOOL",
+                )
+            ],
+        )
+
+    monkeypatch.setattr(
+        "ohmo.cli.review_ohmo_eval_case_drafts",
+        fake_review_ohmo_eval_case_drafts,
+    )
+
+    def fake_write_ohmo_eval_review_manifest(
+        *,
+        workspace: str | Path | None = None,
+        case_id: str | None = None,
+        limit: int = 20,
+        filename: str = "review_manifest.json",
+    ):
+        del case_id, limit
+        return SimpleNamespace(
+            path=Path(workspace) / "evals" / "cases" / filename,
+            relative_path=f"cases/{filename}",
+            total_count=17,
+            shown_count=1,
+        )
+
+    monkeypatch.setattr(
+        "ohmo.cli.write_ohmo_eval_review_manifest",
+        fake_write_ohmo_eval_review_manifest,
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "evals",
+            "review",
+            "--workspace",
+            str(workspace),
+            "--limit",
+            "1",
+            "--manifest",
+            "review_manifest.json",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["privacy"] == "metadata_only"
+    assert payload["action"] == "review"
+    assert payload["total_count"] == 17
+    assert payload["shown_count"] == 1
+    assert payload["manifest"]["relative_path"] == "cases/review_manifest.json"
+    assert payload["cases"][0]["case_id"] == "case_001"
+    assert "Draft eval cases:" not in result.output
+    assert "SECRET TOOL" not in result.output
+
+
 def test_ohmo_evals_review_command_validates_manifest(
     tmp_path: Path,
     monkeypatch,
@@ -466,6 +679,66 @@ def test_ohmo_evals_review_command_validates_manifest(
     assert "- case_001" in result.output
     assert "- case_004" in result.output
     assert "Promote approved with: ohmo evals promote --manifest review_manifest.json" in result.output
+
+
+def test_ohmo_evals_review_command_validate_manifest_outputs_json(
+    tmp_path: Path,
+    monkeypatch,
+):
+    runner = CliRunner()
+    workspace = tmp_path / ".ohmo-home"
+
+    def fake_validate_ohmo_eval_review_manifest(
+        *,
+        workspace: str | Path | None = None,
+        filename: str = "review_manifest.json",
+    ):
+        return SimpleNamespace(
+            path=Path(workspace) / "evals" / "cases" / filename,
+            relative_path=f"cases/{filename}",
+            total_count=4,
+            approved_count=2,
+            rejected_count=1,
+            pending_count=1,
+            missing_case_ids=[],
+            approved_case_ids=["case_001", "case_004"],
+        )
+
+    monkeypatch.setattr(
+        "ohmo.cli.validate_ohmo_eval_review_manifest",
+        fake_validate_ohmo_eval_review_manifest,
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "evals",
+            "review",
+            "--workspace",
+            str(workspace),
+            "--validate-manifest",
+            "review_manifest.json",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload == {
+        "privacy": "metadata_only",
+        "action": "validate_manifest",
+        "manifest": {
+            "path": str(workspace / "evals" / "cases" / "review_manifest.json"),
+            "relative_path": "cases/review_manifest.json",
+        },
+        "total_count": 4,
+        "approved_count": 2,
+        "rejected_count": 1,
+        "pending_count": 1,
+        "missing_case_ids": [],
+        "approved_case_ids": ["case_001", "case_004"],
+    }
+    assert "Promote approved with:" not in result.output
 
 
 def test_ohmo_evals_review_command_validate_manifest_reports_errors(
@@ -697,11 +970,15 @@ def test_ohmo_evals_pack_command_builds_runnable_pack(tmp_path: Path, monkeypatc
     workspace = tmp_path / ".ohmo-home"
     calls: list[dict[str, object]] = []
 
-    def fake_build_ohmo_eval_pack(*, workspace: str | Path | None = None):
-        calls.append({"workspace": workspace})
+    def fake_build_ohmo_eval_pack(
+        *,
+        workspace: str | Path | None = None,
+        pack_filename: str = "eval_pack.json",
+    ):
+        calls.append({"workspace": workspace, "pack_filename": pack_filename})
         return SimpleNamespace(
             write=SimpleNamespace(
-                path=Path(workspace) / "evals" / "packs" / "eval_pack.json",
+                path=Path(workspace) / "evals" / "packs" / pack_filename,
             ),
             case_count=3,
             gold_case_count=4,
@@ -720,9 +997,47 @@ def test_ohmo_evals_pack_command_builds_runnable_pack(tmp_path: Path, monkeypatc
     )
 
     assert result.exit_code == 0
-    assert calls == [{"workspace": workspace.resolve()}]
+    assert calls == [{"workspace": workspace.resolve(), "pack_filename": "eval_pack.json"}]
     assert "Wrote runnable pack:" in result.output
     assert "Built runnable pack with 3 cases from 4 gold cases" in result.output
+
+
+def test_ohmo_evals_pack_command_passes_output_filename(tmp_path: Path, monkeypatch):
+    runner = CliRunner()
+    workspace = tmp_path / ".ohmo-home"
+    calls: list[dict[str, object]] = []
+
+    def fake_build_ohmo_eval_pack(
+        *,
+        workspace: str | Path | None = None,
+        pack_filename: str = "eval_pack.json",
+    ):
+        calls.append({"workspace": workspace, "pack_filename": pack_filename})
+        return SimpleNamespace(
+            write=SimpleNamespace(
+                path=Path(workspace) / "evals" / "packs" / pack_filename,
+            ),
+            case_count=3,
+            gold_case_count=4,
+        )
+
+    monkeypatch.setattr("ohmo.cli.build_ohmo_eval_pack", fake_build_ohmo_eval_pack)
+
+    result = runner.invoke(
+        app,
+        [
+            "evals",
+            "pack",
+            "--workspace",
+            str(workspace),
+            "--output",
+            "custom_eval_pack.json",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert calls == [{"workspace": workspace.resolve(), "pack_filename": "custom_eval_pack.json"}]
+    assert "custom_eval_pack.json" in result.output
 
 
 def test_ohmo_evals_smoke_command_runs_report_only_eval(tmp_path: Path, monkeypatch):
@@ -734,6 +1049,7 @@ def test_ohmo_evals_smoke_command_runs_report_only_eval(tmp_path: Path, monkeypa
         *,
         workspace: str | Path | None = None,
         pack_filename: str = "eval_pack.json",
+        report_filename: str = "smoke_report.json",
         limit: int | None = None,
         report_only: bool = False,
     ):
@@ -741,6 +1057,7 @@ def test_ohmo_evals_smoke_command_runs_report_only_eval(tmp_path: Path, monkeypa
             {
                 "workspace": workspace,
                 "pack_filename": pack_filename,
+                "report_filename": report_filename,
                 "limit": limit,
                 "report_only": report_only,
             }
@@ -748,7 +1065,7 @@ def test_ohmo_evals_smoke_command_runs_report_only_eval(tmp_path: Path, monkeypa
         return SimpleNamespace(
             report_only=report_only,
             write=SimpleNamespace(
-                path=Path(workspace) / "evals" / "reports" / "smoke_report.json",
+                path=Path(workspace) / "evals" / "reports" / report_filename,
                 report=SimpleNamespace(case_count=2, passed_count=1, failed_count=1),
             ),
         )
@@ -792,16 +1109,139 @@ def test_ohmo_evals_smoke_command_runs_report_only_eval(tmp_path: Path, monkeypa
         {
             "workspace": workspace.resolve(),
             "pack_filename": "custom_pack.json",
+            "report_filename": "smoke_report.json",
             "limit": 2,
             "report_only": False,
         },
         {
             "workspace": workspace.resolve(),
             "pack_filename": "custom_pack.json",
+            "report_filename": "smoke_report.json",
             "limit": 2,
             "report_only": True,
         },
     ]
+
+
+def test_ohmo_evals_smoke_command_passes_output_filename(
+    tmp_path: Path,
+    monkeypatch,
+):
+    runner = CliRunner()
+    workspace = tmp_path / ".ohmo-home"
+    calls: list[dict[str, object]] = []
+
+    def fake_run_ohmo_eval_smoke(
+        *,
+        workspace: str | Path | None = None,
+        pack_filename: str = "eval_pack.json",
+        report_filename: str = "smoke_report.json",
+        limit: int | None = None,
+        report_only: bool = False,
+    ):
+        calls.append(
+            {
+                "workspace": workspace,
+                "pack_filename": pack_filename,
+                "report_filename": report_filename,
+                "limit": limit,
+                "report_only": report_only,
+            }
+        )
+        return SimpleNamespace(
+            report_only=report_only,
+            write=SimpleNamespace(
+                path=Path(workspace) / "evals" / "reports" / report_filename,
+                report=SimpleNamespace(case_count=1, passed_count=1, failed_count=0),
+            ),
+        )
+
+    monkeypatch.setattr("ohmo.cli.run_ohmo_eval_smoke", fake_run_ohmo_eval_smoke)
+
+    result = runner.invoke(
+        app,
+        [
+            "evals",
+            "smoke",
+            "--workspace",
+            str(workspace),
+            "--output",
+            "custom_smoke_report.json",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert calls == [
+        {
+            "workspace": workspace.resolve(),
+            "pack_filename": "eval_pack.json",
+            "report_filename": "custom_smoke_report.json",
+            "limit": None,
+            "report_only": False,
+        }
+    ]
+    assert "custom_smoke_report.json" in result.output
+
+
+def test_ohmo_evals_smoke_command_outputs_json_summary(tmp_path: Path, monkeypatch):
+    runner = CliRunner()
+    workspace = tmp_path / ".ohmo-home"
+
+    def fake_run_ohmo_eval_smoke(
+        *,
+        workspace: str | Path | None = None,
+        pack_filename: str = "eval_pack.json",
+        report_filename: str = "smoke_report.json",
+        limit: int | None = None,
+        report_only: bool = False,
+    ):
+        del pack_filename, limit
+        return SimpleNamespace(
+            report_only=report_only,
+            write=SimpleNamespace(
+                path=Path(workspace) / "evals" / "reports" / report_filename,
+                relative_path=f"reports/{report_filename}",
+                report=SimpleNamespace(
+                    report_kind="smoke_report",
+                    report_id="smoke-1",
+                    pack_id="pack-1",
+                    case_count=2,
+                    passed_count=2,
+                    failed_count=0,
+                    cases=[SimpleNamespace(raw_prompt_text="SECRET PROMPT")],
+                ),
+            ),
+        )
+
+    monkeypatch.setattr("ohmo.cli.run_ohmo_eval_smoke", fake_run_ohmo_eval_smoke)
+
+    result = runner.invoke(
+        app,
+        [
+            "evals",
+            "smoke",
+            "--workspace",
+            str(workspace),
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload == {
+        "privacy": "metadata_only",
+        "report_path": str(workspace / "evals" / "reports" / "smoke_report.json"),
+        "relative_path": "reports/smoke_report.json",
+        "report_kind": "smoke_report",
+        "report_id": "smoke-1",
+        "pack_id": "pack-1",
+        "case_count": 2,
+        "passed_count": 2,
+        "failed_count": 0,
+        "report_only": False,
+    }
+    assert "Wrote smoke report:" not in result.output
+    assert "SECRET PROMPT" not in result.output
 
 
 def test_ohmo_evals_run_command_runs_eval_report(tmp_path: Path, monkeypatch):
@@ -813,6 +1253,7 @@ def test_ohmo_evals_run_command_runs_eval_report(tmp_path: Path, monkeypatch):
         *,
         workspace: str | Path | None = None,
         pack_filename: str = "eval_pack.json",
+        report_filename: str = "eval_report.json",
         limit: int | None = None,
         report_only: bool = False,
         executor_name: str = "replay-tools",
@@ -825,6 +1266,7 @@ def test_ohmo_evals_run_command_runs_eval_report(tmp_path: Path, monkeypatch):
             {
                 "workspace": workspace,
                 "pack_filename": pack_filename,
+                "report_filename": report_filename,
                 "limit": limit,
                 "report_only": report_only,
                 "executor_name": executor_name,
@@ -837,7 +1279,7 @@ def test_ohmo_evals_run_command_runs_eval_report(tmp_path: Path, monkeypatch):
         return SimpleNamespace(
             report_only=report_only,
             write=SimpleNamespace(
-                path=Path(workspace) / "evals" / "reports" / "eval_report.json",
+                path=Path(workspace) / "evals" / "reports" / report_filename,
                 report=SimpleNamespace(case_count=2, passed_count=1, failed_count=1),
             ),
         )
@@ -884,6 +1326,7 @@ def test_ohmo_evals_run_command_runs_eval_report(tmp_path: Path, monkeypatch):
         {
             "workspace": workspace.resolve(),
             "pack_filename": "custom_pack.json",
+            "report_filename": "eval_report.json",
             "limit": 2,
             "report_only": False,
             "executor_name": "replay-tools",
@@ -895,6 +1338,7 @@ def test_ohmo_evals_run_command_runs_eval_report(tmp_path: Path, monkeypatch):
         {
             "workspace": workspace.resolve(),
             "pack_filename": "custom_pack.json",
+            "report_filename": "eval_report.json",
             "limit": 2,
             "report_only": True,
             "executor_name": "replay-tools",
@@ -904,6 +1348,157 @@ def test_ohmo_evals_run_command_runs_eval_report(tmp_path: Path, monkeypatch):
             "system_prompt": "You are running an Ohmo replay-only eval.",
         },
     ]
+
+
+def test_ohmo_evals_run_command_passes_output_filename(tmp_path: Path, monkeypatch):
+    runner = CliRunner()
+    workspace = tmp_path / ".ohmo-home"
+    calls: list[dict[str, object]] = []
+
+    def fake_run_ohmo_eval_report(
+        *,
+        workspace: str | Path | None = None,
+        pack_filename: str = "eval_pack.json",
+        report_filename: str = "eval_report.json",
+        limit: int | None = None,
+        report_only: bool = False,
+        executor_name: str = "replay-tools",
+        agent_runner_name: str = "scripted",
+        model: str | None = None,
+        provider_profile: str | None = None,
+        system_prompt: str = "You are running an Ohmo replay-only eval.",
+    ):
+        calls.append(
+            {
+                "workspace": workspace,
+                "pack_filename": pack_filename,
+                "report_filename": report_filename,
+                "limit": limit,
+                "report_only": report_only,
+                "executor_name": executor_name,
+                "agent_runner_name": agent_runner_name,
+                "model": model,
+                "provider_profile": provider_profile,
+                "system_prompt": system_prompt,
+            }
+        )
+        return SimpleNamespace(
+            report_only=report_only,
+            write=SimpleNamespace(
+                path=Path(workspace) / "evals" / "reports" / report_filename,
+                report=SimpleNamespace(
+                    case_count=1,
+                    passed_count=1,
+                    failed_count=0,
+                    blocked_count=0,
+                    error_count=0,
+                ),
+            ),
+        )
+
+    monkeypatch.setattr("ohmo.cli.run_ohmo_eval_report", fake_run_ohmo_eval_report)
+
+    result = runner.invoke(
+        app,
+        [
+            "evals",
+            "run",
+            "--workspace",
+            str(workspace),
+            "--output",
+            "custom_eval_report.json",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert calls == [
+        {
+            "workspace": workspace.resolve(),
+            "pack_filename": "eval_pack.json",
+            "report_filename": "custom_eval_report.json",
+            "limit": None,
+            "report_only": False,
+            "executor_name": "replay-tools",
+            "agent_runner_name": "scripted",
+            "model": None,
+            "provider_profile": None,
+            "system_prompt": "You are running an Ohmo replay-only eval.",
+        }
+    ]
+    assert "custom_eval_report.json" in result.output
+
+
+def test_ohmo_evals_run_command_outputs_json_summary(tmp_path: Path, monkeypatch):
+    runner = CliRunner()
+    workspace = tmp_path / ".ohmo-home"
+
+    def fake_run_ohmo_eval_report(
+        *,
+        workspace: str | Path | None = None,
+        pack_filename: str = "eval_pack.json",
+        report_filename: str = "eval_report.json",
+        limit: int | None = None,
+        report_only: bool = False,
+        executor_name: str = "replay-tools",
+        agent_runner_name: str = "scripted",
+        model: str | None = None,
+        provider_profile: str | None = None,
+        system_prompt: str = "You are running an Ohmo replay-only eval.",
+    ):
+        del pack_filename, limit, executor_name, agent_runner_name
+        del model, provider_profile, system_prompt
+        return SimpleNamespace(
+            report_only=report_only,
+            write=SimpleNamespace(
+                path=Path(workspace) / "evals" / "reports" / report_filename,
+                relative_path=f"reports/{report_filename}",
+                report=SimpleNamespace(
+                    report_kind="execution_report",
+                    report_id="exec-1",
+                    pack_id="pack-1",
+                    case_count=2,
+                    passed_count=2,
+                    failed_count=0,
+                    blocked_count=0,
+                    error_count=0,
+                    cases=[SimpleNamespace(raw_final_text="SECRET FINAL")],
+                ),
+            ),
+        )
+
+    monkeypatch.setattr("ohmo.cli.run_ohmo_eval_report", fake_run_ohmo_eval_report)
+
+    result = runner.invoke(
+        app,
+        [
+            "evals",
+            "run",
+            "--workspace",
+            str(workspace),
+            "--output",
+            "custom_eval_report.json",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload == {
+        "privacy": "metadata_only",
+        "report_path": str(workspace / "evals" / "reports" / "custom_eval_report.json"),
+        "relative_path": "reports/custom_eval_report.json",
+        "report_kind": "execution_report",
+        "report_id": "exec-1",
+        "pack_id": "pack-1",
+        "case_count": 2,
+        "passed_count": 2,
+        "failed_count": 0,
+        "blocked_count": 0,
+        "error_count": 0,
+        "report_only": False,
+    }
+    assert "Wrote eval report:" not in result.output
+    assert "SECRET FINAL" not in result.output
 
 
 def test_ohmo_evals_run_command_passes_query_engine_runner_options(
@@ -918,6 +1513,7 @@ def test_ohmo_evals_run_command_passes_query_engine_runner_options(
         *,
         workspace: str | Path | None = None,
         pack_filename: str = "eval_pack.json",
+        report_filename: str = "eval_report.json",
         limit: int | None = None,
         report_only: bool = False,
         executor_name: str = "replay-tools",
@@ -930,6 +1526,7 @@ def test_ohmo_evals_run_command_passes_query_engine_runner_options(
             {
                 "workspace": workspace,
                 "pack_filename": pack_filename,
+                "report_filename": report_filename,
                 "limit": limit,
                 "report_only": report_only,
                 "executor_name": executor_name,
@@ -942,7 +1539,7 @@ def test_ohmo_evals_run_command_passes_query_engine_runner_options(
         return SimpleNamespace(
             report_only=report_only,
             write=SimpleNamespace(
-                path=Path(workspace) / "evals" / "reports" / "eval_report.json",
+                path=Path(workspace) / "evals" / "reports" / report_filename,
                 report=SimpleNamespace(
                     case_count=1,
                     passed_count=1,
@@ -978,6 +1575,7 @@ def test_ohmo_evals_run_command_passes_query_engine_runner_options(
         {
             "workspace": workspace.resolve(),
             "pack_filename": "eval_pack.json",
+            "report_filename": "eval_report.json",
             "limit": None,
             "report_only": False,
             "executor_name": "replay-tools",
@@ -1081,6 +1679,78 @@ def test_ohmo_evals_run_command_check_config_does_not_run_eval(
     assert "profile=openai-compatible model=eval-model" in result.output
 
 
+def test_ohmo_evals_run_command_check_config_outputs_json(
+    tmp_path: Path,
+    monkeypatch,
+):
+    runner = CliRunner()
+    workspace = tmp_path / ".ohmo-home"
+
+    def fake_check_ohmo_eval_run_config(
+        *,
+        workspace: str | Path | None = None,
+        pack_filename: str = "eval_pack.json",
+        limit: int | None = None,
+        executor_name: str = "replay-tools",
+        agent_runner_name: str = "scripted",
+        model: str | None = None,
+        provider_profile: str | None = None,
+        system_prompt: str = "You are running an Ohmo replay-only eval.",
+    ):
+        del workspace, pack_filename, limit, executor_name, agent_runner_name
+        del model, provider_profile, system_prompt
+        return SimpleNamespace(
+            pack_id="pack-1",
+            pack_case_count=5,
+            selected_case_count=2,
+            executor_name="replay-tools",
+            agent_runner_name="query-engine",
+            model="eval-model",
+            provider_profile="openai-compatible",
+            replay_tools_only=True,
+        )
+
+    monkeypatch.setattr(
+        "ohmo.cli.check_ohmo_eval_run_config",
+        fake_check_ohmo_eval_run_config,
+    )
+
+    def fail_run_ohmo_eval_report(**kwargs):
+        raise AssertionError("eval run should not execute in --check-config mode")
+
+    monkeypatch.setattr("ohmo.cli.run_ohmo_eval_report", fail_run_ohmo_eval_report)
+
+    result = runner.invoke(
+        app,
+        [
+            "evals",
+            "run",
+            "--workspace",
+            str(workspace),
+            "--check-config",
+            "--system-prompt",
+            "SECRET SYSTEM PROMPT",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload == {
+        "privacy": "metadata_only",
+        "pack_id": "pack-1",
+        "pack_case_count": 5,
+        "selected_case_count": 2,
+        "executor_name": "replay-tools",
+        "agent_runner_name": "query-engine",
+        "model": "eval-model",
+        "provider_profile": "openai-compatible",
+        "replay_tools_only": True,
+    }
+    assert "Eval run configuration is valid." not in result.output
+    assert "SECRET SYSTEM PROMPT" not in result.output
+
+
 def test_ohmo_evals_run_command_help_lists_supported_executor_and_runner_ids():
     runner = CliRunner()
 
@@ -1108,6 +1778,7 @@ def test_ohmo_evals_run_command_reports_blocked_and_error_counts(
         *,
         workspace: str | Path | None = None,
         pack_filename: str = "eval_pack.json",
+        report_filename: str = "eval_report.json",
         limit: int | None = None,
         report_only: bool = False,
         executor_name: str = "replay-tools",
@@ -1116,6 +1787,7 @@ def test_ohmo_evals_run_command_reports_blocked_and_error_counts(
         provider_profile: str | None = None,
         system_prompt: str = "You are running an Ohmo replay-only eval.",
     ):
+        del pack_filename, report_filename
         del agent_runner_name, model, provider_profile, system_prompt
         return SimpleNamespace(
             report_only=report_only,
@@ -1325,6 +1997,86 @@ def test_ohmo_evals_compare_command_fails_on_regressions_and_supports_report_onl
     ]
 
 
+def test_ohmo_evals_compare_command_outputs_json_summary(tmp_path: Path, monkeypatch):
+    runner = CliRunner()
+    workspace = tmp_path / ".ohmo-home"
+
+    def fake_compare_ohmo_eval_reports(
+        *,
+        workspace: str | Path | None = None,
+        baseline_report: str | Path,
+        candidate_report: str | Path = "eval_report.json",
+        report_filename: str = "eval_compare.json",
+        score_tolerance: float = 0.0,
+        report_only: bool = False,
+    ):
+        del baseline_report, candidate_report, score_tolerance
+        return SimpleNamespace(
+            report_only=report_only,
+            write=SimpleNamespace(
+                path=Path(workspace) / "evals" / "reports" / report_filename,
+                relative_path=f"reports/{report_filename}",
+                report=SimpleNamespace(
+                    report_kind="execution_comparison_report",
+                    report_id="compare-1",
+                    baseline_report_id="baseline-1",
+                    candidate_report_id="candidate-1",
+                    baseline_pack_id="pack-old",
+                    candidate_pack_id="pack-new",
+                    case_count=2,
+                    compared_count=2,
+                    unchanged_count=1,
+                    improvement_count=1,
+                    regression_count=0,
+                    added_count=0,
+                    removed_count=0,
+                    score_delta=0.25,
+                    cases=[SimpleNamespace(raw_tool_text="SECRET TOOL")],
+                ),
+            ),
+        )
+
+    monkeypatch.setattr("ohmo.cli.compare_ohmo_eval_reports", fake_compare_ohmo_eval_reports)
+
+    result = runner.invoke(
+        app,
+        [
+            "evals",
+            "compare",
+            "--workspace",
+            str(workspace),
+            "--baseline",
+            "baseline.json",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload == {
+        "privacy": "metadata_only",
+        "report_path": str(workspace / "evals" / "reports" / "eval_compare.json"),
+        "relative_path": "reports/eval_compare.json",
+        "report_kind": "execution_comparison_report",
+        "report_id": "compare-1",
+        "baseline_report_id": "baseline-1",
+        "candidate_report_id": "candidate-1",
+        "baseline_pack_id": "pack-old",
+        "candidate_pack_id": "pack-new",
+        "case_count": 2,
+        "compared_count": 2,
+        "unchanged_count": 1,
+        "improvement_count": 1,
+        "regression_count": 0,
+        "added_count": 0,
+        "removed_count": 0,
+        "score_delta": 0.25,
+        "report_only": False,
+    }
+    assert "Compared eval reports:" not in result.output
+    assert "SECRET TOOL" not in result.output
+
+
 def test_ohmo_evals_baseline_save_command(tmp_path: Path, monkeypatch):
     runner = CliRunner()
     workspace = tmp_path / ".ohmo-home"
@@ -1423,6 +2175,70 @@ def test_ohmo_evals_baseline_list_command(tmp_path: Path, monkeypatch):
     assert "Eval baselines:" in result.output
     assert "- main cases=3 passed=2 failed=1 blocked=0 error=0" in result.output
     assert "path=reports/baselines/main.json" in result.output
+
+
+def test_ohmo_evals_baseline_list_command_outputs_json_summary(
+    tmp_path: Path,
+    monkeypatch,
+):
+    runner = CliRunner()
+    workspace = tmp_path / ".ohmo-home"
+
+    def fake_list_ohmo_eval_baselines(*, workspace: str | Path | None = None):
+        return SimpleNamespace(
+            baselines=[
+                SimpleNamespace(
+                    name="main",
+                    path=Path(workspace) / "evals" / "reports" / "baselines" / "main.json",
+                    relative_path="reports/baselines/main.json",
+                    report_id="exec-1",
+                    pack_id="pack-1",
+                    case_count=3,
+                    passed_count=2,
+                    failed_count=1,
+                    blocked_count=0,
+                    error_count=0,
+                    raw_prompt_text="SECRET PROMPT",
+                )
+            ]
+        )
+
+    monkeypatch.setattr("ohmo.cli.list_ohmo_eval_baselines", fake_list_ohmo_eval_baselines)
+
+    result = runner.invoke(
+        app,
+        [
+            "evals",
+            "baseline",
+            "list",
+            "--workspace",
+            str(workspace),
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload == {
+        "privacy": "metadata_only",
+        "baseline_count": 1,
+        "baselines": [
+            {
+                "name": "main",
+                "path": str(workspace / "evals" / "reports" / "baselines" / "main.json"),
+                "relative_path": "reports/baselines/main.json",
+                "report_id": "exec-1",
+                "pack_id": "pack-1",
+                "case_count": 3,
+                "passed_count": 2,
+                "failed_count": 1,
+                "blocked_count": 0,
+                "error_count": 0,
+            }
+        ],
+    }
+    assert "Eval baselines:" not in result.output
+    assert "SECRET PROMPT" not in result.output
 
 
 def test_ohmo_evals_baseline_list_command_empty(tmp_path: Path, monkeypatch):

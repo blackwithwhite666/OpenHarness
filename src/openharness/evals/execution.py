@@ -5,9 +5,9 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from pydantic import ValidationError
 
@@ -15,6 +15,7 @@ from openharness.evals.facets import EvalTextFacetInput, collect_text_facets
 from openharness.evals.executor import (
     EvalExecutionContext,
     EvalExecutor,
+    EvalExecutorResult,
     EvalToolFixture,
     ReplayToolsExecutor,
 )
@@ -46,10 +47,61 @@ class EvalExecutionReportWrite:
     relative_path: str
 
 
+@dataclass(frozen=True)
+class EvalExecutionScorerResult:
+    """Metadata-only scoring outcome for one eval execution."""
+
+    passed: bool
+    score: float
+    scorer_name: str
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+class EvalExecutionScorer(Protocol):
+    """Scores transient executor output against an eval execution context."""
+
+    name: str
+
+    def score(
+        self,
+        *,
+        context: EvalExecutionContext,
+        executor_result: EvalExecutorResult,
+    ) -> EvalExecutionScorerResult:
+        """Return a metadata-only score result."""
+
+
+class ExactMatchEvalScorer:
+    """Default deterministic scorer for replay-style evals."""
+
+    name = "exact-final-text"
+
+    def score(
+        self,
+        *,
+        context: EvalExecutionContext,
+        executor_result: EvalExecutorResult,
+    ) -> EvalExecutionScorerResult:
+        passed = _texts_match(
+            executor_result.final_text,
+            context.expected_final_text,
+        )
+        return EvalExecutionScorerResult(
+            passed=passed,
+            score=1.0 if passed else 0.0,
+            scorer_name=self.name,
+            metadata={
+                "expected_text_length": len(_normalize_text(context.expected_final_text)),
+                "observed_text_length": len(_normalize_text(executor_result.final_text)),
+            },
+        )
+
+
 def run_execution_report(
     store: EvalStore,
     *,
     executor: EvalExecutor | None = None,
+    scorer: EvalExecutionScorer | None = None,
     pack: EvalRunPack | None = None,
     pack_filename: str = "eval_pack.json",
     report_filename: str = "eval_report.json",
@@ -60,6 +112,7 @@ def run_execution_report(
         raise ValueError("limit must be positive")
 
     selected_executor = executor or ReplayToolsExecutor()
+    selected_scorer = scorer or ExactMatchEvalScorer()
     payload = pack or read_run_pack(store, pack_filename=pack_filename)
     cases = payload.cases[:limit] if limit is not None else payload.cases
     if not cases:
@@ -69,7 +122,14 @@ def run_execution_report(
         item.facet.facet_id: item for item in collect_text_facets(store)
     }
     report_cases = [
-        _execute_case(store, payload, case, facet_inputs_by_id, selected_executor)
+        _execute_case(
+            store,
+            payload,
+            case,
+            facet_inputs_by_id,
+            selected_executor,
+            selected_scorer,
+        )
         for case in cases
     ]
     passed_count = sum(1 for case in report_cases if case.status == "passed")
@@ -94,6 +154,7 @@ def run_execution_report(
             "privacy": "metadata_only",
             "mode": "execution_replay",
             "executor_name": selected_executor.name,
+            "scorer_name": selected_scorer.name,
             "score_schema_version": _EXECUTION_SCORE_SCHEMA_VERSION,
             "pack_case_count": len(payload.cases),
             "limit": limit or 0,
@@ -114,6 +175,7 @@ def _execute_case(
     case: EvalRunPackCase,
     facet_inputs_by_id: dict[str, EvalTextFacetInput],
     executor: EvalExecutor,
+    scorer: EvalExecutionScorer,
 ) -> EvalExecutionReportCase:
     episode = store.get_episode(case.episode_id)
     events = list(store.iter_events(case.episode_id)) if episode is not None else []
@@ -193,13 +255,14 @@ def _execute_case(
         )
 
     observed_tool_path = [_sanitize_label(value, prefix="tool") for value in executor_result.tool_path]
+    scorer_result = scorer.score(
+        context=execution_context,
+        executor_result=executor_result,
+    )
     behavior_checks = {
         "execution_completed": True,
         "tool_sequence_matches": list(executor_result.tool_path) == list(case.tool_names),
-        "final_output_matches": _texts_match(
-            executor_result.final_text,
-            execution_context.expected_final_text,
-        ),
+        "final_output_matches": scorer_result.passed,
         "privacy_report_metadata_only": True,
     }
     all_checks = {**checks, **behavior_checks}
@@ -217,9 +280,9 @@ def _execute_case(
         error_hash="",
         metadata={
             "tool_calls_source": "replay_fixtures",
-            "final_output_match_score": 1.0
-            if behavior_checks["final_output_matches"]
-            else 0.0,
+            "final_output_match_score": scorer_result.score,
+            "scorer_name": scorer_result.scorer_name,
+            "scorer_metadata_key_count": len(scorer_result.metadata),
             "executor_metadata_key_count": len(executor_result.metadata),
         },
     )
@@ -236,6 +299,7 @@ def _execute_case(
         metadata=_execution_case_metadata(
             case,
             executor_name=executor.name,
+            scorer_name=scorer_result.scorer_name,
             resource_snapshot_status=resource_snapshot_status,
         ),
     )
@@ -283,6 +347,7 @@ def _error_execution_case(
         metadata=_execution_case_metadata(
             case,
             executor_name=executor_name,
+            scorer_name="exact-final-text",
             resource_snapshot_status=resource_snapshot_status,
         ),
     )
@@ -309,6 +374,7 @@ def _blocked_execution_case(
         metadata=_execution_case_metadata(
             case,
             executor_name=executor_name,
+            scorer_name="",
             resource_snapshot_status=resource_snapshot_status,
         ),
     )
@@ -318,6 +384,7 @@ def _execution_case_metadata(
     case: EvalRunPackCase,
     *,
     executor_name: str,
+    scorer_name: str,
     resource_snapshot_status: str,
 ) -> dict[str, Any]:
     return {
@@ -325,6 +392,7 @@ def _execution_case_metadata(
         "tool_count": len(case.tool_names),
         "rubric_count": len(case.rubric),
         "executor_name": executor_name,
+        "scorer_name": scorer_name,
         "resource_snapshot_status": resource_snapshot_status,
         "score_schema_version": _EXECUTION_SCORE_SCHEMA_VERSION,
     }

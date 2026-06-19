@@ -13,6 +13,7 @@ from openharness.evals import (
     EvalEvent,
     EvalExecutionContext,
     EvalExecutorResult,
+    EvalExecutionScorerResult,
     QueryEngineEvalAgentRunner,
     ReplayToolsExecutor,
     EvalResource,
@@ -185,6 +186,8 @@ def test_execution_report_replay_tools_writes_observed_trace_without_private_tex
     )
     assert case.checks["tool_sequence_matches"] is True
     assert case.checks["final_output_matches"] is True
+    assert case.metadata["scorer_name"] == "exact-final-text"
+    assert result.report.metadata["scorer_name"] == "exact-final-text"
 
     serialized = result.path.read_text(encoding="utf-8")
     assert "private execution request" not in serialized
@@ -193,6 +196,86 @@ def test_execution_report_replay_tools_writes_observed_trace_without_private_tex
     assert "private raw tool output" not in serialized
     assert "private tool input" not in serialized
     assert "private tool output" not in serialized
+
+
+def test_execution_report_schema_contract_is_stable(tmp_path: Path):
+    store = EvalStore(tmp_path / "evals")
+    _add_episode(
+        store,
+        episode_id="ep-1",
+        user_text="private schema request",
+        final_text="private schema answer",
+        tool_name="web_fetch",
+    )
+    drafts = build_case_drafts(store, build_case_candidates(store))
+    write_case_draft_pack(store, drafts)
+    promote_case_drafts(store, case_ids=[drafts[0].case_id])
+    pack = write_run_pack(store).pack
+
+    result = run_execution_report(store, pack=pack)
+
+    assert result.report.report_kind == "execution_report"
+    assert result.report.schema_version == 1
+    assert result.report.metadata["privacy"] == "metadata_only"
+    assert result.report.metadata["mode"] == "execution_replay"
+    assert result.report.metadata["executor_name"] == "replay-tools"
+    assert result.report.metadata["scorer_name"] == "exact-final-text"
+    assert result.report.metadata["score_schema_version"] == 1
+    case = result.report.cases[0]
+    assert set(case.checks) == {
+        "episode_exists",
+        "has_events",
+        "input_facets_resolve",
+        "expected_facets_resolve",
+        "tool_fixtures_resolve",
+        "tool_trace_complete",
+        "resource_snapshot_valid_or_absent",
+        "has_rubric",
+        "execution_completed",
+        "tool_sequence_matches",
+        "final_output_matches",
+        "privacy_report_metadata_only",
+    }
+    assert case.status in {"passed", "failed", "blocked", "error"}
+    assert case.observed_trace is not None
+    assert case.observed_trace.metadata["tool_calls_source"] == "replay_fixtures"
+    assert case.observed_trace.metadata["scorer_name"] == "exact-final-text"
+    assert "final_text_hash" in case.observed_trace.model_dump()
+    assert "final_text_length" in case.observed_trace.model_dump()
+
+
+def test_execution_report_accepts_custom_metadata_only_scorer(tmp_path: Path):
+    store = EvalStore(tmp_path / "evals")
+    _add_episode(
+        store,
+        episode_id="ep-1",
+        user_text="private scorer request",
+        final_text="private scorer answer",
+    )
+    drafts = build_case_drafts(store, build_case_candidates(store))
+    write_case_draft_pack(store, drafts)
+    promote_case_drafts(store, case_ids=[drafts[0].case_id])
+    pack = write_run_pack(store).pack
+
+    result = run_execution_report(
+        store,
+        pack=pack,
+        executor=_MismatchExecutor(),
+        scorer=_AlwaysPassScorer(),
+    )
+
+    assert result.report.passed_count == 1
+    assert result.report.metadata["scorer_name"] == "always-pass"
+    case = result.report.cases[0]
+    assert case.status == "passed"
+    assert case.checks["final_output_matches"] is True
+    assert case.observed_trace is not None
+    assert case.observed_trace.metadata["scorer_name"] == "always-pass"
+    assert case.observed_trace.metadata["scorer_metadata_key_count"] == 1
+    serialized = result.path.read_text(encoding="utf-8")
+    assert "private scorer request" not in serialized
+    assert "private scorer answer" not in serialized
+    assert "private scorer note" not in serialized
 
 
 def test_execution_report_query_engine_runner_uses_reconstructed_prompt_and_replay_tools(
@@ -521,6 +604,19 @@ class _MismatchExecutor:
             final_text="different final text",
             tool_path=(),
             event_kind_path=("execution_started", "execution_completed"),
+        )
+
+
+class _AlwaysPassScorer:
+    name = "always-pass"
+
+    def score(self, *, context, executor_result):
+        del context, executor_result
+        return EvalExecutionScorerResult(
+            passed=True,
+            score=0.75,
+            scorer_name=self.name,
+            metadata={"note": "private scorer note"},
         )
 
 

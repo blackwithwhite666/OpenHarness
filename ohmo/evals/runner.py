@@ -66,6 +66,7 @@ def run_ohmo_eval_report(
     *,
     workspace: str | Path | None = None,
     pack_filename: str = "eval_pack.json",
+    report_filename: str = "eval_report.json",
     limit: int | None = None,
     report_only: bool = False,
     executor_name: str = "replay-tools",
@@ -91,7 +92,13 @@ def run_ohmo_eval_report(
     )
     store = get_eval_store(workspace)
     pack = read_run_pack(store, pack_filename=pack_filename)
-    write = run_execution_report(store, pack=pack, limit=limit, executor=executor)
+    write = run_execution_report(
+        store,
+        pack=pack,
+        report_filename=report_filename,
+        limit=limit,
+        executor=executor,
+    )
     return OhmoEvalRunResult(write=write, report_only=report_only)
 
 

@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from openharness.evals import EvalEpisode, EvalEvent, read_gold_cases
+from openharness.evals import EvalEpisode, EvalEvent, read_case_drafts, read_gold_cases
 from ohmo.evals import (
     get_eval_store,
     promote_ohmo_eval_case_drafts,
@@ -189,6 +189,75 @@ def test_validate_ohmo_eval_review_manifest_rejects_missing_draft_cases(
         )
 
 
+def test_validate_ohmo_eval_review_manifest_rejects_stale_approved_rows(
+    tmp_path: Path,
+):
+    workspace = tmp_path / "workspace"
+    _add_episode(workspace, episode_id="ep-1", user_text="private first")
+    write_ohmo_eval_mine(workspace=workspace)
+    manifest = write_ohmo_eval_review_manifest(
+        workspace=workspace,
+        filename="batch_review.json",
+    )
+    payload = json.loads(manifest.path.read_text(encoding="utf-8"))
+    payload["items"][0]["decision"] = "approved"
+    payload["items"][0]["episode_id"] = "stale-episode"
+    payload["items"][0]["case_kind"] = "stale-kind"
+    payload["items"][0]["input_facet_count"] = 99
+    payload["items"][0]["expected_facet_count"] = 0
+    payload["items"][0]["tool_names"] = ["stale_tool"]
+    manifest.path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError) as exc_info:
+        validate_ohmo_eval_review_manifest(
+            workspace=workspace,
+            filename="batch_review.json",
+        )
+
+    message = str(exc_info.value)
+    assert "stale approved review manifest rows" in message
+    assert payload["items"][0]["case_id"] in message
+    assert "episode_id" in message
+    assert "case_kind" in message
+    assert "input_facet_count" in message
+    assert "expected_facet_count" in message
+    assert "tool_names" in message
+
+
+def test_promote_ohmo_eval_case_drafts_from_manifest_rejects_stale_approved_rows(
+    tmp_path: Path,
+):
+    workspace = tmp_path / "workspace"
+    store = _add_episode(workspace, episode_id="ep-1", user_text="private first")
+    write_ohmo_eval_mine(workspace=workspace)
+    manifest = write_ohmo_eval_review_manifest(
+        workspace=workspace,
+        filename="batch_review.json",
+    )
+    payload = json.loads(manifest.path.read_text(encoding="utf-8"))
+    payload["items"][0]["decision"] = "approved"
+    manifest.path.write_text(json.dumps(payload), encoding="utf-8")
+    draft = read_case_drafts(store)[0]
+    _write_case_drafts(
+        store,
+        [
+            draft.model_copy(
+                update={
+                    "tool_names": ["web_fetch"],
+                }
+            )
+        ],
+    )
+
+    with pytest.raises(ValueError, match="stale approved review manifest rows"):
+        promote_ohmo_eval_case_drafts(
+            workspace=workspace,
+            manifest_filename="batch_review.json",
+        )
+
+    assert read_gold_cases(store) == []
+
+
 def test_promote_ohmo_eval_case_drafts_from_manifest_validates_selection(
     tmp_path: Path,
 ):
@@ -253,3 +322,13 @@ def _add_episode(workspace: Path, *, episode_id: str, user_text: str):
         )
     )
     return store
+
+
+def _write_case_drafts(store, drafts) -> None:
+    payload = "\n".join(draft.model_dump_json() for draft in drafts)
+    if payload:
+        payload += "\n"
+    (store.root / "cases" / "case_drafts.jsonl").write_text(
+        payload,
+        encoding="utf-8",
+    )

@@ -38,11 +38,12 @@ class OhmoEvalSmokeResult:
 def build_ohmo_eval_pack(
     *,
     workspace: str | Path | None = None,
+    pack_filename: str = "eval_pack.json",
 ) -> OhmoEvalPackResult:
     """Build a runnable eval pack from reviewed Ohmo gold cases."""
     store = get_eval_store(workspace)
     gold_case_count = len(read_gold_cases(store))
-    write = write_run_pack(store)
+    write = write_run_pack(store, pack_filename=pack_filename)
     return OhmoEvalPackResult(
         write=write,
         case_count=len(write.pack.cases),
@@ -54,6 +55,7 @@ def run_ohmo_eval_smoke(
     *,
     workspace: str | Path | None = None,
     pack_filename: str = "eval_pack.json",
+    report_filename: str = "smoke_report.json",
     limit: int | None = None,
     report_only: bool = False,
 ) -> OhmoEvalSmokeResult:
@@ -64,7 +66,7 @@ def run_ohmo_eval_smoke(
     pack = read_run_pack(store, pack_filename=pack_filename)
     if limit is not None:
         pack = _limited_pack(pack, limit)
-    write = run_smoke_report(store, pack=pack)
+    write = run_smoke_report(store, pack=pack, report_filename=report_filename)
     return OhmoEvalSmokeResult(write=write, report_only=report_only)
 
 

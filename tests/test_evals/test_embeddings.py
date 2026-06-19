@@ -77,6 +77,9 @@ async def test_write_embedding_index_materializes_dense_records_without_raw_text
     assert result.manifest.facet_count == 3
     assert result.manifest.embedding_count == 3
     assert result.manifest.skipped_count == 0
+    assert result.manifest.metadata["rebuild"] is True
+    assert result.manifest.metadata["embedded_facet_count"] == 3
+    assert result.manifest.metadata["reused_embedding_count"] == 0
     assert store.count_embedding_records() == 3
 
     assert client.calls == [

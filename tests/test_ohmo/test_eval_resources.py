@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
+import ohmo.evals.resources as eval_resources
 from ohmo.evals import get_eval_store, write_ohmo_resource_snapshot
 from ohmo.workspace import (
     get_attachments_dir,
@@ -183,3 +184,38 @@ def test_ohmo_resource_snapshot_writes_metadata_only_manifest(tmp_path: Path):
         "plugin command token",
     ):
         assert sensitive_fragment not in manifest_text
+
+
+def test_directory_snapshot_caps_recursive_scan_without_path_leaks(
+    tmp_path: Path, monkeypatch
+):
+    monkeypatch.setattr(eval_resources, "_DIRECTORY_AGGREGATE_ENTRY_LIMIT", 3)
+    workspace = tmp_path / ".ohmo-home"
+    initialize_workspace(workspace)
+    secret_nested = get_memory_dir(workspace) / "secret-nested-dir"
+    secret_nested.mkdir()
+    for index in range(8):
+        (secret_nested / f"private-memory-{index}.md").write_text(
+            f"secret memory {index}",
+            encoding="utf-8",
+        )
+
+    store = get_eval_store(workspace)
+    result = write_ohmo_resource_snapshot(
+        store=store,
+        episode_id="episode-capped",
+        workspace=workspace,
+    )
+
+    payload = json.loads(result.path.read_text(encoding="utf-8"))
+    resources = {resource["resource_id"]: resource for resource in payload["resources"]}
+    memory_metadata = resources["ohmo.workspace.memory_dir"]["metadata"]
+
+    assert memory_metadata["truncated"] is True
+    assert memory_metadata["entry_limit"] == 3
+    assert memory_metadata["visited_count"] == 3
+
+    manifest_text = result.path.read_text(encoding="utf-8")
+    assert "secret-nested-dir" not in manifest_text
+    assert "private-memory-" not in manifest_text
+    assert "secret memory" not in manifest_text

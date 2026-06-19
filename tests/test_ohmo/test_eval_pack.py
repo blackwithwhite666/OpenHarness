@@ -24,6 +24,22 @@ def test_build_ohmo_eval_pack_uses_workspace_gold_cases(tmp_path: Path):
     assert "private ohmo pack" not in result.write.path.read_text(encoding="utf-8")
 
 
+def test_build_ohmo_eval_pack_accepts_custom_pack_filename(tmp_path: Path):
+    workspace = tmp_path / "workspace"
+    _prepare_gold_case(workspace, episode_id="ep-1", user_text="private ohmo pack")
+
+    result = build_ohmo_eval_pack(
+        workspace=workspace,
+        pack_filename="custom_eval_pack.json",
+    )
+
+    assert result.write.path == workspace.resolve() / "evals" / "packs" / (
+        "custom_eval_pack.json"
+    )
+    assert result.case_count == 1
+    assert result.write.path.exists()
+
+
 def test_run_ohmo_eval_smoke_writes_report_only_result(tmp_path: Path):
     workspace = tmp_path / "workspace"
     _prepare_gold_case(workspace, episode_id="ep-1", user_text="private ohmo smoke")
@@ -39,6 +55,23 @@ def test_run_ohmo_eval_smoke_writes_report_only_result(tmp_path: Path):
     assert result.write.report.passed_count == 1
     assert result.write.report.failed_count == 0
     assert "private ohmo smoke" not in result.write.path.read_text(encoding="utf-8")
+
+
+def test_run_ohmo_eval_smoke_accepts_custom_report_filename(tmp_path: Path):
+    workspace = tmp_path / "workspace"
+    _prepare_gold_case(workspace, episode_id="ep-1", user_text="private ohmo smoke")
+    build_ohmo_eval_pack(workspace=workspace)
+
+    result = run_ohmo_eval_smoke(
+        workspace=workspace,
+        report_filename="custom_smoke_report.json",
+    )
+
+    assert result.write.path == workspace.resolve() / "evals" / "reports" / (
+        "custom_smoke_report.json"
+    )
+    assert result.write.report.case_count == 1
+    assert result.write.path.exists()
 
 
 def _prepare_gold_case(workspace: Path, *, episode_id: str, user_text: str):

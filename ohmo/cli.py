@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import sys
 from pathlib import Path
@@ -62,6 +63,7 @@ soul_app = typer.Typer(name="soul", help="Inspect or edit soul.md")
 user_app = typer.Typer(name="user", help="Inspect or edit user.md")
 gateway_app = typer.Typer(name="gateway", help="Run the ohmo gateway")
 evals_app = typer.Typer(name="evals", help="Build ohmo eval/data-flywheel artifacts")
+evals_cases_app = typer.Typer(name="cases", help="Inspect metadata-only eval cases")
 evals_baseline_app = typer.Typer(name="baseline", help="Manage ohmo eval baselines")
 
 app.add_typer(memory_app)
@@ -69,6 +71,7 @@ app.add_typer(soul_app)
 app.add_typer(user_app)
 app.add_typer(gateway_app)
 app.add_typer(evals_app)
+evals_app.add_typer(evals_cases_app)
 evals_app.add_typer(evals_baseline_app)
 
 _INTERACTIVE_CHANNELS = ("telegram", "slack", "discord", "feishu")
@@ -80,6 +83,170 @@ _EVAL_AGENT_RUNNER_HELP = (
     "Agent runner to use inside the executor: "
     + ", ".join(SUPPORTED_EVAL_AGENT_RUNNER_NAMES)
 )
+
+
+def _print_json_summary(payload: dict[str, object]) -> None:
+    print(json.dumps(payload, sort_keys=True, ensure_ascii=True))
+
+
+def _path_summary(value: object) -> str:
+    return str(value) if value else ""
+
+
+def _eval_review_item_summary(item: object) -> dict[str, object]:
+    return {
+        "case_id": getattr(item, "case_id"),
+        "case_kind": getattr(item, "case_kind"),
+        "episode_id": getattr(item, "episode_id"),
+        "review_status": getattr(item, "review_status"),
+        "input_facet_count": getattr(item, "input_facet_count"),
+        "expected_facet_count": getattr(item, "expected_facet_count"),
+        "tool_names": list(getattr(item, "tool_names") or []),
+    }
+
+
+def _eval_review_result_summary(
+    result: object,
+    *,
+    action: str,
+    case_id: str | None = None,
+    limit: int | None = None,
+    manifest_write: object | None = None,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "privacy": "metadata_only",
+        "action": action,
+        "total_count": getattr(result, "total_count"),
+        "shown_count": len(getattr(result, "shown")),
+        "cases": [_eval_review_item_summary(item) for item in getattr(result, "shown")],
+    }
+    if case_id is not None:
+        payload["case_id"] = case_id
+    if limit is not None:
+        payload["limit"] = limit
+    if manifest_write is not None:
+        payload["manifest"] = {
+            "path": _path_summary(getattr(manifest_write, "path", "")),
+            "relative_path": getattr(manifest_write, "relative_path", ""),
+            "total_count": getattr(manifest_write, "total_count"),
+            "shown_count": getattr(manifest_write, "shown_count"),
+        }
+    return payload
+
+
+def _eval_review_validation_summary(validation: object) -> dict[str, object]:
+    return {
+        "privacy": "metadata_only",
+        "action": "validate_manifest",
+        "manifest": {
+            "path": _path_summary(getattr(validation, "path", "")),
+            "relative_path": getattr(validation, "relative_path", ""),
+        },
+        "total_count": getattr(validation, "total_count"),
+        "approved_count": getattr(validation, "approved_count"),
+        "rejected_count": getattr(validation, "rejected_count"),
+        "pending_count": getattr(validation, "pending_count"),
+        "missing_case_ids": list(getattr(validation, "missing_case_ids", [])),
+        "approved_case_ids": list(getattr(validation, "approved_case_ids", [])),
+    }
+
+
+def _eval_smoke_summary(result: object) -> dict[str, object]:
+    write = getattr(result, "write")
+    report = getattr(write, "report")
+    return {
+        "privacy": "metadata_only",
+        "report_path": _path_summary(getattr(write, "path", "")),
+        "relative_path": getattr(write, "relative_path", ""),
+        "report_kind": getattr(report, "report_kind", "smoke_report"),
+        "report_id": getattr(report, "report_id", ""),
+        "pack_id": getattr(report, "pack_id", ""),
+        "case_count": getattr(report, "case_count"),
+        "passed_count": getattr(report, "passed_count"),
+        "failed_count": getattr(report, "failed_count"),
+        "report_only": getattr(result, "report_only"),
+    }
+
+
+def _eval_run_summary(result: object) -> dict[str, object]:
+    write = getattr(result, "write")
+    report = getattr(write, "report")
+    return {
+        "privacy": "metadata_only",
+        "report_path": _path_summary(getattr(write, "path", "")),
+        "relative_path": getattr(write, "relative_path", ""),
+        "report_kind": getattr(report, "report_kind", "execution_report"),
+        "report_id": getattr(report, "report_id", ""),
+        "pack_id": getattr(report, "pack_id", ""),
+        "case_count": getattr(report, "case_count"),
+        "passed_count": getattr(report, "passed_count"),
+        "failed_count": getattr(report, "failed_count"),
+        "blocked_count": getattr(report, "blocked_count", 0),
+        "error_count": getattr(report, "error_count", 0),
+        "report_only": getattr(result, "report_only"),
+    }
+
+
+def _eval_run_config_summary(check: object) -> dict[str, object]:
+    return {
+        "privacy": "metadata_only",
+        "pack_id": getattr(check, "pack_id"),
+        "pack_case_count": getattr(check, "pack_case_count"),
+        "selected_case_count": getattr(check, "selected_case_count"),
+        "executor_name": getattr(check, "executor_name"),
+        "agent_runner_name": getattr(check, "agent_runner_name"),
+        "model": getattr(check, "model"),
+        "provider_profile": getattr(check, "provider_profile"),
+        "replay_tools_only": getattr(check, "replay_tools_only"),
+    }
+
+
+def _eval_compare_summary(result: object) -> dict[str, object]:
+    write = getattr(result, "write")
+    report = getattr(write, "report")
+    return {
+        "privacy": "metadata_only",
+        "report_path": _path_summary(getattr(write, "path", "")),
+        "relative_path": getattr(write, "relative_path", ""),
+        "report_kind": getattr(report, "report_kind", "execution_comparison_report"),
+        "report_id": getattr(report, "report_id", ""),
+        "baseline_report_id": getattr(report, "baseline_report_id", ""),
+        "candidate_report_id": getattr(report, "candidate_report_id", ""),
+        "baseline_pack_id": getattr(report, "baseline_pack_id", ""),
+        "candidate_pack_id": getattr(report, "candidate_pack_id", ""),
+        "case_count": getattr(report, "case_count"),
+        "compared_count": getattr(report, "compared_count"),
+        "unchanged_count": getattr(report, "unchanged_count"),
+        "improvement_count": getattr(report, "improvement_count"),
+        "regression_count": getattr(report, "regression_count"),
+        "added_count": getattr(report, "added_count"),
+        "removed_count": getattr(report, "removed_count"),
+        "score_delta": getattr(report, "score_delta"),
+        "report_only": getattr(result, "report_only"),
+    }
+
+
+def _eval_baseline_list_summary(result: object) -> dict[str, object]:
+    baselines = list(getattr(result, "baselines"))
+    return {
+        "privacy": "metadata_only",
+        "baseline_count": len(baselines),
+        "baselines": [
+            {
+                "name": getattr(baseline, "name"),
+                "path": _path_summary(getattr(baseline, "path", "")),
+                "relative_path": getattr(baseline, "relative_path"),
+                "report_id": getattr(baseline, "report_id", ""),
+                "pack_id": getattr(baseline, "pack_id", ""),
+                "case_count": getattr(baseline, "case_count"),
+                "passed_count": getattr(baseline, "passed_count"),
+                "failed_count": getattr(baseline, "failed_count"),
+                "blocked_count": getattr(baseline, "blocked_count"),
+                "error_count": getattr(baseline, "error_count"),
+            }
+            for baseline in baselines
+        ],
+    }
 
 
 def _can_use_questionary() -> bool:
@@ -753,6 +920,87 @@ def evals_mine_cmd(
     )
 
 
+@evals_cases_app.command("list")
+def evals_cases_list_cmd(
+    workspace: str | None = typer.Option(None, "--workspace", help=_WORKSPACE_HELP),
+    limit: int = typer.Option(20, "--limit", min=1, help="Maximum draft cases to show"),
+    json_output: bool = typer.Option(False, "--json", help="Print a JSON summary"),
+) -> None:
+    """List metadata-only draft eval cases."""
+    workspace_root = initialize_workspace(workspace)
+    try:
+        result = review_ohmo_eval_case_drafts(
+            workspace=workspace_root,
+            limit=limit,
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        print(str(exc), file=sys.stderr)
+        raise typer.Exit(1)
+
+    if json_output:
+        _print_json_summary(
+            _eval_review_result_summary(
+                result,
+                action="cases_list",
+                limit=limit,
+            )
+        )
+        return
+
+    print("Draft eval cases:")
+    for item in result.shown:
+        tools = ",".join(item.tool_names) if item.tool_names else "-"
+        print(
+            f"- {item.case_id} {item.case_kind} "
+            f"episode={item.episode_id} "
+            f"facets={item.input_facet_count}/{item.expected_facet_count} "
+            f"tools={tools}"
+        )
+    print(f"Showing {len(result.shown)}/{result.total_count} draft cases.")
+
+
+@evals_cases_app.command("show")
+def evals_cases_show_cmd(
+    case_id: str = typer.Argument(..., help="Draft case id to show"),
+    workspace: str | None = typer.Option(None, "--workspace", help=_WORKSPACE_HELP),
+    json_output: bool = typer.Option(False, "--json", help="Print a JSON summary"),
+) -> None:
+    """Show one metadata-only draft eval case."""
+    workspace_root = initialize_workspace(workspace)
+    try:
+        result = review_ohmo_eval_case_drafts(
+            workspace=workspace_root,
+            case_id=case_id,
+            limit=1,
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        print(str(exc), file=sys.stderr)
+        raise typer.Exit(1)
+
+    if not result.shown:
+        print(f"Draft eval case not found: {case_id}", file=sys.stderr)
+        raise typer.Exit(1)
+
+    if json_output:
+        _print_json_summary(
+            _eval_review_result_summary(
+                result,
+                action="cases_show",
+                case_id=case_id,
+            )
+        )
+        return
+
+    item = result.shown[0]
+    print(f"Draft eval case: {item.case_id}")
+    print(f"- kind: {item.case_kind}")
+    print(f"- episode: {item.episode_id}")
+    print(f"- status: {item.review_status}")
+    print(f"- input_facets: {item.input_facet_count}")
+    print(f"- expected_facets: {item.expected_facet_count}")
+    print(f"- tools: {', '.join(item.tool_names) if item.tool_names else '-'}")
+
+
 @evals_app.command("review")
 def evals_review_cmd(
     workspace: str | None = typer.Option(None, "--workspace", help=_WORKSPACE_HELP),
@@ -768,6 +1016,7 @@ def evals_review_cmd(
         "--validate-manifest",
         help="Validate a review manifest under evals/cases without writing files",
     ),
+    json_output: bool = typer.Option(False, "--json", help="Print a JSON summary"),
 ) -> None:
     """Review metadata-only draft eval cases."""
     workspace_root = initialize_workspace(workspace)
@@ -780,6 +1029,9 @@ def evals_review_cmd(
         except (FileNotFoundError, ValueError) as exc:
             print(str(exc), file=sys.stderr)
             raise typer.Exit(1)
+        if json_output:
+            _print_json_summary(_eval_review_validation_summary(validation))
+            return
         print(f"Review manifest is valid: {validation.path}")
         print(
             "Review decisions: "
@@ -825,6 +1077,17 @@ def evals_review_cmd(
         if not result.shown:
             print(f"Draft eval case not found: {case_id}", file=sys.stderr)
             raise typer.Exit(1)
+        if json_output:
+            _print_json_summary(
+                _eval_review_result_summary(
+                    result,
+                    action="review",
+                    case_id=case_id,
+                    limit=limit,
+                    manifest_write=manifest_write,
+                )
+            )
+            return
         item = result.shown[0]
         print(f"Draft eval case: {item.case_id}")
         print(f"- kind: {item.case_kind}")
@@ -836,6 +1099,17 @@ def evals_review_cmd(
         if manifest_write is not None:
             print(f"Wrote review manifest: {manifest_write.path}")
         print(f"Promote with: ohmo evals promote --case-id {item.case_id}")
+        return
+
+    if json_output:
+        _print_json_summary(
+            _eval_review_result_summary(
+                result,
+                action="review",
+                limit=limit,
+                manifest_write=manifest_write,
+            )
+        )
         return
 
     print("Draft eval cases:")
@@ -901,11 +1175,19 @@ def evals_promote_cmd(
 @evals_app.command("pack")
 def evals_pack_cmd(
     workspace: str | None = typer.Option(None, "--workspace", help=_WORKSPACE_HELP),
+    pack_filename: str = typer.Option(
+        "eval_pack.json",
+        "--output",
+        help="Runnable pack filename under evals/packs",
+    ),
 ) -> None:
     """Build a runnable eval pack from reviewed gold cases."""
     workspace_root = initialize_workspace(workspace)
     try:
-        result = build_ohmo_eval_pack(workspace=workspace_root)
+        result = build_ohmo_eval_pack(
+            workspace=workspace_root,
+            pack_filename=pack_filename,
+        )
     except (FileNotFoundError, ValueError) as exc:
         print(str(exc), file=sys.stderr)
         raise typer.Exit(1)
@@ -925,12 +1207,18 @@ def evals_smoke_cmd(
         "--pack",
         help="Runnable pack filename under evals/packs",
     ),
+    report_filename: str = typer.Option(
+        "smoke_report.json",
+        "--output",
+        help="Smoke report filename under evals/reports",
+    ),
     limit: int | None = typer.Option(None, "--limit", min=1, help="Smoke subset size"),
     report_only: bool = typer.Option(
         False,
         "--report-only",
         help="Exit 0 after writing the report even when smoke checks fail",
     ),
+    json_output: bool = typer.Option(False, "--json", help="Print a JSON summary"),
 ) -> None:
     """Run metadata-only smoke checks over a runnable eval pack."""
     workspace_root = initialize_workspace(workspace)
@@ -938,6 +1226,7 @@ def evals_smoke_cmd(
         result = run_ohmo_eval_smoke(
             workspace=workspace_root,
             pack_filename=pack_filename,
+            report_filename=report_filename,
             limit=limit,
             report_only=report_only,
         )
@@ -946,6 +1235,12 @@ def evals_smoke_cmd(
         raise typer.Exit(1)
 
     report = result.write.report
+    if json_output:
+        _print_json_summary(_eval_smoke_summary(result))
+        if not result.report_only and report.failed_count:
+            raise typer.Exit(1)
+        return
+
     print(f"Wrote smoke report: {result.write.path}")
     print(
         "Smoke evaluated "
@@ -966,6 +1261,11 @@ def evals_run_cmd(
         "eval_pack.json",
         "--pack",
         help="Runnable pack filename under evals/packs",
+    ),
+    report_filename: str = typer.Option(
+        "eval_report.json",
+        "--output",
+        help="Execution report filename under evals/reports",
     ),
     limit: int | None = typer.Option(None, "--limit", min=1, help="Eval subset size"),
     executor_name: str = typer.Option(
@@ -1003,6 +1303,7 @@ def evals_run_cmd(
         "--check-config",
         help="Validate pack/auth/executor setup without executing eval cases",
     ),
+    json_output: bool = typer.Option(False, "--json", help="Print a JSON summary"),
 ) -> None:
     """Run deterministic replay-tools eval checks over a runnable eval pack."""
     workspace_root = initialize_workspace(workspace)
@@ -1018,6 +1319,9 @@ def evals_run_cmd(
                 provider_profile=provider_profile,
                 system_prompt=system_prompt,
             )
+            if json_output:
+                _print_json_summary(_eval_run_config_summary(check))
+                return
             print("Eval run configuration is valid.")
             print(
                 "Pack "
@@ -1036,6 +1340,7 @@ def evals_run_cmd(
         result = run_ohmo_eval_report(
             workspace=workspace_root,
             pack_filename=pack_filename,
+            report_filename=report_filename,
             limit=limit,
             report_only=report_only,
             executor_name=executor_name,
@@ -1049,6 +1354,16 @@ def evals_run_cmd(
         raise typer.Exit(1)
 
     report = result.write.report
+    if json_output:
+        _print_json_summary(_eval_run_summary(result))
+        if not result.report_only and (
+            report.failed_count
+            + getattr(report, "blocked_count", 0)
+            + getattr(report, "error_count", 0)
+        ):
+            raise typer.Exit(1)
+        return
+
     print(f"Wrote eval report: {result.write.path}")
     print(
         "Eval run evaluated "
@@ -1097,6 +1412,7 @@ def evals_compare_cmd(
         "--report-only",
         help="Exit 0 after writing the comparison even when regressions are found",
     ),
+    json_output: bool = typer.Option(False, "--json", help="Print a JSON summary"),
 ) -> None:
     """Compare two execution reports and fail on regressions."""
     workspace_root = initialize_workspace(workspace)
@@ -1114,6 +1430,12 @@ def evals_compare_cmd(
         raise typer.Exit(1)
 
     report = result.write.report
+    if json_output:
+        _print_json_summary(_eval_compare_summary(result))
+        if not result.report_only and report.regression_count:
+            raise typer.Exit(1)
+        return
+
     print(f"Wrote eval comparison report: {result.write.path}")
     print(
         "Compared eval reports: "
@@ -1174,6 +1496,7 @@ def evals_baseline_save_cmd(
 @evals_baseline_app.command("list")
 def evals_baseline_list_cmd(
     workspace: str | None = typer.Option(None, "--workspace", help=_WORKSPACE_HELP),
+    json_output: bool = typer.Option(False, "--json", help="Print a JSON summary"),
 ) -> None:
     """List saved eval report baselines."""
     workspace_root = initialize_workspace(workspace)
@@ -1182,6 +1505,10 @@ def evals_baseline_list_cmd(
     except (FileNotFoundError, ValueError) as exc:
         print(str(exc), file=sys.stderr)
         raise typer.Exit(1)
+
+    if json_output:
+        _print_json_summary(_eval_baseline_list_summary(result))
+        return
 
     if not result.baselines:
         print("No eval baselines saved.")

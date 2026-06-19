@@ -27,6 +27,12 @@ Triggers for adding a broader SQLite projection:
 - multiple gateway/eval processes need coordinated concurrent writes
 - embedding lookup cost starts to dominate and content-hash caching is needed
 
+Until one of those triggers is observed and measured, keep SQLite limited to
+rebuildable lookup rows. New workflow state should be written first as
+JSON/JSONL artifacts with explicit manifests, then optionally indexed from
+those artifacts. A missing or empty `evals.sqlite` file must be recoverable from
+the JSON/JSONL source of truth.
+
 ## Flow
 
 1. Capture gateway episodes while using Ohmo. Captured state lives under
@@ -41,10 +47,16 @@ Triggers for adding a broader SQLite projection:
 3. Review draft cases:
 
    ```bash
+   ohmo evals cases list --workspace <workspace> --limit 20
+   ohmo evals cases show --workspace <workspace> <case-id>
    ohmo evals review --workspace <workspace> --limit 20
    ohmo evals review --workspace <workspace> --manifest review_manifest.json
    ohmo evals review --workspace <workspace> --validate-manifest review_manifest.json
    ```
+
+   `ohmo evals cases list/show` are metadata-only inspection helpers for
+   draft cases. They print case ids, kinds, episode ids, facet counts, and tool
+   names, not raw prompts or tool outputs.
 
    Review manifests are written under `evals/cases/` and contain case ids,
    facet counts, tool names, and review metadata. Edit each item with
@@ -69,7 +81,9 @@ Triggers for adding a broader SQLite projection:
 
    ```bash
    ohmo evals pack --workspace <workspace>
+   ohmo evals pack --workspace <workspace> --output candidate_pack.json
    ohmo evals smoke --workspace <workspace> --pack eval_pack.json
+   ohmo evals smoke --workspace <workspace> --pack candidate_pack.json --output candidate_smoke.json
    ```
 
    The default runnable pack is `evals/packs/eval_pack.json`.
@@ -78,6 +92,7 @@ Triggers for adding a broader SQLite projection:
 
    ```bash
    ohmo evals run --workspace <workspace> --executor replay-tools
+   ohmo evals run --workspace <workspace> --pack candidate_pack.json --output candidate_eval.json
    ohmo evals run --workspace <workspace> --executor replay-tools --check-config
    ohmo evals run --workspace <workspace> --executor replay-tools --agent-runner query-engine --model <model>
    ```
@@ -108,6 +123,47 @@ Triggers for adding a broader SQLite projection:
    regresses or disappears from the candidate report. Use `--report-only` to
    collect the comparison without failing the command.
 
+## Baseline promotion runbook
+
+Use this sequence for a local candidate run before treating it as the new
+baseline:
+
+```bash
+ohmo evals embed --workspace <workspace>
+ohmo evals mine --workspace <workspace>
+ohmo evals review --workspace <workspace> --manifest review_manifest.json
+# edit evals/cases/review_manifest.json and approve the cases worth keeping
+ohmo evals review --workspace <workspace> --validate-manifest review_manifest.json
+ohmo evals promote --workspace <workspace> --manifest review_manifest.json --reviewer <id>
+ohmo evals pack --workspace <workspace>
+ohmo evals smoke --workspace <workspace>
+ohmo evals run --workspace <workspace> --check-config
+ohmo evals run --workspace <workspace>
+ohmo evals compare --workspace <workspace> --baseline baselines/main.json --candidate eval_report.json
+ohmo evals baseline save --workspace <workspace> --from-report eval_report.json --name main --overwrite
+```
+
+Expected default artifacts:
+
+- `evals/embeddings/embedding_manifest.json`
+- `evals/candidates/candidate_manifest.json`
+- `evals/cases/review_manifest.json`
+- `evals/cases/gold_cases.jsonl`
+- `evals/packs/eval_pack.json`
+- `evals/reports/smoke_report.json`
+- `evals/reports/eval_report.json`
+- `evals/reports/eval_compare.json`
+- `evals/reports/baselines/main.json`
+
+`smoke`, `run`, and `compare` exit non-zero when they find failures or
+regressions. Add `--report-only` when CI or local diagnostics should write the
+report but continue.
+
+For machine-readable automation, `review`, `cases list/show`, `smoke`, `run`,
+`compare`, and `baseline list` accept `--json`. JSON output is also
+metadata-only and intentionally omits raw prompts, tool inputs, tool outputs,
+final answers, and reviewer comments.
+
 ## Report contract
 
 Reports include `schema_version` and `report_kind`:
@@ -120,6 +176,20 @@ Reports include `schema_version` and `report_kind`:
 Execution reports split statuses into `passed`, `failed`, `blocked`, and
 `error`. The CLI exits non-zero for any non-passed status unless
 `--report-only` is used.
+
+Execution case checks are stable metadata keys:
+
+- preflight checks: `episode_exists`, `has_events`, `input_facets_resolve`,
+  `expected_facets_resolve`, `tool_fixtures_resolve`, `tool_trace_complete`,
+  `resource_snapshot_valid_or_absent`, and `has_rubric`
+- behavior checks: `execution_completed`, `tool_sequence_matches`,
+  `final_output_matches`, and `privacy_report_metadata_only`
+
+The default scorer is `exact-final-text`. It normalizes whitespace and requires
+the observed final text to equal the reviewed expected final text. Future
+semantic or model-judge scorers must implement the scorer contract and return
+metadata-only results; raw scorer notes, prompts, tool inputs, tool outputs, and
+final answers must not be copied into reports.
 
 `observed_trace` is metadata-only. Executor outputs are treated as untrusted:
 event and tool labels are sanitized, final output is stored as hash and length,
