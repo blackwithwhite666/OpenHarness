@@ -168,29 +168,6 @@ class OhmoSessionRuntimePool:
             self._provider_profile = self._gateway_config.provider_profile
         return result
 
-    def _is_send_owner(self, message: InboundMessage) -> bool:
-        owners = {
-            str(o).strip().lstrip("@").lower()
-            for o in (self._gateway_config.message_send_owners or [])
-            if str(o).strip()
-        }
-        if not owners:
-            return False
-        md = message.metadata or {}
-        candidates: set[str] = set()
-        sid = str(message.sender_id or "")
-        for part in [sid, *sid.split("|")]:
-            part = part.strip().lstrip("@").lower()
-            if part:
-                candidates.add(part)
-        for key in ("username", "user_id"):
-            value = md.get(key)
-            if value is not None and str(value).strip():
-                candidates.add(str(value).strip().lstrip("@").lower())
-        if str(message.chat_id).strip():
-            candidates.add(str(message.chat_id).strip().lstrip("@").lower())
-        return bool(candidates & owners)
-
     async def get_bundle(
         self,
         session_key: str,
@@ -315,8 +292,10 @@ class OhmoSessionRuntimePool:
                 "tz": message.metadata.get("tz") or "",
             }
             engine_metadata["ohmo_send_ctx"] = {
-                "is_owner": self._is_send_owner(message),
                 "sender_id": str(message.sender_id),
+                "username": str(message.metadata.get("username") or "").strip(),
+                "first_name": str(message.metadata.get("first_name") or "").strip(),
+                "display_name": str(message.metadata.get("sender_display_name") or "").strip(),
             }
         logger.info(
             "ohmo runtime processing start channel=%s chat_id=%s session_key=%s session_id=%s content=%r",
@@ -981,11 +960,7 @@ class OhmoSessionRuntimePool:
     def _register_send_message_tool(self, bundle: RuntimeBundle) -> None:
         """Register send_telegram_message when the gateway provided a contact store
         and an outbound publisher (i.e. running inside the real gateway service)."""
-        if (
-            self._contact_store is None
-            or self._send_outbound is None
-            or not (self._gateway_config.message_send_owners or [])
-        ):
+        if self._contact_store is None or self._send_outbound is None:
             return
         registry = getattr(bundle, "tool_registry", None)
         if registry is None:
