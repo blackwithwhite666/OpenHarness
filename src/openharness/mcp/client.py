@@ -315,14 +315,40 @@ class McpClientManager:
                 # OAuth bearer is injected per request (auth=) rather than as a
                 # static header, so it auto-refreshes on the long-lived connection
                 # instead of going stale and 401-ing after the access token's TTL.
-                auth = _OAuthBearerAuth(config.oauth) if getattr(config, "oauth", None) else None
+                oauth = getattr(config, "oauth", None)
+                auth = _OAuthBearerAuth(oauth) if oauth else None
+                if oauth is not None:
+                    # Pre-warm the bearer BEFORE opening the transport so the
+                    # connect's first request (initialize) never blocks on an
+                    # inline token refresh. The access token is short-lived (~1h);
+                    # a connect that coincided with its hourly refresh otherwise ran
+                    # the refresh inline during initialize and blew the client's
+                    # connect timeout -> "Cancelled via cancel scope", leaving the
+                    # server unconnected for the bundle's lifetime. Best-effort: on
+                    # failure, log and let the per-request auth flow surface the real
+                    # error at initialize.
+                    from openharness.mcp.oauth import ensure_bearer
+
+                    try:
+                        await asyncio.to_thread(ensure_bearer, oauth)
+                    except Exception as exc:  # noqa: BLE001 - never abort connect here
+                        log.warning("MCP server %r OAuth bearer pre-warm failed: %s", name, exc)
                 http_client = await stack.enter_async_context(
-                    httpx.AsyncClient(headers=headers or None, auth=auth)
+                    httpx.AsyncClient(
+                        headers=headers or None,
+                        auth=auth,
+                        # The MCP SDK ignores its own timeout/sse_read_timeout once a
+                        # custom http_client is passed, so set an explicit, generous
+                        # timeout here (httpx's 5s default is too tight for a connect
+                        # that may still refresh a token). Tool calls are separately
+                        # bounded by OPENHARNESS_MCP_TOOL_TIMEOUT.
+                        timeout=httpx.Timeout(30.0, connect=10.0),
+                    )
                 )
                 read_stream, write_stream, _get_session_id = await stack.enter_async_context(
                     streamable_http_client(config.url, http_client=http_client)
                 )
-                auth_configured = bool(config.headers or getattr(config, "oauth", None))
+                auth_configured = bool(config.headers or oauth)
             await self._register_connected_session(
                 name=name,
                 config=config,
