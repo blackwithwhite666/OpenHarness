@@ -65,6 +65,20 @@ class OhmoEvalReviewManifestWrite:
     shown_count: int
 
 
+@dataclass(frozen=True)
+class OhmoEvalReviewManifestValidation:
+    """Summary returned after validating a review manifest."""
+
+    path: Path
+    relative_path: str
+    total_count: int
+    approved_count: int
+    rejected_count: int
+    pending_count: int
+    missing_case_ids: list[str]
+    approved_case_ids: list[str]
+
+
 def review_ohmo_eval_case_drafts(
     *,
     workspace: str | Path | None = None,
@@ -120,6 +134,40 @@ def write_ohmo_eval_review_manifest(
         relative_path=path.relative_to(store.root).as_posix(),
         total_count=result.total_count,
         shown_count=len(result.shown),
+    )
+
+
+def validate_ohmo_eval_review_manifest(
+    *,
+    workspace: str | Path | None = None,
+    filename: str = "review_manifest.json",
+) -> OhmoEvalReviewManifestValidation:
+    """Validate a metadata-only review manifest against current draft cases."""
+    store = get_eval_store(workspace)
+    drafts = read_case_drafts(store)
+    draft_case_ids = {draft.case_id for draft in drafts}
+    manifest = _read_review_manifest(store.root, filename)
+    missing_case_ids = [
+        item.case_id
+        for item in manifest.items
+        if item.case_id not in draft_case_ids
+    ]
+    if missing_case_ids:
+        missing = ", ".join(missing_case_ids)
+        raise ValueError(f"review manifest references missing draft cases: {missing}")
+    return OhmoEvalReviewManifestValidation(
+        path=manifest.path,
+        relative_path=manifest.path.relative_to(store.root).as_posix(),
+        total_count=len(manifest.items),
+        approved_count=sum(1 for item in manifest.items if item.decision == "approved"),
+        rejected_count=sum(1 for item in manifest.items if item.decision == "rejected"),
+        pending_count=sum(1 for item in manifest.items if item.decision == "pending"),
+        missing_case_ids=[],
+        approved_case_ids=[
+            item.case_id
+            for item in manifest.items
+            if item.decision == "approved"
+        ],
     )
 
 
@@ -218,15 +266,29 @@ def _review_item_payload(item: OhmoEvalReviewItem) -> dict[str, object]:
 
 
 @dataclass(frozen=True)
+class _ReviewManifestItem:
+    case_id: str
+    decision: str
+    reviewer: str
+    comment: str
+
+
+@dataclass(frozen=True)
+class _ReviewManifest:
+    path: Path
+    items: list[_ReviewManifestItem]
+
+
+@dataclass(frozen=True)
 class _ReviewManifestSelection:
     case_ids: list[str]
     review_metadata_by_case: dict[str, dict[str, object]]
 
 
-def _approved_cases_from_review_manifest(
+def _read_review_manifest(
     store_root: Path,
     filename: str,
-) -> _ReviewManifestSelection:
+) -> _ReviewManifest:
     path = _cases_output_path(store_root, filename)
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -238,8 +300,7 @@ def _approved_cases_from_review_manifest(
     if not isinstance(raw_items, list):
         raise ValueError("review manifest must contain an items list")
 
-    case_ids: list[str] = []
-    metadata_by_case: dict[str, dict[str, object]] = {}
+    items: list[_ReviewManifestItem] = []
     seen: set[str] = set()
     for index, raw_item in enumerate(raw_items, 1):
         if not isinstance(raw_item, dict):
@@ -250,18 +311,34 @@ def _approved_cases_from_review_manifest(
         if case_id in seen:
             raise ValueError(f"duplicate review manifest case_id: {case_id}")
         seen.add(case_id)
-        decision = _normalize_review_decision(raw_item.get("decision", "pending"))
-        if decision != "approved":
+        items.append(
+            _ReviewManifestItem(
+                case_id=case_id,
+                decision=_normalize_review_decision(raw_item.get("decision", "pending")),
+                reviewer=str(raw_item.get("reviewer") or "").strip(),
+                comment=str(raw_item.get("comment") or ""),
+            )
+        )
+    return _ReviewManifest(path=path, items=items)
+
+
+def _approved_cases_from_review_manifest(
+    store_root: Path,
+    filename: str,
+) -> _ReviewManifestSelection:
+    manifest = _read_review_manifest(store_root, filename)
+    case_ids: list[str] = []
+    metadata_by_case: dict[str, dict[str, object]] = {}
+    for item in manifest.items:
+        if item.decision != "approved":
             continue
-        case_ids.append(case_id)
-        comment = str(raw_item.get("comment") or "")
-        item_reviewer = str(raw_item.get("reviewer") or "").strip()
-        metadata_by_case[case_id] = {
-            "review_decision": decision,
-            "review_manifest": path.name,
-            "reviewer": item_reviewer,
-            "review_comment_hash": _hash_text(comment) if comment else "",
-            "review_comment_length": len(comment),
+        case_ids.append(item.case_id)
+        metadata_by_case[item.case_id] = {
+            "review_decision": item.decision,
+            "review_manifest": manifest.path.name,
+            "reviewer": item.reviewer,
+            "review_comment_hash": _hash_text(item.comment) if item.comment else "",
+            "review_comment_length": len(item.comment),
         }
     if not case_ids:
         raise ValueError("review manifest has no approved cases")

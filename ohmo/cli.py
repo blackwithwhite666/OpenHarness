@@ -28,6 +28,7 @@ from ohmo.evals import (
     review_ohmo_eval_case_drafts,
     run_ohmo_eval_report,
     run_ohmo_eval_smoke,
+    validate_ohmo_eval_review_manifest,
     write_ohmo_embedding_index,
     write_ohmo_eval_mine,
     write_ohmo_eval_review_manifest,
@@ -749,9 +750,41 @@ def evals_review_cmd(
         "--manifest",
         help="Write a metadata-only review manifest under evals/cases",
     ),
+    validate_manifest_filename: str | None = typer.Option(
+        None,
+        "--validate-manifest",
+        help="Validate a review manifest under evals/cases without writing files",
+    ),
 ) -> None:
     """Review metadata-only draft eval cases."""
     workspace_root = initialize_workspace(workspace)
+    if validate_manifest_filename:
+        try:
+            validation = validate_ohmo_eval_review_manifest(
+                workspace=workspace_root,
+                filename=validate_manifest_filename,
+            )
+        except (FileNotFoundError, ValueError) as exc:
+            print(str(exc), file=sys.stderr)
+            raise typer.Exit(1)
+        print(f"Review manifest is valid: {validation.path}")
+        print(
+            "Review decisions: "
+            f"total={validation.total_count} "
+            f"approved={validation.approved_count} "
+            f"rejected={validation.rejected_count} "
+            f"pending={validation.pending_count}"
+        )
+        if validation.approved_case_ids:
+            print("Approved cases:")
+            for approved_case_id in validation.approved_case_ids:
+                print(f"- {approved_case_id}")
+        print(
+            "Promote approved with: "
+            f"ohmo evals promote --manifest {validate_manifest_filename}"
+        )
+        return
+
     try:
         result = review_ohmo_eval_case_drafts(
             workspace=workspace_root,

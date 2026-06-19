@@ -10,6 +10,7 @@ from ohmo.evals import (
     get_eval_store,
     promote_ohmo_eval_case_drafts,
     review_ohmo_eval_case_drafts,
+    validate_ohmo_eval_review_manifest,
     write_ohmo_eval_mine,
     write_ohmo_eval_review_manifest,
 )
@@ -137,6 +138,55 @@ def test_promote_ohmo_eval_case_drafts_from_review_manifest(tmp_path: Path):
     assert "keep this case" not in serialized
     assert "private first" not in serialized
     assert "private second" not in serialized
+
+
+def test_validate_ohmo_eval_review_manifest_summarizes_decisions(tmp_path: Path):
+    workspace = tmp_path / "workspace"
+    _add_episode(workspace, episode_id="ep-1", user_text="private first")
+    _add_episode(workspace, episode_id="ep-2", user_text="private second")
+    write_ohmo_eval_mine(workspace=workspace)
+    manifest = write_ohmo_eval_review_manifest(
+        workspace=workspace,
+        filename="batch_review.json",
+    )
+    payload = json.loads(manifest.path.read_text(encoding="utf-8"))
+    payload["items"][0]["decision"] = "approved"
+    payload["items"][1]["decision"] = "rejected"
+    manifest.path.write_text(json.dumps(payload), encoding="utf-8")
+
+    validation = validate_ohmo_eval_review_manifest(
+        workspace=workspace,
+        filename="batch_review.json",
+    )
+
+    assert validation.relative_path == "cases/batch_review.json"
+    assert validation.total_count == 2
+    assert validation.approved_count == 1
+    assert validation.rejected_count == 1
+    assert validation.pending_count == 0
+    assert validation.missing_case_ids == []
+    assert validation.approved_case_ids == [payload["items"][0]["case_id"]]
+
+
+def test_validate_ohmo_eval_review_manifest_rejects_missing_draft_cases(
+    tmp_path: Path,
+):
+    workspace = tmp_path / "workspace"
+    _add_episode(workspace, episode_id="ep-1", user_text="private first")
+    write_ohmo_eval_mine(workspace=workspace)
+    manifest = write_ohmo_eval_review_manifest(
+        workspace=workspace,
+        filename="batch_review.json",
+    )
+    payload = json.loads(manifest.path.read_text(encoding="utf-8"))
+    payload["items"][0]["case_id"] = "missing-case"
+    manifest.path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="missing draft cases: missing-case"):
+        validate_ohmo_eval_review_manifest(
+            workspace=workspace,
+            filename="batch_review.json",
+        )
 
 
 def test_promote_ohmo_eval_case_drafts_from_manifest_validates_selection(

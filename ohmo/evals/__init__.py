@@ -20,9 +20,11 @@ from ohmo.evals.review import (
     OhmoEvalPromoteResult,
     OhmoEvalReviewItem,
     OhmoEvalReviewManifestWrite,
+    OhmoEvalReviewManifestValidation,
     OhmoEvalReviewResult,
     promote_ohmo_eval_case_drafts,
     review_ohmo_eval_case_drafts,
+    validate_ohmo_eval_review_manifest,
     write_ohmo_eval_review_manifest,
 )
 from ohmo.evals.runner import (
@@ -40,6 +42,7 @@ __all__ = [
     "OhmoEvalPromoteResult",
     "OhmoEvalReviewItem",
     "OhmoEvalReviewManifestWrite",
+    "OhmoEvalReviewManifestValidation",
     "OhmoEvalReviewResult",
     "OhmoEvalRunConfigCheckResult",
     "OhmoEvalRunResult",
@@ -54,6 +57,7 @@ __all__ = [
     "review_ohmo_eval_case_drafts",
     "run_ohmo_eval_report",
     "run_ohmo_eval_smoke",
+    "validate_ohmo_eval_review_manifest",
     "write_ohmo_embedding_index",
     "write_ohmo_eval_mine",
     "write_ohmo_eval_review_manifest",

@@ -43,13 +43,15 @@ Triggers for adding a broader SQLite projection:
    ```bash
    ohmo evals review --workspace <workspace> --limit 20
    ohmo evals review --workspace <workspace> --manifest review_manifest.json
+   ohmo evals review --workspace <workspace> --validate-manifest review_manifest.json
    ```
 
    Review manifests are written under `evals/cases/` and contain case ids,
    facet counts, tool names, and review metadata. Edit each item with
    `decision: "approved"` or `decision: "rejected"` before batch promotion.
    They do not contain raw prompts, tool inputs, tool outputs, or final
-   answers.
+   answers. `--validate-manifest` checks the manifest shape, decision values,
+   duplicate ids, and whether referenced drafts still exist.
 
 4. Promote reviewed drafts into the gold set:
 

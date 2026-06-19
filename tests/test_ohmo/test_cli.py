@@ -414,6 +414,95 @@ def test_ohmo_evals_review_command_lists_case_drafts(tmp_path: Path, monkeypatch
     assert "Wrote review manifest:" in result.output
 
 
+def test_ohmo_evals_review_command_validates_manifest(
+    tmp_path: Path,
+    monkeypatch,
+):
+    runner = CliRunner()
+    workspace = tmp_path / ".ohmo-home"
+    calls: list[dict[str, object]] = []
+
+    def fake_validate_ohmo_eval_review_manifest(
+        *,
+        workspace: str | Path | None = None,
+        filename: str = "review_manifest.json",
+    ):
+        calls.append({"workspace": workspace, "filename": filename})
+        return SimpleNamespace(
+            path=Path(workspace) / "evals" / "cases" / filename,
+            total_count=4,
+            approved_count=2,
+            rejected_count=1,
+            pending_count=1,
+            approved_case_ids=["case_001", "case_004"],
+        )
+
+    monkeypatch.setattr(
+        "ohmo.cli.validate_ohmo_eval_review_manifest",
+        fake_validate_ohmo_eval_review_manifest,
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "evals",
+            "review",
+            "--workspace",
+            str(workspace),
+            "--validate-manifest",
+            "review_manifest.json",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert calls == [
+        {
+            "workspace": workspace.resolve(),
+            "filename": "review_manifest.json",
+        }
+    ]
+    assert "Review manifest is valid:" in result.output
+    assert "total=4 approved=2 rejected=1 pending=1" in result.output
+    assert "- case_001" in result.output
+    assert "- case_004" in result.output
+    assert "Promote approved with: ohmo evals promote --manifest review_manifest.json" in result.output
+
+
+def test_ohmo_evals_review_command_validate_manifest_reports_errors(
+    tmp_path: Path,
+    monkeypatch,
+):
+    runner = CliRunner()
+    workspace = tmp_path / ".ohmo-home"
+
+    def fake_validate_ohmo_eval_review_manifest(
+        *,
+        workspace: str | Path | None = None,
+        filename: str = "review_manifest.json",
+    ):
+        raise ValueError("review manifest references missing draft cases: missing-case")
+
+    monkeypatch.setattr(
+        "ohmo.cli.validate_ohmo_eval_review_manifest",
+        fake_validate_ohmo_eval_review_manifest,
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "evals",
+            "review",
+            "--workspace",
+            str(workspace),
+            "--validate-manifest",
+            "review_manifest.json",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "missing draft cases: missing-case" in result.stderr
+
+
 def test_ohmo_evals_promote_command_promotes_selected_case_drafts(
     tmp_path: Path,
     monkeypatch,
