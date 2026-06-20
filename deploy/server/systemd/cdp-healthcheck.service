@@ -1,0 +1,7 @@
+[Unit]
+Description=CDP/Chrome healthcheck + self-heal for browser-backed skills
+After=kasmvnc-chrome.service
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/cdp-healthcheck.sh

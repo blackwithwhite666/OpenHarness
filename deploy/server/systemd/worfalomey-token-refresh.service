@@ -1,0 +1,6 @@
+[Unit]
+Description=Refresh worfalomey MCP OAuth token and reload gateway
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 %h/worfalomey_oauth.py refresh
+ExecStartPost=/usr/bin/systemctl --user try-restart ohmo-gateway.service

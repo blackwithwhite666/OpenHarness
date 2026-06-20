@@ -1,0 +1,20 @@
+[Unit]
+Description=KasmVNC :1 headful Chrome (CDP 127.0.0.1:9222, VNC 127.0.0.1:6080)
+Documentation=https://github.com/kasmtech/KasmVNC
+After=default.target
+
+[Service]
+Type=forking
+PIDFile=%h/.vnc/%H:1.pid
+Environment=HOME=%h
+# Clean any stale session/locks, then start the virtual display + Chrome (xstartup).
+ExecStartPre=-/usr/bin/vncserver -kill :1
+ExecStartPre=-/bin/rm -f /tmp/.X1-lock /tmp/.X11-unix/X1
+ExecStart=/usr/bin/vncserver :1 -geometry 1920x1080 -select-de manual
+ExecStop=/usr/bin/vncserver -kill :1
+Restart=on-failure
+RestartSec=10
+TimeoutStartSec=120
+
+[Install]
+WantedBy=default.target

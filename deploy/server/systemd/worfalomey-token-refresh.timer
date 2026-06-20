@@ -1,0 +1,8 @@
+[Unit]
+Description=Periodic worfalomey MCP token refresh (token TTL 1h)
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=45min
+Persistent=true
+[Install]
+WantedBy=timers.target

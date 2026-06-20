@@ -1,0 +1,13 @@
+[Unit]
+Description=Dropbox daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.dropbox-dist/dropboxd
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

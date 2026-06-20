@@ -1,0 +1,19 @@
+network:
+  protocol: http
+  interface: 127.0.0.1
+  websocket_port: 6080
+  use_ipv4: true
+  use_ipv6: false
+  ssl:
+    require_ssl: false
+    pem_certificate: /home/blackwithwhite/.vnc/self.pem
+    pem_key: /home/blackwithwhite/.vnc/self.key
+desktop:
+  resolution:
+    width: 1920
+    height: 1080
+  allow_resize: true
+logging:
+  log_writer_name: all
+  log_dest: logfile
+  level: 30

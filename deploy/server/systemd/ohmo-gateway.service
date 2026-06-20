@@ -1,0 +1,16 @@
+[Unit]
+Description=OpenHarness ohmo personal-agent gateway (Telegram)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=PATH=/home/blackwithwhite/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=CODEX_HOME=/home/blackwithwhite/.codex
+WorkingDirectory=/home/blackwithwhite/.ohmo
+ExecStart=/home/blackwithwhite/.local/bin/ohmo gateway run
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
