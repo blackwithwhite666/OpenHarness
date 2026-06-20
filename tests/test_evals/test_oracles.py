@@ -186,6 +186,21 @@ def test_capability_trace_oracle_exposes_capability_label_metadata():
     assert out.metadata["unexpected_capabilities"] == []
 
 
+def test_capability_metadata_preserves_subcommand_labels_readable():
+    # bash:<binary> <subcommand> labels contain a space but no raw args, so they
+    # must stay readable in the report — not hashed to cap:<hash>.
+    out = CapabilityTraceOracleV1().score(
+        context=_ctx(["bash"], ["bash:weather-cli forecast"]),
+        executor_result=_result(
+            EvalObservedCall("bash", {"command": "weather-cli forecast 'СПб'"}, False)
+        ),
+    )
+
+    assert out.metadata["observed_capabilities"] == ["bash:weather-cli forecast"]
+    assert out.metadata["expected_capabilities"] == ["bash:weather-cli forecast"]
+    assert out.metadata["missing_capabilities"] == []
+
+
 def test_capability_coverage_oracle_ignores_missing_incidental_capability():
     out = CapabilityCoverageOracleV1().score(
         context=_ctx(["bash"], ["todo_write", "bash:weather-cli forecast"]),

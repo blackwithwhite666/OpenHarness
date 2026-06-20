@@ -925,7 +925,26 @@ def _capability_metadata(
 
 
 def _sorted_sanitized_capabilities(values: set[str]) -> list[str]:
-    return sorted({_sanitize_label(value, prefix="cap") for value in values})
+    return sorted({_sanitize_capability_label(value) for value in values})
+
+
+def _sanitize_capability_label(value: str) -> str:
+    """Sanitize a capability label while keeping the ``binary subcommand`` form.
+
+    Capability labels are structured (a typed tool name, or
+    ``bash:<binary> [subcommand]``) and never carry raw arguments, so a single
+    internal space is safe and worth preserving for readability — unlike
+    ``_sanitize_label``, which hashes anything containing a space and would turn
+    ``bash:maps-cli reviews`` into an opaque ``cap:<hash>``.
+    """
+    text = str(value)
+    if text and len(text) <= 96 and all(_is_safe_capability_char(char) for char in text):
+        return text
+    return _stable_id("cap", text)
+
+
+def _is_safe_capability_char(char: str) -> bool:
+    return char == " " or _is_safe_label_char(char)
 
 
 def _sanitize_label(value: str, *, prefix: str) -> str:
