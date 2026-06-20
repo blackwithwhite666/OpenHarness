@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from openharness.evals import (
+    CapabilityCoverageOracleV1,
     CapabilityTraceOracleV1,
     EVAL_EXECUTION_SCORERS,
     EvalExecutorResult,
@@ -116,6 +117,8 @@ def test_capability_trace_oracle_passes_clean_shell_capability():
     assert out.metadata["tool_error_count"] == 0
     assert out.metadata["check.no_unexpected_capabilities"] is True
     assert out.metadata["check.expected_capabilities_present"] is True
+    assert "missing_capabilities" in out.metadata
+    assert "observed_capabilities" in out.metadata
 
 
 @pytest.mark.parametrize(
@@ -170,6 +173,77 @@ def test_capability_trace_oracle_flags_trace_violations(
     assert out.metadata[count_key] > 0
 
 
+def test_capability_trace_oracle_exposes_capability_label_metadata():
+    out = CapabilityTraceOracleV1().score(
+        context=_ctx(["remind_create"], ["remind_create", "web_fetch"]),
+        executor_result=_result(EvalObservedCall("remind_create", {}, False)),
+    )
+
+    assert out.passed is False
+    assert out.metadata["observed_capabilities"] == ["remind_create"]
+    assert out.metadata["expected_capabilities"] == ["remind_create", "web_fetch"]
+    assert out.metadata["missing_capabilities"] == ["web_fetch"]
+    assert out.metadata["unexpected_capabilities"] == []
+
+
+def test_capability_coverage_oracle_ignores_missing_incidental_capability():
+    out = CapabilityCoverageOracleV1().score(
+        context=_ctx(["bash"], ["todo_write", "bash:weather-cli forecast"]),
+        executor_result=_result(
+            EvalObservedCall(
+                "bash",
+                {"command": "weather-cli forecast 'СПб'"},
+                False,
+            )
+        ),
+    )
+
+    assert out.passed is True
+    assert out.score == 1.0
+    assert out.scorer_name == "capability_coverage_oracle_v1"
+    assert out.metadata["expected_core_count"] == 1
+    assert out.metadata["observed_core_count"] == 1
+    assert out.metadata["missing_core_count"] == 0
+    assert out.metadata["check.no_tool_errors"] is True
+    assert out.metadata["check.expected_core_capabilities_covered"] is True
+    assert out.metadata["check.used_tools_when_expected"] is True
+    assert "check.no_unexpected_capabilities" not in out.metadata
+    assert "call_budget" not in out.metadata
+    assert "todo_write" not in out.metadata["expected_capabilities"]
+    assert out.metadata["missing_capabilities"] == []
+    assert out.metadata["observed_capabilities"]
+
+
+def test_capability_coverage_oracle_fails_when_core_capability_missing():
+    out = CapabilityCoverageOracleV1().score(
+        context=_ctx(["remind_create"], ["todo_write", "remind_create"]),
+        executor_result=_result(EvalObservedCall("todo_write", {}, False)),
+    )
+
+    assert out.passed is False
+    assert out.score == 0.0
+    assert out.metadata["missing_core_count"] == 1
+    assert out.metadata["check.expected_core_capabilities_covered"] is False
+    assert out.metadata["check.used_tools_when_expected"] is False
+    assert out.metadata["missing_capabilities"] == ["remind_create"]
+    assert out.metadata["observed_capabilities"] == []
+
+
+def test_capability_coverage_oracle_tolerates_extra_core_capability():
+    out = CapabilityCoverageOracleV1().score(
+        context=_ctx(["remind_create"], ["remind_create"]),
+        executor_result=_result(
+            EvalObservedCall("remind_create", {}, False),
+            EvalObservedCall("web_fetch", {}, False),
+        ),
+    )
+
+    assert out.passed is True
+    assert out.metadata["missing_core_count"] == 0
+    assert out.metadata["unexpected_capabilities"] == ["web_fetch"]
+    assert out.metadata["check.expected_core_capabilities_covered"] is True
+
+
 def test_resolve_execution_scorer_known_and_unknown():
     assert (
         resolve_execution_scorer("tool_trace_oracle_v1")
@@ -178,6 +252,10 @@ def test_resolve_execution_scorer_known_and_unknown():
     assert (
         resolve_execution_scorer("capability_trace_oracle_v1")
         is EVAL_EXECUTION_SCORERS["capability_trace_oracle_v1"]
+    )
+    assert (
+        resolve_execution_scorer("capability_coverage_oracle_v1")
+        is EVAL_EXECUTION_SCORERS["capability_coverage_oracle_v1"]
     )
     assert isinstance(resolve_execution_scorer("exact-final-text"), ExactMatchEvalScorer)
     with pytest.raises(ValueError, match="unknown eval scorer"):

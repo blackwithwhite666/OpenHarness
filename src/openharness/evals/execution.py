@@ -37,6 +37,15 @@ from openharness.evals.tool_labels import effective_tool_label
 from openharness.utils.fs import atomic_write_text
 
 _EXECUTION_SCORE_SCHEMA_VERSION = 1
+_INCIDENTAL_CAPABILITIES = frozenset(
+    {"todo_write", "sleep", "task_get", "task_output", "task_stop", "tool_search"}
+)
+_CAPABILITY_METADATA_KEYS = (
+    "observed_capabilities",
+    "expected_capabilities",
+    "missing_capabilities",
+    "unexpected_capabilities",
+)
 
 
 @dataclass(frozen=True)
@@ -230,6 +239,77 @@ class CapabilityTraceOracleV1:
                 "tool_error_count": error_count,
                 "call_budget": budget,
                 **{f"check.{name}": value for name, value in checks.items()},
+                **_capability_metadata(expected=expected, observed=observed),
+            },
+        )
+
+
+class CapabilityCoverageOracleV1:
+    """Capability-aware coverage oracle that ignores incidental bookkeeping."""
+
+    name = "capability_coverage_oracle_v1"
+
+    def __init__(
+        self,
+        *,
+        incidental: frozenset[str] = _INCIDENTAL_CAPABILITIES,
+    ) -> None:
+        self._incidental = incidental
+
+    def score(
+        self,
+        *,
+        context: EvalExecutionContext,
+        executor_result: EvalExecutorResult,
+    ) -> EvalExecutionScorerResult:
+        expected = list(context.case.capability_path)
+        expected_core = [
+            capability
+            for capability in expected
+            if capability not in self._incidental
+        ]
+        expected_core_set = set(expected_core)
+        calls = list(executor_result.tool_calls)
+        observed = [
+            effective_tool_label(call.tool_name, call.arguments)
+            for call in calls
+        ]
+        observed_core = [
+            capability
+            for capability in observed
+            if capability not in self._incidental
+        ]
+        observed_core_set = set(observed_core)
+        missing = sorted(
+            {
+                capability
+                for capability in expected_core
+                if capability not in observed_core_set
+            }
+        )
+        error_count = sum(1 for call in calls if call.is_error)
+        checks = {
+            "no_tool_errors": error_count == 0,
+            "expected_core_capabilities_covered": expected_core_set.issubset(
+                observed_core_set
+            ),
+            "used_tools_when_expected": (not expected_core) or bool(observed_core),
+        }
+        passed = all(checks.values())
+        return EvalExecutionScorerResult(
+            passed=passed,
+            score=1.0 if passed else 0.0,
+            scorer_name=self.name,
+            metadata={
+                "expected_core_count": len(expected_core),
+                "observed_core_count": len(observed_core),
+                "missing_core_count": len(missing),
+                "tool_error_count": error_count,
+                **{f"check.{name}": value for name, value in checks.items()},
+                **_capability_metadata(
+                    expected=expected_core,
+                    observed=observed_core,
+                ),
             },
         )
 
@@ -238,6 +318,7 @@ EVAL_EXECUTION_SCORERS: dict[str, EvalExecutionScorer] = {
     ExactMatchEvalScorer.name: ExactMatchEvalScorer(),
     ToolTraceOracleV1.name: ToolTraceOracleV1(),
     CapabilityTraceOracleV1.name: CapabilityTraceOracleV1(),
+    CapabilityCoverageOracleV1.name: CapabilityCoverageOracleV1(),
 }
 
 
@@ -438,6 +519,16 @@ def _execute_case(
         "privacy_report_metadata_only": True,
     }
     all_checks = {**checks, **behavior_checks}
+    observed_trace_metadata = {
+        "tool_calls_source": "replay_fixtures",
+        "final_output_match_score": scorer_result.score,
+        "scorer_name": scorer_result.scorer_name,
+        "scorer_metadata_key_count": len(scorer_result.metadata),
+        "executor_metadata_key_count": len(executor_result.metadata),
+    }
+    for key in _CAPABILITY_METADATA_KEYS:
+        if key in scorer_result.metadata:
+            observed_trace_metadata[key] = scorer_result.metadata[key]
     observed_trace = _observed_trace(
         executor_name=executor.name,
         case=case,
@@ -450,13 +541,7 @@ def _execute_case(
         final_text=executor_result.final_text,
         error_type="",
         error_hash="",
-        metadata={
-            "tool_calls_source": "replay_fixtures",
-            "final_output_match_score": scorer_result.score,
-            "scorer_name": scorer_result.scorer_name,
-            "scorer_metadata_key_count": len(scorer_result.metadata),
-            "executor_metadata_key_count": len(executor_result.metadata),
-        },
+        metadata=observed_trace_metadata,
     )
     return EvalExecutionReportCase(
         gold_case_id=case.gold_case_id,
@@ -818,6 +903,29 @@ def _normalize_text(text: str) -> str:
 
 def _sanitize_labels(values: Sequence[str], *, prefix: str) -> list[str]:
     return [_sanitize_label(value, prefix=prefix) for value in values]
+
+
+def _capability_metadata(
+    *,
+    expected: Sequence[str],
+    observed: Sequence[str],
+) -> dict[str, list[str]]:
+    expected_set = set(expected)
+    observed_set = set(observed)
+    return {
+        "observed_capabilities": _sorted_sanitized_capabilities(observed_set),
+        "expected_capabilities": _sorted_sanitized_capabilities(expected_set),
+        "missing_capabilities": _sorted_sanitized_capabilities(
+            expected_set - observed_set
+        ),
+        "unexpected_capabilities": _sorted_sanitized_capabilities(
+            observed_set - expected_set
+        ),
+    }
+
+
+def _sorted_sanitized_capabilities(values: set[str]) -> list[str]:
+    return sorted({_sanitize_label(value, prefix="cap") for value in values})
 
 
 def _sanitize_label(value: str, *, prefix: str) -> str:

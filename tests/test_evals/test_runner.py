@@ -394,6 +394,11 @@ def test_query_engine_capability_oracle_gates_command_regression(tmp_path: Path)
     case = regression.report.cases[0]
     assert case.checks["final_output_matches"] is False
     assert case.checks["tool_sequence_matches"] is True
+    assert case.observed_trace is not None
+    assert "missing_capabilities" in case.observed_trace.metadata
+    assert "observed_capabilities" in case.observed_trace.metadata
+    assert case.observed_trace.metadata["missing_capabilities"]
+    assert case.observed_trace.metadata["observed_capabilities"] == ["bash:python3"]
 
     # 3. Blind-spot contrast — the SAME regression passes the name-based oracle,
     #    because the observed tool name is still "bash". This is the punchline.
@@ -407,6 +412,8 @@ def test_query_engine_capability_oracle_gates_command_regression(tmp_path: Path)
     # Reports stay metadata-only: no raw commands or user/final text leak.
     for write in (correct, regression, blind):
         serialized = write.path.read_text(encoding="utf-8")
+        assert "weather-cli forecast 'СПб'" not in serialized
+        assert "python3 -c 'print(2+2)'" not in serialized
         assert "'СПб'" not in serialized
         assert "print(2+2)" not in serialized
         assert "private weather request" not in serialized
