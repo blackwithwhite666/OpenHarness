@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import os
 import re
@@ -19,6 +20,7 @@ from ohmo.contact_registry import ContactStore
 from ohmo.group_registry import load_managed_group_record
 from ohmo.gateway.router import session_key_for_message
 from ohmo.gateway.runtime import OhmoSessionRuntimePool
+from ohmo.workspace import get_gateway_interrupted_requests_path
 
 logger = logging.getLogger(__name__)
 
@@ -141,6 +143,8 @@ class OhmoGatewayBridge:
         self._coalesce_max = int(message_coalesce_max)
         self._pending: dict[str, list[InboundMessage]] = {}
         self._pending_deadline: dict[str, float] = {}
+        # In-flight dispatched turns, so a shutdown can record what it interrupts.
+        self._inflight: dict[str, InboundMessage] = {}
         self._contact_store = contact_store
 
     async def run(self) -> None:
@@ -282,6 +286,7 @@ class OhmoGatewayBridge:
             name=f"ohmo-session:{session_key}",
         )
         self._session_tasks[session_key] = task
+        self._inflight[session_key] = message
         task.add_done_callback(lambda finished, key=session_key: self._cleanup_task(key, finished))
 
     def _next_flush_timeout(self) -> float:
@@ -326,9 +331,54 @@ class OhmoGatewayBridge:
 
     def stop(self) -> None:
         self._running = False
+        self._persist_interrupted_requests()
         for session_key, task in list(self._session_tasks.items()):
             self._session_cancel_reasons[session_key] = "gateway stopping"
             task.cancel()
+
+    def _persist_interrupted_requests(self) -> None:
+        """Record in-flight + buffered user requests so a restart can recover.
+
+        A SIGTERM (``systemctl restart``) or crash cancels the active turn and
+        drops any coalesce-buffered messages, none of which Telegram redelivers
+        (the update was already acked). Persist them so startup can tell the user
+        their message was interrupted instead of silently losing it.
+        """
+        pending: list[InboundMessage] = list(self._inflight.values())
+        for buffered in self._pending.values():
+            pending.extend(buffered)
+        records: list[dict] = []
+        seen: set[tuple[str, str, str]] = set()
+        for msg in pending:
+            md = msg.metadata or {}
+            if md.get("_synthetic") or msg.sender_id == "__scheduler__":
+                continue
+            key = (msg.channel, str(msg.chat_id), msg.content)
+            if key in seen:
+                continue
+            seen.add(key)
+            records.append(
+                {
+                    "channel": msg.channel,
+                    "chat_id": str(msg.chat_id),
+                    "content": msg.content,
+                    "session_key": session_key_for_message(msg),
+                }
+            )
+        if not records:
+            return
+        try:
+            path = get_gateway_interrupted_requests_path(self._workspace)
+            path.write_text(
+                json.dumps(records, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            logger.info(
+                "ohmo gateway persisted %d interrupted request(s) for restart recovery",
+                len(records),
+            )
+        except Exception:  # noqa: BLE001 - best effort during shutdown
+            logger.exception("ohmo gateway failed to persist interrupted requests")
 
     async def _handle_stop(self, message, session_key: str) -> None:
         stopped = await self._interrupt_session(
@@ -549,6 +599,7 @@ class OhmoGatewayBridge:
         current = self._session_tasks.get(session_key)
         if current is task:
             self._session_tasks.pop(session_key, None)
+            self._inflight.pop(session_key, None)
         self._session_cancel_reasons.pop(session_key, None)
 
     def _should_process_message(self, message: InboundMessage) -> bool:

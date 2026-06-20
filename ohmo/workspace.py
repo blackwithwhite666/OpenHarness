@@ -239,6 +239,16 @@ def get_gateway_restart_notice_path(workspace: str | Path | None = None) -> Path
     return get_workspace_root(workspace) / "gateway-restart-notice.json"
 
 
+def get_gateway_interrupted_requests_path(workspace: str | Path | None = None) -> Path:
+    """Requests that were in-flight / buffered when the gateway was stopped.
+
+    Persisted on shutdown so a restart (incl. an external ``systemctl restart``
+    or a crash, not just the bot's own ``/restart``) can tell the user their
+    message was interrupted instead of silently dropping it.
+    """
+    return get_workspace_root(workspace) / "gateway-interrupted-requests.json"
+
+
 def get_reminders_path(workspace: str | Path | None = None) -> Path:
     return get_workspace_root(workspace) / "reminders.json"
 

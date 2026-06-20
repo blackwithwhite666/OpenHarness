@@ -50,7 +50,12 @@ from ohmo.memory import add_memory_entry as add_ohmo_memory_entry
 from ohmo.memory import list_memory_files as list_ohmo_memory_files
 from ohmo.gateway.router import session_key_for_message
 from ohmo.session_storage import save_session_snapshot
-from ohmo.workspace import get_gateway_restart_notice_path, get_skills_dir, initialize_workspace
+from ohmo.workspace import (
+    get_gateway_interrupted_requests_path,
+    get_gateway_restart_notice_path,
+    get_skills_dir,
+    initialize_workspace,
+)
 
 
 def _single_eval_episode(workspace: Path):
@@ -2220,6 +2225,94 @@ async def test_gateway_service_publishes_pending_restart_notice(tmp_path, monkey
     assert outbound.content == "✅ gateway 已经重新连上，可以继续了。\nGateway is back online. We can continue."
     assert outbound.chat_id == "chat-1"
     assert not notice_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_gateway_bridge_persists_interrupted_requests_on_stop(tmp_path):
+    workspace = tmp_path / ".ohmo-home"
+    initialize_workspace(workspace)
+
+    class FakeRuntimePool:
+        async def stream_message(self, message, session_key):  # pragma: no cover
+            if False:
+                yield None
+
+    bridge = OhmoGatewayBridge(
+        bus=MessageBus(), runtime_pool=FakeRuntimePool(), workspace=workspace
+    )
+    # An in-flight dispatched turn, a coalesce-buffered message, and a synthetic
+    # reminder (which must be excluded — it is not a user request to recover).
+    bridge._inflight["telegram:c1"] = InboundMessage(
+        channel="telegram", sender_id="u1", chat_id="c1", content="поставь 1-1 с Дарьей"
+    )
+    bridge._pending["telegram:c2"] = [
+        InboundMessage(channel="telegram", sender_id="u1", chat_id="c2", content="buffered q")
+    ]
+    bridge._inflight["telegram:sched"] = InboundMessage(
+        channel="telegram",
+        sender_id="__scheduler__",
+        chat_id="c3",
+        content="reminder fire",
+        metadata={"_synthetic": True},
+    )
+
+    bridge.stop()
+
+    records = json.loads(
+        get_gateway_interrupted_requests_path(workspace).read_text(encoding="utf-8")
+    )
+    contents = {r["content"] for r in records}
+    assert "поставь 1-1 с Дарьей" in contents
+    assert "buffered q" in contents
+    assert "reminder fire" not in contents
+
+
+@pytest.mark.asyncio
+async def test_gateway_bridge_persist_skips_when_nothing_in_flight(tmp_path):
+    workspace = tmp_path / ".ohmo-home"
+    initialize_workspace(workspace)
+    bridge = OhmoGatewayBridge(
+        bus=MessageBus(), runtime_pool=object(), workspace=workspace
+    )
+    bridge.stop()
+    assert not get_gateway_interrupted_requests_path(workspace).exists()
+
+
+@pytest.mark.asyncio
+async def test_gateway_service_publishes_interrupted_requests_notice(tmp_path, monkeypatch):
+    workspace = tmp_path / ".ohmo-home"
+    initialize_workspace(workspace)
+    get_gateway_interrupted_requests_path(workspace).write_text(
+        json.dumps(
+            [
+                {
+                    "channel": "telegram",
+                    "chat_id": "c1",
+                    "session_key": "telegram:c1",
+                    "content": "поставь 1-1 с Дарьей",
+                }
+            ],
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    service = object.__new__(OhmoGatewayService)
+    service._workspace = workspace
+    service._bus = MessageBus()
+
+    async def fake_sleep(delay: float) -> None:
+        return None
+
+    monkeypatch.setattr("ohmo.gateway.service.asyncio.sleep", fake_sleep)
+
+    await OhmoGatewayService._publish_interrupted_requests_notice(service)
+
+    outbound = await asyncio.wait_for(service._bus.consume_outbound(), timeout=1.0)
+    assert "перезапустился" in outbound.content
+    assert "поставь 1-1 с Дарьей" in outbound.content
+    assert outbound.chat_id == "c1"
+    assert not get_gateway_interrupted_requests_path(workspace).exists()
 
 
 @pytest.mark.asyncio

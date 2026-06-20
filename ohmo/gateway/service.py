@@ -27,6 +27,7 @@ from ohmo.gateway.models import GatewayState
 from ohmo.gateway.runtime import OhmoSessionRuntimePool
 from ohmo.reminders.scheduler import ReminderScheduler
 from ohmo.workspace import (
+    get_gateway_interrupted_requests_path,
     get_gateway_restart_notice_path,
     get_logs_dir,
     get_state_path,
@@ -221,6 +222,58 @@ class OhmoGatewayService:
         finally:
             path.unlink(missing_ok=True)
 
+    async def _publish_interrupted_requests_notice(self) -> None:
+        """Tell the user about requests interrupted by the last shutdown.
+
+        Covers any stop (external ``systemctl restart`` / crash, not just the
+        bot's own ``/restart``): the bridge persists in-flight + buffered
+        requests on shutdown, and here we surface them so the message is not
+        silently lost. We notify (safe) rather than auto-replay, to avoid
+        repeating side effects a partially-run turn may already have done.
+        """
+        path = get_gateway_interrupted_requests_path(self._workspace)
+        if not path.exists():
+            return
+        try:
+            records = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(records, list) or not records:
+                return
+            await asyncio.sleep(2.0)
+            published = 0
+            for record in records:
+                if not isinstance(record, dict):
+                    continue
+                channel = record.get("channel")
+                chat_id = record.get("chat_id")
+                content = record.get("content")
+                session_key = record.get("session_key")
+                if not isinstance(channel, str) or not isinstance(chat_id, str):
+                    continue
+                snippet = (content or "").strip()
+                if len(snippet) > 300:
+                    snippet = snippet[:300] + "…"
+                notice = (
+                    "⚠️ Я перезапустился и не успел доделать этот запрос:\n"
+                    f"«{snippet}»\n\n"
+                    "Повтори, пожалуйста."
+                )
+                await self._bus.publish_outbound(
+                    OutboundMessage(
+                        channel=channel,
+                        chat_id=chat_id,
+                        content=notice,
+                        metadata={"_session_key": session_key}
+                        if isinstance(session_key, str)
+                        else {},
+                    )
+                )
+                published += 1
+            logger.info(
+                "ohmo gateway published %d interrupted-request notice(s)", published
+            )
+        finally:
+            path.unlink(missing_ok=True)
+
     async def run_foreground(self) -> int:
         self.pid_file.write_text(str(os.getpid()), encoding="utf-8")
         self.write_state(running=True)
@@ -229,6 +282,10 @@ class OhmoGatewayService:
         restart_notice_task = asyncio.create_task(
             self._publish_pending_restart_notice(),
             name="ohmo-gateway-restart-notice",
+        )
+        interrupted_notice_task = asyncio.create_task(
+            self._publish_interrupted_requests_notice(),
+            name="ohmo-gateway-interrupted-notice",
         )
         scheduler_task = asyncio.create_task(
             self._reminder_scheduler.run(),
@@ -260,6 +317,10 @@ class OhmoGatewayService:
                 restart_notice_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await restart_notice_task
+            if not interrupted_notice_task.done():
+                interrupted_notice_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await interrupted_notice_task
             if not scheduler_task.done():
                 scheduler_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
