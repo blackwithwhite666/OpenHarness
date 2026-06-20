@@ -20,6 +20,7 @@ from openharness.evals.models import (
     EvalUsageGraphNode,
 )
 from openharness.evals.store import EvalStore
+from openharness.evals.tool_labels import effective_tool_path
 from openharness.utils.fs import atomic_write_text
 
 
@@ -80,7 +81,7 @@ class _UsageGraphBuilder:
         )
 
         event_kind_path = [event.kind for event in events]
-        tool_path = self._tool_path(events)
+        tool_path = effective_tool_path(events)
         self._add_episode_motif(
             episode_id=episode.episode_id,
             event_kind_path=event_kind_path,

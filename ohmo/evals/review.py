@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import hashlib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from openharness.evals import (
@@ -31,6 +31,7 @@ class OhmoEvalReviewItem:
     input_facet_count: int
     expected_facet_count: int
     tool_names: list[str]
+    capability_path: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -240,6 +241,7 @@ def _review_item(draft: EvalCaseDraft) -> OhmoEvalReviewItem:
         input_facet_count=len(draft.input_facet_ids),
         expected_facet_count=len(draft.expected_facet_ids),
         tool_names=draft.tool_names,
+        capability_path=draft.capability_path,
     )
 
 
@@ -255,6 +257,7 @@ def _review_item_payload(item: OhmoEvalReviewItem) -> dict[str, object]:
         "input_facet_count": item.input_facet_count,
         "expected_facet_count": item.expected_facet_count,
         "tool_names": item.tool_names,
+        "capability_path": item.capability_path,
     }
 
 

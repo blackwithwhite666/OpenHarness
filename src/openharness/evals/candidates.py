@@ -17,6 +17,7 @@ from openharness.evals.models import (
     EvalPackManifest,
 )
 from openharness.evals.store import EvalStore
+from openharness.evals.tool_labels import effective_tool_path
 from openharness.utils.fs import atomic_write_text
 
 
@@ -47,6 +48,7 @@ def build_case_candidates(store: EvalStore) -> list[EvalCaseCandidate]:
         events = list(store.iter_events(episode_id))
         event_kind_path = [event.kind for event in events]
         tool_path = _tool_path(events)
+        capability_path = effective_tool_path(events)
         facet_ids = facets_by_episode.get(episode_id, [])
         embedded_facet_count = sum(1 for facet_id in facet_ids if facet_id in embedded_facet_ids)
         signals = _signals(
@@ -66,6 +68,7 @@ def build_case_candidates(store: EvalStore) -> list[EvalCaseCandidate]:
                 facet_ids=facet_ids,
                 event_kind_path=event_kind_path,
                 tool_path=tool_path,
+                capability_path=capability_path,
                 metadata={
                     "source": episode.source,
                     "app": episode.app,
@@ -114,6 +117,7 @@ def build_case_drafts(
                 input_facet_ids=input_facet_ids,
                 expected_facet_ids=expected_facet_ids,
                 tool_names=candidate.tool_path,
+                capability_path=candidate.capability_path,
                 rubric=_rubric(candidate),
                 review_status="draft",
                 metadata={

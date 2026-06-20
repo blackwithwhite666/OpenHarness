@@ -88,6 +88,12 @@ from openharness.evals.review import (
 )
 from openharness.evals.runner import EvalReplayReportWrite, run_replay_report
 from openharness.evals.store import EvalStore
+from openharness.evals.tool_labels import (
+    effective_tool_label,
+    effective_tool_path,
+    extract_command_binaries,
+    tool_call_binaries,
+)
 
 __all__ = [
     "DEFAULT_INFERENCE_URL",
@@ -154,6 +160,10 @@ __all__ = [
     "build_usage_graph",
     "compare_execution_reports",
     "collect_text_facets",
+    "effective_tool_label",
+    "effective_tool_path",
+    "extract_command_binaries",
+    "tool_call_binaries",
     "promote_case_drafts",
     "read_case_drafts",
     "read_execution_report",

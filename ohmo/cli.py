@@ -102,6 +102,7 @@ def _eval_review_item_summary(item: object) -> dict[str, object]:
         "input_facet_count": getattr(item, "input_facet_count"),
         "expected_facet_count": getattr(item, "expected_facet_count"),
         "tool_names": list(getattr(item, "tool_names") or []),
+        "capability_path": list(getattr(item, "capability_path", None) or []),
     }
 
 
@@ -949,12 +950,15 @@ def evals_cases_list_cmd(
 
     print("Draft eval cases:")
     for item in result.shown:
-        tools = ",".join(item.tool_names) if item.tool_names else "-"
+        cap_list = getattr(item, "capability_path", None) or []
+        caps = ",".join(cap_list) if cap_list else (
+            ",".join(item.tool_names) if item.tool_names else "-"
+        )
         print(
             f"- {item.case_id} {item.case_kind} "
             f"episode={item.episode_id} "
             f"facets={item.input_facet_count}/{item.expected_facet_count} "
-            f"tools={tools}"
+            f"caps={caps}"
         )
     print(f"Showing {len(result.shown)}/{result.total_count} draft cases.")
 
@@ -999,6 +1003,7 @@ def evals_cases_show_cmd(
     print(f"- input_facets: {item.input_facet_count}")
     print(f"- expected_facets: {item.expected_facet_count}")
     print(f"- tools: {', '.join(item.tool_names) if item.tool_names else '-'}")
+    print(f"- capabilities: {', '.join(getattr(item, 'capability_path', None) or []) or '-'}")
 
 
 @evals_app.command("review")
@@ -1096,6 +1101,7 @@ def evals_review_cmd(
         print(f"- input_facets: {item.input_facet_count}")
         print(f"- expected_facets: {item.expected_facet_count}")
         print(f"- tools: {', '.join(item.tool_names) if item.tool_names else '-'}")
+        print(f"- capabilities: {', '.join(getattr(item, 'capability_path', None) or []) or '-'}")
         if manifest_write is not None:
             print(f"Wrote review manifest: {manifest_write.path}")
         print(f"Promote with: ohmo evals promote --case-id {item.case_id}")
@@ -1114,12 +1120,15 @@ def evals_review_cmd(
 
     print("Draft eval cases:")
     for item in result.shown:
-        tools = ",".join(item.tool_names) if item.tool_names else "-"
+        cap_list = getattr(item, "capability_path", None) or []
+        caps = ",".join(cap_list) if cap_list else (
+            ",".join(item.tool_names) if item.tool_names else "-"
+        )
         print(
             f"- {item.case_id} {item.case_kind} "
             f"episode={item.episode_id} "
             f"facets={item.input_facet_count}/{item.expected_facet_count} "
-            f"tools={tools}"
+            f"caps={caps}"
         )
     print(f"Showing {len(result.shown)}/{result.total_count} draft cases.")
     if manifest_write is not None:

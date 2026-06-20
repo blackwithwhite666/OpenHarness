@@ -392,6 +392,7 @@ def test_ohmo_evals_cases_list_command_outputs_metadata_json(
                 "input_facet_count": 1,
                 "expected_facet_count": 2,
                 "tool_names": ["web_fetch"],
+                "capability_path": [],
             }
         ],
     }

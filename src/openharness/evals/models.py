@@ -279,6 +279,7 @@ class EvalCaseCandidate(BaseModel):
     facet_ids: list[str] = Field(default_factory=list)
     event_kind_path: list[str] = Field(default_factory=list)
     tool_path: list[str] = Field(default_factory=list)
+    capability_path: list[str] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("metadata")
@@ -299,6 +300,7 @@ class EvalCaseDraft(BaseModel):
     input_facet_ids: list[str] = Field(default_factory=list)
     expected_facet_ids: list[str] = Field(default_factory=list)
     tool_names: list[str] = Field(default_factory=list)
+    capability_path: list[str] = Field(default_factory=list)
     rubric: list[str] = Field(default_factory=list)
     scorer: str | None = None
     review_status: str = "draft"

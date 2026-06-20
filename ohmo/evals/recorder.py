@@ -12,6 +12,7 @@ from uuid import uuid4
 
 from openharness.channels.bus.events import InboundMessage
 from openharness.evals import EvalEpisode, EvalEvent, EvalStore
+from openharness.evals.tool_labels import effective_tool_label, tool_call_binaries
 from openharness.engine.stream_events import (
     ErrorEvent,
     ToolExecutionCompleted,
@@ -107,12 +108,20 @@ class GatewayEvalRecorder:
         return snapshot
 
     def record_tool_started(self, event: ToolExecutionStarted) -> None:
+        payload: dict[str, Any] = {
+            "input_summary": _summary(event.tool_input),
+            "input": event.tool_input,
+        }
+        # Lift the real capability out of a shell tool's command so the
+        # trajectory is not collapsed to "bash": record which binaries were
+        # invoked and the effective label (e.g. "bash:maps-cli reviews").
+        binaries = tool_call_binaries(event.tool_name, event.tool_input)
+        if binaries:
+            payload["binaries"] = binaries
+            payload["capability"] = effective_tool_label(event.tool_name, event.tool_input)
         self.record_event(
             "tool_started",
-            payload={
-                "input_summary": _summary(event.tool_input),
-                "input": event.tool_input,
-            },
+            payload=payload,
             tool_name=event.tool_name,
             tool_call_id=event.tool_call_id,
         )

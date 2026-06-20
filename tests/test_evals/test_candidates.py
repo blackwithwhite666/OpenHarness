@@ -178,6 +178,43 @@ def test_candidate_and_case_pack_reject_escaped_output_paths(tmp_path: Path):
         write_case_draft_pack(store, records_filename="../escaped.jsonl")
 
 
+def test_candidate_capability_path_lifts_bash_binary_and_subcommand(tmp_path: Path):
+    store = EvalStore(tmp_path / "evals")
+    _add_episode(
+        store,
+        episode_id="ep-bash",
+        user_goal="weather lookup",
+        user_text="погода в спб?",
+        events=[
+            EvalEvent(
+                episode_id="ep-bash",
+                kind="tool_started",
+                tool_name="bash",
+                tool_call_id="c1",
+                payload={"input": {"command": "weather-cli forecast 'СПб' --json"}},
+            ),
+            EvalEvent(
+                episode_id="ep-bash",
+                kind="tool_completed",
+                tool_name="bash",
+                tool_call_id="c1",
+                payload={"output": "ok"},
+            ),
+            EvalEvent(episode_id="ep-bash", kind="gateway_final", payload={"text": "+15"}),
+        ],
+    )
+
+    candidate = build_case_candidates(store)[0]
+    # Real tool name is preserved (replay maps fixtures by it)...
+    assert candidate.tool_path == ["bash"]
+    # ...while the capability is lifted out of the command (binary + subcommand).
+    assert candidate.capability_path == ["bash:weather-cli forecast"]
+
+    draft = build_case_drafts(store, [candidate])[0]
+    assert draft.tool_names == ["bash"]
+    assert draft.capability_path == ["bash:weather-cli forecast"]
+
+
 def _add_episode(
     store: EvalStore,
     *,
