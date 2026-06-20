@@ -85,6 +85,19 @@ def _reply_context(reply) -> tuple[str, dict]:
     return prefix, meta
 
 
+def _media_filename(media_file, ext: str) -> str:
+    """Collision-free on-disk name for a downloaded Telegram media file.
+
+    Use ``file_unique_id`` (stable, distinct per file), NOT ``file_id[:16]``:
+    Telegram ``file_id``s within a chat share a long common prefix, so the old
+    16-char truncation mapped every voice note to a handful of names — a burst
+    of voices overwrote each other on disk and only the last survived.
+    """
+    stem = getattr(media_file, "file_unique_id", None) or getattr(media_file, "file_id", "")
+    stem = re.sub(r"[^A-Za-z0-9_-]", "", stem)[:48] or "media"
+    return f"{stem}{ext}"
+
+
 def _split_table_row(line: str) -> list[str]:
     inner = line.strip()
     if inner.startswith("|"):
@@ -590,36 +603,43 @@ class TelegramChannel(BaseChannel):
 
         # Download media if present
         if media_file and self._app:
+            file_path = None
             try:
                 file = await self._app.bot.get_file(media_file.file_id)
                 ext = self._get_extension(media_type, getattr(media_file, 'mime_type', None))
 
-                # Save to workspace/media/
+                # Save to workspace/media/ under a collision-free name so a burst
+                # of voices does not overwrite each other (see _media_filename).
                 from openharness.channels.impl.base import resolve_channel_media_dir
                 media_dir = resolve_channel_media_dir(self.name)
 
-                file_path = media_dir / f"{media_file.file_id[:16]}{ext}"
+                file_path = media_dir / _media_filename(media_file, ext)
                 await file.download_to_drive(str(file_path))
-
                 media_paths.append(str(file_path))
-
-                # Handle voice transcription
-                if media_type == "voice" or media_type == "audio":
-                    from openharness.providers.transcription import GroqTranscriptionProvider  # noqa: F401
-                    transcriber = GroqTranscriptionProvider(api_key=self.groq_api_key)
-                    transcription = await transcriber.transcribe(file_path)
-                    if transcription:
-                        logger.info("Transcribed %s: %s...", media_type, transcription[:50])
-                        content_parts.append(f"[transcription: {transcription}]")
-                    else:
-                        content_parts.append(f"[{media_type}: {file_path}]")
-                else:
-                    content_parts.append(f"[{media_type}: {file_path}]")
-
-                logger.debug("Downloaded %s to %s", media_type, file_path)
             except Exception as e:
                 logger.error("Failed to download media: %s", e)
                 content_parts.append(f"[{media_type}: download failed]")
+                file_path = None
+
+            if file_path is not None:
+                # Transcription is best-effort and SEPARATE from the download:
+                # a missing local STT must not be reported as "download failed".
+                transcription = None
+                if media_type in ("voice", "audio"):
+                    try:
+                        from openharness.providers.transcription import GroqTranscriptionProvider  # noqa: F401
+                        transcriber = GroqTranscriptionProvider(api_key=self.groq_api_key)
+                        transcription = await transcriber.transcribe(file_path)
+                    except Exception as e:
+                        logger.info("Local transcription unavailable for %s: %s", media_type, e)
+                if transcription:
+                    logger.info("Transcribed %s: %s...", media_type, transcription[:50])
+                    content_parts.append(f"[transcription: {transcription}]")
+                else:
+                    # Carry the per-file path so a coalesced burst stays
+                    # individually addressable (each voice → its own path).
+                    content_parts.append(f"[{media_type}: {file_path}]")
+                logger.debug("Downloaded %s to %s", media_type, file_path)
 
         content = "\n".join(content_parts) if content_parts else "[empty message]"
 

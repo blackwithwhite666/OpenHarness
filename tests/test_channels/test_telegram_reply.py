@@ -2,7 +2,11 @@
 
 from types import SimpleNamespace
 
-from openharness.channels.impl.telegram import _REPLY_QUOTE_MAX, _reply_context
+from openharness.channels.impl.telegram import (
+    _REPLY_QUOTE_MAX,
+    _media_filename,
+    _reply_context,
+)
 
 
 def _reply(*, text=None, caption=None, from_user=None, message_id=42, **media):
@@ -51,3 +55,21 @@ def test_long_quote_is_truncated():
     assert meta["reply_to_text"].endswith("…")
     assert len(meta["reply_to_text"]) == _REPLY_QUOTE_MAX + 1  # cap + ellipsis
     assert "…" in prefix
+
+
+def test_media_filename_distinct_for_prefix_sharing_file_ids():
+    # Telegram file_ids in a chat share a long prefix (the old file_id[:16] bug);
+    # file_unique_id is distinct, so a burst of voices must not collide on disk.
+    a = SimpleNamespace(file_unique_id="AgADu1", file_id="AwACAgIAAxkBAAIIxxxxxxxx")
+    b = SimpleNamespace(file_unique_id="AgADu2", file_id="AwACAgIAAxkBAAIJyyyyyyyy")
+    name_a = _media_filename(a, ".ogg")
+    name_b = _media_filename(b, ".ogg")
+    assert name_a != name_b
+    assert name_a == "AgADu1.ogg"
+
+
+def test_media_filename_falls_back_to_file_id_and_sanitizes():
+    m = SimpleNamespace(file_unique_id=None, file_id="weird/../id with spaces")
+    name = _media_filename(m, ".oga")
+    assert name.endswith(".oga")
+    assert "/" not in name and " " not in name and ".." not in name
