@@ -33,6 +33,7 @@ from openharness.evals.models import (
 )
 from openharness.evals.pack import read_run_pack
 from openharness.evals.store import EvalStore
+from openharness.evals.tool_labels import effective_tool_label
 from openharness.utils.fs import atomic_write_text
 
 _EXECUTION_SCORE_SCHEMA_VERSION = 1
@@ -164,9 +165,79 @@ class ToolTraceOracleV1:
         )
 
 
+class CapabilityTraceOracleV1:
+    """Capability-aware trace/policy oracle for shell-routed tools.
+
+    Scores the effective capability labels observed in a run instead of only
+    the raw tool names. This keeps typed-tool behavior unchanged while making
+    generic shell tools meaningful for agents that route capabilities through
+    command arguments.
+    """
+
+    name = "capability_trace_oracle_v1"
+
+    def __init__(self, *, max_calls_factor: int = 2, max_calls_floor: int = 3) -> None:
+        self._max_calls_factor = max_calls_factor
+        self._max_calls_floor = max_calls_floor
+
+    def score(
+        self,
+        *,
+        context: EvalExecutionContext,
+        executor_result: EvalExecutorResult,
+    ) -> EvalExecutionScorerResult:
+        expected = list(context.case.capability_path)
+        expected_set = set(expected)
+        calls = list(executor_result.tool_calls)
+        observed = [
+            effective_tool_label(call.tool_name, call.arguments)
+            for call in calls
+        ]
+        observed_set = set(observed)
+        unexpected = sorted(
+            {
+                capability
+                for capability in observed
+                if expected_set and capability not in expected_set
+            }
+        )
+        missing = sorted(
+            {
+                capability
+                for capability in expected
+                if capability not in observed_set
+            }
+        )
+        error_count = sum(1 for call in calls if call.is_error)
+        budget = max(len(expected) * self._max_calls_factor, self._max_calls_floor)
+        checks = {
+            "no_unexpected_capabilities": not unexpected,
+            "no_tool_errors": error_count == 0,
+            "within_call_budget": len(calls) <= budget,
+            "expected_capabilities_present": not missing,
+            "used_tools_when_expected": (not expected) or bool(calls),
+        }
+        passed = all(checks.values())
+        return EvalExecutionScorerResult(
+            passed=passed,
+            score=1.0 if passed else 0.0,
+            scorer_name=self.name,
+            metadata={
+                "observed_call_count": len(calls),
+                "expected_capability_count": len(expected),
+                "unexpected_capability_count": len(unexpected),
+                "missing_capability_count": len(missing),
+                "tool_error_count": error_count,
+                "call_budget": budget,
+                **{f"check.{name}": value for name, value in checks.items()},
+            },
+        )
+
+
 EVAL_EXECUTION_SCORERS: dict[str, EvalExecutionScorer] = {
     ExactMatchEvalScorer.name: ExactMatchEvalScorer(),
     ToolTraceOracleV1.name: ToolTraceOracleV1(),
+    CapabilityTraceOracleV1.name: CapabilityTraceOracleV1(),
 }
 
 

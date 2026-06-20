@@ -30,6 +30,9 @@ def test_run_pack_and_smoke_report_are_metadata_only(tmp_path: Path):
         final_text="private pack answer",
     )
     drafts = build_case_drafts(store, build_case_candidates(store))
+    drafts[0] = drafts[0].model_copy(
+        update={"capability_path": ["bash:weather-cli forecast"]}
+    )
     write_case_draft_pack(store, drafts)
     promote_case_drafts(store, case_ids=[drafts[0].case_id], reviewer="reviewer-1")
 
@@ -41,6 +44,7 @@ def test_run_pack_and_smoke_report_are_metadata_only(tmp_path: Path):
     assert pack_write.pack.metadata == {"privacy": "metadata_only", "case_count": 1}
     assert len(pack_write.pack.cases) == 1
     assert pack_write.pack.cases[0].case_id == drafts[0].case_id
+    assert pack_write.pack.cases[0].capability_path == ["bash:weather-cli forecast"]
     assert pack_write.pack.cases[0].metadata["review_status"] == "approved"
 
     assert smoke_write.relative_path == "reports/smoke_report.json"

@@ -33,6 +33,9 @@ def test_promote_case_drafts_writes_metadata_only_gold_cases(tmp_path: Path):
         final_text="second private answer",
     )
     drafts = build_case_drafts(store, build_case_candidates(store))
+    drafts[0] = drafts[0].model_copy(
+        update={"capability_path": ["bash:weather-cli forecast"]}
+    )
     write_case_draft_pack(store, drafts)
     selected_case_id = drafts[0].case_id
 
@@ -49,6 +52,7 @@ def test_promote_case_drafts_writes_metadata_only_gold_cases(tmp_path: Path):
     assert len(gold_cases) == 1
     gold = gold_cases[0]
     assert gold.case_id == selected_case_id
+    assert gold.capability_path == ["bash:weather-cli forecast"]
     assert gold.review_status == "approved"
     assert gold.reviewer == "reviewer-1"
     assert gold.metadata == {

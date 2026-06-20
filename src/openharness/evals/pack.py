@@ -141,6 +141,7 @@ def _pack_case(gold: EvalGoldCase) -> EvalRunPackCase:
         input_facet_ids=gold.input_facet_ids,
         expected_facet_ids=gold.expected_facet_ids,
         tool_names=gold.tool_names,
+        capability_path=gold.capability_path,
         rubric=gold.rubric,
         scorer=gold.scorer,
         metadata={

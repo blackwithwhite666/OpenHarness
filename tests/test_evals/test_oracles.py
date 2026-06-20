@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from openharness.evals import (
+    CapabilityTraceOracleV1,
     EVAL_EXECUTION_SCORERS,
     EvalExecutorResult,
     EvalObservedCall,
@@ -14,9 +15,14 @@ from openharness.evals import (
 )
 
 
-def _ctx(tool_names):
-    """Minimal duck-typed execution context: the oracle reads case.tool_names."""
-    return SimpleNamespace(case=SimpleNamespace(tool_names=list(tool_names)))
+def _ctx(tool_names, capability_path=()):
+    """Minimal duck-typed execution context: the oracles read case fields."""
+    return SimpleNamespace(
+        case=SimpleNamespace(
+            tool_names=list(tool_names),
+            capability_path=list(capability_path),
+        )
+    )
 
 
 def _result(*calls: EvalObservedCall) -> EvalExecutorResult:
@@ -88,10 +94,90 @@ def test_tool_trace_oracle_is_lenient_when_case_declares_no_tools():
     assert out.passed is True
 
 
+def test_capability_trace_oracle_passes_clean_shell_capability():
+    out = CapabilityTraceOracleV1().score(
+        context=_ctx(["bash"], ["bash:weather-cli forecast"]),
+        executor_result=_result(
+            EvalObservedCall(
+                "bash",
+                {"command": "weather-cli forecast 'СПб'"},
+                False,
+            )
+        ),
+    )
+
+    assert out.passed is True
+    assert out.score == 1.0
+    assert out.scorer_name == "capability_trace_oracle_v1"
+    assert out.metadata["observed_call_count"] == 1
+    assert out.metadata["expected_capability_count"] == 1
+    assert out.metadata["unexpected_capability_count"] == 0
+    assert out.metadata["missing_capability_count"] == 0
+    assert out.metadata["tool_error_count"] == 0
+    assert out.metadata["check.no_unexpected_capabilities"] is True
+    assert out.metadata["check.expected_capabilities_present"] is True
+
+
+@pytest.mark.parametrize(
+    ("capability_path", "calls", "failed_check", "count_key"),
+    [
+        (
+            ["bash:weather-cli forecast", "bash:calendar-cli list"],
+            (EvalObservedCall("bash", {"command": "weather-cli forecast 'СПб'"}, False),),
+            "expected_capabilities_present",
+            "missing_capability_count",
+        ),
+        (
+            ["bash:weather-cli forecast"],
+            (
+                EvalObservedCall("bash", {"command": "weather-cli forecast 'СПб'"}, False),
+                EvalObservedCall("bash", {"command": "calendar-cli list"}, False),
+            ),
+            "no_unexpected_capabilities",
+            "unexpected_capability_count",
+        ),
+        (
+            ["bash:weather-cli forecast"],
+            (EvalObservedCall("bash", {"command": "weather-cli forecast 'СПб'"}, True),),
+            "no_tool_errors",
+            "tool_error_count",
+        ),
+        (
+            ["bash:weather-cli forecast"],
+            tuple(
+                EvalObservedCall("bash", {"command": "weather-cli forecast 'СПб'"}, False)
+                for _ in range(4)
+            ),
+            "within_call_budget",
+            "observed_call_count",
+        ),
+    ],
+)
+def test_capability_trace_oracle_flags_trace_violations(
+    capability_path,
+    calls,
+    failed_check,
+    count_key,
+):
+    out = CapabilityTraceOracleV1(max_calls_factor=2, max_calls_floor=3).score(
+        context=_ctx(["bash"], capability_path),
+        executor_result=_result(*calls),
+    )
+
+    assert out.passed is False
+    assert out.score == 0.0
+    assert out.metadata[f"check.{failed_check}"] is False
+    assert out.metadata[count_key] > 0
+
+
 def test_resolve_execution_scorer_known_and_unknown():
     assert (
         resolve_execution_scorer("tool_trace_oracle_v1")
         is EVAL_EXECUTION_SCORERS["tool_trace_oracle_v1"]
+    )
+    assert (
+        resolve_execution_scorer("capability_trace_oracle_v1")
+        is EVAL_EXECUTION_SCORERS["capability_trace_oracle_v1"]
     )
     assert isinstance(resolve_execution_scorer("exact-final-text"), ExactMatchEvalScorer)
     with pytest.raises(ValueError, match="unknown eval scorer"):

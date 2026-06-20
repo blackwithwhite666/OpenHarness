@@ -15,6 +15,7 @@ from openharness.evals.compare import (
 )
 from openharness.evals.embeddings import EvalEmbeddingIndexWrite, write_embedding_index
 from openharness.evals.execution import (
+    CapabilityTraceOracleV1,
     EVAL_EXECUTION_SCORERS,
     EvalExecutionReportWrite,
     EvalExecutionScorer,
@@ -113,6 +114,7 @@ __all__ = [
     "EvalExecutor",
     "EvalExecutorResult",
     "EvalObservedCall",
+    "CapabilityTraceOracleV1",
     "ExactMatchEvalScorer",
     "ToolTraceOracleV1",
     "EVAL_EXECUTION_SCORERS",
