@@ -24,6 +24,7 @@ from openharness.evals import (
     build_case_candidates,
     build_case_drafts,
     promote_case_drafts,
+    resolve_execution_scorer,
     run_execution_report,
     run_replay_report,
     write_case_draft_pack,
@@ -328,6 +329,88 @@ def test_execution_report_query_engine_runner_uses_reconstructed_prompt_and_repl
     assert "private model prompt" not in serialized
     assert "private raw tool output" not in serialized
     assert "model final from replayed tool" not in serialized
+
+
+def test_query_engine_capability_oracle_gates_command_regression(tmp_path: Path):
+    """The query-engine runner + capability oracle is a real model-regression gate.
+
+    On a shell-routed agent every capability runs through ``bash``, so the
+    name-based ``tool_trace_oracle_v1`` is blind to a capability regression
+    (right tool, wrong command). ``capability_trace_oracle_v1`` judges the
+    effective capability and catches it. This proves the gate is not just
+    golden-sanity.
+    """
+    store = EvalStore(tmp_path / "evals")
+    _add_episode(
+        store,
+        episode_id="ep-1",
+        user_text="private weather request",
+        final_text="private weather answer",
+        tool_name="bash",
+        tool_input={"command": "weather-cli forecast 'СПб'"},
+    )
+    drafts = build_case_drafts(store, build_case_candidates(store))
+    write_case_draft_pack(store, drafts)
+    promote_case_drafts(store, case_ids=[drafts[0].case_id])
+    pack = write_run_pack(store).pack
+    assert pack.cases[0].capability_path == ["bash:weather-cli forecast"]
+    assert pack.cases[0].tool_names == ["bash"]
+
+    def _run(*, command: str, scorer: str, report_filename: str):
+        return run_execution_report(
+            store,
+            pack=pack,
+            report_filename=report_filename,
+            executor=ReplayToolsExecutor(
+                agent_runner=QueryEngineEvalAgentRunner(
+                    api_client=_ScriptedBashModelApiClient(
+                        command=command, final_text="private weather answer"
+                    ),
+                    model="eval-model",
+                    system_prompt="eval system",
+                    cwd=tmp_path,
+                )
+            ),
+            scorer=resolve_execution_scorer(scorer),
+        )
+
+    # 1. Correct capability — the model calls the expected command → passes.
+    correct = _run(
+        command="weather-cli forecast 'СПб'",
+        scorer="capability_trace_oracle_v1",
+        report_filename="eval_report_correct.json",
+    )
+    assert correct.report.passed_count == 1
+
+    # 2. Capability regression — right tool (bash), wrong command → fails the
+    #    capability oracle, even though the tool sequence still matches.
+    regression = _run(
+        command="python3 -c 'print(2+2)'",
+        scorer="capability_trace_oracle_v1",
+        report_filename="eval_report_regress.json",
+    )
+    assert regression.report.passed_count == 0
+    assert regression.report.failed_count == 1
+    case = regression.report.cases[0]
+    assert case.checks["final_output_matches"] is False
+    assert case.checks["tool_sequence_matches"] is True
+
+    # 3. Blind-spot contrast — the SAME regression passes the name-based oracle,
+    #    because the observed tool name is still "bash". This is the punchline.
+    blind = _run(
+        command="python3 -c 'print(2+2)'",
+        scorer="tool_trace_oracle_v1",
+        report_filename="eval_report_blind.json",
+    )
+    assert blind.report.passed_count == 1
+
+    # Reports stay metadata-only: no raw commands or user/final text leak.
+    for write in (correct, regression, blind):
+        serialized = write.path.read_text(encoding="utf-8")
+        assert "'СПб'" not in serialized
+        assert "print(2+2)" not in serialized
+        assert "private weather request" not in serialized
+        assert "private weather answer" not in serialized
 
 
 def test_execution_report_executor_gets_transient_text_but_report_omits_it(
@@ -722,6 +805,44 @@ class _RecordingReplayApiClient:
         )
 
 
+class _ScriptedBashModelApiClient:
+    """Fake model: first calls ``bash`` with a fixed command, then answers.
+
+    Lets a test pin exactly which shell command the model emits, so a capability
+    regression (right tool, wrong command) can be reproduced deterministically.
+    """
+
+    def __init__(self, *, command: str, final_text: str) -> None:
+        self._command = command
+        self._final_text = final_text
+        self.requests = []
+
+    async def stream_message(self, request):
+        self.requests.append(request)
+        if len(self.requests) == 1:
+            yield ApiMessageCompleteEvent(
+                message=ConversationMessage(
+                    role="assistant",
+                    content=[
+                        ToolUseBlock(
+                            id="toolu-bash-1",
+                            name="bash",
+                            input={"command": self._command},
+                        )
+                    ],
+                ),
+                usage=UsageSnapshot(input_tokens=1, output_tokens=1),
+            )
+            return
+        yield ApiMessageCompleteEvent(
+            message=ConversationMessage(
+                role="assistant",
+                content=[TextBlock(text=self._final_text)],
+            ),
+            usage=UsageSnapshot(input_tokens=1, output_tokens=1),
+        )
+
+
 def _add_episode(
     store: EvalStore,
     *,
@@ -729,6 +850,7 @@ def _add_episode(
     user_text: str,
     final_text: str,
     tool_name: str | None = None,
+    tool_input: dict | None = None,
 ) -> None:
     store.append_episode(
         EvalEpisode(
@@ -748,7 +870,11 @@ def _add_episode(
                 tool_call_id="tool-1",
                 payload={
                     "input_summary": "private tool input",
-                    "input": {"query": "private raw tool input"},
+                    "input": (
+                        {"query": "private raw tool input"}
+                        if tool_input is None
+                        else tool_input
+                    ),
                 },
             )
         )

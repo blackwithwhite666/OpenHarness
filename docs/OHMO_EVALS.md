@@ -191,6 +191,18 @@ semantic or model-judge scorers must implement the scorer contract and return
 metadata-only results; raw scorer notes, prompts, tool inputs, tool outputs, and
 final answers must not be copied into reports.
 
+Two deterministic trace/policy oracles are also available via `--scorer`:
+`tool_trace_oracle_v1` (judges the trace by raw tool name) and
+`capability_trace_oracle_v1` (judges the effective capability —
+`bash:<binary> <subcommand>` lifted from the command string). For a shell-routed
+agent like ohmo, where every capability runs through one `bash` tool, prefer
+`--agent-runner query-engine --scorer capability_trace_oracle_v1`:
+`tool_trace_oracle_v1` is name-based and stays green when the model calls `bash`
+with the wrong command (a capability regression), because the tool name is still
+`bash`. The capability oracle catches it. Under the scripted runner both oracles
+are golden-sanity (the observed trace equals the recorded one); the query-engine
+runner is what turns them into a model-regression gate.
+
 `observed_trace` is metadata-only. Executor outputs are treated as untrusted:
 event and tool labels are sanitized, final output is stored as hash and length,
 and executor metadata values are not copied into reports.
