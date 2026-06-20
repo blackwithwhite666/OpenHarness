@@ -21,6 +21,7 @@ from openharness.evals import (
 )
 
 from ohmo.evals.adapter import get_eval_store
+from ohmo.prompts import build_ohmo_system_prompt
 
 
 @dataclass(frozen=True)
@@ -60,7 +61,6 @@ _SUPPORTED_EXECUTORS = {
     "replay_tools": ReplayToolsExecutor,
 }
 _SUPPORTED_AGENT_RUNNERS = set(SUPPORTED_EVAL_AGENT_RUNNER_NAMES)
-_DEFAULT_QUERY_ENGINE_SYSTEM_PROMPT = "You are running an Ohmo replay-only eval."
 
 
 def run_ohmo_eval_report(
@@ -74,7 +74,7 @@ def run_ohmo_eval_report(
     agent_runner_name: str = "scripted",
     model: str | None = None,
     provider_profile: str | None = None,
-    system_prompt: str = _DEFAULT_QUERY_ENGINE_SYSTEM_PROMPT,
+    system_prompt: str | None = None,
     scorer: str | None = None,
 ) -> OhmoEvalRunResult:
     """Run deterministic replay-tools execution checks over an Ohmo eval pack."""
@@ -115,7 +115,7 @@ def check_ohmo_eval_run_config(
     agent_runner_name: str = "scripted",
     model: str | None = None,
     provider_profile: str | None = None,
-    system_prompt: str = _DEFAULT_QUERY_ENGINE_SYSTEM_PROMPT,
+    system_prompt: str | None = None,
     scorer: str | None = None,
 ) -> OhmoEvalRunConfigCheckResult:
     """Validate an eval run configuration without executing eval cases."""
@@ -173,7 +173,7 @@ def _build_agent_runner(
     workspace: Path | None,
     model: str | None,
     provider_profile: str | None,
-    system_prompt: str,
+    system_prompt: str | None,
 ) -> ReplayScriptAgentRunner | QueryEngineEvalAgentRunner:
     return _build_agent_runner_config(
         agent_runner_name,
@@ -190,7 +190,7 @@ def _build_agent_runner_config(
     workspace: Path | None,
     model: str | None,
     provider_profile: str | None,
-    system_prompt: str,
+    system_prompt: str | None,
 ) -> _AgentRunnerConfig:
     normalized = agent_runner_name.strip().lower()
     if normalized not in _SUPPORTED_AGENT_RUNNERS:
@@ -217,11 +217,15 @@ def _build_agent_runner_config(
         raise ValueError(
             "query-engine eval runner requires configured API authentication"
         ) from exc
+    resolved_prompt = system_prompt or build_ohmo_system_prompt(
+        workspace or Path.cwd(),
+        workspace=workspace,
+    )
     return _AgentRunnerConfig(
         agent_runner=QueryEngineEvalAgentRunner(
             api_client=api_client,
             model=settings.model,
-            system_prompt=system_prompt,
+            system_prompt=resolved_prompt,
             cwd=workspace,
         ),
         agent_runner_name="query-engine",

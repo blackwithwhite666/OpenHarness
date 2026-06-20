@@ -1302,10 +1302,10 @@ def evals_run_cmd(
         "--profile",
         help="Provider profile override for --agent-runner query-engine",
     ),
-    system_prompt: str = typer.Option(
-        "You are running an Ohmo replay-only eval.",
+    system_prompt: str | None = typer.Option(
+        None,
         "--system-prompt",
-        help="System prompt for --agent-runner query-engine",
+        help="Override ohmo's real system prompt for --agent-runner query-engine",
     ),
     report_only: bool = typer.Option(
         False,

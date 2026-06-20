@@ -12,6 +12,7 @@ from ohmo.evals import (
     run_ohmo_eval_report,
     write_ohmo_eval_mine,
 )
+from ohmo.evals.runner import _build_agent_runner
 
 
 def test_run_ohmo_eval_report_writes_metadata_replay_report(tmp_path: Path):
@@ -153,6 +154,62 @@ def test_check_ohmo_eval_run_config_query_engine_auth_error_is_value_error(
             workspace=tmp_path / "workspace",
             agent_runner_name="query-engine",
         )
+
+
+def test_build_query_engine_runner_uses_real_prompt_by_default(
+    tmp_path: Path,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        "ohmo.evals.runner.resolve_api_client_from_settings",
+        lambda settings: object(),
+    )
+    monkeypatch.setattr(
+        "ohmo.evals.runner.build_ohmo_system_prompt",
+        lambda *args, **kwargs: "REAL_OHMO_PROMPT",
+    )
+
+    runner = _build_agent_runner(
+        "query-engine",
+        workspace=tmp_path,
+        model=None,
+        provider_profile=None,
+        system_prompt=None,
+    )
+
+    assert runner._system_prompt == "REAL_OHMO_PROMPT"
+
+
+def test_build_query_engine_runner_keeps_system_prompt_override(
+    tmp_path: Path,
+    monkeypatch,
+):
+    build_prompt_calls = 0
+
+    def fake_build_ohmo_system_prompt(*args, **kwargs):
+        nonlocal build_prompt_calls
+        build_prompt_calls += 1
+        return "REAL_OHMO_PROMPT"
+
+    monkeypatch.setattr(
+        "ohmo.evals.runner.resolve_api_client_from_settings",
+        lambda settings: object(),
+    )
+    monkeypatch.setattr(
+        "ohmo.evals.runner.build_ohmo_system_prompt",
+        fake_build_ohmo_system_prompt,
+    )
+
+    runner = _build_agent_runner(
+        "query-engine",
+        workspace=tmp_path,
+        model=None,
+        provider_profile=None,
+        system_prompt="custom override",
+    )
+
+    assert runner._system_prompt == "custom override"
+    assert build_prompt_calls == 0
 
 
 def test_run_ohmo_eval_report_query_engine_auth_error_is_value_error(
