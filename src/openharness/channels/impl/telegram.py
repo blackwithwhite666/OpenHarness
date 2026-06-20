@@ -35,6 +35,55 @@ TELEGRAM_MAX_MESSAGE_LEN = 4000  # Telegram message character limit
 
 _TABLE_ROW_RE = re.compile(r"^\s*\|(.+)\|\s*$")
 
+_REPLY_QUOTE_MAX = 500  # cap the quoted antecedent inlined into the agent prompt
+
+
+def _reply_context(reply) -> tuple[str, dict]:
+    """Build an inline quote prefix + metadata from a replied-to message.
+
+    Telegram delivers a reply (``reply_to_message``) without inlining the quoted
+    message, so a bare follow-up like "а тут?" reaches the agent with no
+    antecedent. Surfacing the quoted text + author lets the agent resolve the
+    reference instead of hallucinating. Returns ``("", {})`` when there is no
+    reply.
+    """
+    if reply is None:
+        return "", {}
+    author_user = getattr(reply, "from_user", None)
+    if author_user is None:
+        author = "unknown"
+    elif getattr(author_user, "is_bot", False):
+        author = "you (the bot)"
+    else:
+        author = (
+            getattr(author_user, "first_name", None)
+            or getattr(author_user, "username", None)
+            or "user"
+        )
+    quoted = (getattr(reply, "text", None) or getattr(reply, "caption", None) or "").strip()
+    if not quoted:
+        for attr, label in (
+            ("photo", "photo"),
+            ("voice", "voice"),
+            ("audio", "audio"),
+            ("document", "file"),
+            ("sticker", "sticker"),
+            ("video", "video"),
+        ):
+            if getattr(reply, attr, None):
+                quoted = f"[{label}]"
+                break
+    if not quoted:
+        quoted = "[no text]"
+    if len(quoted) > _REPLY_QUOTE_MAX:
+        quoted = quoted[:_REPLY_QUOTE_MAX] + "…"
+    prefix = f'[In reply to {author}: "{quoted}"]'
+    meta = {
+        "reply_to_message_id": getattr(reply, "message_id", None),
+        "reply_to_text": quoted,
+    }
+    return prefix, meta
+
 
 def _split_table_row(line: str) -> list[str]:
     inner = line.strip()
@@ -574,6 +623,12 @@ class TelegramChannel(BaseChannel):
 
         content = "\n".join(content_parts) if content_parts else "[empty message]"
 
+        # Surface the replied-to message so a bare follow-up ("а тут?") carries
+        # its antecedent into the agent prompt instead of arriving context-free.
+        reply_prefix, reply_meta = _reply_context(getattr(message, "reply_to_message", None))
+        if reply_prefix:
+            content = f"{reply_prefix}\n{content}"
+
         logger.debug("Telegram message from %s: %s...", sender_id, content[:50])
 
         str_chat_id = str(chat_id)
@@ -589,6 +644,7 @@ class TelegramChannel(BaseChannel):
                         "message_id": message.message_id, "user_id": user.id,
                         "username": user.username, "first_name": user.first_name,
                         "is_group": message.chat.type != "private",
+                        **reply_meta,
                     },
                 }
                 self._start_typing(str_chat_id)
@@ -614,7 +670,8 @@ class TelegramChannel(BaseChannel):
                 "user_id": user.id,
                 "username": user.username,
                 "first_name": user.first_name,
-                "is_group": message.chat.type != "private"
+                "is_group": message.chat.type != "private",
+                **reply_meta,
             }
         )
 
