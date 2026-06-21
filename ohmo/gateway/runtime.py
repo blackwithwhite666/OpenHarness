@@ -453,6 +453,12 @@ class OhmoSessionRuntimePool:
             raise
         finally:
             if recorder is not None:
+                try:
+                    recorder.record_resource_snapshot(
+                        workspace=self._workspace, bundle=bundle, phase="world_after"
+                    )
+                except Exception:
+                    logger.exception("ohmo eval world_after snapshot failed")
                 recorder.finish(status=episode_status)
 
     async def _stream_command_result(

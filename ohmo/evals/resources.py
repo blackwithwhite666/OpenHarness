@@ -39,6 +39,8 @@ from ohmo.workspace import (
 
 _RESOURCE_ID_SAFE = re.compile(r"[^A-Za-z0-9_.:-]+")
 _DIRECTORY_AGGREGATE_ENTRY_LIMIT = 5000
+_SNAPSHOT_PHASES = frozenset({"world_before", "world_after"})
+_TODO_ITEM_RE = re.compile(r"^\s*[-*]\s+(?:\[[ xX]\]\s+)?(.+?)\s*$")
 
 
 @dataclass(frozen=True)
@@ -95,14 +97,17 @@ def write_ohmo_resource_snapshot(
     episode_id: str,
     workspace: str | Path | None,
     bundle: Any | None = None,
+    phase: str = "world_before",
 ) -> ResourceSnapshotWrite:
     """Write the episode resource snapshot under ``states/<episode_id>/``."""
+    if phase not in _SNAPSHOT_PHASES:
+        raise ValueError(f"unknown snapshot phase: {phase!r}")
     manifest = build_ohmo_resource_snapshot(
         episode_id=episode_id,
         workspace=workspace,
         bundle=bundle,
     )
-    path = store.root / "states" / episode_id / "resource_snapshot.json"
+    path = store.root / "states" / episode_id / f"{phase}.json"
     atomic_write_text(path, manifest.model_dump_json(indent=2) + "\n")
 
     relative_path = path.relative_to(store.root).as_posix()
@@ -190,6 +195,8 @@ def _filesystem_resource(
         metadata["total_size_bytes"] = stat_result.st_size
         metadata["newest_mtime_ns"] = stat_result.st_mtime_ns
         metadata["parse_status"] = "not_applicable"
+    if actual_kind in {"directory", "file"}:
+        metadata.update(_state_key_metadata(name, absolute_path))
 
     return EvalResource(
         resource_id=resource_id,
@@ -274,6 +281,96 @@ def _json_parse_metadata(path: Path, *, include_count: bool) -> dict[str, Any]:
     if include_count and isinstance(raw, (dict, list)):
         metadata["record_count"] = len(raw)
     return metadata
+
+
+def _state_key_metadata(name: str, path: Path) -> dict[str, Any]:
+    """Return metadata-only state keys for resources with structured private state."""
+    try:
+        if name == "reminders_json":
+            return _reminders_state_key_metadata(path)
+        if name == "memory_dir":
+            return _memory_state_key_metadata(path)
+        if name == "todos_dir":
+            return _todos_state_key_metadata(path)
+    except Exception:
+        return {"state_keys_status": "error"}
+    return {}
+
+
+def _stable_key(parts: list[Any]) -> str:
+    encoded = json.dumps(
+        parts,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()[:16]
+
+
+def _reminders_state_key_metadata(path: Path) -> dict[str, Any]:
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(raw, list):
+        return {}
+
+    entry_keys: set[str] = set()
+    status_counts: dict[str, int] = {}
+    for item in raw:
+        if not isinstance(item, Mapping):
+            continue
+        entry_keys.add(
+            _stable_key(
+                [
+                    _mapping_field(item, "mode"),
+                    _mapping_field(item, "tz"),
+                    _mapping_field(item, "dtstart"),
+                    _mapping_field(item, "rrule"),
+                    _mapping_field(item, "channel"),
+                    _mapping_field(item, "chat_id"),
+                ]
+            )
+        )
+        status = _mapping_field(item, "status")
+        status_counts[status] = status_counts.get(status, 0) + 1
+    return {
+        "entry_keys": sorted(entry_keys),
+        "status_counts": dict(sorted(status_counts.items())),
+    }
+
+
+def _mapping_field(item: Mapping[str, Any], key: str) -> str:
+    value = item.get(key)
+    return "" if value is None else str(value)
+
+
+def _memory_state_key_metadata(path: Path) -> dict[str, Any]:
+    if not path.is_dir():
+        return {}
+    entry_keys = sorted(
+        child.stem for child in path.iterdir() if child.is_file() and child.suffix == ".md"
+    )
+    return {"entry_keys": entry_keys, "entry_count": len(entry_keys)}
+
+
+def _todos_state_key_metadata(path: Path) -> dict[str, Any]:
+    if not path.is_dir():
+        return {}
+
+    entry_keys: set[str] = set()
+    entry_count = 0
+    for item_path in sorted(path.glob("*.md")):
+        if not item_path.is_file():
+            continue
+        for line in item_path.read_text(encoding="utf-8").splitlines():
+            match = _TODO_ITEM_RE.match(line)
+            if match is None:
+                continue
+            normalized = " ".join(match.group(1).strip().split()).lower()
+            if not normalized:
+                continue
+            entry_count += 1  # Total parsed items before hash de-duplication.
+            entry_keys.add(_stable_key([normalized]))
+
+    return {"entry_keys": sorted(entry_keys), "entry_count": entry_count}
 
 
 def _runtime_tool_resources(bundle: Any | None) -> list[EvalResource]:

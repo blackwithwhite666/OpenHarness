@@ -67,9 +67,12 @@ def _single_eval_episode(workspace: Path):
     return episode, list(store.iter_events(episode_ids[0]))
 
 
-def _assert_resource_snapshot_event(workspace: Path, episode, event, *, tool_count: int):
+def _assert_resource_snapshot_event(
+    workspace: Path, episode, event, *, phase: str = "world_before", tool_count: int
+):
     assert event.kind == "resource_snapshot"
-    assert event.payload["path"] == f"states/{episode.episode_id}/resource_snapshot.json"
+    assert event.payload["path"] == f"states/{episode.episode_id}/{phase}.json"
+    assert event.payload["phase"] == phase
     assert event.payload["resource_count"] >= event.payload["local_resource_count"]
     assert event.payload["local_resource_count"] >= 16
     assert event.payload["tool_count"] == tool_count
@@ -570,9 +573,13 @@ async def test_runtime_pool_records_eval_episode_for_tool_turn(tmp_path, monkeyp
         "tool_started",
         "tool_completed",
         "gateway_final",
+        "resource_snapshot",
         "episode_finished",
     ]
     _assert_resource_snapshot_event(workspace, episode, events[1], tool_count=0)
+    _assert_resource_snapshot_event(
+        workspace, episode, events[5], phase="world_after", tool_count=0
+    )
     assert events[2].tool_name == "web_fetch"
     assert events[2].tool_call_id == "toolu_abc123"
     assert events[2].payload["input"]["url"] == "https://example.com"
@@ -582,7 +589,7 @@ async def test_runtime_pool_records_eval_episode_for_tool_turn(tmp_path, monkeyp
     assert events[3].is_error is False
     assert events[3].payload["output"] == "ok"
     assert events[4].payload["text"] == "done"
-    assert events[5].payload == {"status": "completed"}
+    assert events[6].payload == {"status": "completed"}
 
 
 def _install_fake_tool_turn(monkeypatch, tmp_path, *, session_id):
@@ -755,12 +762,16 @@ async def test_runtime_pool_records_eval_episode_for_command_only_final(tmp_path
         "inbound_message",
         "resource_snapshot",
         "gateway_final",
+        "resource_snapshot",
         "episode_finished",
     ]
     _assert_resource_snapshot_event(workspace, episode, events[1], tool_count=0)
+    _assert_resource_snapshot_event(
+        workspace, episode, events[3], phase="world_after", tool_count=0
+    )
     assert events[2].payload["text"] == "pong"
     assert events[2].payload["metadata"]["_command"] is True
-    assert events[3].payload == {"status": "completed"}
+    assert events[4].payload == {"status": "completed"}
 
 
 @pytest.mark.asyncio

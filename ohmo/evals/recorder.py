@@ -89,17 +89,20 @@ class GatewayEvalRecorder:
         *,
         workspace: str | Path | None,
         bundle: Any | None,
+        phase: str = "world_before",
     ) -> ResourceSnapshotWrite:
         snapshot = write_ohmo_resource_snapshot(
             store=self.store,
             episode_id=self.episode_id,
             workspace=workspace,
             bundle=bundle,
+            phase=phase,
         )
         self.record_event(
             "resource_snapshot",
             payload={
                 "path": snapshot.relative_path,
+                "phase": phase,
                 "resource_count": snapshot.resource_count,
                 "local_resource_count": snapshot.local_resource_count,
                 "tool_count": snapshot.tool_count,

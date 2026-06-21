@@ -4,6 +4,8 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 import ohmo.evals.resources as eval_resources
 from ohmo.evals import get_eval_store, write_ohmo_resource_snapshot
 from ohmo.workspace import (
@@ -109,7 +111,7 @@ def test_ohmo_resource_snapshot_writes_metadata_only_manifest(tmp_path: Path):
         bundle=SimpleNamespace(tool_registry=FakeToolRegistry()),
     )
 
-    assert result.relative_path == "states/episode-1/resource_snapshot.json"
+    assert result.relative_path == "states/episode-1/world_before.json"
     assert result.path == store.root / result.relative_path
     assert result.path.is_file()
     assert result.resource_count == len(result.manifest.resources)
@@ -219,3 +221,142 @@ def test_directory_snapshot_caps_recursive_scan_without_path_leaks(
     assert "secret-nested-dir" not in manifest_text
     assert "private-memory-" not in manifest_text
     assert "secret memory" not in manifest_text
+
+
+def test_state_key_metadata_for_reminders_is_private(tmp_path: Path):
+    workspace = tmp_path / ".ohmo-home"
+    initialize_workspace(workspace)
+    get_reminders_path(workspace).write_text(
+        json.dumps(
+            [
+                {
+                    "id": "reminder-1",
+                    "channel": "telegram",
+                    "chat_id": "chat-1",
+                    "mode": "static",
+                    "tz": "UTC",
+                    "dtstart": "2026-01-02T09:00:00+00:00",
+                    "rrule": None,
+                    "status": "active",
+                    "summary": "secret dentist appointment",
+                },
+                {
+                    "id": "reminder-2",
+                    "channel": "telegram",
+                    "chat_id": "chat-1",
+                    "mode": "static",
+                    "tz": "UTC",
+                    "dtstart": "2026-01-03T09:00:00+00:00",
+                    "rrule": None,
+                    "status": "done",
+                    "summary": "secret renewal note",
+                },
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    manifest = eval_resources.build_ohmo_resource_snapshot(
+        episode_id="episode-reminders",
+        workspace=workspace,
+    )
+
+    resources = {resource.resource_id: resource for resource in manifest.resources}
+    metadata = resources["ohmo.workspace.reminders_json"].metadata
+    assert metadata["record_count"] == 2
+    assert metadata["status_counts"] == {"active": 1, "done": 1}
+    assert len(metadata["entry_keys"]) == 2
+    assert all(_is_hex16(key) for key in metadata["entry_keys"])
+
+    serialized = manifest.model_dump_json()
+    assert "secret dentist appointment" not in serialized
+    assert "secret renewal note" not in serialized
+
+
+def test_state_key_metadata_for_memory_uses_stems_only(tmp_path: Path):
+    workspace = tmp_path / ".ohmo-home"
+    initialize_workspace(workspace)
+    memory_dir = get_memory_dir(workspace)
+    (memory_dir / "project_alpha.md").write_text("private alpha body", encoding="utf-8")
+    (memory_dir / "project_beta.md").write_text("private beta body", encoding="utf-8")
+
+    manifest = eval_resources.build_ohmo_resource_snapshot(
+        episode_id="episode-memory",
+        workspace=workspace,
+    )
+
+    resources = {resource.resource_id: resource for resource in manifest.resources}
+    metadata = resources["ohmo.workspace.memory_dir"].metadata
+    expected_stems = sorted(
+        child.stem
+        for child in memory_dir.iterdir()
+        if child.is_file() and child.suffix == ".md"
+    )
+    assert metadata["entry_keys"] == expected_stems
+    assert metadata["entry_count"] == len(expected_stems)
+
+
+def test_state_key_metadata_for_todos_hashes_items(tmp_path: Path):
+    workspace = tmp_path / ".ohmo-home"
+    initialize_workspace(workspace)
+    todos_dir = workspace / "todos"
+    todos_dir.mkdir()
+    (todos_dir / "list-1.md").write_text(
+        "# TODO\n- [ ] Call Alice about the private plan\n- [x] Buy secret supplies\n",
+        encoding="utf-8",
+    )
+
+    manifest = eval_resources.build_ohmo_resource_snapshot(
+        episode_id="episode-todos",
+        workspace=workspace,
+    )
+
+    resources = {resource.resource_id: resource for resource in manifest.resources}
+    metadata = resources["ohmo.workspace.todos_dir"].metadata
+    assert metadata["entry_count"] == 2
+    assert len(metadata["entry_keys"]) == 2
+    assert all(_is_hex16(key) for key in metadata["entry_keys"])
+
+    serialized = manifest.model_dump_json()
+    assert "Call Alice about the private plan" not in serialized
+    assert "Buy secret supplies" not in serialized
+
+
+def test_resource_snapshot_phase_paths_and_validation(tmp_path: Path):
+    workspace = tmp_path / ".ohmo-home"
+    initialize_workspace(workspace)
+    store = get_eval_store(workspace)
+
+    before = write_ohmo_resource_snapshot(
+        store=store,
+        episode_id="episode-phases",
+        workspace=workspace,
+        phase="world_before",
+    )
+    after = write_ohmo_resource_snapshot(
+        store=store,
+        episode_id="episode-phases",
+        workspace=workspace,
+        phase="world_after",
+    )
+
+    assert before.relative_path == "states/episode-phases/world_before.json"
+    assert after.relative_path == "states/episode-phases/world_after.json"
+    assert before.path.is_file()
+    assert after.path.is_file()
+
+    with pytest.raises(ValueError, match="unknown snapshot phase"):
+        write_ohmo_resource_snapshot(
+            store=store,
+            episode_id="episode-phases",
+            workspace=workspace,
+            phase="../unsafe",
+        )
+
+
+def _is_hex16(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 16
+        and all(char in "0123456789abcdef" for char in value)
+    )
