@@ -215,6 +215,15 @@ def get_sessions_dir(workspace: str | Path | None = None) -> Path:
     return get_workspace_root(workspace) / "sessions"
 
 
+def get_work_dir(workspace: str | Path | None = None) -> Path:
+    """Root of the per-chat scratch/work dirs (``~/.ohmo/work/<token>/``).
+
+    Each unbound chat runs with its own subdir here as cwd, so transient files
+    (diagrams, downloads, scratch) stay isolated per chat instead of colliding in
+    the shared workspace root."""
+    return get_workspace_root(workspace) / "work"
+
+
 def get_logs_dir(workspace: str | Path | None = None) -> Path:
     return get_workspace_root(workspace) / "logs"
 

@@ -317,7 +317,7 @@ async def test_runtime_pool_uses_managed_group_cwd_binding(tmp_path, monkeypatch
     )
     bundle = await pool.get_bundle(
         "feishu:oc_group:ou_user",
-        cwd=pool._cwd_for_message(message),
+        cwd=pool._cwd_for_message(message, "feishu:oc_group:ou_user"),
     )
 
     assert captured["cwd"] == str(project.resolve())

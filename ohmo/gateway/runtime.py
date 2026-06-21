@@ -48,7 +48,12 @@ from ohmo.memory_tool import OhmoMemoryTool
 from ohmo.prompts import build_ohmo_system_prompt
 from ohmo.reminders.store import ReminderStore
 from ohmo.reminders.tool import RemindCancelTool, RemindCreateTool, RemindListTool
-from ohmo.session_storage import OhmoSessionBackend
+from ohmo.session_storage import (
+    OhmoSessionBackend,
+    clear_session_work_dir,
+    get_session_work_dir,
+    reap_stale_work_dirs,
+)
 from ohmo.todo_store import TodoStore
 from ohmo.todo_write_tool import OhmoTodoWriteTool
 from ohmo.workspace import get_plugins_dir, get_skills_dir, initialize_workspace
@@ -155,6 +160,9 @@ class OhmoSessionRuntimePool:
         self._reminder_store = ReminderStore(workspace=self._workspace)
         self._reminder_lock = asyncio.Lock()
         self._bundles: dict[str, RuntimeBundle] = {}
+        reaped = reap_stale_work_dirs(self._workspace)
+        if reaped:
+            logger.info("ohmo runtime reaped %d stale per-chat work dir(s) at startup", reaped)
 
     @property
     def active_sessions(self) -> int:
@@ -284,6 +292,16 @@ class OhmoSessionRuntimePool:
         # and clearing the snapshot above means the next message mints a FRESH
         # session_id → a brand-new empty list. The previous conversation's list
         # file is kept on disk (the agent can still be pointed back at it).
+        # Wipe this chat's scratch/work dir so /new starts on a clean cwd (it is
+        # recreated lazily on the next write).
+        try:
+            clear_session_work_dir(session_key, self._workspace)
+        except Exception:  # noqa: BLE001 — reset must never fail
+            logger.warning(
+                "ohmo runtime reset work-dir clear failed session_key=%s",
+                session_key,
+                exc_info=True,
+            )
         logger.info("ohmo runtime session reset session_key=%s had_bundle=%s", session_key, had_bundle)
         return had_bundle
 
@@ -292,7 +310,7 @@ class OhmoSessionRuntimePool:
         user_message = _build_inbound_user_message(message)
         user_prompt = user_message.text
         command_prompt = (message.content or "").strip()
-        session_cwd = self._cwd_for_message(message)
+        session_cwd = self._cwd_for_message(message, session_key)
         bundle = await self.get_bundle(session_key, latest_user_prompt=user_prompt, cwd=session_cwd)
         engine_metadata = getattr(bundle.engine, "tool_metadata", None)
         if isinstance(engine_metadata, dict):
@@ -912,7 +930,11 @@ class OhmoSessionRuntimePool:
             include_project_memory=False,
         )
 
-    def _cwd_for_message(self, message: InboundMessage) -> str:
+    def _cwd_for_message(self, message: InboundMessage, session_key: str) -> str:
+        # A /group-bound chat runs in its deliberately-bound project/repo cwd.
+        # Every other (unbound) chat gets its OWN per-chat scratch dir as cwd, so
+        # transient output (diagrams, downloads, scratch) is isolated per chat and
+        # reaped on /new — instead of all chats sharing the workspace root.
         record = load_managed_group_record(
             workspace=self._workspace,
             channel=message.channel,
@@ -920,7 +942,7 @@ class OhmoSessionRuntimePool:
         )
         cwd = record.get("cwd") if record else None
         if not cwd:
-            return self._cwd
+            return str(get_session_work_dir(session_key, self._workspace))
         normalized = normalize_cwd(str(cwd))
         if not Path(normalized).is_dir():
             logger.warning(
@@ -929,7 +951,7 @@ class OhmoSessionRuntimePool:
                 message.chat_id,
                 normalized,
             )
-            return self._cwd
+            return str(get_session_work_dir(session_key, self._workspace))
         return normalized
 
     def _register_gateway_tools(self, bundle: RuntimeBundle) -> None:

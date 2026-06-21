@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import shutil
 import time
 from pathlib import Path
 from typing import Any
@@ -18,7 +19,7 @@ from openharness.services.session_storage import (
 )
 from openharness.utils.fs import atomic_write_text
 
-from ohmo.workspace import get_sessions_dir
+from ohmo.workspace import get_sessions_dir, get_work_dir
 
 
 def get_session_dir(workspace: str | Path | None = None) -> Path:
@@ -30,6 +31,47 @@ def get_session_dir(workspace: str | Path | None = None) -> Path:
 
 def _session_key_token(session_key: str) -> str:
     return hashlib.sha1(session_key.encode("utf-8")).hexdigest()[:12]
+
+
+def get_session_work_dir(session_key: str, workspace: str | Path | None = None) -> Path:
+    """Per-chat scratch dir used as the agent cwd for unbound chats.
+
+    Isolates each chat's transient output (diagrams, downloads, scratch) instead
+    of sharing the workspace root across every chat. Lazily created; wiped on
+    ``/new`` and reaped by the startup TTL sweep.
+    """
+    work = get_work_dir(workspace) / _session_key_token(session_key)
+    work.mkdir(parents=True, exist_ok=True)
+    return work
+
+
+def clear_session_work_dir(session_key: str, workspace: str | Path | None = None) -> None:
+    """Remove a chat's work dir — called on ``/new`` for a clean slate.
+
+    The dir is recreated lazily on the next write, so nothing breaks if the chat
+    continues."""
+    shutil.rmtree(get_work_dir(workspace) / _session_key_token(session_key), ignore_errors=True)
+
+
+def reap_stale_work_dirs(workspace: str | Path | None = None, max_age_s: float = 7 * 86400) -> int:
+    """Remove per-chat work dirs untouched for ``max_age_s`` (default 7 days).
+
+    Run once at gateway start so abandoned chats' scratch dirs don't accumulate.
+    Returns the number reaped. Stale-but-live chats simply get a fresh dir on
+    their next write."""
+    root = get_work_dir(workspace)
+    if not root.is_dir():
+        return 0
+    cutoff = time.time() - max_age_s
+    reaped = 0
+    for child in root.iterdir():
+        try:
+            if child.is_dir() and child.stat().st_mtime < cutoff:
+                shutil.rmtree(child, ignore_errors=True)
+                reaped += 1
+        except OSError:
+            continue
+    return reaped
 
 
 def _session_key_latest_path(workspace: str | Path | None, session_key: str) -> Path:
