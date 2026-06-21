@@ -133,6 +133,15 @@ def run_smoke_report(
 
 
 def _pack_case(gold: EvalGoldCase) -> EvalRunPackCase:
+    metadata = {
+        "review_status": gold.review_status,
+        "source_review_status": gold.metadata.get("source_review_status", ""),
+        "candidate_score": gold.metadata.get("candidate_score", 0),
+        "signals": gold.metadata.get("signals", []),
+        "event_count": gold.metadata.get("event_count", 0),
+    }
+    if "state_delta" in gold.metadata:
+        metadata["state_delta"] = gold.metadata.get("state_delta")
     return EvalRunPackCase(
         gold_case_id=gold.gold_case_id,
         case_id=gold.case_id,
@@ -144,13 +153,7 @@ def _pack_case(gold: EvalGoldCase) -> EvalRunPackCase:
         capability_path=gold.capability_path,
         rubric=gold.rubric,
         scorer=gold.scorer,
-        metadata={
-            "review_status": gold.review_status,
-            "source_review_status": gold.metadata.get("source_review_status", ""),
-            "candidate_score": gold.metadata.get("candidate_score", 0),
-            "signals": gold.metadata.get("signals", []),
-            "event_count": gold.metadata.get("event_count", 0),
-        },
+        metadata=metadata,
     )
 
 

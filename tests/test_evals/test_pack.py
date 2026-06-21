@@ -8,6 +8,8 @@ from openharness.evals import (
     EvalEpisode,
     EvalEvent,
     EvalGoldCase,
+    EvalResource,
+    EvalResourceSnapshot,
     EvalRunPack,
     EvalRunPackCase,
     EvalStore,
@@ -75,6 +77,38 @@ def test_run_pack_can_select_gold_cases_and_rejects_missing(tmp_path: Path):
     assert [case.case_id for case in pack.cases] == [drafts[1].case_id]
     with pytest.raises(ValueError, match="gold case not found: missing"):
         build_run_pack(store, case_ids=["missing"])
+
+
+def test_run_pack_carries_state_delta_metadata(tmp_path: Path):
+    store = EvalStore(tmp_path / "evals")
+    _add_episode(
+        store,
+        episode_id="ep-1",
+        user_text="private pack request",
+        final_text="private pack answer",
+    )
+    _write_state_snapshot(
+        store,
+        episode_id="ep-1",
+        phase="world_before",
+        reminder_keys=("aaaaaaaaaaaaaaaa",),
+    )
+    _write_state_snapshot(
+        store,
+        episode_id="ep-1",
+        phase="world_after",
+        reminder_keys=("aaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbb"),
+    )
+    drafts = build_case_drafts(store, build_case_candidates(store))
+    write_case_draft_pack(store, drafts)
+    promote_case_drafts(store, case_ids=[drafts[0].case_id])
+
+    pack = build_run_pack(store)
+
+    assert pack.cases[0].metadata["state_delta"]["changed"] is True
+    assert pack.cases[0].metadata["state_delta"]["reminders"]["added_keys"] == [
+        "bbbbbbbbbbbbbbbb"
+    ]
 
 
 def test_run_pack_ids_are_stable_and_report_ids_include_selected_cases(tmp_path: Path):
@@ -206,3 +240,31 @@ def _add_episode(
             payload={"text": final_text},
         )
     )
+
+
+def _write_state_snapshot(
+    store: EvalStore,
+    *,
+    episode_id: str,
+    phase: str,
+    reminder_keys: tuple[str, ...],
+) -> None:
+    path = store.root / "states" / episode_id / f"{phase}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    snapshot = EvalResourceSnapshot(
+        episode_id=episode_id,
+        resources=[
+            EvalResource(
+                resource_id="resource:reminders_json",
+                kind="local_file",
+                name="reminders_json",
+                exists=True,
+                metadata={
+                    "entry_keys": list(reminder_keys),
+                    "record_count": len(reminder_keys),
+                    "status_counts": {"pending": len(reminder_keys)},
+                },
+            )
+        ],
+    )
+    path.write_text(snapshot.model_dump_json(), encoding="utf-8")

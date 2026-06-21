@@ -11,6 +11,7 @@ from pydantic import BaseModel, ValidationError
 
 from openharness.evals.candidates import EvalPackWrite
 from openharness.evals.models import EvalCaseDraft, EvalGoldCase, EvalPackManifest
+from openharness.evals.state import compute_episode_state_delta
 from openharness.evals.store import EvalStore
 from openharness.utils.fs import atomic_write_text
 
@@ -61,6 +62,7 @@ def promote_case_drafts(
     for draft in selected:
         candidate = _gold_from_draft(
             draft,
+            store=store,
             reviewer=reviewer,
             review_metadata=review_metadata.get(draft.case_id),
         )
@@ -117,6 +119,7 @@ def select_case_drafts(
 def _gold_from_draft(
     draft: EvalCaseDraft,
     *,
+    store: EvalStore,
     reviewer: str,
     review_metadata: Mapping[str, object] | None = None,
 ) -> EvalGoldCase:
@@ -128,6 +131,11 @@ def _gold_from_draft(
     }
     if review_metadata:
         metadata.update(dict(review_metadata))
+    state_delta = compute_episode_state_delta(store, draft.episode_id)
+    if state_delta is not None:
+        metadata["state_delta"] = state_delta
+    else:
+        metadata.pop("state_delta", None)
     return EvalGoldCase(
         gold_case_id=_stable_id("gold", draft.case_id),
         case_id=draft.case_id,

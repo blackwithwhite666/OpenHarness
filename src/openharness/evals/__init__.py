@@ -22,6 +22,7 @@ from openharness.evals.execution import (
     EvalExecutionScorer,
     EvalExecutionScorerResult,
     ExactMatchEvalScorer,
+    StateOracleV1,
     ToolTraceOracleV1,
     resolve_execution_scorer,
     run_execution_report,
@@ -89,6 +90,12 @@ from openharness.evals.review import (
     select_case_drafts,
 )
 from openharness.evals.runner import EvalReplayReportWrite, run_replay_report
+from openharness.evals.state import (
+    compute_episode_state_delta,
+    compute_state_delta,
+    extract_state_keys,
+    read_world_snapshots,
+)
 from openharness.evals.store import EvalStore
 from openharness.evals.tool_labels import (
     effective_tool_label,
@@ -118,6 +125,7 @@ __all__ = [
     "CapabilityCoverageOracleV1",
     "CapabilityTraceOracleV1",
     "ExactMatchEvalScorer",
+    "StateOracleV1",
     "ToolTraceOracleV1",
     "EVAL_EXECUTION_SCORERS",
     "resolve_execution_scorer",
@@ -164,8 +172,11 @@ __all__ = [
     "build_usage_graph",
     "compare_execution_reports",
     "collect_text_facets",
+    "compute_episode_state_delta",
+    "compute_state_delta",
     "effective_tool_label",
     "effective_tool_path",
+    "extract_state_keys",
     "extract_command_binaries",
     "tool_call_binaries",
     "promote_case_drafts",
@@ -173,6 +184,7 @@ __all__ = [
     "read_execution_report",
     "read_gold_cases",
     "read_run_pack",
+    "read_world_snapshots",
     "run_smoke_report",
     "run_execution_report",
     "run_replay_report",

@@ -32,6 +32,7 @@ from openharness.evals.models import (
     EvalRunPackCase,
 )
 from openharness.evals.pack import read_run_pack
+from openharness.evals.state import compute_episode_state_delta
 from openharness.evals.store import EvalStore
 from openharness.evals.tool_labels import effective_tool_label
 from openharness.utils.fs import atomic_write_text
@@ -46,6 +47,7 @@ _CAPABILITY_METADATA_KEYS = (
     "missing_capabilities",
     "unexpected_capabilities",
 )
+_STATE_RESOURCE_NAMES = ("reminders", "memory", "todos")
 
 
 @dataclass(frozen=True)
@@ -323,11 +325,69 @@ class CapabilityCoverageOracleV1:
         )
 
 
+class StateOracleV1:
+    """Metadata-only oracle for captured before/after world-state mutations."""
+
+    name = "state_oracle_v1"
+    requires_exact_tool_sequence = False
+
+    def score(
+        self,
+        *,
+        context: EvalExecutionContext,
+        executor_result: EvalExecutorResult,
+    ) -> EvalExecutionScorerResult:
+        del executor_result
+        observed = compute_episode_state_delta(
+            context.store,
+            context.episode.episode_id,
+        )
+        expected = context.case.metadata.get("state_delta")
+        checks = {
+            "world_after_captured": observed is not None,
+            "state_changed": observed is not None and observed.get("changed") is True,
+            "state_delta_matches_gold": expected is None
+            or _state_delta_matches(observed, expected),
+        }
+        passed = all(checks.values())
+        return EvalExecutionScorerResult(
+            passed=passed,
+            score=_score(checks),
+            scorer_name=self.name,
+            metadata={
+                "observed_delta": observed,
+                "expected_delta": expected,
+                "observed_added_key_count": _state_delta_key_count(
+                    observed,
+                    "added_keys",
+                ),
+                "observed_removed_key_count": _state_delta_key_count(
+                    observed,
+                    "removed_keys",
+                ),
+                "expected_added_key_count": _state_delta_key_count(
+                    expected,
+                    "added_keys",
+                ),
+                "expected_removed_key_count": _state_delta_key_count(
+                    expected,
+                    "removed_keys",
+                ),
+                "observed_changed_resource_count": _state_delta_changed_resource_count(
+                    observed
+                ),
+                "state_resource_count": len(_STATE_RESOURCE_NAMES),
+                **{f"check.{name}": value for name, value in checks.items()},
+            },
+        )
+
+
 EVAL_EXECUTION_SCORERS: dict[str, EvalExecutionScorer] = {
     ExactMatchEvalScorer.name: ExactMatchEvalScorer(),
     ToolTraceOracleV1.name: ToolTraceOracleV1(),
     CapabilityTraceOracleV1.name: CapabilityTraceOracleV1(),
     CapabilityCoverageOracleV1.name: CapabilityCoverageOracleV1(),
+    StateOracleV1.name: StateOracleV1(),
 }
 
 
@@ -962,6 +1022,95 @@ def _score(checks: dict[str, bool]) -> float:
     return sum(1 for passed in checks.values() if passed) / len(checks)
 
 
+def _state_delta_matches(observed: Any, expected: Any) -> bool:
+    if not isinstance(observed, dict) or not isinstance(expected, dict):
+        return False
+    return _canonical_json(_state_delta_compare_payload(observed)) == _canonical_json(
+        _state_delta_compare_payload(expected)
+    )
+
+
+def _state_delta_compare_payload(delta: dict[str, Any]) -> dict[str, Any]:
+    return {
+        resource_name: _state_delta_resource_payload(
+            delta.get(resource_name),
+            resource_name,
+        )
+        for resource_name in _STATE_RESOURCE_NAMES
+    }
+
+
+def _state_delta_resource_payload(value: Any, resource_name: str) -> dict[str, Any]:
+    item = value if isinstance(value, dict) else {}
+    payload: dict[str, Any] = {
+        "added_keys": _sorted_string_list(item.get("added_keys")),
+        "removed_keys": _sorted_string_list(item.get("removed_keys")),
+        "count_before": _safe_int(item.get("count_before"), default=0),
+        "count_after": _safe_int(item.get("count_after"), default=0),
+    }
+    if resource_name == "reminders":
+        payload["status_counts_before"] = _status_counts(
+            item.get("status_counts_before")
+        )
+        payload["status_counts_after"] = _status_counts(item.get("status_counts_after"))
+    return payload
+
+
+def _state_delta_key_count(delta: Any, key_name: str) -> int:
+    if not isinstance(delta, dict):
+        return 0
+    total = 0
+    for resource_name in _STATE_RESOURCE_NAMES:
+        resource_delta = delta.get(resource_name)
+        if not isinstance(resource_delta, dict):
+            continue
+        values = resource_delta.get(key_name)
+        if isinstance(values, list):
+            total += len([item for item in values if isinstance(item, str)])
+    return total
+
+
+def _state_delta_changed_resource_count(delta: Any) -> int:
+    if not isinstance(delta, dict):
+        return 0
+    return sum(
+        1
+        for resource_name in _STATE_RESOURCE_NAMES
+        if _state_resource_has_key_delta(delta.get(resource_name))
+    )
+
+
+def _state_resource_has_key_delta(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+    return bool(
+        _sorted_string_list(value.get("added_keys"))
+        or _sorted_string_list(value.get("removed_keys"))
+    )
+
+
+def _sorted_string_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return sorted(item for item in value if isinstance(item, str))
+
+
+def _status_counts(value: Any) -> dict[str, int]:
+    if not isinstance(value, dict):
+        return {}
+    return {
+        str(key): _safe_int(count, default=0)
+        for key, count in sorted(value.items(), key=lambda item: str(item[0]))
+    }
+
+
+def _safe_int(value: Any, *, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def _normalize_text(text: str) -> str:
     return " ".join(text.split())
 
@@ -1025,6 +1174,10 @@ def _is_safe_label_char(char: str) -> bool:
 
 def _hash_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _canonical_json(value: object) -> str:
+    return json.dumps(value, allow_nan=False, sort_keys=True, separators=(",", ":"))
 
 
 def _report_output_path(store: EvalStore, filename: str) -> Path:

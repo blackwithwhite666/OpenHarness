@@ -8,6 +8,8 @@ from openharness.evals import (
     EvalCaseDraft,
     EvalEpisode,
     EvalEvent,
+    EvalResource,
+    EvalResourceSnapshot,
     EvalStore,
     build_case_candidates,
     build_case_drafts,
@@ -125,6 +127,54 @@ def test_promote_case_drafts_copies_metadata_only_review_metadata(tmp_path: Path
     assert gold.metadata["review_comment_length"] == 12
 
 
+def test_promote_case_drafts_populates_state_delta_from_snapshots(tmp_path: Path):
+    store = EvalStore(tmp_path / "evals")
+    _add_episode(
+        store,
+        episode_id="ep-1",
+        user_text="private request body",
+        final_text="private final answer",
+    )
+    _write_state_snapshot(
+        store,
+        episode_id="ep-1",
+        phase="world_before",
+        reminder_keys=("aaaaaaaaaaaaaaaa",),
+    )
+    _write_state_snapshot(
+        store,
+        episode_id="ep-1",
+        phase="world_after",
+        reminder_keys=("aaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbb"),
+    )
+    drafts = build_case_drafts(store, build_case_candidates(store))
+    write_case_draft_pack(store, drafts)
+
+    promote_case_drafts(store, case_ids=[drafts[0].case_id], reviewer="reviewer-1")
+
+    gold = read_gold_cases(store)[0]
+    assert gold.metadata["state_delta"]["changed"] is True
+    assert gold.metadata["state_delta"]["reminders"]["added_keys"] == [
+        "bbbbbbbbbbbbbbbb"
+    ]
+
+
+def test_promote_case_drafts_omits_state_delta_without_snapshots(tmp_path: Path):
+    store = EvalStore(tmp_path / "evals")
+    _add_episode(
+        store,
+        episode_id="ep-1",
+        user_text="private request body",
+        final_text="private final answer",
+    )
+    drafts = build_case_drafts(store, build_case_candidates(store))
+    write_case_draft_pack(store, drafts)
+
+    promote_case_drafts(store, case_ids=[drafts[0].case_id], reviewer="reviewer-1")
+
+    assert "state_delta" not in read_gold_cases(store)[0].metadata
+
+
 def test_promote_case_drafts_validates_selection_and_paths(tmp_path: Path):
     store = EvalStore(tmp_path / "evals")
     _add_episode(
@@ -195,3 +245,31 @@ def _add_episode(
             payload={"text": final_text},
         )
     )
+
+
+def _write_state_snapshot(
+    store: EvalStore,
+    *,
+    episode_id: str,
+    phase: str,
+    reminder_keys: tuple[str, ...],
+) -> None:
+    path = store.root / "states" / episode_id / f"{phase}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    snapshot = EvalResourceSnapshot(
+        episode_id=episode_id,
+        resources=[
+            EvalResource(
+                resource_id="resource:reminders_json",
+                kind="local_file",
+                name="reminders_json",
+                exists=True,
+                metadata={
+                    "entry_keys": list(reminder_keys),
+                    "record_count": len(reminder_keys),
+                    "status_counts": {"pending": len(reminder_keys)},
+                },
+            )
+        ],
+    )
+    path.write_text(snapshot.model_dump_json(), encoding="utf-8")
