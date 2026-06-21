@@ -12,15 +12,20 @@ metadata:
 > browser, so the "Open in browser" / `open` / `xdg-open` step below does **not** apply. Adapt
 > delivery and tooling as follows:
 >
-> - **Deliver by attaching the file to Telegram.** Write the HTML to `~/.agent/diagrams/`
->   (created; or `/tmp`), then end your reply with an attach marker using an **absolute** path:
->   `[[attach: /home/blackwithwhite/.agent/diagrams/<name>.html]]`. The gateway sends it as a
->   Telegram document; the user opens it in their own browser, where the CDN libs (Mermaid,
->   Chart.js, fonts) load. Always tell the user the file path too.
+> - **Deliver by attaching the file to Telegram.** Write the HTML to a **temp dir**:
+>   `mkdir -p /tmp/ve` then save as `/tmp/ve/<name>.html`. Do **NOT** use `~/.agent/diagrams/` —
+>   the file is transient (its only job is to be attached this turn), and `/tmp` is auto-cleaned,
+>   so nothing accumulates in `$HOME`.
+> - **⚠️ Put the `[[attach: …]]` marker in your FINAL message** — the last thing you send, with
+>   an **absolute** path: `[[attach: /tmp/ve/<name>.html]]`. The gateway extracts `[[attach: …]]`
+>   **only from the final reply**. A marker in mid-turn narration / a "сейчас приложу" progress
+>   line is shown to the user as **plain text and the file is NOT sent**. So: finish all work,
+>   then end with a short final message that carries the marker. The user opens the HTML in their
+>   own browser (CDN libs — Mermaid, Chart.js, fonts — load there). Mention the path too.
 > - **Optional inline preview.** To also show the result in-chat, render the file to an image
->   with the **`browser`** skill — open the `file:///home/blackwithwhite/.agent/diagrams/<name>.html`
->   URL, give CDN-based Mermaid/Chart.js a moment to render, take a screenshot, and
->   `[[attach: /tmp/ve-preview.png]]` it alongside the HTML.
+>   with the **`browser`** skill — open the `file:///tmp/ve/<name>.html` URL, give CDN-based
+>   Mermaid/Chart.js a moment to render, take a screenshot, and `[[attach: /tmp/ve-preview.png]]`
+>   it alongside the HTML — again, both markers in the **final** message.
 > - **AI images: `surf-cli` is NOT installed.** Use the **`falai`** skill instead
 >   (`falai-cli image "<prompt>" --save /tmp` → base64-embed or attach), or skip images — the
 >   page must stand on its own with CSS + typography (degrade gracefully).
