@@ -13,6 +13,7 @@ from openharness.engine.messages import (
     ToolUseBlock,
 )
 from openharness.evals import EvalEpisode, EvalEvent, promote_case_drafts
+import ohmo.evals.runner as runner_module
 from ohmo.evals import (
     build_ohmo_eval_pack,
     check_ohmo_eval_run_config,
@@ -147,6 +148,126 @@ def test_run_ohmo_session_eval_writes_metadata_only_report(
     assert "private raw tool output" not in serialized
     assert "private model final" not in serialized
     assert "SECRET_CITY" not in serialized
+
+
+def test_run_ohmo_session_eval_hybrid_user_sim_profile_records_metrics(
+    tmp_path: Path,
+    monkeypatch,
+):
+    workspace = tmp_path / "workspace"
+    store = get_eval_store(workspace)
+    _append_session_episode(
+        store,
+        episode_id="ep-1",
+        session_id="session-1",
+        user_text="private ohmo first request",
+        tool_call_id="tool-1",
+    )
+    _append_session_episode(
+        store,
+        episode_id="ep-2",
+        session_id="session-1",
+        user_text="private ohmo second request",
+        tool_call_id="tool-2",
+    )
+    agent_client = _ClarifyThenToolModelApiClient()
+    user_client = _UserSimApiClient("private synthetic user answer")
+    build_calls = []
+
+    def fake_build_agent_runner_config(
+        agent_runner_name,
+        *,
+        workspace,
+        model,
+        provider_profile,
+        system_prompt,
+    ):
+        build_calls.append(
+            {
+                "agent_runner_name": agent_runner_name,
+                "model": model,
+                "provider_profile": provider_profile,
+                "system_prompt": system_prompt,
+            }
+        )
+        is_user_sim = provider_profile == "user-profile"
+        return runner_module._AgentRunnerConfig(
+            agent_runner=object(),
+            agent_runner_name="query-engine",
+            model=model or ("user-default-model" if is_user_sim else "agent-model"),
+            provider_profile=provider_profile or "agent-profile",
+            api_client=user_client if is_user_sim else agent_client,
+            system_prompt=system_prompt or "AGENT_PROMPT",
+            cwd=workspace,
+        )
+
+    monkeypatch.setattr(
+        "ohmo.evals.runner._build_agent_runner_config",
+        fake_build_agent_runner_config,
+    )
+
+    result = run_ohmo_session_eval(
+        workspace=workspace,
+        limit=1,
+        provider_profile="agent-profile",
+        user_sim_profile="user-profile",
+        user_sim_model="user-model",
+    )
+
+    assert build_calls[1]["provider_profile"] == "user-profile"
+    assert build_calls[1]["model"] == "user-model"
+    assert str(build_calls[1]["system_prompt"]).startswith("You are simulating")
+    assert result.write.report.metadata["user_simulation"] == "hybrid"
+    assert result.write.report.metadata["user_sim_profile"] == "user-profile"
+    assert result.write.report.metadata["user_sim_model"] == "user-model"
+    assert result.write.report.metadata["mean_replay_hit_rate"] == 0.5
+    assert result.write.report.metadata["total_llm_fallback_count"] == 1
+    case = result.write.report.cases[0]
+    assert case.metadata["user_turn_sources"] == ["replay", "llm_fallback"]
+    assert case.metadata["replay_hit_rate"] == 0.5
+    assert case.metadata["llm_fallback_count"] == 1
+    assert case.metadata["ended_reason"] == "captured_exhausted"
+
+    serialized = result.write.path.read_text(encoding="utf-8")
+    assert "private ohmo first request" not in serialized
+    assert "private ohmo second request" not in serialized
+    assert "private synthetic user answer" not in serialized
+    assert "Which city should I use?" not in serialized
+
+
+def test_run_ohmo_session_eval_rejects_shared_user_sim_profile(
+    tmp_path: Path,
+    monkeypatch,
+):
+    def fake_build_agent_runner_config(
+        agent_runner_name,
+        *,
+        workspace,
+        model,
+        provider_profile,
+        system_prompt,
+    ):
+        return runner_module._AgentRunnerConfig(
+            agent_runner=object(),
+            agent_runner_name=agent_runner_name,
+            model=model or "agent-model",
+            provider_profile=provider_profile or "same-profile",
+            api_client=object(),
+            system_prompt=system_prompt or "AGENT_PROMPT",
+            cwd=workspace,
+        )
+
+    monkeypatch.setattr(
+        "ohmo.evals.runner._build_agent_runner_config",
+        fake_build_agent_runner_config,
+    )
+
+    with pytest.raises(ValueError, match="user_sim_profile"):
+        run_ohmo_session_eval(
+            workspace=tmp_path / "workspace",
+            provider_profile="same-profile",
+            user_sim_profile="same-profile",
+        )
 
 
 def test_run_ohmo_eval_report_rejects_unknown_executor(tmp_path: Path):
@@ -323,6 +444,68 @@ class _PerTurnToolModelApiClient:
                         input={"command": "weather-cli forecast 'SECRET_CITY'"},
                     )
                 ],
+            ),
+            usage=UsageSnapshot(input_tokens=1, output_tokens=1),
+        )
+
+
+class _ClarifyThenToolModelApiClient:
+    def __init__(self) -> None:
+        self.requests = []
+        self._clarified = False
+        self._final_count = 0
+
+    async def stream_message(self, request):
+        self.requests.append(request)
+        last_message = request.messages[-1]
+        if any(isinstance(block, ToolResultBlock) for block in last_message.content):
+            self._final_count += 1
+            yield ApiMessageCompleteEvent(
+                message=ConversationMessage(
+                    role="assistant",
+                    content=[TextBlock(text=f"private model final {self._final_count}")],
+                ),
+                usage=UsageSnapshot(input_tokens=1, output_tokens=1),
+            )
+            return
+
+        if not self._clarified:
+            self._clarified = True
+            yield ApiMessageCompleteEvent(
+                message=ConversationMessage(
+                    role="assistant",
+                    content=[TextBlock(text="Which city should I use?")],
+                ),
+                usage=UsageSnapshot(input_tokens=1, output_tokens=1),
+            )
+            return
+
+        yield ApiMessageCompleteEvent(
+            message=ConversationMessage(
+                role="assistant",
+                content=[
+                    ToolUseBlock(
+                        id=f"toolu-session-{len(self.requests)}",
+                        name="bash",
+                        input={"command": "weather-cli forecast 'SECRET_CITY'"},
+                    )
+                ],
+            ),
+            usage=UsageSnapshot(input_tokens=1, output_tokens=1),
+        )
+
+
+class _UserSimApiClient:
+    def __init__(self, text: str) -> None:
+        self.text = text
+        self.requests = []
+
+    async def stream_message(self, request):
+        self.requests.append(request)
+        yield ApiMessageCompleteEvent(
+            message=ConversationMessage(
+                role="assistant",
+                content=[TextBlock(text=self.text)],
             ),
             usage=UsageSnapshot(input_tokens=1, output_tokens=1),
         )

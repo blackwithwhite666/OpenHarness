@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -23,10 +24,18 @@ from openharness.evals.executor import (
     build_replay_tool_registry,
 )
 from openharness.evals.models import EvalEpisode
+from openharness.evals.session_user_simulator import (
+    ReplayUserSimulator,
+    UserSimulator,
+    _resolve_user_turn,
+    _simulator_ended_reason,
+)
 from openharness.evals.store import EvalStore
 from openharness.evals.tool_labels import effective_tool_label
 from openharness.permissions.checker import PermissionChecker
 from openharness.permissions.modes import PermissionMode
+
+log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -111,6 +120,7 @@ class SessionReplayRunner:
         cwd: str | Path | None = None,
         max_turns: int = 8,
         max_tokens: int = 4096,
+        max_session_turns: int | None = None,
     ) -> None:
         self._api_client = api_client
         self._model = model
@@ -118,22 +128,33 @@ class SessionReplayRunner:
         self._cwd = Path(cwd).resolve() if cwd is not None else Path.cwd().resolve()
         self._max_turns = max_turns
         self._max_tokens = max_tokens
+        self._max_session_turns = max_session_turns
 
-    def run(self, *, group: EvalSessionGroup, store: EvalStore) -> EvalSessionRunResult:
+    def run(
+        self,
+        *,
+        group: EvalSessionGroup,
+        store: EvalStore,
+        user_simulator: UserSimulator | None = None,
+    ) -> EvalSessionRunResult:
         """Replay one captured session with order-based replay fixtures."""
-        return _run_eval_coroutine(self._run(group=group, store=store))
+        return _run_eval_coroutine(
+            self._run(group=group, store=store, user_simulator=user_simulator)
+        )
 
     async def _run(
         self,
         *,
         group: EvalSessionGroup,
         store: EvalStore,
+        user_simulator: UserSimulator | None,
     ) -> EvalSessionRunResult:
         if not group.episode_ids:
             raise ValueError("session group must contain episodes")
 
         episodes: list[EvalEpisode] = []
         fixtures: list[EvalToolFixture] = []
+        captured_capabilities: list[tuple[str, ...]] = []
         source_event_count = 0
         for episode_id in group.episode_ids:
             episode = store.get_episode(episode_id)
@@ -141,8 +162,19 @@ class SessionReplayRunner:
                 raise ValueError(f"episode not found: {episode_id}")
             events = list(store.iter_events(episode_id))
             source_event_count += len(events)
+            episode_fixtures = _tool_fixtures(events)
             episodes.append(episode)
-            fixtures.extend(_tool_fixtures(events))
+            fixtures.extend(episode_fixtures)
+            captured_capabilities.append(
+                tuple(
+                    effective_tool_label(
+                        fixture.tool_name,
+                        _fixture_arguments(events, fixture),
+                    )
+                    for fixture in episode_fixtures
+                )
+            )
+        captured_prompts = tuple(_episode_prompt(episode) for episode in episodes)
 
         engine = QueryEngine(
             api_client=self._api_client,
@@ -158,19 +190,69 @@ class SessionReplayRunner:
         )
 
         turns: list[EvalSessionTurnResult] = []
-        for episode in episodes:
-            turns.append(
-                await consume_engine_turn(
-                    engine,
-                    _episode_prompt(episode),
-                    episode_id=episode.episode_id,
+        user_turn_sources: list[str] = []
+        transcript: list[tuple[str, str]] = []
+        simulator = user_simulator or ReplayUserSimulator(captured_prompts)
+        max_session_turns = self._max_session_turns or _default_max_session_turns(
+            len(captured_prompts)
+        )
+        ended_reason = "model_done"
+        last_turn: EvalSessionTurnResult | None = None
+        while len(turns) < max_session_turns:
+            user_turn = await _resolve_user_turn(
+                simulator.next_turn(
+                    transcript=tuple(transcript),
+                    captured_prompts=captured_prompts,
+                    captured_capabilities=tuple(captured_capabilities),
+                    index=len(turns),
+                    last_turn=last_turn,
                 )
+            )
+            if user_turn is None:
+                ended_reason = _simulator_ended_reason(
+                    simulator,
+                    default=(
+                        "captured_exhausted"
+                        if len(turns) >= len(captured_prompts)
+                        else "model_done"
+                    ),
+                )
+                break
+
+            episode_id = (
+                episodes[len(turns)].episode_id
+                if user_turn.source == "replay" and len(turns) < len(episodes)
+                else ""
+            )
+            transcript.append(("user", user_turn.text))
+            turn = await consume_engine_turn(
+                engine,
+                user_turn.text,
+                episode_id=episode_id,
+            )
+            turns.append(turn)
+            user_turn_sources.append(user_turn.source)
+            transcript.append(("assistant", turn.final_text))
+            last_turn = turn
+        else:
+            ended_reason = "budget"
+            log.info(
+                "session replay stopped by budget session_id=%s max_session_turns=%d",
+                group.session_id,
+                max_session_turns,
             )
 
         union_capabilities = sorted(
             {capability for turn in turns for capability in turn.capabilities}
         )
         final_text = turns[-1].final_text if turns else ""
+        replay_hit_count = sum(1 for source in user_turn_sources if source == "replay")
+        llm_fallback_count = sum(
+            1 for source in user_turn_sources if source == "llm_fallback"
+        )
+        replay_hit_rate = (
+            replay_hit_count / len(user_turn_sources) if user_turn_sources else 0.0
+        )
         return EvalSessionRunResult(
             session_id=group.session_id,
             turns=tuple(turns),
@@ -183,6 +265,11 @@ class SessionReplayRunner:
                 "fixture_count": len(fixtures),
                 "source_event_count": source_event_count,
                 "engine_message_count": len(engine.messages),
+                "user_turn_sources": user_turn_sources,
+                "replay_hit_count": replay_hit_count,
+                "llm_fallback_count": llm_fallback_count,
+                "replay_hit_rate": replay_hit_rate,
+                "ended_reason": ended_reason,
             },
         )
 
@@ -223,6 +310,7 @@ def score_session(
     *,
     gold_capabilities: Sequence[str],
     state_changed: bool | None,
+    clarification_allowed: bool = False,
 ) -> dict[str, Any]:
     """Score one session with capability coverage plus a final-outcome signal."""
     core_gold = {
@@ -232,17 +320,30 @@ def score_session(
     }
     observed = set(result.union_capabilities)
     missing = sorted(core_gold - observed)
+    terminal_clarification = (
+        bool(result.turns)
+        and not result.turns[-1].tool_path
+        and bool(result.turns[-1].final_text.strip())
+    )
+    final_outcome_reached = (
+        state_changed is True
+        if state_changed is not None
+        else bool(result.final_text.strip())
+    )
+    warnings: list[str] = []
+    capability_coverage = not missing
+    if clarification_allowed and terminal_clarification:
+        final_outcome_reached = True
+        if missing:
+            capability_coverage = True
+            warnings.append("capability_coverage_terminal_clarification")
     checks = {
-        "capability_coverage": not missing,
+        "capability_coverage": capability_coverage,
         "no_turn_tool_errors": not any(turn.tool_error for turn in result.turns),
-        "final_outcome_reached": (
-            state_changed is True
-            if state_changed is not None
-            else bool(result.final_text.strip())
-        ),
+        "final_outcome_reached": final_outcome_reached,
     }
     passed = all(checks.values())
-    return {
+    payload: dict[str, Any] = {
         "passed": passed,
         "score": sum(1 for value in checks.values() if value) / len(checks),
         "checks": checks,
@@ -250,6 +351,15 @@ def score_session(
         "observed_capabilities": sorted(observed),
         "turn_count": result.turn_count,
     }
+    if clarification_allowed:
+        payload.update(
+            {
+                "clarification_allowed": True,
+                "terminal_clarification": terminal_clarification,
+                "warnings": warnings,
+            }
+        )
+    return payload
 
 
 def gold_capabilities_for_session(
@@ -277,6 +387,10 @@ def gold_capabilities_for_session(
 
 def _episode_prompt(episode: EvalEpisode) -> str:
     return episode.user_goal or episode.user_text
+
+
+def _default_max_session_turns(captured_prompt_count: int) -> int:
+    return max(captured_prompt_count * 2, captured_prompt_count + 4, 1)
 
 
 def _fixture_arguments(events: Sequence[Any], fixture: EvalToolFixture) -> dict[str, Any]:

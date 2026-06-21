@@ -18,8 +18,12 @@ from openharness.evals import (
     EvalSessionRunResult,
     EvalSessionTurnResult,
     EvalStore,
+    HybridUserSimulator,
+    ReplayUserSimulator,
     SessionReplayRunner,
+    UserTurn,
     group_episodes_into_sessions,
+    replay_matches,
     score_session,
 )
 
@@ -99,6 +103,126 @@ def test_session_replay_runner_reuses_one_engine_across_turns(tmp_path: Path):
     assert user_texts == ["private first turn", "private second turn"]
 
 
+def test_session_replay_runner_default_matches_replay_simulator(tmp_path: Path):
+    store = EvalStore(tmp_path / "evals")
+    _append_tool_episode(
+        store,
+        episode_id="ep-1",
+        session_id="session-1",
+        user_text="private first turn",
+        tool_call_id="tool-1",
+    )
+    _append_tool_episode(
+        store,
+        episode_id="ep-2",
+        session_id="session-1",
+        user_text="private second turn",
+        tool_call_id="tool-2",
+    )
+    group = EvalSessionGroup("session-1", ("ep-1", "ep-2"))
+
+    default_result = SessionReplayRunner(
+        api_client=_PerTurnToolModelApiClient(),
+        model="eval-model",
+        system_prompt="eval system",
+        cwd=tmp_path,
+    ).run(group=group, store=store)
+    replay_result = SessionReplayRunner(
+        api_client=_PerTurnToolModelApiClient(),
+        model="eval-model",
+        system_prompt="eval system",
+        cwd=tmp_path,
+    ).run(group=group, store=store, user_simulator=ReplayUserSimulator())
+
+    assert default_result.turns == replay_result.turns
+    assert default_result.metadata["user_turn_sources"] == ["replay", "replay"]
+    assert default_result.metadata["replay_hit_rate"] == 1.0
+    assert default_result.metadata["llm_fallback_count"] == 0
+    assert default_result.metadata["ended_reason"] == "captured_exhausted"
+
+
+def test_replay_matches_core_capability_sets():
+    assert replay_matches(
+        ("bash:weather-cli forecast", "todo_write"),
+        ("bash:weather-cli forecast",),
+    )
+    assert not replay_matches((), ("bash:weather-cli forecast",))
+    assert not replay_matches(
+        ("bash:calendar-cli create",),
+        ("bash:weather-cli forecast",),
+    )
+
+
+def test_hybrid_user_simulator_falls_back_after_divergence(tmp_path: Path):
+    store = EvalStore(tmp_path / "evals")
+    _append_tool_episode(
+        store,
+        episode_id="ep-1",
+        session_id="session-1",
+        user_text="private first turn",
+        tool_call_id="tool-1",
+    )
+    _append_tool_episode(
+        store,
+        episode_id="ep-2",
+        session_id="session-1",
+        user_text="private second turn",
+        tool_call_id="tool-2",
+    )
+
+    result = SessionReplayRunner(
+        api_client=_ClarifyThenToolModelApiClient(),
+        model="eval-model",
+        system_prompt="eval system",
+        cwd=tmp_path,
+    ).run(
+        group=EvalSessionGroup("session-1", ("ep-1", "ep-2")),
+        store=store,
+        user_simulator=HybridUserSimulator(llm=_OneTurnUserSimulator()),
+    )
+
+    assert result.metadata["user_turn_sources"] == ["replay", "llm_fallback"]
+    assert result.metadata["replay_hit_count"] == 1
+    assert result.metadata["llm_fallback_count"] == 1
+    assert result.metadata["replay_hit_rate"] == 0.5
+    assert result.metadata["ended_reason"] == "captured_exhausted"
+    assert result.turns[1].episode_id == ""
+
+
+def test_hybrid_user_simulator_ends_when_fallback_unavailable(tmp_path: Path):
+    store = EvalStore(tmp_path / "evals")
+    _append_tool_episode(
+        store,
+        episode_id="ep-1",
+        session_id="session-1",
+        user_text="private first turn",
+        tool_call_id="tool-1",
+    )
+    _append_tool_episode(
+        store,
+        episode_id="ep-2",
+        session_id="session-1",
+        user_text="private second turn",
+        tool_call_id="tool-2",
+    )
+
+    result = SessionReplayRunner(
+        api_client=_ClarifyThenToolModelApiClient(),
+        model="eval-model",
+        system_prompt="eval system",
+        cwd=tmp_path,
+    ).run(
+        group=EvalSessionGroup("session-1", ("ep-1", "ep-2")),
+        store=store,
+        user_simulator=HybridUserSimulator(),
+    )
+
+    assert result.turn_count == 1
+    assert result.metadata["user_turn_sources"] == ["replay"]
+    assert result.metadata["llm_fallback_count"] == 0
+    assert result.metadata["ended_reason"] == "fallback_unavailable"
+
+
 def test_score_session_covers_capabilities_and_final_outcome():
     passing = EvalSessionRunResult(
         session_id="session-1",
@@ -147,6 +271,44 @@ def test_score_session_covers_capabilities_and_final_outcome():
     assert fallback["checks"]["final_outcome_reached"] is True
 
 
+def test_score_session_allows_terminal_clarification():
+    clarifying = EvalSessionRunResult(
+        session_id="session-1",
+        turns=(
+            EvalSessionTurnResult(
+                episode_id="ep-1",
+                final_text="Which city should I use?",
+            ),
+        ),
+        union_capabilities=(),
+        final_text="Which city should I use?",
+        turn_count=1,
+    )
+
+    blocked = score_session(
+        clarifying,
+        gold_capabilities=("bash:weather-cli forecast",),
+        state_changed=False,
+    )
+    assert blocked["passed"] is False
+    assert blocked["checks"]["capability_coverage"] is False
+    assert blocked["checks"]["final_outcome_reached"] is False
+    assert "terminal_clarification" not in blocked
+
+    allowed = score_session(
+        clarifying,
+        gold_capabilities=("bash:weather-cli forecast",),
+        state_changed=False,
+        clarification_allowed=True,
+    )
+    assert allowed["passed"] is True
+    assert allowed["checks"]["capability_coverage"] is True
+    assert allowed["checks"]["final_outcome_reached"] is True
+    assert allowed["terminal_clarification"] is True
+    assert allowed["clarification_allowed"] is True
+    assert allowed["warnings"] == ["capability_coverage_terminal_clarification"]
+
+
 class _PerTurnToolModelApiClient:
     def __init__(self) -> None:
         self.requests = []
@@ -179,6 +341,67 @@ class _PerTurnToolModelApiClient:
             ),
             usage=UsageSnapshot(input_tokens=1, output_tokens=1),
         )
+
+
+class _ClarifyThenToolModelApiClient:
+    def __init__(self) -> None:
+        self.requests = []
+        self._clarified = False
+        self._final_count = 0
+
+    async def stream_message(self, request):
+        self.requests.append(request)
+        last_message = request.messages[-1]
+        if any(isinstance(block, ToolResultBlock) for block in last_message.content):
+            self._final_count += 1
+            yield ApiMessageCompleteEvent(
+                message=ConversationMessage(
+                    role="assistant",
+                    content=[TextBlock(text=f"session final {self._final_count}")],
+                ),
+                usage=UsageSnapshot(input_tokens=1, output_tokens=1),
+            )
+            return
+
+        if not self._clarified:
+            self._clarified = True
+            yield ApiMessageCompleteEvent(
+                message=ConversationMessage(
+                    role="assistant",
+                    content=[TextBlock(text="Which city should I use?")],
+                ),
+                usage=UsageSnapshot(input_tokens=1, output_tokens=1),
+            )
+            return
+
+        yield ApiMessageCompleteEvent(
+            message=ConversationMessage(
+                role="assistant",
+                content=[
+                    ToolUseBlock(
+                        id=f"toolu-session-{len(self.requests)}",
+                        name="bash",
+                        input={"command": "weather-cli forecast 'SECRET_CITY'"},
+                    )
+                ],
+            ),
+            usage=UsageSnapshot(input_tokens=1, output_tokens=1),
+        )
+
+
+class _OneTurnUserSimulator:
+    def __init__(self) -> None:
+        self.calls = 0
+        self.ended_reason = ""
+
+    def next_turn(self, **kwargs):
+        del kwargs
+        if self.calls == 0:
+            self.calls += 1
+            self.ended_reason = ""
+            return UserTurn("private synthetic answer", "llm_fallback")
+        self.ended_reason = "model_done"
+        return None
 
 
 def _append_episode(

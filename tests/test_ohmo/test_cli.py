@@ -1373,6 +1373,9 @@ def test_ohmo_evals_run_session_command_runs_session_eval(tmp_path: Path, monkey
         system_prompt: str | None = None,
         samples: int = 1,
         gold_capabilities_by_session=None,
+        user_sim_profile: str | None = None,
+        user_sim_model: str | None = None,
+        clarification_allowed_by_session=None,
     ):
         calls.append(
             {
@@ -1384,6 +1387,9 @@ def test_ohmo_evals_run_session_command_runs_session_eval(tmp_path: Path, monkey
                 "system_prompt": system_prompt,
                 "samples": samples,
                 "gold_capabilities_by_session": gold_capabilities_by_session,
+                "user_sim_profile": user_sim_profile,
+                "user_sim_model": user_sim_model,
+                "clarification_allowed_by_session": clarification_allowed_by_session,
             }
         )
         return SimpleNamespace(
@@ -1421,6 +1427,10 @@ def test_ohmo_evals_run_session_command_runs_session_eval(tmp_path: Path, monkey
             "eval-profile",
             "--system-prompt",
             "eval prompt",
+            "--user-sim-profile",
+            "user-profile",
+            "--user-sim-model",
+            "user-model",
         ],
     )
 
@@ -1437,6 +1447,9 @@ def test_ohmo_evals_run_session_command_runs_session_eval(tmp_path: Path, monkey
             "system_prompt": "eval prompt",
             "samples": 3,
             "gold_capabilities_by_session": None,
+            "user_sim_profile": "user-profile",
+            "user_sim_model": "user-model",
+            "clarification_allowed_by_session": None,
         }
     ]
 

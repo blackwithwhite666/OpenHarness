@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from collections.abc import Mapping, Sequence
 
 from openharness.api.client import SupportsStreamingMessages
 from openharness.api.resolver import (
@@ -16,10 +16,14 @@ from openharness.evals import (
     EvalExecutionReportWrite,
     EvalSessionReport,
     EvalSessionReportCase,
+    HybridUserSimulator,
+    LlmUserSimulator,
     QueryEngineEvalAgentRunner,
+    ReplayUserSimulator,
     ReplayScriptAgentRunner,
     ReplayToolsExecutor,
     SessionReplayRunner,
+    UserSimulator,
     gold_capabilities_for_session,
     group_episodes_into_sessions,
     read_run_pack,
@@ -91,6 +95,11 @@ _SUPPORTED_EXECUTORS = {
     "replay_tools": ReplayToolsExecutor,
 }
 _SUPPORTED_AGENT_RUNNERS = set(SUPPORTED_EVAL_AGENT_RUNNER_NAMES)
+_USER_SIM_SYSTEM_PROMPT = (
+    "You are simulating the human user in an evaluation session. Given the "
+    "original user goal and the conversation so far, reply as the user would. "
+    "Return only the next user message."
+)
 
 
 def run_ohmo_eval_report(
@@ -148,12 +157,17 @@ def run_ohmo_session_eval(
     system_prompt: str | None = None,
     samples: int = 1,
     gold_capabilities_by_session: Mapping[str, Sequence[str]] | None = None,
+    user_sim_profile: str | None = None,
+    user_sim_model: str | None = None,
+    clarification_allowed_by_session: Mapping[str, bool] | None = None,
 ) -> OhmoSessionEvalRunResult:
     """Run P0 session replay checks over captured Ohmo eval episodes."""
     if limit is not None and limit <= 0:
         raise ValueError("limit must be positive")
     if samples < 1:
         raise ValueError("samples must be positive")
+    if user_sim_model is not None and user_sim_profile is None:
+        raise ValueError("user_sim_model requires user_sim_profile")
 
     workspace_root = Path(workspace).expanduser().resolve() if workspace else None
     agent_runner_config = _build_agent_runner_config(
@@ -165,6 +179,38 @@ def run_ohmo_session_eval(
     )
     if agent_runner_config.api_client is None:
         raise ValueError("session eval runner requires configured API authentication")
+
+    user_simulator_factory: Callable[[], UserSimulator] | None = None
+    user_sim_resolved_profile = ""
+    user_sim_resolved_model = ""
+    if user_sim_profile is not None:
+        if user_sim_profile == agent_runner_config.provider_profile:
+            raise ValueError("user_sim_profile must differ from provider_profile")
+        user_sim_config = _build_agent_runner_config(
+            "query-engine",
+            workspace=workspace_root,
+            model=user_sim_model,
+            provider_profile=user_sim_profile,
+            system_prompt=_USER_SIM_SYSTEM_PROMPT,
+        )
+        if user_sim_config.api_client is None:
+            raise ValueError("user simulator requires configured API authentication")
+        if user_sim_config.provider_profile == agent_runner_config.provider_profile:
+            raise ValueError("user_sim_profile must differ from provider_profile")
+        user_sim_resolved_profile = user_sim_config.provider_profile
+        user_sim_resolved_model = user_sim_config.model
+
+        def _new_user_simulator() -> UserSimulator:
+            return HybridUserSimulator(
+                replay=ReplayUserSimulator(),
+                llm=LlmUserSimulator(
+                    api_client=user_sim_config.api_client,
+                    model=user_sim_config.model,
+                    system_prompt=user_sim_config.system_prompt,
+                ),
+            )
+
+        user_simulator_factory = _new_user_simulator
 
     store = get_eval_store(workspace)
     groups = group_episodes_into_sessions(store, app="ohmo")
@@ -185,11 +231,19 @@ def run_ohmo_session_eval(
             runner=runner,
             samples=samples,
             gold_capabilities_by_session=gold_capabilities_by_session,
+            user_simulator_factory=user_simulator_factory,
+            clarification_allowed_by_session=clarification_allowed_by_session,
         )
         for group in groups
     ]
     passed_count = sum(1 for case in cases if case.status == "passed")
     failed_count = len(cases) - passed_count
+    mean_replay_hit_rate = (
+        sum(float(case.metadata.get("replay_hit_rate", 0.0)) for case in cases)
+        / len(cases)
+        if cases
+        else 0.0
+    )
     report = EvalSessionReport(
         report_id=_stable_id(
             "session-eval",
@@ -205,6 +259,13 @@ def run_ohmo_session_eval(
             "runner_name": SessionReplayRunner.name,
             "model": agent_runner_config.model,
             "provider_profile": agent_runner_config.provider_profile,
+            "user_simulation": "hybrid" if user_simulator_factory else "replay",
+            "user_sim_profile": user_sim_resolved_profile,
+            "user_sim_model": user_sim_resolved_model,
+            "mean_replay_hit_rate": mean_replay_hit_rate,
+            "total_llm_fallback_count": sum(
+                int(case.metadata.get("llm_fallback_count", 0)) for case in cases
+            ),
             "gold_source": (
                 "provided"
                 if gold_capabilities_by_session is not None
@@ -363,12 +424,16 @@ def _run_session_report_case_sampled(
     runner: SessionReplayRunner,
     samples: int,
     gold_capabilities_by_session: Mapping[str, Sequence[str]] | None,
+    user_simulator_factory: Callable[[], UserSimulator] | None,
+    clarification_allowed_by_session: Mapping[str, bool] | None,
 ) -> EvalSessionReportCase:
     first = _run_session_report_case(
         store=store,
         group=group,
         runner=runner,
         gold_capabilities_by_session=gold_capabilities_by_session,
+        user_simulator_factory=user_simulator_factory,
+        clarification_allowed_by_session=clarification_allowed_by_session,
     )
     if samples == 1:
         return first
@@ -381,6 +446,8 @@ def _run_session_report_case_sampled(
                 group=group,
                 runner=runner,
                 gold_capabilities_by_session=gold_capabilities_by_session,
+                user_simulator_factory=user_simulator_factory,
+                clarification_allowed_by_session=clarification_allowed_by_session,
             )
         )
     pass_count = sum(1 for case in sample_cases if case.status == "passed")
@@ -404,6 +471,8 @@ def _run_session_report_case(
     group,
     runner: SessionReplayRunner,
     gold_capabilities_by_session: Mapping[str, Sequence[str]] | None,
+    user_simulator_factory: Callable[[], UserSimulator] | None,
+    clarification_allowed_by_session: Mapping[str, bool] | None,
 ) -> EvalSessionReportCase:
     gold_source = (
         "provided"
@@ -420,29 +489,53 @@ def _run_session_report_case(
     state_changed = (
         None if state_delta is None else bool(state_delta.get("changed") is True)
     )
-    result = runner.run(group=group, store=store)
+    result = runner.run(
+        group=group,
+        store=store,
+        user_simulator=(
+            user_simulator_factory() if user_simulator_factory is not None else None
+        ),
+    )
+    clarification_allowed = bool(
+        clarification_allowed_by_session
+        and clarification_allowed_by_session.get(group.session_id, False)
+    )
     score_payload = score_session(
         result,
         gold_capabilities=gold_capabilities,
         state_changed=state_changed,
+        clarification_allowed=clarification_allowed,
     )
+    metadata = {
+        "episode_count": len(group.episode_ids),
+        "gold_source": gold_source,
+        "gold_capability_count": len(gold_capabilities),
+        "observed_capabilities": score_payload["observed_capabilities"],
+        "missing_capabilities": score_payload["missing_capabilities"],
+        "state_delta_captured": state_delta is not None,
+        "state_changed": state_changed,
+        "final_text_length": len(result.final_text),
+        "fixture_count": result.metadata.get("fixture_count", 0),
+        "source_event_count": result.metadata.get("source_event_count", 0),
+        "engine_message_count": result.metadata.get("engine_message_count", 0),
+        "user_turn_sources": result.metadata.get("user_turn_sources", []),
+        "replay_hit_count": result.metadata.get("replay_hit_count", 0),
+        "llm_fallback_count": result.metadata.get("llm_fallback_count", 0),
+        "replay_hit_rate": result.metadata.get("replay_hit_rate", 0.0),
+        "ended_reason": result.metadata.get("ended_reason", ""),
+        "clarification_allowed": clarification_allowed,
+        "terminal_clarification": bool(
+            score_payload.get("terminal_clarification", False)
+        ),
+    }
+    warnings = list(score_payload.get("warnings", []))
+    if warnings:
+        metadata["warnings"] = warnings
     return EvalSessionReportCase(
         session_id=group.session_id,
         status="passed" if score_payload["passed"] else "failed",
         score=float(score_payload["score"]),
         checks=dict(score_payload["checks"]),
         turn_count=result.turn_count,
-        metadata={
-            "episode_count": len(group.episode_ids),
-            "gold_source": gold_source,
-            "gold_capability_count": len(gold_capabilities),
-            "observed_capabilities": score_payload["observed_capabilities"],
-            "missing_capabilities": score_payload["missing_capabilities"],
-            "state_delta_captured": state_delta is not None,
-            "state_changed": state_changed,
-            "final_text_length": len(result.final_text),
-            "fixture_count": result.metadata.get("fixture_count", 0),
-            "source_event_count": result.metadata.get("source_event_count", 0),
-            "engine_message_count": result.metadata.get("engine_message_count", 0),
-        },
+        metadata=metadata,
     )

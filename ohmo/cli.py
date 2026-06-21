@@ -1455,6 +1455,16 @@ def evals_run_session_cmd(
         "--system-prompt",
         help="Override ohmo's real system prompt for the session query-engine runner",
     ),
+    user_sim_profile: str | None = typer.Option(
+        None,
+        "--user-sim-profile",
+        help="Provider profile for the hybrid user simulator",
+    ),
+    user_sim_model: str | None = typer.Option(
+        None,
+        "--user-sim-model",
+        help="Model override for the hybrid user simulator",
+    ),
     json_output: bool = typer.Option(False, "--json", help="Print a JSON summary"),
 ) -> None:
     """Run session-level replay checks over captured Ohmo eval episodes."""
@@ -1468,6 +1478,8 @@ def evals_run_session_cmd(
             model=model,
             provider_profile=provider_profile,
             system_prompt=system_prompt,
+            user_sim_profile=user_sim_profile,
+            user_sim_model=user_sim_model,
         )
     except (FileNotFoundError, ValueError) as exc:
         print(str(exc), file=sys.stderr)
