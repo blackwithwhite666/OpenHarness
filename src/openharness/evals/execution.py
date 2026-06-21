@@ -529,7 +529,8 @@ def run_execution_report(
         raise ValueError("samples must be positive")
 
     selected_executor = executor or ReplayToolsExecutor()
-    selected_scorer = scorer or ExactMatchEvalScorer()
+    scorer_override = scorer
+    default_scorer = scorer or ExactMatchEvalScorer()
     payload = pack or read_run_pack(store, pack_filename=pack_filename)
     cases = payload.cases[:limit] if limit is not None else payload.cases
     if not cases:
@@ -559,8 +560,9 @@ def run_execution_report(
             case,
             facet_inputs_by_id,
             selected_executor,
-            selected_scorer,
+            default_scorer,
             samples=samples,
+            scorer_override=scorer_override,
         )
         for case in cases
     ]
@@ -586,7 +588,7 @@ def run_execution_report(
             "privacy": "metadata_only",
             "mode": "execution_replay",
             "executor_name": selected_executor.name,
-            "scorer_name": selected_scorer.name,
+            "scorer_name": default_scorer.name,
             "score_schema_version": _EXECUTION_SCORE_SCHEMA_VERSION,
             "fixture_match": getattr(selected_executor, "fixture_match_mode", "order"),
             "pack_case_count": len(payload.cases),
@@ -612,6 +614,7 @@ def _execute_case_sampled(
     default_scorer: EvalExecutionScorer,
     *,
     samples: int,
+    scorer_override: EvalExecutionScorer | None = None,
 ) -> EvalExecutionReportCase:
     first = _execute_case(
         store,
@@ -620,6 +623,7 @@ def _execute_case_sampled(
         facet_inputs_by_id,
         executor,
         default_scorer,
+        scorer_override=scorer_override,
     )
     if samples == 1 or first.status in {"blocked", "error"}:
         return first
@@ -634,6 +638,7 @@ def _execute_case_sampled(
                 facet_inputs_by_id,
                 executor,
                 default_scorer,
+                scorer_override=scorer_override,
             )
         )
     pass_count = sum(1 for sample_case in sample_cases if sample_case.status == "passed")
@@ -658,6 +663,8 @@ def _execute_case(
     facet_inputs_by_id: dict[str, EvalTextFacetInput],
     executor: EvalExecutor,
     default_scorer: EvalExecutionScorer,
+    *,
+    scorer_override: EvalExecutionScorer | None = None,
 ) -> EvalExecutionReportCase:
     episode = store.get_episode(case.episode_id)
     events = list(store.iter_events(case.episode_id)) if episode is not None else []
@@ -737,11 +744,14 @@ def _execute_case(
         )
 
     observed_tool_path = [_sanitize_label(value, prefix="tool") for value in executor_result.tool_path]
-    selected_scorer = (
-        EVAL_EXECUTION_SCORERS.get(case.scorer, default_scorer)
-        if getattr(case, "scorer", None)
-        else default_scorer
-    )
+    if scorer_override is not None:
+        selected_scorer = scorer_override
+    else:
+        selected_scorer = (
+            EVAL_EXECUTION_SCORERS.get(case.scorer, default_scorer)
+            if getattr(case, "scorer", None)
+            else default_scorer
+        )
     scorer_result = selected_scorer.score(
         context=execution_context,
         executor_result=executor_result,

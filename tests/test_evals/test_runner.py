@@ -944,6 +944,91 @@ def test_execution_report_per_case_scorer_overrides_default(tmp_path: Path):
     assert case.checks["final_output_matches"] is True
 
 
+def test_execution_report_run_scorer_overrides_per_case_scorer(tmp_path: Path):
+    store = EvalStore(tmp_path / "evals")
+    _add_episode(
+        store,
+        episode_id="ep-1",
+        user_text="private req",
+        final_text="private ans",
+        tool_name="bash",
+        tool_input={"command": "weather-cli forecast 'СПб'"},
+    )
+    drafts = build_case_drafts(store, build_case_candidates(store))
+    write_case_draft_pack(store, drafts)
+    promote_case_drafts(store, case_ids=[drafts[0].case_id])
+    pack = write_run_pack(store).pack
+    pack = pack.model_copy(
+        update={
+            "cases": [
+                case.model_copy(update={"scorer": "capability_coverage_oracle_v1"})
+                for case in pack.cases
+            ]
+        }
+    )
+    scorer = _RecordingPassScorer()
+
+    result = run_execution_report(
+        store,
+        pack=pack,
+        executor=_SequenceExecutor([False]),
+        scorer=scorer,
+    )
+
+    assert scorer.called is True
+    assert result.report.passed_count == 1
+    case = result.report.cases[0]
+    assert case.status == "passed"
+    assert case.checks["final_output_matches"] is True
+    assert case.metadata["scorer_name"] == "recording-pass"
+    assert case.observed_trace is not None
+    assert case.observed_trace.metadata["scorer_name"] == "recording-pass"
+
+
+def test_execution_report_per_case_coverage_scorer_used_without_run_override(
+    tmp_path: Path,
+):
+    store = EvalStore(tmp_path / "evals")
+    _add_episode(
+        store,
+        episode_id="ep-1",
+        user_text="private req",
+        final_text="private ans",
+        tool_name="bash",
+        tool_input={"command": "weather-cli forecast 'СПб'"},
+    )
+    drafts = build_case_drafts(store, build_case_candidates(store))
+    write_case_draft_pack(store, drafts)
+    promote_case_drafts(store, case_ids=[drafts[0].case_id])
+    pack = write_run_pack(store).pack
+    pack = pack.model_copy(
+        update={
+            "cases": [
+                case.model_copy(update={"scorer": "capability_coverage_oracle_v1"})
+                for case in pack.cases
+            ]
+        }
+    )
+
+    result = run_execution_report(
+        store,
+        pack=pack,
+        executor=_CoverageMismatchExecutor(),
+    )
+
+    assert result.report.passed_count == 1
+    assert result.report.metadata["scorer_name"] == "exact-final-text"
+    case = result.report.cases[0]
+    assert case.status == "passed"
+    assert case.checks["tool_sequence_matches"] is False
+    assert case.checks["final_output_matches"] is True
+    assert case.observed_trace is not None
+    assert case.observed_trace.metadata["scorer_name"] == "capability_coverage_oracle_v1"
+    assert case.observed_trace.metadata["observed_capabilities"] == [
+        "bash:weather-cli forecast"
+    ]
+
+
 def test_execution_report_rejects_unknown_per_case_scorer(tmp_path: Path):
     store = EvalStore(tmp_path / "evals")
     _add_episode(
@@ -1044,6 +1129,23 @@ class _AlwaysPassScorer:
             score=0.75,
             scorer_name=self.name,
             metadata={"note": "private scorer note"},
+        )
+
+
+class _RecordingPassScorer:
+    name = "recording-pass"
+
+    def __init__(self) -> None:
+        self.called = False
+
+    def score(self, *, context, executor_result):
+        del context, executor_result
+        self.called = True
+        return EvalExecutionScorerResult(
+            passed=True,
+            score=0.5,
+            scorer_name=self.name,
+            metadata={"override": True},
         )
 
 
