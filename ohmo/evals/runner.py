@@ -76,6 +76,7 @@ def run_ohmo_eval_report(
     provider_profile: str | None = None,
     system_prompt: str | None = None,
     scorer: str | None = None,
+    samples: int = 1,
 ) -> OhmoEvalRunResult:
     """Run deterministic replay-tools execution checks over an Ohmo eval pack."""
     if limit is not None and limit <= 0:
@@ -100,6 +101,7 @@ def run_ohmo_eval_report(
         pack=pack,
         report_filename=report_filename,
         limit=limit,
+        samples=samples,
         executor=executor,
         scorer=selected_scorer,
     )

@@ -349,10 +349,13 @@ def run_execution_report(
     pack_filename: str = "eval_pack.json",
     report_filename: str = "eval_report.json",
     limit: int | None = None,
+    samples: int = 1,
 ) -> EvalExecutionReportWrite:
     """Run executor-based checks over a runnable eval pack."""
     if limit is not None and limit <= 0:
         raise ValueError("limit must be positive")
+    if samples < 1:
+        raise ValueError("samples must be positive")
 
     selected_executor = executor or ReplayToolsExecutor()
     selected_scorer = scorer or ExactMatchEvalScorer()
@@ -379,13 +382,14 @@ def run_execution_report(
         item.facet.facet_id: item for item in collect_text_facets(store)
     }
     report_cases = [
-        _execute_case(
+        _execute_case_sampled(
             store,
             payload,
             case,
             facet_inputs_by_id,
             selected_executor,
             selected_scorer,
+            samples=samples,
         )
         for case in cases
     ]
@@ -415,6 +419,7 @@ def run_execution_report(
             "score_schema_version": _EXECUTION_SCORE_SCHEMA_VERSION,
             "pack_case_count": len(payload.cases),
             "limit": limit or 0,
+            "samples": samples,
         },
     )
     path = _report_output_path(store, report_filename)
@@ -423,6 +428,54 @@ def run_execution_report(
         report=report,
         path=path,
         relative_path=path.relative_to(store.root).as_posix(),
+    )
+
+
+def _execute_case_sampled(
+    store: EvalStore,
+    pack: EvalRunPack,
+    case: EvalRunPackCase,
+    facet_inputs_by_id: dict[str, EvalTextFacetInput],
+    executor: EvalExecutor,
+    default_scorer: EvalExecutionScorer,
+    *,
+    samples: int,
+) -> EvalExecutionReportCase:
+    first = _execute_case(
+        store,
+        pack,
+        case,
+        facet_inputs_by_id,
+        executor,
+        default_scorer,
+    )
+    if samples == 1 or first.status in {"blocked", "error"}:
+        return first
+
+    sample_cases = [first]
+    for _ in range(samples - 1):
+        sample_cases.append(
+            _execute_case(
+                store,
+                pack,
+                case,
+                facet_inputs_by_id,
+                executor,
+                default_scorer,
+            )
+        )
+    pass_count = sum(1 for sample_case in sample_cases if sample_case.status == "passed")
+    return first.model_copy(
+        update={
+            "status": "passed" if pass_count * 2 > samples else "failed",
+            "score": sum(sample_case.score for sample_case in sample_cases) / samples,
+            "metadata": {
+                **first.metadata,
+                "sample_count": samples,
+                "pass_count": pass_count,
+                "pass_rate": pass_count / samples,
+            },
+        }
     )
 
 

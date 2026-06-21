@@ -189,7 +189,9 @@ def test_execution_report_replay_tools_writes_observed_trace_without_private_tex
     assert case.checks["tool_sequence_matches"] is True
     assert case.checks["final_output_matches"] is True
     assert case.metadata["scorer_name"] == "exact-final-text"
+    assert "sample_count" not in case.metadata
     assert result.report.metadata["scorer_name"] == "exact-final-text"
+    assert result.report.metadata["samples"] == 1
 
     serialized = result.path.read_text(encoding="utf-8")
     assert "private execution request" not in serialized
@@ -501,6 +503,61 @@ def test_execution_report_marks_behavior_mismatch_failed(tmp_path: Path):
     assert case.observed_trace.tool_path == []
 
 
+def test_execution_report_samples_majority_passes(tmp_path: Path):
+    store = EvalStore(tmp_path / "evals")
+    _add_episode(
+        store,
+        episode_id="ep-1",
+        user_text="private sampled pass request",
+        final_text="private sampled pass answer",
+    )
+    drafts = build_case_drafts(store, build_case_candidates(store))
+    write_case_draft_pack(store, drafts)
+    promote_case_drafts(store, case_ids=[drafts[0].case_id])
+    pack = write_run_pack(store).pack
+    executor = _SequenceExecutor([True, False, True])
+
+    result = run_execution_report(store, pack=pack, executor=executor, samples=3)
+
+    assert executor.call_count == 3
+    assert result.report.passed_count == 1
+    assert result.report.failed_count == 0
+    assert result.report.metadata["samples"] == 3
+    case = result.report.cases[0]
+    assert case.status == "passed"
+    assert case.metadata["sample_count"] == 3
+    assert case.metadata["pass_count"] == 2
+    assert case.metadata["pass_rate"] == pytest.approx(2 / 3)
+    assert case.checks["final_output_matches"] is True
+
+
+def test_execution_report_samples_majority_fails(tmp_path: Path):
+    store = EvalStore(tmp_path / "evals")
+    _add_episode(
+        store,
+        episode_id="ep-1",
+        user_text="private sampled fail request",
+        final_text="private sampled fail answer",
+    )
+    drafts = build_case_drafts(store, build_case_candidates(store))
+    write_case_draft_pack(store, drafts)
+    promote_case_drafts(store, case_ids=[drafts[0].case_id])
+    pack = write_run_pack(store).pack
+    executor = _SequenceExecutor([False, True, False])
+
+    result = run_execution_report(store, pack=pack, executor=executor, samples=3)
+
+    assert executor.call_count == 3
+    assert result.report.passed_count == 0
+    assert result.report.failed_count == 1
+    case = result.report.cases[0]
+    assert case.status == "failed"
+    assert case.metadata["sample_count"] == 3
+    assert case.metadata["pass_count"] == 1
+    assert case.metadata["pass_rate"] == pytest.approx(1 / 3)
+    assert case.checks["final_output_matches"] is False
+
+
 def test_execution_report_coverage_scorer_treats_tool_sequence_as_advisory(
     tmp_path: Path,
 ):
@@ -607,6 +664,8 @@ def test_execution_report_validates_limit_empty_pack_and_paths(tmp_path: Path):
 
     with pytest.raises(ValueError, match="limit must be positive"):
         run_execution_report(store, pack=pack, limit=0)
+    with pytest.raises(ValueError, match="samples must be positive"):
+        run_execution_report(store, pack=pack, samples=0)
     with pytest.raises(ValueError, match="eval pack must contain cases"):
         run_execution_report(store, pack=pack)
     with pytest.raises(ValueError, match="store.root/reports"):
@@ -780,6 +839,27 @@ class _MismatchExecutor:
         return EvalExecutorResult(
             final_text="different final text",
             tool_path=(),
+            event_kind_path=("execution_started", "execution_completed"),
+        )
+
+
+class _SequenceExecutor:
+    name = "sequence"
+
+    def __init__(self, outcomes: list[bool]) -> None:
+        self._outcomes = outcomes
+        self.call_count = 0
+
+    def run_case(self, context: EvalExecutionContext) -> EvalExecutorResult:
+        outcome = self._outcomes[self.call_count]
+        self.call_count += 1
+        return EvalExecutorResult(
+            final_text=(
+                context.expected_final_text
+                if outcome
+                else "different final text"
+            ),
+            tool_path=tuple(context.case.tool_names),
             event_kind_path=("execution_started", "execution_completed"),
         )
 

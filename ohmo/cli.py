@@ -1277,6 +1277,15 @@ def evals_run_cmd(
         help="Execution report filename under evals/reports",
     ),
     limit: int | None = typer.Option(None, "--limit", min=1, help="Eval subset size"),
+    samples: int = typer.Option(
+        1,
+        "--samples",
+        min=1,
+        help=(
+            "Run each case N times and decide pass/fail by majority — stabilizes "
+            "the non-deterministic query-engine runner"
+        ),
+    ),
     executor_name: str = typer.Option(
         "replay-tools",
         "--executor",
@@ -1357,6 +1366,7 @@ def evals_run_cmd(
             pack_filename=pack_filename,
             report_filename=report_filename,
             limit=limit,
+            samples=samples,
             report_only=report_only,
             executor_name=executor_name,
             agent_runner_name=agent_runner_name,

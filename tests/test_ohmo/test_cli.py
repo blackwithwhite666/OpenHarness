@@ -1256,6 +1256,7 @@ def test_ohmo_evals_run_command_runs_eval_report(tmp_path: Path, monkeypatch):
         pack_filename: str = "eval_pack.json",
         report_filename: str = "eval_report.json",
         limit: int | None = None,
+        samples: int = 1,
         report_only: bool = False,
         executor_name: str = "replay-tools",
         agent_runner_name: str = "scripted",
@@ -1270,6 +1271,7 @@ def test_ohmo_evals_run_command_runs_eval_report(tmp_path: Path, monkeypatch):
                 "pack_filename": pack_filename,
                 "report_filename": report_filename,
                 "limit": limit,
+                "samples": samples,
                 "report_only": report_only,
                 "executor_name": executor_name,
                 "agent_runner_name": agent_runner_name,
@@ -1299,6 +1301,8 @@ def test_ohmo_evals_run_command_runs_eval_report(tmp_path: Path, monkeypatch):
             "custom_pack.json",
             "--limit",
             "2",
+            "--samples",
+            "3",
             "--executor",
             "replay-tools",
         ],
@@ -1330,6 +1334,7 @@ def test_ohmo_evals_run_command_runs_eval_report(tmp_path: Path, monkeypatch):
             "pack_filename": "custom_pack.json",
             "report_filename": "eval_report.json",
             "limit": 2,
+            "samples": 3,
             "report_only": False,
             "executor_name": "replay-tools",
             "agent_runner_name": "scripted",
@@ -1342,6 +1347,7 @@ def test_ohmo_evals_run_command_runs_eval_report(tmp_path: Path, monkeypatch):
             "pack_filename": "custom_pack.json",
             "report_filename": "eval_report.json",
             "limit": 2,
+            "samples": 1,
             "report_only": True,
             "executor_name": "replay-tools",
             "agent_runner_name": "scripted",
@@ -1363,6 +1369,7 @@ def test_ohmo_evals_run_command_passes_output_filename(tmp_path: Path, monkeypat
         pack_filename: str = "eval_pack.json",
         report_filename: str = "eval_report.json",
         limit: int | None = None,
+        samples: int = 1,
         report_only: bool = False,
         executor_name: str = "replay-tools",
         agent_runner_name: str = "scripted",
@@ -1441,6 +1448,7 @@ def test_ohmo_evals_run_command_outputs_json_summary(tmp_path: Path, monkeypatch
         pack_filename: str = "eval_pack.json",
         report_filename: str = "eval_report.json",
         limit: int | None = None,
+        samples: int = 1,
         report_only: bool = False,
         executor_name: str = "replay-tools",
         agent_runner_name: str = "scripted",
@@ -1519,6 +1527,7 @@ def test_ohmo_evals_run_command_passes_query_engine_runner_options(
         pack_filename: str = "eval_pack.json",
         report_filename: str = "eval_report.json",
         limit: int | None = None,
+        samples: int = 1,
         report_only: bool = False,
         executor_name: str = "replay-tools",
         agent_runner_name: str = "scripted",
@@ -1769,6 +1778,7 @@ def test_ohmo_evals_run_command_help_lists_supported_executor_and_runner_ids():
     assert "Eval executor to use:" in output
     assert "replay-tools" in output
     assert "--agent-runner" in output
+    assert "--samples" in output
     assert "Agent runner to use inside the" in output
     assert "executor: scripted," in output
     assert "query-engine" in output
@@ -1787,6 +1797,7 @@ def test_ohmo_evals_run_command_reports_blocked_and_error_counts(
         pack_filename: str = "eval_pack.json",
         report_filename: str = "eval_report.json",
         limit: int | None = None,
+        samples: int = 1,
         report_only: bool = False,
         executor_name: str = "replay-tools",
         agent_runner_name: str = "scripted",
