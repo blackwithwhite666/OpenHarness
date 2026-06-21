@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -17,6 +18,7 @@ from openharness.evals import (
     EvalObservedCall,
     QueryEngineEvalAgentRunner,
     ReplayToolsExecutor,
+    EvalToolFixture,
     EvalResource,
     EvalResourceSnapshot,
     EvalRunPack,
@@ -24,6 +26,7 @@ from openharness.evals import (
     EvalStore,
     build_case_candidates,
     build_case_drafts,
+    build_replay_tool_registry,
     promote_case_drafts,
     resolve_execution_scorer,
     run_execution_report,
@@ -462,6 +465,69 @@ def test_query_engine_capability_oracle_gates_command_regression(tmp_path: Path)
         assert "print(2+2)" not in serialized
         assert "private weather request" not in serialized
         assert "private weather answer" not in serialized
+
+
+def test_query_engine_max_turns_exceeded_is_scored_failure(tmp_path: Path):
+    store = EvalStore(tmp_path / "evals")
+    _add_episode(
+        store,
+        episode_id="ep-1",
+        user_text="private max turns request",
+        final_text="private max turns answer",
+        tool_name="bash",
+        tool_input={"command": "maps-cli search x"},
+    )
+    drafts = build_case_drafts(store, build_case_candidates(store))
+    write_case_draft_pack(store, drafts)
+    promote_case_drafts(store, case_ids=[drafts[0].case_id])
+    pack = write_run_pack(store).pack
+
+    runner = QueryEngineEvalAgentRunner(
+        api_client=_LoopingBashModelApiClient(command="maps-cli search x"),
+        model="eval-model",
+        system_prompt="eval system",
+        cwd=tmp_path,
+        max_turns=2,
+    )
+    direct_result = runner.run(
+        prompt="private max turns request",
+        tool_registry=build_replay_tool_registry(
+            (
+                EvalToolFixture(
+                    tool_name="bash",
+                    call_key_hash="fixture-bash",
+                    output_text="replayed bash output",
+                ),
+            )
+        ),
+        context=SimpleNamespace(events=()),
+    )
+
+    assert direct_result.metadata["max_turns_exceeded"] is True
+    assert direct_result.final_text == ""
+    assert direct_result.tool_path
+    assert "max_turns_exceeded" in direct_result.event_kind_path
+
+    result = run_execution_report(
+        store,
+        pack=pack,
+        executor=ReplayToolsExecutor(
+            agent_runner=QueryEngineEvalAgentRunner(
+                api_client=_LoopingBashModelApiClient(command="maps-cli search x"),
+                model="eval-model",
+                system_prompt="eval system",
+                cwd=tmp_path,
+                max_turns=2,
+            ),
+        ),
+    )
+
+    assert result.report.failed_count == 1
+    assert result.report.error_count == 0
+    case = result.report.cases[0]
+    assert case.status == "failed"
+    assert case.observed_trace is not None
+    assert "max_turns_exceeded" in case.observed_trace.event_kind_path
 
 
 def test_execution_report_executor_gets_transient_text_but_report_omits_it(
@@ -1062,6 +1128,30 @@ class _ScriptedBashModelApiClient:
             message=ConversationMessage(
                 role="assistant",
                 content=[TextBlock(text=self._final_text)],
+            ),
+            usage=UsageSnapshot(input_tokens=1, output_tokens=1),
+        )
+
+
+class _LoopingBashModelApiClient:
+    """Fake model that keeps requesting ``bash`` and never emits a final answer."""
+
+    def __init__(self, *, command: str) -> None:
+        self._command = command
+        self.requests = []
+
+    async def stream_message(self, request):
+        self.requests.append(request)
+        yield ApiMessageCompleteEvent(
+            message=ConversationMessage(
+                role="assistant",
+                content=[
+                    ToolUseBlock(
+                        id=f"toolu-bash-{len(self.requests)}",
+                        name="bash",
+                        input={"command": self._command},
+                    )
+                ],
             ),
             usage=UsageSnapshot(input_tokens=1, output_tokens=1),
         )

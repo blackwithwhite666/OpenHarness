@@ -13,10 +13,11 @@ from openharness.evals.tool_labels import (
 
 def test_extract_command_binaries_basic():
     assert extract_command_binaries("weather-cli forecast 'СПб' --json") == ["weather-cli"]
-    assert extract_command_binaries("cat a.txt | jq .x") == ["cat", "jq"]
+    assert extract_command_binaries("cat a.txt | jq .x") == ["jq"]
     assert extract_command_binaries("FOO=bar maps-cli search x") == ["maps-cli"]
     assert extract_command_binaries("cd /tmp && weather-cli now") == ["weather-cli"]
     assert extract_command_binaries("/usr/local/bin/maps-cli reviews 1") == ["maps-cli"]
+    assert extract_command_binaries("sudo -v") == []
 
 
 def test_extract_command_binaries_ignores_heredoc_body():
@@ -26,12 +27,31 @@ def test_extract_command_binaries_ignores_heredoc_body():
 
 def test_command_capabilities_adds_subcommand_for_cli_tools():
     assert command_capabilities("maps-cli reviews 9089 --json") == ["maps-cli reviews"]
+    assert command_capabilities("maps-cli search 'x'") == ["maps-cli search"]
     assert command_capabilities("weather-cli forecast 'СПб' --days 1") == ["weather-cli forecast"]
     assert command_capabilities("git --no-pager status") == ["git status"]
+    assert command_capabilities("git commit -m x") == ["git commit"]
     # python is not a -cli/known-subcommand tool -> no subcommand appended
     assert command_capabilities("python3.12 - <<'PY'\nprint(1)\nPY") == ["python3.12"]
-    # ls is not a subcommand tool; flags are not subcommands
-    assert command_capabilities("ls -la /tmp") == ["ls"]
+    assert command_capabilities("python3.12 script.py") == ["python3.12"]
+
+
+def test_command_capabilities_skip_flags_and_plumbing():
+    assert command_capabilities("sudo -v") == []
+    assert effective_tool_label("bash", {"command": "sudo -v"}) == "bash"
+
+    for command in (
+        "set -e",
+        "mkdir -p x",
+        "apt-get update",
+        "chmod +x f",
+        "cp a b",
+        "ls -la /tmp",
+    ):
+        assert command_capabilities(command) == []
+        assert effective_tool_label("bash", {"command": command}) == "bash"
+
+    assert command_capabilities("mkdir -p d && maps-cli search x") == ["maps-cli search"]
 
 
 def test_effective_tool_label_shell_vs_typed():

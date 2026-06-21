@@ -15,6 +15,7 @@ from pydantic import BaseModel, ConfigDict
 
 from openharness.api.client import SupportsStreamingMessages
 from openharness.config.settings import PermissionSettings
+from openharness.engine.query import MaxTurnsExceeded
 from openharness.engine.query_engine import QueryEngine
 from openharness.engine.stream_events import (
     AssistantTurnComplete,
@@ -500,39 +501,48 @@ async def _run_query_engine_replay(
     calls_by_id: dict[str, dict[str, Any]] = {}
     event_kind_path: list[str] = ["execution_started"]
     final_text = ""
-    async for event in engine.submit_message(prompt):
-        if isinstance(event, ToolExecutionStarted):
-            tool_path.append(event.tool_name)
-            entry = {
-                "tool_name": event.tool_name,
-                "arguments": dict(event.tool_input or {}),
-                "is_error": False,
-            }
-            observed_calls.append(entry)
-            if event.tool_call_id:
-                calls_by_id[event.tool_call_id] = entry
-            event_kind_path.append("tool_started")
-        elif isinstance(event, ToolExecutionCompleted):
-            entry = calls_by_id.get(event.tool_call_id)
-            if entry is not None:
-                entry["is_error"] = event.is_error
-            event_kind_path.append(
-                "tool_completed_error" if event.is_error else "tool_completed"
-            )
-        elif isinstance(event, AssistantTurnComplete):
-            final_text = event.message.text
-            event_kind_path.append("assistant_turn_complete")
-        elif isinstance(event, ErrorEvent):
-            event_kind_path.append("execution_error")
+    max_turns_exceeded = False
+    try:
+        async for event in engine.submit_message(prompt):
+            if isinstance(event, ToolExecutionStarted):
+                tool_path.append(event.tool_name)
+                entry = {
+                    "tool_name": event.tool_name,
+                    "arguments": dict(event.tool_input or {}),
+                    "is_error": False,
+                }
+                observed_calls.append(entry)
+                if event.tool_call_id:
+                    calls_by_id[event.tool_call_id] = entry
+                event_kind_path.append("tool_started")
+            elif isinstance(event, ToolExecutionCompleted):
+                entry = calls_by_id.get(event.tool_call_id)
+                if entry is not None:
+                    entry["is_error"] = event.is_error
+                event_kind_path.append(
+                    "tool_completed_error" if event.is_error else "tool_completed"
+                )
+            elif isinstance(event, AssistantTurnComplete):
+                final_text = event.message.text
+                event_kind_path.append("assistant_turn_complete")
+            elif isinstance(event, ErrorEvent):
+                event_kind_path.append("execution_error")
+    except MaxTurnsExceeded:
+        max_turns_exceeded = True
+        final_text = ""
+        event_kind_path.append("max_turns_exceeded")
     event_kind_path.append("execution_completed")
+    metadata = {
+        "agent_runner": QueryEngineEvalAgentRunner.name,
+        "engine_message_count": len(engine.messages),
+        "source_event_count": len(context.events),
+    }
+    if max_turns_exceeded:
+        metadata["max_turns_exceeded"] = True
     return EvalExecutorResult(
         final_text=final_text,
         tool_path=tuple(tool_path),
         event_kind_path=tuple(event_kind_path),
         tool_calls=tuple(EvalObservedCall(**entry) for entry in observed_calls),
-        metadata={
-            "agent_runner": QueryEngineEvalAgentRunner.name,
-            "engine_message_count": len(engine.messages),
-            "source_event_count": len(context.events),
-        },
+        metadata=metadata,
     )

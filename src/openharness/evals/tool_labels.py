@@ -31,12 +31,46 @@ _WRAPPERS = frozenset(
      "ionice", "stdbuf", "xargs", "watch", "then", "do", "else", "timeout"}
 )
 _SKIP = frozenset({"cd", "pushd", "popd", ":", "true", "false", "export", "source", "."})
+_PLUMBING = frozenset(
+    {
+        "set",
+        "mkdir",
+        "rmdir",
+        "rm",
+        "mv",
+        "cp",
+        "ln",
+        "touch",
+        "chmod",
+        "chown",
+        "cat",
+        "echo",
+        "ls",
+        "test",
+        "[",
+        "head",
+        "tail",
+        "printf",
+        "kill",
+        "sleep",
+        "pwd",
+        "which",
+        "mkfifo",
+        "apt",
+        "apt-get",
+        "brew",
+        "dpkg",
+        "yum",
+        "dnf",
+        "snap",
+    }
+)
 # Binaries whose first positional token is a meaningful subcommand (capability).
 # Skill CLIs follow the ``*-cli`` convention; a few common multi-command tools
 # are listed explicitly.
 _SUBCOMMAND_BINARIES = frozenset(
     {"git", "docker", "kubectl", "npm", "yarn", "pnpm", "cargo", "go", "pip",
-     "pip3", "poetry", "gh", "ya", "systemctl", "apt", "apt-get", "brew"}
+     "pip3", "poetry", "gh", "ya", "systemctl"}
 )
 _SUBCOMMAND_RE = re.compile(r"^[a-z][a-z0-9][a-z0-9-]*$")
 
@@ -63,7 +97,11 @@ def _command_segments(command: str) -> list[list[str]]:
         except ValueError:
             tokens = line.split()
         i = 0
-        while i < len(tokens) and (_ASSIGN.match(tokens[i]) or tokens[i] in _WRAPPERS):
+        while i < len(tokens) and (
+            _ASSIGN.match(tokens[i])
+            or tokens[i] in _WRAPPERS
+            or tokens[i].startswith("-")
+        ):
             i += 1
         if i < len(tokens):
             segments.append(tokens[i:])
@@ -74,10 +112,20 @@ def _binary_of(token: str) -> str:
     return token.rsplit("/", 1)[-1]
 
 
+def _is_noncapability_binary(binary: str) -> bool:
+    return (
+        not binary
+        or binary.startswith("-")
+        or binary in _SKIP
+        or binary in _PLUMBING
+        or bool(_ASSIGN.match(binary))
+    )
+
+
 def _segment_capability(tokens: list[str]) -> str | None:
     """``binary`` or ``binary subcommand`` for one command segment."""
     binary = _binary_of(tokens[0])
-    if not binary or binary in _SKIP or _ASSIGN.match(binary):
+    if _is_noncapability_binary(binary):
         return None
     if binary.endswith("-cli") or binary in _SUBCOMMAND_BINARIES:
         for token in tokens[1:]:
@@ -94,7 +142,7 @@ def extract_command_binaries(command: str) -> list[str]:
     out: list[str] = []
     for tokens in _command_segments(command):
         binary = _binary_of(tokens[0])
-        if not binary or binary in _SKIP or _ASSIGN.match(binary):
+        if _is_noncapability_binary(binary):
             continue
         if binary not in out:
             out.append(binary)
