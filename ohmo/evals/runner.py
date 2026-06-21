@@ -492,6 +492,7 @@ def _build_agent_runner_config(
                 model=settings.model,
                 system_prompt=resolved_prompt,
                 cwd=workspace,
+                live_mcp_server_names=("google_search",),
             ),
             agent_runner_name="query-engine-live-read",
             model=settings.model,

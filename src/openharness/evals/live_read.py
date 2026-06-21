@@ -2,12 +2,14 @@
 
 Only ``bash`` calls that are single-segment invocations of explicitly
 allowlisted read-only skill CLIs are executed for real. All other tools,
-including typed web/MCP tools, remain replay fixtures in this slice.
+including typed web tools, remain replay fixtures in this slice unless a
+specific MCP server is enabled as a live read lane.
 """
 
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 import shlex
 import shutil
@@ -16,6 +18,7 @@ from collections.abc import Collection
 from pathlib import Path
 
 from openharness.api.client import SupportsStreamingMessages
+from openharness.config import load_settings
 from openharness.evals.executor import (
     EvalExecutionContext,
     EvalExecutorResult,
@@ -25,7 +28,12 @@ from openharness.evals.executor import (
     _run_query_engine_replay,
 )
 from openharness.evals.tool_labels import _binary_of, _command_segments
+from openharness.mcp.client import McpClientManager
+from openharness.mcp.config import load_mcp_server_configs
+from openharness.tools import create_default_tool_registry
 from openharness.tools.base import BaseTool, ToolExecutionContext, ToolRegistry, ToolResult
+
+logger = logging.getLogger(__name__)
 
 READ_LIVE_BASH_ALLOWLIST = frozenset(
     {
@@ -152,7 +160,7 @@ class LiveReadBashTool(BaseTool):
 
 
 class LiveReadAgentRunner:
-    """Run QueryEngine evals with a live allowlisted read lane for ``bash`` only."""
+    """Run QueryEngine evals with selected live read lanes."""
 
     name = "query-engine-live-read"
 
@@ -167,6 +175,7 @@ class LiveReadAgentRunner:
         max_tokens: int = 4096,
         allowlist: Collection[str] = READ_LIVE_BASH_ALLOWLIST,
         timeout: float = 120.0,
+        live_mcp_server_names: tuple[str, ...] = (),
     ) -> None:
         self._api_client = api_client
         self._model = model
@@ -176,6 +185,7 @@ class LiveReadAgentRunner:
         self._max_tokens = max_tokens
         self._allowlist = frozenset(allowlist)
         self._timeout = timeout
+        self._live_mcp_server_names = tuple(live_mcp_server_names)
 
     def run(
         self,
@@ -184,22 +194,48 @@ class LiveReadAgentRunner:
         tool_registry: ToolRegistry,
         context: EvalExecutionContext,
     ) -> EvalExecutorResult:
-        live_cwd = Path(tempfile.mkdtemp(prefix="openharness-eval-live-read-")).resolve()
-        try:
-            mock_bash = tool_registry.get("bash") or ReplayFixtureTool(
-                tool_name="bash",
-                fixtures=(),
-            )
-            tool_registry.register(
-                LiveReadBashTool(
-                    mock_tool=mock_bash,
-                    allowlist=self._allowlist,
-                    cwd=live_cwd,
-                    timeout=self._timeout,
+        async def _run_async() -> EvalExecutorResult:
+            live_cwd = Path(
+                tempfile.mkdtemp(prefix="openharness-eval-live-read-")
+            ).resolve()
+            mcp: McpClientManager | None = None
+            try:
+                if self._live_mcp_server_names:
+                    try:
+                        settings = load_settings()
+                        all_cfg = load_mcp_server_configs(settings, [])
+                        cfg = {
+                            name: all_cfg[name]
+                            for name in self._live_mcp_server_names
+                            if name in all_cfg
+                        }
+                        if cfg:
+                            mcp = McpClientManager(cfg)
+                            await mcp.connect_all()
+                            real_registry = create_default_tool_registry(mcp)
+                            for tool in real_registry.list_tools():
+                                if tool.name.startswith("mcp__"):
+                                    tool_registry.register(tool)
+                    except Exception:
+                        logger.warning(
+                            "live-read MCP connect failed; %s stays replay",
+                            self._live_mcp_server_names,
+                            exc_info=True,
+                        )
+
+                mock_bash = tool_registry.get("bash") or ReplayFixtureTool(
+                    tool_name="bash",
+                    fixtures=(),
                 )
-            )
-            result = _run_eval_coroutine(
-                _run_query_engine_replay(
+                tool_registry.register(
+                    LiveReadBashTool(
+                        mock_tool=mock_bash,
+                        allowlist=self._allowlist,
+                        cwd=live_cwd,
+                        timeout=self._timeout,
+                    )
+                )
+                result = await _run_query_engine_replay(
                     api_client=self._api_client,
                     model=self._model,
                     system_prompt=self._system_prompt,
@@ -210,16 +246,29 @@ class LiveReadAgentRunner:
                     tool_registry=tool_registry,
                     context=context,
                 )
-            )
-            return EvalExecutorResult(
-                final_text=result.final_text,
-                tool_path=result.tool_path,
-                event_kind_path=result.event_kind_path,
-                tool_calls=result.tool_calls,
-                metadata={**result.metadata, "agent_runner": self.name},
-            )
-        finally:
-            shutil.rmtree(live_cwd, ignore_errors=True)
+                return EvalExecutorResult(
+                    final_text=result.final_text,
+                    tool_path=result.tool_path,
+                    event_kind_path=result.event_kind_path,
+                    tool_calls=result.tool_calls,
+                    metadata={
+                        **result.metadata,
+                        "agent_runner": self.name,
+                        "live_mcp_servers": list(self._live_mcp_server_names),
+                    },
+                )
+            finally:
+                if mcp is not None:
+                    try:
+                        await mcp.close()
+                    except Exception:
+                        logger.warning(
+                            "live-read MCP close failed; continuing eval cleanup",
+                            exc_info=True,
+                        )
+                shutil.rmtree(live_cwd, ignore_errors=True)
+
+        return _run_eval_coroutine(_run_async())
 
 
 def _process_output(*, stdout: bytes, stderr: bytes, returncode: int | None) -> str:
