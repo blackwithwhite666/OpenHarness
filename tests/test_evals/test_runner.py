@@ -629,6 +629,52 @@ def test_execution_report_coverage_scorer_treats_tool_sequence_as_advisory(
     assert case.checks["tool_sequence_matches"] is False
     assert "tool_sequence_matches" in case.warnings
     assert case.checks["final_output_matches"] is True
+    assert case.observed_trace is not None
+    assert case.observed_trace.metadata["observed_capabilities"] == [
+        "bash:weather-cli forecast"
+    ]
+    assert case.observed_trace.metadata["expected_capabilities"] == [
+        "bash:weather-cli forecast"
+    ]
+
+
+def test_execution_report_capability_trace_scorer_treats_tool_sequence_as_advisory(
+    tmp_path: Path,
+):
+    store = EvalStore(tmp_path / "evals")
+    _add_episode(
+        store,
+        episode_id="ep-1",
+        user_text="private capability trace request",
+        final_text="private capability trace answer",
+        tool_name="bash",
+        tool_input={"command": "weather-cli forecast 'СПб'"},
+    )
+    drafts = build_case_drafts(store, build_case_candidates(store))
+    write_case_draft_pack(store, drafts)
+    promote_case_drafts(store, case_ids=[drafts[0].case_id])
+    pack = write_run_pack(store).pack
+
+    result = run_execution_report(
+        store,
+        pack=pack,
+        executor=_CoverageMismatchExecutor(),
+        scorer=resolve_execution_scorer("capability_trace_oracle_v1"),
+    )
+
+    assert result.report.passed_count == 1
+    case = result.report.cases[0]
+    assert case.status == "passed"
+    assert case.checks["tool_sequence_matches"] is False
+    assert "tool_sequence_matches" in case.warnings
+    assert case.checks["final_output_matches"] is True
+    assert case.observed_trace is not None
+    assert case.observed_trace.metadata["observed_capabilities"] == [
+        "bash:weather-cli forecast"
+    ]
+    assert case.observed_trace.metadata["expected_capabilities"] == [
+        "bash:weather-cli forecast"
+    ]
 
 
 def test_execution_report_blocks_unresolvable_refs(tmp_path: Path):

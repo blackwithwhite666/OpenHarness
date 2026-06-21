@@ -191,10 +191,13 @@ class CapabilityTraceOracleV1:
     the raw tool names. This keeps typed-tool behavior unchanged while making
     generic shell tools meaningful for agents that route capabilities through
     command arguments.
+
+    Exact tool-sequence equality is advisory here: capability coverage gates,
+    while trajectory order may legitimately drift.
     """
 
     name = "capability_trace_oracle_v1"
-    requires_exact_tool_sequence = True
+    requires_exact_tool_sequence = False
 
     def __init__(self, *, max_calls_factor: int = 2, max_calls_floor: int = 3) -> None:
         self._max_calls_factor = max_calls_factor
