@@ -60,6 +60,7 @@ def test_run_ohmo_eval_report_writes_metadata_replay_report(tmp_path: Path):
     assert result.report_only is True
     assert result.write.path == workspace.resolve() / "evals" / "reports" / "eval_report.json"
     assert result.write.report.metadata["executor_name"] == "replay-tools"
+    assert result.write.report.metadata["fixture_match"] == "order"
     assert result.write.report.case_count == 1
     assert result.write.report.passed_count == 1
     assert result.write.report.failed_count == 0
@@ -103,6 +104,32 @@ def test_run_ohmo_eval_report_accepts_custom_report_filename(tmp_path: Path):
     assert result.write.path.exists()
 
 
+def test_run_ohmo_eval_report_accepts_argument_fixture_matching(tmp_path: Path):
+    workspace = tmp_path / "workspace"
+    store = get_eval_store(workspace)
+    _append_session_episode(
+        store,
+        episode_id="ep-1",
+        session_id="session-1",
+        user_text="private ohmo eval request",
+        tool_call_id="tool-1",
+    )
+    write_ohmo_eval_mine(workspace=workspace)
+    promote_case_drafts(store)
+    build_ohmo_eval_pack(workspace=workspace)
+
+    result = run_ohmo_eval_report(
+        workspace=workspace,
+        limit=1,
+        fixture_match="arguments",
+    )
+
+    assert result.write.report.metadata["fixture_match"] == "arguments"
+    assert result.write.report.passed_count == 1
+    serialized = result.write.path.read_text(encoding="utf-8")
+    assert "SECRET_CITY" not in serialized
+
+
 def test_run_ohmo_session_eval_writes_metadata_only_report(
     tmp_path: Path,
     monkeypatch,
@@ -133,7 +160,11 @@ def test_run_ohmo_session_eval_writes_metadata_only_report(
         lambda *args, **kwargs: "REAL_OHMO_PROMPT",
     )
 
-    result = run_ohmo_session_eval(workspace=workspace, limit=1)
+    result = run_ohmo_session_eval(
+        workspace=workspace,
+        limit=1,
+        fixture_match="arguments",
+    )
 
     assert result.write.path == workspace.resolve() / "evals" / "reports" / (
         "session_report.json"
@@ -143,11 +174,13 @@ def test_run_ohmo_session_eval_writes_metadata_only_report(
     assert result.write.report.passed_count == 1
     assert result.write.report.failed_count == 0
     assert result.write.report.metadata["privacy"] == "metadata_only"
+    assert result.write.report.metadata["fixture_match"] == "arguments"
     assert result.write.report.metadata["gold_source"] == "captured_self_coverage"
     case = result.write.report.cases[0]
     assert case.session_id == "session-1"
     assert case.turn_count == 2
     assert case.checks["capability_coverage"] is True
+    assert case.metadata["fixture_match"] == "arguments"
 
     serialized = result.write.path.read_text(encoding="utf-8")
     assert "private ohmo first request" not in serialized
@@ -290,6 +323,22 @@ def test_run_ohmo_eval_report_rejects_unknown_agent_runner(tmp_path: Path):
         run_ohmo_eval_report(
             workspace=tmp_path / "workspace",
             agent_runner_name="live-tools",
+        )
+
+
+def test_run_ohmo_eval_report_rejects_unknown_fixture_match(tmp_path: Path):
+    with pytest.raises(ValueError, match="unknown fixture match mode"):
+        run_ohmo_eval_report(
+            workspace=tmp_path / "workspace",
+            fixture_match="wrong",
+        )
+
+
+def test_run_ohmo_session_eval_rejects_unknown_fixture_match(tmp_path: Path):
+    with pytest.raises(ValueError, match="unknown fixture match mode"):
+        run_ohmo_session_eval(
+            workspace=tmp_path / "workspace",
+            fixture_match="wrong",
         )
 
 

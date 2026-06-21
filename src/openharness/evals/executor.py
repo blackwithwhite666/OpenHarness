@@ -24,6 +24,7 @@ from openharness.engine.stream_events import (
 )
 from openharness.evals.facets import EvalTextFacetInput
 from openharness.evals.models import EvalEpisode, EvalEvent, EvalRunPack, EvalRunPackCase
+from openharness.evals.replay_matching import _fixture_input_key
 from openharness.evals.state import compute_state_delta
 from openharness.evals.store import EvalStore
 from openharness.permissions.checker import PermissionChecker
@@ -54,6 +55,7 @@ class EvalToolFixture:
     output_text: str = ""
     input_summary_length: int = 0
     output_summary_length: int = 0
+    input_key: str = ""
 
 
 @dataclass(frozen=True)
@@ -132,13 +134,27 @@ class ReplayToolsExecutor:
 
     name = "replay-tools"
 
-    def __init__(self, *, agent_runner: EvalAgentRunner | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        agent_runner: EvalAgentRunner | None = None,
+        match_mode: str = "order",
+    ) -> None:
+        _validate_replay_match_mode(match_mode)
         self._agent_runner = agent_runner or ReplayScriptAgentRunner()
+        self._match_mode = match_mode
+
+    @property
+    def fixture_match_mode(self) -> str:
+        return self._match_mode
 
     def run_case(self, context: EvalExecutionContext) -> EvalExecutorResult:
         return self._agent_runner.run(
             prompt=context.primary_prompt,
-            tool_registry=build_replay_tool_registry(context.tool_fixtures),
+            tool_registry=build_replay_tool_registry(
+                context.tool_fixtures,
+                match_mode=self._match_mode,
+            ),
             context=context,
         )
 
@@ -272,35 +288,70 @@ class SandboxMutatingAgentRunner:
 
 
 class ReplayFixtureTool(BaseTool):
-    """Replay-only tool that returns captured outputs and has no side effects."""
+    """Replay-only tool; exact arg matching may become a tunable policy later."""
 
     description = "Replay-only eval tool backed by captured outputs."
     input_model = ReplayToolInput
 
-    def __init__(self, *, tool_name: str, fixtures: tuple[EvalToolFixture, ...]) -> None:
+    def __init__(
+        self,
+        *,
+        tool_name: str,
+        fixtures: tuple[EvalToolFixture, ...],
+        match_mode: str = "order",
+    ) -> None:
+        _validate_replay_match_mode(match_mode)
         self.name = tool_name
         self._fixtures = fixtures
+        self._match_mode = match_mode
         self._next_index = 0
+        self._used_indexes: set[int] = set()
 
     async def execute(
         self,
         arguments: ReplayToolInput,
         context: ToolExecutionContext,
     ) -> ToolResult:
-        del arguments, context
-        if self._next_index >= len(self._fixtures):
+        if self._match_mode == "order":
+            del arguments, context
+            if self._next_index >= len(self._fixtures):
+                return ToolResult(
+                    output=f"No replay fixture available for {self.name}.",
+                    is_error=True,
+                )
+            fixture = self._fixtures[self._next_index]
+            self._next_index += 1
             return ToolResult(
-                output=f"No replay fixture available for {self.name}.",
-                is_error=True,
+                output=fixture.output_text,
+                is_error=fixture.is_error,
+                metadata={
+                    "replayed": True,
+                    "call_key_hash": fixture.call_key_hash,
+                },
             )
-        fixture = self._fixtures[self._next_index]
-        self._next_index += 1
+
+        del context
+        requested_key = _fixture_input_key(arguments.model_dump())
+        for index, fixture in enumerate(self._fixtures):
+            if index in self._used_indexes or fixture.input_key != requested_key:
+                continue
+            self._used_indexes.add(index)
+            return ToolResult(
+                output=fixture.output_text,
+                is_error=fixture.is_error,
+                metadata={
+                    "replayed": True,
+                    "match": "arguments",
+                    "call_key_hash": fixture.call_key_hash,
+                },
+            )
         return ToolResult(
-            output=fixture.output_text,
-            is_error=fixture.is_error,
+            output=f"No replay fixture for {self.name} with these arguments.",
+            is_error=True,
             metadata={
-                "replayed": True,
-                "call_key_hash": fixture.call_key_hash,
+                "replayed": False,
+                "match": "miss",
+                "requested_key": requested_key,
             },
         )
 
@@ -309,8 +360,13 @@ class ReplayFixtureTool(BaseTool):
         return True
 
 
-def build_replay_tool_registry(fixtures: tuple[EvalToolFixture, ...]) -> ToolRegistry:
+def build_replay_tool_registry(
+    fixtures: tuple[EvalToolFixture, ...],
+    *,
+    match_mode: str = "order",
+) -> ToolRegistry:
     """Build a replay-only registry from captured tool fixtures."""
+    _validate_replay_match_mode(match_mode)
     registry = ToolRegistry()
     by_name: dict[str, list[EvalToolFixture]] = {}
     for fixture in fixtures:
@@ -320,9 +376,15 @@ def build_replay_tool_registry(fixtures: tuple[EvalToolFixture, ...]) -> ToolReg
             ReplayFixtureTool(
                 tool_name=tool_name,
                 fixtures=tuple(tool_fixtures),
+                match_mode=match_mode,
             )
         )
     return registry
+
+
+def _validate_replay_match_mode(match_mode: str) -> None:
+    if match_mode not in {"order", "arguments"}:
+        raise ValueError("fixture match mode must be one of: order, arguments")
 
 
 def _run_eval_coroutine(
@@ -368,7 +430,7 @@ async def _run_scripted_replay(
             continue
         event_kind_path.append("tool_started")
         result = await tool.execute(
-            ReplayToolInput(),
+            ReplayToolInput.model_validate(_fixture_arguments(context, fixture)),
             ToolExecutionContext(cwd=context.store.root),
         )
         tool_path.append(fixture.tool_name)

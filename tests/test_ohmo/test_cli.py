@@ -1264,6 +1264,7 @@ def test_ohmo_evals_run_command_runs_eval_report(tmp_path: Path, monkeypatch):
         provider_profile: str | None = None,
         system_prompt: str | None = None,
         scorer: str | None = None,
+        fixture_match: str = "order",
     ):
         calls.append(
             {
@@ -1278,6 +1279,7 @@ def test_ohmo_evals_run_command_runs_eval_report(tmp_path: Path, monkeypatch):
                 "model": model,
                 "provider_profile": provider_profile,
                 "system_prompt": system_prompt,
+                "fixture_match": fixture_match,
             }
         )
         return SimpleNamespace(
@@ -1305,6 +1307,8 @@ def test_ohmo_evals_run_command_runs_eval_report(tmp_path: Path, monkeypatch):
             "3",
             "--executor",
             "replay-tools",
+            "--fixture-match",
+            "arguments",
         ],
     )
     report_only = runner.invoke(
@@ -1341,6 +1345,7 @@ def test_ohmo_evals_run_command_runs_eval_report(tmp_path: Path, monkeypatch):
             "model": None,
             "provider_profile": None,
             "system_prompt": None,
+            "fixture_match": "arguments",
         },
         {
             "workspace": workspace.resolve(),
@@ -1354,6 +1359,7 @@ def test_ohmo_evals_run_command_runs_eval_report(tmp_path: Path, monkeypatch):
             "model": None,
             "provider_profile": None,
             "system_prompt": None,
+            "fixture_match": "order",
         },
     ]
 
@@ -1380,6 +1386,7 @@ def test_ohmo_evals_run_command_threads_sandbox_agent_runner(
         provider_profile: str | None = None,
         system_prompt: str | None = None,
         scorer: str | None = None,
+        fixture_match: str = "order",
     ):
         calls.append(
             {
@@ -1395,6 +1402,7 @@ def test_ohmo_evals_run_command_threads_sandbox_agent_runner(
                 "provider_profile": provider_profile,
                 "system_prompt": system_prompt,
                 "scorer": scorer,
+                "fixture_match": fixture_match,
             }
         )
         return SimpleNamespace(
@@ -1436,6 +1444,7 @@ def test_ohmo_evals_run_command_threads_sandbox_agent_runner(
             "provider_profile": None,
             "system_prompt": None,
             "scorer": "state_outcome_oracle_v1",
+            "fixture_match": "order",
         }
     ]
 
@@ -1458,6 +1467,7 @@ def test_ohmo_evals_run_session_command_runs_session_eval(tmp_path: Path, monkey
         user_sim_profile: str | None = None,
         user_sim_model: str | None = None,
         clarification_allowed_by_session=None,
+        fixture_match: str = "order",
     ):
         calls.append(
             {
@@ -1472,6 +1482,7 @@ def test_ohmo_evals_run_session_command_runs_session_eval(tmp_path: Path, monkey
                 "user_sim_profile": user_sim_profile,
                 "user_sim_model": user_sim_model,
                 "clarification_allowed_by_session": clarification_allowed_by_session,
+                "fixture_match": fixture_match,
             }
         )
         return SimpleNamespace(
@@ -1513,6 +1524,8 @@ def test_ohmo_evals_run_session_command_runs_session_eval(tmp_path: Path, monkey
             "user-profile",
             "--user-sim-model",
             "user-model",
+            "--fixture-match",
+            "arguments",
         ],
     )
 
@@ -1532,8 +1545,42 @@ def test_ohmo_evals_run_session_command_runs_session_eval(tmp_path: Path, monkey
             "user_sim_profile": "user-profile",
             "user_sim_model": "user-model",
             "clarification_allowed_by_session": None,
+            "fixture_match": "arguments",
         }
     ]
+
+
+def test_ohmo_evals_fixture_match_rejects_invalid_value(tmp_path: Path):
+    runner = CliRunner()
+    workspace = tmp_path / ".ohmo-home"
+
+    eval_result = runner.invoke(
+        app,
+        [
+            "evals",
+            "run",
+            "--workspace",
+            str(workspace),
+            "--fixture-match",
+            "wrong",
+        ],
+    )
+    session_result = runner.invoke(
+        app,
+        [
+            "evals",
+            "run-session",
+            "--workspace",
+            str(workspace),
+            "--fixture-match",
+            "wrong",
+        ],
+    )
+
+    assert eval_result.exit_code == 1
+    assert "unknown fixture match mode: wrong" in eval_result.stderr
+    assert session_result.exit_code == 1
+    assert "unknown fixture match mode: wrong" in session_result.stderr
 
 
 def test_ohmo_evals_run_command_passes_output_filename(tmp_path: Path, monkeypatch):
@@ -1555,6 +1602,7 @@ def test_ohmo_evals_run_command_passes_output_filename(tmp_path: Path, monkeypat
         provider_profile: str | None = None,
         system_prompt: str | None = None,
         scorer: str | None = None,
+        fixture_match: str = "order",
     ):
         calls.append(
             {
@@ -1568,6 +1616,7 @@ def test_ohmo_evals_run_command_passes_output_filename(tmp_path: Path, monkeypat
                 "model": model,
                 "provider_profile": provider_profile,
                 "system_prompt": system_prompt,
+                "fixture_match": fixture_match,
             }
         )
         return SimpleNamespace(
@@ -1611,6 +1660,7 @@ def test_ohmo_evals_run_command_passes_output_filename(tmp_path: Path, monkeypat
             "model": None,
             "provider_profile": None,
             "system_prompt": None,
+            "fixture_match": "order",
         }
     ]
     assert "custom_eval_report.json" in result.output
@@ -1634,9 +1684,10 @@ def test_ohmo_evals_run_command_outputs_json_summary(tmp_path: Path, monkeypatch
         provider_profile: str | None = None,
         system_prompt: str | None = None,
         scorer: str | None = None,
+        fixture_match: str = "order",
     ):
         del pack_filename, limit, executor_name, agent_runner_name
-        del model, provider_profile, system_prompt
+        del model, provider_profile, system_prompt, fixture_match
         return SimpleNamespace(
             report_only=report_only,
             write=SimpleNamespace(
@@ -1713,6 +1764,7 @@ def test_ohmo_evals_run_command_passes_query_engine_runner_options(
         provider_profile: str | None = None,
         system_prompt: str | None = None,
         scorer: str | None = None,
+        fixture_match: str = "order",
     ):
         calls.append(
             {
@@ -1726,6 +1778,7 @@ def test_ohmo_evals_run_command_passes_query_engine_runner_options(
                 "model": model,
                 "provider_profile": provider_profile,
                 "system_prompt": system_prompt,
+                "fixture_match": fixture_match,
             }
         )
         return SimpleNamespace(
@@ -1775,6 +1828,7 @@ def test_ohmo_evals_run_command_passes_query_engine_runner_options(
             "model": "eval-model",
             "provider_profile": "openai-compatible",
             "system_prompt": "eval system",
+            "fixture_match": "order",
         }
     ]
 
@@ -1798,6 +1852,7 @@ def test_ohmo_evals_run_command_check_config_does_not_run_eval(
         provider_profile: str | None = None,
         system_prompt: str | None = None,
         scorer: str | None = None,
+        fixture_match: str = "order",
     ):
         check_calls.append(
             {
@@ -1809,6 +1864,7 @@ def test_ohmo_evals_run_command_check_config_does_not_run_eval(
                 "model": model,
                 "provider_profile": provider_profile,
                 "system_prompt": system_prompt,
+                "fixture_match": fixture_match,
             }
         )
         return SimpleNamespace(
@@ -1864,6 +1920,7 @@ def test_ohmo_evals_run_command_check_config_does_not_run_eval(
             "model": "eval-model",
             "provider_profile": "openai-compatible",
             "system_prompt": None,
+            "fixture_match": "order",
         }
     ]
     assert "Eval run configuration is valid." in result.output
@@ -1890,9 +1947,10 @@ def test_ohmo_evals_run_command_check_config_outputs_json(
         provider_profile: str | None = None,
         system_prompt: str | None = None,
         scorer: str | None = None,
+        fixture_match: str = "order",
     ):
         del workspace, pack_filename, limit, executor_name, agent_runner_name
-        del model, provider_profile, system_prompt
+        del model, provider_profile, system_prompt, fixture_match
         return SimpleNamespace(
             pack_id="pack-1",
             pack_case_count=5,
@@ -1983,9 +2041,10 @@ def test_ohmo_evals_run_command_reports_blocked_and_error_counts(
         provider_profile: str | None = None,
         system_prompt: str | None = None,
         scorer: str | None = None,
+        fixture_match: str = "order",
     ):
         del pack_filename, report_filename
-        del agent_runner_name, model, provider_profile, system_prompt
+        del agent_runner_name, model, provider_profile, system_prompt, fixture_match
         return SimpleNamespace(
             report_only=report_only,
             write=SimpleNamespace(

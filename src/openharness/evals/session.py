@@ -121,7 +121,10 @@ class SessionReplayRunner:
         max_turns: int = 8,
         max_tokens: int = 4096,
         max_session_turns: int | None = None,
+        fixture_match_mode: str = "order",
     ) -> None:
+        if fixture_match_mode not in {"order", "arguments"}:
+            raise ValueError("fixture match mode must be one of: order, arguments")
         self._api_client = api_client
         self._model = model
         self._system_prompt = system_prompt
@@ -129,6 +132,11 @@ class SessionReplayRunner:
         self._max_turns = max_turns
         self._max_tokens = max_tokens
         self._max_session_turns = max_session_turns
+        self._fixture_match_mode = fixture_match_mode
+
+    @property
+    def fixture_match_mode(self) -> str:
+        return self._fixture_match_mode
 
     def run(
         self,
@@ -137,7 +145,7 @@ class SessionReplayRunner:
         store: EvalStore,
         user_simulator: UserSimulator | None = None,
     ) -> EvalSessionRunResult:
-        """Replay one captured session with order-based replay fixtures."""
+        """Replay one captured session with selected replay fixture matching."""
         return _run_eval_coroutine(
             self._run(group=group, store=store, user_simulator=user_simulator)
         )
@@ -178,7 +186,10 @@ class SessionReplayRunner:
 
         engine = QueryEngine(
             api_client=self._api_client,
-            tool_registry=build_replay_tool_registry(tuple(fixtures)),
+            tool_registry=build_replay_tool_registry(
+                tuple(fixtures),
+                match_mode=self._fixture_match_mode,
+            ),
             permission_checker=PermissionChecker(
                 PermissionSettings(mode=PermissionMode.FULL_AUTO)
             ),
@@ -261,6 +272,7 @@ class SessionReplayRunner:
             turn_count=len(turns),
             metadata={
                 "agent_runner": self.name,
+                "fixture_match": self._fixture_match_mode,
                 "episode_count": len(episodes),
                 "fixture_count": len(fixtures),
                 "source_event_count": source_event_count,

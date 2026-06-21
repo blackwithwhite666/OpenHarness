@@ -106,6 +106,7 @@ class _AgentRunnerConfig:
 
 SUPPORTED_EVAL_EXECUTOR_NAMES = ("replay-tools",)
 SUPPORTED_EVAL_AGENT_RUNNER_NAMES = ("scripted", "query-engine", "sandbox")
+SUPPORTED_FIXTURE_MATCH_MODES = ("order", "arguments")
 _SUPPORTED_EXECUTORS = {
     "replay-tools": ReplayToolsExecutor,
     "replay_tools": ReplayToolsExecutor,
@@ -132,10 +133,12 @@ def run_ohmo_eval_report(
     system_prompt: str | None = None,
     scorer: str | None = None,
     samples: int = 1,
+    fixture_match: str = "order",
 ) -> OhmoEvalRunResult:
     """Run deterministic replay-tools execution checks over an Ohmo eval pack."""
     if limit is not None and limit <= 0:
         raise ValueError("limit must be positive")
+    fixture_match = _validate_fixture_match(fixture_match)
     selected_scorer = resolve_execution_scorer(scorer) if scorer else None
     workspace_root = Path(workspace).expanduser().resolve() if workspace else None
     agent_runner_config = _build_agent_runner_config(
@@ -148,6 +151,7 @@ def run_ohmo_eval_report(
     executor = _build_executor(
         executor_name,
         agent_runner=agent_runner_config.agent_runner,
+        fixture_match=fixture_match,
     )
     store = get_eval_store(workspace)
     pack = read_run_pack(store, pack_filename=pack_filename)
@@ -176,12 +180,14 @@ def run_ohmo_session_eval(
     user_sim_profile: str | None = None,
     user_sim_model: str | None = None,
     clarification_allowed_by_session: Mapping[str, bool] | None = None,
+    fixture_match: str = "order",
 ) -> OhmoSessionEvalRunResult:
     """Run P0 session replay checks over captured Ohmo eval episodes."""
     if limit is not None and limit <= 0:
         raise ValueError("limit must be positive")
     if samples < 1:
         raise ValueError("samples must be positive")
+    fixture_match = _validate_fixture_match(fixture_match)
     if user_sim_model is not None and user_sim_profile is None:
         raise ValueError("user_sim_model requires user_sim_profile")
 
@@ -239,6 +245,7 @@ def run_ohmo_session_eval(
         model=agent_runner_config.model,
         system_prompt=agent_runner_config.system_prompt,
         cwd=agent_runner_config.cwd,
+        fixture_match_mode=fixture_match,
     )
     cases = [
         _run_session_report_case_sampled(
@@ -273,6 +280,7 @@ def run_ohmo_session_eval(
             "privacy": "metadata_only",
             "mode": "session_replay",
             "runner_name": SessionReplayRunner.name,
+            "fixture_match": fixture_match,
             "model": agent_runner_config.model,
             "provider_profile": agent_runner_config.provider_profile,
             "user_simulation": "hybrid" if user_simulator_factory else "replay",
@@ -313,10 +321,12 @@ def check_ohmo_eval_run_config(
     provider_profile: str | None = None,
     system_prompt: str | None = None,
     scorer: str | None = None,
+    fixture_match: str = "order",
 ) -> OhmoEvalRunConfigCheckResult:
     """Validate an eval run configuration without executing eval cases."""
     if limit is not None and limit <= 0:
         raise ValueError("limit must be positive")
+    fixture_match = _validate_fixture_match(fixture_match)
     if scorer:
         resolve_execution_scorer(scorer)
     workspace_root = Path(workspace).expanduser().resolve() if workspace else None
@@ -330,6 +340,7 @@ def check_ohmo_eval_run_config(
     executor = _build_executor(
         executor_name,
         agent_runner=agent_runner_config.agent_runner,
+        fixture_match=fixture_match,
     )
     store = get_eval_store(workspace)
     pack = read_run_pack(store, pack_filename=pack_filename)
@@ -356,7 +367,9 @@ def _build_executor(
         | QueryEngineEvalAgentRunner
         | SandboxMutatingAgentRunner
     ),
+    fixture_match: str = "order",
 ) -> ReplayToolsExecutor:
+    fixture_match = _validate_fixture_match(fixture_match)
     normalized = executor_name.strip().lower()
     executor_factory = _SUPPORTED_EXECUTORS.get(normalized)
     if executor_factory is None:
@@ -364,7 +377,17 @@ def _build_executor(
         raise ValueError(
             f"unknown eval executor: {executor_name}. Supported executors: {supported}"
         )
-    return executor_factory(agent_runner=agent_runner)
+    return executor_factory(agent_runner=agent_runner, match_mode=fixture_match)
+
+
+def _validate_fixture_match(fixture_match: str) -> str:
+    normalized = fixture_match.strip().lower()
+    if normalized not in SUPPORTED_FIXTURE_MATCH_MODES:
+        supported = ", ".join(SUPPORTED_FIXTURE_MATCH_MODES)
+        raise ValueError(
+            f"unknown fixture match mode: {fixture_match}. Supported modes: {supported}"
+        )
+    return normalized
 
 
 def _build_agent_runner(
@@ -643,6 +666,7 @@ def _run_session_report_case(
         "state_changed": state_changed,
         "final_text_length": len(result.final_text),
         "fixture_count": result.metadata.get("fixture_count", 0),
+        "fixture_match": result.metadata.get("fixture_match", "order"),
         "source_event_count": result.metadata.get("source_event_count", 0),
         "engine_message_count": result.metadata.get("engine_message_count", 0),
         "user_turn_sources": result.metadata.get("user_turn_sources", []),

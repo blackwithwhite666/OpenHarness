@@ -84,6 +84,7 @@ _EVAL_AGENT_RUNNER_HELP = (
     "Agent runner to use inside the executor: "
     + ", ".join(SUPPORTED_EVAL_AGENT_RUNNER_NAMES)
 )
+_FIXTURE_MATCH_HELP = "Replay fixture matching mode: order or arguments"
 
 
 def _print_json_summary(payload: dict[str, object]) -> None:
@@ -1317,6 +1318,11 @@ def evals_run_cmd(
         "--scorer",
         help="Scorer name applied to cases without their own (default exact-final-text); e.g. tool_trace_oracle_v1",
     ),
+    fixture_match: str = typer.Option(
+        "order",
+        "--fixture-match",
+        help=_FIXTURE_MATCH_HELP,
+    ),
     model: str | None = typer.Option(
         None,
         "--model",
@@ -1358,6 +1364,7 @@ def evals_run_cmd(
                 provider_profile=provider_profile,
                 system_prompt=system_prompt,
                 scorer=scorer,
+                fixture_match=fixture_match,
             )
             if json_output:
                 _print_json_summary(_eval_run_config_summary(check))
@@ -1390,6 +1397,7 @@ def evals_run_cmd(
             provider_profile=provider_profile,
             system_prompt=system_prompt,
             scorer=scorer,
+            fixture_match=fixture_match,
         )
     except (FileNotFoundError, ValueError) as exc:
         print(str(exc), file=sys.stderr)
@@ -1465,6 +1473,11 @@ def evals_run_session_cmd(
         "--user-sim-model",
         help="Model override for the hybrid user simulator",
     ),
+    fixture_match: str = typer.Option(
+        "order",
+        "--fixture-match",
+        help=_FIXTURE_MATCH_HELP,
+    ),
     json_output: bool = typer.Option(False, "--json", help="Print a JSON summary"),
 ) -> None:
     """Run session-level replay checks over captured Ohmo eval episodes."""
@@ -1480,6 +1493,7 @@ def evals_run_session_cmd(
             system_prompt=system_prompt,
             user_sim_profile=user_sim_profile,
             user_sim_model=user_sim_model,
+            fixture_match=fixture_match,
         )
     except (FileNotFoundError, ValueError) as exc:
         print(str(exc), file=sys.stderr)

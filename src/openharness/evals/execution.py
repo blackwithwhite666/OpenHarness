@@ -32,6 +32,7 @@ from openharness.evals.models import (
     EvalRunPackCase,
 )
 from openharness.evals.pack import read_run_pack
+from openharness.evals.replay_matching import _fixture_input_key
 from openharness.evals.state import compute_episode_state_delta
 from openharness.evals.store import EvalStore
 from openharness.evals.tool_labels import effective_tool_label
@@ -539,6 +540,7 @@ def run_execution_report(
             "executor_name": selected_executor.name,
             "scorer_name": selected_scorer.name,
             "score_schema_version": _EXECUTION_SCORE_SCHEMA_VERSION,
+            "fixture_match": getattr(selected_executor, "fixture_match_mode", "order"),
             "pack_case_count": len(payload.cases),
             "limit": limit or 0,
             "samples": samples,
@@ -940,6 +942,7 @@ def _tool_fixtures(events: Sequence[EvalEvent]) -> list[EvalToolFixture]:
                 "output_text": "",
                 "input_summary_length": 0,
                 "output_summary_length": 0,
+                "input_key": "",
             }
             order.append(call_key)
         fixture = fixtures[call_key]
@@ -947,6 +950,12 @@ def _tool_fixtures(events: Sequence[EvalEvent]) -> list[EvalToolFixture]:
             fixture["started"] = True
             fixture["start_event_index"] = index
             fixture["input_text"] = _payload_text(event.payload, ("input", "input_summary"))
+            structured_input = event.payload.get("input")
+            fixture["input_key"] = (
+                _fixture_input_key(structured_input)
+                if isinstance(structured_input, dict)
+                else ""
+            )
             fixture["input_summary_length"] = len(
                 _normalize_text(_payload_text(event.payload, ("input_summary",)))
             )
