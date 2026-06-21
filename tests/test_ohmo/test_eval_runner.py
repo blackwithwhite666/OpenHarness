@@ -12,7 +12,12 @@ from openharness.engine.messages import (
     ToolResultBlock,
     ToolUseBlock,
 )
-from openharness.evals import EvalEpisode, EvalEvent, promote_case_drafts
+from openharness.evals import (
+    EvalEpisode,
+    EvalEvent,
+    LiveReadAgentRunner,
+    promote_case_drafts,
+)
 from openharness.evals import (
     EvalRunPack,
     EvalRunPackCase,
@@ -574,6 +579,37 @@ def test_build_query_engine_runner_keeps_system_prompt_override(
 
     assert runner._system_prompt == "custom override"
     assert build_prompt_calls == 0
+
+
+def test_build_live_read_runner_config_uses_query_engine_settings(
+    tmp_path: Path,
+    monkeypatch,
+):
+    api_client = object()
+    monkeypatch.setattr(
+        "ohmo.evals.runner.resolve_api_client_from_settings",
+        lambda settings: api_client,
+    )
+    monkeypatch.setattr(
+        "ohmo.evals.runner.build_ohmo_system_prompt",
+        lambda *args, **kwargs: "REAL_OHMO_PROMPT",
+    )
+
+    config = runner_module._build_agent_runner_config(
+        "query-engine-live-read",
+        workspace=tmp_path,
+        model="eval-model",
+        provider_profile=None,
+        system_prompt=None,
+    )
+
+    assert isinstance(config.agent_runner, LiveReadAgentRunner)
+    assert config.agent_runner_name == "query-engine-live-read"
+    assert config.model == "eval-model"
+    assert config.api_client is api_client
+    assert config.system_prompt == "REAL_OHMO_PROMPT"
+    assert config.cwd == tmp_path
+    assert config.replay_tools_only is False
 
 
 def test_run_ohmo_eval_report_query_engine_auth_error_is_value_error(

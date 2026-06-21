@@ -19,6 +19,7 @@ from openharness.evals import (
     EvalSessionReport,
     EvalSessionReportCase,
     HybridUserSimulator,
+    LiveReadAgentRunner,
     LlmUserSimulator,
     QueryEngineEvalAgentRunner,
     ReplayUserSimulator,
@@ -94,6 +95,7 @@ class _AgentRunnerConfig:
     agent_runner: (
         ReplayScriptAgentRunner
         | QueryEngineEvalAgentRunner
+        | LiveReadAgentRunner
         | SandboxMutatingAgentRunner
     )
     agent_runner_name: str
@@ -106,7 +108,12 @@ class _AgentRunnerConfig:
 
 
 SUPPORTED_EVAL_EXECUTOR_NAMES = ("replay-tools",)
-SUPPORTED_EVAL_AGENT_RUNNER_NAMES = ("scripted", "query-engine", "sandbox")
+SUPPORTED_EVAL_AGENT_RUNNER_NAMES = (
+    "scripted",
+    "query-engine",
+    "query-engine-live-read",
+    "sandbox",
+)
 SUPPORTED_FIXTURE_MATCH_MODES = ("order", "arguments")
 _SUPPORTED_EXECUTORS = {
     "replay-tools": ReplayToolsExecutor,
@@ -393,6 +400,7 @@ def _build_executor(
     agent_runner: (
         ReplayScriptAgentRunner
         | QueryEngineEvalAgentRunner
+        | LiveReadAgentRunner
         | SandboxMutatingAgentRunner
     ),
     fixture_match: str = "order",
@@ -428,6 +436,7 @@ def _build_agent_runner(
 ) -> (
     ReplayScriptAgentRunner
     | QueryEngineEvalAgentRunner
+    | LiveReadAgentRunner
     | SandboxMutatingAgentRunner
 ):
     return _build_agent_runner_config(
@@ -469,14 +478,29 @@ def _build_agent_runner_config(
     try:
         api_client = resolve_api_client_from_settings(settings)
     except (ApiClientResolutionError, SystemExit) as exc:
-        runner_label = "query-engine" if normalized == "query-engine" else "sandbox"
         raise ValueError(
-            f"{runner_label} eval runner requires configured API authentication"
+            f"{normalized} eval runner requires configured API authentication"
         ) from exc
     resolved_prompt = system_prompt or build_ohmo_system_prompt(
         workspace or Path.cwd(),
         workspace=workspace,
     )
+    if normalized == "query-engine-live-read":
+        return _AgentRunnerConfig(
+            agent_runner=LiveReadAgentRunner(
+                api_client=api_client,
+                model=settings.model,
+                system_prompt=resolved_prompt,
+                cwd=workspace,
+            ),
+            agent_runner_name="query-engine-live-read",
+            model=settings.model,
+            provider_profile=settings.active_profile,
+            api_client=api_client,
+            system_prompt=resolved_prompt,
+            cwd=workspace,
+            replay_tools_only=False,
+        )
     if normalized == "sandbox":
         return _AgentRunnerConfig(
             agent_runner=SandboxMutatingAgentRunner(

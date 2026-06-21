@@ -1449,6 +1449,95 @@ def test_ohmo_evals_run_command_threads_sandbox_agent_runner(
     ]
 
 
+def test_ohmo_evals_run_command_threads_live_read_agent_runner(
+    tmp_path: Path,
+    monkeypatch,
+):
+    runner = CliRunner()
+    workspace = tmp_path / ".ohmo-home"
+    calls: list[dict[str, object]] = []
+
+    def fake_run_ohmo_eval_report(
+        *,
+        workspace: str | Path | None = None,
+        pack_filename: str = "eval_pack.json",
+        report_filename: str = "eval_report.json",
+        limit: int | None = None,
+        samples: int = 1,
+        report_only: bool = False,
+        executor_name: str = "replay-tools",
+        agent_runner_name: str = "scripted",
+        model: str | None = None,
+        provider_profile: str | None = None,
+        system_prompt: str | None = None,
+        scorer: str | None = None,
+        judge_profile: str | None = None,
+        judge_model: str | None = None,
+        fixture_match: str = "order",
+    ):
+        calls.append(
+            {
+                "workspace": workspace,
+                "pack_filename": pack_filename,
+                "report_filename": report_filename,
+                "limit": limit,
+                "samples": samples,
+                "report_only": report_only,
+                "executor_name": executor_name,
+                "agent_runner_name": agent_runner_name,
+                "model": model,
+                "provider_profile": provider_profile,
+                "system_prompt": system_prompt,
+                "scorer": scorer,
+                "judge_profile": judge_profile,
+                "judge_model": judge_model,
+                "fixture_match": fixture_match,
+            }
+        )
+        return SimpleNamespace(
+            report_only=report_only,
+            write=SimpleNamespace(
+                path=Path(workspace) / "evals" / "reports" / report_filename,
+                report=SimpleNamespace(case_count=1, passed_count=1, failed_count=0),
+            ),
+        )
+
+    monkeypatch.setattr("ohmo.cli.run_ohmo_eval_report", fake_run_ohmo_eval_report)
+
+    result = runner.invoke(
+        app,
+        [
+            "evals",
+            "run",
+            "--workspace",
+            str(workspace),
+            "--agent-runner",
+            "query-engine-live-read",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert calls == [
+        {
+            "workspace": workspace.resolve(),
+            "pack_filename": "eval_pack.json",
+            "report_filename": "eval_report.json",
+            "limit": None,
+            "samples": 1,
+            "report_only": False,
+            "executor_name": "replay-tools",
+            "agent_runner_name": "query-engine-live-read",
+            "model": None,
+            "provider_profile": None,
+            "system_prompt": None,
+            "scorer": None,
+            "judge_profile": None,
+            "judge_model": None,
+            "fixture_match": "order",
+        }
+    ]
+
+
 def test_ohmo_evals_run_session_command_runs_session_eval(tmp_path: Path, monkeypatch):
     runner = CliRunner()
     workspace = tmp_path / ".ohmo-home"
@@ -2071,6 +2160,7 @@ def test_ohmo_evals_run_command_help_lists_supported_executor_and_runner_ids():
     assert "Agent runner to use inside the" in output
     assert "executor: scripted," in output
     assert "query-engine" in output
+    assert "query-engine-live-read" in output
 
 
 def test_ohmo_evals_run_command_reports_blocked_and_error_counts(

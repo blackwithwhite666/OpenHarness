@@ -47,6 +47,12 @@ from openharness.evals.facets import EvalTextFacetInput, collect_text_facets
 from openharness.evals.graph import build_usage_graph, write_usage_graph
 from openharness.evals.inference import DEFAULT_INFERENCE_URL, InferenceClient
 from openharness.evals.judge import TrajectoryJudgeScorer
+from openharness.evals.live_read import (
+    READ_LIVE_BASH_ALLOWLIST,
+    LiveReadAgentRunner,
+    LiveReadBashTool,
+    classify_bash_command,
+)
 from openharness.evals.models import (
     EvalCaseCandidate,
     EvalCaseDraft,
@@ -191,7 +197,10 @@ __all__ = [
     "HybridUserSimulator",
     "InferenceClient",
     "LlmUserSimulator",
+    "LiveReadAgentRunner",
+    "LiveReadBashTool",
     "QueryEngineEvalAgentRunner",
+    "READ_LIVE_BASH_ALLOWLIST",
     "ReplayUserSimulator",
     "ReplayFixtureTool",
     "ReplayScriptAgentRunner",
@@ -208,6 +217,7 @@ __all__ = [
     "build_usage_graph",
     "compare_execution_reports",
     "collect_text_facets",
+    "classify_bash_command",
     "compute_episode_state_delta",
     "compute_state_delta",
     "effective_tool_label",
