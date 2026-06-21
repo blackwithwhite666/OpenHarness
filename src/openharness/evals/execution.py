@@ -68,9 +68,14 @@ class EvalExecutionScorerResult:
 
 
 class EvalExecutionScorer(Protocol):
-    """Scores transient executor output against an eval execution context."""
+    """Scores transient executor output against an eval execution context.
+
+    Scorers may set ``requires_exact_tool_sequence`` to ``False`` to make
+    exact tool-path matching advisory; absent external attrs default to True.
+    """
 
     name: str
+    requires_exact_tool_sequence: bool
 
     def score(
         self,
@@ -85,6 +90,7 @@ class ExactMatchEvalScorer:
     """Default deterministic scorer for replay-style evals."""
 
     name = "exact-final-text"
+    requires_exact_tool_sequence = True
 
     def score(
         self,
@@ -129,6 +135,7 @@ class ToolTraceOracleV1:
     """
 
     name = "tool_trace_oracle_v1"
+    requires_exact_tool_sequence = True
 
     def __init__(self, *, max_calls_factor: int = 2, max_calls_floor: int = 3) -> None:
         self._max_calls_factor = max_calls_factor
@@ -184,6 +191,7 @@ class CapabilityTraceOracleV1:
     """
 
     name = "capability_trace_oracle_v1"
+    requires_exact_tool_sequence = True
 
     def __init__(self, *, max_calls_factor: int = 2, max_calls_floor: int = 3) -> None:
         self._max_calls_factor = max_calls_factor
@@ -248,6 +256,7 @@ class CapabilityCoverageOracleV1:
     """Capability-aware coverage oracle that ignores incidental bookkeeping."""
 
     name = "capability_coverage_oracle_v1"
+    requires_exact_tool_sequence = False
 
     def __init__(
         self,
@@ -519,6 +528,9 @@ def _execute_case(
         "privacy_report_metadata_only": True,
     }
     all_checks = {**checks, **behavior_checks}
+    gating_checks = dict(all_checks)
+    if not getattr(selected_scorer, "requires_exact_tool_sequence", True):
+        gating_checks.pop("tool_sequence_matches", None)
     observed_trace_metadata = {
         "tool_calls_source": "replay_fixtures",
         "final_output_match_score": scorer_result.score,
@@ -546,8 +558,8 @@ def _execute_case(
     return EvalExecutionReportCase(
         gold_case_id=case.gold_case_id,
         case_id=case.case_id,
-        status="passed" if all(all_checks.values()) else "failed",
-        score=_score(all_checks),
+        status="passed" if all(gating_checks.values()) else "failed",
+        score=_score(gating_checks),
         max_score=1.0,
         checks=all_checks,
         warnings=[name for name, passed in all_checks.items() if not passed],

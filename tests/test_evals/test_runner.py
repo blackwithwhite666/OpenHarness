@@ -14,6 +14,7 @@ from openharness.evals import (
     EvalExecutionContext,
     EvalExecutorResult,
     EvalExecutionScorerResult,
+    EvalObservedCall,
     QueryEngineEvalAgentRunner,
     ReplayToolsExecutor,
     EvalResource,
@@ -500,6 +501,38 @@ def test_execution_report_marks_behavior_mismatch_failed(tmp_path: Path):
     assert case.observed_trace.tool_path == []
 
 
+def test_execution_report_coverage_scorer_treats_tool_sequence_as_advisory(
+    tmp_path: Path,
+):
+    store = EvalStore(tmp_path / "evals")
+    _add_episode(
+        store,
+        episode_id="ep-1",
+        user_text="private coverage request",
+        final_text="private coverage answer",
+        tool_name="bash",
+        tool_input={"command": "weather-cli forecast 'СПб'"},
+    )
+    drafts = build_case_drafts(store, build_case_candidates(store))
+    write_case_draft_pack(store, drafts)
+    promote_case_drafts(store, case_ids=[drafts[0].case_id])
+    pack = write_run_pack(store).pack
+
+    result = run_execution_report(
+        store,
+        pack=pack,
+        executor=_CoverageMismatchExecutor(),
+        scorer=resolve_execution_scorer("capability_coverage_oracle_v1"),
+    )
+
+    assert result.report.passed_count == 1
+    case = result.report.cases[0]
+    assert case.status == "passed"
+    assert case.checks["tool_sequence_matches"] is False
+    assert "tool_sequence_matches" in case.warnings
+    assert case.checks["final_output_matches"] is True
+
+
 def test_execution_report_blocks_unresolvable_refs(tmp_path: Path):
     store = EvalStore(tmp_path / "evals")
     pack = EvalRunPack(
@@ -748,6 +781,23 @@ class _MismatchExecutor:
             final_text="different final text",
             tool_path=(),
             event_kind_path=("execution_started", "execution_completed"),
+        )
+
+
+class _CoverageMismatchExecutor:
+    name = "coverage_mismatch"
+
+    def run_case(self, context: EvalExecutionContext) -> EvalExecutorResult:
+        return EvalExecutorResult(
+            final_text="different final text",
+            tool_path=("shell",),
+            event_kind_path=("execution_started", "execution_completed"),
+            tool_calls=(
+                EvalObservedCall(
+                    tool_name="bash",
+                    arguments={"command": "weather-cli forecast 'СПб'"},
+                ),
+            ),
         )
 
 
