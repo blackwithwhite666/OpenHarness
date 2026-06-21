@@ -1,0 +1,26 @@
+# docs venv for the ohmo office / document / canvas skills.
+#
+# Create the venv (Python 3.12) on the agent host:
+#   python3.12 -m venv ~/.ohmo/venvs/docs
+#   ~/.ohmo/venvs/docs/bin/pip install -U pip wheel
+#   ~/.ohmo/venvs/docs/bin/pip install -r requirements.txt
+#
+# Versions below are the validated set deployed on 93.77.160.211 (2026-06-21).
+# For an exact transitive lock, use requirements.lock.txt instead.
+
+python-docx==1.2.0
+python-pptx==1.0.2
+openpyxl==3.1.5
+pypdf==6.13.3
+pdfplumber==0.11.10
+pdf2image==1.17.0
+pypdfium2==5.10.1
+reportlab==5.0.0
+pandas==3.0.3
+numpy==2.4.6
+matplotlib==3.11.0
+lxml==6.1.1
+Pillow==12.2.0
+defusedxml==0.7.1
+validators==0.35.0
+markitdown[pptx]==0.1.6

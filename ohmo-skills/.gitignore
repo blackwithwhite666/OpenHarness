@@ -1,0 +1,8 @@
+# Node deps are recreated with `npm install` per skill (package.json/lock pin them)
+node_modules/
+
+# Python / editor cruft
+__pycache__/
+*.pyc
+*.orig.bak
+SKILL.md.bak*

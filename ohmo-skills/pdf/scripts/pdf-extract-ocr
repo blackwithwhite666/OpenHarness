@@ -1,0 +1,290 @@
+#!/usr/bin/env python3.12
+"""Extract PDF text layer and image/page OCR into a Markdown report.
+
+Uses:
+- pypdf for text layer and embedded image extraction
+- pdftoppm when available for page rasterization fallback
+- codex exec -i as VLM/OCR backend for images
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import shutil
+import subprocess
+import sys
+import textwrap
+from pathlib import Path
+
+from pypdf import PdfReader
+
+
+def safe_stem(path: Path) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", path.stem).strip("_") or "pdf"
+
+
+def run(cmd: list[str], *, cwd: Path | None = None, input_text: str | None = None, timeout: int = 600) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        cmd,
+        cwd=str(cwd) if cwd else None,
+        input=input_text,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=timeout,
+        check=False,
+    )
+
+
+def extract_text_layer(pdf: Path) -> list[tuple[int, str]]:
+    reader = PdfReader(str(pdf))
+    pages: list[tuple[int, str]] = []
+    for i, page in enumerate(reader.pages, 1):
+        try:
+            txt = page.extract_text() or ""
+        except Exception as e:  # noqa: BLE001
+            txt = f"[text extraction failed: {e!r}]"
+        pages.append((i, txt.strip()))
+    return pages
+
+
+def extract_embedded_images(pdf: Path, out_dir: Path) -> list[Path]:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    reader = PdfReader(str(pdf))
+    images: list[Path] = []
+    stem = safe_stem(pdf)
+    for page_i, page in enumerate(reader.pages, 1):
+        resources = page.get("/Resources") or {}
+        xobjs = resources.get("/XObject")
+        if not xobjs:
+            continue
+        try:
+            xobjs_obj = xobjs.get_object()
+        except Exception:
+            continue
+        for name, obj in xobjs_obj.items():
+            try:
+                im = obj.get_object()
+                if im.get("/Subtype") != "/Image":
+                    continue
+                data = im.get_data()
+            except Exception:
+                continue
+            if data.startswith(b"\xff\xd8"):
+                suffix = ".jpg"
+            elif data.startswith(b"\x89PNG"):
+                suffix = ".png"
+            elif data.startswith(b"GIF"):
+                suffix = ".gif"
+            else:
+                # Codex may not accept raw image streams. Keep for audit but do not pass to OCR.
+                suffix = ".bin"
+            path = out_dir / f"{stem}_p{page_i}_{str(name).lstrip('/')}{suffix}"
+            path.write_bytes(data)
+            if suffix != ".bin":
+                images.append(path)
+    return images
+
+
+def rasterize_pages(pdf: Path, out_dir: Path, dpi: int = 300, fmt: str = "jpeg") -> list[Path]:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    pdftoppm = shutil.which("pdftoppm")
+    if not pdftoppm:
+        return []
+    prefix = out_dir / safe_stem(pdf)
+    flag = "-jpeg" if fmt in {"jpg", "jpeg"} else "-png"
+    proc = run([pdftoppm, "-r", str(dpi), flag, str(pdf), str(prefix)], timeout=600)
+    if proc.returncode != 0:
+        return []
+    suffixes = ["*.jpg", "*.jpeg"] if flag == "-jpeg" else ["*.png"]
+    files: list[Path] = []
+    for pat in suffixes:
+        files.extend(out_dir.glob(f"{prefix.name}-*{pat[1:]}"))
+    return sorted(files)
+
+
+def default_prompt() -> str:
+    return textwrap.dedent(
+        """
+        Ты VLM/OCR assistant для PDF-документов на русском и английском.
+        Прочитай приложенные изображения страниц/встроенных картинок.
+        Верни Markdown со структурированным извлечением:
+        - для каждого изображения/страницы: что это за документ, дата, видимый текст;
+        - для каждого извлечённого факта/строки указывай источник: page/image number;
+        - для таблиц/анализов: показатель, значение, единицы, референс, флаг отклонения, source page/image;
+        - для скриншотов: все важные UI-тексты и ошибки с source page/image;
+        - что неразборчиво.
+        Не выдумывай значения, которые не видны.
+        Не повторяй персональные адреса, СНИЛС, номера полисов и другие лишние идентификаторы.
+        Если на изображении нет полезного текста, так и напиши.
+        """
+    ).strip()
+
+
+def run_codex_ocr(images: list[Path], prompt: str, out_file: Path, max_images: int | None = None) -> tuple[bool, str]:
+    if not images:
+        out_file.write_text("_No images to OCR._\n", encoding="utf-8")
+        return True, "no images"
+    codex = shutil.which("codex")
+    if not codex:
+        return False, "codex not found on PATH"
+
+    selected = images[:max_images] if max_images else images
+    cmd = [
+        codex,
+        "exec",
+        "-C",
+        str(Path.cwd()),
+        "--skip-git-repo-check",
+        "--sandbox",
+        "read-only",
+        "-o",
+        str(out_file),
+    ]
+    for img in selected:
+        cmd += ["-i", str(img)]
+    cmd.append("-")
+    proc = run(cmd, input_text=prompt, timeout=1200)
+    if proc.returncode != 0:
+        err = (proc.stderr or proc.stdout).strip()
+        return False, err[-4000:]
+    return True, proc.stdout[-1000:]
+
+
+def redact_sensitive_text(text: str) -> str:
+    """Remove obvious personal identifiers from extracted text layer."""
+    redacted: list[str] = []
+    skip_address_continuation = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        lower = stripped.lower()
+
+        if "снилс" in lower:
+            redacted.append("СНИЛС: [redacted]")
+            skip_address_continuation = False
+            continue
+
+        if lower.startswith("адрес по месту") or lower.startswith("адрес фактического"):
+            redacted.append(stripped.split(":", 1)[0] + ": [redacted]")
+            skip_address_continuation = True
+            continue
+
+        if skip_address_continuation:
+            # Address fields in Russian medical PDFs often wrap onto the next 1-2 lines.
+            if any(lower.startswith(prefix) for prefix in [
+                "наименование материала",
+                "дата и время",
+                "оборудование",
+                "результаты",
+                "оказанные услуги",
+            ]):
+                skip_address_continuation = False
+            else:
+                continue
+
+        line = re.sub(r"\b\d{3}-\d{3}-\d{3}\s?\d{2}\b", "[redacted-snils]", line)
+        redacted.append(line)
+    return "\n".join(redacted)
+
+
+def write_report(
+    out: Path,
+    pdf: Path,
+    work_dir: Path,
+    text_pages: list[tuple[int, str]],
+    images: list[Path],
+    ocr_result: str,
+    ocr_ok: bool,
+    ocr_error: str | None,
+) -> None:
+    parts: list[str] = []
+    parts.append(f"# PDF extraction report: `{pdf.name}`\n")
+    parts.append("## Files\n")
+    parts.append(f"- Source PDF: `{pdf}`")
+    parts.append(f"- Work dir: `{work_dir}`")
+    parts.append(f"- Extracted/rasterized images: {len(images)}")
+    if images:
+        parts.append("")
+        for img in images:
+            parts.append(f"  - `{img}`")
+    parts.append("\n## Text layer\n")
+    any_text = False
+    for page_i, txt in text_pages:
+        parts.append(f"### Page {page_i}\n")
+        if txt:
+            any_text = True
+            parts.append("```text")
+            parts.append(redact_sensitive_text(txt))
+            parts.append("```\n")
+        else:
+            parts.append("_No text layer detected on this page._\n")
+    if not any_text:
+        parts.append("\n> No useful text layer detected; OCR/VLM result below is likely the main extraction.\n")
+
+    parts.append("\n## Image OCR / VLM extraction\n")
+    if ocr_ok:
+        parts.append(ocr_result.strip() or "_OCR result is empty._")
+    else:
+        parts.append("_OCR failed._\n")
+        parts.append("```text")
+        parts.append(ocr_error or "unknown error")
+        parts.append("```")
+    parts.append("")
+    out.write_text("\n".join(parts), encoding="utf-8")
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Extract PDF text layer + images, OCR images via codex, write Markdown report.")
+    ap.add_argument("pdf", type=Path, help="PDF path")
+    ap.add_argument("--out", type=Path, default=None, help="Output markdown path")
+    ap.add_argument("--work-dir", type=Path, default=None, help="Working directory for extracted images")
+    ap.add_argument("--prompt", type=str, default=None, help="Custom OCR prompt")
+    ap.add_argument("--prompt-file", type=Path, default=None, help="Read OCR prompt from file")
+    ap.add_argument("--dpi", type=int, default=300, help="DPI for page rasterization fallback")
+    ap.add_argument("--rasterize", choices=["auto", "always", "never"], default="auto")
+    ap.add_argument("--max-images", type=int, default=None, help="Limit images passed to codex")
+    args = ap.parse_args()
+
+    pdf = args.pdf.expanduser().resolve()
+    if not pdf.exists():
+        print(f"PDF not found: {pdf}", file=sys.stderr)
+        return 2
+
+    base_out = Path("/tmp/pdf_ocr") / safe_stem(pdf)
+    work_dir = args.work_dir.expanduser().resolve() if args.work_dir else base_out
+    work_dir.mkdir(parents=True, exist_ok=True)
+    out = args.out.expanduser().resolve() if args.out else work_dir / f"{safe_stem(pdf)}.md"
+
+    prompt = args.prompt or (args.prompt_file.read_text(encoding="utf-8") if args.prompt_file else default_prompt())
+
+    text_pages = extract_text_layer(pdf)
+    embedded_dir = work_dir / "embedded_images"
+    raster_dir = work_dir / "pages"
+    images = extract_embedded_images(pdf, embedded_dir)
+
+    useful_text = sum(len(txt) for _, txt in text_pages) > 200
+    should_rasterize = args.rasterize == "always" or (args.rasterize == "auto" and not images)
+    if should_rasterize:
+        rasterized = rasterize_pages(pdf, raster_dir, dpi=args.dpi)
+        images.extend(rasterized)
+
+    # If there is text layer but no images and rasterize=auto, still OCR is unnecessary.
+    ocr_out = work_dir / "ocr_result.md"
+    if images:
+        ocr_ok, ocr_msg = run_codex_ocr(images, prompt, ocr_out, max_images=args.max_images)
+        ocr_result = ocr_out.read_text(encoding="utf-8") if ocr_out.exists() else ""
+        ocr_error = None if ocr_ok else ocr_msg
+    else:
+        ocr_ok = True
+        ocr_result = "_No images extracted; only text layer is available._\n"
+        ocr_error = None
+
+    write_report(out, pdf, work_dir, text_pages, images, ocr_result, ocr_ok, ocr_error)
+    print(out)
+    return 0 if ocr_ok else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
