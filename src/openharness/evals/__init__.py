@@ -46,6 +46,7 @@ from openharness.evals.executor import (
 from openharness.evals.facets import EvalTextFacetInput, collect_text_facets
 from openharness.evals.graph import build_usage_graph, write_usage_graph
 from openharness.evals.inference import DEFAULT_INFERENCE_URL, InferenceClient
+from openharness.evals.judge import TrajectoryJudgeScorer
 from openharness.evals.models import (
     EvalCaseCandidate,
     EvalCaseDraft,
@@ -149,6 +150,7 @@ __all__ = [
     "StateOutcomeOracleV1",
     "StateOracleV1",
     "ToolTraceOracleV1",
+    "TrajectoryJudgeScorer",
     "EVAL_EXECUTION_SCORERS",
     "resolve_execution_scorer",
     "EvalAgentRunner",

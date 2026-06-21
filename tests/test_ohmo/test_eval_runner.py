@@ -412,6 +412,95 @@ def test_run_ohmo_eval_report_sandbox_scores_reminder_state_outcome(
     assert "private sandbox final" not in serialized
 
 
+def test_run_ohmo_eval_report_trajectory_judge_scores_metadata_only(
+    tmp_path: Path,
+    monkeypatch,
+):
+    workspace = tmp_path / "workspace"
+    store = get_eval_store(workspace)
+    _append_session_episode(
+        store,
+        episode_id="ep-judge",
+        session_id="session-judge",
+        user_text="private judge request",
+        tool_call_id="tool-judge",
+    )
+    write_ohmo_eval_mine(workspace=workspace)
+    promote_case_drafts(store)
+    build_ohmo_eval_pack(workspace=workspace)
+    api_client = _StaticTextApiClient("PASS - PRIVATE JUDGE REASON")
+    config_calls: list[dict[str, object]] = []
+
+    def fake_build_agent_runner_config(
+        agent_runner_name,
+        *,
+        workspace,
+        model,
+        provider_profile,
+        system_prompt,
+    ):
+        config_calls.append(
+            {
+                "agent_runner_name": agent_runner_name,
+                "workspace": workspace,
+                "model": model,
+                "provider_profile": provider_profile,
+                "system_prompt": system_prompt,
+            }
+        )
+        if agent_runner_name == "query-engine":
+            return runner_module._AgentRunnerConfig(
+                agent_runner=runner_module.ReplayScriptAgentRunner(),
+                agent_runner_name="query-engine",
+                model=model or "resolved-judge-model",
+                provider_profile=provider_profile or "resolved-judge-profile",
+                api_client=api_client,
+                system_prompt="",
+                cwd=workspace,
+            )
+        return runner_module._AgentRunnerConfig(
+            agent_runner=runner_module.ReplayScriptAgentRunner(),
+            agent_runner_name="scripted",
+            model="",
+            provider_profile="",
+        )
+
+    monkeypatch.setattr(
+        runner_module,
+        "_build_agent_runner_config",
+        fake_build_agent_runner_config,
+    )
+
+    result = run_ohmo_eval_report(
+        workspace=workspace,
+        scorer="trajectory_judge_v1",
+        judge_profile="judge-profile",
+        judge_model="judge-model",
+        limit=1,
+    )
+
+    assert config_calls[0] == {
+        "agent_runner_name": "query-engine",
+        "workspace": workspace.resolve(),
+        "model": "judge-model",
+        "provider_profile": "judge-profile",
+        "system_prompt": None,
+    }
+    assert result.write.report.metadata["scorer_name"] == "trajectory_judge_v1"
+    assert result.write.report.metadata["judge_model"] == "judge-model"
+    assert result.write.report.metadata["judge_provider_profile"] == "judge-profile"
+    assert result.write.report.passed_count == 1
+    case = result.write.report.cases[0]
+    assert case.status == "passed"
+    assert case.observed_trace is not None
+    assert case.observed_trace.metadata["verdict"] == "pass"
+    assert case.observed_trace.metadata["judge_model"] == "judge-model"
+    serialized = result.write.path.read_text(encoding="utf-8")
+    assert "private judge request" not in serialized
+    assert "private captured final ep-judge" not in serialized
+    assert "PRIVATE JUDGE REASON" not in serialized
+
+
 def test_check_ohmo_eval_run_config_query_engine_auth_error_is_value_error(
     tmp_path: Path,
     monkeypatch,
@@ -597,6 +686,22 @@ class _UserSimApiClient:
             message=ConversationMessage(
                 role="assistant",
                 content=[TextBlock(text=self.text)],
+            ),
+            usage=UsageSnapshot(input_tokens=1, output_tokens=1),
+        )
+
+
+class _StaticTextApiClient:
+    def __init__(self, text: str) -> None:
+        self._text = text
+        self.requests = []
+
+    async def stream_message(self, request):
+        self.requests.append(request)
+        yield ApiMessageCompleteEvent(
+            message=ConversationMessage(
+                role="assistant",
+                content=[TextBlock(text=self._text)],
             ),
             usage=UsageSnapshot(input_tokens=1, output_tokens=1),
         )

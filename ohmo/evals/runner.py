@@ -26,6 +26,7 @@ from openharness.evals import (
     ReplayToolsExecutor,
     SandboxMutatingAgentRunner,
     SessionReplayRunner,
+    TrajectoryJudgeScorer,
     UserSimulator,
     gold_capabilities_for_session,
     group_episodes_into_sessions,
@@ -132,6 +133,8 @@ def run_ohmo_eval_report(
     provider_profile: str | None = None,
     system_prompt: str | None = None,
     scorer: str | None = None,
+    judge_profile: str | None = None,
+    judge_model: str | None = None,
     samples: int = 1,
     fixture_match: str = "order",
 ) -> OhmoEvalRunResult:
@@ -139,8 +142,25 @@ def run_ohmo_eval_report(
     if limit is not None and limit <= 0:
         raise ValueError("limit must be positive")
     fixture_match = _validate_fixture_match(fixture_match)
-    selected_scorer = resolve_execution_scorer(scorer) if scorer else None
     workspace_root = Path(workspace).expanduser().resolve() if workspace else None
+    selected_scorer = None
+    judge_config: _AgentRunnerConfig | None = None
+    if scorer == TrajectoryJudgeScorer.name:
+        judge_config = _build_agent_runner_config(
+            "query-engine",
+            workspace=workspace_root,
+            model=judge_model or model,
+            provider_profile=judge_profile or provider_profile,
+            system_prompt=None,
+        )
+        if judge_config.api_client is None:
+            raise ValueError("trajectory_judge_v1 requires configured API authentication")
+        selected_scorer = TrajectoryJudgeScorer(
+            api_client=judge_config.api_client,
+            model=judge_config.model,
+        )
+    elif scorer:
+        selected_scorer = resolve_execution_scorer(scorer)
     agent_runner_config = _build_agent_runner_config(
         agent_runner_name,
         workspace=workspace_root,
@@ -164,6 +184,10 @@ def run_ohmo_eval_report(
         executor=executor,
         scorer=selected_scorer,
     )
+    if judge_config is not None:
+        write.report.metadata["judge_model"] = judge_config.model
+        write.report.metadata["judge_provider_profile"] = judge_config.provider_profile
+        atomic_write_text(write.path, write.report.model_dump_json(indent=2) + "\n")
     return OhmoEvalRunResult(write=write, report_only=report_only)
 
 

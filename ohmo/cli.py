@@ -1318,6 +1318,16 @@ def evals_run_cmd(
         "--scorer",
         help="Scorer name applied to cases without their own (default exact-final-text); e.g. tool_trace_oracle_v1",
     ),
+    judge_profile: str | None = typer.Option(
+        None,
+        "--judge-profile",
+        help="Provider profile override for --scorer trajectory_judge_v1",
+    ),
+    judge_model: str | None = typer.Option(
+        None,
+        "--judge-model",
+        help="Model override for --scorer trajectory_judge_v1",
+    ),
     fixture_match: str = typer.Option(
         "order",
         "--fixture-match",
@@ -1384,21 +1394,26 @@ def evals_run_cmd(
                     f"profile={check.provider_profile or '-'} model={check.model}"
                 )
             return
-        result = run_ohmo_eval_report(
-            workspace=workspace_root,
-            pack_filename=pack_filename,
-            report_filename=report_filename,
-            limit=limit,
-            samples=samples,
-            report_only=report_only,
-            executor_name=executor_name,
-            agent_runner_name=agent_runner_name,
-            model=model,
-            provider_profile=provider_profile,
-            system_prompt=system_prompt,
-            scorer=scorer,
-            fixture_match=fixture_match,
-        )
+        run_kwargs = {
+            "workspace": workspace_root,
+            "pack_filename": pack_filename,
+            "report_filename": report_filename,
+            "limit": limit,
+            "samples": samples,
+            "report_only": report_only,
+            "executor_name": executor_name,
+            "agent_runner_name": agent_runner_name,
+            "model": model,
+            "provider_profile": provider_profile,
+            "system_prompt": system_prompt,
+            "scorer": scorer,
+            "fixture_match": fixture_match,
+        }
+        if judge_profile is not None:
+            run_kwargs["judge_profile"] = judge_profile
+        if judge_model is not None:
+            run_kwargs["judge_model"] = judge_model
+        result = run_ohmo_eval_report(**run_kwargs)
     except (FileNotFoundError, ValueError) as exc:
         print(str(exc), file=sys.stderr)
         raise typer.Exit(1)

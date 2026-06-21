@@ -1838,6 +1838,54 @@ def test_ohmo_evals_run_command_passes_query_engine_runner_options(
     ]
 
 
+def test_ohmo_evals_run_command_threads_judge_options(
+    tmp_path: Path,
+    monkeypatch,
+):
+    runner = CliRunner()
+    workspace = tmp_path / ".ohmo-home"
+    calls: list[dict[str, object]] = []
+
+    def fake_run_ohmo_eval_report(**kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(
+            report_only=False,
+            write=SimpleNamespace(
+                path=Path(kwargs["workspace"]) / "evals" / "reports" / "eval_report.json",
+                report=SimpleNamespace(
+                    case_count=1,
+                    passed_count=1,
+                    failed_count=0,
+                    blocked_count=0,
+                    error_count=0,
+                ),
+            ),
+        )
+
+    monkeypatch.setattr("ohmo.cli.run_ohmo_eval_report", fake_run_ohmo_eval_report)
+
+    result = runner.invoke(
+        app,
+        [
+            "evals",
+            "run",
+            "--workspace",
+            str(workspace),
+            "--scorer",
+            "trajectory_judge_v1",
+            "--judge-profile",
+            "judge-profile",
+            "--judge-model",
+            "judge-model",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert calls[0]["scorer"] == "trajectory_judge_v1"
+    assert calls[0]["judge_profile"] == "judge-profile"
+    assert calls[0]["judge_model"] == "judge-model"
+
+
 def test_ohmo_evals_run_command_check_config_does_not_run_eval(
     tmp_path: Path,
     monkeypatch,

@@ -12,6 +12,7 @@ from typing import Any, Protocol
 from pydantic import ValidationError
 
 from openharness.evals.facets import EvalTextFacetInput, collect_text_facets
+from openharness.evals.judge import TrajectoryJudgeScorer
 from openharness.evals.executor import (
     EvalExecutionContext,
     EvalExecutor,
@@ -48,6 +49,15 @@ _CAPABILITY_METADATA_KEYS = (
     "missing_capabilities",
     "unexpected_capabilities",
 )
+_JUDGE_METADATA_KEYS = (
+    "judge_model",
+    "verdict",
+    "reason_hash",
+    "reason_length",
+    "observed_capability_count",
+    "had_tool_error",
+)
+_SCORER_REPORT_METADATA_KEYS = _CAPABILITY_METADATA_KEYS + _JUDGE_METADATA_KEYS
 _STATE_RESOURCE_NAMES = ("reminders", "memory", "todos")
 
 
@@ -464,6 +474,23 @@ class StateOutcomeOracleV1:
         )
 
 
+class _TrajectoryJudgeSentinel:
+    name = TrajectoryJudgeScorer.name
+    requires_exact_tool_sequence = False
+
+    def score(
+        self,
+        *,
+        context: EvalExecutionContext,
+        executor_result: EvalExecutorResult,
+    ) -> EvalExecutionScorerResult:
+        del context, executor_result
+        raise RuntimeError(
+            "trajectory_judge_v1 requires an api_client; run via "
+            "'ohmo evals run --scorer trajectory_judge_v1'"
+        )
+
+
 EVAL_EXECUTION_SCORERS: dict[str, EvalExecutionScorer] = {
     ExactMatchEvalScorer.name: ExactMatchEvalScorer(),
     ToolTraceOracleV1.name: ToolTraceOracleV1(),
@@ -471,6 +498,7 @@ EVAL_EXECUTION_SCORERS: dict[str, EvalExecutionScorer] = {
     CapabilityCoverageOracleV1.name: CapabilityCoverageOracleV1(),
     StateOracleV1.name: StateOracleV1(),
     StateOutcomeOracleV1.name: StateOutcomeOracleV1(),
+    TrajectoryJudgeScorer.name: _TrajectoryJudgeSentinel(),
 }
 
 
@@ -735,7 +763,7 @@ def _execute_case(
         "scorer_metadata_key_count": len(scorer_result.metadata),
         "executor_metadata_key_count": len(executor_result.metadata),
     }
-    for key in _CAPABILITY_METADATA_KEYS:
+    for key in _SCORER_REPORT_METADATA_KEYS:
         if key in scorer_result.metadata:
             observed_trace_metadata[key] = scorer_result.metadata[key]
     observed_trace = _observed_trace(
