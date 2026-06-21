@@ -17,6 +17,7 @@ from openharness.channels.bus.events import InboundMessage
 from openharness.channels.bus.queue import MessageBus
 
 from ohmo.gateway.bridge import OhmoGatewayBridge, _coalesce
+from ohmo.gateway.models import GatewayConfig
 
 INTERRUPT_NOTICE = "⏹️ Остановил предыдущую задачу, перехожу к новому сообщению."
 RESET_NOTICE = "🧹 Контекст сброшен — начинаю новую сессию."
@@ -43,6 +44,30 @@ async def _drain_until_final(bus, *, final_text, budget=2.0):
         collected.append(out)
         if out.content == final_text:
             return collected
+
+
+async def _drain_finals(bus, *, count, budget=2.0):
+    collected: list = []
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + budget
+    while len(collected) < count:
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            raise AssertionError(f"wanted {count} final messages; got {[m.content for m in collected]}")
+        out = await asyncio.wait_for(bus.consume_outbound(), timeout=remaining)
+        if out.metadata.get("_progress"):
+            continue
+        collected.append(out)
+    return collected
+
+
+async def _wait_for_pending(bridge, session_key, *, count=1, budget=1.0):
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + budget
+    while len(bridge._pending.get(session_key, [])) < count:
+        if loop.time() >= deadline:
+            raise AssertionError(f"pending {session_key!r} did not reach {count}")
+        await asyncio.sleep(0.005)
 
 
 @pytest.mark.asyncio
@@ -149,6 +174,97 @@ def test_coalesce_merges_media_across_burst_in_order():
 def test_coalesce_single_message_passes_through_unchanged():
     only = InboundMessage(channel="telegram", sender_id="u1", chat_id="c1", content="solo", media=["x.png"])
     assert _coalesce([only]) is only
+
+
+def test_gateway_config_defaults_media_coalesce_window():
+    assert GatewayConfig().message_coalesce_media_window == 3.0
+
+
+@pytest.mark.asyncio
+async def test_gateway_bridge_media_burst_uses_longer_coalesce_window():
+    bus = MessageBus()
+    calls: list[tuple[str, list[str]]] = []
+
+    class FakeRuntimePool:
+        async def stream_message(self, message, session_key):
+            calls.append((message.content, list(message.media)))
+            yield SimpleNamespace(kind="final", text="media-done", metadata={"_session_key": session_key})
+
+    bridge = _make_bridge(
+        bus,
+        FakeRuntimePool(),
+        message_coalesce_window=0.05,
+        message_coalesce_media_window=0.30,
+        message_coalesce_max=20,
+    )
+    task = asyncio.create_task(bridge.run())
+    try:
+        await bus.publish_inbound(
+            InboundMessage(
+                channel="telegram",
+                sender_id="u1",
+                chat_id="c1",
+                content="file one",
+                media=["a.jpg"],
+            )
+        )
+        await _wait_for_pending(bridge, "telegram:c1")
+        await asyncio.sleep(0.12)  # beyond text window, inside media window
+        await bus.publish_inbound(
+            InboundMessage(
+                channel="telegram",
+                sender_id="u1",
+                chat_id="c1",
+                content="file two",
+                media=["b.pdf"],
+            )
+        )
+        outbounds = await _drain_until_final(bus, final_text="media-done")
+    finally:
+        bridge.stop()
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    assert calls == [("file one\n\nfile two", ["a.jpg", "b.pdf"])]
+    assert [m for m in outbounds if m.content == INTERRUPT_NOTICE] == []
+
+
+@pytest.mark.asyncio
+async def test_gateway_bridge_text_only_burst_still_uses_short_window():
+    bus = MessageBus()
+    calls: list[str] = []
+
+    class FakeRuntimePool:
+        async def stream_message(self, message, session_key):
+            calls.append(message.content)
+            yield SimpleNamespace(kind="final", text=f"text-done:{len(calls)}", metadata={"_session_key": session_key})
+
+    bridge = _make_bridge(
+        bus,
+        FakeRuntimePool(),
+        message_coalesce_window=0.05,
+        message_coalesce_media_window=0.30,
+        message_coalesce_max=20,
+    )
+    task = asyncio.create_task(bridge.run())
+    try:
+        await bus.publish_inbound(
+            InboundMessage(channel="telegram", sender_id="u1", chat_id="c1", content="text one")
+        )
+        await _wait_for_pending(bridge, "telegram:c1")
+        await asyncio.sleep(0.12)  # beyond text window, inside media window
+        await bus.publish_inbound(
+            InboundMessage(channel="telegram", sender_id="u1", chat_id="c1", content="text two")
+        )
+        await _drain_finals(bus, count=2)
+    finally:
+        bridge.stop()
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    assert calls == ["text one", "text two"]
 
 
 @pytest.mark.asyncio

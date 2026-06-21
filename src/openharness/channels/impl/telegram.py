@@ -3,13 +3,18 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import logging
 import re
 
-import logging
 from telegram import (
     BotCommand,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    InputMediaAudio,
+    InputMediaDocument,
+    InputMediaPhoto,
+    InputMediaVideo,
     ReplyParameters,
     Update,
 )
@@ -356,11 +361,132 @@ class TelegramChannel(BaseChannel):
         ext = path.rsplit(".", 1)[-1].lower() if "." in path else ""
         if ext in ("jpg", "jpeg", "png", "gif", "webp"):
             return "photo"
+        if ext in ("mp4", "mov", "m4v", "webm", "avi", "mkv"):
+            return "video"
         if ext == "ogg":
             return "voice"
         if ext in ("mp3", "m4a", "wav", "aac"):
             return "audio"
         return "document"
+
+    @classmethod
+    def _partition_media(cls, paths: list[str]) -> tuple[dict[str, list[str]], list[str]]:
+        buckets = {
+            "photo_video": [],
+            "document": [],
+            "audio": [],
+            "voice": [],
+        }
+        order: list[str] = []
+        for path in paths:
+            media_type = cls._get_media_type(path)
+            if media_type in ("photo", "video"):
+                bucket = "photo_video"
+            elif media_type == "audio":
+                bucket = "audio"
+            elif media_type == "voice":
+                bucket = "voice"
+            else:
+                bucket = "document"
+            if not buckets[bucket]:
+                order.append(bucket)
+            buckets[bucket].append(path)
+        return buckets, order
+
+    @staticmethod
+    def _chunked(paths: list[str], size: int) -> list[list[str]]:
+        return [paths[i:i + size] for i in range(0, len(paths), size)]
+
+    @classmethod
+    def _build_input_media(cls, bucket: str, media_path: str, media_file):
+        if bucket == "photo_video":
+            media_type = cls._get_media_type(media_path)
+            if media_type == "video":
+                return InputMediaVideo(media=media_file)
+            return InputMediaPhoto(media=media_file)
+        if bucket == "document":
+            return InputMediaDocument(media=media_file)
+        if bucket == "audio":
+            return InputMediaAudio(media=media_file)
+        raise ValueError(f"unsupported media group bucket: {bucket}")
+
+    async def _send_single_media(
+        self,
+        *,
+        chat_id: int,
+        media_path: str,
+        reply_parameters: ReplyParameters | None,
+    ) -> ReplyParameters | None:
+        try:
+            media_type = self._get_media_type(media_path)
+            if media_type == "photo":
+                sender = self._app.bot.send_photo
+            elif media_type == "video":
+                sender = self._app.bot.send_video
+            elif media_type == "voice":
+                sender = self._app.bot.send_voice
+            elif media_type == "audio":
+                sender = self._app.bot.send_audio
+            else:
+                sender = self._app.bot.send_document
+            param = media_type if media_type in ("photo", "video", "voice", "audio") else "document"
+            with open(media_path, "rb") as f:
+                await sender(
+                    chat_id=chat_id,
+                    **{param: f},
+                    reply_parameters=reply_parameters,
+                )
+            return None
+        except Exception as e:
+            filename = media_path.rsplit("/", 1)[-1]
+            logger.error("Failed to send media %s: %s", media_path, e)
+            try:
+                await self._app.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"[Failed to send: {filename}]",
+                    reply_parameters=reply_parameters,
+                )
+                return None
+            except Exception as fallback_error:
+                logger.error("Failed to send media failure notice for %s: %s", media_path, fallback_error)
+                return reply_parameters
+
+    async def _send_media_group_batch(
+        self,
+        *,
+        chat_id: int,
+        bucket: str,
+        media_paths: list[str],
+        reply_parameters: ReplyParameters | None,
+    ) -> ReplyParameters | None:
+        if len(media_paths) == 1:
+            return await self._send_single_media(
+                chat_id=chat_id,
+                media_path=media_paths[0],
+                reply_parameters=reply_parameters,
+            )
+        try:
+            with contextlib.ExitStack() as stack:
+                media = [
+                    self._build_input_media(bucket, path, stack.enter_context(open(path, "rb")))
+                    for path in media_paths
+                ]
+                await self._app.bot.send_media_group(
+                    chat_id=chat_id,
+                    media=media,
+                    reply_parameters=reply_parameters,
+                )
+            return None
+        except Exception as e:
+            filenames = ", ".join(path.rsplit("/", 1)[-1] for path in media_paths)
+            logger.error("Failed to send media group %s: %s", filenames, e)
+            for media_path in media_paths:
+                reply_parameters = await self._send_single_media(
+                    chat_id=chat_id,
+                    media_path=media_path,
+                    reply_parameters=reply_parameters,
+                )
+            return reply_parameters
 
     async def send(self, msg: OutboundMessage) -> None:
         """Send a message through Telegram."""
@@ -379,7 +505,7 @@ class TelegramChannel(BaseChannel):
             return
 
         reply_params = None
-        if self.config.reply_to_message:
+        if getattr(self.config, "reply_to_message", False):
             reply_to_message_id = msg.metadata.get("message_id")
             if reply_to_message_id:
                 reply_params = ReplyParameters(
@@ -387,30 +513,28 @@ class TelegramChannel(BaseChannel):
                     allow_sending_without_reply=True
                 )
 
+        reply_params_for_next_send = reply_params
+
         # Send media files
-        for media_path in (msg.media or []):
-            try:
-                media_type = self._get_media_type(media_path)
-                sender = {
-                    "photo": self._app.bot.send_photo,
-                    "voice": self._app.bot.send_voice,
-                    "audio": self._app.bot.send_audio,
-                }.get(media_type, self._app.bot.send_document)
-                param = "photo" if media_type == "photo" else media_type if media_type in ("voice", "audio") else "document"
-                with open(media_path, 'rb') as f:
-                    await sender(
+        media_paths = list(msg.media or [])
+        if media_paths:
+            buckets, bucket_order = self._partition_media(media_paths)
+            for bucket in bucket_order:
+                if bucket == "voice":
+                    for media_path in buckets[bucket]:
+                        reply_params_for_next_send = await self._send_single_media(
+                            chat_id=chat_id,
+                            media_path=media_path,
+                            reply_parameters=reply_params_for_next_send,
+                        )
+                    continue
+                for batch in self._chunked(buckets[bucket], 10):
+                    reply_params_for_next_send = await self._send_media_group_batch(
                         chat_id=chat_id,
-                        **{param: f},
-                        reply_parameters=reply_params
+                        bucket=bucket,
+                        media_paths=batch,
+                        reply_parameters=reply_params_for_next_send,
                     )
-            except Exception as e:
-                filename = media_path.rsplit("/", 1)[-1]
-                logger.error("Failed to send media %s: %s", media_path, e)
-                await self._app.bot.send_message(
-                    chat_id=chat_id,
-                    text=f"[Failed to send: {filename}]",
-                    reply_parameters=reply_params
-                )
 
         # Send text content
         if msg.content and msg.content != "[empty message]":
@@ -437,9 +561,10 @@ class TelegramChannel(BaseChannel):
                             chat_id=chat_id,
                             text=html,
                             parse_mode="HTML",
-                            reply_parameters=reply_params,
+                            reply_parameters=reply_params_for_next_send,
                             reply_markup=markup,
                         )
+                        reply_params_for_next_send = None
                 except Exception as e:
                     logger.warning("HTML parse failed, falling back to plain text: %s", e)
                     try:
@@ -453,9 +578,10 @@ class TelegramChannel(BaseChannel):
                             await self._app.bot.send_message(
                                 chat_id=chat_id,
                                 text=chunk,
-                                reply_parameters=reply_params,
+                                reply_parameters=reply_params_for_next_send,
                                 reply_markup=markup,
                             )
+                            reply_params_for_next_send = None
                     except Exception as e2:
                         logger.error("Error sending Telegram message: %s", e2)
 

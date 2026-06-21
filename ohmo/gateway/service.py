@@ -89,6 +89,7 @@ class OhmoGatewayService:
                 self._config.channel_configs.get("feishu", {}).get("group_policy", "managed_or_mention")
             ),
             message_coalesce_window=self._config.message_coalesce_window,
+            message_coalesce_media_window=self._config.message_coalesce_media_window,
             message_coalesce_max=self._config.message_coalesce_max,
             contact_store=self._contact_store,
         )

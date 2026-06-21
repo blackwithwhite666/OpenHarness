@@ -128,6 +128,7 @@ class OhmoGatewayBridge:
         workspace: str | Path | None = None,
         feishu_group_policy: str = "open",
         message_coalesce_window: float = 0.0,
+        message_coalesce_media_window: float = 0.0,
         message_coalesce_max: int = 20,
         contact_store: ContactStore | None = None,
     ) -> None:
@@ -140,6 +141,7 @@ class OhmoGatewayBridge:
         self._session_tasks: dict[str, asyncio.Task[None]] = {}
         self._session_cancel_reasons: dict[str, str] = {}
         self._coalesce_window = float(message_coalesce_window)
+        self._coalesce_media_window = float(message_coalesce_media_window)
         self._coalesce_max = int(message_coalesce_max)
         self._pending: dict[str, list[InboundMessage]] = {}
         self._pending_deadline: dict[str, float] = {}
@@ -221,7 +223,8 @@ class OhmoGatewayBridge:
                 await self._flush_due()
                 continue
 
-            if self._coalesce_window <= 0:
+            effective_window = self._effective_coalesce_window(message, session_key)
+            if effective_window <= 0:
                 # OFF switch: behave exactly like the pre-coalescer code.
                 await self._dispatch(message, session_key)
                 await self._flush_due()
@@ -229,10 +232,17 @@ class OhmoGatewayBridge:
 
             buffer = self._pending.setdefault(session_key, [])
             buffer.append(message)
-            self._pending_deadline[session_key] = time.monotonic() + self._coalesce_window
+            self._pending_deadline[session_key] = time.monotonic() + effective_window
             if len(buffer) >= self._coalesce_max:
                 await self._flush_pending(session_key)
             await self._flush_due()
+
+    def _effective_coalesce_window(self, message: InboundMessage, session_key: str) -> float:
+        has_media = bool(message.media) or any(
+            buffered.media for buffered in self._pending.get(session_key, ())
+        )
+        window = self._coalesce_media_window if has_media else self._coalesce_window
+        return window if window > 0 else self._coalesce_window
 
     def _record_contact(self, message: InboundMessage) -> None:
         if self._contact_store is None:
