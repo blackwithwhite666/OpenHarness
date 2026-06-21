@@ -1,12 +1,14 @@
-# ohmo-skills — document / office / canvas skills
+# ohmo-skills — document / office / canvas / diagram skills
 
 Skills the **ohmo** gateway loads from `~/.ohmo/skills` (via `extra_skill_dirs`) on the
 agent host (`93.77.160.211`). They are **not** part of the `openharness-ai` wheel — they are
 deployed as a directory tree alongside it. This folder is the version-controlled source.
 
-Ported from [`anthropics/skills`](https://github.com/anthropics/skills) and **server-adapted**
-(each `SKILL.md` carries a `Runtime on this server (ohmo)` banner that points Python at the
-shared venv and Node at the per-skill `node_modules`).
+Ported from [`anthropics/skills`](https://github.com/anthropics/skills)
+(docx/pptx/xlsx/canvas-design/pdf) and Arcadia `alice/docs/.agents/skills/visual-explainer`
+(visual-explainer), all **server-adapted**: each `SKILL.md` carries a
+`Runtime on this server (ohmo)` banner (Python → shared venv, Node → per-skill `node_modules`,
+or — for visual-explainer — headless delivery via Telegram attach).
 
 ## Skills
 
@@ -17,6 +19,7 @@ shared venv and Node at the per-skill `node_modules`).
 | `pptx` | create / edit / read decks. | **pptxgenjs (Node)** create · venv Python scripts · `markitdown` read · soffice→pdf images |
 | `xlsx` | create / edit / analyze spreadsheets, recalc formulas. | venv `openpyxl`/`pandas` · `scripts/recalc.py` via LibreOffice |
 | `canvas-design` | poster / static-art `.png`/`.pdf` from a design philosophy. | venv `matplotlib`/`Pillow`/`reportlab` + bundled `canvas-fonts/` |
+| `visual-explainer` | self-contained HTML diagrams / dashboards / data-tables (Mermaid, Chart.js, CSS). | **no venv/node** — pure HTML + browser-side CDN; delivered as a Telegram attachment (headless host) |
 
 ## Runtime model
 
@@ -28,6 +31,11 @@ shared venv and Node at the per-skill `node_modules`).
   `npm install` in the skill dir — `package.json`/`package-lock.json` pin them). `require()`
   resolves from the **script's own dir**, so generators run with the skill dir as the script
   location or with `NODE_PATH=~/.ohmo/skills/<skill>/node_modules`.
+- **visual-explainer** needs **neither venv nor Node** — it emits a self-contained `.html`
+  (Mermaid/Chart.js/fonts load from CDN in the *viewer's* browser). On this headless host it is
+  delivered by attaching the file to Telegram (`[[attach: …]]`, output dir `~/.agent/diagrams`);
+  optional in-chat preview renders the `file://` URL to a PNG via the `browser` skill, and AI
+  images use the `falai` skill (not `surf-cli`).
 
 ## Host system dependencies (already present on 93.77)
 
@@ -46,7 +54,8 @@ python3.12 -m venv ~/.ohmo/venvs/docs
 ~/.ohmo/venvs/docs/bin/pip install -r ohmo-skills/requirements.txt
 
 # 2) skills → the gateway's skill dir
-cp -r ohmo-skills/{pdf,docx,pptx,xlsx,canvas-design} ~/.ohmo/skills/
+cp -r ohmo-skills/{pdf,docx,pptx,xlsx,canvas-design,visual-explainer} ~/.ohmo/skills/
+mkdir -p ~/.agent/diagrams          # visual-explainer output dir
 
 # 3) node deps for the two JS-creation skills
 ( cd ~/.ohmo/skills/docx && npm install )
@@ -64,6 +73,7 @@ existing skill also need a restart for the doc to reload.
 
 `docx`, `pptx`, `xlsx`, `pdf` carry Anthropic's **"Proprietary — source-available, not open
 source"** terms (see each `LICENSE.txt`). `canvas-design` and its bundled fonts are open
-(OFL / see `LICENSE.txt`). They are vendored here **as-is, with their LICENSE.txt unchanged**,
-for personal-VM deployment provenance. Redistribution risk of the source-available skills is
-**accepted by the repo owner** — do not strip or alter the bundled license files.
+(OFL / see `LICENSE.txt`). `visual-explainer` is **MIT** (open; author nicobailon). They are
+vendored here **as-is, with their LICENSE.txt unchanged**, for personal-VM deployment
+provenance. Redistribution risk of the source-available skills is **accepted by the repo
+owner** — do not strip or alter the bundled license files.
