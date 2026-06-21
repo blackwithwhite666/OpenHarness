@@ -1478,6 +1478,15 @@ def evals_run_session_cmd(
         "--fixture-match",
         help=_FIXTURE_MATCH_HELP,
     ),
+    max_session_turns: int | None = typer.Option(
+        None,
+        "--max-session-turns",
+        min=1,
+        help=(
+            "Hard cap on model turns per session (bounds cost on long sessions; "
+            "default scales with the captured turn count)"
+        ),
+    ),
     json_output: bool = typer.Option(False, "--json", help="Print a JSON summary"),
 ) -> None:
     """Run session-level replay checks over captured Ohmo eval episodes."""
@@ -1494,6 +1503,7 @@ def evals_run_session_cmd(
             user_sim_profile=user_sim_profile,
             user_sim_model=user_sim_model,
             fixture_match=fixture_match,
+            max_session_turns=max_session_turns,
         )
     except (FileNotFoundError, ValueError) as exc:
         print(str(exc), file=sys.stderr)

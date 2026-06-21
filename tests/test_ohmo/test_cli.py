@@ -1468,6 +1468,7 @@ def test_ohmo_evals_run_session_command_runs_session_eval(tmp_path: Path, monkey
         user_sim_model: str | None = None,
         clarification_allowed_by_session=None,
         fixture_match: str = "order",
+        max_session_turns: int | None = None,
     ):
         calls.append(
             {
@@ -1483,6 +1484,7 @@ def test_ohmo_evals_run_session_command_runs_session_eval(tmp_path: Path, monkey
                 "user_sim_model": user_sim_model,
                 "clarification_allowed_by_session": clarification_allowed_by_session,
                 "fixture_match": fixture_match,
+                "max_session_turns": max_session_turns,
             }
         )
         return SimpleNamespace(
@@ -1526,6 +1528,8 @@ def test_ohmo_evals_run_session_command_runs_session_eval(tmp_path: Path, monkey
             "user-model",
             "--fixture-match",
             "arguments",
+            "--max-session-turns",
+            "5",
         ],
     )
 
@@ -1546,6 +1550,7 @@ def test_ohmo_evals_run_session_command_runs_session_eval(tmp_path: Path, monkey
             "user_sim_model": "user-model",
             "clarification_allowed_by_session": None,
             "fixture_match": "arguments",
+            "max_session_turns": 5,
         }
     ]
 
