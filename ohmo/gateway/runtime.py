@@ -89,6 +89,8 @@ _GROUP_METADATA_KEYS = (
     "compact_checkpoints",
     "compact_last",
 )
+DEFAULT_REMINDER_TZ = "Europe/Moscow"
+DEFAULT_REMINDER_MAX_PER_CHAT = 50
 
 
 @dataclass(frozen=True)
@@ -129,8 +131,8 @@ class OhmoSessionRuntimePool:
         publish_group_welcome: PublishGroupWelcome | None = None,
         contact_store: ContactStore | None = None,
         send_outbound: Callable[[OutboundMessage], Awaitable[None]] | None = None,
-        default_tz: str = "Europe/Moscow",
-        reminder_max_per_chat: int = 50,
+        default_tz: str = DEFAULT_REMINDER_TZ,
+        reminder_max_per_chat: int = DEFAULT_REMINDER_MAX_PER_CHAT,
     ) -> None:
         self._cwd = str(Path(cwd).resolve())
         self._workspace = workspace

@@ -1358,6 +1358,88 @@ def test_ohmo_evals_run_command_runs_eval_report(tmp_path: Path, monkeypatch):
     ]
 
 
+def test_ohmo_evals_run_command_threads_sandbox_agent_runner(
+    tmp_path: Path,
+    monkeypatch,
+):
+    runner = CliRunner()
+    workspace = tmp_path / ".ohmo-home"
+    calls: list[dict[str, object]] = []
+
+    def fake_run_ohmo_eval_report(
+        *,
+        workspace: str | Path | None = None,
+        pack_filename: str = "eval_pack.json",
+        report_filename: str = "eval_report.json",
+        limit: int | None = None,
+        samples: int = 1,
+        report_only: bool = False,
+        executor_name: str = "replay-tools",
+        agent_runner_name: str = "scripted",
+        model: str | None = None,
+        provider_profile: str | None = None,
+        system_prompt: str | None = None,
+        scorer: str | None = None,
+    ):
+        calls.append(
+            {
+                "workspace": workspace,
+                "pack_filename": pack_filename,
+                "report_filename": report_filename,
+                "limit": limit,
+                "samples": samples,
+                "report_only": report_only,
+                "executor_name": executor_name,
+                "agent_runner_name": agent_runner_name,
+                "model": model,
+                "provider_profile": provider_profile,
+                "system_prompt": system_prompt,
+                "scorer": scorer,
+            }
+        )
+        return SimpleNamespace(
+            report_only=report_only,
+            write=SimpleNamespace(
+                path=Path(workspace) / "evals" / "reports" / report_filename,
+                report=SimpleNamespace(case_count=1, passed_count=1, failed_count=0),
+            ),
+        )
+
+    monkeypatch.setattr("ohmo.cli.run_ohmo_eval_report", fake_run_ohmo_eval_report)
+
+    result = runner.invoke(
+        app,
+        [
+            "evals",
+            "run",
+            "--workspace",
+            str(workspace),
+            "--agent-runner",
+            "sandbox",
+            "--scorer",
+            "state_outcome_oracle_v1",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert calls == [
+        {
+            "workspace": workspace.resolve(),
+            "pack_filename": "eval_pack.json",
+            "report_filename": "eval_report.json",
+            "limit": None,
+            "samples": 1,
+            "report_only": False,
+            "executor_name": "replay-tools",
+            "agent_runner_name": "sandbox",
+            "model": None,
+            "provider_profile": None,
+            "system_prompt": None,
+            "scorer": "state_outcome_oracle_v1",
+        }
+    ]
+
+
 def test_ohmo_evals_run_session_command_runs_session_eval(tmp_path: Path, monkeypatch):
     runner = CliRunner()
     workspace = tmp_path / ".ohmo-home"

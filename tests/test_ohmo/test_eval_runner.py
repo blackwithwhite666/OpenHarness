@@ -13,6 +13,12 @@ from openharness.engine.messages import (
     ToolUseBlock,
 )
 from openharness.evals import EvalEpisode, EvalEvent, promote_case_drafts
+from openharness.evals import (
+    EvalRunPack,
+    EvalRunPackCase,
+    collect_text_facets,
+    write_run_pack,
+)
 import ohmo.evals.runner as runner_module
 from ohmo.evals import (
     build_ohmo_eval_pack,
@@ -23,6 +29,7 @@ from ohmo.evals import (
     write_ohmo_eval_mine,
 )
 from ohmo.evals.runner import _build_agent_runner
+from ohmo.workspace import get_reminders_path
 
 
 def test_run_ohmo_eval_report_writes_metadata_replay_report(tmp_path: Path):
@@ -321,6 +328,41 @@ def test_check_ohmo_eval_run_config_validates_pack_without_running(tmp_path: Pat
     assert not (workspace / "evals" / "reports" / "eval_report.json").exists()
 
 
+def test_run_ohmo_eval_report_sandbox_scores_reminder_state_outcome(
+    tmp_path: Path,
+    monkeypatch,
+):
+    workspace = tmp_path / "workspace"
+    store = get_eval_store(workspace)
+    _write_sandbox_reminder_pack(store)
+    api_client = _ReminderCreateApiClient()
+    monkeypatch.setattr(
+        "ohmo.evals.runner.resolve_api_client_from_settings",
+        lambda settings: api_client,
+    )
+    monkeypatch.setattr(
+        "ohmo.evals.runner.build_ohmo_system_prompt",
+        lambda *args, **kwargs: "REAL_OHMO_PROMPT",
+    )
+
+    result = run_ohmo_eval_report(
+        workspace=workspace,
+        agent_runner_name="sandbox",
+        scorer="state_outcome_oracle_v1",
+        limit=1,
+    )
+
+    assert result.write.report.case_count == 1
+    assert result.write.report.passed_count == 1
+    assert result.write.report.failed_count == 0
+    assert result.write.report.cases[0].status == "passed"
+    assert not get_reminders_path(workspace).exists()
+    serialized = result.write.path.read_text(encoding="utf-8")
+    assert "SECRET REMINDER TEXT" not in serialized
+    assert "private sandbox reminder request" not in serialized
+    assert "private sandbox final" not in serialized
+
+
 def test_check_ohmo_eval_run_config_query_engine_auth_error_is_value_error(
     tmp_path: Path,
     monkeypatch,
@@ -509,6 +551,139 @@ class _UserSimApiClient:
             ),
             usage=UsageSnapshot(input_tokens=1, output_tokens=1),
         )
+
+
+class _ReminderCreateApiClient:
+    def __init__(self) -> None:
+        self.requests = []
+
+    async def stream_message(self, request):
+        self.requests.append(request)
+        last_message = request.messages[-1]
+        if any(isinstance(block, ToolResultBlock) for block in last_message.content):
+            yield ApiMessageCompleteEvent(
+                message=ConversationMessage(
+                    role="assistant",
+                    content=[TextBlock(text="private sandbox final")],
+                ),
+                usage=UsageSnapshot(input_tokens=1, output_tokens=1),
+            )
+            return
+
+        yield ApiMessageCompleteEvent(
+            message=ConversationMessage(
+                role="assistant",
+                content=[
+                    ToolUseBlock(
+                        id="toolu-reminder-sandbox",
+                        name="remind_create",
+                        input={
+                            "summary": "SECRET REMINDER TEXT",
+                            "dtstart": "2099-01-01T09:00:00+03:00",
+                            "rrule": None,
+                            "mode": "static",
+                            "tz": "Europe/Moscow",
+                        },
+                    )
+                ],
+            ),
+            usage=UsageSnapshot(input_tokens=1, output_tokens=1),
+        )
+
+
+def _write_sandbox_reminder_pack(store) -> None:
+    store.append_episode(
+        EvalEpisode(
+            episode_id="ep-sandbox-reminder",
+            source="gateway",
+            app="ohmo",
+            session_id="session-sandbox",
+            user_text="private sandbox reminder request",
+        )
+    )
+    store.append_event(
+        EvalEvent(
+            episode_id="ep-sandbox-reminder",
+            kind="tool_started",
+            tool_name="remind_create",
+            tool_call_id="tool-reminder-1",
+            payload={
+                "input_summary": "private reminder tool input",
+                "input": {
+                    "summary": "SECRET REMINDER TEXT",
+                    "dtstart": "2099-01-01T09:00:00+03:00",
+                },
+            },
+        )
+    )
+    store.append_event(
+        EvalEvent(
+            episode_id="ep-sandbox-reminder",
+            kind="tool_completed",
+            tool_name="remind_create",
+            tool_call_id="tool-reminder-1",
+            payload={"output_summary": "private reminder tool output"},
+        )
+    )
+    store.append_event(
+        EvalEvent(
+            episode_id="ep-sandbox-reminder",
+            kind="gateway_final",
+            payload={"text": "private captured reminder final"},
+        )
+    )
+    facets = collect_text_facets(store)
+    facet_ids_by_kind = {item.facet.facet_kind: item.facet.facet_id for item in facets}
+    write_run_pack(
+        store,
+        pack=EvalRunPack(
+            pack_id="pack-sandbox-reminder",
+            source_records_path="cases/gold_cases.jsonl",
+            cases=[
+                EvalRunPackCase(
+                    gold_case_id="gold-sandbox-reminder",
+                    case_id="case-sandbox-reminder",
+                    episode_id="ep-sandbox-reminder",
+                    case_kind="state",
+                    input_facet_ids=[facet_ids_by_kind["user_request"]],
+                    expected_facet_ids=[facet_ids_by_kind["assistant_final"]],
+                    tool_names=["remind_create"],
+                    capability_path=["remind_create"],
+                    rubric=["Create one reminder in sandbox state."],
+                    metadata={
+                        "state_delta": _expected_one_reminder_delta("gold-key")
+                    },
+                )
+            ],
+            metadata={"privacy": "metadata_only", "case_count": 1},
+        ),
+    )
+
+
+def _expected_one_reminder_delta(key: str) -> dict[str, object]:
+    return {
+        "reminders": {
+            "added_keys": [key],
+            "removed_keys": [],
+            "count_before": 0,
+            "count_after": 1,
+            "status_counts_before": {},
+            "status_counts_after": {"active": 1},
+        },
+        "memory": {
+            "added_keys": [],
+            "removed_keys": [],
+            "count_before": 0,
+            "count_after": 0,
+        },
+        "todos": {
+            "added_keys": [],
+            "removed_keys": [],
+            "count_before": 0,
+            "count_after": 0,
+        },
+        "changed": True,
+    }
 
 
 def _append_session_episode(

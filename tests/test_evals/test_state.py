@@ -9,6 +9,7 @@ from openharness.evals import (
     EvalResource,
     EvalResourceSnapshot,
     EvalStore,
+    StateOutcomeOracleV1,
     StateOracleV1,
     compute_episode_state_delta,
     compute_state_delta,
@@ -146,6 +147,81 @@ def test_state_oracle_is_registered_without_exact_tool_sequence_requirement():
     assert scorer.requires_exact_tool_sequence is False
 
 
+def test_state_outcome_oracle_matches_count_delta_despite_key_drift():
+    observed = _delta(reminder_added=("observed-key",), status_after={"active": 1})
+    expected = _delta(reminder_added=("gold-key",), status_after={"active": 1})
+
+    out = StateOutcomeOracleV1().score(
+        context=_outcome_context({"state_delta": expected}),
+        executor_result=EvalExecutorResult(
+            metadata={"sandbox_state_delta": observed},
+        ),
+    )
+
+    assert out.passed is True
+    assert out.metadata["check.sandbox_executed"] is True
+    assert out.metadata["check.state_mutated"] is True
+    assert out.metadata["check.outcome_matches_gold"] is True
+    assert out.metadata["observed_count_summary"]["reminders"]["added_count"] == 1
+    assert out.metadata["observed_delta"] == observed
+    assert out.metadata["expected_delta"] == expected
+
+
+def test_state_outcome_oracle_fails_when_sandbox_did_not_mutate():
+    observed = _delta()
+    expected = _delta(reminder_added=("gold-key",), status_after={"active": 1})
+
+    out = StateOutcomeOracleV1().score(
+        context=_outcome_context({"state_delta": expected}),
+        executor_result=EvalExecutorResult(
+            metadata={"sandbox_state_delta": observed},
+        ),
+    )
+
+    assert out.passed is False
+    assert out.metadata["check.state_mutated"] is False
+
+
+def test_state_outcome_oracle_fails_on_count_mismatch():
+    observed = _delta(
+        reminder_added=("observed-1", "observed-2"),
+        status_after={"active": 2},
+    )
+    expected = _delta(reminder_added=("gold-key",), status_after={"active": 1})
+
+    out = StateOutcomeOracleV1().score(
+        context=_outcome_context({"state_delta": expected}),
+        executor_result=EvalExecutorResult(
+            metadata={"sandbox_state_delta": observed},
+        ),
+    )
+
+    assert out.passed is False
+    assert out.metadata["check.outcome_matches_gold"] is False
+    assert out.metadata["observed_count_summary"]["reminders"]["added_count"] == 2
+    assert out.metadata["expected_count_summary"]["reminders"]["added_count"] == 1
+
+
+def test_state_outcome_oracle_fails_when_sandbox_delta_absent():
+    out = StateOutcomeOracleV1().score(
+        context=_outcome_context({}),
+        executor_result=EvalExecutorResult(),
+    )
+
+    assert out.passed is False
+    assert out.metadata["check.sandbox_executed"] is False
+    assert out.metadata["check.state_mutated"] is False
+    assert out.metadata["check.outcome_matches_gold"] is True
+
+
+def test_state_outcome_oracle_is_registered_without_exact_tool_sequence_requirement():
+    scorer = resolve_execution_scorer("state_outcome_oracle_v1")
+
+    assert scorer is EVAL_EXECUTION_SCORERS["state_outcome_oracle_v1"]
+    assert isinstance(scorer, StateOutcomeOracleV1)
+    assert scorer.requires_exact_tool_sequence is False
+
+
 def _oracle_context(
     store: EvalStore,
     episode_id: str,
@@ -156,6 +232,42 @@ def _oracle_context(
         episode=SimpleNamespace(episode_id=episode_id),
         case=SimpleNamespace(metadata=metadata),
     )
+
+
+def _outcome_context(metadata: dict[str, object]) -> SimpleNamespace:
+    return SimpleNamespace(case=SimpleNamespace(metadata=metadata))
+
+
+def _delta(
+    *,
+    reminder_added: tuple[str, ...] = (),
+    reminder_removed: tuple[str, ...] = (),
+    status_before: dict[str, int] | None = None,
+    status_after: dict[str, int] | None = None,
+) -> dict[str, object]:
+    return {
+        "reminders": {
+            "added_keys": list(reminder_added),
+            "removed_keys": list(reminder_removed),
+            "count_before": len(reminder_removed),
+            "count_after": len(reminder_added),
+            "status_counts_before": status_before or {},
+            "status_counts_after": status_after or {},
+        },
+        "memory": {
+            "added_keys": [],
+            "removed_keys": [],
+            "count_before": 0,
+            "count_after": 0,
+        },
+        "todos": {
+            "added_keys": [],
+            "removed_keys": [],
+            "count_before": 0,
+            "count_after": 0,
+        },
+        "changed": bool(reminder_added or reminder_removed),
+    }
 
 
 def _write_snapshot(

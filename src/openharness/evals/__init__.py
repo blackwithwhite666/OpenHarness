@@ -22,6 +22,7 @@ from openharness.evals.execution import (
     EvalExecutionScorer,
     EvalExecutionScorerResult,
     ExactMatchEvalScorer,
+    StateOutcomeOracleV1,
     StateOracleV1,
     ToolTraceOracleV1,
     resolve_execution_scorer,
@@ -39,6 +40,7 @@ from openharness.evals.executor import (
     ReplayScriptAgentRunner,
     ReplayToolInput,
     ReplayToolsExecutor,
+    SandboxMutatingAgentRunner,
     build_replay_tool_registry,
 )
 from openharness.evals.facets import EvalTextFacetInput, collect_text_facets
@@ -144,6 +146,7 @@ __all__ = [
     "CapabilityCoverageOracleV1",
     "CapabilityTraceOracleV1",
     "ExactMatchEvalScorer",
+    "StateOutcomeOracleV1",
     "StateOracleV1",
     "ToolTraceOracleV1",
     "EVAL_EXECUTION_SCORERS",
@@ -192,6 +195,7 @@ __all__ = [
     "ReplayScriptAgentRunner",
     "ReplayToolInput",
     "ReplayToolsExecutor",
+    "SandboxMutatingAgentRunner",
     "SessionReplayRunner",
     "UserSimulator",
     "UserTurn",

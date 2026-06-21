@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from openharness.api.client import SupportsStreamingMessages
 from openharness.api.resolver import (
@@ -22,6 +24,7 @@ from openharness.evals import (
     ReplayUserSimulator,
     ReplayScriptAgentRunner,
     ReplayToolsExecutor,
+    SandboxMutatingAgentRunner,
     SessionReplayRunner,
     UserSimulator,
     gold_capabilities_for_session,
@@ -32,11 +35,19 @@ from openharness.evals import (
     score_session,
 )
 from openharness.evals.runner import _report_output_path, _stable_id
-from openharness.evals.state import compute_episode_state_delta
+from openharness.evals.state import compute_episode_state_delta, extract_state_keys
+from openharness.tools.base import BaseTool, ToolExecutionContext, ToolResult
 from openharness.utils.fs import atomic_write_text
 
 from ohmo.evals.adapter import get_eval_store
+from ohmo.evals.resources import build_ohmo_resource_snapshot
+from ohmo.memory_store import MemoryStore
+from ohmo.memory_tool import OhmoMemoryTool
 from ohmo.prompts import build_ohmo_system_prompt
+from ohmo.reminders.store import ReminderStore
+from ohmo.reminders.tool import RemindCancelTool, RemindCreateTool, RemindListTool
+from ohmo.todo_store import TodoStore
+from ohmo.todo_write_tool import OhmoTodoWriteTool
 
 
 @dataclass(frozen=True)
@@ -79,17 +90,22 @@ class OhmoEvalRunConfigCheckResult:
 
 @dataclass(frozen=True)
 class _AgentRunnerConfig:
-    agent_runner: ReplayScriptAgentRunner | QueryEngineEvalAgentRunner
+    agent_runner: (
+        ReplayScriptAgentRunner
+        | QueryEngineEvalAgentRunner
+        | SandboxMutatingAgentRunner
+    )
     agent_runner_name: str
     model: str
     provider_profile: str
     api_client: SupportsStreamingMessages | None = None
     system_prompt: str = ""
     cwd: Path | None = None
+    replay_tools_only: bool = True
 
 
 SUPPORTED_EVAL_EXECUTOR_NAMES = ("replay-tools",)
-SUPPORTED_EVAL_AGENT_RUNNER_NAMES = ("scripted", "query-engine")
+SUPPORTED_EVAL_AGENT_RUNNER_NAMES = ("scripted", "query-engine", "sandbox")
 _SUPPORTED_EXECUTORS = {
     "replay-tools": ReplayToolsExecutor,
     "replay_tools": ReplayToolsExecutor,
@@ -328,14 +344,18 @@ def check_ohmo_eval_run_config(
         agent_runner_name=agent_runner_config.agent_runner_name,
         model=agent_runner_config.model,
         provider_profile=agent_runner_config.provider_profile,
-        replay_tools_only=True,
+        replay_tools_only=agent_runner_config.replay_tools_only,
     )
 
 
 def _build_executor(
     executor_name: str,
     *,
-    agent_runner: ReplayScriptAgentRunner | QueryEngineEvalAgentRunner,
+    agent_runner: (
+        ReplayScriptAgentRunner
+        | QueryEngineEvalAgentRunner
+        | SandboxMutatingAgentRunner
+    ),
 ) -> ReplayToolsExecutor:
     normalized = executor_name.strip().lower()
     executor_factory = _SUPPORTED_EXECUTORS.get(normalized)
@@ -354,7 +374,11 @@ def _build_agent_runner(
     model: str | None,
     provider_profile: str | None,
     system_prompt: str | None,
-) -> ReplayScriptAgentRunner | QueryEngineEvalAgentRunner:
+) -> (
+    ReplayScriptAgentRunner
+    | QueryEngineEvalAgentRunner
+    | SandboxMutatingAgentRunner
+):
     return _build_agent_runner_config(
         agent_runner_name,
         workspace=workspace,
@@ -394,13 +418,32 @@ def _build_agent_runner_config(
     try:
         api_client = resolve_api_client_from_settings(settings)
     except (ApiClientResolutionError, SystemExit) as exc:
+        runner_label = "query-engine" if normalized == "query-engine" else "sandbox"
         raise ValueError(
-            "query-engine eval runner requires configured API authentication"
+            f"{runner_label} eval runner requires configured API authentication"
         ) from exc
     resolved_prompt = system_prompt or build_ohmo_system_prompt(
         workspace or Path.cwd(),
         workspace=workspace,
     )
+    if normalized == "sandbox":
+        return _AgentRunnerConfig(
+            agent_runner=SandboxMutatingAgentRunner(
+                api_client=api_client,
+                model=settings.model,
+                system_prompt=resolved_prompt,
+                cwd=workspace,
+                sandbox_tool_factory=_ohmo_sandbox_tool_factory,
+                sandbox_state_fn=_ohmo_sandbox_state,
+            ),
+            agent_runner_name="sandbox",
+            model=settings.model,
+            provider_profile=settings.active_profile,
+            api_client=api_client,
+            system_prompt=resolved_prompt,
+            cwd=workspace,
+            replay_tools_only=False,
+        )
     return _AgentRunnerConfig(
         agent_runner=QueryEngineEvalAgentRunner(
             api_client=api_client,
@@ -415,6 +458,90 @@ def _build_agent_runner_config(
         system_prompt=resolved_prompt,
         cwd=workspace,
     )
+
+
+def _ohmo_sandbox_tool_factory(sandbox_ws: Path) -> Sequence[BaseTool]:
+    default_tz, reminder_max_per_chat = _ohmo_reminder_defaults()
+    memory_store = MemoryStore(sandbox_ws)
+    todo_store = TodoStore(sandbox_ws)
+    reminder_store = ReminderStore(workspace=sandbox_ws)
+    reminder_lock = asyncio.Lock()
+    reminder_metadata = {
+        "ohmo_reminder_ctx": {
+            "channel": "eval",
+            "chat_id": "eval-sandbox",
+            "session_key": "eval-sandbox",
+            "sender_id": "eval-sandbox",
+            "chat_type": "private",
+            "is_group": False,
+            "tz": default_tz,
+        }
+    }
+    return (
+        OhmoMemoryTool(memory_store),
+        OhmoTodoWriteTool(todo_store, lambda: "eval-sandbox"),
+        _ToolContextMetadataWrapper(
+            RemindCreateTool(
+                reminder_store,
+                reminder_lock,
+                default_tz=default_tz,
+                max_per_chat=reminder_max_per_chat,
+            ),
+            metadata=reminder_metadata,
+        ),
+        _ToolContextMetadataWrapper(
+            RemindListTool(
+                reminder_store,
+                reminder_lock,
+                default_tz=default_tz,
+            ),
+            metadata=reminder_metadata,
+        ),
+        _ToolContextMetadataWrapper(
+            RemindCancelTool(reminder_store, reminder_lock),
+            metadata=reminder_metadata,
+        ),
+    )
+
+
+def _ohmo_reminder_defaults() -> tuple[str, int]:
+    # Avoid importing the gateway runtime during ohmo.evals module initialization.
+    from ohmo.gateway.runtime import (  # noqa: PLC0415
+        DEFAULT_REMINDER_MAX_PER_CHAT,
+        DEFAULT_REMINDER_TZ,
+    )
+
+    return DEFAULT_REMINDER_TZ, DEFAULT_REMINDER_MAX_PER_CHAT
+
+
+def _ohmo_sandbox_state(sandbox_ws: Path) -> dict[str, Any]:
+    return extract_state_keys(
+        build_ohmo_resource_snapshot(episode_id="sandbox", workspace=sandbox_ws)
+    )
+
+
+class _ToolContextMetadataWrapper(BaseTool):
+    """Inject fixed runtime metadata for tools that require channel context."""
+
+    def __init__(self, tool: BaseTool, *, metadata: dict[str, object]) -> None:
+        self._tool = tool
+        self._metadata = metadata
+        self.name = tool.name
+        self.description = tool.description
+        self.input_model = tool.input_model
+
+    async def execute(self, arguments, context: ToolExecutionContext) -> ToolResult:
+        return await self._tool.execute(
+            arguments,
+            ToolExecutionContext(
+                cwd=context.cwd,
+                metadata={**context.metadata, **self._metadata},
+                hook_executor=context.hook_executor,
+            ),
+        )
+
+    def is_read_only(self, arguments) -> bool:
+        return self._tool.is_read_only(arguments)
 
 
 def _run_session_report_case_sampled(

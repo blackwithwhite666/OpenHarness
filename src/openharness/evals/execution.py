@@ -382,12 +382,74 @@ class StateOracleV1:
         )
 
 
+class StateOutcomeOracleV1:
+    """Drift-proof model gate for sandbox-mutated world state.
+
+    This is the P1=A outcome oracle: it grades the observed sandbox state delta
+    produced by a model run, not the exact trajectory or per-entry key hashes.
+    Key identity can drift because the model re-decides tool arguments, so this
+    oracle compares added/removed counts and reminder status-count shifts.
+    """
+
+    name = "state_outcome_oracle_v1"
+    requires_exact_tool_sequence = False
+
+    def score(
+        self,
+        *,
+        context: EvalExecutionContext,
+        executor_result: EvalExecutorResult,
+    ) -> EvalExecutionScorerResult:
+        observed = executor_result.metadata.get("sandbox_state_delta")
+        expected = context.case.metadata.get("state_delta")
+        checks = {
+            "sandbox_executed": observed is not None,
+            "state_mutated": observed is not None and observed.get("changed") is True,
+            "outcome_matches_gold": expected is None
+            or _count_delta_matches(observed, expected),
+        }
+        passed = all(checks.values())
+        return EvalExecutionScorerResult(
+            passed=passed,
+            score=_score(checks),
+            scorer_name=self.name,
+            metadata={
+                "observed_delta": observed,
+                "expected_delta": expected,
+                "observed_count_summary": _state_delta_count_summary(observed),
+                "expected_count_summary": _state_delta_count_summary(expected),
+                "observed_added_key_count": _state_delta_key_count(
+                    observed,
+                    "added_keys",
+                ),
+                "observed_removed_key_count": _state_delta_key_count(
+                    observed,
+                    "removed_keys",
+                ),
+                "expected_added_key_count": _state_delta_key_count(
+                    expected,
+                    "added_keys",
+                ),
+                "expected_removed_key_count": _state_delta_key_count(
+                    expected,
+                    "removed_keys",
+                ),
+                "observed_changed_resource_count": _state_delta_changed_resource_count(
+                    observed
+                ),
+                "state_resource_count": len(_STATE_RESOURCE_NAMES),
+                **{f"check.{name}": value for name, value in checks.items()},
+            },
+        )
+
+
 EVAL_EXECUTION_SCORERS: dict[str, EvalExecutionScorer] = {
     ExactMatchEvalScorer.name: ExactMatchEvalScorer(),
     ToolTraceOracleV1.name: ToolTraceOracleV1(),
     CapabilityTraceOracleV1.name: CapabilityTraceOracleV1(),
     CapabilityCoverageOracleV1.name: CapabilityCoverageOracleV1(),
     StateOracleV1.name: StateOracleV1(),
+    StateOutcomeOracleV1.name: StateOutcomeOracleV1(),
 }
 
 
@@ -1028,6 +1090,53 @@ def _state_delta_matches(observed: Any, expected: Any) -> bool:
     return _canonical_json(_state_delta_compare_payload(observed)) == _canonical_json(
         _state_delta_compare_payload(expected)
     )
+
+
+def _count_delta_matches(observed: Any, expected: Any) -> bool:
+    if not isinstance(observed, dict) or not isinstance(expected, dict):
+        return False
+    return _canonical_json(_state_delta_count_summary(observed)) == _canonical_json(
+        _state_delta_count_summary(expected)
+    )
+
+
+def _state_delta_count_summary(delta: Any) -> dict[str, Any]:
+    if not isinstance(delta, dict):
+        return {}
+    return {
+        resource_name: _state_delta_resource_count_summary(
+            delta.get(resource_name),
+            resource_name,
+        )
+        for resource_name in _STATE_RESOURCE_NAMES
+    }
+
+
+def _state_delta_resource_count_summary(
+    value: Any,
+    resource_name: str,
+) -> dict[str, Any]:
+    item = value if isinstance(value, dict) else {}
+    summary: dict[str, Any] = {
+        "added_count": len(_sorted_string_list(item.get("added_keys"))),
+        "removed_count": len(_sorted_string_list(item.get("removed_keys"))),
+    }
+    if resource_name == "reminders":
+        summary["status_count_shift"] = _status_count_shift(
+            item.get("status_counts_before"),
+            item.get("status_counts_after"),
+        )
+    return summary
+
+
+def _status_count_shift(before: Any, after: Any) -> dict[str, int]:
+    before_counts = _status_counts(before)
+    after_counts = _status_counts(after)
+    return {
+        key: after_counts.get(key, 0) - before_counts.get(key, 0)
+        for key in sorted(set(before_counts) | set(after_counts))
+        if after_counts.get(key, 0) - before_counts.get(key, 0) != 0
+    }
 
 
 def _state_delta_compare_payload(delta: dict[str, Any]) -> dict[str, Any]:

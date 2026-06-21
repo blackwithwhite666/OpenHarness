@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import shutil
+import tempfile
 import threading
-from collections.abc import Coroutine
+from collections.abc import Callable, Coroutine, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol, TypeVar
@@ -22,6 +24,7 @@ from openharness.engine.stream_events import (
 )
 from openharness.evals.facets import EvalTextFacetInput
 from openharness.evals.models import EvalEpisode, EvalEvent, EvalRunPack, EvalRunPackCase
+from openharness.evals.state import compute_state_delta
 from openharness.evals.store import EvalStore
 from openharness.permissions.checker import PermissionChecker
 from openharness.permissions.modes import PermissionMode
@@ -198,6 +201,74 @@ class QueryEngineEvalAgentRunner:
                 context=context,
             )
         )
+
+
+class SandboxMutatingAgentRunner:
+    """Run eval prompts with selected real tools bound to a throwaway sandbox."""
+
+    name = "sandbox"
+
+    def __init__(
+        self,
+        *,
+        api_client: SupportsStreamingMessages,
+        model: str,
+        sandbox_tool_factory: Callable[[Path], Sequence[BaseTool]],
+        sandbox_state_fn: Callable[[Path], dict[str, Any]],
+        system_prompt: str = "You are running a sandboxed eval.",
+        cwd: str | Path | None = None,
+        max_turns: int = 8,
+        max_tokens: int = 4096,
+    ) -> None:
+        self._api_client = api_client
+        self._model = model
+        self._system_prompt = system_prompt
+        self._cwd = Path(cwd).resolve() if cwd is not None else Path.cwd().resolve()
+        self._max_turns = max_turns
+        self._max_tokens = max_tokens
+        self._sandbox_tool_factory = sandbox_tool_factory
+        self._sandbox_state_fn = sandbox_state_fn
+
+    def run(
+        self,
+        *,
+        prompt: str,
+        tool_registry: ToolRegistry,
+        context: EvalExecutionContext,
+    ) -> EvalExecutorResult:
+        sandbox = Path(tempfile.mkdtemp(prefix="openharness-eval-sandbox-")).resolve()
+        try:
+            before = self._sandbox_state_fn(sandbox)
+            for tool in self._sandbox_tool_factory(sandbox):
+                tool_registry.register(tool)
+            result = _run_eval_coroutine(
+                _run_query_engine_replay(
+                    api_client=self._api_client,
+                    model=self._model,
+                    system_prompt=self._system_prompt,
+                    cwd=sandbox,
+                    max_turns=self._max_turns,
+                    max_tokens=self._max_tokens,
+                    prompt=prompt,
+                    tool_registry=tool_registry,
+                    context=context,
+                )
+            )
+            after = self._sandbox_state_fn(sandbox)
+            delta = compute_state_delta(before, after)
+            return EvalExecutorResult(
+                final_text=result.final_text,
+                tool_path=result.tool_path,
+                event_kind_path=result.event_kind_path,
+                tool_calls=result.tool_calls,
+                metadata={
+                    **result.metadata,
+                    "agent_runner": self.name,
+                    "sandbox_state_delta": delta,
+                },
+            )
+        finally:
+            shutil.rmtree(sandbox, ignore_errors=True)
 
 
 class ReplayFixtureTool(BaseTool):
