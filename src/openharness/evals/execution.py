@@ -210,35 +210,48 @@ class CapabilityTraceOracleV1:
         executor_result: EvalExecutorResult,
     ) -> EvalExecutionScorerResult:
         expected = list(context.case.capability_path)
-        expected_set = set(expected)
+        core_expected = [
+            capability
+            for capability in expected
+            if capability not in _INCIDENTAL_CAPABILITIES
+        ]
+        core_expected_set = set(core_expected)
         calls = list(executor_result.tool_calls)
         observed = [
             effective_tool_label(call.tool_name, call.arguments)
             for call in calls
         ]
-        observed_set = set(observed)
+        core_observed = [
+            capability
+            for capability in observed
+            if capability not in _INCIDENTAL_CAPABILITIES
+        ]
+        core_observed_set = set(core_observed)
         unexpected = sorted(
             {
                 capability
-                for capability in observed
-                if expected_set and capability not in expected_set
+                for capability in core_observed
+                if core_expected_set and capability not in core_expected_set
             }
         )
         missing = sorted(
             {
                 capability
-                for capability in expected
-                if capability not in observed_set
+                for capability in core_expected
+                if capability not in core_observed_set
             }
         )
         error_count = sum(1 for call in calls if call.is_error)
-        budget = max(len(expected) * self._max_calls_factor, self._max_calls_floor)
+        budget = max(
+            len(core_expected) * self._max_calls_factor,
+            self._max_calls_floor,
+        )
         checks = {
             "no_unexpected_capabilities": not unexpected,
             "no_tool_errors": error_count == 0,
             "within_call_budget": len(calls) <= budget,
             "expected_capabilities_present": not missing,
-            "used_tools_when_expected": (not expected) or bool(calls),
+            "used_tools_when_expected": (not core_expected) or bool(calls),
         }
         passed = all(checks.values())
         return EvalExecutionScorerResult(
@@ -247,13 +260,17 @@ class CapabilityTraceOracleV1:
             scorer_name=self.name,
             metadata={
                 "observed_call_count": len(calls),
-                "expected_capability_count": len(expected),
+                "expected_capability_count": len(core_expected),
                 "unexpected_capability_count": len(unexpected),
                 "missing_capability_count": len(missing),
+                "incidental_capability_count": len(expected) - len(core_expected),
                 "tool_error_count": error_count,
                 "call_budget": budget,
                 **{f"check.{name}": value for name, value in checks.items()},
-                **_capability_metadata(expected=expected, observed=observed),
+                **_capability_metadata(
+                    expected=core_expected,
+                    observed=core_observed,
+                ),
             },
         )
 

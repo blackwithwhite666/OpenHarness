@@ -186,6 +186,59 @@ def test_capability_trace_oracle_exposes_capability_label_metadata():
     assert out.metadata["unexpected_capabilities"] == []
 
 
+def test_capability_trace_oracle_ignores_missing_incidental_capability():
+    out = CapabilityTraceOracleV1().score(
+        context=_ctx(["todo_write", "bash"], ["todo_write", "bash:weather-cli forecast"]),
+        executor_result=_result(
+            EvalObservedCall(
+                "bash",
+                {"command": "weather-cli forecast 'СПб'"},
+                False,
+            )
+        ),
+    )
+
+    assert out.passed is True
+    assert out.metadata["check.expected_capabilities_present"] is True
+    assert out.metadata["missing_capability_count"] == 0
+    assert out.metadata["incidental_capability_count"] == 1
+    assert out.metadata["expected_capability_count"] == 1
+    assert out.metadata["expected_capabilities"] == ["bash:weather-cli forecast"]
+    assert out.metadata["missing_capabilities"] == []
+
+
+def test_capability_trace_oracle_incidental_call_does_not_cover_core_capability():
+    out = CapabilityTraceOracleV1().score(
+        context=_ctx(["todo_write", "bash"], ["todo_write", "bash:weather-cli forecast"]),
+        executor_result=_result(EvalObservedCall("todo_write", {}, False)),
+    )
+
+    assert out.passed is False
+    assert out.metadata["missing_capability_count"] == 1
+    assert out.metadata["check.expected_capabilities_present"] is False
+    assert out.metadata["missing_capabilities"] == ["bash:weather-cli forecast"]
+    assert out.metadata["observed_capabilities"] == []
+
+
+def test_capability_trace_oracle_ignores_extra_incidental_capability():
+    out = CapabilityTraceOracleV1().score(
+        context=_ctx(["todo_write", "bash"], ["todo_write", "bash:weather-cli forecast"]),
+        executor_result=_result(
+            EvalObservedCall("todo_write", {}, False),
+            EvalObservedCall(
+                "bash",
+                {"command": "weather-cli forecast 'СПб'"},
+                False,
+            ),
+        ),
+    )
+
+    assert out.passed is True
+    assert out.metadata["check.no_unexpected_capabilities"] is True
+    assert out.metadata["unexpected_capability_count"] == 0
+    assert out.metadata["unexpected_capabilities"] == []
+
+
 def test_capability_metadata_preserves_subcommand_labels_readable():
     # bash:<binary> <subcommand> labels contain a space but no raw args, so they
     # must stay readable in the report — not hashed to cap:<hash>.
