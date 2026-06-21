@@ -65,6 +65,26 @@ _PLUMBING = frozenset(
         "snap",
     }
 )
+_SHELL_KEYWORDS = frozenset(
+    {
+        "for",
+        "while",
+        "until",
+        "if",
+        "elif",
+        "then",
+        "else",
+        "fi",
+        "case",
+        "esac",
+        "select",
+        "function",
+        "do",
+        "done",
+        "in",
+        "time",
+    }
+)
 # Binaries whose first positional token is a meaningful subcommand (capability).
 # Skill CLIs follow the ``*-cli`` convention; a few common multi-command tools
 # are listed explicitly.
@@ -118,6 +138,7 @@ def _is_noncapability_binary(binary: str) -> bool:
         or binary.startswith("-")
         or binary in _SKIP
         or binary in _PLUMBING
+        or binary in _SHELL_KEYWORDS
         or bool(_ASSIGN.match(binary))
     )
 

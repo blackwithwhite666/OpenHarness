@@ -207,6 +207,38 @@ def test_capability_trace_oracle_ignores_missing_incidental_capability():
     assert out.metadata["missing_capabilities"] == []
 
 
+def test_capability_oracles_ignore_expected_bare_shell_capability():
+    context = _ctx(["bash"], ["bash", "bash:maps-cli search"])
+    result = _result(
+        EvalObservedCall(
+            "bash",
+            {"command": "maps-cli search 'x'"},
+            False,
+        )
+    )
+
+    trace = CapabilityTraceOracleV1().score(
+        context=context,
+        executor_result=result,
+    )
+    coverage = CapabilityCoverageOracleV1().score(
+        context=context,
+        executor_result=result,
+    )
+
+    assert trace.passed is True
+    assert trace.metadata["check.expected_capabilities_present"] is True
+    assert trace.metadata["missing_capability_count"] == 0
+    assert trace.metadata["incidental_capability_count"] == 1
+    assert trace.metadata["expected_capabilities"] == ["bash:maps-cli search"]
+    assert trace.metadata["missing_capabilities"] == []
+    assert coverage.passed is True
+    assert coverage.metadata["check.expected_core_capabilities_covered"] is True
+    assert coverage.metadata["missing_core_count"] == 0
+    assert coverage.metadata["expected_capabilities"] == ["bash:maps-cli search"]
+    assert coverage.metadata["missing_capabilities"] == []
+
+
 def test_capability_trace_oracle_incidental_call_does_not_cover_core_capability():
     out = CapabilityTraceOracleV1().score(
         context=_ctx(["todo_write", "bash"], ["todo_write", "bash:weather-cli forecast"]),
@@ -237,6 +269,26 @@ def test_capability_trace_oracle_ignores_extra_incidental_capability():
     assert out.metadata["check.no_unexpected_capabilities"] is True
     assert out.metadata["unexpected_capability_count"] == 0
     assert out.metadata["unexpected_capabilities"] == []
+
+
+def test_capability_trace_oracle_ignores_extra_bare_shell_call():
+    out = CapabilityTraceOracleV1().score(
+        context=_ctx(["bash"], ["bash:maps-cli search"]),
+        executor_result=_result(
+            EvalObservedCall(
+                "bash",
+                {"command": "maps-cli search 'x'"},
+                False,
+            ),
+            EvalObservedCall("bash", {"command": "mkdir d"}, False),
+        ),
+    )
+
+    assert out.passed is True
+    assert out.metadata["check.no_unexpected_capabilities"] is True
+    assert out.metadata["unexpected_capability_count"] == 0
+    assert out.metadata["unexpected_capabilities"] == []
+    assert out.metadata["observed_capabilities"] == ["bash:maps-cli search"]
 
 
 def test_capability_metadata_preserves_subcommand_labels_readable():

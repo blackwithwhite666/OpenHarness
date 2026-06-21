@@ -54,6 +54,32 @@ def test_command_capabilities_skip_flags_and_plumbing():
     assert command_capabilities("mkdir -p d && maps-cli search x") == ["maps-cli search"]
 
 
+def test_command_capabilities_ignore_shell_keywords_in_compound_commands():
+    command = "for i in 1 2; do maps-cli search 'x'; done"
+
+    assert command_capabilities(command) == ["maps-cli search"]
+    assert extract_command_binaries(command) == ["maps-cli"]
+    assert effective_tool_label("bash", {"command": command}) == "bash:maps-cli search"
+
+    lifted_labels = {f"bash:{capability}" for capability in command_capabilities(command)}
+    assert "bash:for" not in lifted_labels
+    assert "bash:do" not in lifted_labels
+    assert "bash:done" not in lifted_labels
+
+
+def test_command_capabilities_ignore_pure_keyword_plumbing_commands():
+    command = "for i in 1 2; do mkdir d; done"
+
+    assert command_capabilities(command) == []
+    assert extract_command_binaries(command) == []
+    assert effective_tool_label("bash", {"command": command}) == "bash"
+
+    lifted_labels = {f"bash:{capability}" for capability in command_capabilities(command)}
+    assert "bash:for" not in lifted_labels
+    assert "bash:mkdir" not in lifted_labels
+    assert "bash:done" not in lifted_labels
+
+
 def test_effective_tool_label_shell_vs_typed():
     assert effective_tool_label("bash", {"command": "maps-cli reviews x"}) == "bash:maps-cli reviews"
     assert effective_tool_label("bash", {"command": "python3.12 -"}) == "bash:python3.12"

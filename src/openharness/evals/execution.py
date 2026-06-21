@@ -35,13 +35,13 @@ from openharness.evals.pack import read_run_pack
 from openharness.evals.replay_matching import _fixture_input_key
 from openharness.evals.state import compute_episode_state_delta
 from openharness.evals.store import EvalStore
-from openharness.evals.tool_labels import effective_tool_label
+from openharness.evals.tool_labels import SHELL_TOOL_NAMES, effective_tool_label
 from openharness.utils.fs import atomic_write_text
 
 _EXECUTION_SCORE_SCHEMA_VERSION = 1
 _INCIDENTAL_CAPABILITIES = frozenset(
     {"todo_write", "sleep", "task_get", "task_output", "task_stop", "tool_search"}
-)
+) | SHELL_TOOL_NAMES
 _CAPABILITY_METADATA_KEYS = (
     "observed_capabilities",
     "expected_capabilities",
