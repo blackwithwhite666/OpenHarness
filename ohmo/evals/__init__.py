@@ -38,10 +38,13 @@ from ohmo.evals.review import (
 from ohmo.evals.runner import (
     OhmoEvalRunConfigCheckResult,
     OhmoEvalRunResult,
+    OhmoSessionEvalReportWrite,
+    OhmoSessionEvalRunResult,
     SUPPORTED_EVAL_AGENT_RUNNER_NAMES,
     SUPPORTED_EVAL_EXECUTOR_NAMES,
     check_ohmo_eval_run_config,
     run_ohmo_eval_report,
+    run_ohmo_session_eval,
 )
 
 __all__ = [
@@ -59,6 +62,8 @@ __all__ = [
     "OhmoEvalReviewResult",
     "OhmoEvalRunConfigCheckResult",
     "OhmoEvalRunResult",
+    "OhmoSessionEvalReportWrite",
+    "OhmoSessionEvalRunResult",
     "OhmoEvalSmokeResult",
     "ResourceSnapshotWrite",
     "SUPPORTED_EVAL_AGENT_RUNNER_NAMES",
@@ -72,6 +77,7 @@ __all__ = [
     "promote_ohmo_eval_case_drafts",
     "review_ohmo_eval_case_drafts",
     "run_ohmo_eval_report",
+    "run_ohmo_session_eval",
     "run_ohmo_eval_smoke",
     "save_ohmo_eval_baseline",
     "validate_ohmo_eval_review_manifest",

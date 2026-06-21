@@ -626,6 +626,50 @@ class EvalExecutionReport(BaseModel):
         return _validate_json_mapping(value)
 
 
+class EvalSessionReportCase(BaseModel):
+    """Session-level eval result for one ordered episode group."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    session_id: str
+    status: str
+    score: float = 0.0
+    checks: dict[str, bool] = Field(default_factory=dict)
+    turn_count: int = 0
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("metadata")
+    @classmethod
+    def _metadata_is_json(cls, value: dict[str, Any]) -> dict[str, Any]:
+        return _validate_json_mapping(value)
+
+
+class EvalSessionReport(BaseModel):
+    """Metadata-only session replay report."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: int = 1
+    report_kind: str = "session_report"
+    report_id: str
+    created_at: datetime = Field(default_factory=_utc_now)
+    session_count: int
+    passed_count: int
+    failed_count: int
+    cases: list[EvalSessionReportCase] = Field(default_factory=list)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("created_at")
+    @classmethod
+    def _created_at_is_utc(cls, value: datetime) -> datetime:
+        return _normalize_timestamp(value)
+
+    @field_validator("metadata")
+    @classmethod
+    def _metadata_is_json(cls, value: dict[str, Any]) -> dict[str, Any]:
+        return _validate_json_mapping(value)
+
+
 class EvalReportComparisonCase(BaseModel):
     """Metadata-only comparison for one eval case across two execution reports."""
 

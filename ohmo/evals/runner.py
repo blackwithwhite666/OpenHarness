@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from collections.abc import Mapping, Sequence
 
+from openharness.api.client import SupportsStreamingMessages
 from openharness.api.resolver import (
     ApiClientResolutionError,
     resolve_api_client_from_settings,
@@ -12,13 +14,22 @@ from openharness.api.resolver import (
 from openharness.config import load_settings
 from openharness.evals import (
     EvalExecutionReportWrite,
+    EvalSessionReport,
+    EvalSessionReportCase,
     QueryEngineEvalAgentRunner,
     ReplayScriptAgentRunner,
     ReplayToolsExecutor,
+    SessionReplayRunner,
+    gold_capabilities_for_session,
+    group_episodes_into_sessions,
     read_run_pack,
     resolve_execution_scorer,
     run_execution_report,
+    score_session,
 )
+from openharness.evals.runner import _report_output_path, _stable_id
+from openharness.evals.state import compute_episode_state_delta
+from openharness.utils.fs import atomic_write_text
 
 from ohmo.evals.adapter import get_eval_store
 from ohmo.prompts import build_ohmo_system_prompt
@@ -30,6 +41,22 @@ class OhmoEvalRunResult:
 
     write: EvalExecutionReportWrite
     report_only: bool
+
+
+@dataclass(frozen=True)
+class OhmoSessionEvalReportWrite:
+    """Summary returned after writing an Ohmo session eval report."""
+
+    report: EvalSessionReport
+    path: Path
+    relative_path: str
+
+
+@dataclass(frozen=True)
+class OhmoSessionEvalRunResult:
+    """Summary returned after running an Ohmo session eval report."""
+
+    write: OhmoSessionEvalReportWrite
 
 
 @dataclass(frozen=True)
@@ -52,6 +79,9 @@ class _AgentRunnerConfig:
     agent_runner_name: str
     model: str
     provider_profile: str
+    api_client: SupportsStreamingMessages | None = None
+    system_prompt: str = ""
+    cwd: Path | None = None
 
 
 SUPPORTED_EVAL_EXECUTOR_NAMES = ("replay-tools",)
@@ -106,6 +136,93 @@ def run_ohmo_eval_report(
         scorer=selected_scorer,
     )
     return OhmoEvalRunResult(write=write, report_only=report_only)
+
+
+def run_ohmo_session_eval(
+    *,
+    workspace: str | Path | None = None,
+    report_filename: str = "session_report.json",
+    limit: int | None = None,
+    model: str | None = None,
+    provider_profile: str | None = None,
+    system_prompt: str | None = None,
+    samples: int = 1,
+    gold_capabilities_by_session: Mapping[str, Sequence[str]] | None = None,
+) -> OhmoSessionEvalRunResult:
+    """Run P0 session replay checks over captured Ohmo eval episodes."""
+    if limit is not None and limit <= 0:
+        raise ValueError("limit must be positive")
+    if samples < 1:
+        raise ValueError("samples must be positive")
+
+    workspace_root = Path(workspace).expanduser().resolve() if workspace else None
+    agent_runner_config = _build_agent_runner_config(
+        "query-engine",
+        workspace=workspace_root,
+        model=model,
+        provider_profile=provider_profile,
+        system_prompt=system_prompt,
+    )
+    if agent_runner_config.api_client is None:
+        raise ValueError("session eval runner requires configured API authentication")
+
+    store = get_eval_store(workspace)
+    groups = group_episodes_into_sessions(store, app="ohmo")
+    groups = groups[:limit] if limit is not None else groups
+    if not groups:
+        raise ValueError("eval store must contain ohmo sessions")
+
+    runner = SessionReplayRunner(
+        api_client=agent_runner_config.api_client,
+        model=agent_runner_config.model,
+        system_prompt=agent_runner_config.system_prompt,
+        cwd=agent_runner_config.cwd,
+    )
+    cases = [
+        _run_session_report_case_sampled(
+            store=store,
+            group=group,
+            runner=runner,
+            samples=samples,
+            gold_capabilities_by_session=gold_capabilities_by_session,
+        )
+        for group in groups
+    ]
+    passed_count = sum(1 for case in cases if case.status == "passed")
+    failed_count = len(cases) - passed_count
+    report = EvalSessionReport(
+        report_id=_stable_id(
+            "session-eval",
+            *(group.session_id for group in groups),
+        ),
+        session_count=len(cases),
+        passed_count=passed_count,
+        failed_count=failed_count,
+        cases=cases,
+        metadata={
+            "privacy": "metadata_only",
+            "mode": "session_replay",
+            "runner_name": SessionReplayRunner.name,
+            "model": agent_runner_config.model,
+            "provider_profile": agent_runner_config.provider_profile,
+            "gold_source": (
+                "provided"
+                if gold_capabilities_by_session is not None
+                else "captured_self_coverage"
+            ),
+            "limit": limit or 0,
+            "samples": samples,
+        },
+    )
+    path = _report_output_path(store, report_filename)
+    atomic_write_text(path, report.model_dump_json(indent=2) + "\n")
+    return OhmoSessionEvalRunResult(
+        write=OhmoSessionEvalReportWrite(
+            report=report,
+            path=path,
+            relative_path=path.relative_to(store.root).as_posix(),
+        )
+    )
 
 
 def check_ohmo_eval_run_config(
@@ -233,4 +350,99 @@ def _build_agent_runner_config(
         agent_runner_name="query-engine",
         model=settings.model,
         provider_profile=settings.active_profile,
+        api_client=api_client,
+        system_prompt=resolved_prompt,
+        cwd=workspace,
+    )
+
+
+def _run_session_report_case_sampled(
+    *,
+    store,
+    group,
+    runner: SessionReplayRunner,
+    samples: int,
+    gold_capabilities_by_session: Mapping[str, Sequence[str]] | None,
+) -> EvalSessionReportCase:
+    first = _run_session_report_case(
+        store=store,
+        group=group,
+        runner=runner,
+        gold_capabilities_by_session=gold_capabilities_by_session,
+    )
+    if samples == 1:
+        return first
+
+    sample_cases = [first]
+    for _ in range(samples - 1):
+        sample_cases.append(
+            _run_session_report_case(
+                store=store,
+                group=group,
+                runner=runner,
+                gold_capabilities_by_session=gold_capabilities_by_session,
+            )
+        )
+    pass_count = sum(1 for case in sample_cases if case.status == "passed")
+    return first.model_copy(
+        update={
+            "status": "passed" if pass_count * 2 > samples else "failed",
+            "score": sum(case.score for case in sample_cases) / samples,
+            "metadata": {
+                **first.metadata,
+                "sample_count": samples,
+                "pass_count": pass_count,
+                "pass_rate": pass_count / samples,
+            },
+        }
+    )
+
+
+def _run_session_report_case(
+    *,
+    store,
+    group,
+    runner: SessionReplayRunner,
+    gold_capabilities_by_session: Mapping[str, Sequence[str]] | None,
+) -> EvalSessionReportCase:
+    gold_source = (
+        "provided"
+        if gold_capabilities_by_session
+        and group.session_id in gold_capabilities_by_session
+        else "captured_self_coverage"
+    )
+    gold_capabilities = gold_capabilities_for_session(
+        store,
+        group,
+        overrides=gold_capabilities_by_session,
+    )
+    state_delta = compute_episode_state_delta(store, group.episode_ids[-1])
+    state_changed = (
+        None if state_delta is None else bool(state_delta.get("changed") is True)
+    )
+    result = runner.run(group=group, store=store)
+    score_payload = score_session(
+        result,
+        gold_capabilities=gold_capabilities,
+        state_changed=state_changed,
+    )
+    return EvalSessionReportCase(
+        session_id=group.session_id,
+        status="passed" if score_payload["passed"] else "failed",
+        score=float(score_payload["score"]),
+        checks=dict(score_payload["checks"]),
+        turn_count=result.turn_count,
+        metadata={
+            "episode_count": len(group.episode_ids),
+            "gold_source": gold_source,
+            "gold_capability_count": len(gold_capabilities),
+            "observed_capabilities": score_payload["observed_capabilities"],
+            "missing_capabilities": score_payload["missing_capabilities"],
+            "state_delta_captured": state_delta is not None,
+            "state_changed": state_changed,
+            "final_text_length": len(result.final_text),
+            "fixture_count": result.metadata.get("fixture_count", 0),
+            "source_event_count": result.metadata.get("source_event_count", 0),
+            "engine_message_count": result.metadata.get("engine_message_count", 0),
+        },
     )

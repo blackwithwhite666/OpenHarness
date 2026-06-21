@@ -31,6 +31,7 @@ from ohmo.evals import (
     promote_ohmo_eval_case_drafts,
     review_ohmo_eval_case_drafts,
     run_ohmo_eval_report,
+    run_ohmo_session_eval,
     run_ohmo_eval_smoke,
     save_ohmo_eval_baseline,
     validate_ohmo_eval_review_manifest,
@@ -185,6 +186,21 @@ def _eval_run_summary(result: object) -> dict[str, object]:
         "blocked_count": getattr(report, "blocked_count", 0),
         "error_count": getattr(report, "error_count", 0),
         "report_only": getattr(result, "report_only"),
+    }
+
+
+def _eval_session_run_summary(result: object) -> dict[str, object]:
+    write = getattr(result, "write")
+    report = getattr(write, "report")
+    return {
+        "privacy": "metadata_only",
+        "report_path": _path_summary(getattr(write, "path", "")),
+        "relative_path": getattr(write, "relative_path", ""),
+        "report_kind": getattr(report, "report_kind", "session_report"),
+        "report_id": getattr(report, "report_id", ""),
+        "session_count": getattr(report, "session_count"),
+        "passed_count": getattr(report, "passed_count"),
+        "failed_count": getattr(report, "failed_count"),
     }
 
 
@@ -1406,6 +1422,71 @@ def evals_run_cmd(
         + getattr(report, "blocked_count", 0)
         + getattr(report, "error_count", 0)
     ):
+        raise typer.Exit(1)
+
+
+@evals_app.command("run-session")
+def evals_run_session_cmd(
+    workspace: str | None = typer.Option(None, "--workspace", help=_WORKSPACE_HELP),
+    report_filename: str = typer.Option(
+        "session_report.json",
+        "--output",
+        help="Session report filename under evals/reports",
+    ),
+    limit: int | None = typer.Option(None, "--limit", min=1, help="Session subset size"),
+    samples: int = typer.Option(
+        1,
+        "--samples",
+        min=1,
+        help="Run each session N times and decide pass/fail by majority",
+    ),
+    model: str | None = typer.Option(
+        None,
+        "--model",
+        help="Model override for the session query-engine runner",
+    ),
+    provider_profile: str | None = typer.Option(
+        None,
+        "--profile",
+        help="Provider profile override for the session query-engine runner",
+    ),
+    system_prompt: str | None = typer.Option(
+        None,
+        "--system-prompt",
+        help="Override ohmo's real system prompt for the session query-engine runner",
+    ),
+    json_output: bool = typer.Option(False, "--json", help="Print a JSON summary"),
+) -> None:
+    """Run session-level replay checks over captured Ohmo eval episodes."""
+    workspace_root = initialize_workspace(workspace)
+    try:
+        result = run_ohmo_session_eval(
+            workspace=workspace_root,
+            report_filename=report_filename,
+            limit=limit,
+            samples=samples,
+            model=model,
+            provider_profile=provider_profile,
+            system_prompt=system_prompt,
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        print(str(exc), file=sys.stderr)
+        raise typer.Exit(1)
+
+    report = result.write.report
+    if json_output:
+        _print_json_summary(_eval_session_run_summary(result))
+        if report.failed_count:
+            raise typer.Exit(1)
+        return
+
+    print(f"Wrote session eval report: {result.write.path}")
+    print(
+        "Session eval evaluated "
+        f"{report.session_count} sessions: "
+        f"passed={report.passed_count} failed={report.failed_count}"
+    )
+    if report.failed_count:
         raise typer.Exit(1)
 
 

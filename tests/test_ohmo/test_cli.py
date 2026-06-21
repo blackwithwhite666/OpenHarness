@@ -1358,6 +1358,89 @@ def test_ohmo_evals_run_command_runs_eval_report(tmp_path: Path, monkeypatch):
     ]
 
 
+def test_ohmo_evals_run_session_command_runs_session_eval(tmp_path: Path, monkeypatch):
+    runner = CliRunner()
+    workspace = tmp_path / ".ohmo-home"
+    calls: list[dict[str, object]] = []
+
+    def fake_run_ohmo_session_eval(
+        *,
+        workspace: str | Path | None = None,
+        report_filename: str = "session_report.json",
+        limit: int | None = None,
+        model: str | None = None,
+        provider_profile: str | None = None,
+        system_prompt: str | None = None,
+        samples: int = 1,
+        gold_capabilities_by_session=None,
+    ):
+        calls.append(
+            {
+                "workspace": workspace,
+                "report_filename": report_filename,
+                "limit": limit,
+                "model": model,
+                "provider_profile": provider_profile,
+                "system_prompt": system_prompt,
+                "samples": samples,
+                "gold_capabilities_by_session": gold_capabilities_by_session,
+            }
+        )
+        return SimpleNamespace(
+            write=SimpleNamespace(
+                path=Path(workspace) / "evals" / "reports" / report_filename,
+                relative_path=f"reports/{report_filename}",
+                report=SimpleNamespace(
+                    report_kind="session_report",
+                    report_id="session-eval:test",
+                    session_count=2,
+                    passed_count=2,
+                    failed_count=0,
+                ),
+            ),
+        )
+
+    monkeypatch.setattr("ohmo.cli.run_ohmo_session_eval", fake_run_ohmo_session_eval)
+
+    result = runner.invoke(
+        app,
+        [
+            "evals",
+            "run-session",
+            "--workspace",
+            str(workspace),
+            "--output",
+            "custom_session_report.json",
+            "--limit",
+            "2",
+            "--samples",
+            "3",
+            "--model",
+            "eval-model",
+            "--profile",
+            "eval-profile",
+            "--system-prompt",
+            "eval prompt",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert "Wrote session eval report:" in result.output
+    assert "Session eval evaluated 2 sessions: passed=2 failed=0" in result.output
+    assert calls == [
+        {
+            "workspace": workspace.resolve(),
+            "report_filename": "custom_session_report.json",
+            "limit": 2,
+            "model": "eval-model",
+            "provider_profile": "eval-profile",
+            "system_prompt": "eval prompt",
+            "samples": 3,
+            "gold_capabilities_by_session": None,
+        }
+    ]
+
+
 def test_ohmo_evals_run_command_passes_output_filename(tmp_path: Path, monkeypatch):
     runner = CliRunner()
     workspace = tmp_path / ".ohmo-home"

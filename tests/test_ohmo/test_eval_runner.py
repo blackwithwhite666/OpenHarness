@@ -4,12 +4,21 @@ from pathlib import Path
 
 import pytest
 
+from openharness.api.client import ApiMessageCompleteEvent
+from openharness.api.usage import UsageSnapshot
+from openharness.engine.messages import (
+    ConversationMessage,
+    TextBlock,
+    ToolResultBlock,
+    ToolUseBlock,
+)
 from openharness.evals import EvalEpisode, EvalEvent, promote_case_drafts
 from ohmo.evals import (
     build_ohmo_eval_pack,
     check_ohmo_eval_run_config,
     get_eval_store,
     run_ohmo_eval_report,
+    run_ohmo_session_eval,
     write_ohmo_eval_mine,
 )
 from ohmo.evals.runner import _build_agent_runner
@@ -84,6 +93,60 @@ def test_run_ohmo_eval_report_accepts_custom_report_filename(tmp_path: Path):
     )
     assert result.write.report.case_count == 1
     assert result.write.path.exists()
+
+
+def test_run_ohmo_session_eval_writes_metadata_only_report(
+    tmp_path: Path,
+    monkeypatch,
+):
+    workspace = tmp_path / "workspace"
+    store = get_eval_store(workspace)
+    _append_session_episode(
+        store,
+        episode_id="ep-1",
+        session_id="session-1",
+        user_text="private ohmo first request",
+        tool_call_id="tool-1",
+    )
+    _append_session_episode(
+        store,
+        episode_id="ep-2",
+        session_id="session-1",
+        user_text="private ohmo second request",
+        tool_call_id="tool-2",
+    )
+    api_client = _PerTurnToolModelApiClient()
+    monkeypatch.setattr(
+        "ohmo.evals.runner.resolve_api_client_from_settings",
+        lambda settings: api_client,
+    )
+    monkeypatch.setattr(
+        "ohmo.evals.runner.build_ohmo_system_prompt",
+        lambda *args, **kwargs: "REAL_OHMO_PROMPT",
+    )
+
+    result = run_ohmo_session_eval(workspace=workspace, limit=1)
+
+    assert result.write.path == workspace.resolve() / "evals" / "reports" / (
+        "session_report.json"
+    )
+    assert result.write.report.report_kind == "session_report"
+    assert result.write.report.session_count == 1
+    assert result.write.report.passed_count == 1
+    assert result.write.report.failed_count == 0
+    assert result.write.report.metadata["privacy"] == "metadata_only"
+    assert result.write.report.metadata["gold_source"] == "captured_self_coverage"
+    case = result.write.report.cases[0]
+    assert case.session_id == "session-1"
+    assert case.turn_count == 2
+    assert case.checks["capability_coverage"] is True
+
+    serialized = result.write.path.read_text(encoding="utf-8")
+    assert "private ohmo first request" not in serialized
+    assert "private ohmo second request" not in serialized
+    assert "private raw tool output" not in serialized
+    assert "private model final" not in serialized
+    assert "SECRET_CITY" not in serialized
 
 
 def test_run_ohmo_eval_report_rejects_unknown_executor(tmp_path: Path):
@@ -229,3 +292,87 @@ def test_run_ohmo_eval_report_query_engine_auth_error_is_value_error(
             workspace=tmp_path / "workspace",
             agent_runner_name="query-engine",
         )
+
+
+class _PerTurnToolModelApiClient:
+    def __init__(self) -> None:
+        self.requests = []
+        self._final_count = 0
+
+    async def stream_message(self, request):
+        self.requests.append(request)
+        last_message = request.messages[-1]
+        if any(isinstance(block, ToolResultBlock) for block in last_message.content):
+            self._final_count += 1
+            yield ApiMessageCompleteEvent(
+                message=ConversationMessage(
+                    role="assistant",
+                    content=[TextBlock(text=f"private model final {self._final_count}")],
+                ),
+                usage=UsageSnapshot(input_tokens=1, output_tokens=1),
+            )
+            return
+
+        yield ApiMessageCompleteEvent(
+            message=ConversationMessage(
+                role="assistant",
+                content=[
+                    ToolUseBlock(
+                        id=f"toolu-session-{len(self.requests)}",
+                        name="bash",
+                        input={"command": "weather-cli forecast 'SECRET_CITY'"},
+                    )
+                ],
+            ),
+            usage=UsageSnapshot(input_tokens=1, output_tokens=1),
+        )
+
+
+def _append_session_episode(
+    store,
+    *,
+    episode_id: str,
+    session_id: str,
+    user_text: str,
+    tool_call_id: str,
+) -> None:
+    store.append_episode(
+        EvalEpisode(
+            episode_id=episode_id,
+            source="gateway",
+            app="ohmo",
+            session_id=session_id,
+            user_text=user_text,
+        )
+    )
+    store.append_event(
+        EvalEvent(
+            episode_id=episode_id,
+            kind="tool_started",
+            tool_name="bash",
+            tool_call_id=tool_call_id,
+            payload={
+                "input_summary": "private tool input",
+                "input": {"command": "weather-cli forecast 'SECRET_CITY'"},
+            },
+        )
+    )
+    store.append_event(
+        EvalEvent(
+            episode_id=episode_id,
+            kind="tool_completed",
+            tool_name="bash",
+            tool_call_id=tool_call_id,
+            payload={
+                "output_summary": "private tool output",
+                "output": {"text": "private raw tool output"},
+            },
+        )
+    )
+    store.append_event(
+        EvalEvent(
+            episode_id=episode_id,
+            kind="gateway_final",
+            payload={"text": f"private captured final {episode_id}"},
+        )
+    )

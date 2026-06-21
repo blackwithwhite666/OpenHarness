@@ -7,7 +7,7 @@ import threading
 from collections.abc import Coroutine
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Protocol, TypeVar
 
 from pydantic import BaseModel, ConfigDict
 
@@ -26,6 +26,8 @@ from openharness.evals.store import EvalStore
 from openharness.permissions.checker import PermissionChecker
 from openharness.permissions.modes import PermissionMode
 from openharness.tools.base import BaseTool, ToolExecutionContext, ToolRegistry, ToolResult
+
+ResultT = TypeVar("ResultT")
 
 
 class ReplayToolInput(BaseModel):
@@ -253,14 +255,14 @@ def build_replay_tool_registry(fixtures: tuple[EvalToolFixture, ...]) -> ToolReg
 
 
 def _run_eval_coroutine(
-    coro: Coroutine[Any, Any, EvalExecutorResult],
-) -> EvalExecutorResult:
+    coro: Coroutine[Any, Any, ResultT],
+) -> ResultT:
     try:
         asyncio.get_running_loop()
     except RuntimeError:
         return asyncio.run(coro)
 
-    result: dict[str, EvalExecutorResult] = {}
+    result: dict[str, ResultT] = {}
     errors: list[BaseException] = []
 
     def run_in_thread() -> None:
