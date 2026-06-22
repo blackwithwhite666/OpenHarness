@@ -8,7 +8,9 @@ from pathlib import Path
 
 import pytest
 
-from openharness.engine.messages import ConversationMessage
+from openharness.api.client import ApiMessageCompleteEvent
+from openharness.api.usage import UsageSnapshot
+from openharness.engine.messages import ConversationMessage, TextBlock
 
 import ohmo.memory_judge as mj
 from ohmo.memory_judge import (
@@ -22,6 +24,20 @@ from ohmo.memory_judge import (
     run_memory_judge,
 )
 from ohmo.memory_store import MemoryOpResult, MemoryStore
+
+
+class _FakeCompletionClient:
+    def __init__(self, *responses: str) -> None:
+        self.responses = list(responses)
+        self.requests = []
+
+    async def stream_message(self, request):
+        self.requests.append(request)
+        text = self.responses.pop(0) if self.responses else '{"ops":[],"reason":"done"}'
+        yield ApiMessageCompleteEvent(
+            message=ConversationMessage(role="assistant", content=[TextBlock(text=text)]),
+            usage=UsageSnapshot(),
+        )
 
 
 # ----------------------------- parsing --------------------------------------
@@ -292,6 +308,113 @@ async def test_run_memory_judge_call_failure_is_best_effort(tmp_path: Path, monk
     msgs = [ConversationMessage.from_user_text("hi there friend, how are you")]
     out = await run_memory_judge(api_client=object(), model="m", messages=msgs, store=store)
     assert not out.applied and "call failed" in out.reason
+
+
+async def test_propose_consolidations_returns_consolidate_ops(tmp_path: Path):
+    store = MemoryStore(tmp_path)
+    store.add("Work prefs", "User uses UTC. User prefers concise replies.")
+    store.add("Reply prefs", "User uses UTC. User likes tables.")
+    client = _FakeCompletionClient(
+        json.dumps(
+            {
+                "ops": [
+                    {
+                        "action": "consolidate",
+                        "names": ["work_prefs.md", "reply_prefs.md"],
+                        "into": "work_prefs.md",
+                        "title": "Preferences",
+                        "content": "User uses UTC, prefers concise replies, and likes tables.",
+                    },
+                    {"action": "remove", "name": "reply_prefs.md", "reason": "duplicate"},
+                ],
+                "reason": "overlap",
+            }
+        )
+    )
+
+    ops, reason = await mj.propose_consolidations(api_client=client, model="m", store=store)
+
+    assert reason == "overlap"
+    assert len(ops) == 1
+    assert ops[0]["action"] == "consolidate"
+    assert "work_prefs.md | Work prefs" in client.requests[0].messages[-1].text
+
+
+async def test_propose_consolidations_junk_returns_no_ops(tmp_path: Path):
+    store = MemoryStore(tmp_path)
+    store.add("A", "abc")
+    client = _FakeCompletionClient("not json")
+
+    ops, reason = await mj.propose_consolidations(api_client=client, model="m", store=store)
+
+    assert ops == []
+    assert reason == "no valid consolidate ops"
+
+
+async def test_run_consolidation_pass_applies_until_empty_round(tmp_path: Path):
+    store = MemoryStore(tmp_path)
+    store.add("Work prefs", "User uses UTC. User prefers concise replies.")
+    store.add("Reply prefs", "User uses UTC. User likes tables.")
+    client = _FakeCompletionClient(
+        json.dumps(
+            {
+                "ops": [
+                    {
+                        "action": "consolidate",
+                        "names": ["work_prefs.md", "reply_prefs.md"],
+                        "into": "work_prefs.md",
+                        "title": "Preferences",
+                        "content": "User uses UTC, prefers concise replies, and likes tables.",
+                    }
+                ],
+                "reason": "overlap",
+            }
+        ),
+        '{"ops":[],"reason":"done"}',
+    )
+
+    summary = await mj.run_consolidation_pass(
+        api_client=client,
+        model="m",
+        store=store,
+        rounds=3,
+    )
+
+    assert summary["rounds_run"] == 2
+    assert summary["applied"] == ["consolidate work_prefs.md: merged 2 → 1"]
+    assert summary["freed"] > 0
+    assert summary["chars_after"] < summary["chars_before"]
+    assert store.get("reply_prefs.md") is None
+
+
+async def test_run_consolidation_pass_stops_when_guard_skips_grow_merge(tmp_path: Path):
+    store = MemoryStore(tmp_path)
+    store.add("A", "abc")
+    store.add("B", "def")
+    client = _FakeCompletionClient(
+        json.dumps(
+            {
+                "ops": [
+                    {
+                        "action": "consolidate",
+                        "names": ["a.md", "b.md"],
+                        "into": "a.md",
+                        "content": "abcdef",
+                    }
+                ],
+                "reason": "bad merge",
+            }
+        ),
+        '{"ops":[],"reason":"should not be called"}',
+    )
+
+    summary = await mj.run_consolidation_pass(api_client=client, model="m", store=store)
+
+    assert summary["rounds_run"] == 1
+    assert summary["applied"] == []
+    assert summary["skipped"] == ["consolidate: would not shrink"]
+    assert store.get("a.md").content == "abc"
+    assert store.get("b.md").content == "def"
 
 
 # ----------------------------- gating ---------------------------------------

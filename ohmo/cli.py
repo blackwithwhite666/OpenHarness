@@ -11,6 +11,7 @@ from pathlib import Path
 import typer
 
 from openharness.auth.manager import AuthManager
+from openharness.api.resolver import ApiClientResolutionError, resolve_api_client_from_settings
 from openharness.config import load_settings
 
 from ohmo.gateway.config import load_gateway_config, save_gateway_config
@@ -41,7 +42,12 @@ from ohmo.evals import (
     write_ohmo_eval_review_manifest,
 )
 from ohmo.memory import add_memory_entry, remove_memory_entry
-from ohmo.memory_judge import load_removal_proposals, save_removal_proposals
+from ohmo.memory_judge import (
+    load_removal_proposals,
+    propose_consolidations,
+    run_consolidation_pass,
+    save_removal_proposals,
+)
 from ohmo.memory_store import MemoryStore
 from ohmo.runtime import launch_ohmo_react_tui, run_ohmo_backend, run_ohmo_print_mode
 from ohmo.session_storage import OhmoSessionBackend
@@ -801,6 +807,49 @@ def _resolve_existing_memory_names(store: MemoryStore, names: list[str]) -> tupl
     return resolved, missing
 
 
+def _resolve_memory_consolidation_client(
+    *,
+    model: str | None,
+    profile: str | None,
+) -> tuple[object, str]:
+    settings = load_settings().merge_cli_overrides(
+        model=model,
+        active_profile=profile,
+    )
+    settings = settings.materialize_active_profile()
+    try:
+        api_client = resolve_api_client_from_settings(settings)
+    except (ApiClientResolutionError, SystemExit) as exc:
+        raise ValueError("memory consolidate requires configured API authentication") from exc
+    return api_client, str(settings.model)
+
+
+def _consolidation_names(op: dict) -> list[str]:
+    names = op.get("names", [])
+    if not isinstance(names, list):
+        return []
+    return [str(name).strip() for name in names if str(name or "").strip()]
+
+
+def _projected_consolidation_delta(store: MemoryStore, op: dict) -> int | None:
+    original_chars = 0
+    for name in _consolidation_names(op):
+        entry = store.get(name)
+        if entry is None:
+            return None
+        original_chars += len(entry.content)
+    merged = str(op.get("content", "") or "").strip()
+    return original_chars - len(merged)
+
+
+def _format_consolidation_delta(delta: int | None) -> str:
+    if delta is None:
+        return "projected delta unknown"
+    if delta >= 0:
+        return f"projected freed {delta} chars"
+    return f"projected growth {-delta} chars"
+
+
 @memory_app.command("list")
 def memory_list_cmd(workspace: str | None = typer.Option(None, "--workspace", help=_WORKSPACE_HELP)) -> None:
     store = MemoryStore(workspace)
@@ -917,6 +966,78 @@ def memory_prune_cmd(
         print(f"Memory entry not found: {name}", file=sys.stderr)
     if missing and not removed:
         raise typer.Exit(1)
+
+
+@memory_app.command("consolidate")
+def memory_consolidate_cmd(
+    workspace: str | None = typer.Option(None, "--workspace", help=_WORKSPACE_HELP),
+    rounds: int = typer.Option(3, "--rounds", min=1, help="Maximum consolidation rounds to run"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Print proposed merges without applying them"),
+    model: str | None = typer.Option(None, "--model", help="Model override for the consolidation judge"),
+    profile: str | None = typer.Option(None, "--profile", help="Provider profile override"),
+) -> None:
+    """Run a manual lossless memory consolidation pass."""
+    store = MemoryStore(workspace)
+    try:
+        api_client, resolved_model = _resolve_memory_consolidation_client(
+            model=model,
+            profile=profile,
+        )
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        raise typer.Exit(1)
+
+    if dry_run:
+        try:
+            ops, reason = asyncio.run(
+                propose_consolidations(
+                    api_client=api_client,
+                    model=resolved_model,
+                    store=store,
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 — keep the CLI read-only on failure
+            print(f"Consolidation dry-run failed: {exc}", file=sys.stderr)
+            raise typer.Exit(1)
+        if not ops:
+            print(f"No consolidation proposals. {reason}".rstrip())
+            return
+        print("Proposed consolidations:")
+        for op in ops:
+            names = ", ".join(_consolidation_names(op)) or "(none)"
+            into = str(op.get("into", "") or "").strip() or "(missing into)"
+            delta = _projected_consolidation_delta(store, op)
+            print(f"- {names} -> {into} ({_format_consolidation_delta(delta)})")
+        return
+
+    before = store.total_chars()
+    print(f"Memory before: {before}/{_memory_store_budget(store)} chars")
+    try:
+        summary = asyncio.run(
+            run_consolidation_pass(
+                api_client=api_client,
+                model=resolved_model,
+                store=store,
+                rounds=rounds,
+            )
+        )
+    except Exception as exc:  # noqa: BLE001 — mutations go through rollback-safe apply path
+        print(f"Consolidation failed: {exc}", file=sys.stderr)
+        raise typer.Exit(1)
+
+    applied = list(summary.get("applied", []))
+    skipped = list(summary.get("skipped", []))
+    if applied:
+        for item in applied:
+            print(f"Applied: {item}")
+    else:
+        print("No consolidations applied.")
+    for item in skipped:
+        print(f"Skipped: {item}")
+    print(
+        f"{summary.get('chars_before', before)} → {summary.get('chars_after', store.total_chars())} "
+        f"(freed {summary.get('freed', 0)} chars)"
+    )
 
 
 def _show_or_edit(path: Path, set_text: str | None) -> None:

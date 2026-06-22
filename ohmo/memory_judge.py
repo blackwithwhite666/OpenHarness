@@ -41,6 +41,7 @@ DEFAULT_JUDGE_INTERVAL = 3
 _MAX_OPS = 5  # cap ops applied per run
 _MAX_TRANSCRIPT_CHARS = 8000  # trim the conversation fed to the judge
 _MAX_MEMORY_CTX_CHARS = 4000  # trim the current-memory context fed to the judge
+_MAX_CONSOLIDATE_ENTRY_CHARS = 1200  # bound each full-store entry in manual consolidate prompts
 _JUDGE_MAX_TOKENS = 800
 _DEFAULT_TIMEOUT = 30.0
 _FALSE = {"0", "false", "no", "off"}
@@ -73,6 +74,17 @@ JUDGE_SYSTEM_PROMPT = (
     '{"action": "remove", "name": "<entry>", "reason": "why it is stale/redundant and safe to drop"}], '
     '"reason": "<short>"}\n'
     'If nothing is worth changing, respond exactly: {"ops": [], "reason": "nothing to save"}'
+)
+
+CONSOLIDATE_SYSTEM_PROMPT = (
+    "You compress an AI assistant's long-term memory WITHOUT losing facts. Given the FULL list "
+    "of memory entries (name, title, content), propose `consolidate` ops that merge genuinely "
+    "OVERLAPPING/duplicate entries into ONE shorter entry. Preserve EVERY distinct fact — only "
+    "remove redundancy. The merged content MUST be shorter than the originals combined. Only "
+    "merge clearly-related entries; when unsure, skip. Respond with ONLY JSON: "
+    '{"ops":[{"action":"consolidate","names":[...],"into":"<name>","title":"...",'
+    '"content":"<merged shorter>"}],"reason":"<short>"}. If nothing should merge: '
+    '{"ops":[],"reason":"..."}'
 )
 
 
@@ -132,6 +144,31 @@ def _render_current_memory(store: MemoryStore) -> str:
         lines.append(line)
         total += len(line)
     return "\n".join(lines)
+
+
+def _render_all_entries(store: MemoryStore) -> str:
+    entries = store.list()
+    budget = _store_budget(store)
+    lines = [
+        "# Memory budget",
+        f"{store.total_chars()}/{budget} chars",
+        "",
+        "# Full memory entries",
+        f"(Each entry content is trimmed to {_MAX_CONSOLIDATE_ENTRY_CHARS} chars in this prompt.)",
+    ]
+    if not entries:
+        lines.append("(memory is empty)")
+        return "\n".join(lines)
+
+    for entry in entries:
+        content = entry.content.strip()
+        if len(content) > _MAX_CONSOLIDATE_ENTRY_CHARS:
+            content = (
+                content[:_MAX_CONSOLIDATE_ENTRY_CHARS].rstrip()
+                + f"\n[trimmed from {len(entry.content)} chars]"
+            )
+        lines.append(f"- {entry.name} | {entry.title}\n{content}")
+    return "\n\n".join(lines)
 
 
 def _store_budget(store: MemoryStore) -> int:
@@ -378,6 +415,81 @@ async def _complete(api_client, model: str, system: str, user: str, *, timeout: 
         return text
 
     return (await asyncio.wait_for(_collect(), timeout=timeout)).strip()
+
+
+async def propose_consolidations(
+    *,
+    api_client,
+    model: str,
+    store: MemoryStore,
+    timeout: float = _DEFAULT_TIMEOUT,
+) -> tuple[list[dict], str]:
+    """Ask the model for lossless consolidate ops over the whole store.
+
+    Best-effort: failures return no ops and a short reason. The caller still
+    relies on ``apply_judge_ops`` for all validation and mutation safety.
+    """
+    user_prompt = (
+        f"{_render_all_entries(store)}\n\n"
+        "Propose only lossless consolidate ops for clearly overlapping entries. JSON only."
+    )
+    try:
+        raw = await _complete(api_client, model, CONSOLIDATE_SYSTEM_PROMPT, user_prompt, timeout=timeout)
+    except Exception as exc:  # noqa: BLE001 — manual consolidate is best-effort
+        log.warning("memory consolidation proposal failed: %s", exc)
+        return [], f"call failed: {exc}"
+    ops, reason = parse_judge_ops(raw)
+    consolidate_ops = [
+        op for op in ops if str(op.get("action", "")).strip().lower() == "consolidate"
+    ]
+    if not reason and raw:
+        reason = "no valid consolidate ops"
+    return consolidate_ops, reason
+
+
+async def run_consolidation_pass(
+    *,
+    api_client,
+    model: str,
+    store: MemoryStore,
+    rounds: int = 3,
+    max_ops: int = _MAX_OPS,
+    timeout: float = _DEFAULT_TIMEOUT,
+) -> dict:
+    """Run bounded manual consolidation rounds through the safe judge apply path."""
+    chars_before = store.total_chars()
+    applied: list[str] = []
+    skipped: list[str] = []
+    rounds_run = 0
+
+    for _ in range(max(0, rounds)):
+        ops, _reason = await propose_consolidations(
+            api_client=api_client,
+            model=model,
+            store=store,
+            timeout=timeout,
+        )
+        rounds_run += 1
+        ops = [op for op in ops if str(op.get("action", "")).strip().lower() == "consolidate"]
+        if not ops:
+            break
+
+        outcome = apply_judge_ops(store, ops, max_ops=max_ops)
+        applied.extend(outcome.applied)
+        skipped.extend(outcome.skipped)
+        round_applied = sum(1 for item in outcome.applied if item.startswith("consolidate "))
+        if round_applied == 0:
+            break
+
+    chars_after = store.total_chars()
+    return {
+        "rounds_run": rounds_run,
+        "applied": applied,
+        "skipped": skipped,
+        "chars_before": chars_before,
+        "chars_after": chars_after,
+        "freed": max(0, chars_before - chars_after),
+    }
 
 
 async def run_memory_judge(

@@ -4,9 +4,46 @@ from types import SimpleNamespace
 
 from typer.testing import CliRunner
 
+from openharness.api.client import ApiMessageCompleteEvent
+from openharness.api.usage import UsageSnapshot
+from openharness.engine.messages import ConversationMessage, TextBlock
+
 from ohmo.cli import app
 from ohmo.memory_judge import load_removal_proposals, save_removal_proposals
 from ohmo.memory_store import MemoryStore
+
+
+class _FakeSettings:
+    model = "fake-model"
+    active_profile = "fake-profile"
+
+    def merge_cli_overrides(self, *, model=None, active_profile=None):
+        settings = _FakeSettings()
+        settings.model = model or self.model
+        settings.active_profile = active_profile or self.active_profile
+        return settings
+
+    def materialize_active_profile(self):
+        return self
+
+
+class _FakeCompletionClient:
+    def __init__(self, *responses: str) -> None:
+        self.responses = list(responses)
+        self.requests = []
+
+    async def stream_message(self, request):
+        self.requests.append(request)
+        text = self.responses.pop(0) if self.responses else '{"ops":[],"reason":"done"}'
+        yield ApiMessageCompleteEvent(
+            message=ConversationMessage(role="assistant", content=[TextBlock(text=text)]),
+            usage=UsageSnapshot(),
+        )
+
+
+def _patch_memory_consolidation_client(monkeypatch, client: _FakeCompletionClient) -> None:
+    monkeypatch.setattr("ohmo.cli.load_settings", lambda: _FakeSettings())
+    monkeypatch.setattr("ohmo.cli.resolve_api_client_from_settings", lambda settings: client)
 
 
 def test_ohmo_help():
@@ -310,6 +347,80 @@ def test_ohmo_memory_prune_dismiss_keeps_entry(tmp_path: Path):
     assert "Dismissed proposals: timezone.md" in result.output
     assert store.get("timezone.md") is not None
     assert load_removal_proposals(store) == []
+
+
+def test_ohmo_memory_consolidate_dry_run_prints_without_changing_store(tmp_path: Path, monkeypatch):
+    runner = CliRunner()
+    workspace = tmp_path / ".ohmo-home"
+    store = MemoryStore(workspace)
+    store.add("Work prefs", "User uses UTC. User prefers concise replies.")
+    store.add("Reply prefs", "User uses UTC. User likes tables.")
+    before = store.total_chars()
+    client = _FakeCompletionClient(
+        json.dumps(
+            {
+                "ops": [
+                    {
+                        "action": "consolidate",
+                        "names": ["work_prefs.md", "reply_prefs.md"],
+                        "into": "work_prefs.md",
+                        "title": "Preferences",
+                        "content": "User uses UTC, prefers concise replies, and likes tables.",
+                    }
+                ],
+                "reason": "overlap",
+            }
+        )
+    )
+    _patch_memory_consolidation_client(monkeypatch, client)
+
+    result = runner.invoke(
+        app,
+        ["memory", "consolidate", "--workspace", str(workspace), "--dry-run"],
+    )
+
+    assert result.exit_code == 0
+    assert "Proposed consolidations:" in result.output
+    assert "work_prefs.md, reply_prefs.md -> work_prefs.md" in result.output
+    assert "projected freed" in result.output
+    assert store.total_chars() == before
+    assert store.get("reply_prefs.md") is not None
+
+
+def test_ohmo_memory_consolidate_apply_shrinks_store(tmp_path: Path, monkeypatch):
+    runner = CliRunner()
+    workspace = tmp_path / ".ohmo-home"
+    store = MemoryStore(workspace)
+    store.add("Work prefs", "User uses UTC. User prefers concise replies.")
+    store.add("Reply prefs", "User uses UTC. User likes tables.")
+    before = store.total_chars()
+    client = _FakeCompletionClient(
+        json.dumps(
+            {
+                "ops": [
+                    {
+                        "action": "consolidate",
+                        "names": ["work_prefs.md", "reply_prefs.md"],
+                        "into": "work_prefs.md",
+                        "title": "Preferences",
+                        "content": "User uses UTC, prefers concise replies, and likes tables.",
+                    }
+                ],
+                "reason": "overlap",
+            }
+        ),
+        '{"ops":[],"reason":"done"}',
+    )
+    _patch_memory_consolidation_client(monkeypatch, client)
+
+    result = runner.invoke(app, ["memory", "consolidate", "--workspace", str(workspace)])
+
+    assert result.exit_code == 0
+    assert "Memory before:" in result.output
+    assert "Applied: consolidate work_prefs.md: merged 2 → 1" in result.output
+    assert "freed " in result.output
+    assert store.total_chars() < before
+    assert store.get("reply_prefs.md") is None
 
 
 def test_ohmo_evals_embed_command_runs_embedding_index(tmp_path: Path, monkeypatch):
