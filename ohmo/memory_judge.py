@@ -44,6 +44,9 @@ _MAX_MEMORY_CTX_CHARS = 4000  # trim the current-memory context fed to the judge
 _MAX_CONSOLIDATE_ENTRY_CHARS = 1200  # bound each full-store entry in manual consolidate prompts
 _JUDGE_MAX_TOKENS = 800
 _DEFAULT_TIMEOUT = 30.0
+# Consolidation prompts pack the WHOLE store (tens of KB) and ask the model to
+# author several merges, so they need far more headroom than the per-turn judge.
+CONSOLIDATE_TIMEOUT = 180.0
 _FALSE = {"0", "false", "no", "off"}
 REMOVAL_PROPOSALS_FILENAME = "removal_proposals.json"
 
@@ -422,7 +425,7 @@ async def propose_consolidations(
     api_client,
     model: str,
     store: MemoryStore,
-    timeout: float = _DEFAULT_TIMEOUT,
+    timeout: float = CONSOLIDATE_TIMEOUT,
 ) -> tuple[list[dict], str]:
     """Ask the model for lossless consolidate ops over the whole store.
 
@@ -454,7 +457,7 @@ async def run_consolidation_pass(
     store: MemoryStore,
     rounds: int = 3,
     max_ops: int = _MAX_OPS,
-    timeout: float = _DEFAULT_TIMEOUT,
+    timeout: float = CONSOLIDATE_TIMEOUT,
 ) -> dict:
     """Run bounded manual consolidation rounds through the safe judge apply path."""
     chars_before = store.total_chars()
