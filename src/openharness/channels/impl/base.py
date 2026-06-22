@@ -31,6 +31,29 @@ def resolve_channel_media_dir(channel_name: str) -> Path:
     return media_dir
 
 
+def resolve_channel_state_dir(channel_name: str, kind: str) -> Path:
+    """Return a local directory for small persisted channel state (not media).
+
+    Mirrors :func:`resolve_channel_media_dir` but roots state under the workspace
+    itself (e.g. ``~/.ohmo/live_location/telegram``) rather than the attachments
+    download dir, since this is bot state rather than user-supplied files.
+    """
+    custom_root = os.environ.get("OPENHARNESS_CHANNEL_STATE_DIR")
+    if custom_root:
+        root = Path(custom_root).expanduser().resolve() / kind
+    else:
+        ohmo_workspace = os.environ.get("OHMO_WORKSPACE")
+        if ohmo_workspace:
+            from ohmo.workspace import get_workspace_root
+
+            root = get_workspace_root(ohmo_workspace) / kind
+        else:
+            root = get_data_dir() / kind
+    state_dir = root / channel_name
+    state_dir.mkdir(parents=True, exist_ok=True)
+    return state_dir
+
+
 class BaseChannel(ABC):
     """
     Abstract base class for chat channel implementations.
