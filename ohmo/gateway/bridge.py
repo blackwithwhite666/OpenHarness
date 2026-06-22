@@ -36,7 +36,9 @@ def _content_snippet(text: str, *, limit: int = 160) -> str:
 _ATTACH_RE = re.compile(r"\[\[\s*attach\s*:\s*([^\]]+?)\s*\]\]", re.IGNORECASE)
 
 
-def _extract_attachments(text: str) -> tuple[str, list[str]]:
+def _extract_attachments(
+    text: str, base_dir: str | os.PathLike | None = None
+) -> tuple[str, list[str]]:
     """Pull ``[[attach: <path>]]`` markers out of an agent reply.
 
     Returns ``(text_without_markers, [existing_file_paths])``. The agent writes a
@@ -45,6 +47,12 @@ def _extract_attachments(text: str) -> tuple[str, list[str]]:
     message (``OutboundMessage.media`` → Telegram ``send_document``). Only paths
     that resolve to an existing readable file are attached; every marker is
     stripped from the text regardless (so a typo'd path never leaks raw).
+
+    A **relative** path resolves against ``base_dir`` — the session's cwd (its
+    per-chat work dir) — so the agent can attach a file it just wrote with a plain
+    ``[[attach: report.html]]`` instead of spelling out an absolute path. Absolute
+    and ``~`` paths are used as-is. Without ``base_dir`` a relative path resolves
+    against the process cwd (legacy behavior).
     """
     if not text or "[[" not in text:
         return text, []
@@ -53,6 +61,8 @@ def _extract_attachments(text: str) -> tuple[str, list[str]]:
     for match in _ATTACH_RE.finditer(text):
         raw = match.group(1).strip().strip("'\"")
         path = os.path.expanduser(raw)
+        if base_dir and not os.path.isabs(path):
+            path = os.path.join(str(base_dir), path)
         if path and path not in seen and os.path.isfile(path):
             seen.add(path)
             paths.append(path)
@@ -571,7 +581,12 @@ class OhmoGatewayBridge:
                 session_key,
             )
             return
-        content, media = _extract_attachments(reply)
+        # Resolve a relative [[attach:]] path against the session's cwd (its
+        # per-chat work dir) so the agent can attach a file it wrote with a plain
+        # name. getattr keeps the bridge resilient to pool stubs lacking session_cwd.
+        cwd_fn = getattr(self._runtime_pool, "session_cwd", None)
+        base_dir = cwd_fn(message, session_key) if callable(cwd_fn) else None
+        content, media = _extract_attachments(reply, base_dir=base_dir)
         content, question, options = _extract_ask(content)
         if options:
             # Show the question above the buttons (the visible text may already

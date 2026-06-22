@@ -3079,6 +3079,24 @@ def test_extract_attachments_passthrough_without_markers():
     assert media == []
 
 
+def test_extract_attachments_resolves_relative_against_base_dir(tmp_path):
+    from ohmo.gateway.bridge import _extract_attachments
+
+    (tmp_path / "diagram.html").write_text("<html></html>")
+    # a relative path resolves against base_dir (the session cwd / per-chat work dir)
+    clean, media = _extract_attachments("Готово.\n[[attach: diagram.html]]", base_dir=tmp_path)
+    assert media == [str(tmp_path / "diagram.html")]
+    assert "[[attach" not in clean
+    # without base_dir a relative path is NOT found (resolves against process cwd)
+    _clean2, media2 = _extract_attachments("[[attach: diagram.html]]")
+    assert media2 == []
+    # an absolute path is unaffected by base_dir
+    _clean3, media3 = _extract_attachments(
+        f"[[attach: {tmp_path / 'diagram.html'}]]", base_dir="/nonexistent"
+    )
+    assert media3 == [str(tmp_path / "diagram.html")]
+
+
 def test_extract_attachments_dedupes_same_file(tmp_path):
     from ohmo.gateway.bridge import _extract_attachments
 

@@ -12,20 +12,20 @@ metadata:
 > browser, so the "Open in browser" / `open` / `xdg-open` step below does **not** apply. Adapt
 > delivery and tooling as follows:
 >
-> - **Deliver by attaching the file to Telegram.** Write the HTML to a **temp dir**:
->   `mkdir -p /tmp/ve` then save as `/tmp/ve/<name>.html`. Do **NOT** use `~/.agent/diagrams/` —
->   the file is transient (its only job is to be attached this turn), and `/tmp` is auto-cleaned,
->   so nothing accumulates in `$HOME`.
-> - **⚠️ Put the `[[attach: …]]` marker in your FINAL message** — the last thing you send, with
->   an **absolute** path: `[[attach: /tmp/ve/<name>.html]]`. The gateway extracts `[[attach: …]]`
->   **only from the final reply**. A marker in mid-turn narration / a "сейчас приложу" progress
->   line is shown to the user as **plain text and the file is NOT sent**. So: finish all work,
->   then end with a short final message that carries the marker. The user opens the HTML in their
->   own browser (CDN libs — Mermaid, Chart.js, fonts — load there). Mention the path too.
-> - **Optional inline preview.** To also show the result in-chat, render the file to an image
->   with the **`browser`** skill — open the `file:///tmp/ve/<name>.html` URL, give CDN-based
->   Mermaid/Chart.js a moment to render, take a screenshot, and `[[attach: /tmp/ve-preview.png]]`
->   it alongside the HTML — again, both markers in the **final** message.
+> - **Deliver by attaching the file to Telegram.** Write the HTML into your **current working
+>   directory** — just save as `<name>.html` (a plain relative path; no `mkdir`, no `/tmp`, NOT
+>   `~/.agent/diagrams/`). Your cwd is a private per-chat scratch dir that is auto-cleaned on
+>   `/new`, so nothing accumulates.
+> - **⚠️ Put the `[[attach: …]]` marker in your FINAL message** — the last thing you send:
+>   `[[attach: <name>.html]]` (a relative path is fine — the gateway resolves it against your
+>   cwd). The gateway extracts `[[attach: …]]` **only from the final reply**: a marker in mid-turn
+>   narration / a "сейчас приложу" progress line is shown as **plain text and the file is NOT
+>   sent**. So finish all work, then end with a short final message that carries the marker. The
+>   user opens the HTML in their own browser (CDN libs — Mermaid, Chart.js, fonts — load there).
+> - **Optional inline preview.** To also show it in-chat, render to an image with the **`browser`**
+>   skill — open `file://$PWD/<name>.html` (the browser needs an absolute URL; `$PWD` expands to
+>   your cwd), let CDN Mermaid/Chart.js render, screenshot to `ve-preview.png`, and
+>   `[[attach: ve-preview.png]]` it alongside — again, both markers in the **final** message.
 > - **AI images: `surf-cli` is NOT installed.** Use the **`falai`** skill instead
 >   (`falai-cli image "<prompt>" --save /tmp` → base64-embed or attach), or skip images — the
 >   page must stand on its own with CSS + typography (degrade gracefully).

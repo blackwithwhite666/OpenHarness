@@ -954,6 +954,12 @@ class OhmoSessionRuntimePool:
             return str(get_session_work_dir(session_key, self._workspace))
         return normalized
 
+    def session_cwd(self, message: InboundMessage, session_key: str) -> str:
+        """The cwd a session runs in — its per-chat work dir, or a /group-bound
+        chat's bound project cwd. Public wrapper so the bridge can resolve a
+        relative ``[[attach: …]]`` path against the same dir the agent wrote into."""
+        return self._cwd_for_message(message, session_key)
+
     def _register_gateway_tools(self, bundle: RuntimeBundle) -> None:
         self._unregister_group_tool(bundle)
         self._register_todo_tool(bundle)
