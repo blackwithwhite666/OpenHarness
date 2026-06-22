@@ -13,6 +13,7 @@ import pytest
 
 from openharness.channels.bus.queue import MessageBus
 from openharness.channels.impl.telegram import (
+    _ALLOWED_UPDATES,
     TelegramChannel,
     _format_live_current,
     _format_live_started,
@@ -37,6 +38,14 @@ def _loc(lat=59.93, lon=30.31, live_period=None, heading=None, accuracy=None):
         horizontal_accuracy=accuracy,
         proximity_alert_radius=None,
     )
+
+
+def test_polling_subscribes_to_edited_message():
+    # Live-location movement arrives as edited_message; without it in
+    # allowed_updates Telegram never delivers live updates.
+    assert "edited_message" in _ALLOWED_UPDATES
+    assert "message" in _ALLOWED_UPDATES
+    assert "callback_query" in _ALLOWED_UPDATES
 
 
 def test_format_static_location_includes_coords_and_accuracy():

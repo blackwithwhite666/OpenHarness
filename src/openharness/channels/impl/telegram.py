@@ -44,6 +44,11 @@ _TABLE_ROW_RE = re.compile(r"^\s*\|(.+)\|\s*$")
 
 _REPLY_QUOTE_MAX = 500  # cap the quoted antecedent inlined into the agent prompt
 
+# Update types we ask Telegram to deliver. "edited_message" is load-bearing for
+# LIVE location: movement arrives as message *edits*, so dropping it silently
+# disables live-location tracking even with the right handler/filters in place.
+_ALLOWED_UPDATES = ["message", "edited_message", "callback_query"]
+
 
 def _reply_context(reply) -> tuple[str, dict]:
     """Build an inline quote prefix + metadata from a replied-to message.
@@ -401,9 +406,11 @@ class TelegramChannel(BaseChannel):
         except Exception as e:
             logger.warning("Failed to register bot commands: %s", e)
 
-        # Start polling (this runs until stopped)
+        # Start polling (this runs until stopped). "edited_message" is required
+        # for Telegram LIVE location: movement arrives as edits, not new messages,
+        # so omitting it means live-location updates are never delivered.
         await self._app.updater.start_polling(
-            allowed_updates=["message", "callback_query"],
+            allowed_updates=_ALLOWED_UPDATES,
             drop_pending_updates=True  # Ignore old messages on startup
         )
 
