@@ -656,6 +656,68 @@ def _execute_case_sampled(
     )
 
 
+def _session_conversation_history(
+    store: EvalStore,
+    episode: EvalEpisode,
+    *,
+    max_messages: int = 16,
+    max_chars: int = 12000,
+) -> tuple[tuple[str, str], ...]:
+    if not episode.session_id or max_messages <= 0 or max_chars <= 0:
+        return ()
+
+    indexed_episode_ids = list(enumerate(store.list_episode_ids()))
+    target_order = next(
+        (
+            index
+            for index, episode_id in indexed_episode_ids
+            if episode_id == episode.episode_id
+        ),
+        len(indexed_episode_ids),
+    )
+    target_position = (episode.created_at, target_order)
+    prior: list[tuple[int, EvalEpisode]] = []
+    for index, episode_id in indexed_episode_ids:
+        if episode_id == episode.episode_id:
+            continue
+        candidate = store.get_episode(episode_id)
+        if candidate is None:
+            continue
+        if candidate.session_id != episode.session_id or candidate.app != episode.app:
+            continue
+        if (candidate.created_at, index) >= target_position:
+            continue
+        prior.append((index, candidate))
+
+    messages: list[tuple[str, str]] = []
+    for _, prior_episode in sorted(prior, key=lambda item: (item[1].created_at, item[0])):
+        user_text = prior_episode.user_text
+        if user_text.strip():
+            messages.append(("user", user_text))
+        assistant_text = _episode_gateway_final_text(store, prior_episode.episode_id)
+        if assistant_text.strip():
+            messages.append(("assistant", assistant_text))
+
+    kept = messages[-max_messages:]
+    while kept and sum(len(text) for _, text in kept) > max_chars:
+        kept = kept[1:]
+    return tuple(kept)
+
+
+def _episode_gateway_final_text(store: EvalStore, episode_id: str) -> str:
+    text = ""
+    for event in store.iter_events(episode_id):
+        if event.kind != "gateway_final":
+            continue
+        event_text = _payload_text(
+            event.payload,
+            ("text", "assistant_final", "output", "final"),
+        )
+        if event_text:
+            text = event_text
+    return text
+
+
 def _execute_case(
     store: EvalStore,
     pack: EvalRunPack,
@@ -713,6 +775,7 @@ def _execute_case(
             executor_name=executor.name,
         )
 
+    conversation_history = _session_conversation_history(store, episode)
     execution_context = EvalExecutionContext(
         store=store,
         pack=pack,
@@ -728,6 +791,7 @@ def _execute_case(
             ("assistant_final", "gateway_error", "tool_output"),
         ),
         resource_snapshot_status=resource_snapshot_status,
+        conversation_history=conversation_history,
     )
 
     try:

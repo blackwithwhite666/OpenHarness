@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -34,6 +35,9 @@ from openharness.evals import (
     write_case_draft_pack,
     write_run_pack,
 )
+from openharness.evals.execution import _session_conversation_history
+from openharness.evals.executor import _run_query_engine_replay
+from openharness.tools.base import ToolRegistry
 
 
 def test_replay_report_reconstructs_metadata_context_without_private_text(tmp_path: Path):
@@ -335,6 +339,171 @@ def test_execution_report_query_engine_runner_uses_reconstructed_prompt_and_repl
     assert "private model prompt" not in serialized
     assert "private raw tool output" not in serialized
     assert "model final from replayed tool" not in serialized
+
+
+def test_session_conversation_history_reconstructs_prior_same_session_turns(
+    tmp_path: Path,
+):
+    store = EvalStore(tmp_path / "evals")
+    base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    _add_session_episode(
+        store,
+        episode_id="ep-1",
+        session_id="session-1",
+        app="ohmo",
+        created_at=base,
+        user_text="first user",
+        final_text="first assistant",
+    )
+    _add_session_episode(
+        store,
+        episode_id="ep-other-session",
+        session_id="session-2",
+        app="ohmo",
+        created_at=base + timedelta(seconds=1),
+        user_text="excluded user",
+        final_text="excluded assistant",
+    )
+    _add_session_episode(
+        store,
+        episode_id="ep-other-app",
+        session_id="session-1",
+        app="other",
+        created_at=base + timedelta(seconds=2),
+        user_text="excluded app user",
+        final_text="excluded app assistant",
+    )
+    _add_session_episode(
+        store,
+        episode_id="ep-2",
+        session_id="session-1",
+        app="ohmo",
+        created_at=base + timedelta(seconds=3),
+        user_text="second user",
+        final_text="second assistant",
+    )
+    _add_session_episode(
+        store,
+        episode_id="ep-3",
+        session_id="session-1",
+        app="ohmo",
+        created_at=base + timedelta(seconds=4),
+        user_text="current user",
+        final_text="current assistant",
+    )
+
+    first = store.get_episode("ep-1")
+    current = store.get_episode("ep-3")
+
+    assert first is not None
+    assert current is not None
+    assert _session_conversation_history(store, first) == ()
+    assert _session_conversation_history(store, current) == (
+        ("user", "first user"),
+        ("assistant", "first assistant"),
+        ("user", "second user"),
+        ("assistant", "second assistant"),
+    )
+
+
+def test_session_conversation_history_caps_to_recent_messages_and_chars(
+    tmp_path: Path,
+):
+    store = EvalStore(tmp_path / "evals")
+    base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    for index in range(6):
+        _add_session_episode(
+            store,
+            episode_id=f"ep-{index}",
+            session_id="session-1",
+            app="ohmo",
+            created_at=base + timedelta(seconds=index),
+            user_text=f"user-{index}",
+            final_text=f"assistant-{index}",
+        )
+    _add_session_episode(
+        store,
+        episode_id="ep-target",
+        session_id="session-1",
+        app="ohmo",
+        created_at=base + timedelta(seconds=6),
+        user_text="target user",
+        final_text="target assistant",
+    )
+    target = store.get_episode("ep-target")
+
+    assert target is not None
+    assert _session_conversation_history(store, target, max_messages=4) == (
+        ("user", "user-4"),
+        ("assistant", "assistant-4"),
+        ("user", "user-5"),
+        ("assistant", "assistant-5"),
+    )
+    assert _session_conversation_history(
+        store,
+        target,
+        max_messages=20,
+        max_chars=len("user-5") + len("assistant-5"),
+    ) == (
+        ("user", "user-5"),
+        ("assistant", "assistant-5"),
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_query_engine_replay_seeds_conversation_history(tmp_path: Path):
+    api_client = _FinalOnlyModelApiClient(final_text="seeded final")
+    context = _query_replay_context(
+        tmp_path,
+        conversation_history=(
+            ("user", "prior user"),
+            ("assistant", "prior assistant"),
+        ),
+    )
+
+    result = await _run_query_engine_replay(
+        api_client=api_client,
+        model="eval-model",
+        system_prompt="eval system",
+        cwd=tmp_path,
+        max_turns=1,
+        max_tokens=128,
+        prompt="current turn",
+        tool_registry=ToolRegistry(),
+        context=context,
+    )
+
+    assert api_client.message_snapshots[0][:3] == [
+        ("user", "prior user"),
+        ("assistant", "prior assistant"),
+        ("user", "current turn"),
+    ]
+    assert result.final_text == "seeded final"
+    assert result.metadata["seeded_history_message_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_run_query_engine_replay_empty_history_submits_only_prompt(
+    tmp_path: Path,
+):
+    api_client = _FinalOnlyModelApiClient(final_text="plain final")
+    context = _query_replay_context(tmp_path, conversation_history=())
+
+    result = await _run_query_engine_replay(
+        api_client=api_client,
+        model="eval-model",
+        system_prompt="eval system",
+        cwd=tmp_path,
+        max_turns=1,
+        max_tokens=128,
+        prompt="current turn",
+        tool_registry=ToolRegistry(),
+        context=context,
+    )
+
+    assert api_client.message_snapshots[0][0] == ("user", "current turn")
+    assert result.final_text == "plain final"
+    assert result.metadata["seeded_history_message_count"] == 0
 
 
 def test_query_engine_capability_oracle_gates_command_regression(tmp_path: Path):
@@ -1197,6 +1366,24 @@ class _RecordingReplayApiClient:
         )
 
 
+class _FinalOnlyModelApiClient:
+    def __init__(self, *, final_text: str) -> None:
+        self._final_text = final_text
+        self.message_snapshots = []
+
+    async def stream_message(self, request):
+        self.message_snapshots.append(
+            [(message.role, message.text) for message in request.messages]
+        )
+        yield ApiMessageCompleteEvent(
+            message=ConversationMessage(
+                role="assistant",
+                content=[TextBlock(text=self._final_text)],
+            ),
+            usage=UsageSnapshot(input_tokens=1, output_tokens=1),
+        )
+
+
 class _ScriptedBashModelApiClient:
     """Fake model: first calls ``bash`` with a fixed command, then answers.
 
@@ -1257,6 +1444,76 @@ class _LoopingBashModelApiClient:
             ),
             usage=UsageSnapshot(input_tokens=1, output_tokens=1),
         )
+
+
+def _query_replay_context(
+    tmp_path: Path,
+    *,
+    conversation_history: tuple[tuple[str, str], ...],
+) -> EvalExecutionContext:
+    store = EvalStore(tmp_path / "evals")
+    case = EvalRunPackCase(
+        gold_case_id="gold-1",
+        case_id="case-1",
+        episode_id="ep-1",
+        case_kind="unit",
+        rubric=["Answer the user."],
+    )
+    pack = EvalRunPack(
+        pack_id="pack-1",
+        source_records_path="cases/gold_cases.jsonl",
+        cases=[case],
+    )
+    episode = EvalEpisode(
+        episode_id="ep-1",
+        source="gateway",
+        app="ohmo",
+        session_id="session-1",
+        user_text="current turn",
+    )
+    return EvalExecutionContext(
+        store=store,
+        pack=pack,
+        case=case,
+        episode=episode,
+        events=(),
+        input_facets=(),
+        expected_facets=(),
+        tool_fixtures=(),
+        primary_prompt="current turn",
+        expected_final_text="expected final",
+        resource_snapshot_status="absent",
+        conversation_history=conversation_history,
+    )
+
+
+def _add_session_episode(
+    store: EvalStore,
+    *,
+    episode_id: str,
+    session_id: str,
+    app: str,
+    created_at: datetime,
+    user_text: str,
+    final_text: str,
+) -> None:
+    store.append_episode(
+        EvalEpisode(
+            episode_id=episode_id,
+            source="gateway",
+            app=app,
+            session_id=session_id,
+            created_at=created_at,
+            user_text=user_text,
+        )
+    )
+    store.append_event(
+        EvalEvent(
+            episode_id=episode_id,
+            kind="gateway_final",
+            payload={"text": final_text},
+        )
+    )
 
 
 def _add_episode(

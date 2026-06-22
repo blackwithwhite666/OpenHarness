@@ -15,6 +15,7 @@ from pydantic import BaseModel, ConfigDict
 
 from openharness.api.client import SupportsStreamingMessages
 from openharness.config.settings import PermissionSettings
+from openharness.engine.messages import ConversationMessage, TextBlock
 from openharness.engine.query import MaxTurnsExceeded
 from openharness.engine.query_engine import QueryEngine
 from openharness.engine.stream_events import (
@@ -87,6 +88,7 @@ class EvalExecutionContext:
     expected_final_text: str
     resource_snapshot_status: str
     scratch_dir: Path | None = None
+    conversation_history: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -527,6 +529,14 @@ async def _run_query_engine_replay(
         max_turns=max_turns,
         max_tokens=max_tokens,
     )
+    conversation_history = getattr(context, "conversation_history", ())
+    if conversation_history:
+        engine.load_messages(
+            [
+                _conversation_history_message(role, text)
+                for role, text in conversation_history
+            ]
+        )
     tool_path: list[str] = []
     observed_calls: list[dict[str, Any]] = []
     calls_by_id: dict[str, dict[str, Any]] = {}
@@ -567,6 +577,7 @@ async def _run_query_engine_replay(
         "agent_runner": QueryEngineEvalAgentRunner.name,
         "engine_message_count": len(engine.messages),
         "source_event_count": len(context.events),
+        "seeded_history_message_count": len(conversation_history),
     }
     if max_turns_exceeded:
         metadata["max_turns_exceeded"] = True
@@ -577,3 +588,11 @@ async def _run_query_engine_replay(
         tool_calls=tuple(EvalObservedCall(**entry) for entry in observed_calls),
         metadata=metadata,
     )
+
+
+def _conversation_history_message(role: str, text: str) -> ConversationMessage:
+    if role == "user":
+        return ConversationMessage.from_user_text(text)
+    if role == "assistant":
+        return ConversationMessage(role="assistant", content=[TextBlock(text=text)])
+    raise ValueError(f"unsupported conversation history role: {role}")
