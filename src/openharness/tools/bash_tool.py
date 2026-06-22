@@ -14,6 +14,12 @@ from openharness.utils.shell import create_shell_subprocess
 
 
 _READ_REMAINING_OUTPUT_TIMEOUT_SECONDS = 2.0
+_RESOURCE_KILL_OUTPUT_MARKERS: tuple[str, ...] = (
+    "Session terminated, killing",
+    "Out of memory",
+    "oom-kill",
+    "Killed process",
+)
 
 
 class BashToolInput(BaseModel):
@@ -78,7 +84,7 @@ class BashTool(BaseTool):
 
         output_buffer = await _read_remaining_output(process)
         text = _format_output(output_buffer)
-        if getattr(process, "_oh_scope_unit", None) is not None and process.returncode in (137, -9):
+        if _looks_resource_killed(process, text):
             # Accurate detection would read the scope's cgroup memory.events oom_kill,
             # but the transient scope is gone by then, so this is a best-effort heuristic.
             text += (
@@ -90,6 +96,17 @@ class BashTool(BaseTool):
             is_error=process.returncode != 0,
             metadata={"returncode": process.returncode},
         )
+
+
+def _looks_resource_killed(process: asyncio.subprocess.Process, text: str) -> bool:
+    if getattr(process, "_oh_scope_unit", None) is None:
+        return False
+    returncode = process.returncode
+    return (
+        returncode in (137, -9)
+        or (returncode is not None and returncode < 0)
+        or any(marker in text for marker in _RESOURCE_KILL_OUTPUT_MARKERS)
+    )
 
 
 async def _terminate_process(process: asyncio.subprocess.Process, *, force: bool) -> None:

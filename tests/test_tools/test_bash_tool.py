@@ -250,6 +250,30 @@ async def test_bash_tool_terminates_resource_scope_on_timeout(monkeypatch, tmp_p
 
 
 @pytest.mark.asyncio
+async def test_bash_tool_adds_resource_limit_hint_for_scope_returncode_137(monkeypatch, tmp_path: Path):
+    process = _FakeProcess(
+        stdout=_FakeStdout([b"before kill\n", b""]),
+        returncode=137,
+    )
+    process._oh_scope_unit = "oh-task-test.scope"
+
+    async def fake_create_shell_subprocess(*args, **kwargs):
+        return process
+
+    monkeypatch.setitem(BashTool.execute.__globals__, "create_shell_subprocess", fake_create_shell_subprocess)
+
+    result = await BashTool().execute(
+        BashToolInput(command="python alloc.py"),
+        ToolExecutionContext(cwd=tmp_path),
+    )
+
+    assert result.is_error is True
+    assert result.metadata["returncode"] == 137
+    assert "before kill" in result.output
+    assert "likely exceeded the per-task memory limit" in result.output
+
+
+@pytest.mark.asyncio
 async def test_bash_tool_adds_resource_limit_hint_for_killed_process(monkeypatch, tmp_path: Path):
     process = _FakeProcess(
         stdout=_FakeStdout([b"before kill\n", b""]),
@@ -271,3 +295,80 @@ async def test_bash_tool_adds_resource_limit_hint_for_killed_process(monkeypatch
     assert result.metadata["returncode"] == -9
     assert "before kill" in result.output
     assert "likely exceeded the per-task memory limit" in result.output
+
+
+@pytest.mark.asyncio
+async def test_bash_tool_adds_resource_limit_hint_for_scope_kill_output_marker(monkeypatch, tmp_path: Path):
+    process = _FakeProcess(
+        stdout=_FakeStdout([b"Session terminated, killing shell\n", b""]),
+        returncode=0,
+    )
+    process._oh_scope_unit = "oh-task-test.scope"
+
+    async def fake_create_shell_subprocess(*args, **kwargs):
+        return process
+
+    monkeypatch.setitem(BashTool.execute.__globals__, "create_shell_subprocess", fake_create_shell_subprocess)
+
+    result = await BashTool().execute(
+        BashToolInput(command="python alloc.py"),
+        ToolExecutionContext(cwd=tmp_path),
+    )
+
+    assert result.is_error is False
+    assert result.metadata["returncode"] == 0
+    assert "Session terminated, killing shell" in result.output
+    assert "likely exceeded the per-task memory limit" in result.output
+
+
+@pytest.mark.asyncio
+async def test_bash_tool_does_not_add_resource_limit_hint_for_scope_with_benign_output(
+    monkeypatch,
+    tmp_path: Path,
+):
+    process = _FakeProcess(
+        stdout=_FakeStdout([b"hello\n", b""]),
+        returncode=0,
+    )
+    process._oh_scope_unit = "oh-task-test.scope"
+
+    async def fake_create_shell_subprocess(*args, **kwargs):
+        return process
+
+    monkeypatch.setitem(BashTool.execute.__globals__, "create_shell_subprocess", fake_create_shell_subprocess)
+
+    result = await BashTool().execute(
+        BashToolInput(command="printf hello"),
+        ToolExecutionContext(cwd=tmp_path),
+    )
+
+    assert result.is_error is False
+    assert result.metadata["returncode"] == 0
+    assert result.output == "hello"
+    assert "likely exceeded the per-task memory limit" not in result.output
+
+
+@pytest.mark.asyncio
+async def test_bash_tool_does_not_add_resource_limit_hint_without_scope_for_killed_output(
+    monkeypatch,
+    tmp_path: Path,
+):
+    process = _FakeProcess(
+        stdout=_FakeStdout([b"Killed process 1234\n", b""]),
+        returncode=0,
+    )
+
+    async def fake_create_shell_subprocess(*args, **kwargs):
+        return process
+
+    monkeypatch.setitem(BashTool.execute.__globals__, "create_shell_subprocess", fake_create_shell_subprocess)
+
+    result = await BashTool().execute(
+        BashToolInput(command="printf killed"),
+        ToolExecutionContext(cwd=tmp_path),
+    )
+
+    assert result.is_error is False
+    assert result.metadata["returncode"] == 0
+    assert result.output == "Killed process 1234"
+    assert "likely exceeded the per-task memory limit" not in result.output
