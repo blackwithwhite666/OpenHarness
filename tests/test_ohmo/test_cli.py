@@ -5,6 +5,8 @@ from types import SimpleNamespace
 from typer.testing import CliRunner
 
 from ohmo.cli import app
+from ohmo.memory_judge import load_removal_proposals, save_removal_proposals
+from ohmo.memory_store import MemoryStore
 
 
 def test_ohmo_help():
@@ -221,6 +223,93 @@ def test_ohmo_config_keeps_existing_channel_when_not_reconfigured(tmp_path: Path
     assert updated["enabled_channels"] == ["feishu"]
     assert updated["channel_configs"]["feishu"]["app_id"] == "old_app"
     assert updated["channel_configs"]["feishu"]["app_secret"] == "old_secret"
+
+
+def test_ohmo_memory_list_outputs_sizes_and_budget(tmp_path: Path):
+    runner = CliRunner()
+    workspace = tmp_path / ".ohmo-home"
+    store = MemoryStore(workspace)
+    store.add("Timezone", "UTC")
+
+    result = runner.invoke(app, ["memory", "list", "--workspace", str(workspace)])
+
+    assert result.exit_code == 0
+    assert "name | title | size" in result.output
+    assert "timezone.md | Timezone | 3" in result.output
+    assert "total: 3/24000" in result.output
+
+
+def test_ohmo_memory_proposals_and_prune_apply(tmp_path: Path):
+    runner = CliRunner()
+    workspace = tmp_path / ".ohmo-home"
+    store = MemoryStore(workspace)
+    store.add("Timezone", "UTC")
+    store.add("Style", "Concise")
+    save_removal_proposals(
+        store,
+        [
+            {"name": "timezone.md", "reason": "duplicated"},
+            {"name": "missing.md", "reason": "stale"},
+        ],
+    )
+
+    proposals = runner.invoke(app, ["memory", "proposals", "--workspace", str(workspace)])
+    assert proposals.exit_code == 0
+    assert "timezone.md | duplicated | 3" in proposals.output
+    assert "missing.md" not in proposals.output
+
+    result = runner.invoke(
+        app,
+        ["memory", "prune", "--workspace", str(workspace), "--apply", "timezone.md"],
+    )
+
+    assert result.exit_code == 0
+    assert "Removed timezone.md (3 chars)" in result.output
+    assert "Freed 3 chars." in result.output
+    assert store.get("timezone.md") is None
+    assert store.get("style.md") is not None
+    assert load_removal_proposals(store) == []
+
+
+def test_ohmo_memory_prune_all_proposed(tmp_path: Path):
+    runner = CliRunner()
+    workspace = tmp_path / ".ohmo-home"
+    store = MemoryStore(workspace)
+    store.add("A", "aaa")
+    store.add("B", "bbb")
+    save_removal_proposals(
+        store,
+        [
+            {"name": "a.md", "reason": "stale"},
+            {"name": "b.md", "reason": "stale"},
+        ],
+    )
+
+    result = runner.invoke(app, ["memory", "prune", "--workspace", str(workspace), "--all-proposed"])
+
+    assert result.exit_code == 0
+    assert "Removed a.md (3 chars)" in result.output
+    assert "Removed b.md (3 chars)" in result.output
+    assert store.list() == []
+    assert load_removal_proposals(store) == []
+
+
+def test_ohmo_memory_prune_dismiss_keeps_entry(tmp_path: Path):
+    runner = CliRunner()
+    workspace = tmp_path / ".ohmo-home"
+    store = MemoryStore(workspace)
+    store.add("Timezone", "UTC")
+    save_removal_proposals(store, [{"name": "timezone.md", "reason": "duplicated"}])
+
+    result = runner.invoke(
+        app,
+        ["memory", "prune", "--workspace", str(workspace), "--dismiss", "timezone.md"],
+    )
+
+    assert result.exit_code == 0
+    assert "Dismissed proposals: timezone.md" in result.output
+    assert store.get("timezone.md") is not None
+    assert load_removal_proposals(store) == []
 
 
 def test_ohmo_evals_embed_command_runs_embedding_index(tmp_path: Path, monkeypatch):

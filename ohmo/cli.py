@@ -40,7 +40,9 @@ from ohmo.evals import (
     write_ohmo_eval_mine,
     write_ohmo_eval_review_manifest,
 )
-from ohmo.memory import add_memory_entry, list_memory_files, remove_memory_entry
+from ohmo.memory import add_memory_entry, remove_memory_entry
+from ohmo.memory_judge import load_removal_proposals, save_removal_proposals
+from ohmo.memory_store import MemoryStore
 from ohmo.runtime import launch_ohmo_react_tui, run_ohmo_backend, run_ohmo_print_mode
 from ohmo.session_storage import OhmoSessionBackend
 from ohmo.workspace import (
@@ -775,10 +777,37 @@ def doctor_cmd(
     print("\n".join(lines))
 
 
+def _memory_store_budget(store: MemoryStore) -> int:
+    return int(getattr(store, "_store_char_budget", 0) or 0)
+
+
+def _parse_memory_names(raw: str) -> list[str]:
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
+def _resolve_existing_memory_names(store: MemoryStore, names: list[str]) -> tuple[list[str], list[str]]:
+    resolved: list[str] = []
+    missing: list[str] = []
+    seen: set[str] = set()
+    for name in names:
+        entry = store.get(name)
+        if entry is None:
+            missing.append(name)
+            continue
+        if entry.name in seen:
+            continue
+        seen.add(entry.name)
+        resolved.append(entry.name)
+    return resolved, missing
+
+
 @memory_app.command("list")
 def memory_list_cmd(workspace: str | None = typer.Option(None, "--workspace", help=_WORKSPACE_HELP)) -> None:
-    for path in list_memory_files(workspace):
-        print(path.name)
+    store = MemoryStore(workspace)
+    print("name | title | size")
+    for entry in store.list():
+        print(f"{entry.name} | {entry.title} | {len(entry.content)}")
+    print(f"total: {store.total_chars()}/{_memory_store_budget(store)}")
 
 
 @memory_app.command("add")
@@ -805,6 +834,89 @@ def memory_remove_cmd(
         return
     print(f"Memory entry not found: {name}", file=sys.stderr)
     raise typer.Exit(1)
+
+
+@memory_app.command("proposals")
+def memory_proposals_cmd(workspace: str | None = typer.Option(None, "--workspace", help=_WORKSPACE_HELP)) -> None:
+    store = MemoryStore(workspace)
+    proposals = load_removal_proposals(store)
+    if not proposals:
+        print("No pending removal proposals.")
+        return
+    entries = {entry.name: entry for entry in store.list()}
+    print("name | reason | size")
+    for proposal in proposals:
+        entry = entries.get(str(proposal["name"]))
+        if entry is None:
+            continue
+        print(f"{entry.name} | {proposal.get('reason', '')} | {len(entry.content)}")
+
+
+@memory_app.command("prune")
+def memory_prune_cmd(
+    workspace: str | None = typer.Option(None, "--workspace", help=_WORKSPACE_HELP),
+    apply_names: str | None = typer.Option(None, "--apply", help="Comma-separated memory entries to remove"),
+    all_proposed: bool = typer.Option(False, "--all-proposed", help="Remove every pending proposal"),
+    dismiss_names: str | None = typer.Option(None, "--dismiss", help="Comma-separated proposals to dismiss"),
+) -> None:
+    mode_count = sum([apply_names is not None, all_proposed, dismiss_names is not None])
+    if mode_count != 1:
+        raise typer.BadParameter("Choose exactly one of --apply, --all-proposed, or --dismiss.")
+
+    store = MemoryStore(workspace)
+    proposals = load_removal_proposals(store)
+
+    if dismiss_names is not None:
+        names = _parse_memory_names(dismiss_names)
+        if not names:
+            raise typer.BadParameter("--dismiss requires at least one name.")
+        resolved, _ = _resolve_existing_memory_names(store, names)
+        targets = set(resolved) | {name for name in names if name in {p["name"] for p in proposals}}
+        remaining = [proposal for proposal in proposals if proposal["name"] not in targets]
+        save_removal_proposals(store, remaining)
+        print(f"Dismissed proposals: {', '.join(sorted(targets)) if targets else '(none)'}")
+        return
+
+    if all_proposed:
+        target_names = [str(proposal["name"]) for proposal in proposals]
+        missing: list[str] = []
+    else:
+        names = _parse_memory_names(apply_names or "")
+        if not names:
+            raise typer.BadParameter("--apply requires at least one name.")
+        target_names, missing = _resolve_existing_memory_names(store, names)
+
+    if not target_names and not missing:
+        print("No pending removal proposals.")
+        return
+
+    removed: list[tuple[str, int]] = []
+    for name in target_names:
+        entry = store.get(name)
+        if entry is None:
+            missing.append(name)
+            continue
+        size = len(entry.content)
+        result = store.remove(entry.name)
+        if result.ok:
+            removed.append((entry.name, size))
+        else:
+            missing.append(entry.name)
+
+    removed_names = {name for name, _ in removed}
+    save_removal_proposals(
+        store,
+        [proposal for proposal in proposals if proposal["name"] not in removed_names],
+    )
+
+    for name, size in removed:
+        print(f"Removed {name} ({size} chars)")
+    if removed:
+        print(f"Freed {sum(size for _, size in removed)} chars.")
+    for name in missing:
+        print(f"Memory entry not found: {name}", file=sys.stderr)
+    if missing and not removed:
+        raise typer.Exit(1)
 
 
 def _show_or_edit(path: Path, set_text: str | None) -> None:

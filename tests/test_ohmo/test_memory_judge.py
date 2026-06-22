@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import json
 from pathlib import Path
 
 import pytest
@@ -15,10 +16,12 @@ from ohmo.memory_judge import (
     apply_judge_ops,
     judge_enabled,
     judge_interval,
+    load_removal_proposals,
     parse_judge_ops,
+    removal_proposals_path,
     run_memory_judge,
 )
-from ohmo.memory_store import MemoryStore
+from ohmo.memory_store import MemoryOpResult, MemoryStore
 
 
 # ----------------------------- parsing --------------------------------------
@@ -56,14 +59,134 @@ def test_apply_add_then_update(tmp_path: Path):
     assert store.get("tz").content == "MSK"
 
 
-def test_apply_remove_is_not_auto_applied(tmp_path: Path):
+def test_apply_remove_is_proposed_not_auto_applied(tmp_path: Path):
     # The judge must not autonomously delete memory — removal is human-only.
     store = MemoryStore(tmp_path)
     store.add("tz", "UTC")
-    out = apply_judge_ops(store, [{"action": "remove", "name": "tz"}])
+    out = apply_judge_ops(store, [{"action": "remove", "name": "tz", "reason": "duplicate"}])
     assert not out.applied
-    assert out.skipped and "not auto-applied" in out.skipped[0]
+    assert out.proposed_removals == [{"name": "tz", "reason": "duplicate"}]
     assert store.get("tz") is not None  # still there
+
+
+def test_apply_consolidate_happy_path(tmp_path: Path):
+    store = MemoryStore(tmp_path)
+    store.add("Work prefs", "User uses UTC. User prefers concise replies.")
+    store.add("Reply prefs", "User uses UTC. User likes tables.")
+    before = store.total_chars()
+
+    out = apply_judge_ops(
+        store,
+        [
+            {
+                "action": "consolidate",
+                "names": ["work_prefs.md", "reply_prefs.md"],
+                "into": "work_prefs.md",
+                "title": "Preferences",
+                "content": "User uses UTC, prefers concise replies, and likes tables.",
+            }
+        ],
+    )
+
+    assert out.applied == ["consolidate work_prefs.md: merged 2 → 1"]
+    assert store.get("work_prefs.md").title == "Preferences"
+    assert store.get("work_prefs.md").content == "User uses UTC, prefers concise replies, and likes tables."
+    assert store.get("reply_prefs.md") is None
+    assert store.total_chars() < before
+
+
+def test_apply_consolidate_lossless_guard_requires_shrink(tmp_path: Path):
+    store = MemoryStore(tmp_path)
+    store.add("A", "abc")
+    store.add("B", "def")
+
+    out = apply_judge_ops(
+        store,
+        [
+            {
+                "action": "consolidate",
+                "names": ["a.md", "b.md"],
+                "into": "a.md",
+                "content": "abcdef",
+            }
+        ],
+    )
+
+    assert out.skipped == ["consolidate: would not shrink"]
+    assert store.get("a.md").content == "abc"
+    assert store.get("b.md").content == "def"
+
+
+@pytest.mark.parametrize(
+    "op",
+    [
+        {"action": "consolidate", "names": ["a.md"], "into": "a.md", "content": "ab"},
+        {"action": "consolidate", "names": ["a.md", "missing.md"], "into": "a.md", "content": "ab"},
+        {"action": "consolidate", "names": ["a.md", "b.md"], "into": "c.md", "content": "ab"},
+    ],
+)
+def test_apply_consolidate_validation_skips_untouched(tmp_path: Path, op: dict):
+    store = MemoryStore(tmp_path)
+    store.add("A", "abc")
+    store.add("B", "def")
+
+    out = apply_judge_ops(store, [op])
+
+    assert out.skipped
+    assert store.get("a.md").content == "abc"
+    assert store.get("b.md").content == "def"
+
+
+def test_apply_consolidate_rollback_restores_removed_entries(tmp_path: Path, monkeypatch):
+    store = MemoryStore(tmp_path)
+    store.add("A", "abc")
+    store.add("B", "abc plus def")
+    original_update = store.update
+
+    def fail_merged_update(name: str, content: str, *, title: str | None = None):
+        if content == "abc def":
+            return MemoryOpResult(False, "forced failure")
+        return original_update(name, content, title=title)
+
+    monkeypatch.setattr(store, "update", fail_merged_update)
+
+    out = apply_judge_ops(
+        store,
+        [
+            {
+                "action": "consolidate",
+                "names": ["a.md", "b.md"],
+                "into": "a.md",
+                "content": "abc def",
+            }
+        ],
+    )
+
+    assert out.skipped == ["consolidate a.md: forced failure"]
+    assert store.get("a.md").content == "abc"
+    assert store.get("b.md").content == "abc plus def"
+
+
+def test_apply_consolidate_remove_first_avoids_transient_overflow(tmp_path: Path):
+    store = MemoryStore(tmp_path, store_char_budget=30)
+    store.add("A", "a" * 20)
+    store.add("B", "b" * 10)
+
+    out = apply_judge_ops(
+        store,
+        [
+            {
+                "action": "consolidate",
+                "names": ["a.md", "b.md"],
+                "into": "a.md",
+                "content": "a" * 15 + "b" * 10,
+            }
+        ],
+    )
+
+    assert out.applied == ["consolidate a.md: merged 2 → 1"]
+    assert store.get("b.md") is None
+    assert store.total_chars() == 25
 
 
 def test_apply_unknown_action_skipped(tmp_path: Path):
@@ -98,6 +221,52 @@ async def test_run_memory_judge_applies(tmp_path: Path, monkeypatch):
     msgs = [ConversationMessage.from_user_text("I always use UTC, remember that")]
     out = await run_memory_judge(api_client=object(), model="m", messages=msgs, store=store)
     assert out.applied and store.get("timezone").content == "User prefers UTC."
+
+
+async def test_run_memory_judge_persists_removal_proposals(tmp_path: Path, monkeypatch):
+    store = MemoryStore(tmp_path)
+    store.add("Timezone", "UTC")
+    store.add("Legacy", "Old duplicated fact")
+    proposal_path = removal_proposals_path(store)
+    proposal_path.parent.mkdir(parents=True, exist_ok=True)
+    proposal_path.write_text(
+        json.dumps(
+            [
+                {"name": "legacy.md", "reason": "old reason"},
+                {"name": "missing.md", "reason": "stale"},
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    seen: dict[str, str] = {}
+
+    async def fake_complete(api_client, model, system, user, **kwargs):
+        seen["user"] = user
+        return (
+            '{"ops":['
+            '{"action":"remove","name":"legacy.md","reason":"new reason"},'
+            '{"action":"remove","name":"timezone","reason":"redundant"}'
+            '],"reason":"cleanup"}'
+        )
+
+    monkeypatch.setattr(mj, "_complete", fake_complete)
+    msgs = [ConversationMessage.from_user_text("That old duplicated fact is stale")]
+
+    out = await run_memory_judge(api_client=object(), model="m", messages=msgs, store=store)
+
+    assert out.proposed_removals == [
+        {"name": "legacy.md", "reason": "new reason"},
+        {"name": "timezone", "reason": "redundant"},
+    ]
+    assert store.get("legacy.md") is not None
+    assert store.get("timezone.md") is not None
+    assert load_removal_proposals(store) == [
+        {"name": "legacy.md", "reason": "new reason"},
+        {"name": "timezone.md", "reason": "redundant"},
+    ]
+    assert "missing.md" not in proposal_path.read_text(encoding="utf-8")
+    assert "# Memory budget\n" in seen["user"]
 
 
 async def test_run_memory_judge_empty_transcript_makes_no_call(tmp_path: Path, monkeypatch):
