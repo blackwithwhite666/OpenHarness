@@ -742,6 +742,11 @@ def test_build_live_read_runner_config_uses_query_engine_settings(
     assert config.system_prompt == "REAL_OHMO_PROMPT"
     assert config.cwd == tmp_path
     assert config.replay_tools_only is False
+    assert config.agent_runner._live_typed_read_tool_names == (
+        "read_file",
+        "glob",
+        "grep",
+    )
 
 
 def test_run_ohmo_eval_report_query_engine_auth_error_is_value_error(

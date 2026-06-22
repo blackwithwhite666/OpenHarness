@@ -22,6 +22,7 @@ from openharness.evals import (
     build_replay_tool_registry,
     classify_bash_command,
 )
+from openharness.evals.workspace_materialize import LiveLocalReadTool
 from openharness.tools.base import BaseTool, ToolExecutionContext, ToolRegistry, ToolResult
 
 
@@ -241,6 +242,49 @@ def test_live_read_agent_runner_overrides_google_search_mcp_and_closes(
     assert managers[0].closed is True
 
 
+def test_live_read_agent_runner_wraps_typed_read_tools_and_cleans_temp_cwd(
+    tmp_path: Path,
+):
+    api_client = _LiveReadFileModelApiClient()
+    runner = LiveReadAgentRunner(
+        api_client=api_client,
+        model="eval-model",
+        system_prompt="eval system",
+        cwd=tmp_path,
+        live_typed_read_tool_names=("read_file",),
+    )
+    read_fixture = EvalToolFixture(
+        tool_name="read_file",
+        call_key_hash="fixture-read",
+        input_text='{"path": "/home/u/a.md", "offset": 0, "limit": 20}',
+        output_text="CAPTURED_CONTENT",
+    )
+    write_fixture = EvalToolFixture(
+        tool_name="write_file",
+        call_key_hash="fixture-write",
+        input_text='{"path": "/home/u/a.md", "content": "MUTATION"}',
+        output_text="WRITE_REPLAY",
+    )
+    registry = build_replay_tool_registry((read_fixture, write_fixture))
+
+    result = runner.run(
+        prompt="private live file read request",
+        tool_registry=registry,
+        context=SimpleNamespace(events=(), tool_fixtures=(read_fixture, write_fixture)),
+    )
+
+    read_tool = registry.get("read_file")
+    write_tool = registry.get("write_file")
+    assert isinstance(read_tool, LiveLocalReadTool)
+    assert not isinstance(write_tool, LiveLocalReadTool)
+    assert read_tool._sandbox.exists() is False
+    assert result.final_text == "final saw live local read"
+    assert result.tool_path == ("read_file",)
+    assert result.metadata["agent_runner"] == "query-engine-live-read"
+    assert result.metadata["live_local_read_tools"] == ["read_file"]
+    assert result.metadata["materialized_file_count"] == 1
+
+
 def test_live_read_agent_runner_keeps_replay_google_search_when_mcp_connect_fails(
     tmp_path: Path,
     monkeypatch,
@@ -379,6 +423,44 @@ class _LiveReadModelApiClient:
             message=ConversationMessage(
                 role="assistant",
                 content=[TextBlock(text="final saw LIVE_RESULT")],
+            ),
+            usage=UsageSnapshot(input_tokens=1, output_tokens=1),
+        )
+
+
+class _LiveReadFileModelApiClient:
+    def __init__(self) -> None:
+        self.requests = []
+
+    async def stream_message(self, request):
+        self.requests.append(request)
+        if len(self.requests) == 1:
+            yield ApiMessageCompleteEvent(
+                message=ConversationMessage(
+                    role="assistant",
+                    content=[
+                        ToolUseBlock(
+                            id="toolu-live-file",
+                            name="read_file",
+                            input={"path": "/home/u/a.md", "offset": 0, "limit": 20},
+                        )
+                    ],
+                ),
+                usage=UsageSnapshot(input_tokens=1, output_tokens=1),
+            )
+            return
+
+        tool_results = [
+            block
+            for message in request.messages
+            for block in message.content
+            if isinstance(block, ToolResultBlock)
+        ]
+        assert any("\tCAPTURED_CONTENT" in block.content for block in tool_results)
+        yield ApiMessageCompleteEvent(
+            message=ConversationMessage(
+                role="assistant",
+                content=[TextBlock(text="final saw live local read")],
             ),
             usage=UsageSnapshot(input_tokens=1, output_tokens=1),
         )

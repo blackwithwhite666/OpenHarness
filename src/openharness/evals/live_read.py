@@ -28,6 +28,10 @@ from openharness.evals.executor import (
     _run_query_engine_replay,
 )
 from openharness.evals.tool_labels import _binary_of, _command_segments
+from openharness.evals.workspace_materialize import (
+    LiveLocalReadTool,
+    materialize_read_fixtures,
+)
 from openharness.mcp.client import McpClientManager
 from openharness.mcp.config import load_mcp_server_configs
 from openharness.tools import create_default_tool_registry
@@ -176,6 +180,7 @@ class LiveReadAgentRunner:
         allowlist: Collection[str] = READ_LIVE_BASH_ALLOWLIST,
         timeout: float = 120.0,
         live_mcp_server_names: tuple[str, ...] = (),
+        live_typed_read_tool_names: tuple[str, ...] = (),
     ) -> None:
         self._api_client = api_client
         self._model = model
@@ -186,6 +191,7 @@ class LiveReadAgentRunner:
         self._allowlist = frozenset(allowlist)
         self._timeout = timeout
         self._live_mcp_server_names = tuple(live_mcp_server_names)
+        self._live_typed_read_tool_names = tuple(live_typed_read_tool_names)
 
     def run(
         self,
@@ -199,6 +205,9 @@ class LiveReadAgentRunner:
                 tempfile.mkdtemp(prefix="openharness-eval-live-read-")
             ).resolve()
             mcp: McpClientManager | None = None
+            mcp_connected = False
+            real_registry: ToolRegistry | None = None
+            materialized_file_count = 0
             try:
                 if self._live_mcp_server_names:
                     try:
@@ -212,6 +221,7 @@ class LiveReadAgentRunner:
                         if cfg:
                             mcp = McpClientManager(cfg)
                             await mcp.connect_all()
+                            mcp_connected = True
                             real_registry = create_default_tool_registry(mcp)
                             for tool in real_registry.list_tools():
                                 if tool.name.startswith("mcp__"):
@@ -220,6 +230,43 @@ class LiveReadAgentRunner:
                         logger.warning(
                             "live-read MCP connect failed; %s stays replay",
                             self._live_mcp_server_names,
+                            exc_info=True,
+                        )
+
+                if self._live_typed_read_tool_names:
+                    try:
+                        materialize_sandbox = live_cwd / "_ws"
+                        materialize_sandbox.mkdir(parents=True, exist_ok=True)
+                        materialized_file_count = materialize_read_fixtures(
+                            getattr(context, "tool_fixtures", ()),
+                            materialize_sandbox,
+                        )
+                        if real_registry is None:
+                            real_registry = create_default_tool_registry(
+                                mcp if mcp_connected else None
+                            )
+                        wrappers: list[LiveLocalReadTool] = []
+                        for name in self._live_typed_read_tool_names:
+                            real_tool = real_registry.get(name)
+                            if real_tool is None:
+                                continue
+                            mock_tool = tool_registry.get(name) or ReplayFixtureTool(
+                                tool_name=name,
+                                fixtures=(),
+                            )
+                            wrappers.append(
+                                LiveLocalReadTool(
+                                    real_tool=real_tool,
+                                    mock_tool=mock_tool,
+                                    sandbox=materialize_sandbox,
+                                )
+                            )
+                        for wrapper in wrappers:
+                            tool_registry.register(wrapper)
+                    except Exception:
+                        logger.warning(
+                            "live-read local typed tool setup failed; %s stays replay",
+                            self._live_typed_read_tool_names,
                             exc_info=True,
                         )
 
@@ -255,6 +302,8 @@ class LiveReadAgentRunner:
                         **result.metadata,
                         "agent_runner": self.name,
                         "live_mcp_servers": list(self._live_mcp_server_names),
+                        "live_local_read_tools": list(self._live_typed_read_tool_names),
+                        "materialized_file_count": materialized_file_count,
                     },
                 )
             finally:

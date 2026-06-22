@@ -531,6 +531,7 @@ def _build_agent_runner_config(
                 system_prompt=resolved_prompt,
                 cwd=workspace,
                 live_mcp_server_names=("google_search",),
+                live_typed_read_tool_names=("read_file", "glob", "grep"),
             ),
             agent_runner_name="query-engine-live-read",
             model=settings.model,
