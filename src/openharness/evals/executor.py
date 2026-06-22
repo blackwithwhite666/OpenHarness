@@ -60,6 +60,14 @@ class EvalToolFixture:
 
 
 @dataclass(frozen=True)
+class SynthContext:
+    """Auxiliary LLM context for synthesized replay fixture codegen."""
+
+    api_client: SupportsStreamingMessages
+    model: str
+
+
+@dataclass(frozen=True)
 class EvalExecutionContext:
     """Transient context passed to eval executors.
 
@@ -140,10 +148,12 @@ class ReplayToolsExecutor:
         *,
         agent_runner: EvalAgentRunner | None = None,
         match_mode: str = "order",
+        synth_context: SynthContext | None = None,
     ) -> None:
         _validate_replay_match_mode(match_mode)
         self._agent_runner = agent_runner or ReplayScriptAgentRunner()
         self._match_mode = match_mode
+        self._synth_context = synth_context
 
     @property
     def fixture_match_mode(self) -> str:
@@ -155,6 +165,7 @@ class ReplayToolsExecutor:
             tool_registry=build_replay_tool_registry(
                 context.tool_fixtures,
                 match_mode=self._match_mode,
+                synth_context=self._synth_context,
             ),
             context=context,
         )
@@ -365,27 +376,47 @@ def build_replay_tool_registry(
     fixtures: tuple[EvalToolFixture, ...],
     *,
     match_mode: str = "order",
+    synth_context: SynthContext | None = None,
 ) -> ToolRegistry:
     """Build a replay-only registry from captured tool fixtures."""
     _validate_replay_match_mode(match_mode)
+    if match_mode == "synth" and synth_context is None:
+        raise ValueError("synth fixture match requires a SynthContext")
     registry = ToolRegistry()
     by_name: dict[str, list[EvalToolFixture]] = {}
     for fixture in fixtures:
         by_name.setdefault(fixture.tool_name, []).append(fixture)
     for tool_name, tool_fixtures in by_name.items():
-        registry.register(
-            ReplayFixtureTool(
-                tool_name=tool_name,
-                fixtures=tuple(tool_fixtures),
-                match_mode=match_mode,
+        fixtures_tuple = tuple(tool_fixtures)
+        if match_mode == "synth":
+            assert synth_context is not None
+            from openharness.evals.synth_fixture import (  # noqa: PLC0415
+                SynthesizedFixtureTool,
             )
-        )
+
+            registry.register(
+                SynthesizedFixtureTool(
+                    tool_name=tool_name,
+                    fixtures=fixtures_tuple,
+                    api_client=synth_context.api_client,
+                    model=synth_context.model,
+                    fallback_match_mode="order",
+                )
+            )
+        else:
+            registry.register(
+                ReplayFixtureTool(
+                    tool_name=tool_name,
+                    fixtures=fixtures_tuple,
+                    match_mode=match_mode,
+                )
+            )
     return registry
 
 
 def _validate_replay_match_mode(match_mode: str) -> None:
-    if match_mode not in {"order", "arguments"}:
-        raise ValueError("fixture match mode must be one of: order, arguments")
+    if match_mode not in {"order", "arguments", "synth"}:
+        raise ValueError("fixture match mode must be one of: order, arguments, synth")
 
 
 def _run_eval_coroutine(

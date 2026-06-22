@@ -24,6 +24,7 @@ from ohmo.gateway.service import (
 from ohmo.evals import (
     SUPPORTED_EVAL_AGENT_RUNNER_NAMES,
     SUPPORTED_EVAL_EXECUTOR_NAMES,
+    SUPPORTED_FIXTURE_MATCH_MODES,
     build_ohmo_eval_pack,
     check_ohmo_eval_run_config,
     compare_ohmo_eval_reports,
@@ -84,7 +85,9 @@ _EVAL_AGENT_RUNNER_HELP = (
     "Agent runner to use inside the executor: "
     + ", ".join(SUPPORTED_EVAL_AGENT_RUNNER_NAMES)
 )
-_FIXTURE_MATCH_HELP = "Replay fixture matching mode: order or arguments"
+_FIXTURE_MATCH_HELP = (
+    "Replay fixture matching mode: " + ", ".join(SUPPORTED_FIXTURE_MATCH_MODES)
+)
 
 
 def _print_json_summary(payload: dict[str, object]) -> None:
@@ -1328,6 +1331,16 @@ def evals_run_cmd(
         "--judge-model",
         help="Model override for --scorer trajectory_judge_v1",
     ),
+    synth_profile: str | None = typer.Option(
+        None,
+        "--synth-profile",
+        help="Provider profile override for --fixture-match synth",
+    ),
+    synth_model: str | None = typer.Option(
+        None,
+        "--synth-model",
+        help="Model override for --fixture-match synth",
+    ),
     fixture_match: str = typer.Option(
         "order",
         "--fixture-match",
@@ -1413,6 +1426,10 @@ def evals_run_cmd(
             run_kwargs["judge_profile"] = judge_profile
         if judge_model is not None:
             run_kwargs["judge_model"] = judge_model
+        if synth_profile is not None:
+            run_kwargs["synth_profile"] = synth_profile
+        if synth_model is not None:
+            run_kwargs["synth_model"] = synth_model
         result = run_ohmo_eval_report(**run_kwargs)
     except (FileNotFoundError, ValueError) as exc:
         print(str(exc), file=sys.stderr)

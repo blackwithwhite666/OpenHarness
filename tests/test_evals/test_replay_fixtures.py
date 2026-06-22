@@ -9,8 +9,11 @@ from openharness.evals import (
     EvalToolFixture,
     ReplayFixtureTool,
     ReplayToolInput,
+    SynthContext,
+    SynthesizedFixtureTool,
     build_replay_tool_registry,
 )
+from openharness.evals.executor import _validate_replay_match_mode
 from openharness.evals.execution import _fixture_input_key, _tool_fixtures
 from openharness.tools.base import ToolExecutionContext
 
@@ -171,6 +174,28 @@ async def test_build_replay_tool_registry_wires_arguments_mode(tmp_path: Path):
 
     assert result.output == "second"
     assert result.metadata["match"] == "arguments"
+
+
+def test_build_replay_tool_registry_synth_requires_context():
+    with pytest.raises(ValueError, match="requires a SynthContext"):
+        build_replay_tool_registry(
+            (_fixture("bash", "first", {"command": "first command"}),),
+            match_mode="synth",
+        )
+
+
+def test_build_replay_tool_registry_wires_synth_mode():
+    registry = build_replay_tool_registry(
+        (_fixture("bash", "first", {"command": "first command"}),),
+        match_mode="synth",
+        synth_context=SynthContext(api_client=object(), model="codegen-model"),
+    )
+
+    assert isinstance(registry.get("bash"), SynthesizedFixtureTool)
+
+
+def test_validate_replay_match_mode_accepts_synth():
+    _validate_replay_match_mode("synth")
 
 
 def _fixture(

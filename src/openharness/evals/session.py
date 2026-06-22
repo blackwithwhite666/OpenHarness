@@ -20,6 +20,7 @@ from openharness.engine.stream_events import (
 from openharness.evals.execution import _INCIDENTAL_CAPABILITIES, _tool_fixtures
 from openharness.evals.executor import (
     EvalToolFixture,
+    SynthContext,
     _run_eval_coroutine,
     build_replay_tool_registry,
 )
@@ -122,9 +123,12 @@ class SessionReplayRunner:
         max_tokens: int = 4096,
         max_session_turns: int | None = None,
         fixture_match_mode: str = "order",
+        synth_context: SynthContext | None = None,
     ) -> None:
-        if fixture_match_mode not in {"order", "arguments"}:
-            raise ValueError("fixture match mode must be one of: order, arguments")
+        if fixture_match_mode not in {"order", "arguments", "synth"}:
+            raise ValueError("fixture match mode must be one of: order, arguments, synth")
+        if fixture_match_mode == "synth" and synth_context is None:
+            raise ValueError("synth fixture match requires a SynthContext")
         self._api_client = api_client
         self._model = model
         self._system_prompt = system_prompt
@@ -133,6 +137,7 @@ class SessionReplayRunner:
         self._max_tokens = max_tokens
         self._max_session_turns = max_session_turns
         self._fixture_match_mode = fixture_match_mode
+        self._synth_context = synth_context
 
     @property
     def fixture_match_mode(self) -> str:
@@ -189,6 +194,7 @@ class SessionReplayRunner:
             tool_registry=build_replay_tool_registry(
                 tuple(fixtures),
                 match_mode=self._fixture_match_mode,
+                synth_context=self._synth_context,
             ),
             permission_checker=PermissionChecker(
                 PermissionSettings(mode=PermissionMode.FULL_AUTO)

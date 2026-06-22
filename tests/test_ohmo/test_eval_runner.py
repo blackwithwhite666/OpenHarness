@@ -16,6 +16,7 @@ from openharness.evals import (
     EvalEpisode,
     EvalEvent,
     LiveReadAgentRunner,
+    SynthContext,
     promote_case_drafts,
 )
 from openharness.evals import (
@@ -380,6 +381,137 @@ def test_check_ohmo_eval_run_config_validates_pack_without_running(tmp_path: Pat
     assert result.provider_profile == ""
     assert result.replay_tools_only is True
     assert not (workspace / "evals" / "reports" / "eval_report.json").exists()
+
+
+def test_check_ohmo_eval_run_config_accepts_synth_without_client(tmp_path: Path):
+    workspace = tmp_path / "workspace"
+    store = get_eval_store(workspace)
+    store.append_episode(
+        EvalEpisode(
+            episode_id="ep-1",
+            source="gateway",
+            app="ohmo",
+            session_id="session-1",
+            user_text="private ohmo eval request",
+        )
+    )
+    store.append_event(
+        EvalEvent(
+            episode_id="ep-1",
+            kind="gateway_final",
+            payload={"text": "private ohmo eval answer"},
+        )
+    )
+    write_ohmo_eval_mine(workspace=workspace)
+    promote_case_drafts(store)
+    build_ohmo_eval_pack(workspace=workspace)
+
+    result = check_ohmo_eval_run_config(
+        workspace=workspace,
+        limit=1,
+        fixture_match="synth",
+    )
+
+    assert result.executor_name == "replay-tools"
+    assert result.agent_runner_name == "scripted"
+    assert result.selected_case_count == 1
+
+
+def test_build_executor_threads_synth_context():
+    synth_context = SynthContext(api_client=object(), model="codegen-model")
+
+    executor = runner_module._build_executor(
+        "replay-tools",
+        agent_runner=runner_module.ReplayScriptAgentRunner(),
+        fixture_match="synth",
+        synth_context=synth_context,
+    )
+
+    assert executor.fixture_match_mode == "synth"
+    assert executor._synth_context is synth_context
+
+
+def test_run_ohmo_eval_report_synth_builds_codegen_context(
+    tmp_path: Path,
+    monkeypatch,
+):
+    workspace = tmp_path / "workspace"
+    store = get_eval_store(workspace)
+    _append_session_episode(
+        store,
+        episode_id="ep-synth",
+        session_id="session-synth",
+        user_text="private synth request",
+        tool_call_id="tool-synth",
+    )
+    write_ohmo_eval_mine(workspace=workspace)
+    promote_case_drafts(store)
+    build_ohmo_eval_pack(workspace=workspace)
+    api_client = _StaticTextApiClient(
+        """
+def respond(arguments, captured):
+    return captured[0]["output"]
+""".strip()
+    )
+    config_calls: list[dict[str, object]] = []
+
+    def fake_build_agent_runner_config(
+        agent_runner_name,
+        *,
+        workspace,
+        model,
+        provider_profile,
+        system_prompt,
+    ):
+        config_calls.append(
+            {
+                "agent_runner_name": agent_runner_name,
+                "model": model,
+                "provider_profile": provider_profile,
+                "system_prompt": system_prompt,
+            }
+        )
+        if agent_runner_name == "query-engine":
+            return runner_module._AgentRunnerConfig(
+                agent_runner=runner_module.ReplayScriptAgentRunner(),
+                agent_runner_name="query-engine",
+                model=model or "resolved-synth-model",
+                provider_profile=provider_profile or "resolved-synth-profile",
+                api_client=api_client,
+                system_prompt="",
+                cwd=workspace,
+            )
+        return runner_module._AgentRunnerConfig(
+            agent_runner=runner_module.ReplayScriptAgentRunner(),
+            agent_runner_name="scripted",
+            model="",
+            provider_profile="",
+        )
+
+    monkeypatch.setattr(
+        runner_module,
+        "_build_agent_runner_config",
+        fake_build_agent_runner_config,
+    )
+
+    result = run_ohmo_eval_report(
+        workspace=workspace,
+        limit=1,
+        fixture_match="synth",
+        synth_profile="synth-profile",
+        synth_model="synth-model",
+    )
+
+    assert config_calls[0] == {
+        "agent_runner_name": "query-engine",
+        "model": "synth-model",
+        "provider_profile": "synth-profile",
+        "system_prompt": None,
+    }
+    assert result.write.report.metadata["fixture_match"] == "synth"
+    assert result.write.report.metadata["synth_model"] == "synth-model"
+    assert result.write.report.metadata["synth_provider_profile"] == "synth-profile"
+    assert len(api_client.requests) == 1
 
 
 def test_run_ohmo_eval_report_sandbox_scores_reminder_state_outcome(

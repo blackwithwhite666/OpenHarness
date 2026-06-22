@@ -27,6 +27,7 @@ from openharness.evals import (
     ReplayToolsExecutor,
     SandboxMutatingAgentRunner,
     SessionReplayRunner,
+    SynthContext,
     TrajectoryJudgeScorer,
     UserSimulator,
     gold_capabilities_for_session,
@@ -114,7 +115,7 @@ SUPPORTED_EVAL_AGENT_RUNNER_NAMES = (
     "query-engine-live-read",
     "sandbox",
 )
-SUPPORTED_FIXTURE_MATCH_MODES = ("order", "arguments")
+SUPPORTED_FIXTURE_MATCH_MODES = ("order", "arguments", "synth")
 _SUPPORTED_EXECUTORS = {
     "replay-tools": ReplayToolsExecutor,
     "replay_tools": ReplayToolsExecutor,
@@ -142,6 +143,8 @@ def run_ohmo_eval_report(
     scorer: str | None = None,
     judge_profile: str | None = None,
     judge_model: str | None = None,
+    synth_profile: str | None = None,
+    synth_model: str | None = None,
     samples: int = 1,
     fixture_match: str = "order",
 ) -> OhmoEvalRunResult:
@@ -152,6 +155,8 @@ def run_ohmo_eval_report(
     workspace_root = Path(workspace).expanduser().resolve() if workspace else None
     selected_scorer = None
     judge_config: _AgentRunnerConfig | None = None
+    synth_config: _AgentRunnerConfig | None = None
+    synth_context: SynthContext | None = None
     if scorer == TrajectoryJudgeScorer.name:
         judge_config = _build_agent_runner_config(
             "query-engine",
@@ -168,6 +173,20 @@ def run_ohmo_eval_report(
         )
     elif scorer:
         selected_scorer = resolve_execution_scorer(scorer)
+    if fixture_match == "synth":
+        synth_config = _build_agent_runner_config(
+            "query-engine",
+            workspace=workspace_root,
+            model=synth_model or model,
+            provider_profile=synth_profile or provider_profile,
+            system_prompt=None,
+        )
+        if synth_config.api_client is None:
+            raise ValueError("synth fixture match requires configured API authentication")
+        synth_context = SynthContext(
+            api_client=synth_config.api_client,
+            model=synth_config.model,
+        )
     agent_runner_config = _build_agent_runner_config(
         agent_runner_name,
         workspace=workspace_root,
@@ -179,6 +198,7 @@ def run_ohmo_eval_report(
         executor_name,
         agent_runner=agent_runner_config.agent_runner,
         fixture_match=fixture_match,
+        synth_context=synth_context,
     )
     store = get_eval_store(workspace)
     pack = read_run_pack(store, pack_filename=pack_filename)
@@ -194,6 +214,10 @@ def run_ohmo_eval_report(
     if judge_config is not None:
         write.report.metadata["judge_model"] = judge_config.model
         write.report.metadata["judge_provider_profile"] = judge_config.provider_profile
+    if synth_config is not None:
+        write.report.metadata["synth_model"] = synth_config.model
+        write.report.metadata["synth_provider_profile"] = synth_config.provider_profile
+    if judge_config is not None or synth_config is not None:
         atomic_write_text(write.path, write.report.model_dump_json(indent=2) + "\n")
     return OhmoEvalRunResult(write=write, report_only=report_only)
 
@@ -235,6 +259,14 @@ def run_ohmo_session_eval(
     )
     if agent_runner_config.api_client is None:
         raise ValueError("session eval runner requires configured API authentication")
+    synth_context = (
+        SynthContext(
+            api_client=agent_runner_config.api_client,
+            model=agent_runner_config.model,
+        )
+        if fixture_match == "synth"
+        else None
+    )
 
     user_simulator_factory: Callable[[], UserSimulator] | None = None
     user_sim_resolved_profile = ""
@@ -281,6 +313,7 @@ def run_ohmo_session_eval(
         cwd=agent_runner_config.cwd,
         fixture_match_mode=fixture_match,
         max_session_turns=max_session_turns,
+        synth_context=synth_context,
     )
     cases = [
         _run_session_report_case_sampled(
@@ -404,6 +437,7 @@ def _build_executor(
         | SandboxMutatingAgentRunner
     ),
     fixture_match: str = "order",
+    synth_context: SynthContext | None = None,
 ) -> ReplayToolsExecutor:
     fixture_match = _validate_fixture_match(fixture_match)
     normalized = executor_name.strip().lower()
@@ -413,7 +447,11 @@ def _build_executor(
         raise ValueError(
             f"unknown eval executor: {executor_name}. Supported executors: {supported}"
         )
-    return executor_factory(agent_runner=agent_runner, match_mode=fixture_match)
+    return executor_factory(
+        agent_runner=agent_runner,
+        match_mode=fixture_match,
+        synth_context=synth_context,
+    )
 
 
 def _validate_fixture_match(fixture_match: str) -> str:

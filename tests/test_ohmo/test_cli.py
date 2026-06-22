@@ -1975,6 +1975,54 @@ def test_ohmo_evals_run_command_threads_judge_options(
     assert calls[0]["judge_model"] == "judge-model"
 
 
+def test_ohmo_evals_run_command_threads_synth_options(
+    tmp_path: Path,
+    monkeypatch,
+):
+    runner = CliRunner()
+    workspace = tmp_path / ".ohmo-home"
+    calls: list[dict[str, object]] = []
+
+    def fake_run_ohmo_eval_report(**kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(
+            report_only=False,
+            write=SimpleNamespace(
+                path=Path(kwargs["workspace"]) / "evals" / "reports" / "eval_report.json",
+                report=SimpleNamespace(
+                    case_count=1,
+                    passed_count=1,
+                    failed_count=0,
+                    blocked_count=0,
+                    error_count=0,
+                ),
+            ),
+        )
+
+    monkeypatch.setattr("ohmo.cli.run_ohmo_eval_report", fake_run_ohmo_eval_report)
+
+    result = runner.invoke(
+        app,
+        [
+            "evals",
+            "run",
+            "--workspace",
+            str(workspace),
+            "--fixture-match",
+            "synth",
+            "--synth-profile",
+            "synth-profile",
+            "--synth-model",
+            "synth-model",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert calls[0]["fixture_match"] == "synth"
+    assert calls[0]["synth_profile"] == "synth-profile"
+    assert calls[0]["synth_model"] == "synth-model"
+
+
 def test_ohmo_evals_run_command_check_config_does_not_run_eval(
     tmp_path: Path,
     monkeypatch,

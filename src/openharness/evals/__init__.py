@@ -41,6 +41,7 @@ from openharness.evals.executor import (
     ReplayToolInput,
     ReplayToolsExecutor,
     SandboxMutatingAgentRunner,
+    SynthContext,
     build_replay_tool_registry,
 )
 from openharness.evals.facets import EvalTextFacetInput, collect_text_facets
@@ -118,6 +119,10 @@ from openharness.evals.session_user_simulator import (
     UserTurn,
     replay_matches,
 )
+from openharness.evals.synth_fixture import (
+    SYNTH_CODEGEN_SYSTEM_PROMPT,
+    SynthesizedFixtureTool,
+)
 from openharness.evals.state import (
     compute_episode_state_delta,
     compute_state_delta,
@@ -155,6 +160,9 @@ __all__ = [
     "ExactMatchEvalScorer",
     "StateOutcomeOracleV1",
     "StateOracleV1",
+    "SYNTH_CODEGEN_SYSTEM_PROMPT",
+    "SynthContext",
+    "SynthesizedFixtureTool",
     "ToolTraceOracleV1",
     "TrajectoryJudgeScorer",
     "EVAL_EXECUTION_SCORERS",
