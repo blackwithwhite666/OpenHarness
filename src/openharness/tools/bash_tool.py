@@ -78,6 +78,13 @@ class BashTool(BaseTool):
 
         output_buffer = await _read_remaining_output(process)
         text = _format_output(output_buffer)
+        if getattr(process, "_oh_scope_unit", None) is not None and process.returncode in (137, -9):
+            # Accurate detection would read the scope's cgroup memory.events oom_kill,
+            # but the transient scope is gone by then, so this is a best-effort heuristic.
+            text += (
+                "\n\n[task killed: likely exceeded the per-task memory limit (MemoryMax). "
+                "Raise sandbox.resources.memory_max or split the work.]"
+            )
         return ToolResult(
             output=text,
             is_error=process.returncode != 0,
@@ -91,6 +98,7 @@ async def _terminate_process(process: asyncio.subprocess.Process, *, force: bool
     if force:
         process.kill()
         await process.wait()
+        _reap_resource_scope(process)
         return
     process.terminate()
     try:
@@ -98,6 +106,19 @@ async def _terminate_process(process: asyncio.subprocess.Process, *, force: bool
     except asyncio.TimeoutError:
         process.kill()
         await process.wait()
+    _reap_resource_scope(process)
+
+
+def _reap_resource_scope(process: asyncio.subprocess.Process) -> None:
+    unit = getattr(process, "_oh_scope_unit", None)
+    if not unit:
+        return
+    try:
+        from openharness.sandbox.resource_limit import kill_resource_scope
+
+        kill_resource_scope(unit)
+    except Exception:
+        pass
 
 
 async def _read_remaining_output(process: asyncio.subprocess.Process) -> bytearray:

@@ -94,6 +94,19 @@ class DockerSandboxSettings(BaseModel):
     extra_env: dict[str, str] = Field(default_factory=dict)
 
 
+class SandboxResourceSettings(BaseModel):
+    """Per-task OS resource ceiling (cgroup v2 via systemd-run scope)."""
+
+    enabled: bool = False
+    memory_max: str = "70%"
+    memory_high: str = ""
+    memory_swap_max: str = "2G"
+    pids_max: int = 0
+    cpu_weight: int = 0
+    backend: str = "auto"
+    fail_if_unavailable: bool = False
+
+
 class SandboxSettings(BaseModel):
     """Sandbox-runtime integration settings."""
 
@@ -104,6 +117,7 @@ class SandboxSettings(BaseModel):
     network: SandboxNetworkSettings = Field(default_factory=SandboxNetworkSettings)
     filesystem: SandboxFilesystemSettings = Field(default_factory=SandboxFilesystemSettings)
     docker: DockerSandboxSettings = Field(default_factory=DockerSandboxSettings)
+    resources: SandboxResourceSettings = Field(default_factory=SandboxResourceSettings)
 
 
 class ProviderProfile(BaseModel):

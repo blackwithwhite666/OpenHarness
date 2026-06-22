@@ -213,3 +213,61 @@ async def test_bash_tool_timeout_does_not_hang_when_stdout_stays_open(monkeypatc
 
     assert result.is_error is True
     assert result.metadata["timed_out"] is True
+
+
+@pytest.mark.asyncio
+async def test_bash_tool_terminates_resource_scope_on_timeout(monkeypatch, tmp_path: Path):
+    process = _FakeProcess(stdout=_NeverClosingStdout())
+    process._oh_scope_unit = "oh-task-test.scope"
+    killed_units: list[str] = []
+
+    async def fake_create_shell_subprocess(*args, **kwargs):
+        return process
+
+    monkeypatch.setattr("openharness.tools.bash_tool.create_shell_subprocess", fake_create_shell_subprocess)
+    monkeypatch.setattr(
+        bash_tool_module,
+        "_READ_REMAINING_OUTPUT_TIMEOUT_SECONDS",
+        0.05,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "openharness.sandbox.resource_limit.kill_resource_scope",
+        lambda unit: killed_units.append(unit),
+    )
+
+    result = await asyncio.wait_for(
+        BashTool().execute(
+            BashToolInput(command="sleep 10", timeout_seconds=1),
+            ToolExecutionContext(cwd=tmp_path),
+        ),
+        timeout=2.0,
+    )
+
+    assert result.is_error is True
+    assert process.killed is True
+    assert killed_units == ["oh-task-test.scope"]
+
+
+@pytest.mark.asyncio
+async def test_bash_tool_adds_resource_limit_hint_for_killed_process(monkeypatch, tmp_path: Path):
+    process = _FakeProcess(
+        stdout=_FakeStdout([b"before kill\n", b""]),
+        returncode=-9,
+    )
+    process._oh_scope_unit = "oh-task-test.scope"
+
+    async def fake_create_shell_subprocess(*args, **kwargs):
+        return process
+
+    monkeypatch.setitem(BashTool.execute.__globals__, "create_shell_subprocess", fake_create_shell_subprocess)
+
+    result = await BashTool().execute(
+        BashToolInput(command="python alloc.py"),
+        ToolExecutionContext(cwd=tmp_path),
+    )
+
+    assert result.is_error is True
+    assert result.metadata["returncode"] == -9
+    assert "before kill" in result.output
+    assert "likely exceeded the per-task memory limit" in result.output

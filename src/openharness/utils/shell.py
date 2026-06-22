@@ -11,7 +11,7 @@ from pathlib import Path
 
 from openharness.config import Settings, load_settings
 from openharness.platforms import PlatformName, get_platform
-from openharness.sandbox import wrap_command_for_sandbox
+from openharness.sandbox import wrap_command_for_sandbox, wrap_command_with_resource_limit
 
 
 def resolve_shell_command(
@@ -85,6 +85,7 @@ async def create_shell_subprocess(
     # Existing srt path
     argv = resolve_shell_command(command, prefer_pty=prefer_pty)
     argv, cleanup_path = wrap_command_for_sandbox(argv, settings=resolved_settings)
+    argv, scope_unit = wrap_command_with_resource_limit(argv, settings=resolved_settings)
 
     try:
         process = await asyncio.create_subprocess_exec(
@@ -100,6 +101,8 @@ async def create_shell_subprocess(
             cleanup_path.unlink(missing_ok=True)
         raise
 
+    if scope_unit is not None:
+        process._oh_scope_unit = scope_unit  # type: ignore[attr-defined]
     if cleanup_path is not None:
         asyncio.create_task(_cleanup_after_exit(process, cleanup_path))
     return process
