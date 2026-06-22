@@ -35,7 +35,7 @@ def resolve_channel_state_dir(channel_name: str, kind: str) -> Path:
     """Return a local directory for small persisted channel state (not media).
 
     Mirrors :func:`resolve_channel_media_dir` but roots state under the workspace
-    itself (e.g. ``~/.ohmo/live_location/telegram``) rather than the attachments
+    itself (e.g. ``~/.ohmo/last_location/telegram``) rather than the attachments
     download dir, since this is bot state rather than user-supplied files.
     """
     custom_root = os.environ.get("OPENHARNESS_CHANNEL_STATE_DIR")

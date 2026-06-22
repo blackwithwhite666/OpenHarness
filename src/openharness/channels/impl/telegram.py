@@ -32,7 +32,7 @@ from telegram.request import HTTPXRequest
 from openharness.channels.bus.events import OutboundMessage
 from openharness.channels.bus.queue import MessageBus
 from openharness.channels.impl.base import BaseChannel, resolve_channel_state_dir
-from openharness.channels.live_location import LiveLocationStore
+from openharness.channels.last_location import LastLocationStore
 from openharness.config.schema import TelegramConfig
 from openharness.utils.helpers import split_message
 
@@ -147,8 +147,19 @@ def _format_venue(venue) -> str:
     return f"[venue: {body} ({coord})]"
 
 
+def _humanize_age(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m"
+    if seconds < 86400:
+        return f"{seconds // 3600}h"
+    return f"{seconds // 86400}d"
+
+
 def _live_expires_at(message, loc) -> float | None:
-    """Epoch seconds when this live share stops updating, or ``None`` if static."""
+    """Epoch seconds when a live share stops updating, or ``None`` if not live."""
     live_period = getattr(loc, "live_period", None)
     if not live_period:
         return None
@@ -161,25 +172,25 @@ def _live_expires_at(message, loc) -> float | None:
     return base + float(live_period)
 
 
-def _format_live_started(loc, expires_at: float | None) -> str:
-    body = f"[live location started: {_fmt_coord(loc.latitude, loc.longitude)}"
-    if expires_at is not None:
-        mins = max(0, int((expires_at - time.time()) // 60))
-        body += f"; updates for ~{mins} min"
-    body += f"; {_maps_link(loc.latitude, loc.longitude)}]"
-    return body
+def _format_last_location(record: dict, now: float) -> str:
+    """The chat's last known location, injected into a turn as context.
 
-
-def _format_live_current(record: dict, now: float) -> str:
+    Always shown if present (per "add it if there is one"); the live-share expiry
+    is surfaced so the agent knows whether the user is still actively there or the
+    share has ended."""
     lat, lon = record["latitude"], record["longitude"]
-    ago = max(0, int(now - record.get("updated_at", now)))
-    body = f"[current live location: {_fmt_coord(lat, lon)}; updated {ago}s ago"
-    exp = record.get("expires_at")
-    if exp is not None:
-        left = max(0, int((exp - now) // 60))
-        body += f", ~{left} min left"
-    body += f"; {_maps_link(lat, lon)}]"
-    return body
+    age = _humanize_age(now - record.get("updated_at", now))
+    label = record.get("label")
+    head = f"«{label}» " if label else ""
+    parts = [f"[last known location: {head}{_fmt_coord(lat, lon)}; shared {age} ago"]
+    expires_at = record.get("expires_at")
+    if expires_at is not None:
+        if expires_at > now:
+            parts.append(f"; live, expires in ~{_humanize_age(expires_at - now)}")
+        else:
+            parts.append(f"; live share ended ~{_humanize_age(now - expires_at)} ago")
+    parts.append(f"; {_maps_link(lat, lon)}]")
+    return "".join(parts)
 
 
 def _split_table_row(line: str) -> list[str]:
@@ -341,10 +352,11 @@ class TelegramChannel(BaseChannel):
         self._typing_tasks: dict[str, asyncio.Task] = {}  # chat_id -> typing loop task
         self._media_group_buffers: dict[str, dict] = {}
         self._media_group_tasks: dict[str, asyncio.Task] = {}
-        # Latest known live location per chat (updated silently from edited_message
-        # live-location updates; surfaced into the next real turn, never its own).
-        self._live_store = LiveLocationStore(
-            resolve_channel_state_dir(self.name, "live_location")
+        # Last known location per chat. ANY inbound location (pin / venue / live
+        # share + its edits) silently overwrites it; it is injected into the next
+        # real user turn as context. No turn is ever spawned by a location itself.
+        self._last_location = LastLocationStore(
+            resolve_channel_state_dir(self.name, "last_location")
         )
 
     async def start(self) -> None:
@@ -783,45 +795,49 @@ class TelegramChannel(BaseChannel):
             },
         )
 
-    def _record_live_location(self, message) -> None:
-        """Persist a live-location update silently (no agent turn).
+    def _record_last_location(self, message) -> bool:
+        """Silently overwrite the chat's last known location. Returns True if a
+        location/venue was present and stored.
 
-        Telegram streams live-location movement as ``edited_message`` updates with
-        the same ``message_id``. We stash the latest coordinates per chat so a
-        later "where am I / what's nearby" turn can use them, without spawning a
-        model turn per edit (which over an hour would be dozens of calls)."""
-        loc = getattr(message, "location", None)
+        Any location — a static pin, a venue, or a live share (initial message and
+        every ``edited_message`` movement update) — just updates the store. It is
+        NEVER turned into an agent turn; it is context for the next real request."""
+        venue = getattr(message, "venue", None)
+        loc = getattr(message, "location", None) or (venue.location if venue else None)
         if loc is None:
-            return
-        expires_at = _live_expires_at(message, loc)
-        if expires_at is None:
-            # An edit that dropped live_period: treat as the share ending.
-            return
-        self._live_store.update(
+            return False
+        source = "venue" if venue else ("live" if getattr(loc, "live_period", None) else "pin")
+        self._last_location.update(
             str(message.chat_id),
             latitude=loc.latitude,
             longitude=loc.longitude,
-            expires_at=expires_at,
-            heading=getattr(loc, "heading", None),
+            source=source,
+            label=(venue.title if venue else None),
             horizontal_accuracy=getattr(loc, "horizontal_accuracy", None),
-            message_id=getattr(message, "message_id", None),
+            expires_at=_live_expires_at(message, loc),
         )
         logger.info(
-            "telegram live-location update chat_id=%s coord=%s (silent, no turn)",
-            message.chat_id, _fmt_coord(loc.latitude, loc.longitude),
+            "telegram last-location update chat_id=%s coord=%s source=%s (silent, no turn)",
+            message.chat_id, _fmt_coord(loc.latitude, loc.longitude), source,
         )
+        return True
 
     async def _on_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming messages (text, photos, voice, documents, geo)."""
         if not update.effective_user:
             return
 
-        # Edited messages: we only act on live-location movement (recorded
-        # silently). Every other edit is ignored, as before.
+        # Any location (pin / venue / live start / live edit, on a new OR edited
+        # message) just updates the last-known location silently — no turn.
+        eff = update.effective_message
+        if eff is not None and (
+            getattr(eff, "location", None) is not None or getattr(eff, "venue", None) is not None
+        ):
+            self._record_last_location(eff)
+            return
+
+        # Any other edited message is ignored (as before — no turn on edits).
         if update.message is None:
-            edited = update.edited_message
-            if edited is not None and getattr(edited, "location", None) is not None:
-                self._record_live_location(edited)
             return
 
         message = update.message
@@ -859,20 +875,8 @@ class TelegramChannel(BaseChannel):
             media_file = message.document
             media_type = "file"
 
-        # Geo: venue (carries its own .location) takes precedence over a bare pin.
-        # A live-location *start* (live_period set) is recorded so its subsequent
-        # silent edits extend the same share; a static pin is one-shot turn text.
-        if message.venue is not None:
-            content_parts.append(_format_venue(message.venue))
-        elif message.location is not None:
-            loc = message.location
-            if getattr(loc, "live_period", None):
-                self._record_live_location(message)
-                content_parts.append(
-                    _format_live_started(loc, _live_expires_at(message, loc))
-                )
-            else:
-                content_parts.append(_format_location(loc))
+        # (Location/venue messages already returned early in _record_last_location;
+        # they never reach this normal-content path.)
 
         # Download media if present
         if media_file and self._app:
@@ -914,12 +918,12 @@ class TelegramChannel(BaseChannel):
                     content_parts.append(f"[{media_type}: {file_path}]")
                 logger.debug("Downloaded %s to %s", media_type, file_path)
 
-        # If a live-location share is active for this chat, surface the latest
-        # known coordinates so a follow-up like "what's nearby?" can be answered.
-        if message.venue is None and message.location is None:
-            live = self._live_store.get(str(chat_id))
-            if live:
-                content_parts.append(_format_live_current(live, time.time()))
+        # Inject the chat's last known location (if any) so a request like
+        # "what's nearby?" has coordinates. Location messages returned earlier, so
+        # this only ever augments a real text/media turn. Absent → nothing added.
+        last = self._last_location.get(str(chat_id))
+        if last:
+            content_parts.append(_format_last_location(last, time.time()))
 
         content = "\n".join(content_parts) if content_parts else "[empty message]"
 
