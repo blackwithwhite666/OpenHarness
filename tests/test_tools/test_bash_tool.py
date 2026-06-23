@@ -54,7 +54,7 @@ class _FakeProcess:
 
     async def wait(self):
         if self.returncode is None:
-            await asyncio.sleep(60)
+            await asyncio.Event().wait()
         return self.returncode
 
     def terminate(self):
@@ -68,7 +68,7 @@ class _FakeProcess:
 
 class _NeverClosingStdout:
     async def read(self, _size: int = -1):
-        await asyncio.sleep(60)
+        await asyncio.Event().wait()
         return b""
 
 
@@ -195,7 +195,11 @@ async def test_bash_tool_timeout_does_not_hang_when_stdout_stays_open(monkeypatc
     async def fake_create_shell_subprocess(*args, **kwargs):
         return process
 
-    monkeypatch.setattr("openharness.tools.bash_tool.create_shell_subprocess", fake_create_shell_subprocess)
+    monkeypatch.setitem(
+        BashTool.execute.__globals__,
+        "create_shell_subprocess",
+        fake_create_shell_subprocess,
+    )
     monkeypatch.setattr(
         bash_tool_module,
         "_READ_REMAINING_OUTPUT_TIMEOUT_SECONDS",
@@ -224,7 +228,11 @@ async def test_bash_tool_terminates_resource_scope_on_timeout(monkeypatch, tmp_p
     async def fake_create_shell_subprocess(*args, **kwargs):
         return process
 
-    monkeypatch.setattr("openharness.tools.bash_tool.create_shell_subprocess", fake_create_shell_subprocess)
+    monkeypatch.setitem(
+        BashTool.execute.__globals__,
+        "create_shell_subprocess",
+        fake_create_shell_subprocess,
+    )
     monkeypatch.setattr(
         bash_tool_module,
         "_READ_REMAINING_OUTPUT_TIMEOUT_SECONDS",
