@@ -18,6 +18,7 @@ from openharness.evals import (
     EvalExecutionReportWrite,
     EvalSessionReport,
     EvalSessionReportCase,
+    HistoryContext,
     HybridUserSimulator,
     LiveReadAgentRunner,
     LlmUserSimulator,
@@ -145,6 +146,8 @@ def run_ohmo_eval_report(
     judge_model: str | None = None,
     synth_profile: str | None = None,
     synth_model: str | None = None,
+    history_profile: str | None = None,
+    history_model: str | None = None,
     samples: int = 1,
     fixture_match: str = "order",
 ) -> OhmoEvalRunResult:
@@ -156,7 +159,9 @@ def run_ohmo_eval_report(
     selected_scorer = None
     judge_config: _AgentRunnerConfig | None = None
     synth_config: _AgentRunnerConfig | None = None
+    history_config: _AgentRunnerConfig | None = None
     synth_context: SynthContext | None = None
+    history_context: HistoryContext | None = None
     if scorer == TrajectoryJudgeScorer.name:
         judge_config = _build_agent_runner_config(
             "query-engine",
@@ -187,6 +192,38 @@ def run_ohmo_eval_report(
             api_client=synth_config.api_client,
             model=synth_config.model,
         )
+    if history_profile is not None or history_model is not None:
+        history_config = _build_agent_runner_config(
+            "query-engine",
+            workspace=workspace_root,
+            model=(
+                history_model
+                or (synth_config.model if synth_config is not None else synth_model)
+                or (judge_config.model if judge_config is not None else judge_model)
+                or model
+            ),
+            provider_profile=(
+                history_profile
+                or (
+                    synth_config.provider_profile
+                    if synth_config is not None
+                    else synth_profile
+                )
+                or (
+                    judge_config.provider_profile
+                    if judge_config is not None
+                    else judge_profile
+                )
+                or provider_profile
+            ),
+            system_prompt=None,
+        )
+        if history_config.api_client is None:
+            raise ValueError("history segmentation requires configured API authentication")
+        history_context = HistoryContext(
+            api_client=history_config.api_client,
+            model=history_config.model,
+        )
     agent_runner_config = _build_agent_runner_config(
         agent_runner_name,
         workspace=workspace_root,
@@ -210,6 +247,7 @@ def run_ohmo_eval_report(
         samples=samples,
         executor=executor,
         scorer=selected_scorer,
+        history_context=history_context,
     )
     if judge_config is not None:
         write.report.metadata["judge_model"] = judge_config.model
@@ -217,7 +255,14 @@ def run_ohmo_eval_report(
     if synth_config is not None:
         write.report.metadata["synth_model"] = synth_config.model
         write.report.metadata["synth_provider_profile"] = synth_config.provider_profile
-    if judge_config is not None or synth_config is not None:
+    if history_config is not None:
+        write.report.metadata["history_model"] = history_config.model
+        write.report.metadata["history_provider_profile"] = history_config.provider_profile
+    if (
+        judge_config is not None
+        or synth_config is not None
+        or history_config is not None
+    ):
         atomic_write_text(write.path, write.report.model_dump_json(indent=2) + "\n")
     return OhmoEvalRunResult(write=write, report_only=report_only)
 

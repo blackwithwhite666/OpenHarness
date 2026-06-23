@@ -1574,6 +1574,16 @@ def evals_run_cmd(
         "--synth-model",
         help="Model override for --fixture-match synth",
     ),
+    history_profile: str | None = typer.Option(
+        None,
+        "--history-profile",
+        help="Provider profile override for LLM-scoped history reconstruction",
+    ),
+    history_model: str | None = typer.Option(
+        None,
+        "--history-model",
+        help="Model override for LLM-scoped history reconstruction",
+    ),
     fixture_match: str = typer.Option(
         "order",
         "--fixture-match",
@@ -1606,7 +1616,10 @@ def evals_run_cmd(
     ),
     json_output: bool = typer.Option(False, "--json", help="Print a JSON summary"),
 ) -> None:
-    """Run deterministic replay-tools eval checks over a runnable eval pack."""
+    """Run deterministic replay-tools eval checks over a runnable eval pack.
+
+    Agent runner to use inside the executor is selected with --agent-runner.
+    """
     workspace_root = initialize_workspace(workspace)
     try:
         if check_config:
@@ -1663,6 +1676,10 @@ def evals_run_cmd(
             run_kwargs["synth_profile"] = synth_profile
         if synth_model is not None:
             run_kwargs["synth_model"] = synth_model
+        if history_profile is not None:
+            run_kwargs["history_profile"] = history_profile
+        if history_model is not None:
+            run_kwargs["history_model"] = history_model
         result = run_ohmo_eval_report(**run_kwargs)
     except (FileNotFoundError, ValueError) as exc:
         print(str(exc), file=sys.stderr)

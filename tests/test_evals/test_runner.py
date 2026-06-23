@@ -35,7 +35,7 @@ from openharness.evals import (
     write_case_draft_pack,
     write_run_pack,
 )
-from openharness.evals.execution import _session_conversation_history
+from openharness.evals.execution import HistoryContext, _session_conversation_history
 from openharness.evals.executor import _run_query_engine_replay
 from openharness.tools.base import ToolRegistry
 
@@ -341,14 +341,14 @@ def test_execution_report_query_engine_runner_uses_reconstructed_prompt_and_repl
     assert "model final from replayed tool" not in serialized
 
 
-def test_session_conversation_history_reconstructs_prior_same_session_turns(
+def test_session_conversation_history_is_opt_in_and_filters_same_session_turns(
     tmp_path: Path,
 ):
     store = EvalStore(tmp_path / "evals")
     base = datetime(2026, 1, 1, tzinfo=timezone.utc)
     _add_session_episode(
         store,
-        episode_id="ep-1",
+        episode_id="ep-opt-1",
         session_id="session-1",
         app="ohmo",
         created_at=base,
@@ -375,7 +375,7 @@ def test_session_conversation_history_reconstructs_prior_same_session_turns(
     )
     _add_session_episode(
         store,
-        episode_id="ep-2",
+        episode_id="ep-opt-2",
         session_id="session-1",
         app="ohmo",
         created_at=base + timedelta(seconds=3),
@@ -384,7 +384,7 @@ def test_session_conversation_history_reconstructs_prior_same_session_turns(
     )
     _add_session_episode(
         store,
-        episode_id="ep-3",
+        episode_id="ep-opt-target",
         session_id="session-1",
         app="ohmo",
         created_at=base + timedelta(seconds=4),
@@ -392,18 +392,26 @@ def test_session_conversation_history_reconstructs_prior_same_session_turns(
         final_text="current assistant",
     )
 
-    first = store.get_episode("ep-1")
-    current = store.get_episode("ep-3")
+    first = store.get_episode("ep-opt-1")
+    current = store.get_episode("ep-opt-target")
+    client = _HistorySegmentApiClient('{"start_index": 0}')
+    history_context = HistoryContext(api_client=client, model="history-model")
 
     assert first is not None
     assert current is not None
     assert _session_conversation_history(store, first) == ()
-    assert _session_conversation_history(store, current) == (
+    assert _session_conversation_history(store, current) == ()
+    assert _session_conversation_history(
+        store,
+        current,
+        history_context=history_context,
+    ) == (
         ("user", "first user"),
         ("assistant", "first assistant"),
         ("user", "second user"),
         ("assistant", "second assistant"),
     )
+    assert len(client.requests) == 1
 
 
 def test_session_conversation_history_caps_to_recent_messages_and_chars(
@@ -414,7 +422,7 @@ def test_session_conversation_history_caps_to_recent_messages_and_chars(
     for index in range(6):
         _add_session_episode(
             store,
-            episode_id=f"ep-{index}",
+            episode_id=f"ep-caps-{index}",
             session_id="session-1",
             app="ohmo",
             created_at=base + timedelta(seconds=index),
@@ -423,17 +431,26 @@ def test_session_conversation_history_caps_to_recent_messages_and_chars(
         )
     _add_session_episode(
         store,
-        episode_id="ep-target",
+        episode_id="ep-caps-target",
         session_id="session-1",
         app="ohmo",
         created_at=base + timedelta(seconds=6),
         user_text="target user",
         final_text="target assistant",
     )
-    target = store.get_episode("ep-target")
+    target = store.get_episode("ep-caps-target")
+    history_context = HistoryContext(
+        api_client=_HistorySegmentApiClient('{"start_index": 0}'),
+        model="history-model",
+    )
 
     assert target is not None
-    assert _session_conversation_history(store, target, max_messages=4) == (
+    assert _session_conversation_history(
+        store,
+        target,
+        history_context=history_context,
+        max_messages=4,
+    ) == (
         ("user", "user-4"),
         ("assistant", "assistant-4"),
         ("user", "user-5"),
@@ -442,12 +459,188 @@ def test_session_conversation_history_caps_to_recent_messages_and_chars(
     assert _session_conversation_history(
         store,
         target,
+        history_context=history_context,
         max_messages=20,
         max_chars=len("user-5") + len("assistant-5"),
     ) == (
         ("user", "user-5"),
         ("assistant", "assistant-5"),
     )
+
+
+def test_session_conversation_history_applies_24h_window(tmp_path: Path):
+    store = EvalStore(tmp_path / "evals")
+    target_time = datetime(2026, 1, 2, tzinfo=timezone.utc)
+    _add_session_episode(
+        store,
+        episode_id="ep-window-old",
+        session_id="session-window",
+        app="ohmo",
+        created_at=target_time - timedelta(hours=25),
+        user_text="old user",
+        final_text="old assistant",
+    )
+    _add_session_episode(
+        store,
+        episode_id="ep-window-near",
+        session_id="session-window",
+        app="ohmo",
+        created_at=target_time - timedelta(hours=2),
+        user_text="near user",
+        final_text="near assistant",
+    )
+    _add_session_episode(
+        store,
+        episode_id="ep-window-target",
+        session_id="session-window",
+        app="ohmo",
+        created_at=target_time,
+        user_text="target user",
+        final_text="target assistant",
+    )
+    target = store.get_episode("ep-window-target")
+    client = _HistorySegmentApiClient('{"start_index": 0}')
+
+    assert target is not None
+    assert _session_conversation_history(
+        store,
+        target,
+        history_context=HistoryContext(api_client=client, model="history-model"),
+    ) == (
+        ("user", "near user"),
+        ("assistant", "near assistant"),
+    )
+    prompt = client.requests[0].messages[0].text
+    assert "near user" in prompt
+    assert "old user" not in prompt
+
+
+def test_session_conversation_history_uses_segment_start_index(tmp_path: Path):
+    store = EvalStore(tmp_path / "evals")
+    base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    for index in range(3):
+        _add_session_episode(
+            store,
+            episode_id=f"ep-segment-{index}",
+            session_id="session-segment",
+            app="ohmo",
+            created_at=base + timedelta(seconds=index),
+            user_text=f"user-{index}",
+            final_text=f"assistant-{index}",
+        )
+    _add_session_episode(
+        store,
+        episode_id="ep-segment-target",
+        session_id="session-segment",
+        app="ohmo",
+        created_at=base + timedelta(seconds=3),
+        user_text="target user",
+        final_text="target assistant",
+    )
+    target = store.get_episode("ep-segment-target")
+
+    assert target is not None
+    assert _session_conversation_history(
+        store,
+        target,
+        history_context=HistoryContext(
+            api_client=_HistorySegmentApiClient('{"start_index": 1}'),
+            model="history-model",
+        ),
+    ) == (
+        ("user", "user-1"),
+        ("assistant", "assistant-1"),
+        ("user", "user-2"),
+        ("assistant", "assistant-2"),
+    )
+
+
+@pytest.mark.parametrize(
+    ("response", "target_suffix"),
+    [
+        ('{"start_index": null}', "null"),
+        ("not json", "junk"),
+        (RuntimeError("segment failed"), "raising"),
+    ],
+)
+def test_session_conversation_history_fails_closed_on_segment_failure(
+    tmp_path: Path,
+    response: str | Exception,
+    target_suffix: str,
+):
+    store = EvalStore(tmp_path / "evals")
+    base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    _add_session_episode(
+        store,
+        episode_id=f"ep-fail-prior-{target_suffix}",
+        session_id=f"session-fail-{target_suffix}",
+        app="ohmo",
+        created_at=base,
+        user_text="prior user",
+        final_text="prior assistant",
+    )
+    target_id = f"ep-fail-target-{target_suffix}"
+    _add_session_episode(
+        store,
+        episode_id=target_id,
+        session_id=f"session-fail-{target_suffix}",
+        app="ohmo",
+        created_at=base + timedelta(seconds=1),
+        user_text="target user",
+        final_text="target assistant",
+    )
+    target = store.get_episode(target_id)
+
+    assert target is not None
+    assert _session_conversation_history(
+        store,
+        target,
+        history_context=HistoryContext(
+            api_client=_HistorySegmentApiClient(response),
+            model="history-model",
+        ),
+    ) == ()
+
+
+def test_session_conversation_history_caps_candidate_window_to_last_40_turns(
+    tmp_path: Path,
+):
+    store = EvalStore(tmp_path / "evals")
+    base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    for index in range(45):
+        _add_session_episode(
+            store,
+            episode_id=f"ep-window-cap-{index:02d}",
+            session_id="session-window-cap",
+            app="ohmo",
+            created_at=base + timedelta(minutes=index),
+            user_text=f"user-{index:02d}",
+            final_text=f"assistant-{index:02d}",
+        )
+    _add_session_episode(
+        store,
+        episode_id="ep-window-cap-target",
+        session_id="session-window-cap",
+        app="ohmo",
+        created_at=base + timedelta(minutes=45),
+        user_text="target user",
+        final_text="target assistant",
+    )
+    target = store.get_episode("ep-window-cap-target")
+    client = _HistorySegmentApiClient('{"start_index": 0}')
+
+    assert target is not None
+    _session_conversation_history(
+        store,
+        target,
+        history_context=HistoryContext(api_client=client, model="history-model"),
+        max_messages=100,
+    )
+    prompt = client.requests[0].messages[0].text
+    assert prompt.count("user: user-") == 40
+    assert "user-04" not in prompt
+    assert "user-05" in prompt
+    assert "user-44" in prompt
 
 
 @pytest.mark.asyncio
@@ -1221,6 +1414,48 @@ def test_execution_report_rejects_unknown_per_case_scorer(tmp_path: Path):
         run_execution_report(store, pack=pack)
 
 
+def test_execution_report_surfaces_safe_executor_counters(tmp_path: Path):
+    store = EvalStore(tmp_path / "evals")
+    _add_episode(
+        store,
+        episode_id="ep-counters",
+        user_text="private req",
+        final_text="private ans",
+    )
+    drafts = build_case_drafts(store, build_case_candidates(store))
+    write_case_draft_pack(store, drafts)
+    promote_case_drafts(store, case_ids=[drafts[0].case_id])
+    pack = write_run_pack(store).pack
+
+    result = run_execution_report(
+        store,
+        pack=pack,
+        executor=_CounterMetadataExecutor(),
+    )
+
+    case = result.report.cases[0]
+    assert case.metadata["seeded_history_message_count"] == 2
+    assert case.metadata["materialized_file_count"] == 1
+    assert "private_note" not in case.metadata
+    assert "private executor metadata" not in result.path.read_text(encoding="utf-8")
+
+
+class _CounterMetadataExecutor:
+    name = "counter_metadata"
+
+    def run_case(self, context: EvalExecutionContext) -> EvalExecutorResult:
+        return EvalExecutorResult(
+            final_text=context.expected_final_text,
+            tool_path=tuple(context.case.tool_names),
+            event_kind_path=("execution_started", "execution_completed"),
+            metadata={
+                "seeded_history_message_count": 2,
+                "materialized_file_count": 1,
+                "private_note": "private executor metadata",
+            },
+        )
+
+
 class _CapturingExecutor:
     name = "capture"
 
@@ -1379,6 +1614,24 @@ class _FinalOnlyModelApiClient:
             message=ConversationMessage(
                 role="assistant",
                 content=[TextBlock(text=self._final_text)],
+            ),
+            usage=UsageSnapshot(input_tokens=1, output_tokens=1),
+        )
+
+
+class _HistorySegmentApiClient:
+    def __init__(self, response: str | Exception) -> None:
+        self._response = response
+        self.requests = []
+
+    async def stream_message(self, request):
+        self.requests.append(request)
+        if isinstance(self._response, Exception):
+            raise self._response
+        yield ApiMessageCompleteEvent(
+            message=ConversationMessage(
+                role="assistant",
+                content=[TextBlock(text=self._response)],
             ),
             usage=UsageSnapshot(input_tokens=1, output_tokens=1),
         )

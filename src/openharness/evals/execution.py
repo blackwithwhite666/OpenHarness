@@ -2,15 +2,23 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Protocol
 
 from pydantic import ValidationError
 
+from openharness.api.client import (
+    ApiMessageCompleteEvent,
+    ApiMessageRequest,
+    SupportsStreamingMessages,
+)
+from openharness.engine.messages import ConversationMessage
 from openharness.evals.facets import EvalTextFacetInput, collect_text_facets
 from openharness.evals.judge import TrajectoryJudgeScorer
 from openharness.evals.executor import (
@@ -19,6 +27,7 @@ from openharness.evals.executor import (
     EvalExecutorResult,
     EvalToolFixture,
     ReplayToolsExecutor,
+    _run_eval_coroutine,
 )
 from openharness.evals.models import (
     EvalEpisode,
@@ -58,7 +67,40 @@ _JUDGE_METADATA_KEYS = (
     "had_tool_error",
 )
 _SCORER_REPORT_METADATA_KEYS = _CAPABILITY_METADATA_KEYS + _JUDGE_METADATA_KEYS
+_EXECUTOR_REPORT_METADATA_KEYS = (
+    "seeded_history_message_count",
+    "materialized_file_count",
+)
 _STATE_RESOURCE_NAMES = ("reminders", "memory", "todos")
+_HISTORY_WINDOW_HOURS = 24
+_HISTORY_WINDOW_MAX_TURNS = 40
+_HISTORY_SEGMENT_TIMEOUT = 30.0
+SESSION_SEGMENT_SYSTEM_PROMPT = (
+    "These are consecutive turns in ONE chat, oldest first, followed by a "
+    "TARGET turn. The user may have switched topics several times. Return the "
+    "index of the EARLIEST prior turn that is part of the SAME ongoing "
+    "conversation / task that the TARGET continues (a contiguous thread up to "
+    "the target). If the TARGET starts a brand-new topic unrelated to all "
+    'prior turns, there is no relevant history. Respond with ONLY JSON: '
+    '{"start_index": <int>} (the earliest in-thread index), or '
+    '{"start_index": null} if none relate. Be conservative: when unsure '
+    "whether an older turn belongs, EXCLUDE it."
+)
+_HISTORY_SEGMENT_CACHE: dict[str, int | None] = {}
+
+
+@dataclass(frozen=True)
+class HistoryContext:
+    """Auxiliary LLM context for scoping prior turns to a target conversation."""
+
+    api_client: SupportsStreamingMessages
+    model: str
+
+
+@dataclass(frozen=True)
+class _HistoryCandidateTurn:
+    user_text: str
+    assistant_text: str
 
 
 @dataclass(frozen=True)
@@ -516,6 +558,7 @@ def run_execution_report(
     *,
     executor: EvalExecutor | None = None,
     scorer: EvalExecutionScorer | None = None,
+    history_context: HistoryContext | None = None,
     pack: EvalRunPack | None = None,
     pack_filename: str = "eval_pack.json",
     report_filename: str = "eval_report.json",
@@ -563,6 +606,7 @@ def run_execution_report(
             default_scorer,
             samples=samples,
             scorer_override=scorer_override,
+            history_context=history_context,
         )
         for case in cases
     ]
@@ -615,6 +659,7 @@ def _execute_case_sampled(
     *,
     samples: int,
     scorer_override: EvalExecutionScorer | None = None,
+    history_context: HistoryContext | None = None,
 ) -> EvalExecutionReportCase:
     first = _execute_case(
         store,
@@ -624,6 +669,7 @@ def _execute_case_sampled(
         executor,
         default_scorer,
         scorer_override=scorer_override,
+        history_context=history_context,
     )
     if samples == 1 or first.status in {"blocked", "error"}:
         return first
@@ -639,6 +685,7 @@ def _execute_case_sampled(
                 executor,
                 default_scorer,
                 scorer_override=scorer_override,
+                history_context=history_context,
             )
         )
     pass_count = sum(1 for sample_case in sample_cases if sample_case.status == "passed")
@@ -660,10 +707,16 @@ def _session_conversation_history(
     store: EvalStore,
     episode: EvalEpisode,
     *,
+    history_context: HistoryContext | None = None,
     max_messages: int = 16,
     max_chars: int = 12000,
 ) -> tuple[tuple[str, str], ...]:
-    if not episode.session_id or max_messages <= 0 or max_chars <= 0:
+    if (
+        not episode.session_id
+        or history_context is None
+        or max_messages <= 0
+        or max_chars <= 0
+    ):
         return ()
 
     indexed_episode_ids = list(enumerate(store.list_episode_ids()))
@@ -689,19 +742,152 @@ def _session_conversation_history(
             continue
         prior.append((index, candidate))
 
-    messages: list[tuple[str, str]] = []
-    for _, prior_episode in sorted(prior, key=lambda item: (item[1].created_at, item[0])):
-        user_text = prior_episode.user_text
-        if user_text.strip():
-            messages.append(("user", user_text))
-        assistant_text = _episode_gateway_final_text(store, prior_episode.episode_id)
-        if assistant_text.strip():
-            messages.append(("assistant", assistant_text))
+    candidates = [
+        item
+        for item in sorted(prior, key=lambda item: (item[1].created_at, item[0]))
+        if _within_history_window(item[1], episode)
+    ][-_HISTORY_WINDOW_MAX_TURNS:]
+    if not candidates:
+        return ()
+
+    candidate_turns = [
+        _HistoryCandidateTurn(
+            user_text=prior_episode.user_text,
+            assistant_text=_episode_gateway_final_text(store, prior_episode.episode_id),
+        )
+        for _, prior_episode in candidates
+    ]
+    start_index = _segment_conversation(history_context, candidate_turns, episode)
+    if start_index is None:
+        return ()
+
+    messages = _history_turn_messages(candidate_turns[start_index:])
 
     kept = messages[-max_messages:]
     while kept and sum(len(text) for _, text in kept) > max_chars:
         kept = kept[1:]
     return tuple(kept)
+
+
+def _within_history_window(candidate: EvalEpisode, target: EvalEpisode) -> bool:
+    candidate_created_at = _parse_history_timestamp(candidate.created_at)
+    target_created_at = _parse_history_timestamp(target.created_at)
+    if candidate_created_at is None or target_created_at is None:
+        return True
+    return target_created_at - candidate_created_at <= timedelta(
+        hours=_HISTORY_WINDOW_HOURS
+    )
+
+
+def _parse_history_timestamp(value: Any) -> datetime | None:
+    try:
+        if isinstance(value, datetime):
+            timestamp = value
+        elif isinstance(value, str):
+            timestamp = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        else:
+            return None
+    except ValueError:
+        return None
+    if timestamp.tzinfo is None:
+        return timestamp.replace(tzinfo=timezone.utc)
+    return timestamp.astimezone(timezone.utc)
+
+
+def _history_turn_messages(
+    turns: Sequence[_HistoryCandidateTurn],
+) -> list[tuple[str, str]]:
+    messages: list[tuple[str, str]] = []
+    for turn in turns:
+        if turn.user_text.strip():
+            messages.append(("user", turn.user_text))
+        if turn.assistant_text.strip():
+            messages.append(("assistant", turn.assistant_text))
+    return messages
+
+
+def _segment_conversation(
+    history_context: HistoryContext,
+    candidate_turns: Sequence[_HistoryCandidateTurn],
+    target_episode: EvalEpisode,
+) -> int | None:
+    cache_key = target_episode.episode_id
+    if cache_key in _HISTORY_SEGMENT_CACHE:
+        cached = _HISTORY_SEGMENT_CACHE[cache_key]
+        if cached is None or cached >= len(candidate_turns):
+            return None
+        return cached
+
+    try:
+        prompt = _history_segment_prompt(candidate_turns, target_episode)
+        text = _run_eval_coroutine(_complete_history_segment(history_context, prompt))
+        start_index = _parse_segment_start_index(text, len(candidate_turns))
+    except Exception:
+        start_index = None
+    _HISTORY_SEGMENT_CACHE[cache_key] = start_index
+    return start_index
+
+
+async def _complete_history_segment(
+    history_context: HistoryContext,
+    prompt: str,
+) -> str:
+    request = ApiMessageRequest(
+        model=history_context.model,
+        messages=[ConversationMessage.from_user_text(prompt)],
+        system_prompt=SESSION_SEGMENT_SYSTEM_PROMPT,
+        # Output is a tiny JSON, but reasoning models can spend tokens before
+        # it — keep headroom (matches the judge) so the JSON is never truncated.
+        max_tokens=512,
+        tools=[],
+    )
+
+    async def _collect() -> str:
+        text = ""
+        async for event in history_context.api_client.stream_message(request):
+            if isinstance(event, ApiMessageCompleteEvent):
+                text = event.message.text.strip()
+        return text
+
+    return await asyncio.wait_for(_collect(), timeout=_HISTORY_SEGMENT_TIMEOUT)
+
+
+def _history_segment_prompt(
+    candidate_turns: Sequence[_HistoryCandidateTurn],
+    target_episode: EvalEpisode,
+) -> str:
+    lines: list[str] = []
+    for index, turn in enumerate(candidate_turns):
+        lines.append(
+            f"[{index}] user: {_trim_history_text(turn.user_text, 300)}\n"
+            f"    assistant: {_trim_history_text(turn.assistant_text, 300)}"
+        )
+    lines.append(f"TARGET user: {_trim_history_text(target_episode.user_text, 500)}")
+    return "\n".join(lines)
+
+
+def _trim_history_text(text: str, max_length: int) -> str:
+    clean = " ".join(text.split())
+    if len(clean) <= max_length:
+        return clean
+    return clean[: max_length - 3].rstrip() + "..."
+
+
+def _parse_segment_start_index(text: str, candidate_count: int) -> int | None:
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    start_index = payload.get("start_index")
+    if start_index is None or isinstance(start_index, bool):
+        return None
+    if not isinstance(start_index, int):
+        return None
+    if start_index < 0 or start_index >= candidate_count:
+        return None
+    return start_index
 
 
 def _episode_gateway_final_text(store: EvalStore, episode_id: str) -> str:
@@ -727,6 +913,7 @@ def _execute_case(
     default_scorer: EvalExecutionScorer,
     *,
     scorer_override: EvalExecutionScorer | None = None,
+    history_context: HistoryContext | None = None,
 ) -> EvalExecutionReportCase:
     episode = store.get_episode(case.episode_id)
     events = list(store.iter_events(case.episode_id)) if episode is not None else []
@@ -775,7 +962,11 @@ def _execute_case(
             executor_name=executor.name,
         )
 
-    conversation_history = _session_conversation_history(store, episode)
+    conversation_history = _session_conversation_history(
+        store,
+        episode,
+        history_context=history_context,
+    )
     execution_context = EvalExecutionContext(
         store=store,
         pack=pack,
@@ -864,12 +1055,15 @@ def _execute_case(
         warnings=[name for name, passed in all_checks.items() if not passed],
         context=context,
         observed_trace=observed_trace,
-        metadata=_execution_case_metadata(
-            case,
-            executor_name=executor.name,
-            scorer_name=scorer_result.scorer_name,
-            resource_snapshot_status=resource_snapshot_status,
-        ),
+        metadata={
+            **_execution_case_metadata(
+                case,
+                executor_name=executor.name,
+                scorer_name=scorer_result.scorer_name,
+                resource_snapshot_status=resource_snapshot_status,
+            ),
+            **_executor_report_metadata(executor_result.metadata),
+        },
     )
 
 
@@ -964,6 +1158,15 @@ def _execution_case_metadata(
         "resource_snapshot_status": resource_snapshot_status,
         "score_schema_version": _EXECUTION_SCORE_SCHEMA_VERSION,
     }
+
+
+def _executor_report_metadata(metadata: dict[str, Any]) -> dict[str, int]:
+    report_metadata: dict[str, int] = {}
+    for key in _EXECUTOR_REPORT_METADATA_KEYS:
+        value = metadata.get(key)
+        if isinstance(value, int) and not isinstance(value, bool):
+            report_metadata[key] = value
+    return report_metadata
 
 
 def _metadata_context(

@@ -514,6 +514,127 @@ def respond(arguments, captured):
     assert len(api_client.requests) == 1
 
 
+def test_run_ohmo_eval_report_history_builds_segment_context(
+    tmp_path: Path,
+    monkeypatch,
+):
+    workspace = tmp_path / "workspace"
+    store = get_eval_store(workspace)
+    _append_session_episode(
+        store,
+        episode_id="ep-history",
+        session_id="session-history",
+        user_text="private history request",
+        tool_call_id="tool-history",
+    )
+    write_ohmo_eval_mine(workspace=workspace)
+    promote_case_drafts(store)
+    build_ohmo_eval_pack(workspace=workspace)
+    api_client = _StaticTextApiClient('{"start_index": null}')
+    config_calls: list[dict[str, object]] = []
+
+    def fake_build_agent_runner_config(
+        agent_runner_name,
+        *,
+        workspace,
+        model,
+        provider_profile,
+        system_prompt,
+    ):
+        config_calls.append(
+            {
+                "agent_runner_name": agent_runner_name,
+                "model": model,
+                "provider_profile": provider_profile,
+                "system_prompt": system_prompt,
+            }
+        )
+        if agent_runner_name == "query-engine":
+            return runner_module._AgentRunnerConfig(
+                agent_runner=runner_module.ReplayScriptAgentRunner(),
+                agent_runner_name="query-engine",
+                model=model or "resolved-history-model",
+                provider_profile=provider_profile or "resolved-history-profile",
+                api_client=api_client,
+                system_prompt="",
+                cwd=workspace,
+            )
+        return runner_module._AgentRunnerConfig(
+            agent_runner=runner_module.ReplayScriptAgentRunner(),
+            agent_runner_name="scripted",
+            model="",
+            provider_profile="",
+        )
+
+    monkeypatch.setattr(
+        runner_module,
+        "_build_agent_runner_config",
+        fake_build_agent_runner_config,
+    )
+
+    result = run_ohmo_eval_report(
+        workspace=workspace,
+        limit=1,
+        history_profile="history-profile",
+        history_model="history-model",
+    )
+
+    assert config_calls[0] == {
+        "agent_runner_name": "query-engine",
+        "model": "history-model",
+        "provider_profile": "history-profile",
+        "system_prompt": None,
+    }
+    assert result.write.report.metadata["history_model"] == "history-model"
+    assert result.write.report.metadata["history_provider_profile"] == "history-profile"
+
+
+def test_run_ohmo_eval_report_without_history_flags_does_not_build_history_client(
+    tmp_path: Path,
+    monkeypatch,
+):
+    workspace = tmp_path / "workspace"
+    store = get_eval_store(workspace)
+    _append_session_episode(
+        store,
+        episode_id="ep-no-history",
+        session_id="session-no-history",
+        user_text="private no history request",
+        tool_call_id="tool-no-history",
+    )
+    write_ohmo_eval_mine(workspace=workspace)
+    promote_case_drafts(store)
+    build_ohmo_eval_pack(workspace=workspace)
+    config_calls: list[str] = []
+
+    def fake_build_agent_runner_config(
+        agent_runner_name,
+        *,
+        workspace,
+        model,
+        provider_profile,
+        system_prompt,
+    ):
+        del workspace, model, provider_profile, system_prompt
+        config_calls.append(agent_runner_name)
+        return runner_module._AgentRunnerConfig(
+            agent_runner=runner_module.ReplayScriptAgentRunner(),
+            agent_runner_name="scripted",
+            model="",
+            provider_profile="",
+        )
+
+    monkeypatch.setattr(
+        runner_module,
+        "_build_agent_runner_config",
+        fake_build_agent_runner_config,
+    )
+
+    run_ohmo_eval_report(workspace=workspace, limit=1)
+
+    assert config_calls == ["scripted"]
+
+
 def test_run_ohmo_eval_report_sandbox_scores_reminder_state_outcome(
     tmp_path: Path,
     monkeypatch,
