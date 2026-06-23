@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -43,12 +44,14 @@ from openharness.evals.models import (
 )
 from openharness.evals.pack import read_run_pack
 from openharness.evals.replay_matching import _fixture_input_key
+from openharness.evals.replay_integrity import replay_integrity
 from openharness.evals.state import compute_episode_state_delta
 from openharness.evals.store import EvalStore
 from openharness.evals.tool_labels import SHELL_TOOL_NAMES, effective_tool_label
 from openharness.utils.fs import atomic_write_text
 
 _EXECUTION_SCORE_SCHEMA_VERSION = 1
+logger = logging.getLogger(__name__)
 _INCIDENTAL_CAPABILITIES = frozenset(
     {"todo_write", "sleep", "task_get", "task_output", "task_stop", "tool_search"}
 ) | SHELL_TOOL_NAMES
@@ -926,6 +929,7 @@ def _execute_case(
     input_facet_kinds = [item.facet.facet_kind for item in resolved_inputs]
     expected_facet_kinds = [item.facet.facet_kind for item in resolved_expected]
     tool_fixtures = _tool_fixtures(events)
+    replay_ok, unreplayable_reason = replay_integrity(episode, events, tool_fixtures)
     source_tool_path = [fixture.tool_name for fixture in tool_fixtures]
     resource_snapshot_status = _resource_snapshot_status(store, events)
     checks = {
@@ -941,6 +945,7 @@ def _execute_case(
         "tool_trace_complete": _tool_trace_complete(tool_fixtures, case.tool_names),
         "resource_snapshot_valid_or_absent": resource_snapshot_status
         in {"absent", "valid"},
+        "replay_inputs_recoverable": replay_ok,
         "has_rubric": bool(case.rubric),
     }
     context = None
@@ -953,6 +958,21 @@ def _execute_case(
             expected_facet_kinds=expected_facet_kinds,
             case=case,
         )
+        if unreplayable_reason:
+            context = context.model_copy(
+                update={
+                    "metadata": {
+                        **context.metadata,
+                        "unreplayable_reason": unreplayable_reason,
+                    }
+                }
+            )
+    if unreplayable_reason:
+        logger.warning(
+            "eval case %s unreplayable: %s",
+            case.gold_case_id,
+            unreplayable_reason,
+        )
     if not all(checks.values()) or episode is None:
         return _blocked_execution_case(
             case,
@@ -960,6 +980,7 @@ def _execute_case(
             context,
             resource_snapshot_status=resource_snapshot_status,
             executor_name=executor.name,
+            unreplayable_reason=unreplayable_reason,
         )
 
     conversation_history = _session_conversation_history(
@@ -1122,7 +1143,16 @@ def _blocked_execution_case(
     *,
     resource_snapshot_status: str,
     executor_name: str,
+    unreplayable_reason: str | None = None,
 ) -> EvalExecutionReportCase:
+    metadata = _execution_case_metadata(
+        case,
+        executor_name=executor_name,
+        scorer_name="",
+        resource_snapshot_status=resource_snapshot_status,
+    )
+    if unreplayable_reason:
+        metadata["unreplayable_reason"] = unreplayable_reason
     return EvalExecutionReportCase(
         gold_case_id=case.gold_case_id,
         case_id=case.case_id,
@@ -1133,12 +1163,7 @@ def _blocked_execution_case(
         warnings=[name for name, passed in checks.items() if not passed],
         context=context,
         observed_trace=None,
-        metadata=_execution_case_metadata(
-            case,
-            executor_name=executor_name,
-            scorer_name="",
-            resource_snapshot_status=resource_snapshot_status,
-        ),
+        metadata=metadata,
     )
 
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -16,9 +17,15 @@ from openharness.evals.models import (
     EvalSmokeReport,
     EvalSmokeReportCase,
 )
+from openharness.evals.replay_integrity import (
+    replay_integrity,
+    replay_integrity_tool_fixtures,
+)
 from openharness.evals.review import read_gold_cases
 from openharness.evals.store import EvalStore
 from openharness.utils.fs import atomic_write_text
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -52,16 +59,50 @@ def build_run_pack(
     if not selected:
         raise ValueError("no gold cases available for eval pack")
 
-    cases = [_pack_case(gold) for gold in selected]
+    cases: list[EvalRunPackCase] = []
+    skipped_unreplayable: list[tuple[str, str]] = []
+    for gold in selected:
+        episode = store.get_episode(gold.episode_id)
+        events = list(store.iter_events(gold.episode_id)) if episode is not None else []
+        ok, reason = replay_integrity(
+            episode,
+            events,
+            replay_integrity_tool_fixtures(events),
+        )
+        if not ok:
+            reason_text = reason or "unreplayable"
+            skipped_unreplayable.append((gold.gold_case_id, reason_text))
+            logger.warning(
+                "pack: skipped unreplayable case %s: %s",
+                gold.gold_case_id,
+                reason_text,
+            )
+            continue
+        cases.append(_pack_case(gold))
+    if skipped_unreplayable:
+        logger.warning(
+            "pack: skipped %s unreplayable cases: %s",
+            len(skipped_unreplayable),
+            ", ".join(f"{gold_case_id}:{reason}" for gold_case_id, reason in skipped_unreplayable),
+        )
+    if not cases:
+        raise ValueError("no replayable gold cases available for eval pack")
     pack_id = _stable_id("pack", _canonical_json([case.model_dump(mode="json") for case in cases]))
+    metadata = {
+        "privacy": "metadata_only",
+        "case_count": len(cases),
+    }
+    if skipped_unreplayable:
+        metadata["skipped_unreplayable_count"] = len(skipped_unreplayable)
+        metadata["skipped_unreplayable"] = [
+            {"gold_case_id": gold_case_id, "reason": reason}
+            for gold_case_id, reason in skipped_unreplayable
+        ]
     return EvalRunPack(
         pack_id=pack_id,
         source_records_path=f"cases/{gold_records_filename}",
         cases=cases,
-        metadata={
-            "privacy": "metadata_only",
-            "case_count": len(cases),
-        },
+        metadata=metadata,
     )
 
 

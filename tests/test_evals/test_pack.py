@@ -17,6 +17,7 @@ from openharness.evals import (
     build_case_drafts,
     build_run_pack,
     promote_case_drafts,
+    read_gold_cases,
     run_smoke_report,
     write_case_draft_pack,
     write_run_pack,
@@ -77,6 +78,49 @@ def test_run_pack_can_select_gold_cases_and_rejects_missing(tmp_path: Path):
     assert [case.case_id for case in pack.cases] == [drafts[1].case_id]
     with pytest.raises(ValueError, match="gold case not found: missing"):
         build_run_pack(store, case_ids=["missing"])
+
+
+def test_run_pack_skips_unreplayable_cases_with_warning(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+):
+    store = EvalStore(tmp_path / "evals")
+    _add_episode(
+        store,
+        episode_id="ep-broken",
+        user_text="[voice: download failed]",
+        final_text="private broken final",
+    )
+    _add_episode(
+        store,
+        episode_id="ep-clean",
+        user_text="private clean request",
+        final_text="private clean final",
+    )
+    drafts = build_case_drafts(store, build_case_candidates(store))
+    write_case_draft_pack(store, drafts)
+    promote_case_drafts(store)
+
+    clean_case_id = next(draft.case_id for draft in drafts if draft.episode_id == "ep-clean")
+    broken_gold_case_id = next(
+        gold.gold_case_id for gold in read_gold_cases(store) if gold.episode_id == "ep-broken"
+    )
+    with caplog.at_level("WARNING", logger="openharness.evals.pack"):
+        pack = build_run_pack(store)
+
+    assert [case.case_id for case in pack.cases] == [clean_case_id]
+    assert pack.metadata["case_count"] == 1
+    assert pack.metadata["skipped_unreplayable_count"] == 1
+    assert pack.metadata["skipped_unreplayable"] == [
+        {
+            "gold_case_id": broken_gold_case_id,
+            "reason": "unreplayable_input:download_failed",
+        }
+    ]
+    assert (
+        f"pack: skipped unreplayable case {broken_gold_case_id}: unreplayable_input:download_failed"
+    ) in caplog.text
+    assert "pack: skipped 1 unreplayable cases:" in caplog.text
 
 
 def test_run_pack_carries_state_delta_metadata(tmp_path: Path):

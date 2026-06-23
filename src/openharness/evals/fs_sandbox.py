@@ -423,7 +423,7 @@ class FsSandboxAgentRunner:
         max_tokens: int = 4096,
         timeout: float = 120.0,
         net_mode: str = "none",
-        mutable_dirs: Iterable[str | Path] = ("memory", "todos", "reminders"),
+        mutable_dirs: Iterable[str | Path] = ("memory", "todos", "reminders", "user.md"),
         ro_source_dirs: Iterable[str | Path] | None = None,
     ) -> None:
         self._api_client = api_client
@@ -438,7 +438,7 @@ class FsSandboxAgentRunner:
         self._ro_source_dirs = (
             tuple(ro_source_dirs)
             if ro_source_dirs is not None
-            else (Path.home() / ".ohmo" / "skills", Path(sys.prefix))
+            else (Path.home() / ".ohmo" / "skills", Path.home() / "bin", Path(sys.prefix))
         )
         self._home = Path.home().resolve()
 

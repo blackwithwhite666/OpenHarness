@@ -110,6 +110,7 @@ from openharness.evals.review import (
     read_gold_cases,
     select_case_drafts,
 )
+from openharness.evals.replay_integrity import replay_integrity
 from openharness.evals.runner import EvalReplayReportWrite, run_replay_report
 from openharness.evals.session import (
     EvalSessionGroup,
@@ -257,6 +258,7 @@ __all__ = [
     "read_gold_cases",
     "read_run_pack",
     "read_world_snapshots",
+    "replay_integrity",
     "run_smoke_report",
     "run_execution_report",
     "run_replay_report",

@@ -241,6 +241,7 @@ def test_execution_report_schema_contract_is_stable(tmp_path: Path):
         "tool_fixtures_resolve",
         "tool_trace_complete",
         "resource_snapshot_valid_or_absent",
+        "replay_inputs_recoverable",
         "has_rubric",
         "execution_completed",
         "tool_sequence_matches",

@@ -23,7 +23,7 @@ from openharness.evals.fs_sandbox import (
     build_bwrap_argv,
 )
 from openharness.tools import create_default_tool_registry
-from openharness.tools.base import BaseTool, ToolExecutionContext, ToolRegistry, ToolResult
+from openharness.tools.base import BaseTool, ToolExecutionContext, ToolResult
 
 
 def test_build_bwrap_argv_net_modes_and_binds(tmp_path: Path):
@@ -73,15 +73,17 @@ def test_assemble_fs_copies_mutable_dirs_and_builds_remap(tmp_path: Path):
     cwd = tmp_path / "case"
     memory = home / ".ohmo" / "memory"
     skills = home / ".ohmo" / "skills"
+    user_file = home / ".ohmo" / "user.md"
     memory.mkdir(parents=True)
     skills.mkdir(parents=True)
     cwd.mkdir()
     (memory / "fact.md").write_text("remembered\n", encoding="utf-8")
+    user_file.write_text("profile\n", encoding="utf-8")
 
     plan = assemble_fs(
         root,
         home=home,
-        mutable_dirs=("memory", "todos"),
+        mutable_dirs=("memory", "todos", "user.md"),
         ro_source_dirs=(skills, home / ".ohmo" / "missing"),
         cwd=cwd,
     )
@@ -91,18 +93,21 @@ def test_assemble_fs_copies_mutable_dirs_and_builds_remap(tmp_path: Path):
     assert (plan.state_root / "memory" / "fact.md").read_text(encoding="utf-8") == (
         "remembered\n"
     )
+    assert (plan.state_root / "user.md").read_text(encoding="utf-8") == "profile\n"
     assert (plan.state_root / "todos").is_dir()
     assert plan.remap[(home / ".ohmo" / "memory").resolve()] == (
         plan.state_root / "memory"
     )
+    assert plan.remap[user_file.resolve()] == plan.state_root / "user.md"
     assert plan.remap[Path("/tmp")] == plan.tmp
     assert plan.remap[cwd.resolve()] == plan.work
     assert (plan.state_root / "memory", (home / ".ohmo" / "memory").resolve()) in (
         plan.rw_binds
     )
+    assert (plan.state_root / "user.md", user_file.resolve()) in plan.rw_binds
     assert (plan.tmp, Path("/tmp")) in plan.rw_binds
     assert plan.ro_binds == (skills.resolve(),)
-    assert plan.mutable_copies == ("memory", "todos")
+    assert plan.mutable_copies == ("memory", "todos", "user.md")
 
 
 @pytest.mark.asyncio
@@ -255,13 +260,16 @@ def test_fs_sandbox_agent_runner_overrides_tools_and_cleans_up(tmp_path: Path):
     assert result.tool_path == ("write_file", "read_file")
     assert result.metadata["agent_runner"] == "fs-sandbox"
     assert result.metadata["sandbox_net_mode"] == "none"
-    assert result.metadata["mutable_copies"] == ["memory", "todos", "reminders"]
+    assert result.metadata["mutable_copies"] == ["memory", "todos", "reminders", "user.md"]
     assert isinstance(registry.get("bash"), FsSandboxBashTool)
     for name in ("read_file", "write_file", "edit_file", "glob", "grep"):
         assert isinstance(registry.get(name), SandboxFsTool)
 
     bash_tool = registry.get("bash")
     assert isinstance(bash_tool, FsSandboxBashTool)
+    home_bin = (Path.home() / "bin").resolve()
+    if home_bin.exists():
+        assert home_bin in bash_tool._ro_binds
     assert bash_tool._sandbox_root.exists() is False
     assert not (tmp_path / "note.txt").exists()
 
