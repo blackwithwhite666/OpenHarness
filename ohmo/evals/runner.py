@@ -150,8 +150,11 @@ def run_ohmo_eval_report(
     history_model: str | None = None,
     samples: int = 1,
     fixture_match: str = "order",
+    max_turns: int = 8,
 ) -> OhmoEvalRunResult:
     """Run deterministic replay-tools execution checks over an Ohmo eval pack."""
+    if max_turns < 1:
+        raise ValueError("max_turns must be positive")
     if limit is not None and limit <= 0:
         raise ValueError("limit must be positive")
     fixture_match = _validate_fixture_match(fixture_match)
@@ -230,6 +233,7 @@ def run_ohmo_eval_report(
         model=model,
         provider_profile=provider_profile,
         system_prompt=system_prompt,
+        max_turns=max_turns,
     )
     executor = _build_executor(
         executor_name,
@@ -538,6 +542,7 @@ def _build_agent_runner_config(
     model: str | None,
     provider_profile: str | None,
     system_prompt: str | None,
+    max_turns: int = 8,
 ) -> _AgentRunnerConfig:
     normalized = agent_runner_name.strip().lower()
     if normalized not in _SUPPORTED_AGENT_RUNNERS:
@@ -575,6 +580,7 @@ def _build_agent_runner_config(
                 model=settings.model,
                 system_prompt=resolved_prompt,
                 cwd=workspace,
+                max_turns=max_turns,
                 live_mcp_server_names=("google_search",),
                 live_typed_read_tool_names=("read_file", "glob", "grep"),
             ),
@@ -610,6 +616,7 @@ def _build_agent_runner_config(
             model=settings.model,
             system_prompt=resolved_prompt,
             cwd=workspace,
+            max_turns=max_turns,
         ),
         agent_runner_name="query-engine",
         model=settings.model,

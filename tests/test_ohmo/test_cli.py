@@ -1465,6 +1465,7 @@ def test_ohmo_evals_run_command_runs_eval_report(tmp_path: Path, monkeypatch):
         system_prompt: str | None = None,
         scorer: str | None = None,
         fixture_match: str = "order",
+        max_turns: int = 8,
     ):
         calls.append(
             {
@@ -1587,6 +1588,7 @@ def test_ohmo_evals_run_command_threads_sandbox_agent_runner(
         system_prompt: str | None = None,
         scorer: str | None = None,
         fixture_match: str = "order",
+        max_turns: int = 8,
     ):
         calls.append(
             {
@@ -1674,6 +1676,7 @@ def test_ohmo_evals_run_command_threads_live_read_agent_runner(
         judge_profile: str | None = None,
         judge_model: str | None = None,
         fixture_match: str = "order",
+        max_turns: int = 8,
     ):
         calls.append(
             {
@@ -1897,6 +1900,7 @@ def test_ohmo_evals_run_command_passes_output_filename(tmp_path: Path, monkeypat
         system_prompt: str | None = None,
         scorer: str | None = None,
         fixture_match: str = "order",
+        max_turns: int = 8,
     ):
         calls.append(
             {
@@ -1979,6 +1983,7 @@ def test_ohmo_evals_run_command_outputs_json_summary(tmp_path: Path, monkeypatch
         system_prompt: str | None = None,
         scorer: str | None = None,
         fixture_match: str = "order",
+        max_turns: int = 8,
     ):
         del pack_filename, limit, executor_name, agent_runner_name
         del model, provider_profile, system_prompt, fixture_match
@@ -2059,6 +2064,7 @@ def test_ohmo_evals_run_command_passes_query_engine_runner_options(
         system_prompt: str | None = None,
         scorer: str | None = None,
         fixture_match: str = "order",
+        max_turns: int = 8,
     ):
         calls.append(
             {
@@ -2268,6 +2274,48 @@ def test_ohmo_evals_run_command_threads_history_options(
     assert calls[0]["history_model"] == "history-model"
 
 
+def test_ohmo_evals_run_command_threads_max_turns(
+    tmp_path: Path,
+    monkeypatch,
+):
+    runner = CliRunner()
+    workspace = tmp_path / ".ohmo-home"
+    calls: list[dict[str, object]] = []
+
+    def fake_run_ohmo_eval_report(**kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(
+            report_only=False,
+            write=SimpleNamespace(
+                path=Path(kwargs["workspace"]) / "evals" / "reports" / "eval_report.json",
+                report=SimpleNamespace(
+                    case_count=1,
+                    passed_count=1,
+                    failed_count=0,
+                    blocked_count=0,
+                    error_count=0,
+                ),
+            ),
+        )
+
+    monkeypatch.setattr("ohmo.cli.run_ohmo_eval_report", fake_run_ohmo_eval_report)
+
+    result = runner.invoke(
+        app,
+        ["evals", "run", "--workspace", str(workspace), "--max-turns", "50"],
+    )
+    assert result.exit_code == 0
+    assert calls[0]["max_turns"] == 50
+
+    # default when the flag is omitted
+    result = runner.invoke(
+        app,
+        ["evals", "run", "--workspace", str(workspace)],
+    )
+    assert result.exit_code == 0
+    assert calls[1]["max_turns"] == 8
+
+
 def test_ohmo_evals_run_command_check_config_does_not_run_eval(
     tmp_path: Path,
     monkeypatch,
@@ -2288,6 +2336,7 @@ def test_ohmo_evals_run_command_check_config_does_not_run_eval(
         system_prompt: str | None = None,
         scorer: str | None = None,
         fixture_match: str = "order",
+        max_turns: int = 8,
     ):
         check_calls.append(
             {
@@ -2383,6 +2432,7 @@ def test_ohmo_evals_run_command_check_config_outputs_json(
         system_prompt: str | None = None,
         scorer: str | None = None,
         fixture_match: str = "order",
+        max_turns: int = 8,
     ):
         del workspace, pack_filename, limit, executor_name, agent_runner_name
         del model, provider_profile, system_prompt, fixture_match
@@ -2478,6 +2528,7 @@ def test_ohmo_evals_run_command_reports_blocked_and_error_counts(
         system_prompt: str | None = None,
         scorer: str | None = None,
         fixture_match: str = "order",
+        max_turns: int = 8,
     ):
         del pack_filename, report_filename
         del agent_runner_name, model, provider_profile, system_prompt, fixture_match

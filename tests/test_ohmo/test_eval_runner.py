@@ -227,6 +227,7 @@ def test_run_ohmo_session_eval_hybrid_user_sim_profile_records_metrics(
         model,
         provider_profile,
         system_prompt,
+        max_turns: int = 8,
     ):
         build_calls.append(
             {
@@ -292,6 +293,7 @@ def test_run_ohmo_session_eval_rejects_shared_user_sim_profile(
         model,
         provider_profile,
         system_prompt,
+        max_turns: int = 8,
     ):
         return runner_module._AgentRunnerConfig(
             agent_runner=object(),
@@ -462,6 +464,7 @@ def respond(arguments, captured):
         model,
         provider_profile,
         system_prompt,
+        max_turns: int = 8,
     ):
         config_calls.append(
             {
@@ -540,6 +543,7 @@ def test_run_ohmo_eval_report_history_builds_segment_context(
         model,
         provider_profile,
         system_prompt,
+        max_turns: int = 8,
     ):
         config_calls.append(
             {
@@ -589,6 +593,54 @@ def test_run_ohmo_eval_report_history_builds_segment_context(
     assert result.write.report.metadata["history_provider_profile"] == "history-profile"
 
 
+def test_run_ohmo_eval_report_threads_max_turns_to_agent_runner(
+    tmp_path: Path,
+    monkeypatch,
+):
+    workspace = tmp_path / "workspace"
+    store = get_eval_store(workspace)
+    _append_session_episode(
+        store,
+        episode_id="ep-max-turns",
+        session_id="session-max-turns",
+        user_text="max turns request",
+        tool_call_id="tool-max-turns",
+    )
+    write_ohmo_eval_mine(workspace=workspace)
+    promote_case_drafts(store)
+    build_ohmo_eval_pack(workspace=workspace)
+    seen_max_turns: list[int] = []
+
+    def fake_build_agent_runner_config(
+        agent_runner_name,
+        *,
+        workspace,
+        model,
+        provider_profile,
+        system_prompt,
+        max_turns: int = 8,
+    ):
+        seen_max_turns.append(max_turns)
+        return runner_module._AgentRunnerConfig(
+            agent_runner=runner_module.ReplayScriptAgentRunner(),
+            agent_runner_name="scripted",
+            model="",
+            provider_profile="",
+        )
+
+    monkeypatch.setattr(
+        runner_module,
+        "_build_agent_runner_config",
+        fake_build_agent_runner_config,
+    )
+
+    run_ohmo_eval_report(workspace=workspace, limit=1, max_turns=50)
+    assert seen_max_turns == [50]
+
+    with pytest.raises(ValueError):
+        run_ohmo_eval_report(workspace=workspace, limit=1, max_turns=0)
+
+
 def test_run_ohmo_eval_report_without_history_flags_does_not_build_history_client(
     tmp_path: Path,
     monkeypatch,
@@ -614,6 +666,7 @@ def test_run_ohmo_eval_report_without_history_flags_does_not_build_history_clien
         model,
         provider_profile,
         system_prompt,
+        max_turns: int = 8,
     ):
         del workspace, model, provider_profile, system_prompt
         config_calls.append(agent_runner_name)
@@ -696,6 +749,7 @@ def test_run_ohmo_eval_report_trajectory_judge_scores_metadata_only(
         model,
         provider_profile,
         system_prompt,
+        max_turns: int = 8,
     ):
         config_calls.append(
             {

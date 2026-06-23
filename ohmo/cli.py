@@ -1604,6 +1604,12 @@ def evals_run_cmd(
         "--system-prompt",
         help="Override ohmo's real system prompt for --agent-runner query-engine",
     ),
+    max_turns: int = typer.Option(
+        8,
+        "--max-turns",
+        min=1,
+        help="Assistant-turn budget for the agent loop (query-engine / live-read runners)",
+    ),
     report_only: bool = typer.Option(
         False,
         "--report-only",
@@ -1667,6 +1673,7 @@ def evals_run_cmd(
             "system_prompt": system_prompt,
             "scorer": scorer,
             "fixture_match": fixture_match,
+            "max_turns": max_turns,
         }
         if judge_profile is not None:
             run_kwargs["judge_profile"] = judge_profile
