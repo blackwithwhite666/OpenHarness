@@ -18,6 +18,7 @@ from openharness.evals import (
     EvalExecutionReportWrite,
     EvalSessionReport,
     EvalSessionReportCase,
+    FsSandboxAgentRunner,
     HistoryContext,
     HybridUserSimulator,
     LiveReadAgentRunner,
@@ -98,6 +99,7 @@ class _AgentRunnerConfig:
         ReplayScriptAgentRunner
         | QueryEngineEvalAgentRunner
         | LiveReadAgentRunner
+        | FsSandboxAgentRunner
         | SandboxMutatingAgentRunner
     )
     agent_runner_name: str
@@ -114,6 +116,7 @@ SUPPORTED_EVAL_AGENT_RUNNER_NAMES = (
     "scripted",
     "query-engine",
     "query-engine-live-read",
+    "fs-sandbox",
     "sandbox",
 )
 SUPPORTED_FIXTURE_MATCH_MODES = ("order", "arguments", "synth")
@@ -483,6 +486,7 @@ def _build_executor(
         ReplayScriptAgentRunner
         | QueryEngineEvalAgentRunner
         | LiveReadAgentRunner
+        | FsSandboxAgentRunner
         | SandboxMutatingAgentRunner
     ),
     fixture_match: str = "order",
@@ -524,6 +528,7 @@ def _build_agent_runner(
     ReplayScriptAgentRunner
     | QueryEngineEvalAgentRunner
     | LiveReadAgentRunner
+    | FsSandboxAgentRunner
     | SandboxMutatingAgentRunner
 ):
     return _build_agent_runner_config(
@@ -585,6 +590,24 @@ def _build_agent_runner_config(
                 live_typed_read_tool_names=("read_file", "glob", "grep"),
             ),
             agent_runner_name="query-engine-live-read",
+            model=settings.model,
+            provider_profile=settings.active_profile,
+            api_client=api_client,
+            system_prompt=resolved_prompt,
+            cwd=workspace,
+            replay_tools_only=False,
+        )
+    if normalized == "fs-sandbox":
+        return _AgentRunnerConfig(
+            agent_runner=FsSandboxAgentRunner(
+                api_client=api_client,
+                model=settings.model,
+                system_prompt=resolved_prompt,
+                cwd=workspace,
+                max_turns=max_turns,
+                net_mode="none",
+            ),
+            agent_runner_name="fs-sandbox",
             model=settings.model,
             provider_profile=settings.active_profile,
             api_client=api_client,

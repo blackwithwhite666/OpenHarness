@@ -55,6 +55,14 @@ from openharness.evals.live_read import (
     LiveReadBashTool,
     classify_bash_command,
 )
+from openharness.evals.fs_sandbox import (
+    FsSandboxAgentRunner,
+    FsSandboxBashTool,
+    SandboxFsTool,
+    SandboxPlan,
+    assemble_fs,
+    build_bwrap_argv,
+)
 from openharness.evals.models import (
     EvalCaseCandidate,
     EvalCaseDraft,
@@ -206,6 +214,8 @@ __all__ = [
     "EvalUsageGraphNode",
     "HybridUserSimulator",
     "InferenceClient",
+    "FsSandboxAgentRunner",
+    "FsSandboxBashTool",
     "LlmUserSimulator",
     "LiveReadAgentRunner",
     "LiveReadBashTool",
@@ -217,10 +227,14 @@ __all__ = [
     "ReplayToolInput",
     "ReplayToolsExecutor",
     "SandboxMutatingAgentRunner",
+    "SandboxFsTool",
+    "SandboxPlan",
     "SessionReplayRunner",
     "UserSimulator",
     "UserTurn",
+    "assemble_fs",
     "build_replay_tool_registry",
+    "build_bwrap_argv",
     "build_case_candidates",
     "build_case_drafts",
     "build_run_pack",

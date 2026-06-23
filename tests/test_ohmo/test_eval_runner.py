@@ -15,6 +15,7 @@ from openharness.engine.messages import (
 from openharness.evals import (
     EvalEpisode,
     EvalEvent,
+    FsSandboxAgentRunner,
     LiveReadAgentRunner,
     SynthContext,
     promote_case_drafts,
@@ -922,6 +923,40 @@ def test_build_live_read_runner_config_uses_query_engine_settings(
         "glob",
         "grep",
     )
+
+
+def test_build_fs_sandbox_runner_config_uses_query_engine_settings(
+    tmp_path: Path,
+    monkeypatch,
+):
+    api_client = object()
+    monkeypatch.setattr(
+        "ohmo.evals.runner.resolve_api_client_from_settings",
+        lambda settings: api_client,
+    )
+    monkeypatch.setattr(
+        "ohmo.evals.runner.build_ohmo_system_prompt",
+        lambda *args, **kwargs: "REAL_OHMO_PROMPT",
+    )
+
+    config = runner_module._build_agent_runner_config(
+        "fs-sandbox",
+        workspace=tmp_path,
+        model="eval-model",
+        provider_profile=None,
+        system_prompt=None,
+        max_turns=5,
+    )
+
+    assert isinstance(config.agent_runner, FsSandboxAgentRunner)
+    assert config.agent_runner_name == "fs-sandbox"
+    assert config.model == "eval-model"
+    assert config.api_client is api_client
+    assert config.system_prompt == "REAL_OHMO_PROMPT"
+    assert config.cwd == tmp_path
+    assert config.replay_tools_only is False
+    assert config.agent_runner._max_turns == 5
+    assert config.agent_runner._net_mode == "none"
 
 
 def test_run_ohmo_eval_report_query_engine_auth_error_is_value_error(
