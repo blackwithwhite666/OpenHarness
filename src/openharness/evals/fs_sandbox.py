@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import shutil
 import sys
 import tempfile
@@ -14,6 +15,7 @@ from pathlib import Path
 from pydantic import BaseModel
 
 from openharness.api.client import SupportsStreamingMessages
+from openharness.config import load_settings
 from openharness.evals.executor import (
     EvalExecutionContext,
     EvalExecutorResult,
@@ -23,6 +25,8 @@ from openharness.evals.executor import (
     _run_query_engine_replay,
 )
 from openharness.evals.live_read import _process_output, _truncate_output
+from openharness.mcp.client import McpClientManager
+from openharness.mcp.config import load_mcp_server_configs
 from openharness.tools import create_default_tool_registry
 from openharness.tools.base import BaseTool, ToolExecutionContext, ToolRegistry, ToolResult
 
@@ -71,6 +75,9 @@ def build_bwrap_argv(
     ro_binds: Iterable[str | Path],
     rw_binds: Iterable[tuple[str | Path, str | Path]],
     net_mode: str = "none",
+    uid: int | None = None,
+    gid: int | None = None,
+    proxy_url: str | None = None,
 ) -> list[str]:
     """Build the bubblewrap argv used for real bash execution."""
     del sandbox_root
@@ -80,14 +87,25 @@ def build_bwrap_argv(
         "--unshare-pid",
         "--unshare-ipc",
         "--unshare-uts",
-        "--new-session",
     ]
+    netns_name: str | None = None
     if net_mode == "none":
+        bwrap_argv.append("--new-session")
         bwrap_argv.append("--unshare-net")
     elif net_mode == "host":
-        pass
+        bwrap_argv.append("--new-session")
     elif net_mode.startswith("netns:") and net_mode.removeprefix("netns:"):
-        pass
+        netns_name = net_mode.removeprefix("netns:")
+        bwrap_argv.extend(
+            [
+                "--unshare-user",
+                "--uid",
+                str(os.getuid() if uid is None else uid),
+                "--gid",
+                str(os.getgid() if gid is None else gid),
+                "--new-session",
+            ]
+        )
     else:
         raise ValueError(f"unsupported sandbox net_mode: {net_mode}")
 
@@ -115,14 +133,28 @@ def build_bwrap_argv(
             "--setenv",
             "PATH",
             "/usr/bin:/bin",
+        ]
+    )
+    if proxy_url:
+        bwrap_argv.extend(
+            [
+                "--setenv",
+                "HTTPS_PROXY",
+                proxy_url,
+                "--setenv",
+                "HTTP_PROXY",
+                proxy_url,
+            ]
+        )
+    bwrap_argv.extend(
+        [
             "--chdir",
             str(Path(cwd).expanduser().resolve()),
         ]
     )
 
-    if net_mode.startswith("netns:"):
-        name = net_mode.removeprefix("netns:")
-        return ["ip", "netns", "exec", name, *bwrap_argv]
+    if netns_name is not None:
+        return ["sudo", "ip", "netns", "exec", netns_name, *bwrap_argv]
     return bwrap_argv
 
 
@@ -219,6 +251,7 @@ class FsSandboxBashTool(BaseTool):
         ro_binds: Iterable[str | Path],
         rw_binds: Iterable[tuple[str | Path, str | Path]],
         net_mode: str = "none",
+        proxy_url: str | None = None,
         timeout: float = 120.0,
     ) -> None:
         self._mock_tool = mock_tool
@@ -231,6 +264,7 @@ class FsSandboxBashTool(BaseTool):
             for src, dest in rw_binds
         )
         self._net_mode = net_mode
+        self._proxy_url = proxy_url
         self._timeout = timeout
 
     async def execute(
@@ -248,6 +282,7 @@ class FsSandboxBashTool(BaseTool):
             ro_binds=self._ro_binds,
             rw_binds=self._rw_binds,
             net_mode=self._net_mode,
+            proxy_url=self._proxy_url,
         ) + ["bash", "-lc", command]
         metadata = {"lane": "fs-sandbox", "net_mode": self._net_mode}
         try:
@@ -423,6 +458,8 @@ class FsSandboxAgentRunner:
         max_tokens: int = 4096,
         timeout: float = 120.0,
         net_mode: str = "none",
+        proxy_url: str | None = None,
+        live_mcp_server_names: tuple[str, ...] = (),
         mutable_dirs: Iterable[str | Path] = ("memory", "todos", "reminders", "user.md"),
         ro_source_dirs: Iterable[str | Path] | None = None,
     ) -> None:
@@ -434,6 +471,8 @@ class FsSandboxAgentRunner:
         self._max_tokens = max_tokens
         self._timeout = timeout
         self._net_mode = net_mode
+        self._proxy_url = proxy_url
+        self._live_mcp_server_names = tuple(live_mcp_server_names)
         self._mutable_dirs = tuple(mutable_dirs)
         self._ro_source_dirs = (
             tuple(ro_source_dirs)
@@ -453,6 +492,8 @@ class FsSandboxAgentRunner:
             sandbox_root = Path(
                 tempfile.mkdtemp(prefix="openharness-eval-fs-sandbox-")
             ).resolve()
+            mcp: McpClientManager | None = None
+            mcp_connected = False
             try:
                 plan = assemble_fs(
                     sandbox_root,
@@ -461,7 +502,35 @@ class FsSandboxAgentRunner:
                     ro_source_dirs=self._ro_source_dirs,
                     cwd=self._cwd,
                 )
-                real_registry = create_default_tool_registry()
+                real_registry: ToolRegistry | None = None
+                if self._live_mcp_server_names:
+                    try:
+                        settings = load_settings()
+                        all_cfg = load_mcp_server_configs(settings, [])
+                        cfg = {
+                            name: all_cfg[name]
+                            for name in self._live_mcp_server_names
+                            if name in all_cfg
+                        }
+                        if cfg:
+                            mcp = McpClientManager(cfg)
+                            await mcp.connect_all()
+                            mcp_connected = True
+                            real_registry = create_default_tool_registry(mcp)
+                            for tool in real_registry.list_tools():
+                                if tool.name.startswith("mcp__"):
+                                    tool_registry.register(tool)
+                    except Exception:
+                        logger.warning(
+                            "fs-sandbox MCP connect failed; %s stays replay",
+                            self._live_mcp_server_names,
+                            exc_info=True,
+                        )
+
+                if real_registry is None:
+                    real_registry = create_default_tool_registry(
+                        mcp if mcp_connected else None
+                    )
                 for name in _FS_TOOL_NAMES:
                     real_tool = real_registry.get(name)
                     if real_tool is None:
@@ -492,6 +561,7 @@ class FsSandboxAgentRunner:
                         ro_binds=plan.ro_binds,
                         rw_binds=plan.rw_binds,
                         net_mode=self._net_mode,
+                        proxy_url=self._proxy_url,
                         timeout=self._timeout,
                     )
                 )
@@ -517,11 +587,20 @@ class FsSandboxAgentRunner:
                         **result.metadata,
                         "agent_runner": self.name,
                         "sandbox_net_mode": self._net_mode,
+                        "live_mcp_servers": list(self._live_mcp_server_names),
                         "mutable_copies": list(plan.mutable_copies),
                         "local_state_tools": list(local_state_tools),
                     },
                 )
             finally:
+                if mcp is not None:
+                    try:
+                        await mcp.close()
+                    except Exception:
+                        logger.warning(
+                            "fs-sandbox MCP close failed; continuing eval cleanup",
+                            exc_info=True,
+                        )
                 shutil.rmtree(sandbox_root, ignore_errors=True)
 
         return _run_eval_coroutine(_run_async())

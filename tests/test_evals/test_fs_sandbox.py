@@ -46,6 +46,8 @@ def test_build_bwrap_argv_net_modes_and_binds(tmp_path: Path):
 
     assert argv[0] == "bwrap"
     assert "--unshare-net" in argv
+    assert "--unshare-user" not in argv
+    assert "sudo" not in argv
     assert "--clearenv" not in argv
     assert _contains_subsequence(argv, ["--ro-bind", str(ro), str(ro)])
     assert _contains_subsequence(argv, ["--bind", str(rw), str(dest)])
@@ -60,11 +62,26 @@ def test_build_bwrap_argv_net_modes_and_binds(tmp_path: Path):
         ro_binds=(ro,),
         rw_binds=((rw, dest),),
         net_mode="netns:evalns",
+        uid=123,
+        gid=456,
+        proxy_url="http://10.77.0.1:3128",
     )
 
-    assert netns_argv[:4] == ["ip", "netns", "exec", "evalns"]
+    assert netns_argv[:5] == ["sudo", "ip", "netns", "exec", "evalns"]
     assert "bwrap" in netns_argv
+    assert _contains_subsequence(
+        netns_argv,
+        ["--unshare-user", "--uid", "123", "--gid", "456"],
+    )
     assert "--unshare-net" not in netns_argv
+    assert _contains_subsequence(
+        netns_argv,
+        ["--setenv", "HTTPS_PROXY", "http://10.77.0.1:3128"],
+    )
+    assert _contains_subsequence(
+        netns_argv,
+        ["--setenv", "HTTP_PROXY", "http://10.77.0.1:3128"],
+    )
 
 
 def test_assemble_fs_copies_mutable_dirs_and_builds_remap(tmp_path: Path):
@@ -272,6 +289,61 @@ def test_fs_sandbox_agent_runner_overrides_tools_and_cleans_up(tmp_path: Path):
         assert home_bin in bash_tool._ro_binds
     assert bash_tool._sandbox_root.exists() is False
     assert not (tmp_path / "note.txt").exists()
+
+
+def test_fs_sandbox_agent_runner_threads_netns_proxy_to_bash_tool(
+    tmp_path: Path,
+    monkeypatch,
+):
+    monkeypatch.setattr("openharness.evals.fs_sandbox.load_settings", lambda: object())
+    monkeypatch.setattr(
+        "openharness.evals.fs_sandbox.load_mcp_server_configs",
+        lambda settings, cli_configs: {},
+    )
+    api_client = _WriteReadApiClient()
+    runner = FsSandboxAgentRunner(
+        api_client=api_client,
+        model="eval-model",
+        system_prompt="eval system",
+        cwd=tmp_path,
+        net_mode="netns:evalns",
+        proxy_url="http://10.77.0.1:3128",
+        live_mcp_server_names=("google_search",),
+    )
+    registry = build_replay_tool_registry(())
+
+    result = runner.run(
+        prompt="write and read",
+        tool_registry=registry,
+        context=SimpleNamespace(events=()),
+    )
+
+    bash_tool = registry.get("bash")
+    assert isinstance(bash_tool, FsSandboxBashTool)
+    assert result.metadata["sandbox_net_mode"] == "netns:evalns"
+    assert result.metadata["live_mcp_servers"] == ["google_search"]
+    argv = build_bwrap_argv(
+        sandbox_root=bash_tool._sandbox_root,
+        cwd=bash_tool._cwd,
+        home=bash_tool._home,
+        ro_binds=bash_tool._ro_binds,
+        rw_binds=bash_tool._rw_binds,
+        net_mode=bash_tool._net_mode,
+        proxy_url=bash_tool._proxy_url,
+        uid=123,
+        gid=456,
+    ) + ["bash", "-lc", "echo ok"]
+    assert argv[:5] == ["sudo", "ip", "netns", "exec", "evalns"]
+    assert _contains_subsequence(
+        argv,
+        ["--unshare-user", "--uid", "123", "--gid", "456"],
+    )
+    assert "--unshare-net" not in argv
+    assert _contains_subsequence(
+        argv,
+        ["--setenv", "HTTPS_PROXY", "http://10.77.0.1:3128"],
+    )
+    assert argv[-3:] == ["bash", "-lc", "echo ok"]
 
 
 def _contains_subsequence(items: list[str], expected: list[str]) -> bool:

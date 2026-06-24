@@ -957,6 +957,39 @@ def test_build_fs_sandbox_runner_config_uses_query_engine_settings(
     assert config.replay_tools_only is False
     assert config.agent_runner._max_turns == 5
     assert config.agent_runner._net_mode == "none"
+    assert config.agent_runner._proxy_url is None
+    assert config.agent_runner._live_mcp_server_names == ()
+
+
+def test_build_fs_sandbox_runner_config_enables_live_google_for_netns(
+    tmp_path: Path,
+    monkeypatch,
+):
+    api_client = object()
+    monkeypatch.setattr(
+        "ohmo.evals.runner.resolve_api_client_from_settings",
+        lambda settings: api_client,
+    )
+    monkeypatch.setattr(
+        "ohmo.evals.runner.build_ohmo_system_prompt",
+        lambda *args, **kwargs: "REAL_OHMO_PROMPT",
+    )
+
+    config = runner_module._build_agent_runner_config(
+        "fs-sandbox",
+        workspace=tmp_path,
+        model="eval-model",
+        provider_profile=None,
+        system_prompt=None,
+        max_turns=5,
+        sandbox_net_mode="netns:evalns",
+        sandbox_proxy_url="http://10.77.0.1:3128",
+    )
+
+    assert isinstance(config.agent_runner, FsSandboxAgentRunner)
+    assert config.agent_runner._net_mode == "netns:evalns"
+    assert config.agent_runner._proxy_url == "http://10.77.0.1:3128"
+    assert config.agent_runner._live_mcp_server_names == ("google_search",)
 
 
 def test_run_ohmo_eval_report_query_engine_auth_error_is_value_error(

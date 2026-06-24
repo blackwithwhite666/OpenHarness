@@ -1610,6 +1610,16 @@ def evals_run_cmd(
         min=1,
         help="Assistant-turn budget for the agent loop (query-engine / live-read runners)",
     ),
+    sandbox_net_mode: str = typer.Option(
+        "none",
+        "--sandbox-net-mode",
+        help="Network mode for --agent-runner fs-sandbox (none, host, or netns:<name>)",
+    ),
+    sandbox_proxy_url: str | None = typer.Option(
+        None,
+        "--sandbox-proxy-url",
+        help="Proxy URL injected into fs-sandbox bash as HTTP(S)_PROXY",
+    ),
     report_only: bool = typer.Option(
         False,
         "--report-only",
@@ -1675,6 +1685,9 @@ def evals_run_cmd(
             "fixture_match": fixture_match,
             "max_turns": max_turns,
         }
+        if sandbox_net_mode != "none" or sandbox_proxy_url is not None:
+            run_kwargs["sandbox_net_mode"] = sandbox_net_mode
+            run_kwargs["sandbox_proxy_url"] = sandbox_proxy_url
         if judge_profile is not None:
             run_kwargs["judge_profile"] = judge_profile
         if judge_model is not None:

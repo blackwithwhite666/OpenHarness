@@ -1651,6 +1651,53 @@ def test_ohmo_evals_run_command_threads_sandbox_agent_runner(
     ]
 
 
+def test_ohmo_evals_run_command_threads_fs_sandbox_network_options(
+    tmp_path: Path,
+    monkeypatch,
+):
+    runner = CliRunner()
+    workspace = tmp_path / ".ohmo-home"
+    calls: list[dict[str, object]] = []
+
+    def fake_run_ohmo_eval_report(**kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(
+            report_only=kwargs.get("report_only", False),
+            write=SimpleNamespace(
+                path=(
+                    Path(kwargs["workspace"])
+                    / "evals"
+                    / "reports"
+                    / "eval_report.json"
+                ),
+                report=SimpleNamespace(case_count=1, passed_count=1, failed_count=0),
+            ),
+        )
+
+    monkeypatch.setattr("ohmo.cli.run_ohmo_eval_report", fake_run_ohmo_eval_report)
+
+    result = runner.invoke(
+        app,
+        [
+            "evals",
+            "run",
+            "--workspace",
+            str(workspace),
+            "--agent-runner",
+            "fs-sandbox",
+            "--sandbox-net-mode",
+            "netns:evalns",
+            "--sandbox-proxy-url",
+            "http://10.77.0.1:3128",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert calls[0]["agent_runner_name"] == "fs-sandbox"
+    assert calls[0]["sandbox_net_mode"] == "netns:evalns"
+    assert calls[0]["sandbox_proxy_url"] == "http://10.77.0.1:3128"
+
+
 def test_ohmo_evals_run_command_threads_live_read_agent_runner(
     tmp_path: Path,
     monkeypatch,
