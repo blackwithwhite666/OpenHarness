@@ -47,9 +47,25 @@ def replay_integrity(
 
     if any(_read_file_fixture_is_missing_input(fixture) for fixture in tool_fixtures):
         return False, "missing_input_file"
-    if TELEGRAM_FILE_ID_RE.search(input_text):
+    # A telegram file-id may sit in the reply-context / gold answer (not just this
+    # turn's text) -- scan the whole episode so attachment-dependent turns are caught.
+    if TELEGRAM_FILE_ID_RE.search(_episode_scan_text(episode, events)):
         return False, "unrecoverable_media_ref"
     return True, None
+
+
+def _episode_scan_text(episode: EvalEpisode | None, events: Sequence[EvalEvent]) -> str:
+    """All episode-side text (input + gold reply + event payloads) for media-ref scans."""
+    parts: list[str] = []
+    if episode is not None:
+        parts.append(episode.user_text)
+        parts.append(episode.user_goal)
+    for event in events:
+        payload = event.payload if isinstance(event.payload, dict) else {}
+        for value in payload.values():
+            if isinstance(value, str):
+                parts.append(value)
+    return "\n".join(p for p in parts if p)
 
 
 def replay_integrity_tool_fixtures(
@@ -104,10 +120,13 @@ def _primary_input_text(
 def _read_file_fixture_is_missing_input(fixture: object) -> bool:
     if getattr(fixture, "tool_name", None) != "read_file":
         return False
-    output_text = _fixture_text(fixture, "output_text")
-    if not bool(getattr(fixture, "is_error", False)) and not MISSING_FILE_RE.search(output_text):
+    # Only a REAL read error counts as a missing input. Matching "not found" /
+    # "ENOENT" in the OUTPUT content false-positives on files that merely contain
+    # those words (e.g. a skill's docs) -- that over-blocked a passing case.
+    if not bool(getattr(fixture, "is_error", False)):
         return False
     input_text = _fixture_text(fixture, "input_text")
+    output_text = _fixture_text(fixture, "output_text")
     return _contains_absolute_path(input_text) or _contains_absolute_path(output_text)
 
 

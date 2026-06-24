@@ -60,12 +60,53 @@ def test_replay_integrity_blocks_missing_read_file_absolute_path() -> None:
                 call_key_hash="fixture-read",
                 input_text='{"path": "/tmp/missing-input.txt"}',
                 output_text="No such file or directory",
+                is_error=True,
             ),
         ),
     )
 
     assert ok is False
     assert reason == "missing_input_file"
+
+
+def test_replay_integrity_allows_notfound_text_in_successful_read() -> None:
+    # A successful read whose CONTENT mentions "not found" / "ENOENT" (e.g. docs)
+    # must NOT be flagged -- only a real read error counts (regression for the
+    # false-positive that over-blocked a passing case).
+    ok, reason = replay_integrity(
+        _episode("Make the skill."),
+        (),
+        (
+            EvalToolFixture(
+                tool_name="read_file",
+                call_key_hash="fixture-read",
+                input_text='{"path": "/home/u/.ohmo/skills/x/SKILL.md"}',
+                output_text="if the key is not found raise ENOENT ...",
+                is_error=False,
+            ),
+        ),
+    )
+
+    assert ok is True
+    assert reason is None
+
+
+def test_replay_integrity_blocks_telegram_media_reference_in_gold() -> None:
+    # The file-id lives in the gold reply (an event payload), not this turn's text.
+    ok, reason = replay_integrity(
+        _episode("Now verify the pdf skill works."),
+        (
+            EvalEvent(
+                episode_id="ep-1",
+                kind="gateway_final",
+                payload={"text": "OCR ran on input: AgADabcdefghijklmnop"},
+            ),
+        ),
+        (),
+    )
+
+    assert ok is False
+    assert reason == "unrecoverable_media_ref"
 
 
 def test_replay_integrity_allows_clean_text_and_normal_fixtures() -> None:
