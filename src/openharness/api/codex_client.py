@@ -27,7 +27,7 @@ log = logging.getLogger(__name__)
 
 DEFAULT_CODEX_BASE_URL = "https://chatgpt.com/backend-api"
 JWT_CLAIM_PATH = "https://api.openai.com/auth"
-MAX_RETRIES = 3
+MAX_RETRIES = 5
 BASE_DELAY_SECONDS = 1.0
 MAX_DELAY_SECONDS = 30.0
 
@@ -405,7 +405,25 @@ class CodexApiClient:
             return True
         if isinstance(exc, RequestFailure):
             message = str(exc).lower()
-            return any(term in message for term in ["timeout", "connect", "network", "rate", "overloaded"])
+            return any(
+                term in message
+                for term in [
+                    "timeout",
+                    "connect",
+                    "network",
+                    "rate",
+                    "overloaded",
+                    "you can retry",
+                    "try again",
+                    "temporarily",
+                    "processing your request",
+                    "internal error",
+                    "server_is_overloaded",
+                    "503",
+                    "502",
+                    "500",
+                ]
+            )
         if isinstance(exc, (httpx.TimeoutException, httpx.NetworkError)):
             return True
         return False
