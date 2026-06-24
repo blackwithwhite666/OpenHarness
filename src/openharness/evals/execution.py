@@ -567,6 +567,7 @@ def run_execution_report(
     report_filename: str = "eval_report.json",
     limit: int | None = None,
     samples: int = 1,
+    max_turns: int | None = None,
 ) -> EvalExecutionReportWrite:
     """Run executor-based checks over a runnable eval pack."""
     if limit is not None and limit <= 0:
@@ -641,6 +642,7 @@ def run_execution_report(
             "pack_case_count": len(payload.cases),
             "limit": limit or 0,
             "samples": samples,
+            "max_turns": max_turns,
         },
     )
     path = _report_output_path(store, report_filename)

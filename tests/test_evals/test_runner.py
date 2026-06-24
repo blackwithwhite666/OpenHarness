@@ -700,6 +700,48 @@ async def test_run_query_engine_replay_empty_history_submits_only_prompt(
     assert result.metadata["seeded_history_message_count"] == 0
 
 
+@pytest.mark.asyncio
+async def test_run_query_engine_replay_keeps_partial_answer_on_max_turns(
+    tmp_path: Path,
+):
+    """A truncated run keeps its last *non-empty* assistant text, not "".
+
+    Truncation usually hits mid-tool-loop, so the very last turn is a tool call
+    with empty text; the executor falls back to the last real partial answer.
+    Blanking it made "turn budget too small" indistinguishable from "model said
+    nothing" — both became an empty auto-fail. The run stays flagged.
+    """
+    api_client = _PartialThenLoopApiClient(
+        partial_text="partial progress answer", command="maps-cli search x"
+    )
+    context = _query_replay_context(tmp_path, conversation_history=())
+
+    result = await _run_query_engine_replay(
+        api_client=api_client,
+        model="eval-model",
+        system_prompt="eval system",
+        cwd=tmp_path,
+        max_turns=2,
+        max_tokens=128,
+        prompt="current turn",
+        tool_registry=build_replay_tool_registry(
+            (
+                EvalToolFixture(
+                    tool_name="bash",
+                    call_key_hash="fixture-bash",
+                    output_text="replayed bash output",
+                ),
+            )
+        ),
+        context=context,
+    )
+
+    assert "max_turns_exceeded" in result.event_kind_path
+    assert result.metadata.get("max_turns_exceeded") is True
+    # final turn was a tool call (empty text) -> fall back to the real partial
+    assert result.final_text == "partial progress answer"
+
+
 def test_query_engine_capability_oracle_gates_command_regression(tmp_path: Path):
     """The query-engine runner + capability oracle is a real model-regression gate.
 
@@ -1696,6 +1738,33 @@ class _LoopingBashModelApiClient:
                     )
                 ],
             ),
+            usage=UsageSnapshot(input_tokens=1, output_tokens=1),
+        )
+
+
+class _PartialThenLoopApiClient:
+    """Emits a partial text answer *and* a tool call on the first turn, then loops
+    on the tool — so the run reaches MaxTurnsExceeded after producing a real
+    partial answer whose final turn (a tool call) carries empty text."""
+
+    def __init__(self, *, partial_text: str, command: str) -> None:
+        self._partial_text = partial_text
+        self._command = command
+        self.requests = []
+
+    async def stream_message(self, request):
+        self.requests.append(request)
+        content = [
+            ToolUseBlock(
+                id=f"toolu-bash-{len(self.requests)}",
+                name="bash",
+                input={"command": self._command},
+            )
+        ]
+        if len(self.requests) == 1:
+            content = [TextBlock(text=self._partial_text), *content]
+        yield ApiMessageCompleteEvent(
+            message=ConversationMessage(role="assistant", content=content),
             usage=UsageSnapshot(input_tokens=1, output_tokens=1),
         )
 

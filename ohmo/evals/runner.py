@@ -270,6 +270,7 @@ def run_ohmo_eval_report(
         report_filename=report_filename,
         limit=limit,
         samples=samples,
+        max_turns=max_turns,
         executor=executor,
         scorer=selected_scorer,
         history_context=history_context,

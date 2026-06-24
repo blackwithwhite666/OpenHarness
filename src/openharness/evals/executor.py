@@ -542,6 +542,7 @@ async def _run_query_engine_replay(
     calls_by_id: dict[str, dict[str, Any]] = {}
     event_kind_path: list[str] = ["execution_started"]
     final_text = ""
+    last_nonempty_final_text = ""
     max_turns_exceeded = False
     try:
         async for event in engine.submit_message(prompt):
@@ -565,12 +566,19 @@ async def _run_query_engine_replay(
                 )
             elif isinstance(event, AssistantTurnComplete):
                 final_text = event.message.text
+                if final_text:
+                    last_nonempty_final_text = final_text
                 event_kind_path.append("assistant_turn_complete")
             elif isinstance(event, ErrorEvent):
                 event_kind_path.append("execution_error")
     except MaxTurnsExceeded:
+        # Keep the agent's most recent non-empty assistant text instead of
+        # discarding it. Truncation usually hits mid-tool-loop (the last turn is a
+        # tool call with empty text), so fall back to the last real partial answer.
+        # The run stays flagged via max_turns_exceeded; this stops a too-small turn
+        # budget from masquerading as an empty ("model said nothing") auto-fail.
         max_turns_exceeded = True
-        final_text = ""
+        final_text = last_nonempty_final_text
         event_kind_path.append("max_turns_exceeded")
     event_kind_path.append("execution_completed")
     metadata = {
