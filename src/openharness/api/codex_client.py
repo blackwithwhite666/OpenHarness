@@ -419,12 +419,27 @@ class CodexApiClient:
                     "processing your request",
                     "internal error",
                     "server_is_overloaded",
-                    "503",
-                    "502",
+                    "peer closed",
+                    "incomplete",
+                    "connection reset",
+                    "reset by peer",
+                    "closed connection",
+                    "protocol",
+                    "broken pipe",
+                    "aborted",
+                    "eof",
+                    "unavailable",
+                    "capacity",
                     "500",
+                    "502",
+                    "503",
+                    "504",
+                    "429",
                 ]
             )
-        if isinstance(exc, (httpx.TimeoutException, httpx.NetworkError)):
+        # httpx.TransportError covers timeouts, network errors AND protocol
+        # errors (e.g. RemoteProtocolError "peer closed connection") -- all transient.
+        if isinstance(exc, httpx.TransportError):
             return True
         return False
 
