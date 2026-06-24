@@ -209,6 +209,44 @@ async def test_send_telegram_message_signs_with_sender(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_send_telegram_message_signs_from_reminder_creator(tmp_path: Path):
+    # A reminder turn surfaces the creator as send_ctx.sender_id in the Telegram
+    # "<id>|<username>" form (no username/first_name keys, since the scheduler
+    # only stored the creator's sender_id). The tool must still sign + send,
+    # signing as @<username> — not refuse for lack of a human sender.
+    published: list[OutboundMessage] = []
+
+    async def send_outbound(message: OutboundMessage) -> None:
+        published.append(message)
+
+    store = ContactStore(tmp_path)
+    store.record_inbound(channel="telegram", chat_id="123", username="alice")
+    tool = SendTelegramMessageTool(store, send_outbound)
+
+    result = await tool.execute(
+        SendTelegramMessageInput(recipient="@alice", text="Hello Alice"),
+        ToolExecutionContext(
+            cwd=tmp_path,
+            metadata={
+                "ohmo_send_ctx": {
+                    "sender_id": "42|valeria",
+                    "username": "",
+                    "first_name": "",
+                    "display_name": "",
+                }
+            },
+        ),
+    )
+
+    assert not result.is_error
+    assert len(published) == 1
+    content = published[0].content
+    assert "Hello Alice" in content
+    assert "@valeria" in content
+    assert "через бота" in content
+
+
+@pytest.mark.asyncio
 async def test_send_telegram_message_fuzzy_match_suggests_without_sending(tmp_path: Path):
     published: list[OutboundMessage] = []
 

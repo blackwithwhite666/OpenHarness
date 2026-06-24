@@ -176,7 +176,7 @@ async def test_cancel_between_snapshot_and_fire_is_not_delivered() -> None:
 
 async def test_agentic_publishes_inbound() -> None:
     store = ReminderStore()
-    store.add(_reminder("r1", mode="agentic"))
+    store.add(_reminder("r1", mode="agentic", created_by="42|valeria"))
     bus = FakeBus()
     sched = _make_scheduler(bus, store)
 
@@ -189,6 +189,9 @@ async def test_agentic_publishes_inbound() -> None:
     assert msg.session_key_override == "telegram:100"
     assert msg.metadata["_synthetic"] is True
     assert msg.content == "ping-r1"
+    # The creator is carried so a tool fired from this synthetic turn can sign
+    # on the human's behalf instead of refusing (no identifiable sender).
+    assert msg.metadata["_reminder_created_by"] == "42|valeria"
 
 
 async def test_catchup_once_fires_one_then_advances() -> None:

@@ -326,8 +326,14 @@ class OhmoSessionRuntimePool:
                 "is_group": _is_group_message(message),
                 "tz": message.metadata.get("tz") or "",
             }
+            # A synthetic reminder turn has sender_id=__scheduler__ (no identifiable
+            # human), but the reminder carries who scheduled it. Surface that creator
+            # as the send sender_id so send_telegram_message can sign on their behalf
+            # instead of refusing the whole turn (the creator's id is the same
+            # "<id>|<username>" shape _sender_label already parses).
+            reminder_created_by = str(message.metadata.get("_reminder_created_by") or "").strip()
             engine_metadata["ohmo_send_ctx"] = {
-                "sender_id": str(message.sender_id),
+                "sender_id": reminder_created_by or str(message.sender_id),
                 "username": str(message.metadata.get("username") or "").strip(),
                 "first_name": str(message.metadata.get("first_name") or "").strip(),
                 "display_name": str(message.metadata.get("sender_display_name") or "").strip(),

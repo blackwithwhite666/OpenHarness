@@ -203,7 +203,16 @@ class ReminderScheduler:
                 chat_id=reminder.chat_id,
                 content=reminder.summary,
                 session_key_override=reminder.session_key,
-                metadata={"_synthetic": True, "_reminder_id": reminder.id},
+                # ``_reminder_created_by`` carries the human who scheduled this
+                # reminder (the creator's channel sender_id, e.g. Telegram
+                # "<id>|<username>"). The turn itself is synthetic
+                # (sender_id=__scheduler__), but a tool like send_telegram_message
+                # can sign on the creator's behalf — see runtime ohmo_send_ctx.
+                metadata={
+                    "_synthetic": True,
+                    "_reminder_id": reminder.id,
+                    "_reminder_created_by": reminder.created_by,
+                },
             )
         )
 
