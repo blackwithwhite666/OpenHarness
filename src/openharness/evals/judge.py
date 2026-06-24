@@ -25,10 +25,16 @@ if TYPE_CHECKING:
 
 
 DEFAULT_TRAJECTORY_JUDGE_SYSTEM_PROMPT = (
-    "You are an evaluation judge. Judge whether the agent accomplished the "
-    "user's request from the observed trajectory and final answer. Tolerate a "
-    "different but valid tool path. Reply with the first word PASS or FAIL, "
-    "then one short sentence explaining why."
+    "You are an evaluation judge. Decide whether the agent ACCOMPLISHED THE "
+    "USER'S REQUEST, judging from the observed trajectory and the final answer. "
+    "The gold answer is ONE acceptable reference, NOT a required template: the "
+    "agent's answer need not match its wording, structure, ordering, or level of "
+    "detail. PASS when the answer is correct and responsive to what the user "
+    "actually asked -- even if it is shorter, organized differently, or omits "
+    "extra facts the gold happened to include. Tolerate a different-but-valid "
+    "tool path. FAIL only if the answer is wrong, off-topic, or omits something "
+    "the USER EXPLICITLY asked for. Reply with the first word PASS or FAIL, then "
+    "one short sentence explaining why."
 )
 _VERDICT_RE = re.compile(r"^\s*([A-Za-z]+)\b(.*)$", re.DOTALL)
 
@@ -127,15 +133,19 @@ def _judge_prompt(
         else "No observed tool calls."
     )
     reference = (
-        "\n\nAccepted outcome reference from the gold run:\n"
+        "\n\nONE acceptable reference answer (NOT a required template -- the "
+        "agent's answer need not match its wording, structure, or completeness):\n"
         f"{accepted_outcome.strip()}"
         if accepted_outcome.strip()
         else ""
     )
     return (
-        "Judge by trajectory and outcome: did the agent accomplish the user's "
-        "request? Tolerate a different-but-valid tool path. Reply with the "
-        "FIRST word PASS or FAIL, then one short sentence why.\n\n"
+        "Did the agent accomplish the user's request? Grade task accomplishment, "
+        "NOT similarity to the reference. PASS a correct, responsive answer even "
+        "if it is shorter or organized differently than the reference; FAIL only "
+        "if it is wrong, off-topic, or misses something the user EXPLICITLY asked "
+        "for. Tolerate a different-but-valid tool path. Reply with the FIRST word "
+        "PASS or FAIL, then one short sentence why.\n\n"
         f"User goal:\n{user_goal.strip()}\n\n"
         f"Observed trajectory:\n{trajectory}\n\n"
         f"Agent final answer:\n{final_answer.strip()}"
