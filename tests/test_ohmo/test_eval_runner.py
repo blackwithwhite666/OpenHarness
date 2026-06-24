@@ -958,6 +958,8 @@ def test_build_fs_sandbox_runner_config_uses_query_engine_settings(
     assert config.agent_runner._max_turns == 5
     assert config.agent_runner._net_mode == "none"
     assert config.agent_runner._proxy_url is None
+    assert config.agent_runner._browser_socket is None
+    assert config.agent_runner._browser_cli_name is None
     assert config.agent_runner._live_mcp_server_names == ()
 
 
@@ -984,11 +986,15 @@ def test_build_fs_sandbox_runner_config_enables_live_google_for_netns(
         max_turns=5,
         sandbox_net_mode="netns:evalns",
         sandbox_proxy_url="http://10.77.0.1:3128",
+        sandbox_browser_socket="/tmp/browser-cli-ohmo.sock",
+        sandbox_browser_name="ohmo",
     )
 
     assert isinstance(config.agent_runner, FsSandboxAgentRunner)
     assert config.agent_runner._net_mode == "netns:evalns"
     assert config.agent_runner._proxy_url == "http://10.77.0.1:3128"
+    assert config.agent_runner._browser_socket == "/tmp/browser-cli-ohmo.sock"
+    assert config.agent_runner._browser_cli_name == "ohmo"
     assert config.agent_runner._live_mcp_server_names == ("google_search",)
 
 

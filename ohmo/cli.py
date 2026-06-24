@@ -1620,6 +1620,16 @@ def evals_run_cmd(
         "--sandbox-proxy-url",
         help="Proxy URL injected into fs-sandbox bash as HTTP(S)_PROXY",
     ),
+    sandbox_browser_socket: str | None = typer.Option(
+        None,
+        "--sandbox-browser-socket",
+        help="browser-cli daemon AF_UNIX socket bind-mounted into fs-sandbox bash",
+    ),
+    sandbox_browser_name: str | None = typer.Option(
+        None,
+        "--sandbox-browser-name",
+        help="BROWSER_CLI_NAME injected into fs-sandbox bash",
+    ),
     report_only: bool = typer.Option(
         False,
         "--report-only",
@@ -1685,9 +1695,16 @@ def evals_run_cmd(
             "fixture_match": fixture_match,
             "max_turns": max_turns,
         }
-        if sandbox_net_mode != "none" or sandbox_proxy_url is not None:
+        if (
+            sandbox_net_mode != "none"
+            or sandbox_proxy_url is not None
+            or sandbox_browser_socket is not None
+            or sandbox_browser_name is not None
+        ):
             run_kwargs["sandbox_net_mode"] = sandbox_net_mode
             run_kwargs["sandbox_proxy_url"] = sandbox_proxy_url
+            run_kwargs["sandbox_browser_socket"] = sandbox_browser_socket
+            run_kwargs["sandbox_browser_name"] = sandbox_browser_name
         if judge_profile is not None:
             run_kwargs["judge_profile"] = judge_profile
         if judge_model is not None:

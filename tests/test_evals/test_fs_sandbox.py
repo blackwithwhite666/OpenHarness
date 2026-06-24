@@ -84,6 +84,55 @@ def test_build_bwrap_argv_net_modes_and_binds(tmp_path: Path):
     )
 
 
+def test_build_bwrap_argv_browser_socket_bind_and_env(tmp_path: Path):
+    home = tmp_path / "home"
+    cwd = tmp_path / "cwd"
+    tmp_bind = tmp_path / "tmp"
+    for path in (home, cwd, tmp_bind):
+        path.mkdir()
+
+    argv = build_bwrap_argv(
+        sandbox_root=tmp_path / "sandbox",
+        cwd=cwd,
+        home=home,
+        ro_binds=(),
+        rw_binds=((tmp_bind, Path("/tmp")),),
+        net_mode="none",
+        browser_socket="/tmp/browser-cli-ohmo.sock",
+        browser_cli_name="ohmo",
+    )
+
+    assert _contains_subsequence(
+        argv,
+        ["--bind", "/tmp/browser-cli-ohmo.sock", "/tmp/browser-cli-ohmo.sock"],
+    )
+    assert _contains_subsequence(argv, ["--setenv", "BROWSER_CLI_NAME", "ohmo"])
+    tmp_bind_index = _subsequence_index(argv, ["--bind", str(tmp_bind), "/tmp"])
+    socket_bind_index = _subsequence_index(
+        argv,
+        ["--bind", "/tmp/browser-cli-ohmo.sock", "/tmp/browser-cli-ohmo.sock"],
+    )
+    assert tmp_bind_index < socket_bind_index
+
+    omitted = build_bwrap_argv(
+        sandbox_root=tmp_path / "sandbox",
+        cwd=cwd,
+        home=home,
+        ro_binds=(),
+        rw_binds=((tmp_bind, Path("/tmp")),),
+        net_mode="none",
+    )
+
+    assert not _contains_subsequence(
+        omitted,
+        ["--bind", "/tmp/browser-cli-ohmo.sock", "/tmp/browser-cli-ohmo.sock"],
+    )
+    assert not _contains_subsequence(
+        omitted,
+        ["--setenv", "BROWSER_CLI_NAME", "ohmo"],
+    )
+
+
 def test_assemble_fs_copies_mutable_dirs_and_builds_remap(tmp_path: Path):
     root = tmp_path / "sandbox"
     home = tmp_path / "home"
@@ -284,6 +333,8 @@ def test_fs_sandbox_agent_runner_overrides_tools_and_cleans_up(tmp_path: Path):
 
     bash_tool = registry.get("bash")
     assert isinstance(bash_tool, FsSandboxBashTool)
+    assert bash_tool._browser_socket is None
+    assert bash_tool._browser_cli_name is None
     home_bin = (Path.home() / "bin").resolve()
     if home_bin.exists():
         assert home_bin in bash_tool._ro_binds
@@ -291,7 +342,7 @@ def test_fs_sandbox_agent_runner_overrides_tools_and_cleans_up(tmp_path: Path):
     assert not (tmp_path / "note.txt").exists()
 
 
-def test_fs_sandbox_agent_runner_threads_netns_proxy_to_bash_tool(
+def test_fs_sandbox_agent_runner_threads_netns_proxy_browser_to_bash_tool(
     tmp_path: Path,
     monkeypatch,
 ):
@@ -308,6 +359,8 @@ def test_fs_sandbox_agent_runner_threads_netns_proxy_to_bash_tool(
         cwd=tmp_path,
         net_mode="netns:evalns",
         proxy_url="http://10.77.0.1:3128",
+        browser_socket="/tmp/browser-cli-ohmo.sock",
+        browser_cli_name="ohmo",
         live_mcp_server_names=("google_search",),
     )
     registry = build_replay_tool_registry(())
@@ -330,6 +383,8 @@ def test_fs_sandbox_agent_runner_threads_netns_proxy_to_bash_tool(
         rw_binds=bash_tool._rw_binds,
         net_mode=bash_tool._net_mode,
         proxy_url=bash_tool._proxy_url,
+        browser_socket=bash_tool._browser_socket,
+        browser_cli_name=bash_tool._browser_cli_name,
         uid=123,
         gid=456,
     ) + ["bash", "-lc", "echo ok"]
@@ -343,12 +398,25 @@ def test_fs_sandbox_agent_runner_threads_netns_proxy_to_bash_tool(
         argv,
         ["--setenv", "HTTPS_PROXY", "http://10.77.0.1:3128"],
     )
+    assert _contains_subsequence(
+        argv,
+        ["--bind", "/tmp/browser-cli-ohmo.sock", "/tmp/browser-cli-ohmo.sock"],
+    )
+    assert _contains_subsequence(argv, ["--setenv", "BROWSER_CLI_NAME", "ohmo"])
     assert argv[-3:] == ["bash", "-lc", "echo ok"]
 
 
 def _contains_subsequence(items: list[str], expected: list[str]) -> bool:
     width = len(expected)
     return any(items[index : index + width] == expected for index in range(len(items)))
+
+
+def _subsequence_index(items: list[str], expected: list[str]) -> int:
+    width = len(expected)
+    for index in range(len(items)):
+        if items[index : index + width] == expected:
+            return index
+    raise AssertionError(f"{expected!r} not found in {items!r}")
 
 
 class _RecordingMockTool(BaseTool):

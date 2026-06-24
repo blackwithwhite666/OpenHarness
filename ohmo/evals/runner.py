@@ -156,6 +156,8 @@ def run_ohmo_eval_report(
     max_turns: int = 8,
     sandbox_net_mode: str = "none",
     sandbox_proxy_url: str | None = None,
+    sandbox_browser_socket: str | None = None,
+    sandbox_browser_name: str | None = None,
 ) -> OhmoEvalRunResult:
     """Run deterministic replay-tools execution checks over an Ohmo eval pack."""
     if max_turns < 1:
@@ -233,10 +235,17 @@ def run_ohmo_eval_report(
             model=history_config.model,
         )
     agent_runner_kwargs: dict[str, object] = {}
-    if sandbox_net_mode != "none" or sandbox_proxy_url is not None:
+    if (
+        sandbox_net_mode != "none"
+        or sandbox_proxy_url is not None
+        or sandbox_browser_socket is not None
+        or sandbox_browser_name is not None
+    ):
         agent_runner_kwargs = {
             "sandbox_net_mode": sandbox_net_mode,
             "sandbox_proxy_url": sandbox_proxy_url,
+            "sandbox_browser_socket": sandbox_browser_socket,
+            "sandbox_browser_name": sandbox_browser_name,
         }
     agent_runner_config = _build_agent_runner_config(
         agent_runner_name,
@@ -559,6 +568,8 @@ def _build_agent_runner_config(
     max_turns: int = 8,
     sandbox_net_mode: str = "none",
     sandbox_proxy_url: str | None = None,
+    sandbox_browser_socket: str | None = None,
+    sandbox_browser_name: str | None = None,
 ) -> _AgentRunnerConfig:
     normalized = agent_runner_name.strip().lower()
     if normalized not in _SUPPORTED_AGENT_RUNNERS:
@@ -618,6 +629,8 @@ def _build_agent_runner_config(
                 max_turns=max_turns,
                 net_mode=sandbox_net_mode,
                 proxy_url=sandbox_proxy_url,
+                browser_socket=sandbox_browser_socket,
+                browser_cli_name=sandbox_browser_name,
                 live_mcp_server_names=(
                     ("google_search",) if sandbox_net_mode.startswith("netns:") else ()
                 ),

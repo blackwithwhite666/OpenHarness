@@ -1689,6 +1689,10 @@ def test_ohmo_evals_run_command_threads_fs_sandbox_network_options(
             "netns:evalns",
             "--sandbox-proxy-url",
             "http://10.77.0.1:3128",
+            "--sandbox-browser-socket",
+            "/tmp/browser-cli-ohmo.sock",
+            "--sandbox-browser-name",
+            "ohmo",
         ],
     )
 
@@ -1696,6 +1700,8 @@ def test_ohmo_evals_run_command_threads_fs_sandbox_network_options(
     assert calls[0]["agent_runner_name"] == "fs-sandbox"
     assert calls[0]["sandbox_net_mode"] == "netns:evalns"
     assert calls[0]["sandbox_proxy_url"] == "http://10.77.0.1:3128"
+    assert calls[0]["sandbox_browser_socket"] == "/tmp/browser-cli-ohmo.sock"
+    assert calls[0]["sandbox_browser_name"] == "ohmo"
 
 
 def test_ohmo_evals_run_command_threads_live_read_agent_runner(
@@ -2548,7 +2554,8 @@ def test_ohmo_evals_run_command_help_lists_supported_executor_and_runner_ids():
     assert "--agent-runner" in output
     assert "--samples" in output
     assert "Agent runner to use inside the" in output
-    assert "executor: scripted," in output
+    assert "inside the executor:" in output
+    assert "scripted," in output
     assert "query-engine" in output
     assert "query-engine-live-read" in output
 

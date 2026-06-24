@@ -78,6 +78,8 @@ def build_bwrap_argv(
     uid: int | None = None,
     gid: int | None = None,
     proxy_url: str | None = None,
+    browser_socket: str | None = None,
+    browser_cli_name: str | None = None,
 ) -> list[str]:
     """Build the bubblewrap argv used for real bash execution."""
     del sandbox_root
@@ -125,6 +127,10 @@ def build_bwrap_argv(
         dest = Path(raw_dest).expanduser()
         bwrap_argv.extend(["--bind", str(src), str(dest)])
 
+    if browser_socket:
+        socket_path = str(Path(browser_socket).expanduser())
+        bwrap_argv.extend(["--bind", socket_path, socket_path])
+
     bwrap_argv.extend(
         [
             "--setenv",
@@ -146,6 +152,8 @@ def build_bwrap_argv(
                 proxy_url,
             ]
         )
+    if browser_cli_name:
+        bwrap_argv.extend(["--setenv", "BROWSER_CLI_NAME", browser_cli_name])
     bwrap_argv.extend(
         [
             "--chdir",
@@ -252,6 +260,8 @@ class FsSandboxBashTool(BaseTool):
         rw_binds: Iterable[tuple[str | Path, str | Path]],
         net_mode: str = "none",
         proxy_url: str | None = None,
+        browser_socket: str | None = None,
+        browser_cli_name: str | None = None,
         timeout: float = 120.0,
     ) -> None:
         self._mock_tool = mock_tool
@@ -265,6 +275,8 @@ class FsSandboxBashTool(BaseTool):
         )
         self._net_mode = net_mode
         self._proxy_url = proxy_url
+        self._browser_socket = browser_socket
+        self._browser_cli_name = browser_cli_name
         self._timeout = timeout
 
     async def execute(
@@ -283,6 +295,8 @@ class FsSandboxBashTool(BaseTool):
             rw_binds=self._rw_binds,
             net_mode=self._net_mode,
             proxy_url=self._proxy_url,
+            browser_socket=self._browser_socket,
+            browser_cli_name=self._browser_cli_name,
         ) + ["bash", "-lc", command]
         metadata = {"lane": "fs-sandbox", "net_mode": self._net_mode}
         try:
@@ -459,6 +473,8 @@ class FsSandboxAgentRunner:
         timeout: float = 120.0,
         net_mode: str = "none",
         proxy_url: str | None = None,
+        browser_socket: str | None = None,
+        browser_cli_name: str | None = None,
         live_mcp_server_names: tuple[str, ...] = (),
         mutable_dirs: Iterable[str | Path] = ("memory", "todos", "reminders", "user.md"),
         ro_source_dirs: Iterable[str | Path] | None = None,
@@ -472,6 +488,8 @@ class FsSandboxAgentRunner:
         self._timeout = timeout
         self._net_mode = net_mode
         self._proxy_url = proxy_url
+        self._browser_socket = browser_socket
+        self._browser_cli_name = browser_cli_name
         self._live_mcp_server_names = tuple(live_mcp_server_names)
         self._mutable_dirs = tuple(mutable_dirs)
         self._ro_source_dirs = (
@@ -562,6 +580,8 @@ class FsSandboxAgentRunner:
                         rw_binds=plan.rw_binds,
                         net_mode=self._net_mode,
                         proxy_url=self._proxy_url,
+                        browser_socket=self._browser_socket,
+                        browser_cli_name=self._browser_cli_name,
                         timeout=self._timeout,
                     )
                 )
