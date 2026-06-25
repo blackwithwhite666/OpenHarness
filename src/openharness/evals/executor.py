@@ -6,6 +6,7 @@ import asyncio
 import shutil
 import tempfile
 import threading
+import time
 from collections.abc import Callable, Coroutine, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -103,6 +104,9 @@ class EvalObservedCall:
     tool_name: str
     arguments: dict[str, Any] = field(default_factory=dict)
     is_error: bool = False
+    output: str = ""
+    started_ms: int | None = None
+    ended_ms: int | None = None
 
 
 @dataclass(frozen=True)
@@ -551,7 +555,10 @@ async def _run_query_engine_replay(
                 entry = {
                     "tool_name": event.tool_name,
                     "arguments": dict(event.tool_input or {}),
+                    "output": "",
                     "is_error": False,
+                    "started_ms": int(time.time() * 1000),
+                    "ended_ms": None,
                 }
                 observed_calls.append(entry)
                 if event.tool_call_id:
@@ -561,6 +568,8 @@ async def _run_query_engine_replay(
                 entry = calls_by_id.get(event.tool_call_id)
                 if entry is not None:
                     entry["is_error"] = event.is_error
+                    entry["output"] = event.output
+                    entry["ended_ms"] = int(time.time() * 1000)
                 event_kind_path.append(
                     "tool_completed_error" if event.is_error else "tool_completed"
                 )

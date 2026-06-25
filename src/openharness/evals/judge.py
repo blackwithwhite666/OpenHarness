@@ -89,6 +89,7 @@ class TrajectoryJudgeScorer:
                 "observed_capability_count": len(observed),
                 "had_tool_error": any(item["is_error"] for item in observed),
             },
+            raw_reason=reason,
         )
 
     async def _complete(self, prompt: str) -> str:

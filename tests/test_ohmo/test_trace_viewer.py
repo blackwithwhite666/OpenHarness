@@ -141,6 +141,51 @@ def test_eval_report_lane_lists_and_renders_metadata_traces(tmp_path: Path) -> N
     assert route_trace.json()["goldEpisodeId"] == "ep-gold"
 
 
+def test_eval_case_to_trace_viewer_data_prefers_rich_trace(tmp_path: Path) -> None:
+    store = get_eval_store(tmp_path)
+    _write_eval_report(store)
+    _write_rich_eval_trace(store)
+
+    data = eval_case_to_trace_viewer_data(store, "eval_report_x.json", "case-1")
+
+    assert data["goldEpisodeId"] == "ep-gold"
+    assert data["traceRecord"]["spansCount"] == 2
+    assert data["traceRecord"]["durationMs"] == 250
+    assert data["traceRecord"]["agentDescription"] == "replay-tools · trajectory_judge_v1"
+    assert data["badges"] == [
+        {"label": "score 0.9"},
+        {"label": "failed"},
+        {"label": "1/3"},
+        {"label": "judge: fail"},
+    ]
+
+    root = data["spans"][0]
+    assert root["status"] == "error"
+    assert root["input"] == "покажи отзывы Xander"
+    assert root["output"] == "нашёл два отзыва"
+    assert root["startTimeMs"] == 1_000
+    assert root["endTimeMs"] == 1_250
+    assert root["durationMs"] == 250
+    attributes = {item["key"]: item["value"]["stringValue"] for item in root["attributes"]}
+    assert attributes["judge_verdict"] == "fail"
+    assert attributes["judge_reason"] == "final answer missed one required detail"
+
+    assert len(root["children"]) == 1
+    child = root["children"][0]
+    assert child["title"] == "bash:maps-cli reviews"
+    assert child["type"] == "tool_execution"
+    assert child["status"] == "success"
+    assert child["input"] == json.dumps(
+        {"command": "maps-cli reviews Xander"},
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    assert child["output"] == "review one\nreview two"
+    assert child["startTimeMs"] == 1_000
+    assert child["endTimeMs"] == 1_250
+    assert child["durationMs"] > 0
+
+
 def _append_trace_episode(
     store,
     *,
@@ -284,5 +329,36 @@ def _write_eval_report(store) -> None:
     reports_dir.mkdir(parents=True, exist_ok=True)
     (reports_dir / "eval_report_x.json").write_text(
         json.dumps(report, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+
+def _write_rich_eval_trace(store) -> None:
+    rich_trace = {
+        "case_id": "case-1",
+        "sample_index": 0,
+        "prompt": "покажи отзывы Xander",
+        "final_text": "нашёл два отзыва",
+        "tool_calls": [
+            {
+                "tool_name": "bash",
+                "input": {"command": "maps-cli reviews Xander"},
+                "output": "review one\nreview two",
+                "is_error": False,
+                "started_ms": 1_000,
+                "ended_ms": 1_250,
+            }
+        ],
+        "judge": {
+            "verdict": "fail",
+            "reason": "final answer missed one required detail",
+        },
+        "score": 0.9,
+        "passed": False,
+    }
+    trace_dir = store.root / "traces" / "report-x"
+    trace_dir.mkdir(parents=True, exist_ok=True)
+    (trace_dir / "case-1-0.json").write_text(
+        json.dumps(rich_trace, ensure_ascii=False),
         encoding="utf-8",
     )

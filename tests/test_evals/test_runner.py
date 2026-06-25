@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -9,22 +10,28 @@ import pytest
 
 from openharness.api.client import ApiMessageCompleteEvent
 from openharness.api.usage import UsageSnapshot
-from openharness.engine.messages import ConversationMessage, TextBlock, ToolResultBlock, ToolUseBlock
+from openharness.engine.messages import (
+    ConversationMessage,
+    TextBlock,
+    ToolResultBlock,
+    ToolUseBlock,
+)
 from openharness.evals import (
     EvalEpisode,
     EvalEvent,
     EvalExecutionContext,
-    EvalExecutorResult,
     EvalExecutionScorerResult,
+    EvalExecutorResult,
     EvalObservedCall,
-    QueryEngineEvalAgentRunner,
-    ReplayToolsExecutor,
-    EvalToolFixture,
     EvalResource,
     EvalResourceSnapshot,
     EvalRunPack,
     EvalRunPackCase,
     EvalStore,
+    EvalToolFixture,
+    QueryEngineEvalAgentRunner,
+    ReplayToolsExecutor,
+    TrajectoryJudgeScorer,
     build_case_candidates,
     build_case_drafts,
     build_replay_tool_registry,
@@ -340,6 +347,95 @@ def test_execution_report_query_engine_runner_uses_reconstructed_prompt_and_repl
     assert "private model prompt" not in serialized
     assert "private raw tool output" not in serialized
     assert "model final from replayed tool" not in serialized
+
+
+def test_execution_report_query_engine_writes_rich_trace_and_keeps_report_private(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    raw_judge_reason = "private raw judge reason"
+
+    def _make_pack(root: Path) -> tuple[EvalStore, EvalRunPack]:
+        store = EvalStore(root)
+        _add_episode(
+            store,
+            episode_id="ep-1",
+            user_text="private trace prompt",
+            final_text="model final from replayed tool",
+            tool_name="web_fetch",
+        )
+        drafts = build_case_drafts(store, build_case_candidates(store))
+        write_case_draft_pack(store, drafts)
+        promote_case_drafts(store, case_ids=[drafts[0].case_id])
+        return store, write_run_pack(store).pack
+
+    def _run(store: EvalStore, pack: EvalRunPack):
+        return run_execution_report(
+            store,
+            pack=pack,
+            executor=ReplayToolsExecutor(
+                agent_runner=QueryEngineEvalAgentRunner(
+                    api_client=_RecordingReplayApiClient(),
+                    model="eval-model",
+                    system_prompt="eval system",
+                    cwd=tmp_path,
+                )
+            ),
+            scorer=TrajectoryJudgeScorer(
+                api_client=_FinalOnlyModelApiClient(
+                    final_text=f"PASS {raw_judge_reason}"
+                ),
+                model="judge-model",
+            ),
+        )
+
+    monkeypatch.delenv("OHMO_EVALS_TRACE_CAPTURE", raising=False)
+    store, pack = _make_pack(tmp_path / "evals-enabled")
+    result = _run(store, pack)
+
+    trace_path = (
+        store.root
+        / "traces"
+        / result.report.report_id
+        / f"{pack.cases[0].case_id}-0.json"
+    )
+    assert trace_path.exists()
+    trace = json.loads(trace_path.read_text(encoding="utf-8"))
+    assert trace["case_id"] == pack.cases[0].case_id
+    assert trace["sample_index"] == 0
+    assert trace["prompt"] == "private trace prompt"
+    assert trace["final_text"] == "model final from replayed tool"
+    assert trace["judge"] == {"verdict": "pass", "reason": raw_judge_reason}
+    assert trace["score"] == 1.0
+    assert trace["passed"] is True
+    assert trace["tool_calls"] == [
+        {
+            "tool_name": "web_fetch",
+            "input": {"query": "private raw tool input"},
+            "output": '{"text": "private raw tool output"}',
+            "is_error": False,
+            "started_ms": trace["tool_calls"][0]["started_ms"],
+            "ended_ms": trace["tool_calls"][0]["ended_ms"],
+        }
+    ]
+    assert isinstance(trace["tool_calls"][0]["started_ms"], int)
+    assert isinstance(trace["tool_calls"][0]["ended_ms"], int)
+    assert trace["tool_calls"][0]["ended_ms"] >= trace["tool_calls"][0]["started_ms"]
+
+    serialized_report = result.path.read_text(encoding="utf-8")
+    assert raw_judge_reason not in serialized_report
+    assert "raw_judge_reason" not in serialized_report
+
+    monkeypatch.setenv("OHMO_EVALS_TRACE_CAPTURE", "0")
+    disabled_store, disabled_pack = _make_pack(tmp_path / "evals-disabled")
+    disabled = _run(disabled_store, disabled_pack)
+    disabled_trace_path = (
+        disabled_store.root
+        / "traces"
+        / disabled.report.report_id
+        / f"{disabled_pack.cases[0].case_id}-0.json"
+    )
+    assert not disabled_trace_path.exists()
 
 
 def test_session_conversation_history_falls_back_to_raw_and_filters_same_session_turns(

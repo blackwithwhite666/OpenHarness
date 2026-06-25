@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from openharness.evals.tool_labels import effective_tool_label
 from ohmo.evals.viewer.adapter import category_for
 
 EXECUTION_REPORT_KIND = "execution_report"
@@ -45,7 +46,12 @@ def list_eval_traces(store: Any, run: str) -> dict[str, Any]:
     return {"traces": traces, "total": len(traces)}
 
 
-def eval_case_to_trace_viewer_data(store: Any, run: str, case_id: str) -> dict[str, Any]:
+def eval_case_to_trace_viewer_data(
+    store: Any,
+    run: str,
+    case_id: str,
+    sample: int = 0,
+) -> dict[str, Any]:
     """Return one eval report case as the JSON-friendly trace viewer DTO."""
     report = _read_execution_report(store, run)
     case = _find_case(report, case_id)
@@ -66,6 +72,29 @@ def eval_case_to_trace_viewer_data(store: Any, run: str, case_id: str) -> dict[s
     sample_count = _int_value(case_metadata.get("sample_count"))
     score = case.get("score")
     gold_episode_id = _string_value(context.get("episode_id"))
+    badges = _case_badges(case, score=score, pass_count=pass_count, sample_count=sample_count)
+
+    rich_trace = _read_rich_trace_or_none(
+        store,
+        report_id=_string_value(report.get("report_id")),
+        case_id=case_id,
+        sample=sample,
+    )
+    if rich_trace is not None:
+        return _rich_trace_viewer_data(
+            case_id=case_id,
+            case=case,
+            rich_trace=rich_trace,
+            status=status,
+            scorer=scorer,
+            executor=executor,
+            fixture_match=fixture_match,
+            pass_count=pass_count,
+            sample_count=sample_count,
+            score=score,
+            gold_episode_id=gold_episode_id,
+            badges=badges,
+        )
 
     child_spans = [
         _tool_call_span(
@@ -111,11 +140,75 @@ def eval_case_to_trace_viewer_data(store: Any, run: str, case_id: str) -> dict[s
         },
         "spans": [root_span],
         "goldEpisodeId": gold_episode_id,
-        "badges": [
-            {"label": f"score {_label_value(score)}"},
-            {"label": _string_value(case.get("status")) or ""},
-            {"label": f"{_label_value(pass_count)}/{_label_value(sample_count)}"},
-        ],
+        "badges": badges,
+    }
+
+
+def _rich_trace_viewer_data(
+    *,
+    case_id: str,
+    case: dict[str, Any],
+    rich_trace: dict[str, Any],
+    status: str,
+    scorer: str | None,
+    executor: str | None,
+    fixture_match: str | None,
+    pass_count: int,
+    sample_count: int,
+    score: Any,
+    gold_episode_id: str | None,
+    badges: list[dict[str, str]],
+) -> dict[str, Any]:
+    tool_calls = _sequence_of_mappings(rich_trace.get("tool_calls"))
+    child_spans = [
+        _rich_tool_call_span(case_id=case_id, index=index, tool_call=tool_call)
+        for index, tool_call in enumerate(tool_calls, start=1)
+    ]
+    start_ms, end_ms = _rich_trace_bounds_ms(tool_calls)
+    duration_ms = max(0, end_ms - start_ms)
+    judge = _mapping(rich_trace.get("judge"))
+    judge_verdict = _string_value(judge.get("verdict"))
+    judge_reason = _string_value(judge.get("reason"))
+    if judge_verdict:
+        badges = [*badges, {"label": f"judge: {judge_verdict}"}]
+
+    root_span = {
+        "id": case_id,
+        "title": case_id,
+        "startTimeMs": start_ms,
+        "endTimeMs": end_ms,
+        "durationMs": duration_ms,
+        "type": "agent_invocation",
+        "status": status,
+        "input": _text_or_json(rich_trace.get("prompt")),
+        "output": _text_or_json(rich_trace.get("final_text")),
+        "raw": _json_dumps({"case": case, "trace": rich_trace}),
+        "attributes": _root_attributes(
+            scorer=scorer,
+            executor=executor,
+            fixture_match=fixture_match,
+            pass_count=pass_count,
+            sample_count=sample_count,
+            score=score,
+            gold_episode_id=gold_episode_id,
+            judge_verdict=judge_verdict,
+            judge_reason=judge_reason,
+        ),
+        "children": child_spans,
+    }
+
+    return {
+        "traceRecord": {
+            "id": case_id,
+            "name": case_id,
+            "spansCount": 1 + len(child_spans),
+            "durationMs": duration_ms,
+            "agentDescription": _agent_description(executor, scorer),
+            "startTimeMs": start_ms,
+        },
+        "spans": [root_span],
+        "goldEpisodeId": gold_episode_id,
+        "badges": badges,
     }
 
 
@@ -163,6 +256,32 @@ def _tool_call_span(
     }
 
 
+def _rich_tool_call_span(
+    *,
+    case_id: str,
+    index: int,
+    tool_call: dict[str, Any],
+) -> dict[str, Any]:
+    tool_name = _string_value(tool_call.get("tool_name")) or ""
+    input_value = tool_call.get("input")
+    start_ms = _int_value(tool_call.get("started_ms"))
+    end_ms = _int_value(tool_call.get("ended_ms"))
+    return {
+        "id": f"{case_id}:tool:{index}",
+        "title": effective_tool_label(tool_name, input_value),
+        "startTimeMs": start_ms,
+        "endTimeMs": end_ms,
+        "durationMs": max(0, end_ms - start_ms),
+        "type": category_for(tool_name),
+        "status": "error" if bool(tool_call.get("is_error")) else "success",
+        "input": _json_or_none(input_value),
+        "output": _text_or_json(tool_call.get("output")),
+        "raw": _json_dumps(tool_call),
+        "attributes": _tool_attributes(tool_call, ordinal=index),
+        "children": [],
+    }
+
+
 def _root_attributes(
     *,
     scorer: str | None,
@@ -172,6 +291,8 @@ def _root_attributes(
     sample_count: int,
     score: Any,
     gold_episode_id: str | None,
+    judge_verdict: Any = None,
+    judge_reason: Any = None,
 ) -> list[dict[str, dict[str, str] | str]]:
     attributes: list[dict[str, dict[str, str] | str]] = []
     _append_attribute(attributes, "scorer", scorer)
@@ -181,6 +302,8 @@ def _root_attributes(
     _append_attribute(attributes, "sample_count", sample_count)
     _append_attribute(attributes, "score", score)
     _append_attribute(attributes, "gold_episode_id", gold_episode_id)
+    _append_attribute(attributes, "judge_verdict", judge_verdict)
+    _append_attribute(attributes, "judge_reason", judge_reason)
     return attributes
 
 
@@ -220,15 +343,58 @@ def _read_execution_report(store: Any, run: str) -> dict[str, Any]:
 
 
 def _read_report_or_none(path: Path) -> dict[str, Any] | None:
+    value = _read_json_mapping_or_none(path)
+    if value is None:
+        return None
+    if value.get("report_kind") != EXECUTION_REPORT_KIND:
+        return None
+    return value
+
+
+def _read_rich_trace_or_none(
+    store: Any,
+    *,
+    report_id: str | None,
+    case_id: str,
+    sample: int,
+) -> dict[str, Any] | None:
+    if not report_id:
+        return None
+    sample_indexes = [sample]
+    if sample != 0:
+        sample_indexes.append(0)
+    for sample_index in sample_indexes:
+        path = _rich_trace_path(store, report_id=report_id, case_id=case_id, sample=sample_index)
+        if path is None or not path.exists():
+            continue
+        rich_trace = _read_json_mapping_or_none(path)
+        if rich_trace is not None:
+            return rich_trace
+    return None
+
+
+def _read_json_mapping_or_none(path: Path) -> dict[str, Any] | None:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError, UnicodeDecodeError):
         return None
     if not isinstance(value, dict):
         return None
-    if value.get("report_kind") != EXECUTION_REPORT_KIND:
-        return None
     return value
+
+
+def _rich_trace_path(
+    store: Any,
+    *,
+    report_id: str,
+    case_id: str,
+    sample: int,
+) -> Path | None:
+    traces_dir = (Path(store.root) / "traces").resolve()
+    path = (traces_dir / report_id / f"{case_id}-{sample}.json").resolve()
+    if not _is_relative_to(path, traces_dir):
+        return None
+    return path
 
 
 def _report_path(store: Any, run: str) -> Path:
@@ -277,6 +443,15 @@ def _epoch_ms(value: Any) -> int:
     if parsed.tzinfo is None or parsed.utcoffset() is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return int(parsed.timestamp() * 1000)
+
+
+def _rich_trace_bounds_ms(tool_calls: list[dict[str, Any]]) -> tuple[int, int]:
+    if not tool_calls:
+        return 0, 0
+    return (
+        min(_int_value(tool_call.get("started_ms")) for tool_call in tool_calls),
+        max(_int_value(tool_call.get("ended_ms")) for tool_call in tool_calls),
+    )
 
 
 def _mapping(value: Any) -> dict[str, Any]:
@@ -328,6 +503,34 @@ def _int_value(value: Any) -> int:
 
 def _label_value(value: Any) -> str:
     return _string_value(value) or "0"
+
+
+def _case_badges(
+    case: dict[str, Any],
+    *,
+    score: Any,
+    pass_count: int,
+    sample_count: int,
+) -> list[dict[str, str]]:
+    return [
+        {"label": f"score {_label_value(score)}"},
+        {"label": _string_value(case.get("status")) or ""},
+        {"label": f"{_label_value(pass_count)}/{_label_value(sample_count)}"},
+    ]
+
+
+def _json_or_none(value: Any) -> str | None:
+    if value is None:
+        return None
+    return _json_dumps(value)
+
+
+def _text_or_json(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    return _json_dumps(value)
 
 
 def _json_dumps(value: Any) -> str:

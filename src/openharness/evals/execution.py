@@ -48,6 +48,7 @@ from openharness.evals.replay_integrity import replay_integrity
 from openharness.evals.state import compute_episode_state_delta
 from openharness.evals.store import EvalStore
 from openharness.evals.tool_labels import SHELL_TOOL_NAMES, effective_tool_label
+from openharness.evals.trace_capture import write_eval_trace
 from openharness.utils.fs import atomic_write_text
 
 _EXECUTION_SCORE_SCHEMA_VERSION = 1
@@ -123,6 +124,10 @@ class EvalExecutionScorerResult:
     score: float
     scorer_name: str
     metadata: dict[str, Any] = field(default_factory=dict)
+    # Transient, recorder-only: the raw judge reason. NEVER serialized into the
+    # metadata-only report (only reason_hash/length go to metadata); the D7
+    # trace recorder reads this for the rich eval trace.
+    raw_reason: str | None = None
 
 
 class EvalExecutionScorer(Protocol):
@@ -600,6 +605,13 @@ def run_execution_report(
     facet_inputs_by_id = {
         item.facet.facet_id: item for item in collect_text_facets(store)
     }
+    report_id = _stable_id(
+        "eval-exec",
+        selected_executor.name,
+        payload.pack_id,
+        *(case.case_id for case in cases),
+    )
+    traces_root = store.root / "traces"
     report_cases = [
         _execute_case_sampled(
             store,
@@ -611,6 +623,8 @@ def run_execution_report(
             samples=samples,
             scorer_override=scorer_override,
             history_context=history_context,
+            traces_root=traces_root,
+            run_id=report_id,
         )
         for case in cases
     ]
@@ -619,12 +633,7 @@ def run_execution_report(
     error_count = sum(1 for case in report_cases if case.status == "error")
     failed_count = sum(1 for case in report_cases if case.status == "failed")
     report = EvalExecutionReport(
-        report_id=_stable_id(
-            "eval-exec",
-            selected_executor.name,
-            payload.pack_id,
-            *(case.case_id for case in cases),
-        ),
+        report_id=report_id,
         pack_id=payload.pack_id,
         case_count=len(report_cases),
         passed_count=passed_count,
@@ -665,6 +674,8 @@ def _execute_case_sampled(
     samples: int,
     scorer_override: EvalExecutionScorer | None = None,
     history_context: HistoryContext | None = None,
+    traces_root: Path,
+    run_id: str,
 ) -> EvalExecutionReportCase:
     first = _execute_case(
         store,
@@ -675,12 +686,15 @@ def _execute_case_sampled(
         default_scorer,
         scorer_override=scorer_override,
         history_context=history_context,
+        traces_root=traces_root,
+        run_id=run_id,
+        sample_index=0,
     )
     if samples == 1 or first.status in {"blocked", "error"}:
         return first
 
     sample_cases = [first]
-    for _ in range(samples - 1):
+    for sample_index in range(1, samples):
         sample_cases.append(
             _execute_case(
                 store,
@@ -691,6 +705,9 @@ def _execute_case_sampled(
                 default_scorer,
                 scorer_override=scorer_override,
                 history_context=history_context,
+                traces_root=traces_root,
+                run_id=run_id,
+                sample_index=sample_index,
             )
         )
     pass_count = sum(1 for sample_case in sample_cases if sample_case.status == "passed")
@@ -920,6 +937,9 @@ def _execute_case(
     *,
     scorer_override: EvalExecutionScorer | None = None,
     history_context: HistoryContext | None = None,
+    traces_root: Path,
+    run_id: str,
+    sample_index: int,
 ) -> EvalExecutionReportCase:
     episode = store.get_episode(case.episode_id)
     events = list(store.iter_events(case.episode_id)) if episode is not None else []
@@ -1035,6 +1055,24 @@ def _execute_case(
         context=execution_context,
         executor_result=executor_result,
     )
+    try:
+        write_eval_trace(
+            traces_root,
+            run_id,
+            case.case_id,
+            sample_index,
+            context=execution_context,
+            executor_result=executor_result,
+            scorer_result=scorer_result,
+        )
+    except Exception:
+        logger.warning(
+            "failed to write eval trace: run_id=%s case_id=%s sample_index=%s",
+            run_id,
+            case.case_id,
+            sample_index,
+            exc_info=True,
+        )
     behavior_checks = {
         "execution_completed": True,
         "tool_sequence_matches": list(executor_result.tool_path) == list(case.tool_names),
