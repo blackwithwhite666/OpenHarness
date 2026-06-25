@@ -716,12 +716,7 @@ def _session_conversation_history(
     max_messages: int = 16,
     max_chars: int = 12000,
 ) -> tuple[tuple[str, str], ...]:
-    if (
-        not episode.session_id
-        or history_context is None
-        or max_messages <= 0
-        or max_chars <= 0
-    ):
+    if not episode.session_id or max_messages <= 0 or max_chars <= 0:
         return ()
 
     indexed_episode_ids = list(enumerate(store.list_episode_ids()))
@@ -762,11 +757,17 @@ def _session_conversation_history(
         )
         for _, prior_episode in candidates
     ]
-    start_index = _segment_conversation(history_context, candidate_turns, episode)
-    if start_index is None:
-        return ()
+    # When an LLM history segmenter is configured, use it to find where the
+    # relevant thread starts; otherwise fall back to the raw recent turns in the
+    # window so the agent is never silently starved of conversation context (the
+    # bare query-engine eval used to get no history at all without --history-*).
+    if history_context is not None:
+        start_index = _segment_conversation(history_context, candidate_turns, episode)
+        if start_index is None:
+            return ()
+        candidate_turns = candidate_turns[start_index:]
 
-    messages = _history_turn_messages(candidate_turns[start_index:])
+    messages = _history_turn_messages(candidate_turns)
 
     kept = messages[-max_messages:]
     while kept and sum(len(text) for _, text in kept) > max_chars:

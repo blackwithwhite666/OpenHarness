@@ -14,6 +14,7 @@ from openharness.api.resolver import (
     resolve_api_client_from_settings,
 )
 from openharness.config import load_settings
+from openharness.config.settings import Settings
 from openharness.evals import (
     EvalExecutionReportWrite,
     EvalSessionReport,
@@ -41,6 +42,7 @@ from openharness.evals import (
 )
 from openharness.evals.runner import _report_output_path, _stable_id
 from openharness.evals.state import compute_episode_state_delta, extract_state_keys
+from openharness.prompts import build_runtime_system_prompt
 from openharness.tools.base import BaseTool, ToolExecutionContext, ToolResult
 from openharness.utils.fs import atomic_write_text
 
@@ -53,6 +55,7 @@ from ohmo.reminders.store import ReminderStore
 from ohmo.reminders.tool import RemindCancelTool, RemindCreateTool, RemindListTool
 from ohmo.todo_store import TodoStore
 from ohmo.todo_write_tool import OhmoTodoWriteTool
+from ohmo.workspace import get_plugins_dir, get_skills_dir
 
 
 @dataclass(frozen=True)
@@ -559,6 +562,41 @@ def _build_agent_runner(
     ).agent_runner
 
 
+def _resolve_eval_system_prompt(
+    settings: Settings,
+    *,
+    workspace: Path | None,
+    system_prompt: str | None,
+) -> str:
+    """Build the eval agent's system prompt to match the live gateway.
+
+    An explicit ``system_prompt`` override is returned verbatim. Otherwise the
+    prompt is assembled exactly like the production gateway does
+    (``build_runtime()`` -> ``build_runtime_system_prompt()``): the ohmo persona
+    plus the "# Available Skills" catalog (and delegation/reasoning sections).
+    The bare ``build_ohmo_system_prompt()`` omits the skills catalog, which left
+    the query-engine eval agent blind to its own skills (pdf/maps/browser/...)
+    and made it under-investigate relative to production.
+    """
+    if system_prompt:
+        return system_prompt
+    prompt_cwd = workspace or Path.cwd()
+    persona = build_ohmo_system_prompt(prompt_cwd, workspace=workspace)
+    if workspace is not None:
+        skill_dirs: tuple[str, ...] = (str(get_skills_dir(workspace)),)
+        plugin_roots: tuple[str, ...] = (str(get_plugins_dir(workspace)),)
+    else:
+        skill_dirs = ()
+        plugin_roots = ()
+    return build_runtime_system_prompt(
+        settings.model_copy(update={"system_prompt": persona}),
+        cwd=prompt_cwd,
+        extra_skill_dirs=skill_dirs,
+        extra_plugin_roots=plugin_roots,
+        include_project_memory=False,
+    )
+
+
 def _build_agent_runner_config(
     agent_runner_name: str,
     *,
@@ -597,9 +635,8 @@ def _build_agent_runner_config(
         raise ValueError(
             f"{normalized} eval runner requires configured API authentication"
         ) from exc
-    resolved_prompt = system_prompt or build_ohmo_system_prompt(
-        workspace or Path.cwd(),
-        workspace=workspace,
+    resolved_prompt = _resolve_eval_system_prompt(
+        settings, workspace=workspace, system_prompt=system_prompt
     )
     if normalized == "query-engine-live-read":
         return _AgentRunnerConfig(

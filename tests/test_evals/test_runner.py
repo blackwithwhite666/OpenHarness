@@ -342,7 +342,7 @@ def test_execution_report_query_engine_runner_uses_reconstructed_prompt_and_repl
     assert "model final from replayed tool" not in serialized
 
 
-def test_session_conversation_history_is_opt_in_and_filters_same_session_turns(
+def test_session_conversation_history_falls_back_to_raw_and_filters_same_session_turns(
     tmp_path: Path,
 ):
     store = EvalStore(tmp_path / "evals")
@@ -400,8 +400,17 @@ def test_session_conversation_history_is_opt_in_and_filters_same_session_turns(
 
     assert first is not None
     assert current is not None
+    # First turn has no prior same-session turns -> empty regardless of segmenter.
     assert _session_conversation_history(store, first) == ()
-    assert _session_conversation_history(store, current) == ()
+    # Without an LLM segmenter, history falls back to the raw recent turns in the
+    # window (filtered to the same session+app), instead of being silently empty.
+    assert _session_conversation_history(store, current) == (
+        ("user", "first user"),
+        ("assistant", "first assistant"),
+        ("user", "second user"),
+        ("assistant", "second assistant"),
+    )
+    # With a segmenter, the start index is honored (here start_index=0 -> same).
     assert _session_conversation_history(
         store,
         current,

@@ -35,8 +35,9 @@ from ohmo.evals import (
     run_ohmo_session_eval,
     write_ohmo_eval_mine,
 )
-from ohmo.evals.runner import _build_agent_runner
-from ohmo.workspace import get_reminders_path
+from openharness.config.settings import Settings
+from ohmo.evals.runner import _build_agent_runner, _resolve_eval_system_prompt
+from ohmo.workspace import get_reminders_path, get_skills_dir, initialize_workspace
 
 
 def test_run_ohmo_eval_report_writes_metadata_replay_report(tmp_path: Path):
@@ -62,9 +63,7 @@ def test_run_ohmo_eval_report_writes_metadata_replay_report(tmp_path: Path):
     promote_case_drafts(store)
     build_ohmo_eval_pack(workspace=workspace)
 
-    result = run_ohmo_eval_report(
-        workspace=workspace, limit=1, max_turns=23, report_only=True
-    )
+    result = run_ohmo_eval_report(workspace=workspace, limit=1, max_turns=23, report_only=True)
 
     assert result.report_only is True
     assert result.write.path == workspace.resolve() / "evals" / "reports" / "eval_report.json"
@@ -177,9 +176,7 @@ def test_run_ohmo_session_eval_writes_metadata_only_report(
         fixture_match="arguments",
     )
 
-    assert result.write.path == workspace.resolve() / "evals" / "reports" / (
-        "session_report.json"
-    )
+    assert result.write.path == workspace.resolve() / "evals" / "reports" / ("session_report.json")
     assert result.write.report.report_kind == "session_report"
     assert result.write.report.session_count == 1
     assert result.write.report.passed_count == 1
@@ -830,7 +827,9 @@ def test_check_ohmo_eval_run_config_query_engine_auth_error_is_value_error(
         fake_resolve_api_client,
     )
 
-    with pytest.raises(ValueError, match="query-engine eval runner requires configured API authentication"):
+    with pytest.raises(
+        ValueError, match="query-engine eval runner requires configured API authentication"
+    ):
         check_ohmo_eval_run_config(
             workspace=tmp_path / "workspace",
             agent_runner_name="query-engine",
@@ -858,7 +857,11 @@ def test_build_query_engine_runner_uses_real_prompt_by_default(
         system_prompt=None,
     )
 
-    assert runner._system_prompt == "REAL_OHMO_PROMPT"
+    # The eval prompt is now assembled like the live gateway: the ohmo persona
+    # PLUS the runtime sections (skills catalog, delegation, ...), not the bare
+    # persona. Without the enrichment the agent is blind to its own skills.
+    assert "REAL_OHMO_PROMPT" in runner._system_prompt
+    assert "# Delegation And Subagents" in runner._system_prompt
 
 
 def test_build_query_engine_runner_keeps_system_prompt_override(
@@ -919,7 +922,7 @@ def test_build_live_read_runner_config_uses_query_engine_settings(
     assert config.agent_runner_name == "query-engine-live-read"
     assert config.model == "eval-model"
     assert config.api_client is api_client
-    assert config.system_prompt == "REAL_OHMO_PROMPT"
+    assert "REAL_OHMO_PROMPT" in config.system_prompt
     assert config.cwd == tmp_path
     assert config.replay_tools_only is False
     assert config.agent_runner._live_typed_read_tool_names == (
@@ -956,7 +959,7 @@ def test_build_fs_sandbox_runner_config_uses_query_engine_settings(
     assert config.agent_runner_name == "fs-sandbox"
     assert config.model == "eval-model"
     assert config.api_client is api_client
-    assert config.system_prompt == "REAL_OHMO_PROMPT"
+    assert "REAL_OHMO_PROMPT" in config.system_prompt
     assert config.cwd == tmp_path
     assert config.replay_tools_only is False
     assert config.agent_runner._max_turns == 5
@@ -1014,7 +1017,9 @@ def test_run_ohmo_eval_report_query_engine_auth_error_is_value_error(
         fake_resolve_api_client,
     )
 
-    with pytest.raises(ValueError, match="query-engine eval runner requires configured API authentication"):
+    with pytest.raises(
+        ValueError, match="query-engine eval runner requires configured API authentication"
+    ):
         run_ohmo_eval_report(
             workspace=tmp_path / "workspace",
             agent_runner_name="query-engine",
@@ -1230,9 +1235,7 @@ def _write_sandbox_reminder_pack(store) -> None:
                     tool_names=["remind_create"],
                     capability_path=["remind_create"],
                     rubric=["Create one reminder in sandbox state."],
-                    metadata={
-                        "state_delta": _expected_one_reminder_delta("gold-key")
-                    },
+                    metadata={"state_delta": _expected_one_reminder_delta("gold-key")},
                 )
             ],
             metadata={"privacy": "metadata_only", "case_count": 1},
@@ -1314,3 +1317,37 @@ def _append_session_episode(
             payload={"text": f"private captured final {episode_id}"},
         )
     )
+
+
+def test_eval_system_prompt_surfaces_skills_like_gateway(tmp_path: Path, monkeypatch):
+    """The query-engine eval agent must see the same "# Available Skills" catalog
+    the live gateway injects. Without it the agent is blind to its skills
+    (pdf/maps/browser/...) and under-investigates vs production — the root cause
+    of the 291ba0a6 (menu) and 58713fa8 (lab PDF) eval failures.
+    """
+    monkeypatch.delenv("CLAUDE_CODE_COORDINATOR_MODE", raising=False)
+    monkeypatch.setenv("OPENHARNESS_DATA_DIR", str(tmp_path / "data"))
+    workspace = tmp_path / ".ohmo-home"
+    initialize_workspace(workspace)
+    skill_dir = get_skills_dir(workspace) / "frobnicate"
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: frobnicate\n"
+        "description: Frobnicate lab PDFs via deep extraction.\n---\nBody.\n",
+        encoding="utf-8",
+    )
+
+    prompt = _resolve_eval_system_prompt(Settings(), workspace=workspace, system_prompt=None)
+
+    assert "# Available Skills" in prompt
+    assert "frobnicate" in prompt
+    assert "Frobnicate lab PDFs via deep extraction." in prompt
+
+
+def test_eval_system_prompt_honors_explicit_override(tmp_path: Path):
+    workspace = tmp_path / ".ohmo-home"
+    initialize_workspace(workspace)
+    resolved = _resolve_eval_system_prompt(
+        Settings(), workspace=workspace, system_prompt="EXPLICIT_OVERRIDE"
+    )
+    assert resolved == "EXPLICIT_OVERRIDE"
