@@ -5,7 +5,23 @@ import type {
   TraceSpanStatus,
 } from "@evilmartians/agent-prism-types";
 
-import type { SpanDTO, TraceDetailDTO, TraceSummaryDTO } from "./api";
+import type {
+  SpanDTO,
+  TraceBadgeDTO,
+  TraceDetailDTO,
+  TraceSummaryDTO,
+} from "./api";
+
+export type TraceRecordWithBadges = TraceRecord & {
+  badges?: TraceBadgeDTO[];
+};
+
+export interface MappedTrace {
+  traceRecord: TraceRecordWithBadges;
+  spans: TraceSpan[];
+  goldEpisodeId?: string;
+  badges?: TraceBadgeDTO[];
+}
 
 const SPAN_TYPES = new Set<TraceSpanCategory>([
   "llm_call",
@@ -87,12 +103,16 @@ export function mapTraceSummary(dto: TraceSummaryDTO): TraceRecord {
   };
 }
 
-export function mapTrace(dto: TraceDetailDTO): {
-  traceRecord: TraceRecord;
-  spans: TraceSpan[];
-} {
+export function mapTrace(dto: TraceDetailDTO): MappedTrace {
+  const badges = dto.badges ?? [];
+
   return {
-    traceRecord: mapTraceRecord(dto.traceRecord),
+    traceRecord: {
+      ...mapTraceRecord(dto.traceRecord),
+      badges,
+    },
     spans: dto.spans.map(mapSpan),
+    badges,
+    goldEpisodeId: dto.goldEpisodeId,
   };
 }

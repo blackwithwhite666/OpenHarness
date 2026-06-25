@@ -1,11 +1,20 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from openharness.evals import EvalEpisode, EvalEvent
 from ohmo.evals import get_eval_store
-from ohmo.evals.viewer import episode_to_trace_viewer_data, list_prod_traces
+from ohmo.evals.viewer import (
+    create_app,
+    episode_to_trace_viewer_data,
+    eval_case_to_trace_viewer_data,
+    list_eval_runs,
+    list_eval_traces,
+    list_prod_traces,
+)
+from starlette.testclient import TestClient
 
 
 def test_episode_to_trace_viewer_data_maps_successful_tool_turn(tmp_path: Path) -> None:
@@ -74,6 +83,64 @@ def test_list_prod_traces_returns_prod_items_and_filters_by_query(tmp_path: Path
     assert filtered["traces"][0]["kind"] == "prod"
 
 
+def test_eval_report_lane_lists_and_renders_metadata_traces(tmp_path: Path) -> None:
+    store = get_eval_store(tmp_path)
+    _write_eval_report(store)
+
+    runs = list_eval_runs(store)
+    created_at = int(datetime(2026, 1, 1, 12, 44, 5, tzinfo=timezone.utc).timestamp() * 1000)
+    assert runs["runs"] == [
+        {
+            "run": "eval_report_x.json",
+            "reportId": "report-x",
+            "packId": "pack-x",
+            "createdAt": created_at,
+            "scorer": "trajectory_judge_v1",
+            "executor": "replay-tools",
+            "samples": 3,
+            "caseCount": 1,
+            "passedCount": 0,
+            "failedCount": 1,
+        }
+    ]
+
+    traces = list_eval_traces(store, "eval_report_x.json")
+    assert traces["total"] == 1
+    assert traces["traces"][0]["id"] == "case-1"
+    assert traces["traces"][0]["kind"] == "eval"
+    assert traces["traces"][0]["goldEpisodeId"] == "ep-gold"
+    assert traces["traces"][0]["spansCount"] == 3
+
+    data = eval_case_to_trace_viewer_data(store, "eval_report_x.json", "case-1")
+    assert data["goldEpisodeId"] == "ep-gold"
+    assert data["badges"] == [
+        {"label": "score 0.9"},
+        {"label": "failed"},
+        {"label": "1/3"},
+    ]
+    root = data["spans"][0]
+    assert root["status"] == "error"
+    assert len(root["children"]) == 2
+    assert root["children"][1]["status"] == "error"
+
+    client = TestClient(create_app(tmp_path))
+    assert client.get("/api/runs").json()["runs"][0]["run"] == "eval_report_x.json"
+
+    route_traces = client.get("/api/eval-traces", params={"run": "eval_report_x.json"})
+    assert route_traces.status_code == 200
+    assert route_traces.json()["traces"][0]["kind"] == "eval"
+
+    missing_run = client.get("/api/eval-traces")
+    assert missing_run.status_code == 400
+
+    route_trace = client.get(
+        "/api/eval-traces/case-1",
+        params={"run": "eval_report_x.json"},
+    )
+    assert route_trace.status_code == 200
+    assert route_trace.json()["goldEpisodeId"] == "ep-gold"
+
+
 def _append_trace_episode(
     store,
     *,
@@ -129,4 +196,93 @@ def _append_trace_episode(
             timestamp=base + timedelta(milliseconds=500),
             payload={"text": "вот отзывы"},
         )
+    )
+
+
+def _write_eval_report(store) -> None:
+    report = {
+        "report_id": "report-x",
+        "pack_id": "pack-x",
+        "created_at": "2026-01-01T12:44:05Z",
+        "report_kind": "execution_report",
+        "schema_version": 1,
+        "case_count": 1,
+        "passed_count": 0,
+        "failed_count": 1,
+        "blocked_count": 0,
+        "error_count": 0,
+        "metadata": {
+            "executor_name": "replay-tools",
+            "scorer_name": "trajectory_judge_v1",
+            "fixture_match": "order",
+            "samples": 3,
+            "judge_model": "judge-model",
+            "history_model": "history-model",
+            "mode": "execution_replay",
+            "privacy": "metadata_only",
+        },
+        "cases": [
+            {
+                "case_id": "case-1",
+                "gold_case_id": "gold-1",
+                "status": "failed",
+                "score": 0.9,
+                "max_score": 1.0,
+                "context": {
+                    "episode_id": "ep-gold",
+                    "capability_path": ["bash:maps-cli reviews", "send_message"],
+                    "tool_path": ["bash", "send_message"],
+                    "event_kind_path": ["tool_started", "tool_completed"],
+                    "status": "open",
+                },
+                "observed_trace": {
+                    "tool_path": ["bash", "send_message"],
+                    "event_kind_path": ["tool_started", "tool_completed"],
+                    "final_text_length": 42,
+                    "final_text_hash": "hash-final",
+                    "error_count": 1,
+                    "tool_calls": [
+                        {
+                            "tool_name": "bash",
+                            "is_error": False,
+                            "started": True,
+                            "completed": True,
+                            "start_event_index": 0,
+                            "complete_event_index": 1,
+                            "input_summary_length": 12,
+                            "output_summary_length": 34,
+                            "call_key_hash": "call-1",
+                        },
+                        {
+                            "tool_name": "send_message",
+                            "is_error": True,
+                            "started": True,
+                            "completed": True,
+                            "start_event_index": 2,
+                            "complete_event_index": 3,
+                            "input_summary_length": 56,
+                            "output_summary_length": 78,
+                            "call_key_hash": "call-2",
+                        },
+                    ],
+                },
+                "metadata": {
+                    "scorer_name": "trajectory_judge_v1",
+                    "executor_name": "replay-tools",
+                    "pass_count": 1,
+                    "sample_count": 3,
+                    "pass_rate": 1 / 3,
+                    "tool_count": 2,
+                    "rubric_count": 1,
+                },
+                "checks": ["trajectory_judge_v1"],
+                "warnings": [],
+            }
+        ],
+    }
+    reports_dir = store.root / "reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    (reports_dir / "eval_report_x.json").write_text(
+        json.dumps(report, ensure_ascii=False),
+        encoding="utf-8",
     )

@@ -8,8 +8,42 @@ export interface TraceSummaryDTO {
   durationMs: number;
 }
 
+export interface EvalRunDTO {
+  run: string;
+  reportId: string;
+  packId: string;
+  createdAt: number;
+  scorer: string;
+  executor: string;
+  samples: number;
+  caseCount: number;
+  passedCount: number;
+  failedCount: number;
+}
+
+export interface RunListResponseDTO {
+  runs: EvalRunDTO[];
+}
+
+export interface EvalTraceSummaryDTO {
+  id: string;
+  name: string;
+  kind: "eval";
+  status: "success" | "error" | "warning";
+  score: number | null;
+  passCount: number;
+  sampleCount: number;
+  goldEpisodeId: string;
+  spansCount: number;
+}
+
 export interface TraceListResponseDTO {
   traces: TraceSummaryDTO[];
+  total: number;
+}
+
+export interface EvalTraceListResponseDTO {
+  traces: EvalTraceSummaryDTO[];
   total: number;
 }
 
@@ -44,9 +78,15 @@ export interface TraceRecordDTO {
   startTimeMs: number;
 }
 
+export interface TraceBadgeDTO {
+  label: string;
+}
+
 export interface TraceDetailDTO {
   traceRecord: TraceRecordDTO;
   spans: SpanDTO[];
+  goldEpisodeId?: string;
+  badges?: TraceBadgeDTO[];
 }
 
 async function getJson<T>(url: string): Promise<T> {
@@ -72,4 +112,27 @@ export function listTraces(q = ""): Promise<TraceListResponseDTO> {
 
 export function getTrace(id: string): Promise<TraceDetailDTO> {
   return getJson<TraceDetailDTO>(`/api/traces/${encodeURIComponent(id)}`);
+}
+
+export function listRuns(): Promise<RunListResponseDTO> {
+  return getJson<RunListResponseDTO>("/api/runs");
+}
+
+export function listEvalTraces(run: string): Promise<EvalTraceListResponseDTO> {
+  const params = new URLSearchParams({ run });
+
+  return getJson<EvalTraceListResponseDTO>(
+    `/api/eval-traces?${params.toString()}`,
+  );
+}
+
+export function getEvalTrace(
+  caseId: string,
+  run: string,
+): Promise<TraceDetailDTO> {
+  const params = new URLSearchParams({ run });
+
+  return getJson<TraceDetailDTO>(
+    `/api/eval-traces/${encodeURIComponent(caseId)}?${params.toString()}`,
+  );
 }
