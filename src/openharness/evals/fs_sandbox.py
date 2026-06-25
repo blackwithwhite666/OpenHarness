@@ -603,6 +603,7 @@ class FsSandboxAgentRunner:
                     tool_path=result.tool_path,
                     event_kind_path=result.event_kind_path,
                     tool_calls=result.tool_calls,
+                    model_calls=result.model_calls,
                     metadata={
                         **result.metadata,
                         "agent_runner": self.name,

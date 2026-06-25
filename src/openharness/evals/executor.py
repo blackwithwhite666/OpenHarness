@@ -117,6 +117,7 @@ class EvalExecutorResult:
     tool_path: tuple[str, ...] = ()
     event_kind_path: tuple[str, ...] = ()
     tool_calls: tuple[EvalObservedCall, ...] = ()
+    model_calls: tuple[dict[str, Any], ...] = ()
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
@@ -295,6 +296,7 @@ class SandboxMutatingAgentRunner:
                 tool_path=result.tool_path,
                 event_kind_path=result.event_kind_path,
                 tool_calls=result.tool_calls,
+                model_calls=result.model_calls,
                 metadata={
                     **result.metadata,
                     "agent_runner": self.name,
@@ -543,13 +545,16 @@ async def _run_query_engine_replay(
         )
     tool_path: list[str] = []
     observed_calls: list[dict[str, Any]] = []
+    model_calls: list[dict[str, Any]] = []
     calls_by_id: dict[str, dict[str, Any]] = {}
     event_kind_path: list[str] = ["execution_started"]
     final_text = ""
     last_nonempty_final_text = ""
     max_turns_exceeded = False
+    turn_started_ms = int(time.time() * 1000)
     try:
         async for event in engine.submit_message(prompt):
+            event_time_ms = int(time.time() * 1000)
             if isinstance(event, ToolExecutionStarted):
                 tool_path.append(event.tool_name)
                 entry = {
@@ -557,7 +562,7 @@ async def _run_query_engine_replay(
                     "arguments": dict(event.tool_input or {}),
                     "output": "",
                     "is_error": False,
-                    "started_ms": int(time.time() * 1000),
+                    "started_ms": event_time_ms,
                     "ended_ms": None,
                 }
                 observed_calls.append(entry)
@@ -569,17 +574,27 @@ async def _run_query_engine_replay(
                 if entry is not None:
                     entry["is_error"] = event.is_error
                     entry["output"] = event.output
-                    entry["ended_ms"] = int(time.time() * 1000)
+                    entry["ended_ms"] = event_time_ms
                 event_kind_path.append(
                     "tool_completed_error" if event.is_error else "tool_completed"
                 )
             elif isinstance(event, AssistantTurnComplete):
+                model_calls.append(
+                    {
+                        "model": model,
+                        "input_tokens": event.usage.input_tokens,
+                        "output_tokens": event.usage.output_tokens,
+                        "started_ms": turn_started_ms,
+                        "ended_ms": event_time_ms,
+                    }
+                )
                 final_text = event.message.text
                 if final_text:
                     last_nonempty_final_text = final_text
                 event_kind_path.append("assistant_turn_complete")
             elif isinstance(event, ErrorEvent):
                 event_kind_path.append("execution_error")
+            turn_started_ms = int(time.time() * 1000)
     except MaxTurnsExceeded:
         # Keep the agent's most recent non-empty assistant text instead of
         # discarding it. Truncation usually hits mid-tool-loop (the last turn is a
@@ -603,6 +618,7 @@ async def _run_query_engine_replay(
         tool_path=tuple(tool_path),
         event_kind_path=tuple(event_kind_path),
         tool_calls=tuple(EvalObservedCall(**entry) for entry in observed_calls),
+        model_calls=tuple(model_calls),
         metadata=metadata,
     )
 

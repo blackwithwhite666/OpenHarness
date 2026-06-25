@@ -160,12 +160,22 @@ def _rich_trace_viewer_data(
     badges: list[dict[str, str]],
 ) -> dict[str, Any]:
     tool_calls = _sequence_of_mappings(rich_trace.get("tool_calls"))
-    child_spans = [
+    model_calls = _sequence_of_mappings(rich_trace.get("model_calls"))
+    tool_spans = [
         _rich_tool_call_span(case_id=case_id, index=index, tool_call=tool_call)
         for index, tool_call in enumerate(tool_calls, start=1)
     ]
-    start_ms, end_ms = _rich_trace_bounds_ms(tool_calls)
+    model_spans = [
+        _rich_model_call_span(case_id=case_id, index=index, model_call=model_call)
+        for index, model_call in enumerate(model_calls, start=1)
+    ]
+    child_spans = sorted(
+        [*model_spans, *tool_spans],
+        key=lambda span: _int_value(span.get("startTimeMs")),
+    )
+    start_ms, end_ms = _rich_trace_bounds_ms(child_spans)
     duration_ms = max(0, end_ms - start_ms)
+    total_tokens = sum(_model_call_tokens(model_call) for model_call in model_calls)
     judge = _mapping(rich_trace.get("judge"))
     judge_verdict = _string_value(judge.get("verdict"))
     judge_reason = _string_value(judge.get("reason"))
@@ -205,6 +215,7 @@ def _rich_trace_viewer_data(
             "durationMs": duration_ms,
             "agentDescription": _agent_description(executor, scorer),
             "startTimeMs": start_ms,
+            "totalTokens": total_tokens,
         },
         "spans": [root_span],
         "goldEpisodeId": gold_episode_id,
@@ -282,6 +293,37 @@ def _rich_tool_call_span(
     }
 
 
+def _rich_model_call_span(
+    *,
+    case_id: str,
+    index: int,
+    model_call: dict[str, Any],
+) -> dict[str, Any]:
+    model = _string_value(model_call.get("model")) or f"model call {index}"
+    input_tokens = _int_value(model_call.get("input_tokens"))
+    output_tokens = _int_value(model_call.get("output_tokens"))
+    start_ms = _int_value(model_call.get("started_ms"))
+    end_ms = _int_value(model_call.get("ended_ms"))
+    return {
+        "id": f"{case_id}:llm:{index}",
+        "title": model,
+        "startTimeMs": start_ms,
+        "endTimeMs": end_ms,
+        "durationMs": max(0, end_ms - start_ms),
+        "type": "llm_call",
+        "status": "success",
+        "tokensCount": input_tokens + output_tokens,
+        "input": None,
+        "output": None,
+        "raw": _json_dumps(model_call),
+        "attributes": _model_call_attributes(
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+        ),
+        "children": [],
+    }
+
+
 def _root_attributes(
     *,
     scorer: str | None,
@@ -304,6 +346,17 @@ def _root_attributes(
     _append_attribute(attributes, "gold_episode_id", gold_episode_id)
     _append_attribute(attributes, "judge_verdict", judge_verdict)
     _append_attribute(attributes, "judge_reason", judge_reason)
+    return attributes
+
+
+def _model_call_attributes(
+    *,
+    input_tokens: int,
+    output_tokens: int,
+) -> list[dict[str, dict[str, str] | str]]:
+    attributes: list[dict[str, dict[str, str] | str]] = []
+    _append_attribute(attributes, "input_tokens", input_tokens)
+    _append_attribute(attributes, "output_tokens", output_tokens)
     return attributes
 
 
@@ -445,12 +498,18 @@ def _epoch_ms(value: Any) -> int:
     return int(parsed.timestamp() * 1000)
 
 
-def _rich_trace_bounds_ms(tool_calls: list[dict[str, Any]]) -> tuple[int, int]:
-    if not tool_calls:
+def _rich_trace_bounds_ms(spans: list[dict[str, Any]]) -> tuple[int, int]:
+    if not spans:
         return 0, 0
     return (
-        min(_int_value(tool_call.get("started_ms")) for tool_call in tool_calls),
-        max(_int_value(tool_call.get("ended_ms")) for tool_call in tool_calls),
+        min(_int_value(span.get("startTimeMs")) for span in spans),
+        max(_int_value(span.get("endTimeMs")) for span in spans),
+    )
+
+
+def _model_call_tokens(model_call: dict[str, Any]) -> int:
+    return _int_value(model_call.get("input_tokens")) + _int_value(
+        model_call.get("output_tokens")
     )
 
 

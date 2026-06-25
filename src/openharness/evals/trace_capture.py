@@ -42,6 +42,17 @@ def write_eval_trace(
             }
             for call in executor_result.tool_calls
         ],
+        "model_calls": [
+            {
+                "model": call.get("model"),
+                "input_tokens": call.get("input_tokens"),
+                "output_tokens": call.get("output_tokens"),
+                "started_ms": call.get("started_ms"),
+                "ended_ms": call.get("ended_ms"),
+            }
+            for call in getattr(executor_result, "model_calls", ())
+            if isinstance(call, dict)
+        ],
         "judge": {
             "verdict": scorer_result.metadata.get("verdict"),
             "reason": getattr(scorer_result, "raw_reason", None),

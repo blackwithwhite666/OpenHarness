@@ -421,6 +421,26 @@ def test_execution_report_query_engine_writes_rich_trace_and_keeps_report_privat
     assert isinstance(trace["tool_calls"][0]["started_ms"], int)
     assert isinstance(trace["tool_calls"][0]["ended_ms"], int)
     assert trace["tool_calls"][0]["ended_ms"] >= trace["tool_calls"][0]["started_ms"]
+    assert trace["model_calls"] == [
+        {
+            "model": "eval-model",
+            "input_tokens": 11,
+            "output_tokens": 7,
+            "started_ms": trace["model_calls"][0]["started_ms"],
+            "ended_ms": trace["model_calls"][0]["ended_ms"],
+        },
+        {
+            "model": "eval-model",
+            "input_tokens": 13,
+            "output_tokens": 5,
+            "started_ms": trace["model_calls"][1]["started_ms"],
+            "ended_ms": trace["model_calls"][1]["ended_ms"],
+        },
+    ]
+    for model_call in trace["model_calls"]:
+        assert isinstance(model_call["started_ms"], int)
+        assert isinstance(model_call["ended_ms"], int)
+        assert model_call["ended_ms"] >= model_call["started_ms"]
 
     serialized_report = result.path.read_text(encoding="utf-8")
     assert raw_judge_reason not in serialized_report
@@ -1737,7 +1757,7 @@ class _RecordingReplayApiClient:
                         )
                     ],
                 ),
-                usage=UsageSnapshot(input_tokens=1, output_tokens=1),
+                usage=UsageSnapshot(input_tokens=11, output_tokens=7),
             )
             return
         yield ApiMessageCompleteEvent(
@@ -1745,7 +1765,7 @@ class _RecordingReplayApiClient:
                 role="assistant",
                 content=[TextBlock(text="model final from replayed tool")],
             ),
-            usage=UsageSnapshot(input_tokens=1, output_tokens=1),
+            usage=UsageSnapshot(input_tokens=13, output_tokens=5),
         )
 
 

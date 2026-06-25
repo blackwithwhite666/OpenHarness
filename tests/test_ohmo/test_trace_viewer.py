@@ -149,8 +149,9 @@ def test_eval_case_to_trace_viewer_data_prefers_rich_trace(tmp_path: Path) -> No
     data = eval_case_to_trace_viewer_data(store, "eval_report_x.json", "case-1")
 
     assert data["goldEpisodeId"] == "ep-gold"
-    assert data["traceRecord"]["spansCount"] == 2
-    assert data["traceRecord"]["durationMs"] == 250
+    assert data["traceRecord"]["spansCount"] == 4
+    assert data["traceRecord"]["durationMs"] == 600
+    assert data["traceRecord"]["totalTokens"] == 40
     assert data["traceRecord"]["agentDescription"] == "replay-tools · trajectory_judge_v1"
     assert data["badges"] == [
         {"label": "score 0.9"},
@@ -163,15 +164,35 @@ def test_eval_case_to_trace_viewer_data_prefers_rich_trace(tmp_path: Path) -> No
     assert root["status"] == "error"
     assert root["input"] == "покажи отзывы Xander"
     assert root["output"] == "нашёл два отзыва"
-    assert root["startTimeMs"] == 1_000
-    assert root["endTimeMs"] == 1_250
-    assert root["durationMs"] == 250
+    assert root["startTimeMs"] == 900
+    assert root["endTimeMs"] == 1_500
+    assert root["durationMs"] == 600
     attributes = {item["key"]: item["value"]["stringValue"] for item in root["attributes"]}
     assert attributes["judge_verdict"] == "fail"
     assert attributes["judge_reason"] == "final answer missed one required detail"
 
-    assert len(root["children"]) == 1
-    child = root["children"][0]
+    assert len(root["children"]) == 3
+    assert [child["type"] for child in root["children"]] == [
+        "llm_call",
+        "tool_execution",
+        "llm_call",
+    ]
+    assert [child["startTimeMs"] for child in root["children"]] == [900, 1_100, 1_300]
+
+    first_llm = root["children"][0]
+    assert first_llm["title"] == "gpt-5.5"
+    assert first_llm["status"] == "success"
+    assert first_llm["tokensCount"] == 13
+    assert first_llm["input"] is None
+    assert first_llm["output"] is None
+    llm_attributes = {
+        item["key"]: item["value"]["stringValue"]
+        for item in first_llm["attributes"]
+    }
+    assert llm_attributes["input_tokens"] == "10"
+    assert llm_attributes["output_tokens"] == "3"
+
+    child = root["children"][1]
     assert child["title"] == "bash:maps-cli reviews"
     assert child["type"] == "tool_execution"
     assert child["status"] == "success"
@@ -181,9 +202,13 @@ def test_eval_case_to_trace_viewer_data_prefers_rich_trace(tmp_path: Path) -> No
         sort_keys=True,
     )
     assert child["output"] == "review one\nreview two"
-    assert child["startTimeMs"] == 1_000
+    assert child["startTimeMs"] == 1_100
     assert child["endTimeMs"] == 1_250
     assert child["durationMs"] > 0
+
+    final_llm = root["children"][2]
+    assert final_llm["title"] == "gpt-5.5"
+    assert final_llm["tokensCount"] == 27
 
 
 def _append_trace_episode(
@@ -339,13 +364,29 @@ def _write_rich_eval_trace(store) -> None:
         "sample_index": 0,
         "prompt": "покажи отзывы Xander",
         "final_text": "нашёл два отзыва",
+        "model_calls": [
+            {
+                "model": "gpt-5.5",
+                "input_tokens": 10,
+                "output_tokens": 3,
+                "started_ms": 900,
+                "ended_ms": 1_000,
+            },
+            {
+                "model": "gpt-5.5",
+                "input_tokens": 20,
+                "output_tokens": 7,
+                "started_ms": 1_300,
+                "ended_ms": 1_500,
+            },
+        ],
         "tool_calls": [
             {
                 "tool_name": "bash",
                 "input": {"command": "maps-cli reviews Xander"},
                 "output": "review one\nreview two",
                 "is_error": False,
-                "started_ms": 1_000,
+                "started_ms": 1_100,
                 "ended_ms": 1_250,
             }
         ],
