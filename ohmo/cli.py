@@ -1531,12 +1531,12 @@ def evals_run_cmd(
     ),
     limit: int | None = typer.Option(None, "--limit", min=1, help="Eval subset size"),
     samples: int = typer.Option(
-        1,
+        3,
         "--samples",
         min=1,
         help=(
             "Run each case N times and decide pass/fail by majority — stabilizes "
-            "the non-deterministic query-engine runner"
+            "the non-deterministic query-engine runner (default 3; pass 1 to disable)"
         ),
     ),
     executor_name: str = typer.Option(
@@ -1762,10 +1762,10 @@ def evals_run_session_cmd(
     ),
     limit: int | None = typer.Option(None, "--limit", min=1, help="Session subset size"),
     samples: int = typer.Option(
-        1,
+        3,
         "--samples",
         min=1,
-        help="Run each session N times and decide pass/fail by majority",
+        help="Run each session N times and decide pass/fail by majority (default 3; pass 1 to disable)",
     ),
     model: str | None = typer.Option(
         None,
