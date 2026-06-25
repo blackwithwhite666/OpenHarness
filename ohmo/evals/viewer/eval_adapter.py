@@ -42,7 +42,11 @@ def list_eval_runs(store: Any) -> dict[str, Any]:
 def list_eval_traces(store: Any, run: str) -> dict[str, Any]:
     """Return case summaries for one execution report."""
     report = _read_execution_report(store, run)
-    traces = [_case_summary(case) for case in _cases(report)]
+    report_metadata = _mapping(report.get("metadata"))
+    report_id = _string_value(report.get("report_id"))
+    traces = [
+        _case_summary(store, report_id, report_metadata, case) for case in _cases(report)
+    ]
     return {"traces": traces, "total": len(traces)}
 
 
@@ -60,6 +64,7 @@ def eval_case_to_trace_viewer_data(
 
     report_metadata = _mapping(report.get("metadata"))
     case_metadata = _mapping(case.get("metadata"))
+    report_id = _string_value(report.get("report_id"))
     context = _mapping(case.get("context"))
     observed_trace = _mapping(case.get("observed_trace"))
     tool_calls = _sequence_of_mappings(observed_trace.get("tool_calls"))
@@ -69,28 +74,41 @@ def eval_case_to_trace_viewer_data(
     executor = _first_string(case_metadata.get("executor_name"), report_metadata.get("executor_name"))
     fixture_match = _string_value(report_metadata.get("fixture_match"))
     pass_count = _int_value(case_metadata.get("pass_count"))
-    sample_count = _int_value(case_metadata.get("sample_count"))
+    sample_count = _first_int(
+        case_metadata.get("sample_count"),
+        report_metadata.get("sample_count"),
+        report_metadata.get("samples"),
+    )
+    effective_sample_count = _effective_sample_count(
+        store,
+        report_id=report_id,
+        case_id=case_id,
+        fallback=sample_count,
+    )
     score = case.get("score")
     gold_episode_id = _string_value(context.get("episode_id"))
     badges = _case_badges(case, score=score, pass_count=pass_count, sample_count=sample_count)
 
-    rich_trace = _read_rich_trace_or_none(
+    rich_result = _read_rich_trace_or_none(
         store,
-        report_id=_string_value(report.get("report_id")),
+        report_id=report_id,
         case_id=case_id,
         sample=sample,
     )
-    if rich_trace is not None:
+    if rich_result is not None:
+        rich_trace, loaded_sample = rich_result
         return _rich_trace_viewer_data(
             case_id=case_id,
             case=case,
             rich_trace=rich_trace,
+            sample=loaded_sample,
+            sample_count=effective_sample_count,
             status=status,
             scorer=scorer,
             executor=executor,
             fixture_match=fixture_match,
             pass_count=pass_count,
-            sample_count=sample_count,
+            metadata_sample_count=sample_count,
             score=score,
             gold_episode_id=gold_episode_id,
             badges=badges,
@@ -141,6 +159,8 @@ def eval_case_to_trace_viewer_data(
         "spans": [root_span],
         "goldEpisodeId": gold_episode_id,
         "badges": badges,
+        "sample": max(0, sample),
+        "sampleCount": effective_sample_count,
     }
 
 
@@ -149,12 +169,14 @@ def _rich_trace_viewer_data(
     case_id: str,
     case: dict[str, Any],
     rich_trace: dict[str, Any],
+    sample: int,
+    sample_count: int,
     status: str,
     scorer: str | None,
     executor: str | None,
     fixture_match: str | None,
     pass_count: int,
-    sample_count: int,
+    metadata_sample_count: int,
     score: Any,
     gold_episode_id: str | None,
     badges: list[dict[str, str]],
@@ -181,6 +203,7 @@ def _rich_trace_viewer_data(
     judge_reason = _string_value(judge.get("reason"))
     if judge_verdict:
         badges = [*badges, {"label": f"judge: {judge_verdict}"}]
+    root_status = _rich_trace_status(rich_trace, default=status)
 
     root_span = {
         "id": case_id,
@@ -189,7 +212,7 @@ def _rich_trace_viewer_data(
         "endTimeMs": end_ms,
         "durationMs": duration_ms,
         "type": "agent_invocation",
-        "status": status,
+        "status": root_status,
         "input": _text_or_json(rich_trace.get("prompt")),
         "output": _text_or_json(rich_trace.get("final_text")),
         "raw": _json_dumps({"case": case, "trace": rich_trace}),
@@ -198,7 +221,7 @@ def _rich_trace_viewer_data(
             executor=executor,
             fixture_match=fixture_match,
             pass_count=pass_count,
-            sample_count=sample_count,
+            sample_count=metadata_sample_count,
             score=score,
             gold_episode_id=gold_episode_id,
             judge_verdict=judge_verdict,
@@ -220,15 +243,27 @@ def _rich_trace_viewer_data(
         "spans": [root_span],
         "goldEpisodeId": gold_episode_id,
         "badges": badges,
+        "sample": sample,
+        "sampleCount": sample_count,
     }
 
 
-def _case_summary(case: dict[str, Any]) -> dict[str, Any]:
+def _case_summary(
+    store: Any,
+    report_id: str | None,
+    report_metadata: dict[str, Any],
+    case: dict[str, Any],
+) -> dict[str, Any]:
     case_metadata = _mapping(case.get("metadata"))
     context = _mapping(case.get("context"))
     observed_trace = _mapping(case.get("observed_trace"))
     tool_calls = _sequence_of_mappings(observed_trace.get("tool_calls"))
     case_id = _string_value(case.get("case_id")) or ""
+    metadata_sample_count = _first_int(
+        case_metadata.get("sample_count"),
+        report_metadata.get("sample_count"),
+        report_metadata.get("samples"),
+    )
     return {
         "id": case_id,
         "name": case_id,
@@ -236,7 +271,12 @@ def _case_summary(case: dict[str, Any]) -> dict[str, Any]:
         "status": _status_for_case(_string_value(case.get("status"))),
         "score": case.get("score"),
         "passCount": _int_value(case_metadata.get("pass_count")),
-        "sampleCount": _int_value(case_metadata.get("sample_count")),
+        "sampleCount": _effective_sample_count(
+            store,
+            report_id=report_id,
+            case_id=case_id,
+            fallback=metadata_sample_count,
+        ),
         "goldEpisodeId": _string_value(context.get("episode_id")),
         "spansCount": 1 + len(tool_calls),
     }
@@ -410,11 +450,12 @@ def _read_rich_trace_or_none(
     report_id: str | None,
     case_id: str,
     sample: int,
-) -> dict[str, Any] | None:
+) -> tuple[dict[str, Any], int] | None:
     if not report_id:
         return None
-    sample_indexes = [sample]
-    if sample != 0:
+    requested_sample = max(0, sample)
+    sample_indexes = [requested_sample]
+    if requested_sample != 0:
         sample_indexes.append(0)
     for sample_index in sample_indexes:
         path = _rich_trace_path(store, report_id=report_id, case_id=case_id, sample=sample_index)
@@ -422,8 +463,58 @@ def _read_rich_trace_or_none(
             continue
         rich_trace = _read_json_mapping_or_none(path)
         if rich_trace is not None:
-            return rich_trace
+            return rich_trace, sample_index
     return None
+
+
+def _effective_sample_count(
+    store: Any,
+    *,
+    report_id: str | None,
+    case_id: str,
+    fallback: int,
+) -> int:
+    rich_samples = _rich_trace_samples(store, report_id=report_id, case_id=case_id)
+    if rich_samples:
+        return len(rich_samples)
+    return fallback
+
+
+def _rich_trace_samples(
+    store: Any,
+    *,
+    report_id: str | None,
+    case_id: str,
+) -> list[int]:
+    if not report_id:
+        return []
+    report_dir = _rich_trace_report_dir(store, report_id)
+    if report_dir is None or not report_dir.is_dir():
+        return []
+
+    prefix = f"{case_id}-"
+    suffix = ".json"
+    samples: set[int] = set()
+    try:
+        paths = list(report_dir.rglob(f"*{suffix}"))
+    except OSError:
+        return []
+    for path in paths:
+        relative_name = path.relative_to(report_dir).as_posix()
+        if (
+            not path.is_file()
+            or not relative_name.startswith(prefix)
+            or not relative_name.endswith(suffix)
+        ):
+            continue
+        sample_text = relative_name[len(prefix) : -len(suffix)]
+        try:
+            sample = int(sample_text)
+        except ValueError:
+            continue
+        if sample >= 0:
+            samples.add(sample)
+    return sorted(samples)
 
 
 def _read_json_mapping_or_none(path: Path) -> dict[str, Any] | None:
@@ -443,8 +534,18 @@ def _rich_trace_path(
     case_id: str,
     sample: int,
 ) -> Path | None:
+    report_dir = _rich_trace_report_dir(store, report_id)
+    if report_dir is None:
+        return None
+    path = (report_dir / f"{case_id}-{sample}.json").resolve()
+    if not _is_relative_to(path, report_dir):
+        return None
+    return path
+
+
+def _rich_trace_report_dir(store: Any, report_id: str) -> Path | None:
     traces_dir = (Path(store.root) / "traces").resolve()
-    path = (traces_dir / report_id / f"{case_id}-{sample}.json").resolve()
+    path = (traces_dir / report_id).resolve()
     if not _is_relative_to(path, traces_dir):
         return None
     return path
@@ -475,6 +576,20 @@ def _status_for_case(status: str | None) -> str:
     if status in {"failed", "error"}:
         return "error"
     return "warning"
+
+
+def _rich_trace_status(rich_trace: dict[str, Any], *, default: str) -> str:
+    passed = rich_trace.get("passed")
+    if isinstance(passed, bool):
+        return "success" if passed else "error"
+
+    judge = _mapping(rich_trace.get("judge"))
+    verdict = (_string_value(judge.get("verdict")) or "").casefold()
+    if verdict in {"pass", "passed", "success", "ok"}:
+        return "success"
+    if verdict in {"fail", "failed", "error"}:
+        return "error"
+    return default
 
 
 def _agent_description(executor: str | None, scorer: str | None) -> str:
@@ -535,6 +650,14 @@ def _first_string(*values: Any) -> str | None:
         if string_value:
             return string_value
     return None
+
+
+def _first_int(*values: Any) -> int:
+    for value in values:
+        int_value = _int_value(value)
+        if int_value:
+            return int_value
+    return 0
 
 
 def _string_value(value: Any) -> str | None:

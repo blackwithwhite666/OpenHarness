@@ -21,6 +21,8 @@ export interface MappedTrace {
   spans: TraceSpan[];
   goldEpisodeId?: string;
   badges?: TraceBadgeDTO[];
+  sample?: number;
+  sampleCount?: number;
 }
 
 const SPAN_TYPES = new Set<TraceSpanCategory>([
@@ -114,5 +116,7 @@ export function mapTrace(dto: TraceDetailDTO): MappedTrace {
     spans: dto.spans.map(mapSpan),
     badges,
     goldEpisodeId: dto.goldEpisodeId,
+    sample: dto.sample,
+    sampleCount: dto.sampleCount,
   };
 }

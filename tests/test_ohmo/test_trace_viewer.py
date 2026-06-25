@@ -109,10 +109,13 @@ def test_eval_report_lane_lists_and_renders_metadata_traces(tmp_path: Path) -> N
     assert traces["traces"][0]["id"] == "case-1"
     assert traces["traces"][0]["kind"] == "eval"
     assert traces["traces"][0]["goldEpisodeId"] == "ep-gold"
+    assert traces["traces"][0]["sampleCount"] == 3
     assert traces["traces"][0]["spansCount"] == 3
 
     data = eval_case_to_trace_viewer_data(store, "eval_report_x.json", "case-1")
     assert data["goldEpisodeId"] == "ep-gold"
+    assert data["sample"] == 0
+    assert data["sampleCount"] == 3
     assert data["badges"] == [
         {"label": "score 0.9"},
         {"label": "failed"},
@@ -209,6 +212,48 @@ def test_eval_case_to_trace_viewer_data_prefers_rich_trace(tmp_path: Path) -> No
     final_llm = root["children"][2]
     assert final_llm["title"] == "gpt-5.5"
     assert final_llm["tokensCount"] == 27
+
+
+def test_eval_trace_multi_sample_count_and_requested_sample_load(tmp_path: Path) -> None:
+    store = get_eval_store(tmp_path)
+    _write_eval_report(store)
+    _write_rich_eval_trace(store, final_text="sample zero answer")
+    _write_rich_eval_trace(
+        store,
+        sample_index=1,
+        final_text="sample one answer",
+        judge_verdict="pass",
+        judge_reason="sample one passed",
+        score=1.0,
+        passed=True,
+    )
+
+    traces = list_eval_traces(store, "eval_report_x.json")
+
+    assert traces["traces"][0]["sampleCount"] == 2
+
+    data = eval_case_to_trace_viewer_data(
+        store,
+        "eval_report_x.json",
+        "case-1",
+        sample=1,
+    )
+
+    assert data["sample"] == 1
+    assert data["sampleCount"] == 2
+    assert data["spans"][0]["output"] == "sample one answer"
+    assert data["spans"][0]["status"] == "success"
+    assert data["badges"][-1] == {"label": "judge: pass"}
+
+    client = TestClient(create_app(tmp_path))
+    route_trace = client.get(
+        "/api/eval-traces/case-1",
+        params={"run": "eval_report_x.json", "sample": "1"},
+    )
+    assert route_trace.status_code == 200
+    route_payload = route_trace.json()
+    assert route_payload["sample"] == 1
+    assert route_payload["spans"][0]["output"] == "sample one answer"
 
 
 def _append_trace_episode(
@@ -358,12 +403,22 @@ def _write_eval_report(store) -> None:
     )
 
 
-def _write_rich_eval_trace(store) -> None:
+def _write_rich_eval_trace(
+    store,
+    *,
+    sample_index: int = 0,
+    prompt: str = "покажи отзывы Xander",
+    final_text: str = "нашёл два отзыва",
+    judge_verdict: str = "fail",
+    judge_reason: str = "final answer missed one required detail",
+    score: float = 0.9,
+    passed: bool = False,
+) -> None:
     rich_trace = {
         "case_id": "case-1",
-        "sample_index": 0,
-        "prompt": "покажи отзывы Xander",
-        "final_text": "нашёл два отзыва",
+        "sample_index": sample_index,
+        "prompt": prompt,
+        "final_text": final_text,
         "model_calls": [
             {
                 "model": "gpt-5.5",
@@ -391,15 +446,15 @@ def _write_rich_eval_trace(store) -> None:
             }
         ],
         "judge": {
-            "verdict": "fail",
-            "reason": "final answer missed one required detail",
+            "verdict": judge_verdict,
+            "reason": judge_reason,
         },
-        "score": 0.9,
-        "passed": False,
+        "score": score,
+        "passed": passed,
     }
     trace_dir = store.root / "traces" / "report-x"
     trace_dir.mkdir(parents=True, exist_ok=True)
-    (trace_dir / "case-1-0.json").write_text(
+    (trace_dir / f"case-1-{sample_index}.json").write_text(
         json.dumps(rich_trace, ensure_ascii=False),
         encoding="utf-8",
     )

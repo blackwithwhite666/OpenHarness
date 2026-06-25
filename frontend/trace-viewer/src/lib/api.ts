@@ -87,6 +87,8 @@ export interface TraceDetailDTO {
   spans: SpanDTO[];
   goldEpisodeId?: string;
   badges?: TraceBadgeDTO[];
+  sample?: number;
+  sampleCount?: number;
 }
 
 async function getJson<T>(url: string): Promise<T> {
@@ -129,8 +131,9 @@ export function listEvalTraces(run: string): Promise<EvalTraceListResponseDTO> {
 export function getEvalTrace(
   caseId: string,
   run: string,
+  sample = 0,
 ): Promise<TraceDetailDTO> {
-  const params = new URLSearchParams({ run });
+  const params = new URLSearchParams({ run, sample: String(sample) });
 
   return getJson<TraceDetailDTO>(
     `/api/eval-traces/${encodeURIComponent(caseId)}?${params.toString()}`,

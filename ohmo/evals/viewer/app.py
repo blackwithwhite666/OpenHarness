@@ -63,12 +63,14 @@ def create_app(workspace: str | Path | None = None) -> Starlette:
         return JSONResponse(data)
 
     async def eval_trace(request: Any) -> JSONResponse:
-        run = request.query_params.get("run")
+        params = request.query_params
+        run = params.get("run")
         if run is None or not run.strip():
             return JSONResponse({"detail": "run query parameter is required"}, status_code=400)
         case_id = request.path_params["case_id"]
+        sample = max(0, _int_param(params.get("sample"), default=0))
         try:
-            data = eval_case_to_trace_viewer_data(store, run.strip(), case_id)
+            data = eval_case_to_trace_viewer_data(store, run.strip(), case_id, sample=sample)
         except KeyError:
             return JSONResponse({"detail": "eval trace not found"}, status_code=404)
         return JSONResponse(data)

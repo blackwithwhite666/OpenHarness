@@ -20,13 +20,25 @@ import {
   listTraces,
   type EvalRunDTO,
   type EvalTraceSummaryDTO,
+  type TraceSummaryDTO,
 } from "./lib/api";
 import { mapTrace, mapTraceSummary } from "./lib/mapTrace";
 
 type SourceTab = "prod" | "eval";
+type StatusFilter = "all" | "passed" | "failed";
 
 type TraceRecordWithBadges = TraceRecord & {
   badges?: BadgeProps[];
+};
+
+type ProdTraceRecord = TraceRecord & {
+  status: TraceSummaryDTO["status"];
+};
+
+type EvalTraceRecord = TraceRecordWithBadges & {
+  status: EvalTraceSummaryDTO["status"];
+  goldEpisodeId: string;
+  sampleCount: number;
 };
 
 interface LoadedTrace {
@@ -34,12 +46,15 @@ interface LoadedTrace {
   spans: TraceSpan[];
   goldEpisodeId?: string;
   badges?: BadgeProps[];
+  sample?: number;
+  sampleCount?: number;
 }
 
 function App() {
   const [sourceTab, setSourceTab] = useState<SourceTab>("prod");
   const [query, setQuery] = useState("");
-  const [traces, setTraces] = useState<TraceRecord[]>([]);
+  const [prodStatusFilter, setProdStatusFilter] = useState<StatusFilter>("all");
+  const [traces, setTraces] = useState<ProdTraceRecord[]>([]);
   const [selectedTrace, setSelectedTrace] = useState<TraceRecord | undefined>();
   const [loadedTrace, setLoadedTrace] = useState<LoadedTrace | undefined>();
   const [selectedSpan, setSelectedSpan] = useState<TraceSpan | undefined>();
@@ -52,9 +67,12 @@ function App() {
   const [traceError, setTraceError] = useState<string | undefined>();
   const [evalRuns, setEvalRuns] = useState<EvalRunDTO[]>([]);
   const [selectedRunId, setSelectedRunId] = useState<string | undefined>();
-  const [evalTraces, setEvalTraces] = useState<TraceRecordWithBadges[]>([]);
+  const [evalTraces, setEvalTraces] = useState<EvalTraceRecord[]>([]);
   const [selectedEvalTrace, setSelectedEvalTrace] =
-    useState<TraceRecordWithBadges | undefined>();
+    useState<EvalTraceRecord | undefined>();
+  const [selectedEvalSample, setSelectedEvalSample] = useState(0);
+  const [evalQuery, setEvalQuery] = useState("");
+  const [evalStatusFilter, setEvalStatusFilter] = useState<StatusFilter>("all");
   const [loadedEvalTrace, setLoadedEvalTrace] = useState<LoadedTrace | undefined>();
   const [selectedEvalSpan, setSelectedEvalSpan] = useState<TraceSpan | undefined>();
   const [evalTraceListExpanded, setEvalTraceListExpanded] = useState(true);
@@ -73,7 +91,10 @@ function App() {
 
     try {
       const response = await listTraces(search);
-      const nextTraces = response.traces.map(mapTraceSummary);
+      const nextTraces = response.traces.map((trace) => ({
+        ...mapTraceSummary(trace),
+        status: trace.status,
+      }));
       setTraces(nextTraces);
     } catch (error) {
       setListError(error instanceof Error ? error.message : "Failed to load traces");
@@ -84,6 +105,7 @@ function App() {
 
   const clearEvalTraceSelection = useCallback(() => {
     setSelectedEvalTrace(undefined);
+    setSelectedEvalSample(0);
     setLoadedEvalTrace(undefined);
     setSelectedEvalSpan(undefined);
     setEvalSpanSearchValue("");
@@ -209,11 +231,12 @@ function App() {
     [clearEvalTraceSelection],
   );
 
-  const handleEvalTraceSelect = useCallback(
-    async (trace: TraceRecordWithBadges) => {
+  const loadEvalTrace = useCallback(
+    async (trace: EvalTraceRecord, sample: number) => {
       if (!selectedRunId) return;
 
       setSelectedEvalTrace(trace);
+      setSelectedEvalSample(sample);
       setLoadedEvalTrace(undefined);
       setSelectedEvalSpan(undefined);
       setEvalSpanSearchValue("");
@@ -222,9 +245,10 @@ function App() {
       setIsEvalTraceLoading(true);
 
       try {
-        const response = await getEvalTrace(trace.id, selectedRunId);
+        const response = await getEvalTrace(trace.id, selectedRunId, sample);
         const mappedTrace = mapTrace(response);
         setLoadedEvalTrace(mappedTrace);
+        setSelectedEvalSample(mappedTrace.sample ?? sample);
         const flatSpans = flattenSpans(mappedTrace.spans);
         setEvalExpandedSpansIds(flatSpans.map((span) => span.id));
         setSelectedEvalSpan(flatSpans[0]);
@@ -237,6 +261,22 @@ function App() {
       }
     },
     [selectedRunId],
+  );
+
+  const handleEvalTraceSelect = useCallback(
+    async (trace: EvalTraceRecord) => {
+      await loadEvalTrace(trace, 0);
+    },
+    [loadEvalTrace],
+  );
+
+  const handleEvalSampleSelect = useCallback(
+    async (sample: number) => {
+      if (!selectedEvalTrace) return;
+
+      await loadEvalTrace(selectedEvalTrace, sample);
+    },
+    [loadEvalTrace, selectedEvalTrace],
   );
 
   const handleOpenGoldEpisode = useCallback(
@@ -269,13 +309,14 @@ function App() {
     }
 
     if (selectedRunId && selectedEvalTrace) {
-      void handleEvalTraceSelect(selectedEvalTrace);
+      void loadEvalTrace(selectedEvalTrace, selectedEvalSample);
     }
   }, [
     fetchEvalRuns,
     fetchEvalTraceList,
-    handleEvalTraceSelect,
+    loadEvalTrace,
     selectedEvalTrace,
+    selectedEvalSample,
     selectedRunId,
   ]);
 
@@ -283,6 +324,12 @@ function App() {
     loadedTrace?.traceRecord ??
     traces.find((trace) => trace.id === selectedTrace?.id) ??
     selectedTrace;
+
+  const filteredTraces = useMemo(
+    () =>
+      traces.filter((trace) => matchesStatusFilter(trace.status, prodStatusFilter)),
+    [prodStatusFilter, traces],
+  );
 
   const evalAllSpanIds = useMemo(
     () =>
@@ -306,6 +353,26 @@ function App() {
     selectedEvalTrace;
 
   const selectedRun = evalRuns.find((run) => run.run === selectedRunId);
+  const selectedEvalSampleCount =
+    loadedEvalTrace?.sampleCount ?? selectedEvalTrace?.sampleCount ?? 0;
+  const selectedEvalSampleStatus = loadedEvalTrace?.spans[0]?.status;
+  const filteredEvalTraces = useMemo(() => {
+    const normalizedQuery = evalQuery.trim().toLocaleLowerCase();
+
+    return evalTraces.filter((trace) => {
+      if (!matchesStatusFilter(trace.status, evalStatusFilter)) {
+        return false;
+      }
+
+      if (!normalizedQuery) {
+        return true;
+      }
+
+      return [trace.id, trace.goldEpisodeId].some((value) =>
+        value.toLocaleLowerCase().includes(normalizedQuery),
+      );
+    });
+  }, [evalQuery, evalStatusFilter, evalTraces]);
 
   const prodContent = (
     <PanelGroup direction="horizontal" className="min-h-0 flex-1">
@@ -338,14 +405,21 @@ function App() {
               Refresh
             </Button>
           </div>
+          <StatusFilterControl
+            ariaLabel="Filter prod traces by status"
+            value={prodStatusFilter}
+            onChange={setProdStatusFilter}
+          />
 
           {listError && <ErrorMessage message={listError} />}
 
           {isListLoading && traces.length === 0 ? (
             <StatusMessage>Loading traces...</StatusMessage>
+          ) : traces.length > 0 && filteredTraces.length === 0 ? (
+            <StatusMessage>No traces match the filters.</StatusMessage>
           ) : (
             <TraceList
-              traces={traces}
+              traces={filteredTraces}
               expanded={traceListExpanded}
               onExpandStateChange={setTraceListExpanded}
               onTraceSelect={(trace) => void handleTraceSelect(trace)}
@@ -446,6 +520,25 @@ function App() {
                 {selectedRun.packId}
               </div>
             )}
+
+            <div className="flex items-center gap-2">
+              <TextInput
+                aria-label="Search eval cases"
+                className="min-w-0 flex-1"
+                hideLabel
+                id="eval-case-search"
+                label="Search eval cases"
+                placeholder="Search cases"
+                startIcon={<Search className="size-4" />}
+                value={evalQuery}
+                onChange={(event) => setEvalQuery(event.target.value)}
+              />
+              <StatusFilterControl
+                ariaLabel="Filter eval cases by status"
+                value={evalStatusFilter}
+                onChange={setEvalStatusFilter}
+              />
+            </div>
           </div>
 
           {runError && <ErrorMessage message={runError} />}
@@ -459,14 +552,14 @@ function App() {
             <StatusMessage>Loading eval cases...</StatusMessage>
           ) : evalTraces.length === 0 ? (
             <StatusMessage>No eval cases for this run.</StatusMessage>
+          ) : filteredEvalTraces.length === 0 ? (
+            <StatusMessage>No eval cases match the filters.</StatusMessage>
           ) : (
             <TraceList
-              traces={evalTraces}
+              traces={filteredEvalTraces}
               expanded={evalTraceListExpanded}
               onExpandStateChange={setEvalTraceListExpanded}
-              onTraceSelect={(trace) =>
-                void handleEvalTraceSelect(trace as TraceRecordWithBadges)
-              }
+              onTraceSelect={(trace) => void handleEvalTraceSelect(trace as EvalTraceRecord)}
               selectedTrace={selectedEvalTraceRecord}
               className="min-h-0 flex-1"
             />
@@ -484,6 +577,14 @@ function App() {
             <ErrorMessage message={evalTraceError} />
           ) : loadedEvalTrace && selectedEvalTraceRecord ? (
             <>
+              {selectedEvalSampleCount > 1 && (
+                <SampleSelector
+                  count={selectedEvalSampleCount}
+                  selectedSample={selectedEvalSample}
+                  selectedSampleStatus={selectedEvalSampleStatus}
+                  onSelect={(sample) => void handleEvalSampleSelect(sample)}
+                />
+              )}
               {loadedEvalTrace.goldEpisodeId && (
                 <div className="flex shrink-0 justify-end px-4">
                   <Button
@@ -498,6 +599,7 @@ function App() {
                   </Button>
                 </div>
               )}
+              {/* TODO P3: gold-vs-observed diff */}
               <TraceViewerTreeViewContainer
                 searchValue={evalSpanSearchValue}
                 setSearchValue={setEvalSpanSearchValue}
@@ -571,7 +673,97 @@ function App() {
   );
 }
 
-function mapEvalTraceSummary(dto: EvalTraceSummaryDTO): TraceRecordWithBadges {
+function StatusFilterControl({
+  ariaLabel,
+  value,
+  onChange,
+}: {
+  ariaLabel: string;
+  value: StatusFilter;
+  onChange: (value: StatusFilter) => void;
+}) {
+  const filters: StatusFilter[] = ["all", "passed", "failed"];
+
+  return (
+    <div
+      aria-label={ariaLabel}
+      className="border-agentprism-border bg-agentprism-muted flex shrink-0 rounded-md border p-0.5"
+      role="group"
+    >
+      {filters.map((filter) => (
+        <button
+          key={filter}
+          aria-pressed={value === filter}
+          className={`rounded px-2.5 py-1 text-xs ${
+            value === filter
+              ? "bg-agentprism-background text-agentprism-foreground shadow-sm"
+              : "text-agentprism-muted-foreground"
+          }`}
+          type="button"
+          onClick={() => onChange(filter)}
+        >
+          {filter}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function SampleSelector({
+  count,
+  selectedSample,
+  selectedSampleStatus,
+  onSelect,
+}: {
+  count: number;
+  selectedSample: number;
+  selectedSampleStatus?: TraceSpan["status"];
+  onSelect: (sample: number) => void;
+}) {
+  return (
+    <div className="flex shrink-0 flex-wrap items-center gap-1 px-4">
+      {Array.from({ length: count }, (_, sample) => {
+        const isSelected = sample === selectedSample;
+
+        return (
+          <button
+            key={sample}
+            aria-pressed={isSelected}
+            className={`border-agentprism-border inline-flex h-7 items-center gap-1 rounded-md border px-2 text-xs ${
+              isSelected
+                ? "bg-agentprism-secondary text-agentprism-foreground"
+                : "bg-agentprism-background text-agentprism-muted-foreground hover:bg-agentprism-secondary/45"
+            }`}
+            type="button"
+            onClick={() => onSelect(sample)}
+          >
+            {isSelected && selectedSampleStatus && (
+              <span
+                className={`block size-1.5 shrink-0 rounded-full ${TRACE_STATUS_DOT_CLASSES[selectedSampleStatus]}`}
+              />
+            )}
+            #{sample}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+function matchesStatusFilter(
+  status: TraceSummaryDTO["status"] | EvalTraceSummaryDTO["status"],
+  filter: StatusFilter,
+): boolean {
+  if (filter === "all") {
+    return true;
+  }
+  if (filter === "passed") {
+    return status === "success";
+  }
+  return status !== "success";
+}
+
+function mapEvalTraceSummary(dto: EvalTraceSummaryDTO): EvalTraceRecord {
   const badges: BadgeProps[] = [
     {
       label: <EvalStatusLabel status={dto.status} />,
@@ -592,6 +784,9 @@ function mapEvalTraceSummary(dto: EvalTraceSummaryDTO): TraceRecordWithBadges {
     durationMs: 0,
     agentDescription: dto.goldEpisodeId,
     badges,
+    status: dto.status,
+    goldEpisodeId: dto.goldEpisodeId,
+    sampleCount: dto.sampleCount,
   };
 }
 
@@ -599,17 +794,18 @@ function EvalStatusLabel({ status }: { status: EvalTraceSummaryDTO["status"] }) 
   return (
     <span className="inline-flex min-w-0 items-center gap-1">
       <span
-        className={`block size-1.5 shrink-0 rounded-full ${EVAL_STATUS_DOT_CLASSES[status]}`}
+        className={`block size-1.5 shrink-0 rounded-full ${TRACE_STATUS_DOT_CLASSES[status]}`}
       />
       <span className="truncate">{status}</span>
     </span>
   );
 }
 
-const EVAL_STATUS_DOT_CLASSES: Record<EvalTraceSummaryDTO["status"], string> = {
+const TRACE_STATUS_DOT_CLASSES: Record<TraceSpan["status"], string> = {
   success: "bg-agentprism-success",
   error: "bg-agentprism-error",
   warning: "bg-agentprism-warning",
+  pending: "bg-agentprism-pending",
 };
 
 function formatRunOption(run: EvalRunDTO): string {
