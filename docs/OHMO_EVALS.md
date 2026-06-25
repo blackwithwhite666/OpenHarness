@@ -123,6 +123,46 @@ the JSON/JSONL source of truth.
    regresses or disappears from the candidate report. Use `--report-only` to
    collect the comparison without failing the command.
 
+## Gating vs realism: which config to run
+
+Two lanes with different jobs — do not conflate them.
+
+**Gating lane (the score you track and regression-gate on): frozen replay + majority vote.**
+
+```bash
+ohmo evals run --agent-runner query-engine --fixture-match order \
+  --scorer trajectory_judge_v1 --samples 3
+```
+
+- `--fixture-match order` serves every tool from recorded fixtures (identical
+  bytes every run). This removes the dominant noise source: live tools almost
+  never *error*, but they return **different content** each run, and that
+  variance flips verdicts. Freezing the tools makes most flappers fully stable.
+- `--samples N` (now **default 3**) majority-votes the residual model sampling —
+  the cases that still coin-flip even with frozen tools. Pass `--samples 1` only
+  when you deliberately want raw single-run variance.
+- This is the reproducible number for `baseline save` / `compare`.
+
+**Realism lane (a periodic probe, NOT the gate): live tools in a sandbox.**
+
+```bash
+ohmo evals run --agent-runner fs-sandbox --sandbox-net-mode netns:<ns> \
+  --sandbox-proxy-url <proxy> --sandbox-browser-socket <sock> --sandbox-browser-name <name>
+```
+
+- Runs `google_search` / maps / browser LIVE through a network-namespaced
+  sandbox. More realistic, but live-content variance makes the score wander
+  run-to-run. Use it to catch breakage that only live tools expose — not as a
+  number you gate on.
+
+Empirical basis (2026-06-24): of 5 cases that flapped under the live lane, **4
+went rock-stable (5/5) under frozen replay**; the 1 that still flapped (3/5) was
+majority-voted to a stable verdict by `--samples 3`. So **frozen replay is the
+bigger stability lever; `--samples N` mops up the residual model sampling.** A
+too-small `--max-turns` is a separate, deterministic failure (truncation), now
+recorded in report metadata; on `MaxTurnsExceeded` the runner keeps the last
+non-empty partial answer instead of blanking it.
+
 ## Baseline promotion runbook
 
 Use this sequence for a local candidate run before treating it as the new
