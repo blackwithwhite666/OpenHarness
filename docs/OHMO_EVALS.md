@@ -250,3 +250,44 @@ and executor metadata values are not copied into reports.
 Comparison reports are also metadata-only. They compare case ids, statuses,
 scores, and aggregate counts. They do not read or persist raw prompts, tool
 inputs, tool outputs, or final answers.
+
+## Trace viewer (web UI)
+
+A read-only web viewer for **all** captured traces — prod episodes and прокачки
+(eval runs) — built on [evilmartians/agent-prism](https://github.com/evilmartians/agent-prism).
+Design: `agents-playgroud/adrs/ohmo-eval-trace-viewer.md`. Code: `ohmo/evals/viewer/`
+(Starlette backend, binds **127.0.0.1 only**) + `frontend/trace-viewer/` (Vite + React 19 +
+Tailwind 3 + copied agent-prism components).
+
+Build the SPA, then run the backend:
+
+```bash
+cd frontend/trace-viewer && npm install && npm run build      # produces dist/
+# back at repo root — point the backend at the build and the eval workspace:
+OHMO_VIEWER_STATIC_DIR=$PWD/frontend/trace-viewer/dist \
+OHMO_VIEWER_WORKSPACE="$HOME/.ohmo" OHMO_VIEWER_PORT=8765 \
+python -m ohmo.evals.viewer                                   # http://127.0.0.1:8765
+```
+
+Deployed on the server as a **systemd user service** `ohmo-trace-viewer.service`
+(internal, localhost:8765). Deploy = pipx reinstall (backend) + `scp dist/* …:~/.ohmo/trace-viewer-dist/`
+(frontend) + `systemctl --user restart ohmo-trace-viewer`. Access (internal only, no public
+exposure — prod episodes hold personal data):
+
+```bash
+ssh -f -N -L 8765:localhost:8765 <server>   # then open http://localhost:8765
+```
+
+Two lanes:
+
+- **prod** — rich episodes: span tree with real durations (from event timestamps), capability
+  titles (`effective_tool_label`), `llm_call` model spans (model + tokens), and per-span In/Out.
+- **прокачки** — eval runs: cases with score / verdict / pass-count badges, the observed tool +
+  `llm_call` tree, a flap / multi-sample selector, status filters, search, and an "open gold
+  episode" cross-link to the rich prod trace. Eval traces are **rich** when the D7 recorder captured
+  them (`traces/<report_id>/<case>-<sample>.json`: tool input/output + timestamps, final text, judge
+  reason, model-call tokens — gated by `OHMO_EVALS_TRACE_CAPTURE`, default on); older runs fall back
+  to the metadata-only report.
+
+Endpoints: `GET /api/traces[/{id}]`, `GET /api/runs`, `GET /api/eval-traces[/{case_id}?run=&sample=]`.
+The viewer is read-only; the `traces/` artifacts are raw (a redaction toggle is a future option).

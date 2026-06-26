@@ -48,6 +48,133 @@ def test_episode_to_trace_viewer_data_maps_successful_tool_turn(tmp_path: Path) 
     assert child["output"] == "..."
 
 
+def test_episode_to_trace_viewer_data_renders_prod_model_calls(tmp_path: Path) -> None:
+    store = get_eval_store(tmp_path)
+    base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+    episode_id = "ep-model-calls"
+    store.append_episode(
+        EvalEpisode(
+            episode_id=episode_id,
+            source="gateway",
+            app="ohmo",
+            session_id="session-1",
+            created_at=base,
+            user_text="проверь отзывы",
+            metadata={"model": "gpt-prod", "cwd": "/tmp/project"},
+        )
+    )
+    store.append_event(
+        EvalEvent(
+            episode_id=episode_id,
+            kind="inbound_message",
+            timestamp=base,
+            payload={"user_text": "проверь отзывы"},
+        )
+    )
+    store.append_event(
+        EvalEvent(
+            episode_id=episode_id,
+            kind="model_call",
+            timestamp=base + timedelta(milliseconds=80),
+            payload={"model": "gpt-prod", "input_tokens": 3, "output_tokens": 2},
+        )
+    )
+    store.append_event(
+        EvalEvent(
+            episode_id=episode_id,
+            kind="tool_started",
+            timestamp=base + timedelta(milliseconds=100),
+            payload={"input": {"command": "maps-cli reviews Xander"}},
+            tool_name="bash",
+            tool_call_id="c1",
+        )
+    )
+    store.append_event(
+        EvalEvent(
+            episode_id=episode_id,
+            kind="tool_completed",
+            timestamp=base + timedelta(milliseconds=200),
+            payload={"output": "review one"},
+            tool_name="bash",
+            tool_call_id="c1",
+        )
+    )
+    store.append_event(
+        EvalEvent(
+            episode_id=episode_id,
+            kind="model_call",
+            timestamp=base + timedelta(milliseconds=350),
+            payload={"model": "gpt-prod", "input_tokens": 11, "output_tokens": 7},
+        )
+    )
+    store.append_event(
+        EvalEvent(
+            episode_id=episode_id,
+            kind="tool_started",
+            timestamp=base + timedelta(milliseconds=400),
+            payload={"input": {"command": "maps-cli orgs Xander"}},
+            tool_name="bash",
+            tool_call_id="c2",
+        )
+    )
+    store.append_event(
+        EvalEvent(
+            episode_id=episode_id,
+            kind="tool_completed",
+            timestamp=base + timedelta(milliseconds=500),
+            payload={"output": "org details"},
+            tool_name="bash",
+            tool_call_id="c2",
+        )
+    )
+    store.append_event(
+        EvalEvent(
+            episode_id=episode_id,
+            kind="gateway_final",
+            timestamp=base + timedelta(milliseconds=600),
+            payload={"text": "готово"},
+        )
+    )
+
+    data = episode_to_trace_viewer_data(store, episode_id)
+
+    assert data["traceRecord"]["spansCount"] == 5
+    assert data["traceRecord"]["totalTokens"] == 23
+    children = data["spans"][0]["children"]
+    assert [child["type"] for child in children] == [
+        "llm_call",
+        "tool_execution",
+        "llm_call",
+        "tool_execution",
+    ]
+    base_ms = int(base.timestamp() * 1000)
+    assert [child["startTimeMs"] for child in children] == [
+        base_ms,
+        base_ms + 100,
+        base_ms + 200,
+        base_ms + 400,
+    ]
+
+    first_llm = children[0]
+    assert first_llm["title"] == "gpt-prod"
+    assert first_llm["tokensCount"] == 5
+    assert first_llm["durationMs"] == 80
+    assert first_llm["input"] is None
+    assert first_llm["output"] is None
+
+    second_llm = children[2]
+    assert second_llm["title"] == "gpt-prod"
+    assert second_llm["tokensCount"] == 18
+    assert second_llm["startTimeMs"] == base_ms + 200
+    assert second_llm["endTimeMs"] == base_ms + 350
+    attributes = {
+        item["key"]: item["value"]["stringValue"]
+        for item in second_llm["attributes"]
+    }
+    assert attributes["input_tokens"] == "11"
+    assert attributes["output_tokens"] == "7"
+
+
 def test_episode_to_trace_viewer_data_propagates_tool_error_status(tmp_path: Path) -> None:
     store = get_eval_store(tmp_path)
     base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)

@@ -19,9 +19,10 @@ def episode_to_trace_viewer_data(store: Any, episode_id: str) -> dict[str, Any]:
         raise KeyError(episode_id)
 
     events = list(store.iter_events(episode_id))
-    child_spans = _tool_spans(episode_id, events)
+    child_spans = _child_spans(episode_id, events)
     start_ms, end_ms = _trace_bounds_ms(episode, events)
     final_output = _gateway_final_text(events)
+    total_tokens = _model_call_total_tokens(events)
     root_status = "error" if any(span["status"] == "error" for span in child_spans) else "success"
     duration_ms = max(0, end_ms - start_ms)
 
@@ -53,6 +54,7 @@ def episode_to_trace_viewer_data(store: Any, episode_id: str) -> dict[str, Any]:
             "durationMs": duration_ms,
             "agentDescription": _string_value(episode.metadata.get("model")) or "",
             "startTimeMs": start_ms,
+            "totalTokens": total_tokens,
         },
         "spans": [root_span],
     }
@@ -96,6 +98,14 @@ def category_for(tool_name: str | None) -> str:
     if name.startswith(("bash", "mcp__")) or name:
         return "tool_execution"
     return "unknown"
+
+
+def _child_spans(episode_id: str, events: list[EvalEvent]) -> list[dict[str, Any]]:
+    child_spans = [
+        *_model_call_spans(episode_id, events),
+        *_tool_spans(episode_id, events),
+    ]
+    return sorted(child_spans, key=lambda span: _int_value(span.get("startTimeMs")))
 
 
 def _tool_spans(episode_id: str, events: list[EvalEvent]) -> list[dict[str, Any]]:
@@ -157,17 +167,72 @@ def _tool_span(
     }
 
 
+def _model_call_spans(episode_id: str, events: list[EvalEvent]) -> list[dict[str, Any]]:
+    if not events:
+        return []
+
+    spans: list[dict[str, Any]] = []
+    first_event = events[0]
+    previous_event: EvalEvent | None = None
+    ordinal = 0
+    for event in events:
+        if event.kind == "model_call":
+            ordinal += 1
+            spans.append(
+                _model_call_span(
+                    episode_id,
+                    ordinal,
+                    previous_event or first_event,
+                    event,
+                )
+            )
+        previous_event = event
+    return spans
+
+
+def _model_call_span(
+    episode_id: str,
+    index: int,
+    start_event: EvalEvent,
+    event: EvalEvent,
+) -> dict[str, Any]:
+    payload = event.payload or {}
+    model = _string_value(payload.get("model")) or f"model call {index}"
+    input_tokens = _int_value(payload.get("input_tokens"))
+    output_tokens = _int_value(payload.get("output_tokens"))
+    start_ms = _epoch_ms(start_event.timestamp)
+    end_ms = _epoch_ms(event.timestamp)
+    return {
+        "id": f"{episode_id}:llm:{index}",
+        "title": model,
+        "startTimeMs": start_ms,
+        "endTimeMs": end_ms,
+        "durationMs": max(0, end_ms - start_ms),
+        "type": "llm_call",
+        "status": "success",
+        "tokensCount": input_tokens + output_tokens,
+        "input": None,
+        "output": None,
+        "raw": _json_dumps(_model_dump(event)),
+        "attributes": _model_call_attributes(
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+        ),
+        "children": [],
+    }
+
+
 def _prod_trace_summary(store: Any, episode: EvalEpisode) -> dict[str, Any]:
     events = list(store.iter_events(episode.episode_id))
-    tool_spans = _tool_spans(episode.episode_id, events)
+    child_spans = _child_spans(episode.episode_id, events)
     start_ms, end_ms = _trace_bounds_ms(episode, events)
     return {
         "id": episode.episode_id,
         "name": episode.user_text or "(turn)",
         "kind": "prod",
         "createdAt": _epoch_ms(episode.created_at),
-        "status": "error" if any(span["status"] == "error" for span in tool_spans) else "success",
-        "spansCount": 1 + len(tool_spans),
+        "status": "error" if any(span["status"] == "error" for span in child_spans) else "success",
+        "spansCount": 1 + len(child_spans),
         "durationMs": max(0, end_ms - start_ms),
     }
 
@@ -186,6 +251,17 @@ def _tool_attributes(
     attributes: list[dict[str, dict[str, str] | str]] = []
     _append_attribute(attributes, "tool_call_id", tool_call_id)
     _append_attribute(attributes, "tool_name", tool_name)
+    return attributes
+
+
+def _model_call_attributes(
+    *,
+    input_tokens: int,
+    output_tokens: int,
+) -> list[dict[str, dict[str, str] | str]]:
+    attributes: list[dict[str, dict[str, str] | str]] = []
+    _append_attribute(attributes, "input_tokens", input_tokens)
+    _append_attribute(attributes, "output_tokens", output_tokens)
     return attributes
 
 
@@ -221,8 +297,32 @@ def _tool_call_key(event: EvalEvent, index: int) -> str:
     return f"missing-tool-call-id:{index}"
 
 
+def _model_call_total_tokens(events: list[EvalEvent]) -> int:
+    return sum(
+        _model_call_tokens(event)
+        for event in events
+        if event.kind == "model_call"
+    )
+
+
+def _model_call_tokens(event: EvalEvent) -> int:
+    payload = event.payload or {}
+    return _int_value(payload.get("input_tokens")) + _int_value(payload.get("output_tokens"))
+
+
 def _epoch_ms(value: datetime) -> int:
     return int(value.timestamp() * 1000)
+
+
+def _int_value(value: Any) -> int:
+    if isinstance(value, (int, float)):
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(value)
+        except ValueError:
+            return 0
+    return 0
 
 
 def _json_or_none(value: Any) -> str | None:

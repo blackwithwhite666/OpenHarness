@@ -852,8 +852,14 @@ class OhmoSessionRuntimePool:
                 metadata={"_session_key": session_key},
             )
             return
-        if isinstance(event, AssistantTurnComplete) and not reply_parts:
-            reply_parts.append(event.message.text.strip())
+        if isinstance(event, AssistantTurnComplete):
+            if recorder is not None and event.usage is not None:
+                recorder.record_model_call(
+                    event,
+                    model=str(bundle.current_settings().model or ""),
+                )
+            if not reply_parts:
+                reply_parts.append(event.message.text.strip())
 
     async def _save_snapshot(self, bundle: RuntimeBundle, session_key: str, user_prompt: str) -> None:
         tool_metadata = _sanitize_group_command_metadata(getattr(bundle.engine, "tool_metadata", {}) or {})

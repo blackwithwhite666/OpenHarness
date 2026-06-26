@@ -14,6 +14,7 @@ from openharness.channels.bus.events import InboundMessage
 from openharness.evals import EvalEpisode, EvalEvent, EvalStore
 from openharness.evals.tool_labels import effective_tool_label, tool_call_binaries
 from openharness.engine.stream_events import (
+    AssistantTurnComplete,
     ErrorEvent,
     ToolExecutionCompleted,
     ToolExecutionStarted,
@@ -139,6 +140,16 @@ class GatewayEvalRecorder:
             tool_name=event.tool_name,
             tool_call_id=event.tool_call_id,
             is_error=event.is_error,
+        )
+
+    def record_model_call(self, event: AssistantTurnComplete, *, model: str) -> None:
+        self.record_event(
+            "model_call",
+            payload={
+                "model": model,
+                "input_tokens": event.usage.input_tokens,
+                "output_tokens": event.usage.output_tokens,
+            },
         )
 
     def record_engine_error(self, event: ErrorEvent) -> None:
