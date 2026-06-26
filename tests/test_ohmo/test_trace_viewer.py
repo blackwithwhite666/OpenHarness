@@ -383,6 +383,70 @@ def test_eval_trace_multi_sample_count_and_requested_sample_load(tmp_path: Path)
     assert route_payload["spans"][0]["output"] == "sample one answer"
 
 
+def test_episode_session_conversation_renders_session_chat(tmp_path: Path) -> None:
+    from ohmo.evals.viewer import episode_session_conversation
+
+    store = get_eval_store(tmp_path)
+    base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+    _append_trace_episode(store, episode_id="ep-1", base=base, user_text="первый вопрос")
+    _append_trace_episode(
+        store,
+        episode_id="ep-2",
+        base=base + timedelta(minutes=5),
+        user_text="второй вопрос",
+    )
+
+    data = episode_session_conversation(store, "ep-2")
+
+    assert data["kind"] == "session"
+    assert data["sessionId"] == "session-1"
+    assert data["anchorEpisodeId"] == "ep-2"
+    roles = [(m["role"], m["episodeId"]) for m in data["messages"]]
+    assert roles == [
+        ("user", "ep-1"),
+        ("assistant", "ep-1"),
+        ("user", "ep-2"),
+        ("assistant", "ep-2"),
+    ]
+    assistant = data["messages"][1]
+    assert assistant["text"] == "вот отзывы"
+    assert assistant["toolCalls"][0]["name"].startswith("bash:maps-cli")
+    assert assistant["toolCalls"][0]["status"] == "success"
+
+    client = TestClient(create_app(tmp_path))
+    route = client.get("/api/session/ep-2")
+    assert route.status_code == 200
+    assert route.json()["anchorEpisodeId"] == "ep-2"
+    assert client.get("/api/session/missing").status_code == 404
+
+
+def test_eval_case_conversation_uses_rich_trace(tmp_path: Path) -> None:
+    from ohmo.evals.viewer import eval_case_conversation
+
+    store = get_eval_store(tmp_path)
+    _write_eval_report(store)
+    _write_rich_eval_trace(store, final_text="нашёл два отзыва")
+
+    data = eval_case_conversation(store, "eval_report_x.json", "case-1")
+
+    assert data["kind"] == "observed"
+    assert data["goldEpisodeId"] == "ep-gold"
+    assert data["judgeVerdict"] == "fail"
+    assert [m["role"] for m in data["messages"]] == ["user", "assistant"]
+    assert data["messages"][0]["text"] == "покажи отзывы Xander"
+    assert data["messages"][1]["text"] == "нашёл два отзыва"
+    assert data["messages"][1]["toolCalls"][0]["name"].startswith("bash:maps-cli")
+
+    client = TestClient(create_app(tmp_path))
+    route = client.get(
+        "/api/eval-conversation/case-1",
+        params={"run": "eval_report_x.json"},
+    )
+    assert route.status_code == 200
+    assert route.json()["goldEpisodeId"] == "ep-gold"
+    assert client.get("/api/eval-conversation/case-1").status_code == 400
+
+
 def _append_trace_episode(
     store,
     *,

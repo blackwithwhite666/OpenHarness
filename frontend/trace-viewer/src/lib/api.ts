@@ -91,6 +91,32 @@ export interface TraceDetailDTO {
   sampleCount?: number;
 }
 
+export interface ConversationToolCallDTO {
+  name: string;
+  status: "success" | "error";
+}
+
+export interface ConversationMessageDTO {
+  role: "user" | "assistant";
+  text: string;
+  ts: number;
+  episodeId: string | null;
+  toolCalls: ConversationToolCallDTO[];
+  status: "success" | "error";
+}
+
+export interface ConversationDTO {
+  title: string;
+  kind: "session" | "observed";
+  sessionId: string;
+  anchorEpisodeId?: string;
+  goldEpisodeId?: string;
+  sample?: number;
+  judgeVerdict?: string | null;
+  judgeReason?: string | null;
+  messages: ConversationMessageDTO[];
+}
+
 async function getJson<T>(url: string): Promise<T> {
   const response = await fetch(url);
 
@@ -137,5 +163,23 @@ export function getEvalTrace(
 
   return getJson<TraceDetailDTO>(
     `/api/eval-traces/${encodeURIComponent(caseId)}?${params.toString()}`,
+  );
+}
+
+export function getSession(episodeId: string): Promise<ConversationDTO> {
+  return getJson<ConversationDTO>(
+    `/api/session/${encodeURIComponent(episodeId)}`,
+  );
+}
+
+export function getEvalConversation(
+  caseId: string,
+  run: string,
+  sample = 0,
+): Promise<ConversationDTO> {
+  const params = new URLSearchParams({ run, sample: String(sample) });
+
+  return getJson<ConversationDTO>(
+    `/api/eval-conversation/${encodeURIComponent(caseId)}?${params.toString()}`,
   );
 }

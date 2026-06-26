@@ -5,6 +5,7 @@ import {
   AlertCircle,
   ExternalLink,
   GitCompareArrows,
+  MessagesSquare,
   RefreshCw,
   Search,
 } from "lucide-react";
@@ -13,6 +14,7 @@ import {
   useCallback,
   useEffect,
   useMemo,
+  useRef,
   useState,
 } from "react";
 import { Panel, PanelGroup, PanelResizeHandle } from "react-resizable-panels";
@@ -20,21 +22,26 @@ import { Panel, PanelGroup, PanelResizeHandle } from "react-resizable-panels";
 import type { BadgeProps } from "./components/agent-prism/Badge";
 
 import { Button } from "./components/agent-prism/Button";
+import { ChatView } from "./components/ChatView";
 import { DetailsView } from "./components/agent-prism/DetailsView/DetailsView";
 import { TextInput } from "./components/agent-prism/TextInput";
 import { TraceList } from "./components/agent-prism/TraceList/TraceList";
 import { TraceViewerTreeViewContainer } from "./components/agent-prism/TraceViewer/TraceViewerTreeViewContainer";
 import {
+  getEvalConversation,
   getEvalTrace,
+  getSession,
   getTrace,
   listEvalTraces,
   listRuns,
   listTraces,
+  type ConversationDTO,
   type EvalRunDTO,
   type EvalTraceSummaryDTO,
   type TraceSummaryDTO,
 } from "./lib/api";
 import { mapTrace, mapTraceSummary } from "./lib/mapTrace";
+import { type AppRoute, type ChatKind, parseHash, serializeRoute } from "./lib/route";
 
 type SourceTab = "prod" | "eval";
 type StatusFilter = "all" | "passed" | "failed";
@@ -62,8 +69,28 @@ interface LoadedTrace {
   sampleCount?: number;
 }
 
+type ChatTarget =
+  | { kind: "session"; episodeId: string }
+  | { kind: "gold"; episodeId: string }
+  | { kind: "observed"; run: string; caseId: string; sample: number };
+
+interface PendingEvalRestore {
+  run: string;
+  caseId?: string;
+  sample: number;
+  chat?: ChatKind;
+}
+
 function App() {
-  const [sourceTab, setSourceTab] = useState<SourceTab>("prod");
+  const initialRouteRef = useRef<AppRoute | null>(null);
+  if (initialRouteRef.current === null) {
+    initialRouteRef.current = parseHash(
+      typeof window !== "undefined" ? window.location.hash : "",
+    );
+  }
+  const initialRoute = initialRouteRef.current;
+
+  const [sourceTab, setSourceTab] = useState<SourceTab>(initialRoute.tab);
   const [query, setQuery] = useState("");
   const [prodStatusFilter, setProdStatusFilter] = useState<StatusFilter>("all");
   const [traces, setTraces] = useState<ProdTraceRecord[]>([]);
@@ -78,7 +105,9 @@ function App() {
   const [listError, setListError] = useState<string | undefined>();
   const [traceError, setTraceError] = useState<string | undefined>();
   const [evalRuns, setEvalRuns] = useState<EvalRunDTO[]>([]);
-  const [selectedRunId, setSelectedRunId] = useState<string | undefined>();
+  const [selectedRunId, setSelectedRunId] = useState<string | undefined>(
+    initialRoute.tab === "eval" ? initialRoute.run : undefined,
+  );
   const [evalTraces, setEvalTraces] = useState<EvalTraceRecord[]>([]);
   const [selectedEvalTrace, setSelectedEvalTrace] =
     useState<EvalTraceRecord | undefined>();
@@ -103,6 +132,13 @@ function App() {
   const [goldSpanSearchValue, setGoldSpanSearchValue] = useState("");
   const [isGoldTraceLoading, setIsGoldTraceLoading] = useState(false);
   const [goldTraceError, setGoldTraceError] = useState<string | undefined>();
+  const [chatTarget, setChatTarget] = useState<ChatTarget | undefined>();
+  const [chatData, setChatData] = useState<ConversationDTO | undefined>();
+  const [chatLoading, setChatLoading] = useState(false);
+  const [chatError, setChatError] = useState<string | undefined>();
+  const [evalRestoreNonce, setEvalRestoreNonce] = useState(0);
+  const pendingEvalRef = useRef<PendingEvalRestore | null>(null);
+  const pendingGoldChatRef = useRef(false);
 
   const fetchTraceList = useCallback(async (search: string) => {
     setIsListLoading(true);
@@ -323,6 +359,209 @@ function App() {
     },
     [handleTraceSelect],
   );
+
+  const handleOpenEpisodeFromChat = useCallback(
+    (episodeId: string) => {
+      setChatTarget(undefined);
+      handleOpenGoldEpisode(episodeId);
+    },
+    [handleOpenGoldEpisode],
+  );
+
+  // Fetch the conversation transcript whenever a chat target is opened.
+  useEffect(() => {
+    if (!chatTarget) {
+      setChatData(undefined);
+      setChatError(undefined);
+      setChatLoading(false);
+      return;
+    }
+
+    let ignore = false;
+    setChatLoading(true);
+    setChatError(undefined);
+    setChatData(undefined);
+
+    const request =
+      chatTarget.kind === "observed"
+        ? getEvalConversation(chatTarget.caseId, chatTarget.run, chatTarget.sample)
+        : getSession(chatTarget.episodeId);
+
+    request
+      .then((data) => {
+        if (!ignore) setChatData(data);
+      })
+      .catch((error) => {
+        if (!ignore)
+          setChatError(
+            error instanceof Error ? error.message : "Failed to load conversation",
+          );
+      })
+      .finally(() => {
+        if (!ignore) setChatLoading(false);
+      });
+
+    return () => {
+      ignore = true;
+    };
+  }, [chatTarget]);
+
+  // Consume a pending eval restore once its run is the active one (deep links /
+  // back-forward). Declared after the clear-on-runId effect so the clear runs
+  // first and does not wipe the restored selection.
+  useEffect(() => {
+    const pending = pendingEvalRef.current;
+    if (!pending || sourceTab !== "eval" || selectedRunId !== pending.run) return;
+
+    pendingEvalRef.current = null;
+    if (!pending.caseId) return;
+
+    const synthetic: EvalTraceRecord = {
+      id: pending.caseId,
+      name: pending.caseId,
+      spansCount: 0,
+      durationMs: 0,
+      agentDescription: "",
+      badges: [],
+      status: "warning",
+      goldEpisodeId: "",
+      sampleCount: 0,
+    };
+
+    if (pending.chat === "observed") {
+      setChatTarget({
+        kind: "observed",
+        run: pending.run,
+        caseId: pending.caseId,
+        sample: pending.sample,
+      });
+    } else if (pending.chat === "gold") {
+      pendingGoldChatRef.current = true;
+    }
+
+    void loadEvalTrace(synthetic, pending.sample);
+  }, [evalRestoreNonce, loadEvalTrace, selectedRunId, sourceTab]);
+
+  // A pending gold-chat deep link can only resolve once the eval trace (and thus
+  // its gold episode id) has loaded.
+  useEffect(() => {
+    if (!pendingGoldChatRef.current) return;
+    const goldEpisodeId = loadedEvalTrace?.goldEpisodeId;
+    if (!goldEpisodeId) return;
+
+    pendingGoldChatRef.current = false;
+    setChatTarget({ kind: "gold", episodeId: goldEpisodeId });
+  }, [loadedEvalTrace]);
+
+  // Restore the rest of the initial deep link once on mount (tab + selected run
+  // are already seeded into state).
+  useEffect(() => {
+    const route = initialRoute;
+    if (route.tab === "prod") {
+      if (route.trace) {
+        void handleTraceSelect({
+          id: route.trace,
+          name: route.trace,
+          spansCount: 0,
+          durationMs: 0,
+          agentDescription: "",
+        });
+        if (route.chat === "session") {
+          setChatTarget({ kind: "session", episodeId: route.trace });
+        }
+      }
+    } else if (route.run) {
+      pendingEvalRef.current = {
+        run: route.run,
+        caseId: route.caseId,
+        sample: route.sample ?? 0,
+        chat: route.chat,
+      };
+      setEvalRestoreNonce((nonce) => nonce + 1);
+    }
+  }, [handleTraceSelect, initialRoute]);
+
+  const currentRoute = useMemo<AppRoute>(() => {
+    if (sourceTab === "prod") {
+      return {
+        tab: "prod",
+        trace: selectedTrace?.id,
+        chat: chatTarget?.kind === "session" ? "session" : undefined,
+      };
+    }
+
+    return {
+      tab: "eval",
+      run: selectedRunId,
+      caseId: selectedEvalTrace?.id,
+      sample: selectedEvalSample,
+      chat:
+        chatTarget?.kind === "observed"
+          ? "observed"
+          : chatTarget?.kind === "gold"
+            ? "gold"
+            : undefined,
+    };
+  }, [
+    chatTarget,
+    selectedEvalSample,
+    selectedEvalTrace?.id,
+    selectedRunId,
+    selectedTrace?.id,
+    sourceTab,
+  ]);
+
+  // Keep the URL in sync (replaceState does not fire hashchange, so this never
+  // loops with the listener below). Every view is therefore directly linkable.
+  useEffect(() => {
+    const next = serializeRoute(currentRoute);
+    if (window.location.hash !== next) {
+      window.history.replaceState(null, "", next);
+    }
+  }, [currentRoute]);
+
+  // React to back/forward navigation and pasted URLs.
+  useEffect(() => {
+    const handler = () => {
+      const route = parseHash(window.location.hash);
+      setSourceTab(route.tab);
+
+      if (route.tab === "prod") {
+        if (route.trace) {
+          void handleTraceSelect({
+            id: route.trace,
+            name: route.trace,
+            spansCount: 0,
+            durationMs: 0,
+            agentDescription: "",
+          });
+          setChatTarget(
+            route.chat === "session"
+              ? { kind: "session", episodeId: route.trace }
+              : undefined,
+          );
+        } else {
+          setChatTarget(undefined);
+        }
+        return;
+      }
+
+      setChatTarget(undefined);
+      if (route.run) {
+        pendingEvalRef.current = {
+          run: route.run,
+          caseId: route.caseId,
+          sample: route.sample ?? 0,
+          chat: route.chat,
+        };
+        setSelectedRunId(route.run);
+        setEvalRestoreNonce((nonce) => nonce + 1);
+      }
+    };
+
+    window.addEventListener("hashchange", handler);
+    return () => window.removeEventListener("hashchange", handler);
+  }, [handleTraceSelect]);
 
   const handleRefresh = useCallback(() => {
     void fetchTraceList(query);
@@ -545,18 +784,35 @@ function App() {
           ) : traceError ? (
             <ErrorMessage message={traceError} />
           ) : loadedTrace && selectedTraceRecord ? (
-            <TraceViewerTreeViewContainer
-              searchValue={spanSearchValue}
-              setSearchValue={setSpanSearchValue}
-              handleExpandAll={() => setExpandedSpansIds(allSpanIds)}
-              handleCollapseAll={() => setExpandedSpansIds([])}
-              filteredSpans={filteredSpans}
-              selectedSpan={selectedSpan}
-              setSelectedSpan={setSelectedSpan}
-              expandedSpansIds={expandedSpansIds}
-              setExpandedSpansIds={setExpandedSpansIds}
-              selectedTrace={selectedTraceRecord}
-            />
+            <>
+              <div className="flex shrink-0 justify-end">
+                <Button
+                  aria-label="View session as chat"
+                  iconStart={<MessagesSquare className="size-4" />}
+                  onClick={() =>
+                    setChatTarget({
+                      kind: "session",
+                      episodeId: selectedTraceRecord.id,
+                    })
+                  }
+                  variant="secondary"
+                >
+                  View as chat
+                </Button>
+              </div>
+              <TraceViewerTreeViewContainer
+                searchValue={spanSearchValue}
+                setSearchValue={setSpanSearchValue}
+                handleExpandAll={() => setExpandedSpansIds(allSpanIds)}
+                handleCollapseAll={() => setExpandedSpansIds([])}
+                filteredSpans={filteredSpans}
+                selectedSpan={selectedSpan}
+                setSelectedSpan={setSelectedSpan}
+                expandedSpansIds={expandedSpansIds}
+                setExpandedSpansIds={setExpandedSpansIds}
+                selectedTrace={selectedTraceRecord}
+              />
+            </>
           ) : (
             <StatusMessage>Select a trace to inspect spans.</StatusMessage>
           )}
@@ -702,6 +958,38 @@ function App() {
                 >
                   Compare to gold
                 </Button>
+                {selectedRunId && selectedEvalTraceRecord && (
+                  <Button
+                    aria-label="View observed dialog"
+                    iconStart={<MessagesSquare className="size-4" />}
+                    onClick={() =>
+                      setChatTarget({
+                        kind: "observed",
+                        run: selectedRunId,
+                        caseId: selectedEvalTraceRecord.id,
+                        sample: selectedEvalSample,
+                      })
+                    }
+                    variant="secondary"
+                  >
+                    observed dialog
+                  </Button>
+                )}
+                {loadedEvalTrace.goldEpisodeId && (
+                  <Button
+                    aria-label="View gold dialog"
+                    iconStart={<MessagesSquare className="size-4" />}
+                    onClick={() =>
+                      setChatTarget({
+                        kind: "gold",
+                        episodeId: loadedEvalTrace.goldEpisodeId!,
+                      })
+                    }
+                    variant="secondary"
+                  >
+                    gold dialog
+                  </Button>
+                )}
                 {loadedEvalTrace.goldEpisodeId && (
                   <Button
                     aria-label="Open gold episode"
@@ -826,7 +1114,10 @@ function App() {
                 : "text-agentprism-muted-foreground"
             }`}
             type="button"
-            onClick={() => setSourceTab("prod")}
+            onClick={() => {
+              setSourceTab("prod");
+              setChatTarget(undefined);
+            }}
           >
             prod
           </button>
@@ -837,7 +1128,10 @@ function App() {
                 : "text-agentprism-muted-foreground"
             }`}
             type="button"
-            onClick={() => setSourceTab("eval")}
+            onClick={() => {
+              setSourceTab("eval");
+              setChatTarget(undefined);
+            }}
           >
             прокачки
           </button>
@@ -845,8 +1139,33 @@ function App() {
       </header>
 
       {sourceTab === "prod" ? prodContent : evalContent}
+
+      {chatTarget && (
+        <ChatView
+          title={chatData?.title ?? chatTitleFallback(chatTarget)}
+          data={chatData}
+          loading={chatLoading}
+          error={chatError}
+          onClose={() => setChatTarget(undefined)}
+          onOpenEpisode={
+            chatTarget.kind === "observed"
+              ? undefined
+              : handleOpenEpisodeFromChat
+          }
+          shareUrl={
+            typeof window !== "undefined" ? window.location.href : undefined
+          }
+        />
+      )}
     </main>
   );
+}
+
+function chatTitleFallback(target: ChatTarget): string {
+  if (target.kind === "observed") {
+    return `observed · ${target.caseId}`;
+  }
+  return target.episodeId;
 }
 
 function StatusFilterControl({

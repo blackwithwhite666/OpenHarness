@@ -12,8 +12,13 @@ from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 
 from ohmo.evals import get_eval_store
-from ohmo.evals.viewer.adapter import episode_to_trace_viewer_data, list_prod_traces
+from ohmo.evals.viewer.adapter import (
+    episode_session_conversation,
+    episode_to_trace_viewer_data,
+    list_prod_traces,
+)
 from ohmo.evals.viewer.eval_adapter import (
+    eval_case_conversation,
     eval_case_to_trace_viewer_data,
     list_eval_runs,
     list_eval_traces,
@@ -75,6 +80,27 @@ def create_app(workspace: str | Path | None = None) -> Starlette:
             return JSONResponse({"detail": "eval trace not found"}, status_code=404)
         return JSONResponse(data)
 
+    async def session(request: Any) -> JSONResponse:
+        episode_id = request.path_params["episode_id"]
+        try:
+            data = episode_session_conversation(store, episode_id)
+        except KeyError:
+            return JSONResponse({"detail": "episode not found"}, status_code=404)
+        return JSONResponse(data)
+
+    async def eval_conversation(request: Any) -> JSONResponse:
+        params = request.query_params
+        run = params.get("run")
+        if run is None or not run.strip():
+            return JSONResponse({"detail": "run query parameter is required"}, status_code=400)
+        case_id = request.path_params["case_id"]
+        sample = max(0, _int_param(params.get("sample"), default=0))
+        try:
+            data = eval_case_conversation(store, run.strip(), case_id, sample=sample)
+        except KeyError:
+            return JSONResponse({"detail": "eval case not found"}, status_code=404)
+        return JSONResponse(data)
+
     routes: list[Any] = [
         Route("/healthz", healthz, methods=["GET"]),
         Route("/api/traces", traces, methods=["GET"]),
@@ -82,6 +108,8 @@ def create_app(workspace: str | Path | None = None) -> Starlette:
         Route("/api/runs", runs, methods=["GET"]),
         Route("/api/eval-traces", eval_traces, methods=["GET"]),
         Route("/api/eval-traces/{case_id}", eval_trace, methods=["GET"]),
+        Route("/api/session/{episode_id}", session, methods=["GET"]),
+        Route("/api/eval-conversation/{case_id}", eval_conversation, methods=["GET"]),
     ]
 
     # Static SPA: env override (used on the server, where the repo tree is absent

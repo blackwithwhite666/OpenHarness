@@ -164,6 +164,103 @@ def eval_case_to_trace_viewer_data(
     }
 
 
+def eval_case_conversation(
+    store: Any,
+    run: str,
+    case_id: str,
+    sample: int = 0,
+) -> dict[str, Any]:
+    """Render one eval case's observed turn as a chat transcript.
+
+    The eval is a single user turn: the prompt the agent received and the reply
+    it produced, with the tool calls it made along the way. Also surfaces the
+    gold episode id so the UI can cross-link to the real-chat session, and the
+    judge verdict/reason when present. Raises ``KeyError`` for unknown cases.
+    """
+    report = _read_execution_report(store, run)
+    case = _find_case(report, case_id)
+    if case is None:
+        raise KeyError(case_id)
+
+    report_id = _string_value(report.get("report_id"))
+    context = _mapping(case.get("context"))
+    gold_episode_id = _string_value(context.get("episode_id"))
+    rich_result = _read_rich_trace_or_none(
+        store, report_id=report_id, case_id=case_id, sample=sample
+    )
+
+    prompt: str | None = None
+    final_text: str | None = None
+    judge_verdict: str | None = None
+    judge_reason: str | None = None
+    loaded_sample = max(0, sample)
+
+    if rich_result is not None:
+        rich_trace, loaded_sample = rich_result
+        prompt = _text_or_json(rich_trace.get("prompt"))
+        final_text = _text_or_json(rich_trace.get("final_text"))
+        tool_summaries = [
+            {
+                "name": effective_tool_label(
+                    _string_value(tool_call.get("tool_name")) or "",
+                    tool_call.get("input"),
+                ),
+                "status": "error" if bool(tool_call.get("is_error")) else "success",
+            }
+            for tool_call in _sequence_of_mappings(rich_trace.get("tool_calls"))
+        ]
+        judge = _mapping(rich_trace.get("judge"))
+        judge_verdict = _string_value(judge.get("verdict"))
+        judge_reason = _string_value(judge.get("reason"))
+    else:
+        observed = _mapping(case.get("observed_trace"))
+        tool_summaries = [
+            {
+                "name": _string_value(tool_call.get("tool_name")) or f"tool {index}",
+                "status": "error" if bool(tool_call.get("is_error")) else "success",
+            }
+            for index, tool_call in enumerate(
+                _sequence_of_mappings(observed.get("tool_calls")), start=1
+            )
+        ]
+
+    messages: list[dict[str, Any]] = []
+    if prompt:
+        messages.append(
+            {
+                "role": "user",
+                "text": prompt,
+                "ts": 0,
+                "episodeId": None,
+                "toolCalls": [],
+                "status": "success",
+            }
+        )
+    messages.append(
+        {
+            "role": "assistant",
+            "text": final_text or "",
+            "ts": 0,
+            "episodeId": None,
+            "toolCalls": tool_summaries,
+            "status": "error"
+            if any(summary["status"] == "error" for summary in tool_summaries)
+            else "success",
+        }
+    )
+
+    return {
+        "title": case_id,
+        "kind": "observed",
+        "sessionId": "",
+        "goldEpisodeId": gold_episode_id,
+        "sample": loaded_sample,
+        "judgeVerdict": judge_verdict,
+        "judgeReason": judge_reason,
+        "messages": messages,
+    }
+
+
 def _rich_trace_viewer_data(
     *,
     case_id: str,

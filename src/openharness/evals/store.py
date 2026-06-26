@@ -139,6 +139,24 @@ class EvalStore:
             connection.close()
         return [row["episode_id"] for row in rows]
 
+    def list_session_episode_ids(self, session_id: str) -> list[str]:
+        """List indexed episode ids for one session in creation order."""
+        self._ensure_lookup_index()
+        connection = self._connect()
+        try:
+            rows = connection.execute(
+                """
+                SELECT episode_id
+                FROM episodes
+                WHERE session_id = ?
+                ORDER BY created_at, episode_id
+                """,
+                (session_id,),
+            ).fetchall()
+        finally:
+            connection.close()
+        return [row["episode_id"] for row in rows]
+
     def count_episodes(self) -> int:
         """Return the number of indexed episode records."""
         self._ensure_lookup_index()

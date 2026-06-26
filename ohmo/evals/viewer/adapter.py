@@ -88,6 +88,76 @@ def list_prod_traces(
     }
 
 
+def episode_session_conversation(store: Any, episode_id: str) -> dict[str, Any]:
+    """Render the whole session containing ``episode_id`` as a chat transcript.
+
+    Each episode is one user turn (``user_text``) plus the gateway's reply
+    (``gateway_final`` text) with a compact list of the tool calls it made.
+    Works for any prod/gold episode id; the anchor episode is flagged so the UI
+    can highlight it. Raises ``KeyError`` when the episode is unknown.
+    """
+    anchor = store.get_episode(episode_id)
+    if anchor is None:
+        raise KeyError(episode_id)
+
+    session_id = anchor.session_id or ""
+    episode_ids = (
+        store.list_session_episode_ids(session_id) if session_id else [episode_id]
+    )
+    if episode_id not in episode_ids:
+        episode_ids = [*episode_ids, episode_id]
+
+    messages: list[dict[str, Any]] = []
+    for eid in episode_ids:
+        episode = store.get_episode(eid)
+        if episode is None:
+            continue
+        events = list(store.iter_events(eid))
+        created_ms = _epoch_ms(episode.created_at)
+        if episode.user_text:
+            messages.append(
+                {
+                    "role": "user",
+                    "text": episode.user_text,
+                    "ts": created_ms,
+                    "episodeId": eid,
+                    "toolCalls": [],
+                    "status": "success",
+                }
+            )
+        tool_summaries = _episode_tool_summaries(eid, events)
+        final_text = _gateway_final_text(events)
+        end_ms = _epoch_ms(events[-1].timestamp) if events else created_ms
+        if final_text or tool_summaries:
+            messages.append(
+                {
+                    "role": "assistant",
+                    "text": final_text or "",
+                    "ts": end_ms,
+                    "episodeId": eid,
+                    "toolCalls": tool_summaries,
+                    "status": "error"
+                    if any(summary["status"] == "error" for summary in tool_summaries)
+                    else "success",
+                }
+            )
+
+    return {
+        "title": anchor.user_text or session_id or episode_id,
+        "kind": "session",
+        "sessionId": session_id,
+        "anchorEpisodeId": episode_id,
+        "messages": messages,
+    }
+
+
+def _episode_tool_summaries(episode_id: str, events: list[EvalEvent]) -> list[dict[str, str]]:
+    return [
+        {"name": span["title"], "status": span["status"]}
+        for span in _tool_spans(episode_id, events)
+    ]
+
+
 def category_for(tool_name: str | None) -> str:
     """Map an ohmo tool name to the trace-viewer span category."""
     name = (tool_name or "").strip()
