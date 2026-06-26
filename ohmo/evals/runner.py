@@ -648,6 +648,7 @@ def _build_agent_runner_config(
                 max_turns=max_turns,
                 live_mcp_server_names=("google_search",),
                 live_typed_read_tool_names=("read_file", "glob", "grep"),
+                live_local_tool_factory=_ohmo_todo_write_tool_factory,
             ),
             agent_runner_name="query-engine-live-read",
             model=settings.model,
@@ -706,6 +707,7 @@ def _build_agent_runner_config(
             system_prompt=resolved_prompt,
             cwd=workspace,
             max_turns=max_turns,
+            live_local_tool_factory=_ohmo_todo_write_tool_factory,
         ),
         agent_runner_name="query-engine",
         model=settings.model,
@@ -714,6 +716,10 @@ def _build_agent_runner_config(
         system_prompt=resolved_prompt,
         cwd=workspace,
     )
+
+
+def _ohmo_todo_write_tool_factory(state_root: Path) -> Sequence[BaseTool]:
+    return (OhmoTodoWriteTool(TodoStore(state_root), lambda: "eval-sandbox"),)
 
 
 def _ohmo_sandbox_tool_factory(sandbox_ws: Path) -> Sequence[BaseTool]:

@@ -208,6 +208,7 @@ class QueryEngineEvalAgentRunner:
         cwd: str | Path | None = None,
         max_turns: int = 8,
         max_tokens: int = 4096,
+        live_local_tool_factory: Callable[[Path], Sequence[BaseTool]] | None = None,
     ) -> None:
         self._api_client = api_client
         self._model = model
@@ -215,6 +216,7 @@ class QueryEngineEvalAgentRunner:
         self._cwd = Path(cwd).resolve() if cwd is not None else Path.cwd().resolve()
         self._max_turns = max_turns
         self._max_tokens = max_tokens
+        self._live_local_tool_factory = live_local_tool_factory
 
     def run(
         self,
@@ -223,19 +225,30 @@ class QueryEngineEvalAgentRunner:
         tool_registry: ToolRegistry,
         context: EvalExecutionContext,
     ) -> EvalExecutorResult:
-        return _run_eval_coroutine(
-            _run_query_engine_replay(
-                api_client=self._api_client,
-                model=self._model,
-                system_prompt=self._system_prompt,
-                cwd=self._cwd,
-                max_turns=self._max_turns,
-                max_tokens=self._max_tokens,
-                prompt=prompt,
-                tool_registry=tool_registry,
-                context=context,
+        local_state_root: Path | None = None
+        try:
+            if self._live_local_tool_factory is not None:
+                local_state_root = Path(
+                    tempfile.mkdtemp(prefix="openharness-eval-local-tools-")
+                ).resolve()
+                for tool in self._live_local_tool_factory(local_state_root):
+                    tool_registry.register(tool)
+            return _run_eval_coroutine(
+                _run_query_engine_replay(
+                    api_client=self._api_client,
+                    model=self._model,
+                    system_prompt=self._system_prompt,
+                    cwd=self._cwd,
+                    max_turns=self._max_turns,
+                    max_tokens=self._max_tokens,
+                    prompt=prompt,
+                    tool_registry=tool_registry,
+                    context=context,
+                )
             )
-        )
+        finally:
+            if local_state_root is not None:
+                shutil.rmtree(local_state_root, ignore_errors=True)
 
 
 class SandboxMutatingAgentRunner:

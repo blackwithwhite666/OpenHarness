@@ -15,8 +15,10 @@ from openharness.engine.messages import (
 from openharness.evals import (
     EvalEpisode,
     EvalEvent,
+    EvalExecutionContext,
     FsSandboxAgentRunner,
     LiveReadAgentRunner,
+    ReplayToolsExecutor,
     SynthContext,
     promote_case_drafts,
 )
@@ -930,6 +932,86 @@ def test_build_live_read_runner_config_uses_query_engine_settings(
         "glob",
         "grep",
     )
+    assert config.agent_runner._live_local_tool_factory is (
+        runner_module._ohmo_todo_write_tool_factory
+    )
+
+
+def test_query_engine_runner_executes_todo_write_live_without_gold_fixture(
+    tmp_path: Path,
+    monkeypatch,
+):
+    workspace = tmp_path / "workspace"
+    store = get_eval_store(workspace)
+    api_client = _RepeatedTodoWriteApiClient(call_count=3)
+    created_roots: list[Path] = []
+
+    def fake_mkdtemp(prefix: str) -> str:
+        root = tmp_path / f"{prefix}{len(created_roots)}"
+        root.mkdir(parents=True)
+        created_roots.append(root)
+        return str(root)
+
+    monkeypatch.setattr(
+        "ohmo.evals.runner.resolve_api_client_from_settings",
+        lambda settings: api_client,
+    )
+    monkeypatch.setattr(
+        "ohmo.evals.runner.build_ohmo_system_prompt",
+        lambda *args, **kwargs: "REAL_OHMO_PROMPT",
+    )
+    monkeypatch.setattr("openharness.evals.executor.tempfile.mkdtemp", fake_mkdtemp)
+
+    config = runner_module._build_agent_runner_config(
+        "query-engine",
+        workspace=workspace,
+        model="eval-model",
+        provider_profile=None,
+        system_prompt=None,
+    )
+    episode = EvalEpisode(
+        episode_id="ep-live-todo",
+        source="gateway",
+        app="ohmo",
+        session_id="session-live-todo",
+        user_text="private todo request",
+    )
+    case = EvalRunPackCase(
+        gold_case_id="gold-live-todo",
+        case_id="case-live-todo",
+        episode_id=episode.episode_id,
+        case_kind="tool_workflow",
+    )
+    pack = EvalRunPack(
+        pack_id="pack-live-todo",
+        source_records_path="cases/gold_cases.jsonl",
+        cases=[case],
+    )
+    context = EvalExecutionContext(
+        store=store,
+        pack=pack,
+        case=case,
+        episode=episode,
+        events=(),
+        input_facets=(),
+        expected_facets=(),
+        tool_fixtures=(),
+        primary_prompt="private todo request",
+        expected_final_text="private todo final",
+        resource_snapshot_status="missing",
+    )
+
+    result = ReplayToolsExecutor(agent_runner=config.agent_runner).run_case(context)
+
+    todo_calls = [call for call in result.tool_calls if call.tool_name == "todo_write"]
+    assert result.final_text == "private todo final"
+    assert len(todo_calls) == 3
+    assert all(not call.is_error for call in todo_calls)
+    assert all(call.output.startswith("Updated ") for call in todo_calls)
+    assert all("No replay fixture" not in call.output for call in todo_calls)
+    assert all("todo_write" in names for names in api_client.tool_names_by_request)
+    assert len(created_roots) == 1
+    assert not created_roots[0].exists()
 
 
 def test_build_fs_sandbox_runner_config_uses_query_engine_settings(
@@ -1055,6 +1137,42 @@ class _PerTurnToolModelApiClient:
                         input={"command": "weather-cli forecast 'SECRET_CITY'"},
                     )
                 ],
+            ),
+            usage=UsageSnapshot(input_tokens=1, output_tokens=1),
+        )
+
+
+class _RepeatedTodoWriteApiClient:
+    def __init__(self, *, call_count: int) -> None:
+        self.requests = []
+        self.tool_names_by_request: list[list[str]] = []
+        self._call_count = call_count
+        self._sent_count = 0
+
+    async def stream_message(self, request):
+        self.requests.append(request)
+        self.tool_names_by_request.append([tool["name"] for tool in request.tools])
+        if self._sent_count < self._call_count:
+            self._sent_count += 1
+            yield ApiMessageCompleteEvent(
+                message=ConversationMessage(
+                    role="assistant",
+                    content=[
+                        ToolUseBlock(
+                            id=f"toolu-todo-{self._sent_count}",
+                            name="todo_write",
+                            input={"item": f"private eval step {self._sent_count}"},
+                        )
+                    ],
+                ),
+                usage=UsageSnapshot(input_tokens=1, output_tokens=1),
+            )
+            return
+
+        yield ApiMessageCompleteEvent(
+            message=ConversationMessage(
+                role="assistant",
+                content=[TextBlock(text="private todo final")],
             ),
             usage=UsageSnapshot(input_tokens=1, output_tokens=1),
         )
