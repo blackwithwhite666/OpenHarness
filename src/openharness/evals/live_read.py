@@ -14,7 +14,7 @@ import re
 import shlex
 import shutil
 import tempfile
-from collections.abc import Collection
+from collections.abc import Callable, Collection, Sequence
 from pathlib import Path
 
 from openharness.api.client import SupportsStreamingMessages
@@ -181,6 +181,7 @@ class LiveReadAgentRunner:
         timeout: float = 120.0,
         live_mcp_server_names: tuple[str, ...] = (),
         live_typed_read_tool_names: tuple[str, ...] = (),
+        live_local_tool_factory: Callable[[Path], Sequence[BaseTool]] | None = None,
     ) -> None:
         self._api_client = api_client
         self._model = model
@@ -192,6 +193,7 @@ class LiveReadAgentRunner:
         self._timeout = timeout
         self._live_mcp_server_names = tuple(live_mcp_server_names)
         self._live_typed_read_tool_names = tuple(live_typed_read_tool_names)
+        self._live_local_tool_factory = live_local_tool_factory
 
     def run(
         self,
@@ -209,6 +211,12 @@ class LiveReadAgentRunner:
             real_registry: ToolRegistry | None = None
             materialized_file_count = 0
             try:
+                if self._live_local_tool_factory is not None:
+                    local_state_root = live_cwd / "_local_state"
+                    local_state_root.mkdir(parents=True, exist_ok=True)
+                    for tool in self._live_local_tool_factory(local_state_root):
+                        tool_registry.register(tool)
+
                 if self._live_mcp_server_names:
                     try:
                         settings = load_settings()
