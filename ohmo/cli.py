@@ -1605,7 +1605,7 @@ def evals_run_cmd(
         help="Override ohmo's real system prompt for --agent-runner query-engine",
     ),
     max_turns: int = typer.Option(
-        8,
+        100,
         "--max-turns",
         min=1,
         help="Assistant-turn budget for the agent loop (query-engine / live-read runners)",

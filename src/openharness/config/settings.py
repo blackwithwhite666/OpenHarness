@@ -522,7 +522,7 @@ class Settings(BaseModel):
     provider: str = ""
     active_profile: str = "claude-api"
     profiles: dict[str, ProviderProfile] = Field(default_factory=default_provider_profiles)
-    max_turns: int = 200
+    max_turns: int = 100
 
     # Behavior
     system_prompt: str | None = None

@@ -2366,7 +2366,7 @@ def test_ohmo_evals_run_command_threads_max_turns(
         ["evals", "run", "--workspace", str(workspace)],
     )
     assert result.exit_code == 0
-    assert calls[1]["max_turns"] == 8
+    assert calls[1]["max_turns"] == 100
 
 
 def test_ohmo_evals_run_command_check_config_does_not_run_eval(

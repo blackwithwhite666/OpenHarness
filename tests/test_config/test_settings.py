@@ -27,7 +27,7 @@ class TestSettings:
         assert s.model == "claude-sonnet-4-6"
         assert s.max_tokens == 16384
         assert s.timeout == 30.0
-        assert s.max_turns == 200
+        assert s.max_turns == 100
         assert s.fast_mode is False
         assert s.permission.mode == "default"
         assert s.sandbox.enabled is False

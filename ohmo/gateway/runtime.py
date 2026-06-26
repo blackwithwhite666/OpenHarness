@@ -237,7 +237,7 @@ class OhmoSessionRuntimePool:
             system_prompt=build_ohmo_system_prompt(session_cwd, workspace=self._workspace, extra_prompt=None),
             active_profile=self._provider_profile,
             session_backend=self._session_backend,
-            enforce_max_turns=self._max_turns is not None,
+            enforce_max_turns=True,  # cap each prompt at settings.max_turns by default (was unlimited)
             restore_messages=_sanitize_snapshot_messages(snapshot.get("messages") if snapshot else None),
             restore_tool_metadata=_sanitize_group_command_metadata(snapshot.get("tool_metadata") if snapshot else None),
             extra_skill_dirs=(str(get_skills_dir(self._workspace)),),
@@ -905,7 +905,7 @@ class OhmoSessionRuntimePool:
             system_prompt=build_ohmo_system_prompt(bundle_cwd, workspace=self._workspace, extra_prompt=None),
             active_profile=self._provider_profile,
             session_backend=self._session_backend,
-            enforce_max_turns=self._max_turns is not None,
+            enforce_max_turns=True,  # cap each prompt at settings.max_turns by default (was unlimited)
             restore_messages=[message.model_dump(mode="json") for message in _sanitize_group_command_prompts(snapshot)],
             restore_tool_metadata=_sanitize_group_command_metadata(getattr(bundle.engine, "tool_metadata", {}) or {}),
             extra_skill_dirs=(str(get_skills_dir(self._workspace)),),
