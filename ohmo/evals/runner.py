@@ -44,6 +44,7 @@ from openharness.evals.runner import _report_output_path, _stable_id
 from openharness.evals.state import compute_episode_state_delta, extract_state_keys
 from openharness.prompts import build_runtime_system_prompt
 from openharness.tools.base import BaseTool, ToolExecutionContext, ToolResult
+from openharness.tools.skill_tool import SkillTool
 from openharness.utils.fs import atomic_write_text
 
 from ohmo.evals.adapter import get_eval_store
@@ -648,7 +649,7 @@ def _build_agent_runner_config(
                 max_turns=max_turns,
                 live_mcp_server_names=("google_search",),
                 live_typed_read_tool_names=("read_file", "glob", "grep"),
-                live_local_tool_factory=_ohmo_todo_write_tool_factory,
+                live_local_tool_factory=_make_live_local_tool_factory(workspace),
             ),
             agent_runner_name="query-engine-live-read",
             model=settings.model,
@@ -707,7 +708,7 @@ def _build_agent_runner_config(
             system_prompt=resolved_prompt,
             cwd=workspace,
             max_turns=max_turns,
-            live_local_tool_factory=_ohmo_todo_write_tool_factory,
+            live_local_tool_factory=_make_live_local_tool_factory(workspace),
         ),
         agent_runner_name="query-engine",
         model=settings.model,
@@ -720,6 +721,46 @@ def _build_agent_runner_config(
 
 def _ohmo_todo_write_tool_factory(state_root: Path) -> Sequence[BaseTool]:
     return (OhmoTodoWriteTool(TodoStore(state_root), lambda: "eval-sandbox"),)
+
+
+def _make_live_local_tool_factory(
+    workspace: Path | None,
+) -> Callable[[Path], Sequence[BaseTool]]:
+    """Inject real, deterministic, local tools over the replay registry.
+
+    Mirrors the production tool registry faithfully: ``todo_write`` writes to an
+    isolated store, and ``skill`` reads local SKILL.md files (read-only). Both
+    are local and deterministic, so they are safe inside frozen replay and make
+    the eval harness match prod's skill-invocation mechanism — prod's
+    ``create_default_tool_registry`` always exposes a live ``SkillTool``, while
+    the replay registry only carried ``skill`` if the gold episode happened to
+    call it. Network / non-deterministic tools (web_search/web_fetch/MCP)
+    intentionally stay replay fixtures.
+
+    The injected ``SkillTool`` is wrapped so the eval's per-workspace skill /
+    plugin directories reach ``SkillTool.execute`` via ``context.metadata`` —
+    the same dirs that seed the "# Available Skills" catalog in the prompt.
+    """
+    if workspace is not None:
+        skill_dirs: tuple[str, ...] = (str(get_skills_dir(workspace)),)
+        plugin_roots: tuple[str, ...] = (str(get_plugins_dir(workspace)),)
+    else:
+        skill_dirs = ()
+        plugin_roots = ()
+
+    def factory(state_root: Path) -> Sequence[BaseTool]:
+        return (
+            *_ohmo_todo_write_tool_factory(state_root),
+            _ToolContextMetadataWrapper(
+                SkillTool(),
+                metadata={
+                    "extra_skill_dirs": skill_dirs,
+                    "extra_plugin_roots": plugin_roots,
+                },
+            ),
+        )
+
+    return factory
 
 
 def _ohmo_sandbox_tool_factory(sandbox_ws: Path) -> Sequence[BaseTool]:

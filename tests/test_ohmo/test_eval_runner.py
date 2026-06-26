@@ -932,9 +932,13 @@ def test_build_live_read_runner_config_uses_query_engine_settings(
         "glob",
         "grep",
     )
-    assert config.agent_runner._live_local_tool_factory is (
-        runner_module._ohmo_todo_write_tool_factory
-    )
+    # The live-read lane injects real, deterministic local tools over replay:
+    # todo_write (isolated store) + a live skill tool (reads SKILL.md), matching
+    # prod's create_default_tool_registry. Network tools stay replay.
+    injected = config.agent_runner._live_local_tool_factory(tmp_path / "state")
+    injected_names = {tool.name for tool in injected}
+    assert "todo_write" in injected_names
+    assert "skill" in injected_names
 
 
 def test_query_engine_runner_executes_todo_write_live_without_gold_fixture(
@@ -1012,6 +1016,38 @@ def test_query_engine_runner_executes_todo_write_live_without_gold_fixture(
     assert all("todo_write" in names for names in api_client.tool_names_by_request)
     assert len(created_roots) == 1
     assert not created_roots[0].exists()
+
+
+def test_live_local_factory_skill_tool_reads_workspace_skill_live(tmp_path: Path):
+    # A skill present in the eval workspace must be readable via the injected
+    # live `skill` tool even when no gold episode recorded a skill call —
+    # mirroring prod, where create_default_tool_registry always exposes SkillTool.
+    import asyncio
+
+    from openharness.tools.base import ToolExecutionContext
+
+    from ohmo.workspace import get_skills_dir
+
+    maps_skill = get_skills_dir(tmp_path) / "maps"
+    maps_skill.mkdir(parents=True)
+    (maps_skill / "SKILL.md").write_text(
+        "---\nname: maps\ndescription: Yandex Maps client.\n---\n"
+        "Use `maps-cli menu` to read a restaurant's menu.\n",
+        encoding="utf-8",
+    )
+
+    factory = runner_module._make_live_local_tool_factory(tmp_path)
+    tools = {tool.name: tool for tool in factory(tmp_path / "state")}
+    skill_tool = tools["skill"]
+
+    result = asyncio.run(
+        skill_tool.execute(
+            skill_tool.input_model(name="maps"),
+            ToolExecutionContext(cwd=tmp_path),
+        )
+    )
+    assert not result.is_error
+    assert "maps-cli menu" in result.output
 
 
 def test_build_fs_sandbox_runner_config_uses_query_engine_settings(
