@@ -1,8 +1,20 @@
 import type { TraceRecord, TraceSpan } from "@evilmartians/agent-prism-types";
 
 import { flattenSpans, filterSpansRecursively } from "@evilmartians/agent-prism-data";
-import { AlertCircle, ExternalLink, RefreshCw, Search } from "lucide-react";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import {
+  AlertCircle,
+  ExternalLink,
+  GitCompareArrows,
+  RefreshCw,
+  Search,
+} from "lucide-react";
+import {
+  type ReactNode,
+  useCallback,
+  useEffect,
+  useMemo,
+  useState,
+} from "react";
 import { Panel, PanelGroup, PanelResizeHandle } from "react-resizable-panels";
 
 import type { BadgeProps } from "./components/agent-prism/Badge";
@@ -84,6 +96,13 @@ function App() {
   const [runError, setRunError] = useState<string | undefined>();
   const [evalListError, setEvalListError] = useState<string | undefined>();
   const [evalTraceError, setEvalTraceError] = useState<string | undefined>();
+  const [isGoldCompareEnabled, setIsGoldCompareEnabled] = useState(false);
+  const [loadedGoldTrace, setLoadedGoldTrace] = useState<LoadedTrace | undefined>();
+  const [selectedGoldSpan, setSelectedGoldSpan] = useState<TraceSpan | undefined>();
+  const [goldExpandedSpansIds, setGoldExpandedSpansIds] = useState<string[]>([]);
+  const [goldSpanSearchValue, setGoldSpanSearchValue] = useState("");
+  const [isGoldTraceLoading, setIsGoldTraceLoading] = useState(false);
+  const [goldTraceError, setGoldTraceError] = useState<string | undefined>();
 
   const fetchTraceList = useCallback(async (search: string) => {
     setIsListLoading(true);
@@ -103,6 +122,15 @@ function App() {
     }
   }, []);
 
+  const clearGoldTraceState = useCallback(() => {
+    setLoadedGoldTrace(undefined);
+    setSelectedGoldSpan(undefined);
+    setGoldSpanSearchValue("");
+    setGoldExpandedSpansIds([]);
+    setGoldTraceError(undefined);
+    setIsGoldTraceLoading(false);
+  }, []);
+
   const clearEvalTraceSelection = useCallback(() => {
     setSelectedEvalTrace(undefined);
     setSelectedEvalSample(0);
@@ -111,7 +139,9 @@ function App() {
     setEvalSpanSearchValue("");
     setEvalExpandedSpansIds([]);
     setEvalTraceError(undefined);
-  }, []);
+    setIsGoldCompareEnabled(false);
+    clearGoldTraceState();
+  }, [clearGoldTraceState]);
 
   const fetchEvalRuns = useCallback(async () => {
     setIsRunLoading(true);
@@ -242,6 +272,7 @@ function App() {
       setEvalSpanSearchValue("");
       setEvalExpandedSpansIds([]);
       setEvalTraceError(undefined);
+      clearGoldTraceState();
       setIsEvalTraceLoading(true);
 
       try {
@@ -260,7 +291,7 @@ function App() {
         setIsEvalTraceLoading(false);
       }
     },
-    [selectedRunId],
+    [clearGoldTraceState, selectedRunId],
   );
 
   const handleEvalTraceSelect = useCallback(
@@ -347,10 +378,85 @@ function App() {
       : loadedEvalTrace.spans;
   }, [evalSpanSearchValue, loadedEvalTrace]);
 
+  useEffect(() => {
+    if (!isGoldCompareEnabled) return;
+
+    const goldEpisodeId = loadedEvalTrace?.goldEpisodeId;
+
+    if (!goldEpisodeId) {
+      setIsGoldCompareEnabled(false);
+      clearGoldTraceState();
+      return;
+    }
+
+    let ignore = false;
+
+    setLoadedGoldTrace(undefined);
+    setSelectedGoldSpan(undefined);
+    setGoldSpanSearchValue("");
+    setGoldExpandedSpansIds([]);
+    setGoldTraceError(undefined);
+    setIsGoldTraceLoading(true);
+
+    getTrace(goldEpisodeId)
+      .then((response) => {
+        if (ignore) return;
+
+        const mappedTrace = mapTrace(response);
+        setLoadedGoldTrace(mappedTrace);
+
+        const flatSpans = flattenSpans(mappedTrace.spans);
+        setGoldExpandedSpansIds(flatSpans.map((span) => span.id));
+        setSelectedGoldSpan(flatSpans[0]);
+      })
+      .catch((error) => {
+        if (ignore) return;
+
+        setGoldTraceError(
+          error instanceof Error ? error.message : "Failed to load gold episode",
+        );
+      })
+      .finally(() => {
+        if (!ignore) {
+          setIsGoldTraceLoading(false);
+        }
+      });
+
+    return () => {
+      ignore = true;
+    };
+  }, [clearGoldTraceState, isGoldCompareEnabled, loadedEvalTrace?.goldEpisodeId]);
+
+  const goldAllSpanIds = useMemo(
+    () =>
+      loadedGoldTrace
+        ? flattenSpans(loadedGoldTrace.spans).map((span) => span.id)
+        : [],
+    [loadedGoldTrace],
+  );
+
+  const filteredGoldSpans = useMemo(() => {
+    if (!loadedGoldTrace) return [];
+
+    return goldSpanSearchValue.trim()
+      ? filterSpansRecursively(loadedGoldTrace.spans, goldSpanSearchValue)
+      : loadedGoldTrace.spans;
+  }, [goldSpanSearchValue, loadedGoldTrace]);
+
   const selectedEvalTraceRecord =
     loadedEvalTrace?.traceRecord ??
     evalTraces.find((trace) => trace.id === selectedEvalTrace?.id) ??
     selectedEvalTrace;
+  const selectedGoldTraceRecord = loadedGoldTrace?.traceRecord;
+  const isGoldCompareActive =
+    isGoldCompareEnabled && Boolean(loadedEvalTrace?.goldEpisodeId);
+  const trajectoryComparison = useMemo(
+    () =>
+      loadedEvalTrace && loadedGoldTrace
+        ? compareTrajectories(loadedEvalTrace.spans, loadedGoldTrace.spans)
+        : undefined,
+    [loadedEvalTrace, loadedGoldTrace],
+  );
 
   const selectedRun = evalRuns.find((run) => run.run === selectedRunId);
   const selectedEvalSampleCount =
@@ -585,8 +691,18 @@ function App() {
                   onSelect={(sample) => void handleEvalSampleSelect(sample)}
                 />
               )}
-              {loadedEvalTrace.goldEpisodeId && (
-                <div className="flex shrink-0 justify-end px-4">
+              <div className="flex shrink-0 flex-wrap justify-end gap-2 px-4">
+                <Button
+                  aria-label="Compare to gold"
+                  aria-pressed={isGoldCompareActive}
+                  disabled={!loadedEvalTrace.goldEpisodeId}
+                  iconStart={<GitCompareArrows className="size-4" />}
+                  onClick={() => setIsGoldCompareEnabled((enabled) => !enabled)}
+                  variant={isGoldCompareActive ? "primary" : "secondary"}
+                >
+                  Compare to gold
+                </Button>
+                {loadedEvalTrace.goldEpisodeId && (
                   <Button
                     aria-label="Open gold episode"
                     iconStart={<ExternalLink className="size-4" />}
@@ -597,21 +713,77 @@ function App() {
                   >
                     open gold episode
                   </Button>
+                )}
+              </div>
+              {isGoldCompareActive ? (
+                <div className="flex min-h-0 flex-1 flex-col gap-3">
+                  <TrajectoryComparisonNote comparison={trajectoryComparison} />
+                  <div className="grid min-h-0 flex-1 grid-cols-2 gap-3">
+                    <CompareTraceColumn
+                      title="Observed (eval)"
+                      subtitle={selectedEvalTraceRecord.name}
+                    >
+                      <TraceViewerTreeViewContainer
+                        searchValue={evalSpanSearchValue}
+                        setSearchValue={setEvalSpanSearchValue}
+                        handleExpandAll={() =>
+                          setEvalExpandedSpansIds(evalAllSpanIds)
+                        }
+                        handleCollapseAll={() => setEvalExpandedSpansIds([])}
+                        filteredSpans={filteredEvalSpans}
+                        selectedSpan={selectedEvalSpan}
+                        setSelectedSpan={setSelectedEvalSpan}
+                        expandedSpansIds={evalExpandedSpansIds}
+                        setExpandedSpansIds={setEvalExpandedSpansIds}
+                        selectedTrace={selectedEvalTraceRecord}
+                        showHeader={false}
+                      />
+                    </CompareTraceColumn>
+
+                    <CompareTraceColumn
+                      title="Gold episode"
+                      subtitle={loadedEvalTrace.goldEpisodeId}
+                    >
+                      {isGoldTraceLoading ? (
+                        <StatusMessage>Loading gold episode...</StatusMessage>
+                      ) : goldTraceError ? (
+                        <ErrorMessage message={goldTraceError} />
+                      ) : loadedGoldTrace && selectedGoldTraceRecord ? (
+                        <TraceViewerTreeViewContainer
+                          searchValue={goldSpanSearchValue}
+                          setSearchValue={setGoldSpanSearchValue}
+                          handleExpandAll={() =>
+                            setGoldExpandedSpansIds(goldAllSpanIds)
+                          }
+                          handleCollapseAll={() => setGoldExpandedSpansIds([])}
+                          filteredSpans={filteredGoldSpans}
+                          selectedSpan={selectedGoldSpan}
+                          setSelectedSpan={setSelectedGoldSpan}
+                          expandedSpansIds={goldExpandedSpansIds}
+                          setExpandedSpansIds={setGoldExpandedSpansIds}
+                          selectedTrace={selectedGoldTraceRecord}
+                          showHeader={false}
+                        />
+                      ) : (
+                        <StatusMessage>Gold episode is not loaded.</StatusMessage>
+                      )}
+                    </CompareTraceColumn>
+                  </div>
                 </div>
+              ) : (
+                <TraceViewerTreeViewContainer
+                  searchValue={evalSpanSearchValue}
+                  setSearchValue={setEvalSpanSearchValue}
+                  handleExpandAll={() => setEvalExpandedSpansIds(evalAllSpanIds)}
+                  handleCollapseAll={() => setEvalExpandedSpansIds([])}
+                  filteredSpans={filteredEvalSpans}
+                  selectedSpan={selectedEvalSpan}
+                  setSelectedSpan={setSelectedEvalSpan}
+                  expandedSpansIds={evalExpandedSpansIds}
+                  setExpandedSpansIds={setEvalExpandedSpansIds}
+                  selectedTrace={selectedEvalTraceRecord}
+                />
               )}
-              {/* TODO P3: gold-vs-observed diff */}
-              <TraceViewerTreeViewContainer
-                searchValue={evalSpanSearchValue}
-                setSearchValue={setEvalSpanSearchValue}
-                handleExpandAll={() => setEvalExpandedSpansIds(evalAllSpanIds)}
-                handleCollapseAll={() => setEvalExpandedSpansIds([])}
-                filteredSpans={filteredEvalSpans}
-                selectedSpan={selectedEvalSpan}
-                setSelectedSpan={setSelectedEvalSpan}
-                expandedSpansIds={evalExpandedSpansIds}
-                setExpandedSpansIds={setEvalExpandedSpansIds}
-                selectedTrace={selectedEvalTraceRecord}
-              />
             </>
           ) : (
             <StatusMessage>Select an eval case to inspect spans.</StatusMessage>
@@ -619,22 +791,26 @@ function App() {
         </section>
       </Panel>
 
-      <PanelResizeHandle className="bg-agentprism-border w-px" />
+      {!isGoldCompareActive && (
+        <>
+          <PanelResizeHandle className="bg-agentprism-border w-px" />
 
-      <Panel
-        id="eval-span-details"
-        defaultSize={30}
-        minSize={22}
-        className="min-h-0 overflow-hidden"
-      >
-        <section className="h-full min-h-0 p-4">
-          {selectedEvalSpan ? (
-            <DetailsView data={selectedEvalSpan} />
-          ) : (
-            <StatusMessage>Select a span to see details.</StatusMessage>
-          )}
-        </section>
-      </Panel>
+          <Panel
+            id="eval-span-details"
+            defaultSize={30}
+            minSize={22}
+            className="min-h-0 overflow-hidden"
+          >
+            <section className="h-full min-h-0 p-4">
+              {selectedEvalSpan ? (
+                <DetailsView data={selectedEvalSpan} />
+              ) : (
+                <StatusMessage>Select a span to see details.</StatusMessage>
+              )}
+            </section>
+          </Panel>
+        </>
+      )}
     </PanelGroup>
   );
 
@@ -748,6 +924,171 @@ function SampleSelector({
       })}
     </div>
   );
+}
+
+type TrajectoryComparisonKind =
+  | "match"
+  | "diverge"
+  | "observed-prefix"
+  | "gold-prefix";
+
+interface TrajectoryComparison {
+  kind: TrajectoryComparisonKind;
+  observedLength: number;
+  goldLength: number;
+  step?: number;
+  observedTitle?: string;
+  goldTitle?: string;
+}
+
+function CompareTraceColumn({
+  title,
+  subtitle,
+  children,
+}: {
+  title: string;
+  subtitle?: string;
+  children: ReactNode;
+}) {
+  return (
+    <div className="border-agentprism-border bg-agentprism-background flex min-h-0 min-w-0 flex-col overflow-hidden rounded-md border">
+      <div className="border-agentprism-border flex shrink-0 flex-col gap-0.5 border-b px-4 py-3">
+        <h2 className="text-agentprism-foreground text-sm font-medium">{title}</h2>
+        {subtitle && (
+          <p
+            className="text-agentprism-muted-foreground truncate text-xs"
+            title={subtitle}
+          >
+            {subtitle}
+          </p>
+        )}
+      </div>
+      <div className="flex min-h-0 flex-1 flex-col p-3">{children}</div>
+    </div>
+  );
+}
+
+function TrajectoryComparisonNote({
+  comparison,
+}: {
+  comparison?: TrajectoryComparison;
+}) {
+  if (!comparison) return null;
+
+  const isMatch = comparison.kind === "match";
+
+  return (
+    <div
+      className={`shrink-0 rounded-md border px-4 py-2 text-sm ${
+        isMatch
+          ? "border-agentprism-success/30 bg-agentprism-success-muted text-agentprism-success-muted-foreground"
+          : "border-agentprism-warning/30 bg-agentprism-warning-muted text-agentprism-warning-muted-foreground"
+      }`}
+    >
+      <TrajectoryComparisonText comparison={comparison} />
+    </div>
+  );
+}
+
+function TrajectoryComparisonText({
+  comparison,
+}: {
+  comparison: TrajectoryComparison;
+}) {
+  if (comparison.kind === "match") {
+    return <>trajectories match ({comparison.observedLength} steps)</>;
+  }
+
+  if (comparison.kind === "observed-prefix") {
+    return (
+      <>
+        observed is a prefix of gold; next gold step {comparison.step}:{" "}
+        <TrajectoryStep>{comparison.goldTitle}</TrajectoryStep>
+      </>
+    );
+  }
+
+  if (comparison.kind === "gold-prefix") {
+    return (
+      <>
+        gold is a prefix of observed; next observed step {comparison.step}:{" "}
+        <TrajectoryStep>{comparison.observedTitle}</TrajectoryStep>
+      </>
+    );
+  }
+
+  return (
+    <>
+      diverges at step {comparison.step}: observed{" "}
+      <TrajectoryStep>{comparison.observedTitle}</TrajectoryStep> vs gold{" "}
+      <TrajectoryStep>{comparison.goldTitle}</TrajectoryStep>
+    </>
+  );
+}
+
+function TrajectoryStep({ children }: { children?: string }) {
+  return (
+    <code className="bg-agentprism-background/70 text-agentprism-foreground rounded px-1 py-0.5 text-xs">
+      {children || "(missing)"}
+    </code>
+  );
+}
+
+function compareTrajectories(
+  observedSpans: TraceSpan[],
+  goldSpans: TraceSpan[],
+): TrajectoryComparison {
+  const observedSequence = getTrajectorySequence(observedSpans);
+  const goldSequence = getTrajectorySequence(goldSpans);
+  const sharedLength = Math.min(observedSequence.length, goldSequence.length);
+
+  for (let index = 0; index < sharedLength; index += 1) {
+    if (observedSequence[index] !== goldSequence[index]) {
+      return {
+        kind: "diverge",
+        observedLength: observedSequence.length,
+        goldLength: goldSequence.length,
+        step: index + 1,
+        observedTitle: observedSequence[index],
+        goldTitle: goldSequence[index],
+      };
+    }
+  }
+
+  if (observedSequence.length === goldSequence.length) {
+    return {
+      kind: "match",
+      observedLength: observedSequence.length,
+      goldLength: goldSequence.length,
+    };
+  }
+
+  if (observedSequence.length < goldSequence.length) {
+    return {
+      kind: "observed-prefix",
+      observedLength: observedSequence.length,
+      goldLength: goldSequence.length,
+      step: observedSequence.length + 1,
+      goldTitle: goldSequence[observedSequence.length],
+    };
+  }
+
+  return {
+    kind: "gold-prefix",
+    observedLength: observedSequence.length,
+    goldLength: goldSequence.length,
+    step: goldSequence.length + 1,
+    observedTitle: observedSequence[goldSequence.length],
+  };
+}
+
+function getTrajectorySequence(spans: TraceSpan[]): string[] {
+  const firstRoot = spans[0];
+  const rootChildren = firstRoot?.children ?? [];
+  const trajectorySpans =
+    spans.length === 1 && rootChildren.length > 0 ? rootChildren : spans;
+
+  return trajectorySpans.map((span) => span.title.trim() || "(untitled)");
 }
 
 function matchesStatusFilter(
