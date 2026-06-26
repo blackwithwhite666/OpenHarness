@@ -955,8 +955,8 @@ def test_query_engine_capability_oracle_gates_command_regression(tmp_path: Path)
     )
     assert blind.report.passed_count == 1
 
-    # 4. Argument-matched replay turns the same divergence into an honest tool
-    #    error instead of returning the next captured output by order.
+    # 4. Argument-matched replay turns the same divergence into an empty,
+    #    non-error replay miss instead of returning captured output by order.
     arg_api_client = _ScriptedBashModelApiClient(
         command="python3 -c 'print(2+2)'",
         final_text="private weather answer",
@@ -969,21 +969,22 @@ def test_query_engine_capability_oracle_gates_command_regression(tmp_path: Path)
         api_client=arg_api_client,
     )
     assert arg_matched.report.metadata["fixture_match"] == "arguments"
-    assert arg_matched.report.passed_count == 0
-    assert arg_matched.report.failed_count == 1
+    assert arg_matched.report.passed_count == 1
+    assert arg_matched.report.failed_count == 0
     arg_case = arg_matched.report.cases[0]
     assert arg_case.checks["tool_sequence_matches"] is True
-    assert arg_case.checks["final_output_matches"] is False
+    assert arg_case.checks["final_output_matches"] is True
     assert arg_case.observed_trace is not None
-    assert "tool_completed_error" in arg_case.observed_trace.event_kind_path
+    assert "tool_completed" in arg_case.observed_trace.event_kind_path
+    assert "tool_completed_error" not in arg_case.observed_trace.event_kind_path
     tool_result_blocks = [
         block
         for message in arg_api_client.requests[1].messages
         for block in message.content
         if isinstance(block, ToolResultBlock)
     ]
-    assert tool_result_blocks[0].is_error is True
-    assert "No replay fixture for bash with these arguments." in tool_result_blocks[0].content
+    assert tool_result_blocks[0].is_error is False
+    assert tool_result_blocks[0].content == ""
     assert "private raw tool output" not in tool_result_blocks[0].content
 
     # Reports stay metadata-only: no raw commands or user/final text leak.

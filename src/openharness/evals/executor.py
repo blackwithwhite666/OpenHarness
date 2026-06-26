@@ -345,12 +345,15 @@ class ReplayFixtureTool(BaseTool):
         arguments: ReplayToolInput,
         context: ToolExecutionContext,
     ) -> ToolResult:
+        # Missing fixtures are replay harness limits, not real tool failures.
+        # Keep the over-call signal in metadata without cascading tool errors.
         if self._match_mode == "order":
             del arguments, context
             if self._next_index >= len(self._fixtures):
                 return ToolResult(
-                    output=f"No replay fixture available for {self.name}.",
-                    is_error=True,
+                    output="",
+                    is_error=False,
+                    metadata={"replayed": False, "replay_overflow": True},
                 )
             fixture = self._fixtures[self._next_index]
             self._next_index += 1
@@ -379,11 +382,11 @@ class ReplayFixtureTool(BaseTool):
                 },
             )
         return ToolResult(
-            output=f"No replay fixture for {self.name} with these arguments.",
-            is_error=True,
+            output="",
+            is_error=False,
             metadata={
                 "replayed": False,
-                "match": "miss",
+                "replay_miss": True,
                 "requested_key": requested_key,
             },
         )

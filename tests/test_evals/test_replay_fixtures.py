@@ -94,10 +94,10 @@ async def test_replay_fixture_tool_arguments_mode_matches_by_input_key_not_order
         "match": "arguments",
         "call_key_hash": "hash-second",
     }
-    assert miss.is_error is True
-    assert miss.output == "No replay fixture for bash with these arguments."
+    assert miss.is_error is False
+    assert miss.output == ""
     assert miss.metadata["replayed"] is False
-    assert miss.metadata["match"] == "miss"
+    assert miss.metadata["replay_miss"] is True
     assert miss.metadata["requested_key"] == _fixture_input_key(
         {"command": "missing command"}
     )
@@ -132,8 +132,9 @@ async def test_replay_fixture_tool_arguments_mode_consumes_duplicate_matches_in_
 
     assert first.output == "first duplicate"
     assert second.output == "second duplicate"
-    assert miss.is_error is True
-    assert miss.metadata["match"] == "miss"
+    assert miss.is_error is False
+    assert miss.output == ""
+    assert miss.metadata["replay_miss"] is True
 
 
 @pytest.mark.asyncio
@@ -150,9 +151,21 @@ async def test_replay_fixture_tool_order_mode_remains_default(tmp_path: Path):
         ReplayToolInput.model_validate({"command": "second command"}),
         ToolExecutionContext(cwd=tmp_path),
     )
+    second = await tool.execute(
+        ReplayToolInput.model_validate({"command": "first command"}),
+        ToolExecutionContext(cwd=tmp_path),
+    )
+    overflow = await tool.execute(
+        ReplayToolInput.model_validate({"command": "extra command"}),
+        ToolExecutionContext(cwd=tmp_path),
+    )
 
     assert result.output == "first"
     assert result.metadata == {"replayed": True, "call_key_hash": "hash-first"}
+    assert second.output == "second"
+    assert overflow.is_error is False
+    assert overflow.output == ""
+    assert overflow.metadata == {"replayed": False, "replay_overflow": True}
 
 
 @pytest.mark.asyncio
