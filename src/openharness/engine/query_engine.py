@@ -104,6 +104,11 @@ class QueryEngine:
         return self._tool_metadata
 
     @property
+    def decision_trace_recorder(self) -> DecisionTraceRecorderLike | None:
+        """Return the active decision-trace recorder for future turns."""
+        return self._decision_trace_recorder
+
+    @property
     def total_usage(self):
         """Return the total usage across all turns."""
         return self._cost_tracker.total
@@ -132,6 +137,13 @@ class QueryEngine:
     def set_permission_checker(self, checker: PermissionChecker) -> None:
         """Update the active permission checker for future turns."""
         self._permission_checker = checker
+
+    def set_decision_trace_recorder(
+        self,
+        recorder: DecisionTraceRecorderLike | None,
+    ) -> None:
+        """Update the active decision-trace recorder for future turns."""
+        self._decision_trace_recorder = recorder
 
     def _build_coordinator_context_message(self) -> ConversationMessage | None:
         """Build a synthetic user message carrying coordinator runtime context."""

@@ -120,6 +120,17 @@ MAX_TRACKED_VERIFIED_WORK = 10
 class DecisionTraceRecorderLike(Protocol):
     """Recorder surface used by the generic engine without importing evals."""
 
+    def record(
+        self,
+        kind: str,
+        payload: Mapping[str, Any],
+        *,
+        tool_name: str | None = None,
+        tool_call_id: str | None = None,
+        is_error: bool = False,
+    ) -> object | None:
+        """Append a model-authored or diagnostic decision-trace event."""
+
     def record_structural(
         self,
         kind: str,

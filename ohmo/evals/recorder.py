@@ -11,7 +11,7 @@ from typing import Any
 from uuid import uuid4
 
 from openharness.channels.bus.events import InboundMessage
-from openharness.evals import DecisionTraceRecorder, EvalEpisode, EvalStore
+from openharness.evals import DecisionTraceRecorder, EvalEpisode, EvalEvent, EvalStore
 from openharness.evals.tool_labels import effective_tool_label, tool_call_binaries
 from openharness.engine.stream_events import (
     AssistantTurnComplete,
@@ -32,6 +32,10 @@ class GatewayEvalRecorder:
     episode_id: str
     _finished: bool = False
     _structural_recorder: DecisionTraceRecorder = field(init=False, repr=False)
+    _runtime_recorder: _GatewayDecisionTraceRecorderAdapter = field(
+        init=False,
+        repr=False,
+    )
 
     def __post_init__(self) -> None:
         self._structural_recorder = DecisionTraceRecorder(
@@ -39,6 +43,14 @@ class GatewayEvalRecorder:
             episode_id=self.episode_id,
             enabled=True,
         )
+        self._runtime_recorder = _GatewayDecisionTraceRecorderAdapter(
+            self._structural_recorder
+        )
+
+    @property
+    def decision_trace_recorder(self) -> "_GatewayDecisionTraceRecorderAdapter":
+        """Return the runtime recorder adapter for one gateway engine turn."""
+        return self._runtime_recorder
 
     @classmethod
     def start(
@@ -213,6 +225,58 @@ class GatewayEvalRecorder:
             _json_safe_mapping(payload or {}),
             tool_name=tool_name or None,
             tool_call_id=tool_call_id or None,
+            is_error=is_error,
+        )
+
+
+_RUNTIME_STRUCTURAL_SKIP_KINDS = frozenset(
+    {
+        "model_call",
+        "tool_started",
+        "tool_completed",
+    }
+)
+
+
+class _GatewayDecisionTraceRecorderAdapter:
+    """Runtime recorder bridge for gateway-owned eval episodes."""
+
+    def __init__(self, recorder: DecisionTraceRecorder) -> None:
+        self._recorder = recorder
+
+    def record(
+        self,
+        kind: str,
+        payload: Mapping[str, Any],
+        *,
+        tool_name: str | None = None,
+        tool_call_id: str | None = None,
+        is_error: bool = False,
+    ) -> EvalEvent | None:
+        return self._recorder.record(
+            kind,
+            payload,
+            tool_name=tool_name,
+            tool_call_id=tool_call_id,
+            is_error=is_error,
+        )
+
+    def record_structural(
+        self,
+        kind: str,
+        payload: Mapping[str, Any],
+        *,
+        tool_name: str | None = None,
+        tool_call_id: str | None = None,
+        is_error: bool = False,
+    ) -> EvalEvent | None:
+        if kind in _RUNTIME_STRUCTURAL_SKIP_KINDS:
+            return None
+        return self._recorder.record_structural(
+            kind,
+            payload,
+            tool_name=tool_name,
+            tool_call_id=tool_call_id,
             is_error=is_error,
         )
 

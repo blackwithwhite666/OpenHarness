@@ -28,6 +28,7 @@ from openharness.engine.stream_events import (
 from openharness.memory import add_memory_entry as add_project_memory_entry
 from openharness.memory import list_memory_files as list_project_memory_files
 from openharness.permissions import PermissionChecker, PermissionMode
+from openharness.tools import TraceTool
 from openharness.tools.base import ToolExecutionContext, ToolRegistry
 
 from ohmo.evals import get_eval_store
@@ -590,6 +591,120 @@ async def test_runtime_pool_records_eval_episode_for_tool_turn(tmp_path, monkeyp
     assert events[3].payload["output"] == "ok"
     assert events[4].payload["text"] == "done"
     assert events[6].payload == {"status": "completed"}
+
+
+@pytest.mark.asyncio
+async def test_runtime_pool_wires_trace_tool_to_gateway_eval_episode(
+    tmp_path,
+    monkeypatch,
+):
+    workspace = tmp_path / ".ohmo-home"
+    initialize_workspace(workspace)
+    captured = {}
+
+    class ScriptedApiClient:
+        def __init__(self):
+            self.requests = []
+            self.responses = [
+                (
+                    ConversationMessage(
+                        role="assistant",
+                        content=[
+                            TextBlock(text="Recording a trace breadcrumb."),
+                            ToolUseBlock(
+                                id="trace-call-1",
+                                name="trace",
+                                input={
+                                    "kind": "trace_decision",
+                                    "payload": {
+                                        "schema_version": 1,
+                                        "trace_event_id": "gateway-trace-1",
+                                        "decision": "verify gateway trace recorder wiring",
+                                    },
+                                },
+                            ),
+                        ],
+                    ),
+                    UsageSnapshot(input_tokens=10, output_tokens=4),
+                ),
+                (
+                    ConversationMessage(
+                        role="assistant",
+                        content=[TextBlock(text="Trace recorded and final answer ready.")],
+                    ),
+                    UsageSnapshot(input_tokens=12, output_tokens=6),
+                ),
+            ]
+
+        async def stream_message(self, request):
+            self.requests.append(request)
+            message, usage = self.responses.pop(0)
+            yield ApiMessageCompleteEvent(message=message, usage=usage)
+
+    async def fake_build_runtime(**kwargs):
+        api_client = ScriptedApiClient()
+        registry = ToolRegistry()
+        registry.register(TraceTool())
+        engine = QueryEngine(
+            api_client=api_client,
+            tool_registry=registry,
+            permission_checker=PermissionChecker(
+                PermissionSettings(mode=PermissionMode.FULL_AUTO)
+            ),
+            cwd=tmp_path,
+            model="gpt-5.4",
+            system_prompt="system",
+            max_turns=4,
+        )
+        captured["api_client"] = api_client
+        captured["engine"] = engine
+        return SimpleNamespace(
+            engine=engine,
+            cwd=str(tmp_path),
+            session_id="sess-gateway-trace",
+            current_settings=lambda: SimpleNamespace(model="gpt-5.4"),
+            commands=SimpleNamespace(lookup=lambda raw: None),
+        )
+
+    async def fake_start_runtime(bundle):
+        return None
+
+    monkeypatch.setattr("ohmo.gateway.runtime.build_runtime", fake_build_runtime)
+    monkeypatch.setattr("ohmo.gateway.runtime.start_runtime", fake_start_runtime)
+
+    pool = OhmoSessionRuntimePool(cwd=tmp_path, workspace=workspace, provider_profile="codex")
+    message = InboundMessage(channel="feishu", sender_id="u1", chat_id="c1", content="trace it")
+    updates = [u async for u in pool.stream_message(message, "feishu:c1")]
+
+    assert updates[-1].kind == "final"
+    assert updates[-1].text == "Trace recorded and final answer ready."
+    assert captured["engine"].decision_trace_recorder is None
+
+    episode, events = _single_eval_episode(workspace)
+    assert episode.session_id == "sess-gateway-trace"
+    kinds = [event.kind for event in events]
+    assert "trace_decision" in kinds
+    assert "turn_started" in kinds
+    assert "tool_permission" in kinds
+    assert "assistant_final" in kinds
+    assert kinds.count("model_call") == 2
+    assert kinds.count("tool_started") == 1
+    assert kinds.count("tool_completed") == 1
+
+    [trace_event] = [event for event in events if event.kind == "trace_decision"]
+    assert trace_event.episode_id == episode.episode_id
+    assert trace_event.payload["trace_event_id"] == "gateway-trace-1"
+    assert trace_event.payload["decision"] == "verify gateway trace recorder wiring"
+
+    [trace_tool_completed] = [
+        event
+        for event in events
+        if event.kind == "tool_completed" and event.tool_name == "trace"
+    ]
+    assert trace_tool_completed.payload["output"] == (
+        "Recorded decision trace event: trace_decision"
+    )
+    assert "recorder unavailable" not in trace_tool_completed.payload["output"]
 
 
 def _install_fake_tool_turn(monkeypatch, tmp_path, *, session_id):

@@ -107,6 +107,12 @@ class GatewayStreamUpdate:
     metadata: dict[str, object]
 
 
+@dataclass(frozen=True)
+class _DecisionTraceRecorderRestore:
+    engine: object
+    previous: object | None
+
+
 def _evals_capture_enabled(config) -> bool:
     """Whether to capture an eval episode for this turn.
 
@@ -119,6 +125,30 @@ def _evals_capture_enabled(config) -> bool:
     if raw is not None and raw.strip():
         return raw.strip().lower() not in {"0", "false", "no", "off"}
     return bool(getattr(config, "evals_capture", True))
+
+
+def _install_gateway_decision_trace_recorder(
+    engine: object,
+    recorder: GatewayEvalRecorder | None,
+) -> _DecisionTraceRecorderRestore | None:
+    if recorder is None:
+        return None
+    set_recorder = getattr(engine, "set_decision_trace_recorder", None)
+    if not callable(set_recorder):
+        return None
+    previous = getattr(engine, "decision_trace_recorder", None)
+    set_recorder(recorder.decision_trace_recorder)
+    return _DecisionTraceRecorderRestore(engine=engine, previous=previous)
+
+
+def _restore_gateway_decision_trace_recorder(
+    restore: _DecisionTraceRecorderRestore | None,
+) -> None:
+    if restore is None:
+        return
+    set_recorder = getattr(restore.engine, "set_decision_trace_recorder", None)
+    if callable(set_recorder):
+        set_recorder(restore.previous)
 
 
 class OhmoSessionRuntimePool:
@@ -360,6 +390,10 @@ class OhmoSessionRuntimePool:
             else None
         )
         episode_status = "completed"
+        decision_trace_restore = _install_gateway_decision_trace_recorder(
+            bundle.engine,
+            recorder,
+        )
 
         async def record_updates(updates):
             nonlocal episode_status
@@ -478,6 +512,7 @@ class OhmoSessionRuntimePool:
                 recorder.record_exception(exc)
             raise
         finally:
+            _restore_gateway_decision_trace_recorder(decision_trace_restore)
             if recorder is not None:
                 try:
                     recorder.record_resource_snapshot(
@@ -535,24 +570,31 @@ class OhmoSessionRuntimePool:
             )
             turns = result.continue_turns if result.continue_turns is not None else bundle.engine.max_turns
             reply_parts: list[str] = []
+            decision_trace_restore = _install_gateway_decision_trace_recorder(
+                bundle.engine,
+                recorder,
+            )
             try:
-                async for event in bundle.engine.continue_pending(max_turns=turns):
-                    async for update in self._convert_stream_event(
-                        event=event,
-                        bundle=bundle,
-                        message=message,
-                        session_key=session_key,
-                        content=user_prompt,
-                        reply_parts=reply_parts,
-                        recorder=recorder,
-                    ):
-                        yield update
-            except MaxTurnsExceeded as exc:
-                yield GatewayStreamUpdate(
-                    kind="error",
-                    text=f"Stopped after {exc.max_turns} turns (max_turns).",
-                    metadata={"_session_key": session_key},
-                )
+                try:
+                    async for event in bundle.engine.continue_pending(max_turns=turns):
+                        async for update in self._convert_stream_event(
+                            event=event,
+                            bundle=bundle,
+                            message=message,
+                            session_key=session_key,
+                            content=user_prompt,
+                            reply_parts=reply_parts,
+                            recorder=recorder,
+                        ):
+                            yield update
+                except MaxTurnsExceeded as exc:
+                    yield GatewayStreamUpdate(
+                        kind="error",
+                        text=f"Stopped after {exc.max_turns} turns (max_turns).",
+                        metadata={"_session_key": session_key},
+                    )
+            finally:
+                _restore_gateway_decision_trace_recorder(decision_trace_restore)
             await self._save_snapshot(bundle, session_key, user_prompt)
             reply = "".join(reply_parts).strip()
             if reply:
@@ -589,6 +631,10 @@ class OhmoSessionRuntimePool:
             metadata={"_progress": True, "_session_key": session_key},
         )
         previous_group_request = self._set_group_request_context(bundle, message, session_key)
+        decision_trace_restore = _install_gateway_decision_trace_recorder(
+            bundle.engine,
+            recorder,
+        )
         try:
             async for event in bundle.engine.submit_message(user_message):
                 if isinstance(event, ErrorEvent) and _should_retry_without_image_input(
@@ -651,6 +697,8 @@ class OhmoSessionRuntimePool:
             self._restore_group_request_context(bundle, previous_group_request)
             self._clear_reminder_context(bundle)
             raise
+        finally:
+            _restore_gateway_decision_trace_recorder(decision_trace_restore)
         self._restore_group_request_context(bundle, previous_group_request)
         self._clear_reminder_context(bundle)
         await self._save_snapshot(bundle, session_key, user_prompt)

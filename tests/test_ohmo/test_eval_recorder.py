@@ -18,6 +18,13 @@ from openharness.engine.stream_events import (
 from openharness.evals import (
     DECISION_TRACE_ENV_VAR,
     DECISION_TRACE_MAX_PAYLOAD_BYTES,
+    STRUCTURAL_ASSISTANT_FINAL,
+    STRUCTURAL_MODEL_CALL,
+    STRUCTURAL_TOOL_COMPLETED,
+    STRUCTURAL_TOOL_PERMISSION,
+    STRUCTURAL_TOOL_STARTED,
+    STRUCTURAL_TURN_STARTED,
+    TRACE_DECISION,
     DecisionTraceRecorder,
     EvalEpisode,
     EvalEvent,
@@ -132,6 +139,77 @@ def test_gateway_eval_recorder_keeps_legacy_capture_when_decision_trace_env_disa
     [recorded] = list(store.iter_events("ep-recorder"))
     assert recorded.kind == "gateway_final"
     assert recorded.payload == {"text": "done", "metadata": {}}
+
+
+def test_gateway_eval_recorder_runtime_adapter_records_trace_and_allowed_structural_events(
+    tmp_path: Path,
+) -> None:
+    recorder, store = _new_recorder(tmp_path)
+    runtime_recorder = recorder.decision_trace_recorder
+
+    runtime_recorder.record(
+        TRACE_DECISION,
+        {
+            "schema_version": 1,
+            "trace_event_id": "trace-gateway-1",
+            "decision": "route gateway trace events into the gateway episode",
+        },
+    )
+    runtime_recorder.record_structural(
+        STRUCTURAL_TURN_STARTED,
+        {"model": "gpt-prod", "user_text_summary": "hello"},
+    )
+    runtime_recorder.record_structural(
+        STRUCTURAL_TOOL_PERMISSION,
+        {"allowed": True, "requires_confirmation": False, "read_only": True},
+        tool_name="trace",
+        tool_call_id="trace-call-1",
+    )
+
+    events = list(store.iter_events("ep-recorder"))
+    assert [event.kind for event in events] == [
+        TRACE_DECISION,
+        STRUCTURAL_TURN_STARTED,
+        STRUCTURAL_TOOL_PERMISSION,
+    ]
+    assert {event.episode_id for event in events} == {"ep-recorder"}
+    assert events[0].payload["decision"] == (
+        "route gateway trace events into the gateway episode"
+    )
+    assert events[2].tool_name == "trace"
+    assert events[2].tool_call_id == "trace-call-1"
+
+
+def test_gateway_eval_recorder_runtime_adapter_skips_legacy_duplicated_structural_events(
+    tmp_path: Path,
+) -> None:
+    recorder, store = _new_recorder(tmp_path)
+    runtime_recorder = recorder.decision_trace_recorder
+
+    assert runtime_recorder.record_structural(
+        STRUCTURAL_MODEL_CALL,
+        {"model": "gpt-prod", "input_tokens": 1, "output_tokens": 1},
+    ) is None
+    assert runtime_recorder.record_structural(
+        STRUCTURAL_TOOL_STARTED,
+        {"input_keys": ["url"]},
+        tool_name="web_fetch",
+        tool_call_id="toolu-1",
+    ) is None
+    assert runtime_recorder.record_structural(
+        STRUCTURAL_TOOL_COMPLETED,
+        {"is_error": False, "duration_ms": 1},
+        tool_name="web_fetch",
+        tool_call_id="toolu-1",
+    ) is None
+    runtime_recorder.record_structural(
+        STRUCTURAL_ASSISTANT_FINAL,
+        {"assistant_text_summary": "done", "model": "gpt-prod"},
+    )
+
+    [recorded] = list(store.iter_events("ep-recorder"))
+    assert recorded.kind == STRUCTURAL_ASSISTANT_FINAL
+    assert recorded.payload["assistant_text_summary"] == "done"
 
 
 def test_gateway_eval_recorder_record_model_call_writes_tokens(tmp_path: Path) -> None:
