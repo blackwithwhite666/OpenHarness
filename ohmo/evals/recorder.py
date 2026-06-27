@@ -233,7 +233,6 @@ _RUNTIME_STRUCTURAL_SKIP_KINDS = frozenset(
     {
         "model_call",
         "tool_started",
-        "tool_completed",
     }
 )
 

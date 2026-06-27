@@ -180,7 +180,7 @@ def test_gateway_eval_recorder_runtime_adapter_records_trace_and_allowed_structu
     assert events[2].tool_call_id == "trace-call-1"
 
 
-def test_gateway_eval_recorder_runtime_adapter_skips_legacy_duplicated_structural_events(
+def test_gateway_eval_recorder_runtime_adapter_records_completed_duration_but_skips_start_duplicates(
     tmp_path: Path,
 ) -> None:
     recorder, store = _new_recorder(tmp_path)
@@ -196,20 +196,29 @@ def test_gateway_eval_recorder_runtime_adapter_skips_legacy_duplicated_structura
         tool_name="web_fetch",
         tool_call_id="toolu-1",
     ) is None
-    assert runtime_recorder.record_structural(
+    completed = runtime_recorder.record_structural(
         STRUCTURAL_TOOL_COMPLETED,
-        {"is_error": False, "duration_ms": 1},
+        {"is_error": False, "duration_ms": 12.5},
         tool_name="web_fetch",
         tool_call_id="toolu-1",
-    ) is None
+    )
+    assert completed is not None
     runtime_recorder.record_structural(
         STRUCTURAL_ASSISTANT_FINAL,
         {"assistant_text_summary": "done", "model": "gpt-prod"},
     )
 
-    [recorded] = list(store.iter_events("ep-recorder"))
-    assert recorded.kind == STRUCTURAL_ASSISTANT_FINAL
-    assert recorded.payload["assistant_text_summary"] == "done"
+    events = list(store.iter_events("ep-recorder"))
+    assert [event.kind for event in events] == [
+        STRUCTURAL_TOOL_COMPLETED,
+        STRUCTURAL_ASSISTANT_FINAL,
+    ]
+    recorded_completed = events[0]
+    assert recorded_completed.tool_name == "web_fetch"
+    assert recorded_completed.tool_call_id == "toolu-1"
+    assert isinstance(recorded_completed.payload["duration_ms"], (int, float))
+    assert recorded_completed.payload["duration_ms"] == 12.5
+    assert events[1].payload["assistant_text_summary"] == "done"
 
 
 def test_gateway_eval_recorder_record_model_call_writes_tokens(tmp_path: Path) -> None:

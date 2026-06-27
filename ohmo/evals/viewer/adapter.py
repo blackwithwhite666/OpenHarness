@@ -20,6 +20,7 @@ from openharness.evals.decision_trace_summary import (
 from openharness.evals.tool_labels import effective_tool_label
 
 TOOL_COMPLETED_KINDS = {"tool_completed", "tool_completed_error"}
+_TRACE_TOOL_NAME = "trace"
 _ASSISTANT_FINAL_TRACE_METADATA_KEYS = (
     "model",
     "stop_reason",
@@ -241,7 +242,7 @@ def _tool_span(
     start_event: EvalEvent,
     completed_event: EvalEvent,
 ) -> dict[str, Any]:
-    input_value = (start_event.payload or {}).get("input")
+    input_value = _tool_span_input(start_event)
     output_value = (completed_event.payload or {}).get("output")
     start_ms = _epoch_ms(start_event.timestamp)
     end_ms = _epoch_ms(completed_event.timestamp)
@@ -260,8 +261,8 @@ def _tool_span(
         "output": _text_or_json(output_value),
         "raw": _json_dumps(
             {
-                "started": _model_dump(start_event),
-                "completed": _model_dump(completed_event),
+                "started": _safe_event_dump(start_event),
+                "completed": _safe_event_dump(completed_event),
             }
         ),
         "attributes": _tool_attributes(tool_call_id, tool_name),
@@ -465,10 +466,50 @@ def _decision_trace_payload_metadata(event: EvalEvent) -> dict[str, Any]:
     return metadata
 
 
+def _tool_span_input(event: EvalEvent) -> Any:
+    input_value = (event.payload or {}).get("input")
+    if _is_legacy_trace_tool_started(event):
+        return _legacy_trace_tool_input_metadata(input_value)
+    return input_value
+
+
+def _legacy_trace_tool_input_metadata(input_value: Any) -> dict[str, Any]:
+    if not isinstance(input_value, dict):
+        return {}
+
+    metadata: dict[str, Any] = {}
+    kind = _string_value(input_value.get("kind"))
+    if kind is not None:
+        metadata["kind"] = kind
+
+    raw_payload = input_value.get("payload")
+    payload = raw_payload if isinstance(raw_payload, dict) else input_value
+    for key in _DECISION_TRACE_ATTRIBUTE_KEYS:
+        if key in payload:
+            metadata[key] = payload[key]
+    if "schema_version" in payload:
+        metadata["schema_version"] = payload["schema_version"]
+
+    metadata["unsupported_claim_count"] = unsupported_claim_count_from_payload(payload)
+    if kind == TRACE_UNCERTAINTY:
+        metadata["uncertainty_status"] = _string_value(payload.get("uncertainty_status")) or "present"
+    elif "uncertainty_status" in payload:
+        metadata["uncertainty_status"] = payload["uncertainty_status"]
+    return metadata
+
+
+def _is_legacy_trace_tool_started(event: EvalEvent) -> bool:
+    return event.kind == "tool_started" and event.tool_name == _TRACE_TOOL_NAME
+
+
 def _safe_event_dump(event: EvalEvent) -> dict[str, Any]:
     dumped = _model_dump(event)
     if event.kind in DECISION_TRACE_EVENT_KINDS:
         dumped["payload"] = _decision_trace_payload_metadata(event)
+    elif _is_legacy_trace_tool_started(event):
+        dumped["payload"] = {
+            "input": _legacy_trace_tool_input_metadata((event.payload or {}).get("input"))
+        }
     elif event.kind == STRUCTURAL_ASSISTANT_FINAL:
         payload = event.payload or {}
         dumped["payload"] = {

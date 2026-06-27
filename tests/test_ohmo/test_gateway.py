@@ -689,22 +689,30 @@ async def test_runtime_pool_wires_trace_tool_to_gateway_eval_episode(
     assert "assistant_final" in kinds
     assert kinds.count("model_call") == 2
     assert kinds.count("tool_started") == 1
-    assert kinds.count("tool_completed") == 1
+    assert kinds.count("tool_completed") == 2
 
     [trace_event] = [event for event in events if event.kind == "trace_decision"]
     assert trace_event.episode_id == episode.episode_id
     assert trace_event.payload["trace_event_id"] == "gateway-trace-1"
     assert trace_event.payload["decision"] == "verify gateway trace recorder wiring"
 
-    [trace_tool_completed] = [
+    trace_tool_completed_events = [
         event
         for event in events
         if event.kind == "tool_completed" and event.tool_name == "trace"
     ]
-    assert trace_tool_completed.payload["output"] == (
+    assert len(trace_tool_completed_events) == 2
+    generic_trace_tool_completed, legacy_trace_tool_completed = trace_tool_completed_events
+    assert isinstance(
+        generic_trace_tool_completed.payload["duration_ms"],
+        (int, float),
+    )
+    assert generic_trace_tool_completed.payload["duration_ms"] >= 0
+    assert generic_trace_tool_completed.payload["is_error"] is False
+    assert legacy_trace_tool_completed.payload["output"] == (
         "Recorded decision trace event: trace_decision"
     )
-    assert "recorder unavailable" not in trace_tool_completed.payload["output"]
+    assert "recorder unavailable" not in legacy_trace_tool_completed.payload["output"]
 
 
 def _install_fake_tool_turn(monkeypatch, tmp_path, *, session_id):

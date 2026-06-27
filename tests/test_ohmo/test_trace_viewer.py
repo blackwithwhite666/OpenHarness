@@ -367,6 +367,115 @@ def test_episode_to_trace_viewer_data_renders_decision_trace_metadata_only(
         assert private_fragment not in serialized
 
 
+def test_episode_to_trace_viewer_data_sanitizes_legacy_trace_tool_input(
+    tmp_path: Path,
+) -> None:
+    store = get_eval_store(tmp_path)
+    base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+    episode_id = "ep-legacy-trace-tool"
+    private_fragment = "PRIVATE_RAW_TRACE_TOOL_PAYLOAD"
+    store.append_episode(
+        EvalEpisode(
+            episode_id=episode_id,
+            source="gateway",
+            app="ohmo",
+            session_id="session-1",
+            created_at=base,
+            user_text="trace a sensitive step",
+            metadata={"model": "gpt-prod", "cwd": "/tmp/project"},
+        )
+    )
+    store.append_event(
+        EvalEvent(
+            episode_id=episode_id,
+            kind="inbound_message",
+            timestamp=base,
+            payload={"user_text": "trace a sensitive step"},
+        )
+    )
+    store.append_event(
+        EvalEvent(
+            episode_id=episode_id,
+            kind="tool_started",
+            timestamp=base + timedelta(milliseconds=100),
+            payload={
+                "input_summary": private_fragment,
+                "input": {
+                    "kind": TRACE_DECISION,
+                    "payload": {
+                        "schema_version": 1,
+                        "trace_event_id": "trace-legacy-1",
+                        "related_tool_call_id": "trace-call-1",
+                        "sensitivity": "secret",
+                        "retention": "session",
+                        "decision": private_fragment,
+                        "unsupported_claims": [private_fragment],
+                    },
+                },
+            },
+            tool_name="trace",
+            tool_call_id="trace-call-1",
+        )
+    )
+    store.append_event(
+        EvalEvent(
+            episode_id=episode_id,
+            kind="tool_completed",
+            timestamp=base + timedelta(milliseconds=160),
+            payload={
+                "is_error": False,
+                "duration_ms": 42.5,
+                "output_summary": "Recorded decision trace event: trace_decision",
+                "output_length": 44,
+            },
+            tool_name="trace",
+            tool_call_id="trace-call-1",
+        )
+    )
+    store.append_event(
+        EvalEvent(
+            episode_id=episode_id,
+            kind="tool_completed",
+            timestamp=base + timedelta(milliseconds=200),
+            payload={"output": "Recorded decision trace event: trace_decision"},
+            tool_name="trace",
+            tool_call_id="trace-call-1",
+        )
+    )
+    store.append_event(
+        EvalEvent(
+            episode_id=episode_id,
+            kind="gateway_final",
+            timestamp=base + timedelta(milliseconds=250),
+            payload={"text": "done"},
+        )
+    )
+
+    data = episode_to_trace_viewer_data(store, episode_id)
+
+    root = data["spans"][0]
+    [trace_span] = root["children"]
+    assert trace_span["title"] == "trace"
+    assert trace_span["type"] == "tool_execution"
+    assert trace_span["durationMs"] == 60
+    assert trace_span["output"] is None
+    assert "duration_ms" in trace_span["raw"]
+    safe_input = json.loads(trace_span["input"])
+    assert safe_input == {
+        "kind": TRACE_DECISION,
+        "trace_event_id": "trace-legacy-1",
+        "related_tool_call_id": "trace-call-1",
+        "sensitivity": "secret",
+        "retention": "session",
+        "schema_version": 1,
+        "unsupported_claim_count": 1,
+    }
+
+    serialized = json.dumps(data, ensure_ascii=False)
+    assert private_fragment not in serialized
+    assert "input_summary" not in root["raw"]
+
+
 def test_episode_to_trace_viewer_data_propagates_tool_error_status(tmp_path: Path) -> None:
     store = get_eval_store(tmp_path)
     base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
