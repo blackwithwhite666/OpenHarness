@@ -46,6 +46,8 @@ from openharness.tools.web_search_tool import WebSearchTool
 
 def create_default_tool_registry(mcp_manager=None) -> ToolRegistry:
     """Return the default built-in tool registry."""
+    from openharness.tools.trace_tool import TraceTool
+
     registry = ToolRegistry()
     for tool in (
         BashTool(),
@@ -65,6 +67,7 @@ def create_default_tool_registry(mcp_manager=None) -> ToolRegistry:
         WebSearchTool(),
         ConfigTool(),
         BriefTool(),
+        TraceTool(),
         SleepTool(),
         EnterWorktreeTool(),
         ExitWorktreeTool(),
@@ -96,10 +99,20 @@ def create_default_tool_registry(mcp_manager=None) -> ToolRegistry:
     return registry
 
 
+def __getattr__(name: str):
+    if name in {"TraceTool", "TraceToolInput"}:
+        from openharness.tools.trace_tool import TraceTool, TraceToolInput
+
+        return {"TraceTool": TraceTool, "TraceToolInput": TraceToolInput}[name]
+    raise AttributeError(name)
+
+
 __all__ = [
     "BaseTool",
     "ToolExecutionContext",
     "ToolRegistry",
     "ToolResult",
+    "TraceTool",
+    "TraceToolInput",
     "create_default_tool_registry",
 ]

@@ -4,7 +4,13 @@ import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from openharness.evals import EvalEpisode, EvalEvent
+from openharness.evals import (
+    TRACE_DECISION,
+    TRACE_MISSING_REQUIRED,
+    TRACE_UNCERTAINTY,
+    EvalEpisode,
+    EvalEvent,
+)
 from ohmo.evals import get_eval_store
 from ohmo.evals.viewer import (
     create_app,
@@ -175,6 +181,192 @@ def test_episode_to_trace_viewer_data_renders_prod_model_calls(tmp_path: Path) -
     assert attributes["output_tokens"] == "7"
 
 
+def test_episode_to_trace_viewer_data_renders_decision_trace_metadata_only(
+    tmp_path: Path,
+) -> None:
+    store = get_eval_store(tmp_path)
+    base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+    episode_id = "ep-decision-trace"
+    store.append_episode(
+        EvalEpisode(
+            episode_id=episode_id,
+            source="gateway",
+            app="ohmo",
+            session_id="session-1",
+            created_at=base,
+            user_text="check task",
+            metadata={"model": "gpt-prod", "cwd": "/tmp/project"},
+        )
+    )
+    store.append_event(
+        EvalEvent(
+            episode_id=episode_id,
+            kind="inbound_message",
+            timestamp=base,
+            payload={"user_text": "check task"},
+        )
+    )
+    store.append_event(
+        EvalEvent(
+            episode_id=episode_id,
+            kind="model_call",
+            timestamp=base + timedelta(milliseconds=50),
+            payload={"model": "gpt-prod", "input_tokens": 5, "output_tokens": 8},
+        )
+    )
+    store.append_event(
+        EvalEvent(
+            episode_id=episode_id,
+            kind=TRACE_DECISION,
+            timestamp=base + timedelta(milliseconds=70),
+            payload={
+                "schema_version": 1,
+                "trace_event_id": "trace-decision-1",
+                "related_tool_call_id": "c1",
+                "sensitivity": "private",
+                "retention": "durable",
+                "reason": "evidence_gap",
+                "signals": ["unsupported_claim"],
+                "decision": "PRIVATE_TRACE_DECISION_RAW",
+                "unsupported_claims": ["PRIVATE_UNSUPPORTED_CLAIM_RAW"],
+            },
+        )
+    )
+    store.append_event(
+        EvalEvent(
+            episode_id=episode_id,
+            kind="tool_started",
+            timestamp=base + timedelta(milliseconds=100),
+            payload={"input": {"command": "safe-tool"}},
+            tool_name="bash",
+            tool_call_id="c1",
+        )
+    )
+    store.append_event(
+        EvalEvent(
+            episode_id=episode_id,
+            kind=TRACE_UNCERTAINTY,
+            timestamp=base + timedelta(milliseconds=120),
+            payload={
+                "schema_version": 1,
+                "trace_event_id": "trace-uncertainty-1",
+                "parent_event_id": "trace-decision-1",
+                "sensitivity": "secret",
+                "retention": "session",
+                "uncertainty_status": "open",
+                "uncertainty": "PRIVATE_TRACE_UNCERTAINTY_RAW",
+            },
+        )
+    )
+    store.append_event(
+        EvalEvent(
+            episode_id=episode_id,
+            kind="tool_completed",
+            timestamp=base + timedelta(milliseconds=200),
+            payload={"output": "safe output"},
+            tool_name="bash",
+            tool_call_id="c1",
+        )
+    )
+    store.append_event(
+        EvalEvent(
+            episode_id=episode_id,
+            kind="assistant_final",
+            timestamp=base + timedelta(milliseconds=250),
+            payload={
+                "trace_required": True,
+                "trace_required_reason": "sensitive_action",
+                "trace_required_signals": ["tool_use"],
+                "model_trace_recorded": False,
+                "assistant_text_summary": "PRIVATE_ASSISTANT_FINAL_SUMMARY",
+            },
+        )
+    )
+    store.append_event(
+        EvalEvent(
+            episode_id=episode_id,
+            kind=TRACE_MISSING_REQUIRED,
+            timestamp=base + timedelta(milliseconds=260),
+            payload={
+                "schema_version": 1,
+                "trace_event_id": "trace-missing-1",
+                "sensitivity": "private",
+                "retention": "durable",
+                "reason": "required_trace_absent",
+                "missing": ["trace_finalization"],
+            },
+            is_error=True,
+        )
+    )
+    store.append_event(
+        EvalEvent(
+            episode_id=episode_id,
+            kind="gateway_final",
+            timestamp=base + timedelta(milliseconds=300),
+            payload={"text": "done"},
+        )
+    )
+
+    data = episode_to_trace_viewer_data(store, episode_id)
+
+    root = data["spans"][0]
+    assert root["status"] == "error"
+    assert data["traceRecord"]["spansCount"] == 6
+    children = root["children"]
+    assert [child["type"] for child in children] == [
+        "llm_call",
+        "decision_trace",
+        "tool_execution",
+        "decision_trace",
+        "decision_trace",
+    ]
+    assert [child["title"] for child in children if child["type"] == "decision_trace"] == [
+        TRACE_DECISION,
+        TRACE_UNCERTAINTY,
+        TRACE_MISSING_REQUIRED,
+    ]
+
+    root_attrs = {item["key"]: item["value"]["stringValue"] for item in root["attributes"]}
+    assert root_attrs["decision_trace_event_count"] == "3"
+    assert root_attrs["decision_trace_model_event_count"] == "2"
+    assert root_attrs["decision_trace_diagnostic_event_count"] == "1"
+    assert root_attrs["decision_trace_missing_required_count"] == "1"
+    assert root_attrs["decision_trace_required_count"] == "1"
+    assert root_attrs["decision_trace_recorded_count"] == "0"
+    assert root_attrs["decision_trace_coverage_status"] == "missing"
+    assert root_attrs["unsupported_claim_count"] == "1"
+    assert root_attrs["uncertainty_trace_count"] == "1"
+    assert root_attrs["uncertainty_status"] == "present"
+    assert root_attrs["decision_trace_sensitivity_labels"] == '["private", "secret"]'
+    assert root_attrs["decision_trace_max_sensitivity"] == "secret"
+
+    decision_span = children[1]
+    assert decision_span["input"] is None
+    assert decision_span["output"] is None
+    decision_attrs = {
+        item["key"]: item["value"]["stringValue"]
+        for item in decision_span["attributes"]
+    }
+    assert decision_attrs["kind"] == TRACE_DECISION
+    assert decision_attrs["trace_event_id"] == "trace-decision-1"
+    assert decision_attrs["related_tool_call_id"] == "c1"
+    assert decision_attrs["sensitivity"] == "private"
+    assert decision_attrs["retention"] == "durable"
+    assert decision_attrs["reason"] == "evidence_gap"
+    assert decision_attrs["signals"] == '["unsupported_claim"]'
+    assert decision_attrs["unsupported_claim_count"] == "1"
+    assert children[-1]["status"] == "error"
+
+    serialized = json.dumps(data, ensure_ascii=False)
+    for private_fragment in (
+        "PRIVATE_TRACE_DECISION_RAW",
+        "PRIVATE_TRACE_UNCERTAINTY_RAW",
+        "PRIVATE_UNSUPPORTED_CLAIM_RAW",
+        "PRIVATE_ASSISTANT_FINAL_SUMMARY",
+    ):
+        assert private_fragment not in serialized
+
+
 def test_episode_to_trace_viewer_data_propagates_tool_error_status(tmp_path: Path) -> None:
     store = get_eval_store(tmp_path)
     base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
@@ -252,6 +444,10 @@ def test_eval_report_lane_lists_and_renders_metadata_traces(tmp_path: Path) -> N
     assert root["status"] == "error"
     assert len(root["children"]) == 2
     assert root["children"][1]["status"] == "error"
+    attributes = {item["key"]: item["value"]["stringValue"] for item in root["attributes"]}
+    assert attributes["decision_trace_event_count"] == "2"
+    assert attributes["decision_trace_coverage_status"] == "complete"
+    assert attributes["decision_trace_sensitivity_labels"] == '["private"]'
 
     client = TestClient(create_app(tmp_path))
     assert client.get("/api/runs").json()["runs"][0]["run"] == "eval_report_x.json"
@@ -300,6 +496,8 @@ def test_eval_case_to_trace_viewer_data_prefers_rich_trace(tmp_path: Path) -> No
     attributes = {item["key"]: item["value"]["stringValue"] for item in root["attributes"]}
     assert attributes["judge_verdict"] == "fail"
     assert attributes["judge_reason"] == "final answer missed one required detail"
+    assert attributes["decision_trace_event_count"] == "3"
+    assert attributes["decision_trace_coverage_status"] == "partial"
 
     assert len(root["children"]) == 3
     assert [child["type"] for child in root["children"]] == [
@@ -547,6 +745,7 @@ def _write_eval_report(store) -> None:
                     "final_text_length": 42,
                     "final_text_hash": "hash-final",
                     "error_count": 1,
+                    "metadata": _decision_trace_summary_fixture(event_count=2),
                     "tool_calls": [
                         {
                             "tool_name": "bash",
@@ -642,6 +841,13 @@ def _write_rich_eval_trace(
         },
         "score": score,
         "passed": passed,
+        "metadata": _decision_trace_summary_fixture(
+            event_count=3,
+            recorded_count=1,
+            coverage_status="partial",
+            sensitivity_labels=["private", "secret"],
+            max_sensitivity="secret",
+        ),
     }
     trace_dir = store.root / "traces" / "report-x"
     trace_dir.mkdir(parents=True, exist_ok=True)
@@ -649,3 +855,27 @@ def _write_rich_eval_trace(
         json.dumps(rich_trace, ensure_ascii=False),
         encoding="utf-8",
     )
+
+
+def _decision_trace_summary_fixture(
+    *,
+    event_count: int,
+    recorded_count: int = 1,
+    coverage_status: str = "complete",
+    sensitivity_labels: list[str] | None = None,
+    max_sensitivity: str = "private",
+) -> dict[str, object]:
+    return {
+        "decision_trace_event_count": event_count,
+        "decision_trace_model_event_count": event_count,
+        "decision_trace_diagnostic_event_count": 0,
+        "decision_trace_missing_required_count": 0,
+        "decision_trace_required_count": 1,
+        "decision_trace_recorded_count": recorded_count,
+        "decision_trace_coverage_status": coverage_status,
+        "unsupported_claim_count": 0,
+        "uncertainty_trace_count": 0,
+        "uncertainty_status": "absent",
+        "decision_trace_sensitivity_labels": sensitivity_labels or ["private"],
+        "decision_trace_max_sensitivity": max_sensitivity,
+    }

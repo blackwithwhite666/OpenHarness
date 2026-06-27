@@ -14,7 +14,19 @@ from openharness.engine.messages import (
     ToolResultBlock,
     sanitize_conversation_messages,
 )
-from openharness.engine.query import AskUserPrompt, PermissionPrompt, QueryContext, remember_user_goal, run_query
+from openharness.engine.query import (
+    AskUserPrompt,
+    DecisionTraceRecorderLike,
+    PermissionPrompt,
+    QueryContext,
+    _record_decision_trace_structural,
+    _TRACE_KIND_TURN_CONTINUED,
+    _TRACE_KIND_TURN_STARTED,
+    _turn_continued_trace_payload,
+    _turn_started_trace_payload,
+    remember_user_goal,
+    run_query,
+)
 from openharness.engine.stream_events import AssistantTurnComplete, StreamEvent
 from openharness.hooks import HookEvent, HookExecutor
 from openharness.permissions.checker import PermissionChecker
@@ -41,6 +53,7 @@ class QueryEngine:
         ask_user_prompt: AskUserPrompt | None = None,
         hook_executor: HookExecutor | None = None,
         tool_metadata: dict[str, object] | None = None,
+        decision_trace_recorder: DecisionTraceRecorderLike | None = None,
     ) -> None:
         self._api_client = api_client
         self._tool_registry = tool_registry
@@ -56,6 +69,7 @@ class QueryEngine:
         self._ask_user_prompt = ask_user_prompt
         self._hook_executor = hook_executor
         self._tool_metadata = tool_metadata or {}
+        self._decision_trace_recorder = decision_trace_recorder
         self._messages: list[ConversationMessage] = []
         self._cost_tracker = CostTracker()
 
@@ -188,6 +202,16 @@ class QueryEngine:
             ask_user_prompt=self._ask_user_prompt,
             hook_executor=self._hook_executor,
             tool_metadata=self._tool_metadata,
+            decision_trace_recorder=self._decision_trace_recorder,
+        )
+        _record_decision_trace_structural(
+            self._decision_trace_recorder,
+            _TRACE_KIND_TURN_STARTED,
+            _turn_started_trace_payload(
+                user_message,
+                model=self._model,
+                cwd=self._cwd,
+            ),
         )
         query_messages = list(self._messages)
         coordinator_context = self._build_coordinator_context_message()
@@ -217,6 +241,17 @@ class QueryEngine:
             ask_user_prompt=self._ask_user_prompt,
             hook_executor=self._hook_executor,
             tool_metadata=self._tool_metadata,
+            decision_trace_recorder=self._decision_trace_recorder,
+        )
+        _record_decision_trace_structural(
+            self._decision_trace_recorder,
+            _TRACE_KIND_TURN_CONTINUED,
+            _turn_continued_trace_payload(
+                self._messages,
+                model=self._model,
+                cwd=self._cwd,
+                max_turns=context.max_turns,
+            ),
         )
         async for event, usage in run_query(context, self._messages):
             if usage is not None:

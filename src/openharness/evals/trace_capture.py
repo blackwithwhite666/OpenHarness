@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 from typing import Any
 
+from openharness.evals.decision_trace_summary import summarize_decision_trace
 from openharness.utils.fs import atomic_write_text
 
 _DISABLED_VALUES = {"0", "false", "no", "off"}
@@ -59,6 +60,7 @@ def write_eval_trace(
         },
         "score": scorer_result.score,
         "passed": scorer_result.passed,
+        "metadata": summarize_decision_trace(getattr(context, "events", ())),
     }
     path = traces_root / run_id / f"{case_id}-{sample_index}.json"
     atomic_write_text(path, json.dumps(payload, ensure_ascii=False, indent=2, default=str) + "\n")

@@ -43,6 +43,7 @@ from openharness.evals.models import (
     EvalRunPackCase,
 )
 from openharness.evals.pack import read_run_pack
+from openharness.evals.decision_trace_summary import summarize_decision_trace
 from openharness.evals.replay_matching import _fixture_input_key
 from openharness.evals.replay_integrity import replay_integrity
 from openharness.evals.state import compute_episode_state_delta
@@ -1089,6 +1090,7 @@ def _execute_case(
         "scorer_name": scorer_result.scorer_name,
         "scorer_metadata_key_count": len(scorer_result.metadata),
         "executor_metadata_key_count": len(executor_result.metadata),
+        **summarize_decision_trace(execution_context.events),
     }
     for key in _SCORER_REPORT_METADATA_KEYS:
         if key in scorer_result.metadata:
@@ -1149,7 +1151,10 @@ def _error_execution_case(
         final_text="",
         error_type=type(exc).__name__,
         error_hash=error_hash,
-        metadata={"tool_calls_source": "replay_fixtures"},
+        metadata={
+            "tool_calls_source": "replay_fixtures",
+            **summarize_decision_trace(execution_context.events),
+        },
     )
     error_checks = {
         **checks,

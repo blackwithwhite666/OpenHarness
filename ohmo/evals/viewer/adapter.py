@@ -7,9 +7,39 @@ from datetime import datetime
 from typing import Any
 
 from openharness.evals import EvalEpisode, EvalEvent
+from openharness.evals.decision_trace import (
+    DECISION_TRACE_EVENT_KINDS,
+    STRUCTURAL_ASSISTANT_FINAL,
+    TRACE_MISSING_REQUIRED,
+    TRACE_UNCERTAINTY,
+)
+from openharness.evals.decision_trace_summary import (
+    summarize_decision_trace,
+    unsupported_claim_count_from_payload,
+)
 from openharness.evals.tool_labels import effective_tool_label
 
 TOOL_COMPLETED_KINDS = {"tool_completed", "tool_completed_error"}
+_ASSISTANT_FINAL_TRACE_METADATA_KEYS = (
+    "model",
+    "stop_reason",
+    "content_blocks",
+    "block_counts",
+    "trace_required",
+    "trace_required_reason",
+    "trace_required_signals",
+    "model_trace_recorded",
+)
+_DECISION_TRACE_ATTRIBUTE_KEYS = (
+    "trace_event_id",
+    "related_tool_call_id",
+    "parent_event_id",
+    "sensitivity",
+    "retention",
+    "reason",
+    "signals",
+    "missing",
+)
 
 
 def episode_to_trace_viewer_data(store: Any, episode_id: str) -> dict[str, Any]:
@@ -20,6 +50,7 @@ def episode_to_trace_viewer_data(store: Any, episode_id: str) -> dict[str, Any]:
 
     events = list(store.iter_events(episode_id))
     child_spans = _child_spans(episode_id, events)
+    decision_trace_summary = summarize_decision_trace(events)
     start_ms, end_ms = _trace_bounds_ms(episode, events)
     final_output = _gateway_final_text(events)
     total_tokens = _model_call_total_tokens(events)
@@ -39,10 +70,10 @@ def episode_to_trace_viewer_data(store: Any, episode_id: str) -> dict[str, Any]:
         "raw": _json_dumps(
             {
                 "episode": _model_dump(episode),
-                "events": [_model_dump(event) for event in events],
+                "events": [_safe_event_dump(event) for event in events],
             }
         ),
-        "attributes": _root_attributes(episode),
+        "attributes": _root_attributes(episode, decision_trace_summary),
         "children": child_spans,
     }
 
@@ -174,6 +205,7 @@ def _child_spans(episode_id: str, events: list[EvalEvent]) -> list[dict[str, Any
     child_spans = [
         *_model_call_spans(episode_id, events),
         *_tool_spans(episode_id, events),
+        *_decision_trace_spans(episode_id, events),
     ]
     return sorted(child_spans, key=lambda span: _int_value(span.get("startTimeMs")))
 
@@ -292,6 +324,48 @@ def _model_call_span(
     }
 
 
+def _decision_trace_spans(episode_id: str, events: list[EvalEvent]) -> list[dict[str, Any]]:
+    spans: list[dict[str, Any]] = []
+    for index, event in enumerate(events):
+        if event.kind not in DECISION_TRACE_EVENT_KINDS:
+            continue
+        spans.append(_decision_trace_span(episode_id, index, event))
+    return spans
+
+
+def _decision_trace_span(
+    episode_id: str,
+    index: int,
+    event: EvalEvent,
+) -> dict[str, Any]:
+    payload_metadata = _decision_trace_payload_metadata(event)
+    trace_event_id = _string_value(payload_metadata.get("trace_event_id"))
+    timestamp_ms = _epoch_ms(event.timestamp)
+    return {
+        "id": f"{episode_id}:decision_trace:{trace_event_id or index}",
+        "title": event.kind,
+        "startTimeMs": timestamp_ms,
+        "endTimeMs": timestamp_ms,
+        "durationMs": 0,
+        "type": "decision_trace",
+        "status": "error" if event.kind == TRACE_MISSING_REQUIRED or event.is_error else "success",
+        "input": None,
+        "output": None,
+        "raw": _json_dumps(
+            {
+                "kind": event.kind,
+                "timestamp": event.timestamp.isoformat(),
+                "tool_name": event.tool_name,
+                "tool_call_id": event.tool_call_id,
+                "is_error": event.is_error,
+                "payload_metadata": payload_metadata,
+            }
+        ),
+        "attributes": _decision_trace_attributes(event, payload_metadata),
+        "children": [],
+    }
+
+
 def _prod_trace_summary(store: Any, episode: EvalEpisode) -> dict[str, Any]:
     events = list(store.iter_events(episode.episode_id))
     child_spans = _child_spans(episode.episode_id, events)
@@ -307,10 +381,31 @@ def _prod_trace_summary(store: Any, episode: EvalEpisode) -> dict[str, Any]:
     }
 
 
-def _root_attributes(episode: EvalEpisode) -> list[dict[str, dict[str, str] | str]]:
+def _root_attributes(
+    episode: EvalEpisode,
+    decision_trace_summary: dict[str, Any],
+) -> list[dict[str, dict[str, str] | str]]:
     attributes: list[dict[str, dict[str, str] | str]] = []
     _append_attribute(attributes, "model", episode.metadata.get("model"))
     _append_attribute(attributes, "cwd", episode.metadata.get("cwd"))
+    _append_attributes(attributes, decision_trace_summary)
+    return attributes
+
+
+def _decision_trace_attributes(
+    event: EvalEvent,
+    payload_metadata: dict[str, Any],
+) -> list[dict[str, dict[str, str] | str]]:
+    attributes: list[dict[str, dict[str, str] | str]] = []
+    _append_attribute(attributes, "kind", event.kind)
+    for key in _DECISION_TRACE_ATTRIBUTE_KEYS:
+        _append_attribute(attributes, key, payload_metadata.get(key))
+    _append_attribute(
+        attributes,
+        "unsupported_claim_count",
+        payload_metadata.get("unsupported_claim_count", 0),
+    )
+    _append_attribute(attributes, "uncertainty_status", payload_metadata.get("uncertainty_status"))
     return attributes
 
 
@@ -335,6 +430,14 @@ def _model_call_attributes(
     return attributes
 
 
+def _append_attributes(
+    attributes: list[dict[str, dict[str, str] | str]],
+    values: dict[str, Any],
+) -> None:
+    for key, value in values.items():
+        _append_attribute(attributes, key, value)
+
+
 def _append_attribute(
     attributes: list[dict[str, dict[str, str] | str]],
     key: str,
@@ -344,6 +447,36 @@ def _append_attribute(
     if string_value is None:
         return
     attributes.append({"key": key, "value": {"stringValue": string_value}})
+
+
+def _decision_trace_payload_metadata(event: EvalEvent) -> dict[str, Any]:
+    payload = event.payload or {}
+    metadata: dict[str, Any] = {}
+    for key in _DECISION_TRACE_ATTRIBUTE_KEYS:
+        if key in payload:
+            metadata[key] = payload[key]
+    if "schema_version" in payload:
+        metadata["schema_version"] = payload["schema_version"]
+    metadata["unsupported_claim_count"] = unsupported_claim_count_from_payload(payload)
+    if event.kind == TRACE_UNCERTAINTY:
+        metadata["uncertainty_status"] = _string_value(payload.get("uncertainty_status")) or "present"
+    elif "uncertainty_status" in payload:
+        metadata["uncertainty_status"] = payload["uncertainty_status"]
+    return metadata
+
+
+def _safe_event_dump(event: EvalEvent) -> dict[str, Any]:
+    dumped = _model_dump(event)
+    if event.kind in DECISION_TRACE_EVENT_KINDS:
+        dumped["payload"] = _decision_trace_payload_metadata(event)
+    elif event.kind == STRUCTURAL_ASSISTANT_FINAL:
+        payload = event.payload or {}
+        dumped["payload"] = {
+            key: payload[key]
+            for key in _ASSISTANT_FINAL_TRACE_METADATA_KEYS
+            if key in payload
+        }
+    return dumped
 
 
 def _trace_bounds_ms(episode: EvalEpisode, events: list[EvalEvent]) -> tuple[int, int]:

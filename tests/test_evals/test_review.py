@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -11,6 +12,9 @@ from openharness.evals import (
     EvalResource,
     EvalResourceSnapshot,
     EvalStore,
+    TRACE_DECISION,
+    TRACE_MISSING_REQUIRED,
+    TRACE_UNCERTAINTY,
     build_case_candidates,
     build_case_drafts,
     promote_case_drafts,
@@ -62,6 +66,7 @@ def test_promote_case_drafts_writes_metadata_only_gold_cases(tmp_path: Path):
         "candidate_score": drafts[0].metadata["candidate_score"],
         "signals": drafts[0].metadata["signals"],
         "event_count": drafts[0].metadata["event_count"],
+        **_empty_decision_trace_summary(),
     }
 
     serialized = (
@@ -75,6 +80,108 @@ def test_promote_case_drafts_writes_metadata_only_gold_cases(tmp_path: Path):
         "second private answer",
     ):
         assert sensitive_fragment not in serialized
+
+
+def test_candidate_draft_and_gold_copy_decision_trace_summary_metadata_only(
+    tmp_path: Path,
+):
+    store = EvalStore(tmp_path / "evals")
+    _add_episode(
+        store,
+        episode_id="ep-1",
+        user_text="private request body",
+        final_text="private final answer",
+    )
+    store.append_event(
+        EvalEvent(
+            episode_id="ep-1",
+            kind="assistant_final",
+            payload={
+                "trace_required": True,
+                "trace_required_reason": "sensitive_action",
+                "trace_required_signals": ["tool_use"],
+                "model_trace_recorded": False,
+            },
+        )
+    )
+    store.append_event(
+        EvalEvent(
+            episode_id="ep-1",
+            kind=TRACE_DECISION,
+            payload={
+                "schema_version": 1,
+                "trace_event_id": "trace-decision-1",
+                "sensitivity": "private",
+                "retention": "durable",
+                "decision": "PRIVATE_REVIEW_TRACE_DECISION_RAW",
+                "unsupported_claims_count": 2,
+            },
+        )
+    )
+    store.append_event(
+        EvalEvent(
+            episode_id="ep-1",
+            kind=TRACE_UNCERTAINTY,
+            payload={
+                "schema_version": 1,
+                "trace_event_id": "trace-uncertainty-1",
+                "sensitivity": "secret",
+                "retention": "session",
+                "uncertainty": "PRIVATE_REVIEW_TRACE_UNCERTAINTY_RAW",
+            },
+        )
+    )
+    store.append_event(
+        EvalEvent(
+            episode_id="ep-1",
+            kind=TRACE_MISSING_REQUIRED,
+            payload={
+                "schema_version": 1,
+                "trace_event_id": "trace-missing-1",
+                "sensitivity": "private",
+                "retention": "durable",
+                "missing": ["trace_finalization"],
+            },
+            is_error=True,
+        )
+    )
+
+    [candidate] = build_case_candidates(store)
+    [draft] = build_case_drafts(store, [candidate])
+    candidate_write = write_case_draft_pack(store, [draft])
+    promote = promote_case_drafts(store, case_ids=[draft.case_id], reviewer="reviewer-1")
+    [gold] = read_gold_cases(store)
+
+    expected_summary = {
+        "decision_trace_event_count": 3,
+        "decision_trace_model_event_count": 2,
+        "decision_trace_diagnostic_event_count": 1,
+        "decision_trace_missing_required_count": 1,
+        "decision_trace_required_count": 1,
+        "decision_trace_recorded_count": 0,
+        "decision_trace_coverage_status": "missing",
+        "unsupported_claim_count": 2,
+        "uncertainty_trace_count": 1,
+        "uncertainty_status": "present",
+        "decision_trace_sensitivity_labels": ["private", "secret"],
+        "decision_trace_max_sensitivity": "secret",
+    }
+    for metadata in (candidate.metadata, draft.metadata, gold.metadata):
+        for key, value in expected_summary.items():
+            assert metadata[key] == value
+
+    serialized = "\n".join(
+        [
+            json.dumps(candidate.model_dump(mode="json"), ensure_ascii=False),
+            candidate_write.records_path.read_text(encoding="utf-8"),
+            promote.records_path.read_text(encoding="utf-8"),
+        ]
+    )
+    for private_fragment in (
+        "PRIVATE_REVIEW_TRACE_DECISION_RAW",
+        "PRIVATE_REVIEW_TRACE_UNCERTAINTY_RAW",
+    ):
+        assert private_fragment not in serialized
 
 
 def test_promote_case_drafts_is_idempotent_for_existing_same_gold(tmp_path: Path):
@@ -273,3 +380,20 @@ def _write_state_snapshot(
         ],
     )
     path.write_text(snapshot.model_dump_json(), encoding="utf-8")
+
+
+def _empty_decision_trace_summary() -> dict[str, object]:
+    return {
+        "decision_trace_event_count": 0,
+        "decision_trace_model_event_count": 0,
+        "decision_trace_diagnostic_event_count": 0,
+        "decision_trace_missing_required_count": 0,
+        "decision_trace_required_count": 0,
+        "decision_trace_recorded_count": 0,
+        "decision_trace_coverage_status": "not_required",
+        "unsupported_claim_count": 0,
+        "uncertainty_trace_count": 0,
+        "uncertainty_status": "absent",
+        "decision_trace_sensitivity_labels": [],
+        "decision_trace_max_sensitivity": "",
+    }

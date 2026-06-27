@@ -31,6 +31,9 @@ from openharness.evals import (
     EvalToolFixture,
     QueryEngineEvalAgentRunner,
     ReplayToolsExecutor,
+    TRACE_DECISION,
+    TRACE_MISSING_REQUIRED,
+    TRACE_UNCERTAINTY,
     TrajectoryJudgeScorer,
     build_case_candidates,
     build_case_drafts,
@@ -176,6 +179,59 @@ def test_execution_report_replay_tools_writes_observed_trace_without_private_tex
         final_text="private execution answer",
         tool_name="web_fetch",
     )
+    store.append_event(
+        EvalEvent(
+            episode_id="ep-1",
+            kind="assistant_final",
+            payload={
+                "trace_required": True,
+                "trace_required_reason": "sensitive_action",
+                "trace_required_signals": ["tool_use"],
+                "model_trace_recorded": False,
+            },
+        )
+    )
+    store.append_event(
+        EvalEvent(
+            episode_id="ep-1",
+            kind=TRACE_DECISION,
+            payload={
+                "schema_version": 1,
+                "trace_event_id": "trace-decision-1",
+                "sensitivity": "private",
+                "retention": "durable",
+                "decision": "PRIVATE_EXECUTION_TRACE_DECISION_RAW",
+                "unsupported_claim_count": 1,
+            },
+        )
+    )
+    store.append_event(
+        EvalEvent(
+            episode_id="ep-1",
+            kind=TRACE_UNCERTAINTY,
+            payload={
+                "schema_version": 1,
+                "trace_event_id": "trace-uncertainty-1",
+                "sensitivity": "secret",
+                "retention": "session",
+                "uncertainty": "PRIVATE_EXECUTION_TRACE_UNCERTAINTY_RAW",
+            },
+        )
+    )
+    store.append_event(
+        EvalEvent(
+            episode_id="ep-1",
+            kind=TRACE_MISSING_REQUIRED,
+            payload={
+                "schema_version": 1,
+                "trace_event_id": "trace-missing-1",
+                "sensitivity": "private",
+                "retention": "durable",
+                "missing": ["trace_finalization"],
+            },
+            is_error=True,
+        )
+    )
     drafts = build_case_drafts(store, build_case_candidates(store))
     write_case_draft_pack(store, drafts)
     promote_case_drafts(store, case_ids=[drafts[0].case_id])
@@ -200,6 +256,21 @@ def test_execution_report_replay_tools_writes_observed_trace_without_private_tex
     assert case.observed_trace.tool_calls[0].input_summary_length == len(
         "private tool input"
     )
+    assert case.observed_trace.metadata["decision_trace_event_count"] == 3
+    assert case.observed_trace.metadata["decision_trace_model_event_count"] == 2
+    assert case.observed_trace.metadata["decision_trace_diagnostic_event_count"] == 1
+    assert case.observed_trace.metadata["decision_trace_missing_required_count"] == 1
+    assert case.observed_trace.metadata["decision_trace_required_count"] == 1
+    assert case.observed_trace.metadata["decision_trace_recorded_count"] == 0
+    assert case.observed_trace.metadata["decision_trace_coverage_status"] == "missing"
+    assert case.observed_trace.metadata["unsupported_claim_count"] == 1
+    assert case.observed_trace.metadata["uncertainty_trace_count"] == 1
+    assert case.observed_trace.metadata["uncertainty_status"] == "present"
+    assert case.observed_trace.metadata["decision_trace_sensitivity_labels"] == [
+        "private",
+        "secret",
+    ]
+    assert case.observed_trace.metadata["decision_trace_max_sensitivity"] == "secret"
     assert case.checks["tool_sequence_matches"] is True
     assert case.checks["final_output_matches"] is True
     assert case.metadata["scorer_name"] == "exact-final-text"
@@ -214,6 +285,8 @@ def test_execution_report_replay_tools_writes_observed_trace_without_private_tex
     assert "private raw tool output" not in serialized
     assert "private tool input" not in serialized
     assert "private tool output" not in serialized
+    assert "PRIVATE_EXECUTION_TRACE_DECISION_RAW" not in serialized
+    assert "PRIVATE_EXECUTION_TRACE_UNCERTAINTY_RAW" not in serialized
 
 
 def test_execution_report_schema_contract_is_stable(tmp_path: Path):
@@ -408,6 +481,8 @@ def test_execution_report_query_engine_writes_rich_trace_and_keeps_report_privat
     assert trace["judge"] == {"verdict": "pass", "reason": raw_judge_reason}
     assert trace["score"] == 1.0
     assert trace["passed"] is True
+    assert trace["metadata"]["decision_trace_event_count"] == 0
+    assert trace["metadata"]["decision_trace_coverage_status"] == "not_required"
     assert trace["tool_calls"] == [
         {
             "tool_name": "web_fetch",

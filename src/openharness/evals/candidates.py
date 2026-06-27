@@ -9,6 +9,10 @@ from pathlib import Path
 
 from pydantic import BaseModel
 
+from openharness.evals.decision_trace_summary import (
+    copy_decision_trace_summary_fields,
+    summarize_decision_trace,
+)
 from openharness.evals.facets import collect_text_facets
 from openharness.evals.models import (
     EvalCaseCandidate,
@@ -58,6 +62,7 @@ def build_case_candidates(store: EvalStore) -> list[EvalCaseCandidate]:
         )
         candidate_kind = _candidate_kind(signals)
         score = _score(signals, tool_path)
+        decision_trace_summary = summarize_decision_trace(events)
         candidates.append(
             EvalCaseCandidate(
                 candidate_id=_stable_id("candidate", episode_id, candidate_kind),
@@ -79,6 +84,7 @@ def build_case_candidates(store: EvalStore) -> list[EvalCaseCandidate]:
                     "facet_count": len(facet_ids),
                     "embedded_facet_count": embedded_facet_count,
                     "graph_motif_key": _motif_key(event_kind_path, tool_path),
+                    **decision_trace_summary,
                 },
             )
         )
@@ -124,6 +130,7 @@ def build_case_drafts(
                     "candidate_score": candidate.score,
                     "signals": candidate.signals,
                     "event_count": candidate.metadata.get("event_count", 0),
+                    **copy_decision_trace_summary_fields(candidate.metadata),
                 },
             )
         )

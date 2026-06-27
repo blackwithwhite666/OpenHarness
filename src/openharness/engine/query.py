@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
 import re
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, AsyncIterator, Awaitable, Callable
+from typing import Any, AsyncIterator, Awaitable, Callable, Protocol
 from uuid import uuid4
 
 from openharness.api.client import (
@@ -53,6 +56,57 @@ log = logging.getLogger(__name__)
 PermissionPrompt = Callable[[str, str], Awaitable[bool]]
 AskUserPrompt = Callable[[str], Awaitable[str]]
 
+DECISION_TRACE_RECORDER_METADATA_KEY = "decision_trace_recorder"
+
+_TRACE_KIND_TURN_STARTED = "turn_started"
+_TRACE_KIND_TURN_CONTINUED = "turn_continued"
+_TRACE_KIND_MODEL_CALL = "model_call"
+_TRACE_KIND_ASSISTANT_FINAL = "assistant_final"
+_TRACE_KIND_TOOL_STARTED = "tool_started"
+_TRACE_KIND_TOOL_PERMISSION = "tool_permission"
+_TRACE_KIND_TOOL_COMPLETED = "tool_completed"
+_TRACE_KIND_ENGINE_ERROR = "engine_error"
+_TRACE_TOOL_NAME = "trace"
+_TRACE_MISSING_REQUIRED = "trace_missing_required"
+_TRACE_REQUIRED_MIN_TEXT_CHARS = 80
+_STRUCTURAL_TEXT_SUMMARY_CHARS = 240
+_STRUCTURAL_VALUE_SUMMARY_CHARS = 320
+_TRACE_TRIVIAL_FINAL_TEXTS = frozenset(
+    {
+        "ok",
+        "okay",
+        "done",
+        "thanks",
+        "thank you",
+        "sure",
+        "yes",
+        "no",
+    }
+)
+_TRACE_UNCERTAINTY_MARKERS = (
+    "i'm not sure",
+    "i am not sure",
+    "unclear",
+    "uncertain",
+    "maybe",
+    "might",
+    "probably",
+    "appears",
+    "seems",
+)
+_TRACE_EVIDENCE_FINALIZATION_MARKERS = (
+    "because",
+    "based on",
+    "evidence",
+    "verified",
+    "confirmed",
+    "therefore",
+    "so the",
+    "final",
+    "conclusion",
+    "result",
+)
+
 MAX_TRACKED_READ_FILES = 6
 MAX_TRACKED_SKILLS = 8
 MAX_TRACKED_ASYNC_AGENT_EVENTS = 8
@@ -61,6 +115,36 @@ MAX_TRACKED_WORK_LOG = 10
 MAX_TRACKED_USER_GOALS = 5
 MAX_TRACKED_ACTIVE_ARTIFACTS = 8
 MAX_TRACKED_VERIFIED_WORK = 10
+
+
+class DecisionTraceRecorderLike(Protocol):
+    """Recorder surface used by the generic engine without importing evals."""
+
+    def record_structural(
+        self,
+        kind: str,
+        payload: Mapping[str, Any],
+        *,
+        tool_name: str | None = None,
+        tool_call_id: str | None = None,
+        is_error: bool = False,
+    ) -> object | None:
+        """Append a compact structural decision-trace event."""
+
+
+@dataclass(frozen=True)
+class _TraceRequirement:
+    required: bool
+    reason: str
+    signals: tuple[str, ...] = ()
+
+
+@dataclass
+class _DecisionTraceRunState:
+    successful_model_trace: bool = False
+    tool_call_count: int = 0
+    tool_result_count: int = 0
+    failed_tool_result_count: int = 0
 
 
 def _is_prompt_too_long_error(exc: Exception) -> bool:
@@ -152,6 +236,454 @@ class QueryContext:
     max_turns: int | None = 200
     hook_executor: HookExecutor | None = None
     tool_metadata: dict[str, object] | None = None
+    decision_trace_recorder: DecisionTraceRecorderLike | None = None
+
+
+def _record_decision_trace_structural(
+    recorder: DecisionTraceRecorderLike | None,
+    kind: str,
+    payload: Mapping[str, Any],
+    *,
+    tool_name: str | None = None,
+    tool_call_id: str | None = None,
+    is_error: bool = False,
+) -> None:
+    if recorder is None:
+        return
+    try:
+        recorder.record_structural(
+            kind,
+            payload,
+            tool_name=tool_name,
+            tool_call_id=tool_call_id,
+            is_error=is_error,
+        )
+    except Exception:
+        log.exception("decision trace recorder failed for structural event %s", kind)
+
+
+def _sha256_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
+
+
+def _compact_text_summary(text: str, *, limit: int = _STRUCTURAL_TEXT_SUMMARY_CHARS) -> str:
+    normalized = " ".join(text.split())
+    return normalized[:limit]
+
+
+def _structural_text_fields(
+    prefix: str,
+    text: str,
+    *,
+    limit: int = _STRUCTURAL_TEXT_SUMMARY_CHARS,
+) -> dict[str, object]:
+    return {
+        f"{prefix}_summary": _compact_text_summary(text, limit=limit),
+        f"{prefix}_length": len(text),
+        f"{prefix}_sha256": _sha256_text(text),
+    }
+
+
+def _structural_value_fields(
+    prefix: str,
+    value: Any,
+    *,
+    limit: int = _STRUCTURAL_VALUE_SUMMARY_CHARS,
+) -> dict[str, object]:
+    encoding = "json"
+    try:
+        text = json.dumps(
+            value,
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    except (TypeError, ValueError):
+        encoding = "repr"
+        text = repr(value)
+    return {
+        f"{prefix}_summary": _compact_text_summary(text, limit=limit),
+        f"{prefix}_length": len(text),
+        f"{prefix}_sha256": _sha256_text(text),
+        f"{prefix}_encoding": encoding,
+    }
+
+
+def _message_block_counts(message: ConversationMessage) -> dict[str, int]:
+    counts = {"text": 0, "image": 0, "tool_use": 0, "tool_result": 0}
+    for block in message.content:
+        if isinstance(block, TextBlock):
+            counts["text"] += 1
+        elif isinstance(block, ImageBlock):
+            counts["image"] += 1
+        elif isinstance(block, ToolResultBlock):
+            counts["tool_result"] += 1
+        else:
+            counts["tool_use"] += 1
+    return counts
+
+
+def _turn_started_trace_payload(
+    user_message: ConversationMessage,
+    *,
+    model: str,
+    cwd: Path,
+) -> dict[str, object]:
+    return {
+        "model": model,
+        "cwd": str(cwd),
+        "role": user_message.role,
+        "content_blocks": len(user_message.content),
+        "block_counts": _message_block_counts(user_message),
+        **_structural_text_fields("user_text", user_message.text),
+    }
+
+
+def _turn_continued_trace_payload(
+    messages: list[ConversationMessage],
+    *,
+    model: str,
+    cwd: Path,
+    max_turns: int | None,
+) -> dict[str, object]:
+    pending_tool_result_ids: list[str] = []
+    if messages:
+        last_message = messages[-1]
+        pending_tool_result_ids = [
+            block.tool_use_id
+            for block in last_message.content
+            if isinstance(block, ToolResultBlock)
+        ][-8:]
+    return {
+        "model": model,
+        "cwd": str(cwd),
+        "message_count": len(messages),
+        "max_turns": max_turns,
+        "pending_tool_result_count": len(pending_tool_result_ids),
+        "pending_tool_result_ids": pending_tool_result_ids,
+    }
+
+
+def _model_call_trace_payload(
+    message: ConversationMessage,
+    *,
+    model: str,
+    usage: UsageSnapshot,
+) -> dict[str, object]:
+    return {
+        "model": model,
+        "input_tokens": usage.input_tokens,
+        "output_tokens": usage.output_tokens,
+        "total_tokens": usage.total_tokens,
+        "assistant_role": message.role,
+        "content_blocks": len(message.content),
+        "block_counts": _message_block_counts(message),
+        "tool_use_count": len(message.tool_uses),
+        "tool_names": [tool_use.name for tool_use in message.tool_uses][:12],
+        **_structural_text_fields("assistant_text", message.text),
+    }
+
+
+def _assistant_final_trace_payload(
+    message: ConversationMessage,
+    *,
+    model: str,
+    trace_requirement: _TraceRequirement | None = None,
+    model_trace_recorded: bool = False,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "model": model,
+        "stop_reason": "tool_uses_empty",
+        "content_blocks": len(message.content),
+        "block_counts": _message_block_counts(message),
+        **_structural_text_fields("assistant_text", message.text),
+    }
+    if trace_requirement is not None:
+        payload.update(
+            {
+                "trace_required": trace_requirement.required,
+                "trace_required_reason": trace_requirement.reason,
+                "trace_required_signals": list(trace_requirement.signals),
+                "model_trace_recorded": model_trace_recorded,
+            }
+        )
+    return payload
+
+
+def _tool_started_trace_payload(tool_input: dict[str, object]) -> dict[str, object]:
+    return {
+        "input_keys": sorted(str(key) for key in tool_input.keys())[:40],
+        **_structural_value_fields("input", tool_input),
+    }
+
+
+def _tool_completed_trace_payload(
+    output: str,
+    *,
+    is_error: bool,
+    duration_ms: float,
+) -> dict[str, object]:
+    return {
+        "is_error": is_error,
+        "duration_ms": duration_ms,
+        **_structural_text_fields(
+            "output",
+            output,
+            limit=_STRUCTURAL_VALUE_SUMMARY_CHARS,
+        ),
+    }
+
+
+def _tool_permission_trace_payload(
+    *,
+    allowed: bool,
+    requires_confirmation: bool,
+    reason: str,
+    read_only: bool,
+    file_path: str | None,
+    command: str | None,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "allowed": allowed,
+        "requires_confirmation": requires_confirmation,
+        "reason": _compact_text_summary(reason),
+        "reason_length": len(reason),
+        "read_only": read_only,
+    }
+    if file_path is not None:
+        payload.update(_structural_text_fields("path", file_path))
+    if command is not None:
+        payload.update(_structural_text_fields("command", command))
+    return payload
+
+
+def _engine_error_trace_payload(
+    message: str,
+    *,
+    recoverable: bool,
+    error_type: str,
+) -> dict[str, object]:
+    return {
+        "recoverable": recoverable,
+        "error_type": error_type,
+        **_structural_text_fields("message", message),
+    }
+
+
+def _tool_execution_metadata(
+    context: QueryContext,
+    base: Mapping[str, Any],
+) -> dict[str, Any]:
+    metadata = {
+        **base,
+        **(context.tool_metadata or {}),
+    }
+    if context.decision_trace_recorder is not None:
+        metadata[DECISION_TRACE_RECORDER_METADATA_KEY] = context.decision_trace_recorder
+    return metadata
+
+
+def _messages_include_tool_results(messages: list[ConversationMessage]) -> bool:
+    return any(
+        isinstance(block, ToolResultBlock)
+        for message in messages
+        for block in message.content
+    )
+
+
+def _normalized_trace_final_text(text: str) -> str:
+    return " ".join(text.split()).strip()
+
+
+def _is_trivial_trace_final_text(text: str) -> bool:
+    normalized = _normalized_trace_final_text(text).strip(" .!?:;").lower()
+    if not normalized:
+        return True
+    return normalized in _TRACE_TRIVIAL_FINAL_TEXTS
+
+
+def _contains_any_marker(text: str, markers: tuple[str, ...]) -> bool:
+    lowered = text.lower()
+    return any(marker in lowered for marker in markers)
+
+
+def _classify_trace_requirement(
+    final_message: ConversationMessage,
+    *,
+    run_state: _DecisionTraceRunState,
+    prior_tool_results_seen: bool,
+) -> _TraceRequirement:
+    text = _normalized_trace_final_text(final_message.text)
+    if _is_trivial_trace_final_text(text):
+        return _TraceRequirement(False, "trivial_final_answer")
+
+    signals: list[str] = []
+    if len(text) >= _TRACE_REQUIRED_MIN_TEXT_CHARS:
+        signals.append("substantive_final_answer")
+    if run_state.tool_call_count > 0 or run_state.tool_result_count > 0:
+        signals.append("current_run_tool_use")
+    if run_state.failed_tool_result_count > 0:
+        signals.append("failed_tool_result")
+    if _contains_any_marker(text, _TRACE_UNCERTAINTY_MARKERS):
+        signals.append("uncertainty_language")
+    if len(text) >= 24 and _contains_any_marker(text, _TRACE_EVIDENCE_FINALIZATION_MARKERS):
+        signals.append("evidence_or_finalization_language")
+    if prior_tool_results_seen and len(text) >= 24:
+        signals.append("prior_tool_results")
+
+    if not signals:
+        return _TraceRequirement(False, "no_trace_required_signals")
+    return _TraceRequirement(True, signals[0], tuple(signals))
+
+
+def _decision_trace_repair_instruction(
+    final_message: ConversationMessage,
+    requirement: _TraceRequirement,
+) -> str:
+    trace_event_id = f"trace_repair_{uuid4().hex}"
+    return (
+        "The previous assistant response needs one concise decision-trace "
+        "breadcrumb before finalization. Call only the `trace` tool exactly once "
+        "with kind `trace_finalization`. Use payload fields "
+        f"`schema_version: 1`, `trace_event_id: \"{trace_event_id}\"`, "
+        "`reason`, and a short `final_answer_summary`. Do not write prose. "
+        "Do not include chain-of-thought, secrets, or private raw content.\n\n"
+        f"Trace requirement reason: {requirement.reason}\n"
+        f"Signals: {', '.join(requirement.signals)}\n"
+        f"Final answer summary: {_compact_text_summary(final_message.text)}"
+    )
+
+
+def _record_trace_missing_required(
+    recorder: DecisionTraceRecorderLike | None,
+    *,
+    final_message: ConversationMessage,
+    requirement: _TraceRequirement,
+) -> None:
+    if recorder is None:
+        return
+    record = getattr(recorder, "record", None)
+    if not callable(record):
+        return
+
+    payload = {
+        "schema_version": 1,
+        "trace_event_id": f"trace_missing_required_{uuid4().hex}",
+        "missing": ["model_authored_trace"],
+        "reason": requirement.reason,
+        "signals": list(requirement.signals),
+        "final_answer_length": len(final_message.text),
+        "final_answer_sha256": _sha256_text(final_message.text),
+        "final_answer_summary": _compact_text_summary(final_message.text),
+    }
+    try:
+        record(_TRACE_MISSING_REQUIRED, payload, is_error=True)
+    except Exception:
+        log.exception("decision trace recorder failed for missing-required diagnostic")
+
+
+async def _attempt_decision_trace_repair(
+    context: QueryContext,
+    messages: list[ConversationMessage],
+    *,
+    final_message: ConversationMessage,
+    requirement: _TraceRequirement,
+    effective_max_tokens: int,
+) -> bool:
+    if context.decision_trace_recorder is None:
+        return False
+
+    trace_tool = context.tool_registry.get(_TRACE_TOOL_NAME)
+    if trace_tool is None:
+        return False
+
+    repair_messages = [
+        *messages,
+        ConversationMessage.from_user_text(
+            _decision_trace_repair_instruction(final_message, requirement)
+        ),
+    ]
+    repair_message: ConversationMessage | None = None
+    repair_usage = UsageSnapshot()
+
+    try:
+        async for event in context.api_client.stream_message(
+            ApiMessageRequest(
+                model=context.model,
+                messages=repair_messages,
+                system_prompt=context.system_prompt,
+                max_tokens=min(effective_max_tokens, 1024),
+                tools=[trace_tool.to_api_schema()],
+            )
+        ):
+            if isinstance(event, ApiMessageCompleteEvent):
+                repair_message = event.message
+                repair_usage = event.usage
+    except Exception:
+        log.exception("decision trace repair model call failed")
+        return False
+
+    if repair_message is None:
+        return False
+
+    model_payload = _model_call_trace_payload(
+        repair_message,
+        model=context.model,
+        usage=repair_usage,
+    )
+    model_payload.update(
+        {
+            "repair": True,
+            "trace_required_reason": requirement.reason,
+            "trace_required_signals": list(requirement.signals),
+        }
+    )
+    _record_decision_trace_structural(
+        context.decision_trace_recorder,
+        _TRACE_KIND_MODEL_CALL,
+        model_payload,
+    )
+
+    successful_trace = False
+    for tool_call in repair_message.tool_uses:
+        if tool_call.name != _TRACE_TOOL_NAME:
+            continue
+        start_payload = _tool_started_trace_payload(tool_call.input)
+        start_payload["repair"] = True
+        _record_decision_trace_structural(
+            context.decision_trace_recorder,
+            _TRACE_KIND_TOOL_STARTED,
+            start_payload,
+            tool_name=tool_call.name,
+            tool_call_id=tool_call.id,
+        )
+        tool_started_at = time.monotonic()
+        result = await _execute_tool_call(
+            context,
+            tool_call.name,
+            tool_call.id,
+            tool_call.input,
+        )
+        duration_ms = (time.monotonic() - tool_started_at) * 1000
+        completed_payload = _tool_completed_trace_payload(
+            result.content,
+            is_error=result.is_error,
+            duration_ms=duration_ms,
+        )
+        completed_payload["repair"] = True
+        _record_decision_trace_structural(
+            context.decision_trace_recorder,
+            _TRACE_KIND_TOOL_COMPLETED,
+            completed_payload,
+            tool_name=tool_call.name,
+            tool_call_id=tool_call.id,
+            is_error=result.is_error,
+        )
+        if not result.is_error:
+            successful_trace = True
+
+    return successful_trace
 
 
 def _append_capped_unique(bucket: list[Any], value: Any, *, limit: int) -> None:
@@ -611,10 +1143,10 @@ async def _preprocess_images_in_messages(
 
         exec_context = ToolExecutionContext(
             cwd=context.cwd,
-            metadata={
-                "vision_model_config": vision_config,
-                **(context.tool_metadata or {}),
-            },
+            metadata=_tool_execution_metadata(
+                context,
+                {"vision_model_config": vision_config},
+            ),
         )
         result = await tool.execute(parsed, exec_context)
         if result.is_error:
@@ -654,6 +1186,8 @@ async def run_query(
         context.context_window_tokens,
     )
     reported_token_clamp = False
+    trace_run_state = _DecisionTraceRunState()
+    prior_tool_results_seen = _messages_include_tool_results(messages)
 
     async def _stream_compaction(
         *,
@@ -774,12 +1308,42 @@ async def run_query(
                 if was_compacted:
                     continue
             if "connect" in error_msg.lower() or "timeout" in error_msg.lower() or "network" in error_msg.lower():
+                _record_decision_trace_structural(
+                    context.decision_trace_recorder,
+                    _TRACE_KIND_ENGINE_ERROR,
+                    _engine_error_trace_payload(
+                        error_msg,
+                        recoverable=True,
+                        error_type=type(exc).__name__,
+                    ),
+                    is_error=True,
+                )
                 yield ErrorEvent(message=f"Network error: {error_msg}. Check your internet connection and try again."), None
             else:
+                _record_decision_trace_structural(
+                    context.decision_trace_recorder,
+                    _TRACE_KIND_ENGINE_ERROR,
+                    _engine_error_trace_payload(
+                        error_msg,
+                        recoverable=False,
+                        error_type=type(exc).__name__,
+                    ),
+                    is_error=True,
+                )
                 yield ErrorEvent(message=f"API error: {error_msg}"), None
             return
 
         if final_message is None:
+            _record_decision_trace_structural(
+                context.decision_trace_recorder,
+                _TRACE_KIND_ENGINE_ERROR,
+                _engine_error_trace_payload(
+                    "Model stream finished without a final message",
+                    recoverable=False,
+                    error_type="RuntimeError",
+                ),
+                is_error=True,
+            )
             raise RuntimeError("Model stream finished without a final message")
 
         coordinator_context_message: ConversationMessage | None = None
@@ -789,6 +1353,16 @@ async def run_query(
 
         if final_message.role == "assistant" and final_message.is_effectively_empty():
             log.warning("dropping empty assistant message from provider response")
+            _record_decision_trace_structural(
+                context.decision_trace_recorder,
+                _TRACE_KIND_ENGINE_ERROR,
+                _engine_error_trace_payload(
+                    "Model returned an empty assistant message.",
+                    recoverable=False,
+                    error_type="EmptyAssistantMessage",
+                ),
+                is_error=True,
+            )
             yield ErrorEvent(
                 message=(
                     "Model returned an empty assistant message. "
@@ -798,12 +1372,51 @@ async def run_query(
             return
 
         messages.append(final_message)
-        yield AssistantTurnComplete(message=final_message, usage=usage), usage
+        _record_decision_trace_structural(
+            context.decision_trace_recorder,
+            _TRACE_KIND_MODEL_CALL,
+            _model_call_trace_payload(
+                final_message,
+                model=context.model,
+                usage=usage,
+            ),
+        )
 
         if coordinator_context_message is not None:
             messages.append(coordinator_context_message)
 
         if not final_message.tool_uses:
+            trace_requirement = _classify_trace_requirement(
+                final_message,
+                run_state=trace_run_state,
+                prior_tool_results_seen=prior_tool_results_seen,
+            )
+            if trace_requirement.required and not trace_run_state.successful_model_trace:
+                trace_run_state.successful_model_trace = await _attempt_decision_trace_repair(
+                    context,
+                    messages,
+                    final_message=final_message,
+                    requirement=trace_requirement,
+                    effective_max_tokens=effective_max_tokens,
+                )
+                if not trace_run_state.successful_model_trace:
+                    _record_trace_missing_required(
+                        context.decision_trace_recorder,
+                        final_message=final_message,
+                        requirement=trace_requirement,
+                    )
+
+            yield AssistantTurnComplete(message=final_message, usage=usage), usage
+            _record_decision_trace_structural(
+                context.decision_trace_recorder,
+                _TRACE_KIND_ASSISTANT_FINAL,
+                _assistant_final_trace_payload(
+                    final_message,
+                    model=context.model,
+                    trace_requirement=trace_requirement,
+                    model_trace_recorded=trace_run_state.successful_model_trace,
+                ),
+            )
             if context.hook_executor is not None:
                 await context.hook_executor.execute(
                     HookEvent.STOP,
@@ -814,13 +1427,41 @@ async def run_query(
                 )
             return
 
+        yield AssistantTurnComplete(message=final_message, usage=usage), usage
         tool_calls = final_message.tool_uses
+        trace_run_state.tool_call_count += len(tool_calls)
 
         if len(tool_calls) == 1:
             # Single tool: sequential (stream events immediately)
             tc = tool_calls[0]
+            _record_decision_trace_structural(
+                context.decision_trace_recorder,
+                _TRACE_KIND_TOOL_STARTED,
+                _tool_started_trace_payload(tc.input),
+                tool_name=tc.name,
+                tool_call_id=tc.id,
+            )
             yield ToolExecutionStarted(tool_name=tc.name, tool_input=tc.input, tool_call_id=tc.id), None
+            tool_started_at = time.monotonic()
             result = await _execute_tool_call(context, tc.name, tc.id, tc.input)
+            duration_ms = (time.monotonic() - tool_started_at) * 1000
+            trace_run_state.tool_result_count += 1
+            if result.is_error:
+                trace_run_state.failed_tool_result_count += 1
+            if tc.name == _TRACE_TOOL_NAME and not result.is_error:
+                trace_run_state.successful_model_trace = True
+            _record_decision_trace_structural(
+                context.decision_trace_recorder,
+                _TRACE_KIND_TOOL_COMPLETED,
+                _tool_completed_trace_payload(
+                    result.content,
+                    is_error=result.is_error,
+                    duration_ms=duration_ms,
+                ),
+                tool_name=tc.name,
+                tool_call_id=tc.id,
+                is_error=result.is_error,
+            )
             yield ToolExecutionCompleted(
                 tool_name=tc.name,
                 output=result.content,
@@ -831,10 +1472,22 @@ async def run_query(
         else:
             # Multiple tools: execute concurrently, emit events after
             for tc in tool_calls:
+                _record_decision_trace_structural(
+                    context.decision_trace_recorder,
+                    _TRACE_KIND_TOOL_STARTED,
+                    _tool_started_trace_payload(tc.input),
+                    tool_name=tc.name,
+                    tool_call_id=tc.id,
+                )
                 yield ToolExecutionStarted(tool_name=tc.name, tool_input=tc.input, tool_call_id=tc.id), None
 
             async def _run(tc):
-                return await _execute_tool_call(context, tc.name, tc.id, tc.input)
+                tool_started_at = time.monotonic()
+                try:
+                    result = await _execute_tool_call(context, tc.name, tc.id, tc.input)
+                except Exception as exc:
+                    return exc, (time.monotonic() - tool_started_at) * 1000
+                return result, (time.monotonic() - tool_started_at) * 1000
 
             # Use return_exceptions=True so a single failing tool does not abandon
             # its siblings as cancelled coroutines and leave the conversation with
@@ -844,7 +1497,11 @@ async def run_query(
                 *[_run(tc) for tc in tool_calls], return_exceptions=True
             )
             tool_results = []
+            durations_ms = []
             for tc, result in zip(tool_calls, raw_results):
+                duration_ms = 0.0
+                if isinstance(result, tuple):
+                    result, duration_ms = result
                 if isinstance(result, BaseException):
                     log.exception(
                         "tool execution raised: name=%s id=%s",
@@ -858,8 +1515,26 @@ async def run_query(
                         is_error=True,
                     )
                 tool_results.append(result)
+                durations_ms.append(duration_ms)
+                trace_run_state.tool_result_count += 1
+                if result.is_error:
+                    trace_run_state.failed_tool_result_count += 1
+                if tc.name == _TRACE_TOOL_NAME and not result.is_error:
+                    trace_run_state.successful_model_trace = True
 
-            for tc, result in zip(tool_calls, tool_results):
+            for tc, result, duration_ms in zip(tool_calls, tool_results, durations_ms):
+                _record_decision_trace_structural(
+                    context.decision_trace_recorder,
+                    _TRACE_KIND_TOOL_COMPLETED,
+                    _tool_completed_trace_payload(
+                        result.content,
+                        is_error=result.is_error,
+                        duration_ms=duration_ms,
+                    ),
+                    tool_name=tc.name,
+                    tool_call_id=tc.id,
+                    is_error=result.is_error,
+                )
                 yield ToolExecutionCompleted(
                     tool_name=tc.name,
                     output=result.content,
@@ -870,6 +1545,16 @@ async def run_query(
         messages.append(ConversationMessage(role="user", content=tool_results))
 
     if context.max_turns is not None:
+        _record_decision_trace_structural(
+            context.decision_trace_recorder,
+            _TRACE_KIND_ENGINE_ERROR,
+            _engine_error_trace_payload(
+                f"Exceeded maximum turn limit ({context.max_turns})",
+                recoverable=False,
+                error_type="MaxTurnsExceeded",
+            ),
+            is_error=True,
+        )
         raise MaxTurnsExceeded(context.max_turns)
     raise RuntimeError("Query loop exited without a max_turns limit or final response")
 
@@ -918,13 +1603,29 @@ async def _execute_tool_call(
     # directory-scoped roots such as `glob`/`grep`.
     _file_path = _resolve_permission_file_path(context.cwd, tool_input, parsed_input)
     _command = _extract_permission_command(tool_input, parsed_input)
+    read_only = tool.is_read_only(parsed_input)
     log.debug("permission check: %s read_only=%s path=%s cmd=%s",
-              tool_name, tool.is_read_only(parsed_input), _file_path, _command and _command[:80])
+              tool_name, read_only, _file_path, _command and _command[:80])
     decision = context.permission_checker.evaluate(
         tool_name,
-        is_read_only=tool.is_read_only(parsed_input),
+        is_read_only=read_only,
         file_path=_file_path,
         command=_command,
+    )
+    _record_decision_trace_structural(
+        context.decision_trace_recorder,
+        _TRACE_KIND_TOOL_PERMISSION,
+        _tool_permission_trace_payload(
+            allowed=decision.allowed,
+            requires_confirmation=decision.requires_confirmation,
+            reason=decision.reason,
+            read_only=read_only,
+            file_path=_file_path,
+            command=_command,
+        ),
+        tool_name=tool_name,
+        tool_call_id=tool_use_id,
+        is_error=not decision.allowed and not decision.requires_confirmation,
     )
     if not decision.allowed:
         if decision.requires_confirmation and context.permission_prompt is not None:
@@ -962,11 +1663,13 @@ async def _execute_tool_call(
             parsed_input,
             ToolExecutionContext(
                 cwd=context.cwd,
-                metadata={
-                    "tool_registry": context.tool_registry,
-                    "ask_user_prompt": context.ask_user_prompt,
-                    **(context.tool_metadata or {}),
-                },
+                metadata=_tool_execution_metadata(
+                    context,
+                    {
+                        "tool_registry": context.tool_registry,
+                        "ask_user_prompt": context.ask_user_prompt,
+                    },
+                ),
                 hook_executor=context.hook_executor,
             ),
         )

@@ -109,6 +109,21 @@ def _build_delegation_section() -> str:
     )
 
 
+def _build_decision_trace_section() -> str:
+    """Build guidance for the built-in decision trace tool."""
+    return "\n".join(
+        [
+            "# Decision Trace",
+            "",
+            "Use the `trace` tool for meaningful intent, decision, observation, "
+            "uncertainty, stop condition, and finalization breadcrumbs.",
+            "Keep trace payloads structured and concise.",
+            "Do not put chain-of-thought, secrets, or private raw content in trace payloads.",
+            "Prefer summaries, evidence ids, refs, hashes, and artifact paths.",
+        ]
+    )
+
+
 def build_runtime_system_prompt(
     settings: Settings,
     *,
@@ -138,6 +153,7 @@ def build_runtime_system_prompt(
         f"- Passes: {settings.passes}\n"
         "Adjust depth and iteration count to match these settings while still completing the task."
     )
+    sections.append(_build_decision_trace_section())
 
     skills_section = _build_skills_section(
         cwd,

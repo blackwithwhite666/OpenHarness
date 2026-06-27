@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import asdict, dataclass, is_dataclass
+from dataclasses import asdict, dataclass, field, is_dataclass
 from datetime import date, datetime
 import math
 from pathlib import Path
@@ -11,7 +11,7 @@ from typing import Any
 from uuid import uuid4
 
 from openharness.channels.bus.events import InboundMessage
-from openharness.evals import EvalEpisode, EvalEvent, EvalStore
+from openharness.evals import DecisionTraceRecorder, EvalEpisode, EvalStore
 from openharness.evals.tool_labels import effective_tool_label, tool_call_binaries
 from openharness.engine.stream_events import (
     AssistantTurnComplete,
@@ -31,6 +31,14 @@ class GatewayEvalRecorder:
     store: EvalStore
     episode_id: str
     _finished: bool = False
+    _structural_recorder: DecisionTraceRecorder = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self._structural_recorder = DecisionTraceRecorder(
+            store=self.store,
+            episode_id=self.episode_id,
+            enabled=True,
+        )
 
     @classmethod
     def start(
@@ -200,15 +208,12 @@ class GatewayEvalRecorder:
         tool_call_id: str | None = None,
         is_error: bool = False,
     ) -> None:
-        self.store.append_event(
-            EvalEvent(
-                episode_id=self.episode_id,
-                kind=kind,
-                payload=_json_safe_mapping(payload or {}),
-                tool_name=tool_name or None,
-                tool_call_id=tool_call_id or None,
-                is_error=is_error,
-            )
+        self._structural_recorder.record_legacy_structural(
+            kind,
+            _json_safe_mapping(payload or {}),
+            tool_name=tool_name or None,
+            tool_call_id=tool_call_id or None,
+            is_error=is_error,
         )
 
 

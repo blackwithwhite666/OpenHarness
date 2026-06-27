@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from openharness.evals.decision_trace_summary import copy_decision_trace_summary_fields
 from openharness.evals.tool_labels import effective_tool_label
 from ohmo.evals.viewer.adapter import category_for
 
@@ -67,6 +68,7 @@ def eval_case_to_trace_viewer_data(
     report_id = _string_value(report.get("report_id"))
     context = _mapping(case.get("context"))
     observed_trace = _mapping(case.get("observed_trace"))
+    observed_trace_metadata = _mapping(observed_trace.get("metadata"))
     tool_calls = _sequence_of_mappings(observed_trace.get("tool_calls"))
     capability_path = _string_sequence(context.get("capability_path"))
     status = _status_for_case(_string_value(case.get("status")))
@@ -143,6 +145,9 @@ def eval_case_to_trace_viewer_data(
             sample_count=sample_count,
             score=score,
             gold_episode_id=gold_episode_id,
+            decision_trace_metadata=copy_decision_trace_summary_fields(
+                observed_trace_metadata
+            ),
         ),
         "children": child_spans,
     }
@@ -296,6 +301,7 @@ def _rich_trace_viewer_data(
     duration_ms = max(0, end_ms - start_ms)
     total_tokens = sum(_model_call_tokens(model_call) for model_call in model_calls)
     judge = _mapping(rich_trace.get("judge"))
+    rich_trace_metadata = _mapping(rich_trace.get("metadata"))
     judge_verdict = _string_value(judge.get("verdict"))
     judge_reason = _string_value(judge.get("reason"))
     if judge_verdict:
@@ -323,6 +329,9 @@ def _rich_trace_viewer_data(
             gold_episode_id=gold_episode_id,
             judge_verdict=judge_verdict,
             judge_reason=judge_reason,
+            decision_trace_metadata=copy_decision_trace_summary_fields(
+                rich_trace_metadata
+            ),
         ),
         "children": child_spans,
     }
@@ -472,6 +481,7 @@ def _root_attributes(
     gold_episode_id: str | None,
     judge_verdict: Any = None,
     judge_reason: Any = None,
+    decision_trace_metadata: dict[str, Any] | None = None,
 ) -> list[dict[str, dict[str, str] | str]]:
     attributes: list[dict[str, dict[str, str] | str]] = []
     _append_attribute(attributes, "scorer", scorer)
@@ -483,6 +493,7 @@ def _root_attributes(
     _append_attribute(attributes, "gold_episode_id", gold_episode_id)
     _append_attribute(attributes, "judge_verdict", judge_verdict)
     _append_attribute(attributes, "judge_reason", judge_reason)
+    _append_attributes(attributes, decision_trace_metadata or {})
     return attributes
 
 
@@ -522,6 +533,14 @@ def _append_attribute(
     if string_value is None:
         return
     attributes.append({"key": key, "value": {"stringValue": string_value}})
+
+
+def _append_attributes(
+    attributes: list[dict[str, dict[str, str] | str]],
+    values: dict[str, Any],
+) -> None:
+    for key, value in values.items():
+        _append_attribute(attributes, key, value)
 
 
 def _read_execution_report(store: Any, run: str) -> dict[str, Any]:

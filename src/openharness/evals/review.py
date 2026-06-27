@@ -10,6 +10,7 @@ from typing import Mapping, TypeVar
 from pydantic import BaseModel, ValidationError
 
 from openharness.evals.candidates import EvalPackWrite
+from openharness.evals.decision_trace_summary import copy_decision_trace_summary_fields
 from openharness.evals.models import EvalCaseDraft, EvalGoldCase, EvalPackManifest
 from openharness.evals.state import compute_episode_state_delta
 from openharness.evals.store import EvalStore
@@ -128,6 +129,7 @@ def _gold_from_draft(
         "candidate_score": draft.metadata.get("candidate_score", 0),
         "signals": draft.metadata.get("signals", []),
         "event_count": draft.metadata.get("event_count", 0),
+        **copy_decision_trace_summary_fields(draft.metadata),
     }
     if review_metadata:
         metadata.update(dict(review_metadata))
