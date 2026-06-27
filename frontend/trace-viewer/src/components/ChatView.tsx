@@ -12,6 +12,10 @@ interface ChatViewProps {
   shareUrl?: string;
 }
 
+// Uses concrete Tailwind colors (not the agentprism-* tokens) because those
+// tokens are CSS variables that were never wired into Tailwind utilities, so
+// `bg-agentprism-*` produces no rule. A modal sitting over a dark backdrop
+// needs a real, opaque background to stay readable.
 export function ChatView({
   title,
   data,
@@ -30,17 +34,17 @@ export function ChatView({
       onClick={onClose}
     >
       <div
-        className="border-agentprism-border bg-agentprism-background flex max-h-[90vh] w-full max-w-3xl flex-col overflow-hidden rounded-lg border shadow-xl"
+        className="flex max-h-[90vh] w-full max-w-3xl flex-col overflow-hidden rounded-lg border border-neutral-200 bg-white text-neutral-900 shadow-xl"
         onClick={(event) => event.stopPropagation()}
       >
-        <header className="border-agentprism-border flex shrink-0 items-center gap-3 border-b px-4 py-3">
-          <MessagesSquare className="text-agentprism-muted-foreground size-4 shrink-0" />
+        <header className="flex shrink-0 items-center gap-3 border-b border-neutral-200 px-4 py-3">
+          <MessagesSquare className="size-4 shrink-0 text-neutral-400" />
           <div className="min-w-0 flex-1">
-            <h2 className="text-agentprism-foreground truncate text-sm font-medium" title={title}>
+            <h2 className="truncate text-sm font-medium text-neutral-900" title={title}>
               {title}
             </h2>
             {data && (
-              <p className="text-agentprism-muted-foreground truncate text-xs">
+              <p className="truncate text-xs text-neutral-500">
                 {data.kind === "observed" ? "observed dialog" : "chat session"}
                 {data.sessionId ? ` · ${data.sessionId}` : ""}
                 {` · ${data.messages.length} messages`}
@@ -50,7 +54,7 @@ export function ChatView({
           {shareUrl && (
             <button
               type="button"
-              className="text-agentprism-muted-foreground hover:text-agentprism-foreground text-xs underline"
+              className="text-xs text-neutral-500 underline hover:text-neutral-900"
               onClick={() => void navigator.clipboard?.writeText(shareUrl)}
               title={shareUrl}
             >
@@ -60,18 +64,18 @@ export function ChatView({
           <button
             type="button"
             aria-label="Close conversation"
-            className="text-agentprism-muted-foreground hover:text-agentprism-foreground"
+            className="text-neutral-500 hover:text-neutral-900"
             onClick={onClose}
           >
             <X className="size-4" />
           </button>
         </header>
 
-        <div className="min-h-0 flex-1 overflow-y-auto p-4">
+        <div className="min-h-0 flex-1 overflow-y-auto bg-neutral-50 p-4">
           {loading ? (
             <ChatStatus>Loading conversation…</ChatStatus>
           ) : error ? (
-            <div className="border-agentprism-destructive/30 bg-agentprism-destructive/10 text-agentprism-destructive rounded-md border p-3 text-sm">
+            <div className="rounded-md border border-red-200 bg-red-50 p-3 text-sm text-red-700">
               {error}
             </div>
           ) : !data || data.messages.length === 0 ? (
@@ -107,27 +111,26 @@ function ChatBubble({
   onOpenEpisode?: (episodeId: string) => void;
 }) {
   const isUser = message.role === "user";
-  const isAnchor =
-    !!anchorEpisodeId && message.episodeId === anchorEpisodeId;
+  const isAnchor = !!anchorEpisodeId && message.episodeId === anchorEpisodeId;
 
   return (
     <div className={`flex ${isUser ? "justify-end" : "justify-start"}`}>
       <div
         className={`flex max-w-[85%] flex-col gap-1.5 rounded-lg border px-3 py-2 ${
           isUser
-            ? "border-agentprism-border bg-agentprism-secondary/50"
-            : "border-agentprism-border bg-agentprism-muted"
-        } ${isAnchor ? "ring-agentprism-warning/60 ring-2" : ""}`}
+            ? "border-blue-200 bg-blue-50"
+            : "border-neutral-200 bg-white"
+        } ${isAnchor ? "ring-2 ring-amber-400" : ""}`}
       >
-        <div className="text-agentprism-muted-foreground flex items-center gap-2 text-[11px] uppercase tracking-wide">
+        <div className="flex items-center gap-2 text-[11px] uppercase tracking-wide text-neutral-500">
           <span>{isUser ? "user" : "assistant"}</span>
           {message.status === "error" && (
-            <span className="text-agentprism-destructive">· tool error</span>
+            <span className="text-red-600">· tool error</span>
           )}
           {message.episodeId && onOpenEpisode && (
             <button
               type="button"
-              className="hover:text-agentprism-foreground inline-flex items-center gap-0.5 normal-case underline"
+              className="inline-flex items-center gap-0.5 normal-case underline hover:text-neutral-900"
               onClick={() => onOpenEpisode(message.episodeId!)}
               title={`Open trace ${message.episodeId}`}
             >
@@ -138,13 +141,11 @@ function ChatBubble({
         </div>
 
         {message.text ? (
-          <p className="text-agentprism-foreground whitespace-pre-wrap break-words text-sm">
+          <p className="whitespace-pre-wrap break-words text-sm text-neutral-900">
             {message.text}
           </p>
         ) : (
-          <p className="text-agentprism-muted-foreground text-sm italic">
-            (no text)
-          </p>
+          <p className="text-sm italic text-neutral-400">(no text)</p>
         )}
 
         {message.toolCalls.length > 0 && (
@@ -154,8 +155,8 @@ function ChatBubble({
                 key={index}
                 className={`inline-flex items-center rounded border px-1.5 py-0.5 text-[11px] ${
                   tool.status === "error"
-                    ? "border-agentprism-destructive/40 text-agentprism-destructive"
-                    : "border-agentprism-border text-agentprism-muted-foreground"
+                    ? "border-red-300 text-red-600"
+                    : "border-neutral-300 text-neutral-600"
                 }`}
                 title={tool.name}
               >
@@ -182,8 +183,8 @@ function JudgeNote({
     <div
       className={`rounded-md border px-3 py-2 text-sm ${
         isPass
-          ? "border-agentprism-success/30 bg-agentprism-success-muted text-agentprism-success-muted-foreground"
-          : "border-agentprism-warning/30 bg-agentprism-warning-muted text-agentprism-warning-muted-foreground"
+          ? "border-emerald-200 bg-emerald-50 text-emerald-800"
+          : "border-amber-200 bg-amber-50 text-amber-800"
       }`}
     >
       <span className="font-medium">judge: {verdict}</span>
@@ -194,7 +195,7 @@ function JudgeNote({
 
 function ChatStatus({ children }: { children: string }) {
   return (
-    <div className="text-agentprism-muted-foreground flex h-40 items-center justify-center text-sm">
+    <div className="flex h-40 items-center justify-center text-sm text-neutral-500">
       {children}
     </div>
   );

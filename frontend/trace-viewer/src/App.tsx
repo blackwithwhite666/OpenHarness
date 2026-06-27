@@ -1106,12 +1106,12 @@ function App() {
     <main className="bg-agentprism-background text-agentprism-foreground flex h-screen min-h-0 flex-col">
       <header className="border-agentprism-border flex shrink-0 items-center justify-between gap-4 border-b px-4 py-3">
         <h1 className="text-agentprism-foreground text-base font-medium">OpenHarness Trace Viewer</h1>
-        <div className="border-agentprism-border bg-agentprism-muted flex rounded-md border p-0.5">
+        <div className="flex rounded-md border border-neutral-200 bg-neutral-100 p-0.5">
           <button
             className={`rounded px-3 py-1.5 text-sm ${
               sourceTab === "prod"
-                ? "bg-agentprism-background text-agentprism-foreground shadow-sm"
-                : "text-agentprism-muted-foreground"
+                ? "bg-white text-neutral-900 shadow-sm"
+                : "text-neutral-500 hover:text-neutral-900"
             }`}
             type="button"
             onClick={() => {
@@ -1124,8 +1124,8 @@ function App() {
           <button
             className={`rounded px-3 py-1.5 text-sm ${
               sourceTab === "eval"
-                ? "bg-agentprism-background text-agentprism-foreground shadow-sm"
-                : "text-agentprism-muted-foreground"
+                ? "bg-white text-neutral-900 shadow-sm"
+                : "text-neutral-500 hover:text-neutral-900"
             }`}
             type="button"
             onClick={() => {
@@ -1182,7 +1182,7 @@ function StatusFilterControl({
   return (
     <div
       aria-label={ariaLabel}
-      className="border-agentprism-border bg-agentprism-muted flex shrink-0 rounded-md border p-0.5"
+      className="flex shrink-0 rounded-md border border-neutral-200 bg-neutral-100 p-0.5"
       role="group"
     >
       {filters.map((filter) => (
@@ -1191,8 +1191,8 @@ function StatusFilterControl({
           aria-pressed={value === filter}
           className={`rounded px-2.5 py-1 text-xs ${
             value === filter
-              ? "bg-agentprism-background text-agentprism-foreground shadow-sm"
-              : "text-agentprism-muted-foreground"
+              ? "bg-white text-neutral-900 shadow-sm"
+              : "text-neutral-500 hover:text-neutral-900"
           }`}
           type="button"
           onClick={() => onChange(filter)}
@@ -1224,10 +1224,10 @@ function SampleSelector({
           <button
             key={sample}
             aria-pressed={isSelected}
-            className={`border-agentprism-border inline-flex h-7 items-center gap-1 rounded-md border px-2 text-xs ${
+            className={`inline-flex h-7 items-center gap-1 rounded-md border border-neutral-200 px-2 text-xs ${
               isSelected
-                ? "bg-agentprism-secondary text-agentprism-foreground"
-                : "bg-agentprism-background text-agentprism-muted-foreground hover:bg-agentprism-secondary/45"
+                ? "bg-neutral-200 text-neutral-900"
+                : "bg-white text-neutral-500 hover:bg-neutral-100"
             }`}
             type="button"
             onClick={() => onSelect(sample)}
