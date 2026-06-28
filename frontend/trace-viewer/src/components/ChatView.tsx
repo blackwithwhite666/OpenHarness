@@ -47,7 +47,7 @@ export function ChatView({
 
     const frame = window.requestAnimationFrame(() => {
       anchorMessageRef.current?.scrollIntoView({
-        block: "center",
+        block: "start",
         inline: "nearest",
       });
     });

@@ -24,12 +24,33 @@ interface AttachmentMarker {
   path: string;
 }
 
+interface ReplyMarker {
+  label: string;
+  quote: string;
+}
+
+type ReplyPlaceholderKind =
+  | "audio"
+  | "document"
+  | "file"
+  | "photo"
+  | "video"
+  | "voice";
+
 type MessageSegment =
   | { type: "markdown"; text: string }
   | { type: "attachment"; attachment: AttachmentMarker };
 
+interface ParsedMessage {
+  reply?: ReplyMarker;
+  segments: MessageSegment[];
+}
+
 const MEDIA_MARKER_RE =
   /\[\[attach:\s*([^\]\r\n]+?)\s*\]\]|\[(voice|audio|video|photo|image|file):\s*([^\]\r\n]+?)\s*\]/gi;
+const REPLY_MARKER_PREFIX_RE = /^\s*\[In reply to\s+([^:\]\r\n]+):\s*/i;
+const REPLY_PLACEHOLDER_RE =
+  /^\[(photo|voice|audio|video|file|document)\]$/i;
 
 const IMAGE_SUFFIXES = new Set([
   ".apng",
@@ -54,10 +75,11 @@ const AUDIO_SUFFIXES = new Set([
 const VIDEO_SUFFIXES = new Set([".m4v", ".mov", ".mp4", ".ogv", ".webm"]);
 
 export function MarkdownMessage({ text }: { text: string }) {
-  const segments = useMemo(() => splitMessageText(text), [text]);
+  const { reply, segments } = useMemo(() => parseMessageText(text), [text]);
 
   return (
     <div className="flex flex-col gap-2 break-words text-sm text-neutral-900">
+      {reply && <ReplyPreview reply={reply} />}
       {segments.map((segment, index) =>
         segment.type === "markdown" ? (
           <MarkdownBlocks key={index} content={segment.text} />
@@ -67,6 +89,93 @@ export function MarkdownMessage({ text }: { text: string }) {
       )}
     </div>
   );
+}
+
+function parseMessageText(text: string): ParsedMessage {
+  const replyMarker = parseLeadingReplyMarker(text);
+  if (!replyMarker) {
+    return { segments: splitMessageText(text) };
+  }
+
+  return {
+    reply: replyMarker.reply,
+    segments: splitMessageText(replyMarker.rest),
+  };
+}
+
+function parseLeadingReplyMarker(
+  text: string,
+): { reply: ReplyMarker; rest: string } | undefined {
+  const prefix = text.match(REPLY_MARKER_PREFIX_RE);
+  if (!prefix) return undefined;
+
+  const label = prefix[1]?.trim();
+  const opener = text[prefix[0].length];
+  if (!label || !opener) return undefined;
+
+  const unquotedPlaceholder = parseUnquotedReplyPlaceholder(
+    text,
+    prefix[0].length,
+  );
+  if (unquotedPlaceholder) {
+    return {
+      reply: {
+        label: `reply to ${label}`,
+        quote: unquotedPlaceholder.quote,
+      },
+      rest: unquotedPlaceholder.rest,
+    };
+  }
+
+  const closer = opener === "“" ? "”" : opener;
+  if (opener !== '"' && opener !== "'" && opener !== "“") return undefined;
+
+  const quoteStart = prefix[0].length + 1;
+  const quoteEnd = findReplyQuoteEnd(text, quoteStart, closer);
+  if (quoteEnd < 0) return undefined;
+
+  let markerEnd = quoteEnd + 1;
+  while (/\s/.test(text[markerEnd] ?? "")) markerEnd += 1;
+  if (text[markerEnd] !== "]") return undefined;
+
+  return {
+    reply: {
+      label: `reply to ${label}`,
+      quote: text.slice(quoteStart, quoteEnd),
+    },
+    rest: text.slice(markerEnd + 1).trimStart(),
+  };
+}
+
+function parseUnquotedReplyPlaceholder(
+  text: string,
+  startIndex: number,
+): { quote: string; rest: string } | undefined {
+  const match = text
+    .slice(startIndex)
+    .match(/^\[(photo|voice|audio|video|file|document)\]\s*\]/i);
+  if (!match) return undefined;
+
+  return {
+    quote: `[${match[1]}]`,
+    rest: text.slice(startIndex + match[0].length).trimStart(),
+  };
+}
+
+function findReplyQuoteEnd(
+  text: string,
+  startIndex: number,
+  closer: string,
+): number {
+  for (let index = startIndex; index < text.length; index += 1) {
+    if (text[index] !== closer) continue;
+
+    let nextIndex = index + 1;
+    while (/\s/.test(text[nextIndex] ?? "")) nextIndex += 1;
+    if (text[nextIndex] === "]") return index;
+  }
+
+  return -1;
 }
 
 function splitMessageText(text: string): MessageSegment[] {
@@ -113,11 +222,153 @@ function MarkdownBlocks({ content }: { content: string }) {
   return <div className="space-y-2">{rendered}</div>;
 }
 
+function CompactMarkdown({ content }: { content: string }) {
+  const tokens = useMemo(() => lexer(content), [content]);
+  const rendered = renderCompactBlocks(tokens);
+  if (!rendered) return null;
+
+  return (
+    <div className="max-h-12 overflow-hidden text-xs leading-4 text-neutral-600">
+      {rendered}
+    </div>
+  );
+}
+
+function ReplyPreview({ reply }: { reply: ReplyMarker }) {
+  const placeholder = replyPlaceholderKind(reply.quote);
+
+  return (
+    <div className="rounded-md border-l-2 border-neutral-300 bg-neutral-100/80 px-2 py-1.5">
+      <div className="mb-0.5 text-[11px] font-medium text-neutral-500">
+        {reply.label}
+      </div>
+      {placeholder ? (
+        <ReplyPlaceholder kind={placeholder} />
+      ) : (
+        <CompactMarkdown content={reply.quote} />
+      )}
+    </div>
+  );
+}
+
+function ReplyPlaceholder({ kind }: { kind: ReplyPlaceholderKind }) {
+  const displayKind = replyPlaceholderDisplayKind(kind);
+  const Icon =
+    displayKind === "image"
+      ? FileImage
+      : displayKind === "audio"
+        ? FileAudio
+        : displayKind === "video"
+          ? FileVideo
+          : Paperclip;
+
+  return (
+    <span className="inline-flex max-w-full items-center gap-1 rounded border border-neutral-200 bg-white/80 px-1.5 py-0.5 text-[11px] text-neutral-600">
+      <Icon className="size-3 shrink-0" />
+      <span className="truncate">{replyPlaceholderLabel(kind)}</span>
+    </span>
+  );
+}
+
+function replyPlaceholderKind(text: string): ReplyPlaceholderKind | undefined {
+  const match = text.trim().match(REPLY_PLACEHOLDER_RE);
+  return match?.[1].toLowerCase() as ReplyPlaceholderKind | undefined;
+}
+
+function replyPlaceholderDisplayKind(
+  kind: ReplyPlaceholderKind,
+): AttachmentDisplayKind {
+  if (kind === "photo") return "image";
+  if (kind === "voice" || kind === "audio") return "audio";
+  if (kind === "video") return "video";
+  return "file";
+}
+
+function replyPlaceholderLabel(kind: ReplyPlaceholderKind): string {
+  if (kind === "voice") return "voice message";
+  return kind;
+}
+
 function renderBlocks(tokens: Token[] | undefined): ReactNode {
   if (!tokens || tokens.length === 0) return null;
 
   return tokens.map((token, index) => (
     <MarkdownBlock key={index} token={token} />
+  ));
+}
+
+function renderCompactBlocks(tokens: Token[] | undefined): ReactNode {
+  if (!tokens || tokens.length === 0) return null;
+
+  const nodes: ReactNode[] = [];
+  for (const token of tokens) {
+    switch (token.type) {
+      case "space":
+        break;
+
+      case "heading": {
+        const heading = token as Tokens.Heading;
+        nodes.push(renderInline(heading.tokens, { compact: true }));
+        break;
+      }
+
+      case "paragraph": {
+        const paragraph = token as Tokens.Paragraph;
+        nodes.push(renderInline(paragraph.tokens, { compact: true }));
+        break;
+      }
+
+      case "text": {
+        const text = token as Tokens.Text;
+        nodes.push(
+          text.tokens && text.tokens.length > 0
+            ? renderInline(text.tokens, { compact: true })
+            : text.text,
+        );
+        break;
+      }
+
+      case "code": {
+        const code = token as Tokens.Code;
+        nodes.push(
+          <code className="rounded bg-neutral-200/70 px-1 py-0.5 text-[0.9em] text-neutral-700">
+            {code.text}
+          </code>,
+        );
+        break;
+      }
+
+      case "blockquote": {
+        const quote = token as Tokens.Blockquote;
+        nodes.push(renderCompactBlocks(quote.tokens));
+        break;
+      }
+
+      case "list": {
+        const list = token as Tokens.List;
+        nodes.push(
+          list.items.map((item) => item.text.trim()).filter(Boolean).join(" · "),
+        );
+        break;
+      }
+
+      default:
+        nodes.push(
+          "text" in token && typeof token.text === "string"
+            ? token.text
+            : token.raw,
+        );
+    }
+  }
+
+  const visibleNodes = nodes.filter((node) => node !== null && node !== "");
+  if (visibleNodes.length === 0) return null;
+
+  return visibleNodes.map((node, index) => (
+    <Fragment key={index}>
+      {index > 0 ? " " : null}
+      {node}
+    </Fragment>
   ));
 }
 
@@ -293,7 +544,10 @@ function MarkdownListItem({ item }: { item: Tokens.ListItem }) {
   );
 }
 
-function renderInline(tokens: Token[] | undefined): ReactNode {
+function renderInline(
+  tokens: Token[] | undefined,
+  options: { compact?: boolean } = {},
+): ReactNode {
   if (!tokens || tokens.length === 0) return null;
 
   return tokens.map((token, index) => {
@@ -301,24 +555,30 @@ function renderInline(tokens: Token[] | undefined): ReactNode {
       case "text": {
         const text = token as Tokens.Text;
         if (text.tokens && text.tokens.length > 0) {
-          return <Fragment key={index}>{renderInline(text.tokens)}</Fragment>;
+          return (
+            <Fragment key={index}>
+              {renderInline(text.tokens, options)}
+            </Fragment>
+          );
         }
         return <Fragment key={index}>{text.text}</Fragment>;
       }
 
       case "strong": {
         const strong = token as Tokens.Strong;
-        return <strong key={index}>{renderInline(strong.tokens)}</strong>;
+        return (
+          <strong key={index}>{renderInline(strong.tokens, options)}</strong>
+        );
       }
 
       case "em": {
         const em = token as Tokens.Em;
-        return <em key={index}>{renderInline(em.tokens)}</em>;
+        return <em key={index}>{renderInline(em.tokens, options)}</em>;
       }
 
       case "del": {
         const del = token as Tokens.Del;
-        return <del key={index}>{renderInline(del.tokens)}</del>;
+        return <del key={index}>{renderInline(del.tokens, options)}</del>;
       }
 
       case "codespan": {
@@ -336,7 +596,7 @@ function renderInline(tokens: Token[] | undefined): ReactNode {
       case "link": {
         const link = token as Tokens.Link;
         const href = safeHref(link.href);
-        const content = inlineTokenContent(link);
+        const content = inlineTokenContent(link, options);
         if (!href) return <Fragment key={index}>{content}</Fragment>;
 
         return (
@@ -355,6 +615,17 @@ function renderInline(tokens: Token[] | undefined): ReactNode {
       case "image": {
         const image = token as Tokens.Image;
         const src = safeHref(image.href);
+        if (options.compact) {
+          return (
+            <span
+              key={index}
+              className="inline-flex max-w-full items-center gap-1 rounded border border-neutral-200 bg-white/80 px-1 py-0.5 text-[11px] text-neutral-600"
+            >
+              <FileImage className="size-3 shrink-0" />
+              <span className="truncate">{image.text || "image"}</span>
+            </span>
+          );
+        }
         if (!src) return <Fragment key={index}>{image.text || image.href}</Fragment>;
 
         return (
@@ -387,10 +658,13 @@ function renderInline(tokens: Token[] | undefined): ReactNode {
   });
 }
 
-function inlineTokenContent(token: Tokens.Link): ReactNode {
+function inlineTokenContent(
+  token: Tokens.Link,
+  options: { compact?: boolean } = {},
+): ReactNode {
   const richToken = token as Tokens.Link & { tokens?: Token[] };
   if (richToken.tokens && richToken.tokens.length > 0) {
-    return renderInline(richToken.tokens);
+    return renderInline(richToken.tokens, options);
   }
   return token.text || token.href;
 }
