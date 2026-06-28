@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, type Ref } from "react";
 import { ExternalLink, MessagesSquare, X } from "lucide-react";
 
 import type { ConversationDTO, ConversationMessageDTO } from "../lib/api";
-import { MarkdownMessage } from "./MarkdownMessage";
+import { MarkdownMessage, messagePlainPreview } from "./MarkdownMessage";
 
 interface ChatViewProps {
   title: string;
@@ -28,6 +28,7 @@ export function ChatView({
   shareUrl,
 }: ChatViewProps) {
   const anchorMessageRef = useRef<HTMLDivElement>(null);
+  const displayTitle = useMemo(() => messagePlainPreview(title) || title, [title]);
   const anchorScrollIndex = useMemo(() => {
     if (!data?.anchorEpisodeId) return -1;
 
@@ -69,8 +70,11 @@ export function ChatView({
         <header className="flex shrink-0 items-center gap-3 border-b border-neutral-200 px-4 py-3">
           <MessagesSquare className="size-4 shrink-0 text-neutral-400" />
           <div className="min-w-0 flex-1">
-            <h2 className="truncate text-sm font-medium text-neutral-900" title={title}>
-              {title}
+            <h2
+              className="truncate text-sm font-medium text-neutral-900"
+              title={displayTitle}
+            >
+              {displayTitle}
             </h2>
             {data && (
               <p className="truncate text-xs text-neutral-500">

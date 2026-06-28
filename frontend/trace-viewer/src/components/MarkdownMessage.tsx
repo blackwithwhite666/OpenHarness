@@ -91,6 +91,20 @@ export function MarkdownMessage({ text }: { text: string }) {
   );
 }
 
+export function messagePlainPreview(text: string): string {
+  const { reply, segments } = parseMessageText(text);
+  const messageText = messageSegmentsPlainPreview(segments);
+  if (messageText) return messageText;
+
+  if (!reply) return "";
+
+  const placeholder = replyPlaceholderKind(reply.quote);
+  if (placeholder) return replyPlaceholderLabel(placeholder);
+
+  const replyText = messageSegmentsPlainPreview(splitMessageText(reply.quote));
+  return replyText || "reply";
+}
+
 function parseMessageText(text: string): ParsedMessage {
   const replyMarker = parseLeadingReplyMarker(text);
   if (!replyMarker) {
@@ -212,6 +226,33 @@ function splitMessageText(text: string): MessageSegment[] {
 function appendMarkdownSegment(segments: MessageSegment[], text: string) {
   if (text.length === 0) return;
   segments.push({ type: "markdown", text });
+}
+
+function messageSegmentsPlainPreview(segments: MessageSegment[]): string {
+  return normalizePlainPreview(
+    segments
+      .map((segment) =>
+        segment.type === "markdown"
+          ? segment.text
+          : attachmentPlainPreview(segment.attachment),
+      )
+      .filter(Boolean)
+      .join(" "),
+  );
+}
+
+function attachmentPlainPreview(attachment: AttachmentMarker): string {
+  if (attachment.kind === "voice") return "voice message";
+  if (attachment.kind === "photo") return "photo";
+
+  const displayKind = attachmentDisplayKind(attachment);
+  if (displayKind !== "file") return displayKind;
+  if (attachment.kind === "attach") return "attachment";
+  return attachment.kind;
+}
+
+function normalizePlainPreview(text: string): string {
+  return text.replace(/\s+/g, " ").trim();
 }
 
 function MarkdownBlocks({ content }: { content: string }) {
