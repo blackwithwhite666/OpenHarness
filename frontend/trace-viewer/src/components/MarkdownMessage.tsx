@@ -1,9 +1,11 @@
 import { Fragment, useEffect, useMemo, useState, type ReactNode } from "react";
 import {
   Download,
+  ExternalLink,
   FileAudio,
   FileImage,
   FileVideo,
+  MapPin,
   Paperclip,
 } from "lucide-react";
 import { lexer, type Token, type Tokens } from "marked";
@@ -29,6 +31,13 @@ interface ReplyMarker {
   quote: string;
 }
 
+interface LocationMarker {
+  label: string;
+  coordinates: string;
+  age?: string;
+  url?: string;
+}
+
 type ReplyPlaceholderKind =
   | "audio"
   | "document"
@@ -39,18 +48,23 @@ type ReplyPlaceholderKind =
 
 type MessageSegment =
   | { type: "markdown"; text: string }
-  | { type: "attachment"; attachment: AttachmentMarker };
+  | { type: "attachment"; attachment: AttachmentMarker }
+  | { type: "location"; location: LocationMarker };
 
 interface ParsedMessage {
   reply?: ReplyMarker;
   segments: MessageSegment[];
 }
 
-const MEDIA_MARKER_RE =
-  /\[\[attach:\s*([^\]\r\n]+?)\s*\]\]|\[(voice|audio|video|photo|image|file):\s*([^\]\r\n]+?)\s*\]/gi;
+const MESSAGE_MARKER_RE =
+  /\[\[attach:\s*([^\]\r\n]+?)\s*\]\]|\[(voice|audio|video|photo|image|file):\s*([^\]\r\n]+?)\s*\]|\[([^\[\]\r\n]*\blocation\s*:\s*[^\[\]\r\n]+?)\]/gi;
 const REPLY_MARKER_PREFIX_RE = /^\s*\[In reply to\s+([^:\]\r\n]+):\s*/i;
 const REPLY_PLACEHOLDER_RE =
   /^\[(photo|voice|audio|video|file|document)\]$/i;
+const COORDINATES_RE =
+  /^\s*([+-]?\d+(?:\.\d+)?)\s*,\s*([+-]?\d+(?:\.\d+)?)\s*$/;
+const ABSOLUTE_HTTP_RE = /^https?:\/\//i;
+const URL_SCHEME_RE = /^[a-z][a-z0-9+.-]*:/i;
 
 const IMAGE_SUFFIXES = new Set([
   ".apng",
@@ -83,8 +97,10 @@ export function MarkdownMessage({ text }: { text: string }) {
       {segments.map((segment, index) =>
         segment.type === "markdown" ? (
           <MarkdownBlocks key={index} content={segment.text} />
-        ) : (
+        ) : segment.type === "attachment" ? (
           <AttachmentPreview key={index} attachment={segment.attachment} />
+        ) : (
+          <LocationPreview key={index} location={segment.location} />
         ),
       )}
     </div>
@@ -195,17 +211,21 @@ function findReplyQuoteEnd(
 function splitMessageText(text: string): MessageSegment[] {
   const segments: MessageSegment[] = [];
   let lastIndex = 0;
-  MEDIA_MARKER_RE.lastIndex = 0;
+  MESSAGE_MARKER_RE.lastIndex = 0;
 
-  for (const match of text.matchAll(MEDIA_MARKER_RE)) {
+  for (const match of text.matchAll(MESSAGE_MARKER_RE)) {
     const index = match.index ?? 0;
+    const attachPath = match[1];
+    const alias = match[2]?.toLowerCase() as AttachmentKind | undefined;
+    const aliasPath = match[3];
+    const location = parseLocationMatch(text, match);
+
+    if (!attachPath && !alias && !location) continue;
+
     if (index > lastIndex) {
       appendMarkdownSegment(segments, text.slice(lastIndex, index));
     }
 
-    const attachPath = match[1];
-    const alias = match[2]?.toLowerCase() as AttachmentKind | undefined;
-    const aliasPath = match[3];
     const path = (attachPath ?? aliasPath ?? "").trim();
     if (path) {
       segments.push({
@@ -215,6 +235,8 @@ function splitMessageText(text: string): MessageSegment[] {
           path,
         },
       });
+    } else if (location) {
+      segments.push({ type: "location", location });
     }
     lastIndex = index + match[0].length;
   }
@@ -229,16 +251,24 @@ function appendMarkdownSegment(segments: MessageSegment[], text: string) {
 }
 
 function messageSegmentsPlainPreview(segments: MessageSegment[]): string {
-  return normalizePlainPreview(
+  const contentText = normalizePlainPreview(
     segments
       .map((segment) =>
         segment.type === "markdown"
           ? segment.text
-          : attachmentPlainPreview(segment.attachment),
+          : segment.type === "attachment"
+            ? attachmentPlainPreview(segment.attachment)
+            : "",
       )
       .filter(Boolean)
       .join(" "),
   );
+  if (contentText) return contentText;
+
+  const location = segments.find((segment) => segment.type === "location");
+  return location?.type === "location"
+    ? locationPlainPreview(location.location)
+    : "";
 }
 
 function attachmentPlainPreview(attachment: AttachmentMarker): string {
@@ -253,6 +283,73 @@ function attachmentPlainPreview(attachment: AttachmentMarker): string {
 
 function normalizePlainPreview(text: string): string {
   return text.replace(/\s+/g, " ").trim();
+}
+
+function parseLocationMatch(
+  text: string,
+  match: RegExpMatchArray,
+): LocationMarker | undefined {
+  const body = match[4];
+  if (!body) return undefined;
+
+  const markerEnd = (match.index ?? 0) + match[0].length;
+  if (text[markerEnd] === "(") return undefined;
+
+  return parseLocationBody(body);
+}
+
+function parseLocationBody(body: string): LocationMarker | undefined {
+  const colonIndex = body.indexOf(":");
+  if (colonIndex < 0) return undefined;
+
+  const label = normalizePlainPreview(body.slice(0, colonIndex));
+  if (!label || !/\blocation\b/i.test(label)) return undefined;
+
+  const parts = body
+    .slice(colonIndex + 1)
+    .split(";")
+    .map((part) => part.trim())
+    .filter(Boolean);
+  const coordinates = parseLocationCoordinates(parts.shift() ?? "");
+  if (!coordinates) return undefined;
+
+  let age: string | undefined;
+  let url: string | undefined;
+  for (const part of parts) {
+    if (!url && ABSOLUTE_HTTP_RE.test(part)) {
+      url = part;
+      continue;
+    }
+    if (URL_SCHEME_RE.test(part) || part.startsWith("//")) continue;
+
+    age = age ? `${age}; ${part}` : part;
+  }
+
+  return { label, coordinates, age, url };
+}
+
+function parseLocationCoordinates(value: string): string | undefined {
+  const match = value.match(COORDINATES_RE);
+  if (!match) return undefined;
+
+  const latitude = Number(match[1]);
+  const longitude = Number(match[2]);
+  if (
+    !Number.isFinite(latitude) ||
+    !Number.isFinite(longitude) ||
+    latitude < -90 ||
+    latitude > 90 ||
+    longitude < -180 ||
+    longitude > 180
+  ) {
+    return undefined;
+  }
+
+  return `${match[1]}, ${match[2]}`;
+}
+
+function locationPlainPreview(location: LocationMarker): string {
+  return `${location.label} ${location.coordinates}`;
 }
 
 function MarkdownBlocks({ content }: { content: string }) {
@@ -710,6 +807,39 @@ function inlineTokenContent(
   return token.text || token.href;
 }
 
+function LocationPreview({ location }: { location: LocationMarker }) {
+  const href = safeMapHref(location.url);
+
+  return (
+    <div className="inline-flex max-w-full items-center gap-2 rounded-md border border-blue-100 bg-blue-50 px-2.5 py-1.5 text-xs text-blue-950">
+      <MapPin className="size-3.5 shrink-0 text-blue-600" />
+      <div className="min-w-0">
+        <div className="flex flex-wrap items-baseline gap-x-1.5 gap-y-0.5">
+          <span className="font-medium">{location.label}</span>
+          <span className="font-mono text-[11px] text-blue-800">
+            {location.coordinates}
+          </span>
+          {location.age && (
+            <span className="text-[11px] text-blue-700">{location.age}</span>
+          )}
+        </div>
+      </div>
+      {href && (
+        <a
+          aria-label={`Open ${location.label} on map`}
+          className="ml-auto inline-flex shrink-0 items-center gap-1 rounded border border-blue-200 bg-white/80 px-1.5 py-0.5 font-medium text-blue-700 hover:border-blue-300 hover:text-blue-900"
+          href={href}
+          rel="noreferrer"
+          target="_blank"
+        >
+          map
+          <ExternalLink className="size-3" />
+        </a>
+      )}
+    </div>
+  );
+}
+
 function AttachmentPreview({ attachment }: { attachment: AttachmentMarker }) {
   const url = useMemo(() => attachmentUrl(attachment.path), [attachment.path]);
   const [availability, setAvailability] = useState<
@@ -911,6 +1041,13 @@ function safeHref(value: string): string | undefined {
   }
 
   return undefined;
+}
+
+function safeMapHref(value: string | undefined): string | undefined {
+  if (!value) return undefined;
+
+  const href = safeHref(value);
+  return href && isExternalHref(href) ? href : undefined;
 }
 
 function isExternalHref(href: string): boolean {
