@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import pytest
 from openharness.evals import (
     TRACE_DECISION,
     TRACE_MISSING_REQUIRED,
@@ -725,6 +727,63 @@ def test_episode_session_conversation_renders_session_chat(tmp_path: Path) -> No
     assert route.status_code == 200
     assert route.json()["anchorEpisodeId"] == "ep-2"
     assert client.get("/api/session/missing").status_code == 404
+
+
+def test_attachment_route_serves_workspace_media_and_downloads(tmp_path: Path) -> None:
+    attachment_dir = tmp_path / "attachments"
+    attachment_dir.mkdir()
+    image = attachment_dir / "preview.png"
+    image.write_bytes(b"\x89PNG\r\n\x1a\npreview")
+    note = attachment_dir / "note.txt"
+    note.write_text("download me", encoding="utf-8")
+
+    client = TestClient(create_app(tmp_path))
+
+    media = client.get("/api/attachments", params={"path": str(image)})
+    assert media.status_code == 200
+    assert media.headers["content-type"].startswith("image/png")
+    assert media.headers["x-content-type-options"] == "nosniff"
+    assert media.headers["content-disposition"].startswith("inline")
+    assert media.content == b"\x89PNG\r\n\x1a\npreview"
+
+    head = client.head("/api/attachments", params={"path": str(image)})
+    assert head.status_code == 200
+    assert head.headers["content-type"].startswith("image/png")
+
+    download = client.get("/api/attachments", params={"path": str(note)})
+    assert download.status_code == 200
+    assert download.headers["content-type"].startswith("application/octet-stream")
+    assert download.headers["content-disposition"].startswith("attachment")
+    assert download.content == b"download me"
+
+
+def test_attachment_route_rejects_missing_outside_and_symlink_escape(tmp_path: Path) -> None:
+    attachment_dir = tmp_path / "attachments"
+    attachment_dir.mkdir()
+    client = TestClient(create_app(tmp_path))
+
+    missing = client.get(
+        "/api/attachments",
+        params={"path": str(attachment_dir / "missing.png")},
+    )
+    assert missing.status_code == 404
+
+    outside = Path("/etc/hosts")
+    if outside.exists():
+        assert client.get("/api/attachments", params={"path": str(outside)}).status_code == 403
+
+        link = attachment_dir / "hosts.txt"
+        try:
+            os.symlink(outside, link)
+        except (AttributeError, NotImplementedError, OSError) as exc:
+            pytest.skip(f"symlinks unavailable: {exc}")
+
+        assert client.get("/api/attachments", params={"path": str(link)}).status_code == 403
+
+    unsupported = attachment_dir / "script.py"
+    unsupported.write_text("print('nope')", encoding="utf-8")
+    rejected = client.get("/api/attachments", params={"path": str(unsupported)})
+    assert rejected.status_code == 403
 
 
 def test_eval_case_conversation_uses_rich_trace(tmp_path: Path) -> None:

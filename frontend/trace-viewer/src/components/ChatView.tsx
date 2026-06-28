@@ -1,6 +1,8 @@
+import { useEffect, useMemo, useRef, type Ref } from "react";
 import { ExternalLink, MessagesSquare, X } from "lucide-react";
 
 import type { ConversationDTO, ConversationMessageDTO } from "../lib/api";
+import { MarkdownMessage } from "./MarkdownMessage";
 
 interface ChatViewProps {
   title: string;
@@ -25,6 +27,33 @@ export function ChatView({
   onOpenEpisode,
   shareUrl,
 }: ChatViewProps) {
+  const anchorMessageRef = useRef<HTMLDivElement>(null);
+  const anchorScrollIndex = useMemo(() => {
+    if (!data?.anchorEpisodeId) return -1;
+
+    let fallbackIndex = -1;
+    for (let index = 0; index < data.messages.length; index += 1) {
+      const message = data.messages[index];
+      if (message.episodeId !== data.anchorEpisodeId) continue;
+      if (message.role === "assistant") return index;
+      if (fallbackIndex < 0) fallbackIndex = index;
+    }
+
+    return fallbackIndex;
+  }, [data]);
+
+  useEffect(() => {
+    if (loading || error || anchorScrollIndex < 0) return;
+
+    const frame = window.requestAnimationFrame(() => {
+      anchorMessageRef.current?.scrollIntoView({
+        block: "center",
+        inline: "nearest",
+      });
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [anchorScrollIndex, data?.anchorEpisodeId, data?.messages.length, error, loading]);
+
   return (
     <div
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4"
@@ -88,6 +117,7 @@ export function ChatView({
               {data.messages.map((message, index) => (
                 <ChatBubble
                   key={index}
+                  anchorRef={index === anchorScrollIndex ? anchorMessageRef : undefined}
                   message={message}
                   anchorEpisodeId={data.anchorEpisodeId}
                   onOpenEpisode={onOpenEpisode}
@@ -102,10 +132,12 @@ export function ChatView({
 }
 
 function ChatBubble({
+  anchorRef,
   message,
   anchorEpisodeId,
   onOpenEpisode,
 }: {
+  anchorRef?: Ref<HTMLDivElement>;
   message: ConversationMessageDTO;
   anchorEpisodeId?: string;
   onOpenEpisode?: (episodeId: string) => void;
@@ -114,7 +146,10 @@ function ChatBubble({
   const isAnchor = !!anchorEpisodeId && message.episodeId === anchorEpisodeId;
 
   return (
-    <div className={`flex ${isUser ? "justify-end" : "justify-start"}`}>
+    <div
+      ref={anchorRef}
+      className={`scroll-mt-4 flex ${isUser ? "justify-end" : "justify-start"}`}
+    >
       <div
         className={`flex max-w-[85%] flex-col gap-1.5 rounded-lg border px-3 py-2 ${
           isUser
@@ -141,9 +176,7 @@ function ChatBubble({
         </div>
 
         {message.text ? (
-          <p className="whitespace-pre-wrap break-words text-sm text-neutral-900">
-            {message.text}
-          </p>
+          <MarkdownMessage text={message.text} />
         ) : (
           <p className="text-sm italic text-neutral-400">(no text)</p>
         )}
