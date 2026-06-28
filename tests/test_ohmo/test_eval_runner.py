@@ -939,6 +939,7 @@ def test_build_live_read_runner_config_uses_query_engine_settings(
     injected_names = {tool.name for tool in injected}
     assert "todo_write" in injected_names
     assert "skill" in injected_names
+    assert "send_telegram_message" in injected_names
 
 
 def test_query_engine_runner_executes_todo_write_live_without_gold_fixture(
@@ -1048,6 +1049,28 @@ def test_live_local_factory_skill_tool_reads_workspace_skill_live(tmp_path: Path
     )
     assert not result.is_error
     assert "maps-cli menu" in result.output
+
+
+def test_live_local_factory_mocks_send_telegram_success(tmp_path: Path):
+    # The send_telegram mock must report success without sending, so scheduler /
+    # background-origin gold tasks (which the real tool fail-closes) stay scorable.
+    import asyncio
+
+    from openharness.tools.base import ToolExecutionContext
+
+    factory = runner_module._make_live_local_tool_factory(tmp_path)
+    tools = {tool.name: tool for tool in factory(tmp_path / "state")}
+    send_tool = tools["send_telegram_message"]
+
+    result = asyncio.run(
+        send_tool.execute(
+            send_tool.input_model(recipient="Marina", text="meeting ends at 15:00"),
+            ToolExecutionContext(cwd=tmp_path),
+        )
+    )
+    assert not result.is_error
+    assert "Marina" in result.output
+    assert result.metadata.get("mock") is True
 
 
 def test_build_fs_sandbox_runner_config_uses_query_engine_settings(
