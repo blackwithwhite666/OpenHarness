@@ -149,6 +149,17 @@ def _build_decision_trace_section() -> str:
             "or private raw content in a trace; prefer summaries, evidence ids, refs, "
             "hashes, and artifact paths. A claim with no supporting observation belongs "
             "in `uncertainties`, not `answer_claims`.",
+            "",
+            "## Absence-claim discipline",
+            "",
+            "Before telling the user something is unavailable / not found / "
+            "inaccessible, actually exhaust the reachable options: try an alternate "
+            "query, a different tool or provider, a broader/narrower search, or load "
+            "the relevant skill. A one-shot empty result is not proof of absence. Only "
+            "after a genuine search may you conclude the information is missing — and "
+            "when you do, record a `trace_missing_required` (what was needed + what you "
+            "tried) and a `trace_stop_condition` (why you stopped). Prefer reporting "
+            "what you DID find over a blanket 'not found'.",
         ]
     )
 

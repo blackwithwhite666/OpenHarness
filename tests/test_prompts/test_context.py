@@ -20,6 +20,19 @@ def test_truncate_to_token_budget():
     assert _truncate_to_token_budget(big, 0) == big  # cap disabled (<= 0)
 
 
+def test_build_runtime_includes_absence_claim_discipline(tmp_path):
+    prompt = build_runtime_system_prompt(
+        Settings(system_prompt="BASE"),
+        cwd=tmp_path,
+        latest_user_prompt="hi",
+        include_project_memory=False,
+    )
+
+    assert "Absence-claim discipline" in prompt
+    assert "trace_missing_required" in prompt
+    assert "trace_stop_condition" in prompt
+
+
 def test_build_runtime_caps_runaway_local_rules(tmp_path, monkeypatch):
     # A runaway auto-generated rules.md (~350k tokens) must not dominate the prompt.
     huge = "".join(f"- /home/x/artifact_{i}.txt\n" for i in range(50_000))
