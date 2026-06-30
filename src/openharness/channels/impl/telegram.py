@@ -39,6 +39,14 @@ from openharness.utils.helpers import split_message
 logger = logging.getLogger(__name__)
 
 TELEGRAM_MAX_MESSAGE_LEN = 4000  # Telegram message character limit
+_TELEGRAM_URL_LOGGERS = ("httpx", "httpcore", "telegram.ext")
+
+
+def silence_telegram_token_url_loggers() -> None:
+    """Prevent Telegram bot tokens from appearing in dependency INFO logs."""
+    for name in _TELEGRAM_URL_LOGGERS:
+        logging.getLogger(name).setLevel(logging.WARNING)
+
 
 _TABLE_ROW_RE = re.compile(r"^\s*\|(.+)\|\s*$")
 
@@ -348,6 +356,8 @@ class TelegramChannel(BaseChannel):
         self.config: TelegramConfig = config
         self.groq_api_key = groq_api_key
         self._app: Application | None = None
+        self.last_error: str | None = None
+        self.polling_started = False
         self._chat_ids: dict[str, int] = {}  # Map sender_id to chat_id for replies
         self._typing_tasks: dict[str, asyncio.Task] = {}  # chat_id -> typing loop task
         self._media_group_buffers: dict[str, dict] = {}
@@ -366,6 +376,9 @@ class TelegramChannel(BaseChannel):
             return
 
         self._running = True
+        self.last_error = None
+        self.polling_started = False
+        silence_telegram_token_url_loggers()
 
         # Build the application with larger connection pool to avoid pool-timeout on long runs
         req = HTTPXRequest(connection_pool_size=16, pool_timeout=5.0, connect_timeout=30.0, read_timeout=30.0)
@@ -423,8 +436,10 @@ class TelegramChannel(BaseChannel):
         # so omitting it means live-location updates are never delivered.
         await self._app.updater.start_polling(
             allowed_updates=_ALLOWED_UPDATES,
-            drop_pending_updates=True  # Ignore old messages on startup
+            drop_pending_updates=False,
         )
+        self.polling_started = True
+        logger.info("Telegram polling started")
 
         # Keep running until stopped
         while self._running:
@@ -433,6 +448,7 @@ class TelegramChannel(BaseChannel):
     async def stop(self) -> None:
         """Stop the Telegram bot."""
         self._running = False
+        self.polling_started = False
 
         # Cancel all typing indicators
         for chat_id in list(self._typing_tasks):
@@ -700,7 +716,7 @@ class TelegramChannel(BaseChannel):
 
         user = update.effective_user
         await update.message.reply_text(
-            f"👋 Hi {user.first_name}! I'm nanobot.\n\n"
+            f"👋 Hi {user.first_name}! I'm {self.config.bot_name}.\n\n"
             "Send me a message and I'll respond!\n"
             "Type /help to see available commands."
         )
@@ -710,7 +726,7 @@ class TelegramChannel(BaseChannel):
         if not update.message:
             return
         await update.message.reply_text(
-            "🐈 nanobot commands:\n"
+            f"🐈 {self.config.bot_name} commands:\n"
             "/new — Start a new conversation\n"
             "/stop — Stop the current task\n"
             "/help — Show available commands"
@@ -1019,6 +1035,7 @@ class TelegramChannel(BaseChannel):
 
     async def _on_error(self, update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Log polling / handler errors instead of silently swallowing them."""
+        self.last_error = str(context.error)
         logger.error("Telegram error: %s", context.error)
 
     def _get_extension(self, media_type: str, mime_type: str | None) -> str:

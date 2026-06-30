@@ -272,6 +272,7 @@ class QueryContext:
     model: str
     system_prompt: str
     max_tokens: int
+    effort: str | None = None
     context_window_tokens: int | None = None
     auto_compact_threshold_tokens: int | None = None
     permission_prompt: PermissionPrompt | None = None
@@ -1395,6 +1396,7 @@ async def run_query(
                     system_prompt=context.system_prompt,
                     max_tokens=effective_max_tokens,
                     tools=context.tool_registry.to_api_schema(),
+                    effort=context.effort,
                 )
             ):
                 if isinstance(event, ApiTextDeltaEvent):
@@ -1577,7 +1579,15 @@ async def run_query(
             )
             yield ToolExecutionStarted(tool_name=tc.name, tool_input=tc.input, tool_call_id=tc.id), None
             tool_started_at = time.monotonic()
-            result = await _execute_tool_call(context, tc.name, tc.id, tc.input)
+            try:
+                result = await _execute_tool_call(context, tc.name, tc.id, tc.input)
+            except Exception as exc:
+                log.exception("tool execution raised: name=%s id=%s", tc.name, tc.id)
+                result = ToolResultBlock(
+                    tool_use_id=tc.id,
+                    content=f"Tool {tc.name} failed: {type(exc).__name__}: {exc}",
+                    is_error=True,
+                )
             duration_ms = (time.monotonic() - tool_started_at) * 1000
             trace_run_state.tool_result_count += 1
             if result.is_error:
@@ -1604,6 +1614,7 @@ async def run_query(
                 output=result.content,
                 is_error=result.is_error,
                 tool_call_id=tc.id,
+                metadata=result.result_metadata,
             ), None
             tool_results = [result]
         else:
@@ -1680,6 +1691,7 @@ async def run_query(
                     output=result.content,
                     is_error=result.is_error,
                     tool_call_id=tc.id,
+                    metadata=result.result_metadata,
                 ), None
 
         messages.append(ConversationMessage(role="user", content=tool_results))
@@ -1840,6 +1852,7 @@ async def _execute_tool_call(
         tool_use_id=tool_use_id,
         content=inline_output,
         is_error=result.is_error,
+        result_metadata=dict(result.metadata or {}),
     )
     _record_tool_carryover(
         context,

@@ -41,6 +41,7 @@ class ToolExecutionCompleted:
     output: str
     is_error: bool = False
     tool_call_id: str = ""  # same id as the matching Started event
+    metadata: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)

@@ -6,6 +6,21 @@ import os
 from pathlib import Path
 
 from openharness.commands import MemoryCommandBackend
+from openharness.memory.scan import scan_memory_files
+from openharness.memory.schema import (
+    SCHEMA_VERSION,
+    coerce_int,
+    compute_memory_signature,
+    first_content_line,
+    format_datetime,
+    generate_memory_id,
+    memory_metadata_from_path,
+    render_memory_file,
+    split_memory_file,
+    utc_now,
+)
+from openharness.utils.file_lock import exclusive_file_lock
+from openharness.utils.fs import atomic_write_text
 
 from ohmo.memory_store import MemoryStore
 from ohmo.threat_patterns import scan_for_threats
@@ -149,9 +164,39 @@ def create_memory_command_backend(workspace: str | Path | None = None) -> Memory
 
     return MemoryCommandBackend(
         label="ohmo personal memory",
+        default_type="personal",
+        default_category="preference",
         get_memory_dir=lambda: get_memory_dir(workspace),
         get_entrypoint=lambda: get_memory_index_path(workspace),
         list_files=lambda: list_memory_files(workspace),
         add_entry=lambda title, content: add_memory_entry(workspace, title, content),
         remove_entry=lambda name: remove_memory_entry(workspace, name),
     )
+
+
+def _scan_cwd(workspace: str | Path | None, memory_dir: Path) -> Path:
+    return Path(workspace) if workspace is not None else memory_dir.parent
+
+
+def _next_memory_path(memory_dir: Path, slug: str) -> Path:
+    path = memory_dir / f"{slug}.md"
+    if not path.exists():
+        return path
+    index = 2
+    while True:
+        candidate = memory_dir / f"{slug}_{index}.md"
+        if not candidate.exists():
+            return candidate
+        index += 1
+
+
+def _effective_signature(path: Path, existing_signature: str) -> str:
+    if existing_signature:
+        return existing_signature
+    try:
+        metadata, body, _, _ = split_memory_file(path.read_text(encoding="utf-8"))
+    except OSError:
+        return ""
+    memory_type = str(metadata.get("type") or "personal")
+    category = str(metadata.get("category") or "preference")
+    return compute_memory_signature(body, memory_type, category)

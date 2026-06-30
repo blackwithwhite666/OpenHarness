@@ -11,6 +11,7 @@ import mimetypes
 from pathlib import Path
 import json
 import os
+import re
 import string
 
 from openharness.channels.bus.events import InboundMessage, OutboundMessage
@@ -56,7 +57,13 @@ from ohmo.session_storage import (
 )
 from ohmo.todo_store import TodoStore
 from ohmo.todo_write_tool import OhmoTodoWriteTool
-from ohmo.workspace import get_plugins_dir, get_skills_dir, initialize_workspace
+from ohmo.workspace import (
+    get_memory_dir,
+    get_plugins_dir,
+    get_sessions_dir,
+    get_skills_dir,
+    initialize_workspace,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +86,10 @@ _CHANNEL_THINKING_PHRASES_EN = (
 _TEXT_PREVIEW_BYTES = 4096
 _TEXT_PREVIEW_CHARS = 900
 _BINARY_HEAD_BYTES = 32
+_FINAL_REPLY_IMAGE_PATH_RE = re.compile(
+    r"(?P<path>(?:[A-Za-z]:[\\/]|/)[^\r\n`\"'<>|?*\x00]+?\.(?:png|jpe?g|webp|gif|bmp))",
+    re.IGNORECASE,
+)
 _IMAGE_FALLBACK_NOTE = (
     "[Image attachment omitted because the active model does not support image input. "
     "Use the attachment paths and summaries above if needed.]"
@@ -105,6 +116,7 @@ class GatewayStreamUpdate:
     kind: str
     text: str
     metadata: dict[str, object]
+    media: list[str] | None = None
 
 
 @dataclass(frozen=True)
@@ -274,6 +286,12 @@ class OhmoSessionRuntimePool:
             extra_plugin_roots=(str(get_plugins_dir(self._workspace)),),
             memory_backend=create_memory_command_backend(self._workspace),
             include_project_memory=False,
+            autodream_context={
+                "memory_dir": str(get_memory_dir(self._workspace)),
+                "session_dir": str(get_sessions_dir(self._workspace)),
+                "app_label": "ohmo personal memory",
+                "runner_module": "ohmo",
+            },
         )
         if snapshot and snapshot.get("session_id"):
             bundle.session_id = str(snapshot["session_id"])
@@ -619,6 +637,7 @@ class OhmoSessionRuntimePool:
     ):
         bundle.engine.set_system_prompt(self._runtime_system_prompt(bundle, user_prompt))
         reply_parts: list[str] = []
+        emitted_media: set[str] = set()
         yield GatewayStreamUpdate(
             kind="progress",
             text=_format_channel_progress(
@@ -671,6 +690,7 @@ class OhmoSessionRuntimePool:
                             reply_parts=reply_parts,
                             recorder=recorder,
                         ):
+                            _remember_update_media(emitted_media, update)
                             yield update
                     break
                 async for update in self._convert_stream_event(
@@ -682,6 +702,7 @@ class OhmoSessionRuntimePool:
                     reply_parts=reply_parts,
                     recorder=recorder,
                 ):
+                    _remember_update_media(emitted_media, update)
                     yield update
         except MaxTurnsExceeded as exc:
             yield GatewayStreamUpdate(
@@ -711,10 +732,15 @@ class OhmoSessionRuntimePool:
                 bundle.session_id,
                 _content_snippet(reply),
             )
+            final_media = _extract_final_reply_media(reply, emitted_media)
+            metadata: dict[str, object] = {"_session_key": session_key}
+            if final_media:
+                metadata.update({"_media": final_media, "_final_media_fallback": True})
             yield GatewayStreamUpdate(
                 kind="final",
                 text=reply,
-                metadata={"_session_key": session_key},
+                metadata=metadata,
+                media=final_media or None,
             )
 
     async def _convert_stream_event(
@@ -884,6 +910,14 @@ class OhmoSessionRuntimePool:
                     "_session_key": session_key,
                 },
             )
+            media = _extract_tool_media(event)
+            if media:
+                yield GatewayStreamUpdate(
+                    kind="media",
+                    text=_format_tool_media_caption(event, media),
+                    metadata={"_session_key": session_key, "_media": media, "_tool_media": True},
+                    media=media,
+                )
             return
         if isinstance(event, ErrorEvent):
             if recorder is not None:
@@ -960,6 +994,12 @@ class OhmoSessionRuntimePool:
             extra_plugin_roots=(str(get_plugins_dir(self._workspace)),),
             memory_backend=create_memory_command_backend(self._workspace),
             include_project_memory=False,
+            autodream_context={
+                "memory_dir": str(get_memory_dir(self._workspace)),
+                "session_dir": str(get_sessions_dir(self._workspace)),
+                "app_label": "ohmo personal memory",
+                "runner_module": "ohmo",
+            },
         )
         refreshed.session_id = prior_session_id
         self._register_gateway_tools(refreshed)
@@ -1240,6 +1280,85 @@ def _sanitize_snapshot_messages(raw_messages: object) -> list[dict[str, object]]
         except Exception:
             logger.warning("ohmo runtime skipped invalid restored message while sanitizing snapshot")
     return [message.model_dump(mode="json") for message in _sanitize_group_command_prompts(messages)]
+
+
+def _extract_tool_media(event: ToolExecutionCompleted) -> list[str]:
+    """Return local media paths produced by a tool completion event."""
+    if event.is_error or not isinstance(event.metadata, dict):
+        return []
+    raw_paths = event.metadata.get("paths") or event.metadata.get("media")
+    if isinstance(raw_paths, str):
+        candidates = [raw_paths]
+    elif isinstance(raw_paths, list):
+        candidates = [str(item) for item in raw_paths if isinstance(item, str) and item.strip()]
+    else:
+        candidates = []
+    media: list[str] = []
+    seen: set[str] = set()
+    for raw in candidates:
+        path = Path(raw).expanduser()
+        if not path.is_absolute():
+            path = path.resolve()
+        if not path.is_file():
+            continue
+        resolved = str(path)
+        if resolved not in seen:
+            seen.add(resolved)
+            media.append(resolved)
+    return media
+
+
+def _remember_update_media(seen: set[str], update: GatewayStreamUpdate) -> None:
+    """Track media already emitted during this gateway turn."""
+    raw_media = update.media or (update.metadata or {}).get("_media") or []
+    if isinstance(raw_media, str):
+        candidates = [raw_media]
+    elif isinstance(raw_media, list):
+        candidates = [str(item) for item in raw_media if isinstance(item, str) and item.strip()]
+    else:
+        candidates = []
+    for raw in candidates:
+        try:
+            path = Path(raw).expanduser()
+            if not path.is_absolute():
+                path = path.resolve()
+            seen.add(str(path))
+        except Exception:
+            continue
+
+
+def _extract_final_reply_media(reply: str, emitted_media: set[str]) -> list[str]:
+    """Return local image paths mentioned in final text that were not already emitted."""
+    media: list[str] = []
+    seen = set(emitted_media)
+    for match in _FINAL_REPLY_IMAGE_PATH_RE.finditer(reply or ""):
+        raw = match.group("path").strip(" \t\r\n\"'.,;:，。；：、)]}")
+        if not raw:
+            continue
+        path = Path(raw).expanduser()
+        if not path.is_absolute():
+            continue
+        if not path.is_file():
+            continue
+        resolved = str(path)
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        media.append(resolved)
+    return media
+
+
+def _format_tool_media_caption(event: ToolExecutionCompleted, media: list[str]) -> str:
+    """Return a short caption for media generated by tools."""
+    if event.tool_name == "image_generation":
+        provider = ""
+        if isinstance(event.metadata, dict):
+            provider = str(event.metadata.get("provider") or "").strip()
+        suffix = f" via {provider}" if provider else ""
+        names = ", ".join(Path(path).name for path in media)
+        return f"已生成图片{suffix}：{names}"
+    names = ", ".join(Path(path).name for path in media)
+    return f"已生成文件：{names}"
 
 
 def _sanitize_group_command_prompts(messages: list[ConversationMessage]) -> list[ConversationMessage]:

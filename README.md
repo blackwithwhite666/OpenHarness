@@ -541,7 +541,47 @@ Available Skills:
 - ... 40+ more
 ```
 
-**Compatible with [anthropics/skills](https://github.com/anthropics/skills)** — just copy `.md` files to `~/.openharness/skills/`.
+Skills can live in bundled, user, ohmo, project, or plugin locations. User-level skills are loaded from:
+
+```text
+~/.openharness/skills/<skill>/SKILL.md
+~/.claude/skills/<skill>/SKILL.md
+~/.agents/skills/<skill>/SKILL.md
+```
+
+Project-level skills are enabled by default and are discovered from the current working directory up to the git root:
+
+```text
+<project>/.openharness/skills/<skill>/SKILL.md
+<project>/.agents/skills/<skill>/SKILL.md
+<project>/.claude/skills/<skill>/SKILL.md
+```
+
+Disable project skills for untrusted repositories with:
+
+```bash
+oh config set allow_project_skills false
+```
+
+Use `/skills` to list loaded skills with their source and path. User-invocable skills can be run directly as slash commands, for example `/deploy staging`.
+
+**Compatible with [anthropics/skills](https://github.com/anthropics/skills)** — use the `SKILL.md` directory layout above.
+
+### 🌐 Web search and proxy settings
+
+Built-in `web_search` uses DuckDuckGo HTML search by default. In regions where that endpoint is unreachable, point OpenHarness at a trusted public HTML search endpoint or your own SearXNG instance:
+
+```bash
+export OPENHARNESS_WEB_SEARCH_URL="https://your-searxng.example/search"
+```
+
+`web_search` and `web_fetch` keep `trust_env=False` for SSRF safety, so they do not automatically inherit `HTTP_PROXY` / `HTTPS_PROXY`. If you need a proxy, opt in with an OpenHarness-specific variable:
+
+```bash
+export OPENHARNESS_WEB_PROXY="http://127.0.0.1:7890"
+```
+
+The proxy URL must be HTTP/HTTPS and cannot contain embedded credentials.
 
 ### 🔌 Plugin System
 

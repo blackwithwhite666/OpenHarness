@@ -532,9 +532,13 @@ class OhmoGatewayBridge:
                 inbound_meta["message_id"] = message.metadata["message_id"]
         try:
             reply = ""
+            final_media: list[str] = []
+            final_metadata: dict[str, object] = {}
             async for update in self._runtime_pool.stream_message(message, session_key):
                 if update.kind == "final":
                     reply = update.text
+                    final_media = list(getattr(update, "media", None) or (update.metadata or {}).get("_media") or [])
+                    final_metadata = dict(update.metadata or {})
                     continue
                 if not update.text:
                     continue
@@ -551,6 +555,7 @@ class OhmoGatewayBridge:
                         channel=message.channel,
                         chat_id=message.chat_id,
                         content=update.text,
+                        media=list(getattr(update, "media", None) or (update.metadata or {}).get("_media") or []),
                         metadata={**inbound_meta, **(update.metadata or {})},
                     )
                 )
@@ -606,7 +611,7 @@ class OhmoGatewayBridge:
         # it goes via send_message, where reply_parameters works. Progress is
         # left untouched: carrying message_id there would route it to the draft
         # API, which this non-business bot can't use.
-        final_meta = {**inbound_meta, "_session_key": session_key}
+        final_meta = {**inbound_meta, **final_metadata, "_session_key": session_key}
         if message.channel == "telegram" and "message_id" in message.metadata:
             final_meta["message_id"] = message.metadata["message_id"]
         await self._bus.publish_outbound(
@@ -614,7 +619,7 @@ class OhmoGatewayBridge:
                 channel=message.channel,
                 chat_id=message.chat_id,
                 content=content,
-                media=media,
+                media=[*final_media, *media],
                 buttons=options,
                 metadata=final_meta,
             )
