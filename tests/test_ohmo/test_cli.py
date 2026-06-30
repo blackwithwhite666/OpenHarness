@@ -1467,6 +1467,7 @@ def test_ohmo_evals_run_command_runs_eval_report(tmp_path: Path, monkeypatch):
         fixture_match: str = "order",
         max_turns: int = 8,
         judge_votes: int = 3,
+        judge_grounding: bool = False,
     ):
         calls.append(
             {
@@ -1591,6 +1592,7 @@ def test_ohmo_evals_run_command_threads_sandbox_agent_runner(
         fixture_match: str = "order",
         max_turns: int = 8,
         judge_votes: int = 3,
+        judge_grounding: bool = False,
     ):
         calls.append(
             {
@@ -1733,6 +1735,7 @@ def test_ohmo_evals_run_command_threads_live_read_agent_runner(
         fixture_match: str = "order",
         max_turns: int = 8,
         judge_votes: int = 3,
+        judge_grounding: bool = False,
     ):
         calls.append(
             {
@@ -1958,6 +1961,7 @@ def test_ohmo_evals_run_command_passes_output_filename(tmp_path: Path, monkeypat
         fixture_match: str = "order",
         max_turns: int = 8,
         judge_votes: int = 3,
+        judge_grounding: bool = False,
     ):
         calls.append(
             {
@@ -2042,6 +2046,7 @@ def test_ohmo_evals_run_command_outputs_json_summary(tmp_path: Path, monkeypatch
         fixture_match: str = "order",
         max_turns: int = 8,
         judge_votes: int = 3,
+        judge_grounding: bool = False,
     ):
         del pack_filename, limit, executor_name, agent_runner_name
         del model, provider_profile, system_prompt, fixture_match
@@ -2124,6 +2129,7 @@ def test_ohmo_evals_run_command_passes_query_engine_runner_options(
         fixture_match: str = "order",
         max_turns: int = 8,
         judge_votes: int = 3,
+        judge_grounding: bool = False,
     ):
         calls.append(
             {
@@ -2397,6 +2403,7 @@ def test_ohmo_evals_run_command_check_config_does_not_run_eval(
         fixture_match: str = "order",
         max_turns: int = 8,
         judge_votes: int = 3,
+        judge_grounding: bool = False,
     ):
         check_calls.append(
             {
@@ -2494,6 +2501,7 @@ def test_ohmo_evals_run_command_check_config_outputs_json(
         fixture_match: str = "order",
         max_turns: int = 8,
         judge_votes: int = 3,
+        judge_grounding: bool = False,
     ):
         del workspace, pack_filename, limit, executor_name, agent_runner_name
         del model, provider_profile, system_prompt, fixture_match
@@ -2592,6 +2600,7 @@ def test_ohmo_evals_run_command_reports_blocked_and_error_counts(
         fixture_match: str = "order",
         max_turns: int = 8,
         judge_votes: int = 3,
+        judge_grounding: bool = False,
     ):
         del pack_filename, report_filename
         del agent_runner_name, model, provider_profile, system_prompt, fixture_match

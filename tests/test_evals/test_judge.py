@@ -136,6 +136,27 @@ def test_trajectory_judge_majority_vote(
     assert result.metadata["judge_pass_votes"] == expected_pass_votes
 
 
+def test_trajectory_judge_grounding_mode_judges_method_not_facts(tmp_path: Path):
+    api_client = _StaticJudgeApiClient("PASS - grounded in sources")
+    scorer = TrajectoryJudgeScorer(
+        api_client=api_client, model="judge-model", votes=1, grounding_mode=True
+    )
+
+    result = scorer.score(
+        context=_context(tmp_path),
+        executor_result=EvalExecutorResult(
+            final_text="answer", tool_path=("web_fetch",), tool_calls=()
+        ),
+    )
+
+    assert result.passed is True
+    request = api_client.requests[0]
+    assert "METHOD and GROUNDING" in request.system_prompt
+    user_text = request.messages[0].text
+    assert "TIME-SENSITIVE" in user_text
+    assert "possibly-stale" in user_text.lower()
+
+
 def _context(tmp_path: Path) -> EvalExecutionContext:
     store = EvalStore(tmp_path / "evals")
     case = EvalRunPackCase(

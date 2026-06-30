@@ -41,6 +41,17 @@ DEFAULT_TRAJECTORY_JUDGE_SYSTEM_PROMPT = (
     "Be decisive and consistent: identical answers must get the same verdict. "
     "Reply with the first word PASS or FAIL, then one short sentence explaining why."
 )
+GROUNDING_TRAJECTORY_JUDGE_SYSTEM_PROMPT = (
+    "You are an evaluation judge for a TIME-SENSITIVE / live task whose facts "
+    "change over time, so the reference answer may be STALE. Judge METHOD and "
+    "GROUNDING, not fact-match. PASS when the agent consulted appropriate "
+    "sources/tools for the request and reported concrete findings grounded in "
+    "them (or correctly determined none exist after a real search). FAIL when it "
+    "used the wrong sources or none, fabricated, gave a vacuous/ungrounded "
+    "answer, or claimed unavailable without a genuine search. Do NOT penalize "
+    "differences from the reference answer's specific facts/numbers/dates. Reply "
+    "with the first word PASS or FAIL, then one short sentence explaining why."
+)
 _VERDICT_RE = re.compile(r"^\s*([A-Za-z]+)\b(.*)$", re.DOTALL)
 
 
@@ -55,14 +66,20 @@ class TrajectoryJudgeScorer:
         *,
         api_client: SupportsStreamingMessages,
         model: str,
-        system_prompt: str = DEFAULT_TRAJECTORY_JUDGE_SYSTEM_PROMPT,
+        system_prompt: str | None = None,
         max_tokens: int = 512,
         min_chars: int = 1,
         votes: int = 3,
+        grounding_mode: bool = False,
     ) -> None:
         self._api_client = api_client
         self._model = model
-        self._system_prompt = system_prompt
+        self._grounding = grounding_mode
+        self._system_prompt = system_prompt or (
+            GROUNDING_TRAJECTORY_JUDGE_SYSTEM_PROMPT
+            if grounding_mode
+            else DEFAULT_TRAJECTORY_JUDGE_SYSTEM_PROMPT
+        )
         self._max_tokens = max_tokens
         self._min_chars = min_chars
         self._votes = max(1, int(votes))
@@ -81,6 +98,7 @@ class TrajectoryJudgeScorer:
             observed=observed,
             final_answer=executor_result.final_text,
             accepted_outcome=context.expected_final_text,
+            grounding=self._grounding,
         )
         # Judge the SAME trajectory N times and take the majority verdict; an
         # LLM judge flips on borderline-equivalent answers, so a single vote is
@@ -158,28 +176,49 @@ def _judge_prompt(
     observed: list[dict[str, object]],
     final_answer: str,
     accepted_outcome: str,
+    grounding: bool = False,
 ) -> str:
     trajectory = (
         json.dumps(observed, ensure_ascii=True, indent=2)
         if observed
         else "No observed tool calls."
     )
-    reference = (
-        "\n\nONE acceptable reference answer (NOT a required template -- the "
-        "agent's answer need not match its wording, structure, or completeness):\n"
-        f"{accepted_outcome.strip()}"
-        if accepted_outcome.strip()
-        else ""
-    )
+    if grounding:
+        reference = (
+            "\n\nPossibly-stale reference (facts may have changed; do NOT "
+            f"fact-match against it):\n{accepted_outcome.strip()}"
+            if accepted_outcome.strip()
+            else ""
+        )
+        instruction = (
+            "This is a TIME-SENSITIVE task: judge METHOD and GROUNDING, not "
+            "fact-match. PASS if the agent used appropriate sources/tools and "
+            "reported concrete findings grounded in them (or correctly found none "
+            "after a real search); FAIL if it used wrong/no sources, fabricated, "
+            "answered vacuously, or claimed unavailable without searching. Ignore "
+            "differences from the reference's specific facts. Reply with the FIRST "
+            "word PASS or FAIL, then one short sentence why.\n\n"
+        )
+    else:
+        reference = (
+            "\n\nONE acceptable reference answer (NOT a required template -- the "
+            "agent's answer need not match its wording, structure, or completeness):\n"
+            f"{accepted_outcome.strip()}"
+            if accepted_outcome.strip()
+            else ""
+        )
+        instruction = (
+            "Did the agent accomplish the user's request? Grade task accomplishment, "
+            "NOT similarity to the reference. PASS a correct, responsive answer even "
+            "if it is shorter or organized differently than the reference; FAIL only "
+            "if it is wrong, off-topic, or misses something the user EXPLICITLY asked "
+            "for. Tolerate a different-but-valid tool path. If the answer claims the "
+            "info is unavailable/not found, FAIL when the reference or trajectory shows "
+            "it was reachable. Reply with the FIRST word PASS or FAIL, then one short "
+            "sentence why.\n\n"
+        )
     return (
-        "Did the agent accomplish the user's request? Grade task accomplishment, "
-        "NOT similarity to the reference. PASS a correct, responsive answer even "
-        "if it is shorter or organized differently than the reference; FAIL only "
-        "if it is wrong, off-topic, or misses something the user EXPLICITLY asked "
-        "for. Tolerate a different-but-valid tool path. If the answer claims the "
-        "info is unavailable/not found, FAIL when the reference or trajectory shows "
-        "it was reachable. Reply with the FIRST word PASS or FAIL, then one short "
-        "sentence why.\n\n"
+        f"{instruction}"
         f"User goal:\n{user_goal.strip()}\n\n"
         f"Observed trajectory:\n{trajectory}\n\n"
         f"Agent final answer:\n{final_answer.strip()}"

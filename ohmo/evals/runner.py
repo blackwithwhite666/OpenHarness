@@ -156,6 +156,7 @@ def run_ohmo_eval_report(
     judge_profile: str | None = None,
     judge_model: str | None = None,
     judge_votes: int = 3,
+    judge_grounding: bool = False,
     synth_profile: str | None = None,
     synth_model: str | None = None,
     history_profile: str | None = None,
@@ -195,6 +196,7 @@ def run_ohmo_eval_report(
             api_client=judge_config.api_client,
             model=judge_config.model,
             votes=judge_votes,
+            grounding_mode=judge_grounding,
         )
     elif scorer:
         selected_scorer = resolve_execution_scorer(scorer)

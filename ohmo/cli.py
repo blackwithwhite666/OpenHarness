@@ -1573,6 +1573,14 @@ def evals_run_cmd(
             "(stabilizes the LLM judge; default 3, pass 1 to disable)"
         ),
     ),
+    judge_grounding: bool = typer.Option(
+        False,
+        "--judge-grounding",
+        help=(
+            "Judge time-sensitive cases on method/grounding instead of fact-match "
+            "against a possibly-stale reference (use with --report-only live lanes)"
+        ),
+    ),
     synth_profile: str | None = typer.Option(
         None,
         "--synth-profile",
@@ -1704,6 +1712,7 @@ def evals_run_cmd(
             "fixture_match": fixture_match,
             "max_turns": max_turns,
             "judge_votes": judge_votes,
+            "judge_grounding": judge_grounding,
         }
         if (
             sandbox_net_mode != "none"
