@@ -348,10 +348,15 @@ async def test_trace_required_happy_path_uses_existing_model_trace(
                             id="trace-call-1",
                             name="trace",
                             input={
-                                "kind": TRACE_DECISION,
+                                "kind": TRACE_FINALIZATION,
                                 "payload": _trace_payload(
                                     "trace-1",
-                                    decision="record finalization coverage before answering",
+                                    answer_claims=[
+                                        {
+                                            "claim": "scope stays on the trace recorder path",
+                                            "supported_by": ["toolu_obs_1"],
+                                        }
+                                    ],
                                 ),
                             },
                         )
@@ -377,9 +382,95 @@ async def test_trace_required_happy_path_uses_existing_model_trace(
 
     _ = [event async for event in engine.submit_message("answer with trace coverage")]
 
+    # A proactive trace_finalization closes the requirement: no repair turn.
     assert len(api_client.requests) == 2
     recorded_events = list(store.iter_events("ep-trace"))
+    assert any(event.kind == TRACE_FINALIZATION for event in recorded_events)
+    assert not any(event.kind == TRACE_MISSING_REQUIRED for event in recorded_events)
+
+
+@pytest.mark.asyncio
+async def test_proactive_non_finalization_trace_still_triggers_finalization_repair(
+    tmp_path: Path,
+) -> None:
+    # Fix: a proactive trace_decision (or observation) must NOT close the
+    # finalization requirement — the repair still fires to demand a
+    # trace_finalization that maps the answer to evidence.
+    store, recorder = _store_and_recorder(tmp_path)
+    registry = ToolRegistry()
+    registry.register(TraceTool())
+    final_answer = (
+        "Based on the available result, the implementation should stay scoped to "
+        "the trace recorder path and keep the original final response unchanged."
+    )
+    api_client = _ScriptedApiClient(
+        [
+            _FakeResponse(
+                message=ConversationMessage(
+                    role="assistant",
+                    content=[
+                        ToolUseBlock(
+                            id="trace-call-1",
+                            name="trace",
+                            input={
+                                "kind": TRACE_DECISION,
+                                "payload": _trace_payload(
+                                    "trace-1",
+                                    decision="read the recorder path before answering",
+                                ),
+                            },
+                        )
+                    ],
+                ),
+                usage=UsageSnapshot(input_tokens=8, output_tokens=4),
+            ),
+            _FakeResponse(
+                message=ConversationMessage(
+                    role="assistant",
+                    content=[TextBlock(text=final_answer)],
+                ),
+                usage=UsageSnapshot(input_tokens=12, output_tokens=7),
+            ),
+            _FakeResponse(
+                message=ConversationMessage(
+                    role="assistant",
+                    content=[
+                        ToolUseBlock(
+                            id="repair-trace-1",
+                            name="trace",
+                            input={
+                                "kind": TRACE_FINALIZATION,
+                                "payload": _trace_payload(
+                                    "repair-trace-1",
+                                    reason="substantive final answer",
+                                    answer_claims=[
+                                        {"claim": "scope stays on recorder path",
+                                         "supported_by": ["toolu_obs_1"]}
+                                    ],
+                                ),
+                            },
+                        )
+                    ],
+                ),
+                usage=UsageSnapshot(input_tokens=3, output_tokens=2),
+            ),
+        ]
+    )
+    engine = _engine(
+        tmp_path=tmp_path,
+        api_client=api_client,
+        recorder=recorder,
+        tool_registry=registry,
+    )
+
+    _ = [event async for event in engine.submit_message("answer with trace coverage")]
+
+    # 3 requests: decision turn, final-text turn, finalization repair turn.
+    assert len(api_client.requests) == 3
+    assert [tool["name"] for tool in api_client.requests[2].tools] == ["trace"]
+    recorded_events = list(store.iter_events("ep-trace"))
     assert any(event.kind == TRACE_DECISION for event in recorded_events)
+    assert any(event.kind == TRACE_FINALIZATION for event in recorded_events)
     assert not any(event.kind == TRACE_MISSING_REQUIRED for event in recorded_events)
 
 

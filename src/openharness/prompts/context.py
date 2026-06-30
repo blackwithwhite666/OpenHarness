@@ -123,15 +123,17 @@ def _build_decision_trace_section() -> str:
             "or commit to a plan. Include `chosen`, a one-line `reason`, and the "
             "`options_considered` you rejected.",
             "- `trace_observation` when a tool result changes what you believe or do. "
-            "Set `related_tool_call_id` to the tool_call_id that produced it and give a "
-            "short `summary` plus `confidence`.",
+            "Set `related_tool_call_id` to the exact tool_call_id that produced it and "
+            "give a short `summary` plus `confidence`.",
             "- `trace_uncertainty` when you answer with something unverified or "
             "assumed.",
             "- `trace_finalization` before your final answer: map every user-visible "
             "claim to the evidence that supports it via `answer_claims`.",
             "",
-            "The finalization payload links claims to the tool_call_ids of your "
-            "observations — do not re-paste raw tool output, reference its id:",
+            "Each `supported_by` entry MUST be the verbatim tool_call_id of a tool call "
+            "from this turn (e.g. `toolu_01ab…` / `call_…`) — never a tool name, a "
+            "command string, a paraphrase, or an invented id. Reference the id; do not "
+            "re-paste raw tool output:",
             "",
             "```json",
             "{",
@@ -139,7 +141,7 @@ def _build_decision_trace_section() -> str:
             '  "trace_event_id": "tr_final_1",',
             '  "answer_claims": [',
             '    {"claim": "SimpleWine on Komendantsky is closed today",',
-            '     "supported_by": ["toolu_maps_1", "toolu_web_2"]}',
+            '     "supported_by": ["toolu_01maps", "toolu_02web"]}',
             "  ],",
             '  "uncertainties": ["exact holiday hours not confirmed"]',
             "}",
@@ -147,8 +149,8 @@ def _build_decision_trace_section() -> str:
             "",
             "Keep payloads compact and structured. Never put chain-of-thought, secrets, "
             "or private raw content in a trace; prefer summaries, evidence ids, refs, "
-            "hashes, and artifact paths. A claim with no supporting observation belongs "
-            "in `uncertainties`, not `answer_claims`.",
+            "hashes, and artifact paths. A claim you cannot tie to a tool_call_id "
+            "belongs in `uncertainties`, not `answer_claims`.",
             "",
             "## Absence-claim discipline",
             "",

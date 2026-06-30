@@ -67,6 +67,7 @@ _TRACE_KIND_TOOL_PERMISSION = "tool_permission"
 _TRACE_KIND_TOOL_COMPLETED = "tool_completed"
 _TRACE_KIND_ENGINE_ERROR = "engine_error"
 _TRACE_TOOL_NAME = "trace"
+_TRACE_MODEL_KIND_FINALIZATION = "trace_finalization"
 _TRACE_MISSING_REQUIRED = "trace_missing_required"
 _TRACE_REQUIRED_MIN_TEXT_CHARS = 80
 _STRUCTURAL_TEXT_SUMMARY_CHARS = 240
@@ -164,9 +165,22 @@ _TRACE_REPAIR_MAX_OBSERVATIONS = 12
 _TRACE_OBSERVATION_SUMMARY_CHARS = 160
 
 
+def _trace_tool_kind(tool_input: Any) -> str | None:
+    """Extract the model-authored trace kind from a `trace` tool call input."""
+    if isinstance(tool_input, Mapping):
+        kind = tool_input.get("kind")
+        if isinstance(kind, str):
+            return kind
+    return None
+
+
 @dataclass
 class _DecisionTraceRunState:
     successful_model_trace: bool = False
+    # A trace_required turn is only satisfied by a trace_finalization, not by any
+    # model-authored trace event: a proactive trace_observation alone must still
+    # leave the finalization requirement (and its repair) in force.
+    successful_finalization: bool = False
     tool_call_count: int = 0
     tool_result_count: int = 0
     failed_tool_result_count: int = 0
@@ -756,7 +770,7 @@ async def _attempt_decision_trace_repair(
         model_payload,
     )
 
-    successful_trace = False
+    recorded_finalization = False
     for tool_call in repair_message.tool_uses:
         if tool_call.name != _TRACE_TOOL_NAME:
             continue
@@ -791,10 +805,15 @@ async def _attempt_decision_trace_repair(
             tool_call_id=tool_call.id,
             is_error=result.is_error,
         )
-        if not result.is_error:
-            successful_trace = True
+        if (
+            not result.is_error
+            and _trace_tool_kind(tool_call.input) == _TRACE_MODEL_KIND_FINALIZATION
+        ):
+            recorded_finalization = True
 
-    return successful_trace
+    # The requirement is only satisfied by a finalization: a repair that emitted
+    # only a trace_observation (e.g. a failed-tool turn) has not closed coverage.
+    return recorded_finalization
 
 
 def _append_capped_unique(bucket: list[Any], value: Any, *, limit: int) -> None:
@@ -1502,8 +1521,8 @@ async def run_query(
                 run_state=trace_run_state,
                 prior_tool_results_seen=prior_tool_results_seen,
             )
-            if trace_requirement.required and not trace_run_state.successful_model_trace:
-                trace_run_state.successful_model_trace = await _attempt_decision_trace_repair(
+            if trace_requirement.required and not trace_run_state.successful_finalization:
+                repaired_finalization = await _attempt_decision_trace_repair(
                     context,
                     messages,
                     final_message=final_message,
@@ -1511,7 +1530,10 @@ async def run_query(
                     observations=trace_run_state.observations,
                     effective_max_tokens=effective_max_tokens,
                 )
-                if not trace_run_state.successful_model_trace:
+                if repaired_finalization:
+                    trace_run_state.successful_finalization = True
+                    trace_run_state.successful_model_trace = True
+                else:
                     _record_trace_missing_required(
                         context.decision_trace_recorder,
                         final_message=final_message,
@@ -1526,7 +1548,7 @@ async def run_query(
                     final_message,
                     model=context.model,
                     trace_requirement=trace_requirement,
-                    model_trace_recorded=trace_run_state.successful_model_trace,
+                    model_trace_recorded=trace_run_state.successful_finalization,
                 ),
             )
             if context.hook_executor is not None:
@@ -1562,6 +1584,8 @@ async def run_query(
                 trace_run_state.failed_tool_result_count += 1
             if tc.name == _TRACE_TOOL_NAME and not result.is_error:
                 trace_run_state.successful_model_trace = True
+                if _trace_tool_kind(tc.input) == _TRACE_MODEL_KIND_FINALIZATION:
+                    trace_run_state.successful_finalization = True
             _record_trace_observation(trace_run_state, tc, result)
             _record_decision_trace_structural(
                 context.decision_trace_recorder,
@@ -1634,6 +1658,8 @@ async def run_query(
                     trace_run_state.failed_tool_result_count += 1
                 if tc.name == _TRACE_TOOL_NAME and not result.is_error:
                     trace_run_state.successful_model_trace = True
+                    if _trace_tool_kind(tc.input) == _TRACE_MODEL_KIND_FINALIZATION:
+                        trace_run_state.successful_finalization = True
                 _record_trace_observation(trace_run_state, tc, result)
 
             for tc, result, duration_ms in zip(tool_calls, tool_results, durations_ms):
