@@ -182,6 +182,7 @@ class LiveReadAgentRunner:
         live_mcp_server_names: tuple[str, ...] = (),
         live_typed_read_tool_names: tuple[str, ...] = (),
         live_local_tool_factory: Callable[[Path], Sequence[BaseTool]] | None = None,
+        live_read_passthrough_roots: tuple[Path, ...] = (),
     ) -> None:
         self._api_client = api_client
         self._model = model
@@ -194,6 +195,7 @@ class LiveReadAgentRunner:
         self._live_mcp_server_names = tuple(live_mcp_server_names)
         self._live_typed_read_tool_names = tuple(live_typed_read_tool_names)
         self._live_local_tool_factory = live_local_tool_factory
+        self._live_read_passthrough_roots = tuple(live_read_passthrough_roots)
 
     def run(
         self,
@@ -267,6 +269,7 @@ class LiveReadAgentRunner:
                                     real_tool=real_tool,
                                     mock_tool=mock_tool,
                                     sandbox=materialize_sandbox,
+                                    passthrough_roots=self._live_read_passthrough_roots,
                                 )
                             )
                         for wrapper in wrappers:

@@ -60,7 +60,7 @@ from ohmo.gateway.send_message_tool import (
     SendTelegramMessageTool,
 )
 from ohmo.todo_write_tool import OhmoTodoWriteTool
-from ohmo.workspace import get_plugins_dir, get_skills_dir
+from ohmo.workspace import get_attachments_dir, get_plugins_dir, get_skills_dir
 
 
 @dataclass(frozen=True)
@@ -656,6 +656,9 @@ def _build_agent_runner_config(
                 live_mcp_server_names=("google_search",),
                 live_typed_read_tool_names=("read_file", "glob", "grep"),
                 live_local_tool_factory=_make_live_local_tool_factory(workspace),
+                live_read_passthrough_roots=(
+                    (get_attachments_dir(workspace),) if workspace is not None else ()
+                ),
             ),
             agent_runner_name="query-engine-live-read",
             model=settings.model,

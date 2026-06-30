@@ -138,6 +138,52 @@ async def test_live_local_read_tool_glob_uses_remapped_root(tmp_path: Path):
     assert mock_tool.calls == []
 
 
+@pytest.mark.asyncio
+async def test_live_local_read_tool_passthrough_reads_allowlisted_real_path(
+    tmp_path: Path,
+):
+    # An allowlisted real root (e.g. the attachments dir) is read directly,
+    # read-only, without being materialized into the sandbox — so typed-read
+    # tools see the same files the live bash lane / prod do.
+    attachments = tmp_path / "attachments" / "telegram"
+    attachments.mkdir(parents=True)
+    (attachments / "voice.ogg").write_text("AUDIO-BYTES\n", encoding="utf-8")
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+
+    read_tool = create_default_tool_registry().get("read_file")
+    glob_tool = create_default_tool_registry().get("glob")
+    assert read_tool is not None and glob_tool is not None
+    passthrough = ((tmp_path / "attachments").resolve(),)
+
+    read_wrapper = LiveLocalReadTool(
+        real_tool=read_tool,
+        mock_tool=_RecordingMockTool("read_file", read_tool.input_model, output="MOCKED"),
+        sandbox=sandbox,
+        passthrough_roots=passthrough,
+    )
+    glob_wrapper = LiveLocalReadTool(
+        real_tool=glob_tool,
+        mock_tool=_RecordingMockTool("glob", glob_tool.input_model, output="MOCKED"),
+        sandbox=sandbox,
+        passthrough_roots=passthrough,
+    )
+
+    voice = str(attachments / "voice.ogg")
+    read_result = await read_wrapper.execute(
+        read_tool.input_model(path=voice, limit=20),
+        ToolExecutionContext(cwd=tmp_path),
+    )
+    glob_result = await glob_wrapper.execute(
+        glob_tool.input_model(pattern="*.ogg", root=str(attachments), limit=20),
+        ToolExecutionContext(cwd=tmp_path),
+    )
+
+    assert "AUDIO-BYTES" in read_result.output  # real file, not mock
+    assert "voice.ogg" in glob_result.output  # discovered via real glob
+    assert read_result.metadata["lane"] == "live-local"
+
+
 class _RecordingMockTool(BaseTool):
     description = "recording mock tool"
     input_model = ReplayToolInput

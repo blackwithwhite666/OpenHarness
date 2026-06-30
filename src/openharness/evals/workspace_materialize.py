@@ -35,6 +35,30 @@ def remap_out(text: str, sandbox: Path) -> str:
     return text.replace(str(sandbox.resolve()), "")
 
 
+def passthrough_real_path(path_str: str, roots: tuple[Path, ...]) -> Path | None:
+    """Return the real resolved path when it lives under an allowlisted root.
+
+    Allowlisted roots (e.g. the workspace attachments dir) are read directly,
+    read-only, instead of being mirrored into the sandbox — so typed-read tools
+    (glob/grep/read_file) see the same files the live bash lane and prod do,
+    without copying large media. Returns ``None`` when the path is not under any
+    allowlisted root (caller then falls back to the sandbox mirror).
+    """
+    if not roots:
+        return None
+    try:
+        resolved = Path(path_str).expanduser().resolve()
+    except (OSError, RuntimeError, ValueError):
+        return None
+    for root in roots:
+        try:
+            resolved.relative_to(root)
+        except ValueError:
+            continue
+        return resolved
+    return None
+
+
 def materialize_read_fixtures(fixtures: Iterable[Any], sandbox: Path) -> int:
     """Write captured ``read_file`` outputs into the sandbox mirror.
 
@@ -74,6 +98,7 @@ class LiveLocalReadTool(BaseTool):
         mock_tool: BaseTool,
         sandbox: Path,
         path_fields: tuple[str, ...] = ("path", "root"),
+        passthrough_roots: tuple[Path, ...] = (),
     ) -> None:
         self.name = real_tool.name
         self.description = real_tool.description
@@ -82,17 +107,25 @@ class LiveLocalReadTool(BaseTool):
         self._mock_tool = mock_tool
         self._sandbox = sandbox.resolve()
         self._path_fields = path_fields
+        self._passthrough_roots = tuple(root.resolve() for root in passthrough_roots)
 
     async def execute(
         self,
         arguments: BaseModel,
         context: ToolExecutionContext,
     ) -> ToolResult:
+        passthrough_cwd: Path | None = None
         try:
             data = arguments.model_dump()
             for field in self._path_fields:
                 value = data.get(field)
                 if not isinstance(value, str):
+                    continue
+                real = passthrough_real_path(value, self._passthrough_roots)
+                if real is not None:
+                    # Read the allowlisted real path directly (read-only).
+                    data[field] = str(real)
+                    passthrough_cwd = real if real.is_dir() else real.parent
                     continue
                 remapped = remap_in(value, self._sandbox)
                 if remapped is None:
@@ -102,15 +135,17 @@ class LiveLocalReadTool(BaseTool):
             result = await self._real_tool.execute(
                 remapped_args,
                 ToolExecutionContext(
-                    cwd=self._sandbox,
+                    cwd=passthrough_cwd or self._sandbox,
                     metadata=context.metadata,
                     hook_executor=context.hook_executor,
                 ),
             )
         except Exception:
             return await self._mock_tool.execute(arguments, context)
+        # Passthrough output already holds real paths; only sandbox output needs remap.
+        output = result.output if passthrough_cwd else remap_out(result.output, self._sandbox)
         return ToolResult(
-            output=remap_out(result.output, self._sandbox),
+            output=output,
             is_error=result.is_error,
             metadata={**result.metadata, "lane": "live-local", "tool": self.name},
         )
