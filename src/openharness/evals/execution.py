@@ -615,8 +615,46 @@ def run_execution_report(
         *(case.case_id for case in cases),
     )
     traces_root = store.root / "traces"
-    report_cases = [
-        _execute_case_sampled(
+    path = _report_output_path(store, report_filename)
+    total = len(cases)
+
+    def _build_report(
+        done_cases: list[EvalExecutionReportCase], *, complete: bool
+    ) -> EvalExecutionReport:
+        return EvalExecutionReport(
+            report_id=report_id,
+            pack_id=payload.pack_id,
+            case_count=len(done_cases),
+            passed_count=sum(1 for c in done_cases if c.status == "passed"),
+            failed_count=sum(1 for c in done_cases if c.status == "failed"),
+            blocked_count=sum(1 for c in done_cases if c.status == "blocked"),
+            error_count=sum(1 for c in done_cases if c.status == "error"),
+            cases=done_cases,
+            metadata={
+                "privacy": "metadata_only",
+                "mode": "execution_replay",
+                "executor_name": selected_executor.name,
+                "scorer_name": default_scorer.name,
+                "score_schema_version": _EXECUTION_SCORE_SCHEMA_VERSION,
+                "fixture_match": getattr(selected_executor, "fixture_match_mode", "order"),
+                "pack_case_count": len(payload.cases),
+                "limit": limit or 0,
+                "samples": samples,
+                "max_turns": max_turns,
+                # Progress markers: the report file is rewritten after every
+                # case so an external observer can poll it mid-run. This run is
+                # long and ~entirely network-bound (one model call per agent
+                # turn + judge votes, sequential), so without intermediate
+                # writes the report would only appear at the very end.
+                "progress_done": len(done_cases),
+                "progress_total": total,
+                "progress_complete": complete,
+            },
+        )
+
+    report_cases: list[EvalExecutionReportCase] = []
+    for index, case in enumerate(cases, start=1):
+        report_case = _execute_case_sampled(
             store,
             payload,
             case,
@@ -629,35 +667,23 @@ def run_execution_report(
             traces_root=traces_root,
             run_id=report_id,
         )
-        for case in cases
-    ]
-    passed_count = sum(1 for case in report_cases if case.status == "passed")
-    blocked_count = sum(1 for case in report_cases if case.status == "blocked")
-    error_count = sum(1 for case in report_cases if case.status == "error")
-    failed_count = sum(1 for case in report_cases if case.status == "failed")
-    report = EvalExecutionReport(
-        report_id=report_id,
-        pack_id=payload.pack_id,
-        case_count=len(report_cases),
-        passed_count=passed_count,
-        failed_count=failed_count,
-        blocked_count=blocked_count,
-        error_count=error_count,
-        cases=report_cases,
-        metadata={
-            "privacy": "metadata_only",
-            "mode": "execution_replay",
-            "executor_name": selected_executor.name,
-            "scorer_name": default_scorer.name,
-            "score_schema_version": _EXECUTION_SCORE_SCHEMA_VERSION,
-            "fixture_match": getattr(selected_executor, "fixture_match_mode", "order"),
-            "pack_case_count": len(payload.cases),
-            "limit": limit or 0,
-            "samples": samples,
-            "max_turns": max_turns,
-        },
-    )
-    path = _report_output_path(store, report_filename)
+        report_cases.append(report_case)
+        progress = (
+            f"[eval] {index}/{total} "
+            f"case={getattr(case, 'case_id', '?')} status={report_case.status}"
+        )
+        logger.info(progress)
+        # Reliable progress in the run log even when INFO logging isn't wired
+        # up to stdout (e.g. under nohup).
+        print(progress, flush=True)
+        # Intermediate write: rewrite the report after every case so progress
+        # is observable mid-run.
+        atomic_write_text(
+            path,
+            _build_report(report_cases, complete=False).model_dump_json(indent=2) + "\n",
+        )
+
+    report = _build_report(report_cases, complete=True)
     atomic_write_text(path, report.model_dump_json(indent=2) + "\n")
     return EvalExecutionReportWrite(
         report=report,
