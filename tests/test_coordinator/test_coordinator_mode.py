@@ -16,6 +16,28 @@ from openharness.coordinator.coordinator_mode import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _restore_coordinator_env():
+    """Snapshot/restore the coordinator env flags around every test.
+
+    ``match_session_mode`` mutates ``os.environ`` directly, and
+    ``monkeypatch.delenv(name, raising=False)`` on an absent var records nothing
+    to restore — so without this a test that enters coordinator mode leaks
+    ``CLAUDE_CODE_COORDINATOR_MODE`` into later, unrelated tests (e.g. the eval
+    runner then builds the coordinator prompt instead of the real one).
+    """
+    import os
+
+    keys = ("CLAUDE_CODE_COORDINATOR_MODE", "CLAUDE_CODE_SIMPLE")
+    saved = {k: os.environ.get(k) for k in keys}
+    yield
+    for key, value in saved.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
+
+
 # ---------------------------------------------------------------------------
 # TaskNotification XML round-trip
 # ---------------------------------------------------------------------------
