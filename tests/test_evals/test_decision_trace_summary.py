@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from openharness.evals import (
     EvalEvent,
+    TRACE_ABSENCE,
     TRACE_FINALIZATION,
+    TRACE_MISSING_REQUIRED,
     summarize_decision_trace,
 )
 
@@ -61,6 +63,29 @@ def test_evidence_status_linked_when_claim_has_supported_by() -> None:
     assert summary["decision_trace_supported_claim_count"] == 1
     assert summary["decision_trace_evidence_linked_finalization_count"] == 1
     assert summary["decision_trace_evidence_status"] == "linked"
+
+
+def test_absence_event_counts_separately_from_missing_required() -> None:
+    # A model-authored trace_absence must not inflate the engine's
+    # coverage-failure metric (missing_required_count).
+    events = [
+        EvalEvent(
+            episode_id="ep-1",
+            kind=TRACE_ABSENCE,
+            payload={"schema_version": 1, "trace_event_id": "abs-1", "needed": "x"},
+        ),
+        EvalEvent(
+            episode_id="ep-1",
+            kind=TRACE_MISSING_REQUIRED,
+            payload={"schema_version": 1, "trace_event_id": "miss-1"},
+        ),
+    ]
+    summary = summarize_decision_trace(events)
+    assert summary["decision_trace_absence_count"] == 1
+    assert summary["decision_trace_missing_required_count"] == 1
+    # trace_absence is a model event; trace_missing_required is a diagnostic.
+    assert summary["decision_trace_model_event_count"] == 1
+    assert summary["decision_trace_diagnostic_event_count"] == 1
 
 
 def test_evidence_link_accepts_evidence_id_string() -> None:

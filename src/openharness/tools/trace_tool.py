@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field
 from openharness.evals.decision_trace import (
     DECISION_TRACE_MODEL_EVENT_KINDS,
     DecisionTraceValidationError,
+    resolve_model_trace_kind,
 )
 from openharness.tools.base import BaseTool, ToolExecutionContext, ToolResult
 
@@ -21,6 +22,11 @@ TraceKind = Literal[
     "trace_uncertainty",
     "trace_stop_condition",
     "trace_finalization",
+    # Model-authored "info genuinely absent after a real search". Accepted as an
+    # alias and server-reclaimed to trace_absence so it does not register as the
+    # engine's trace_missing_required coverage failure.
+    "trace_missing_required",
+    "trace_absence",
 ]
 
 
@@ -31,7 +37,8 @@ class TraceToolInput(BaseModel):
         description=(
             "Model-authored decision trace event kind: trace_intent, "
             "trace_decision, trace_observation, trace_uncertainty, "
-            "trace_stop_condition, or trace_finalization."
+            "trace_stop_condition, trace_finalization, or trace_missing_required "
+            "(recorded as trace_absence — an information-genuinely-absent breadcrumb)."
         )
     )
     payload: dict[str, Any] = Field(
@@ -61,14 +68,15 @@ class TraceTool(BaseTool):
         if recorder is None:
             return ToolResult(output="Decision trace recorder unavailable; no trace recorded.")
 
-        if arguments.kind not in DECISION_TRACE_MODEL_EVENT_KINDS:
+        kind = resolve_model_trace_kind(arguments.kind)
+        if kind not in DECISION_TRACE_MODEL_EVENT_KINDS:
             return ToolResult(
                 output=f"Unsupported model-authored decision trace kind: {arguments.kind}",
                 is_error=True,
             )
 
         try:
-            recorded = recorder.record(arguments.kind, arguments.payload)
+            recorded = recorder.record(kind, arguments.payload)
         except DecisionTraceValidationError as exc:
             return ToolResult(
                 output=f"Decision trace validation failed: {exc}",
@@ -77,4 +85,4 @@ class TraceTool(BaseTool):
 
         if not recorded:
             return ToolResult(output="Decision trace recorder disabled; no trace recorded.")
-        return ToolResult(output=f"Recorded decision trace event: {arguments.kind}")
+        return ToolResult(output=f"Recorded decision trace event: {kind}")

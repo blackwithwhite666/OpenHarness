@@ -21,6 +21,8 @@ TRACE_OBSERVATION = "trace_observation"
 TRACE_UNCERTAINTY = "trace_uncertainty"
 TRACE_STOP_CONDITION = "trace_stop_condition"
 TRACE_FINALIZATION = "trace_finalization"
+# Model-authored "I searched and the information is genuinely absent" record.
+TRACE_ABSENCE = "trace_absence"
 TRACE_MISSING_REQUIRED = "trace_missing_required"
 
 STRUCTURAL_TURN_STARTED = "turn_started"
@@ -46,9 +48,22 @@ DECISION_TRACE_MODEL_EVENT_KINDS = frozenset(
         TRACE_UNCERTAINTY,
         TRACE_STOP_CONDITION,
         TRACE_FINALIZATION,
+        TRACE_ABSENCE,
     }
 )
 DECISION_TRACE_DIAGNOSTIC_EVENT_KINDS = frozenset({TRACE_MISSING_REQUIRED})
+
+# Server reclaim: the system prompt tells the model to record a
+# `trace_missing_required` when it concludes information is genuinely absent, but
+# that kind is the engine's coverage-FAILURE diagnostic. Relabel the
+# model-authored variant to TRACE_ABSENCE so a deliberate absence record never
+# pollutes the `trace_missing_required` coverage metric.
+DECISION_TRACE_MODEL_KIND_ALIASES = {TRACE_MISSING_REQUIRED: TRACE_ABSENCE}
+
+
+def resolve_model_trace_kind(kind: str) -> str:
+    """Map a model-supplied trace kind through the server-reclaim aliases."""
+    return DECISION_TRACE_MODEL_KIND_ALIASES.get(kind, kind)
 DECISION_TRACE_EVENT_KINDS = (
     DECISION_TRACE_MODEL_EVENT_KINDS | DECISION_TRACE_DIAGNOSTIC_EVENT_KINDS
 )

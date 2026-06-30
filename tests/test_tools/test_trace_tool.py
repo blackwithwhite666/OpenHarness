@@ -8,6 +8,7 @@ import pytest
 from openharness.config.settings import Settings
 from openharness.evals import (
     DECISION_TRACE_MAX_PAYLOAD_BYTES,
+    TRACE_ABSENCE,
     TRACE_DECISION,
     TRACE_MISSING_REQUIRED,
     DecisionTraceRecorder,
@@ -107,8 +108,8 @@ async def test_trace_tool_disabled_recorder_is_noop(tmp_path: Path) -> None:
 async def test_trace_tool_rejects_unsupported_kind(tmp_path: Path) -> None:
     store, recorder = _store_and_recorder(tmp_path)
     arguments = TraceToolInput.model_construct(
-        kind=TRACE_MISSING_REQUIRED,
-        payload=_payload(missing=["trace_finalization"]),
+        kind="trace_not_a_real_kind",
+        payload=_payload(detail="bogus"),
     )
 
     result = await TraceTool().execute(arguments, _context(tmp_path, recorder))
@@ -116,6 +117,30 @@ async def test_trace_tool_rejects_unsupported_kind(tmp_path: Path) -> None:
     assert result.is_error is True
     assert "Unsupported model-authored decision trace kind" in result.output
     assert store.count_events("ep-1") == 0
+
+
+@pytest.mark.asyncio
+async def test_trace_tool_reclaims_missing_required_to_absence(tmp_path: Path) -> None:
+    # Server reclaim: the model may call trace with kind trace_missing_required
+    # (per the absence-claim prompt), but it is stored as trace_absence so it
+    # never registers as the engine's coverage-failure diagnostic.
+    store, recorder = _store_and_recorder(tmp_path)
+    arguments = TraceToolInput.model_construct(
+        kind=TRACE_MISSING_REQUIRED,
+        payload=_payload(
+            needed="restaurant holiday hours",
+            tried=["maps-cli", "web_search", "site fetch"],
+        ),
+    )
+
+    result = await TraceTool().execute(arguments, _context(tmp_path, recorder))
+
+    assert result.is_error is False
+    assert f"Recorded decision trace event: {TRACE_ABSENCE}" in result.output
+    [event] = list(store.iter_events("ep-1"))
+    assert event.kind == TRACE_ABSENCE
+    # not the engine diagnostic kind
+    assert event.kind != TRACE_MISSING_REQUIRED
 
 
 @pytest.mark.asyncio

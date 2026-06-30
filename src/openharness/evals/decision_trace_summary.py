@@ -10,6 +10,7 @@ from openharness.evals.decision_trace import (
     DECISION_TRACE_EVENT_KINDS,
     DECISION_TRACE_MODEL_EVENT_KINDS,
     STRUCTURAL_ASSISTANT_FINAL,
+    TRACE_ABSENCE,
     TRACE_FINALIZATION,
     TRACE_MISSING_REQUIRED,
     TRACE_UNCERTAINTY,
@@ -20,6 +21,7 @@ DECISION_TRACE_SUMMARY_KEYS = (
     "decision_trace_model_event_count",
     "decision_trace_diagnostic_event_count",
     "decision_trace_missing_required_count",
+    "decision_trace_absence_count",
     "decision_trace_required_count",
     "decision_trace_recorded_count",
     "decision_trace_coverage_status",
@@ -53,6 +55,7 @@ def summarize_decision_trace(events: Sequence[Any]) -> dict[str, Any]:
     model_event_count = 0
     diagnostic_event_count = 0
     missing_required_count = 0
+    absence_count = 0
     required_count = 0
     recorded_count = 0
     finalization_count = 0
@@ -84,6 +87,8 @@ def summarize_decision_trace(events: Sequence[Any]) -> dict[str, Any]:
 
         if kind == TRACE_MISSING_REQUIRED:
             missing_required_count += 1
+        if kind == TRACE_ABSENCE:
+            absence_count += 1
         if kind == STRUCTURAL_ASSISTANT_FINAL:
             if payload.get("trace_required") is True:
                 required_count += 1
@@ -106,6 +111,7 @@ def summarize_decision_trace(events: Sequence[Any]) -> dict[str, Any]:
         "decision_trace_model_event_count": model_event_count,
         "decision_trace_diagnostic_event_count": diagnostic_event_count,
         "decision_trace_missing_required_count": missing_required_count,
+        "decision_trace_absence_count": absence_count,
         "decision_trace_required_count": required_count,
         "decision_trace_recorded_count": recorded_count,
         "decision_trace_coverage_status": _coverage_status(

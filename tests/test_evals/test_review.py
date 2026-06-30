@@ -388,6 +388,7 @@ def _empty_decision_trace_summary() -> dict[str, object]:
         "decision_trace_model_event_count": 0,
         "decision_trace_diagnostic_event_count": 0,
         "decision_trace_missing_required_count": 0,
+        "decision_trace_absence_count": 0,
         "decision_trace_required_count": 0,
         "decision_trace_recorded_count": 0,
         "decision_trace_coverage_status": "not_required",
