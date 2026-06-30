@@ -10,6 +10,7 @@ from openharness.evals.decision_trace import (
     DECISION_TRACE_EVENT_KINDS,
     DECISION_TRACE_MODEL_EVENT_KINDS,
     STRUCTURAL_ASSISTANT_FINAL,
+    TRACE_FINALIZATION,
     TRACE_MISSING_REQUIRED,
     TRACE_UNCERTAINTY,
 )
@@ -22,6 +23,11 @@ DECISION_TRACE_SUMMARY_KEYS = (
     "decision_trace_required_count",
     "decision_trace_recorded_count",
     "decision_trace_coverage_status",
+    "decision_trace_finalization_count",
+    "decision_trace_claim_count",
+    "decision_trace_supported_claim_count",
+    "decision_trace_evidence_linked_finalization_count",
+    "decision_trace_evidence_status",
     "unsupported_claim_count",
     "uncertainty_trace_count",
     "uncertainty_status",
@@ -49,6 +55,10 @@ def summarize_decision_trace(events: Sequence[Any]) -> dict[str, Any]:
     missing_required_count = 0
     required_count = 0
     recorded_count = 0
+    finalization_count = 0
+    claim_count = 0
+    supported_claim_count = 0
+    evidence_linked_finalization_count = 0
     unsupported_claim_count = 0
     uncertainty_trace_count = 0
     sensitivity_labels: set[str] = set()
@@ -63,6 +73,14 @@ def summarize_decision_trace(events: Sequence[Any]) -> dict[str, Any]:
         elif kind in DECISION_TRACE_DIAGNOSTIC_EVENT_KINDS:
             event_count += 1
             diagnostic_event_count += 1
+
+        if kind == TRACE_FINALIZATION:
+            finalization_count += 1
+            claims, supported = _claim_evidence_counts(payload)
+            claim_count += claims
+            supported_claim_count += supported
+            if supported > 0:
+                evidence_linked_finalization_count += 1
 
         if kind == TRACE_MISSING_REQUIRED:
             missing_required_count += 1
@@ -95,6 +113,16 @@ def summarize_decision_trace(events: Sequence[Any]) -> dict[str, Any]:
             recorded_count=recorded_count,
             missing_required_count=missing_required_count,
         ),
+        "decision_trace_finalization_count": finalization_count,
+        "decision_trace_claim_count": claim_count,
+        "decision_trace_supported_claim_count": supported_claim_count,
+        "decision_trace_evidence_linked_finalization_count": (
+            evidence_linked_finalization_count
+        ),
+        "decision_trace_evidence_status": _evidence_status(
+            finalization_count=finalization_count,
+            evidence_linked_finalization_count=evidence_linked_finalization_count,
+        ),
         "unsupported_claim_count": unsupported_claim_count,
         "uncertainty_trace_count": uncertainty_trace_count,
         "uncertainty_status": "present" if uncertainty_trace_count else "absent",
@@ -123,6 +151,55 @@ def unsupported_claim_count_from_payload(payload: Mapping[str, Any]) -> int:
     if isinstance(unsupported_claims, list):
         counts.append(len(unsupported_claims))
     return max(counts, default=0)
+
+
+_EVIDENCE_LINK_KEYS = ("supported_by", "evidence_id", "evidence_ids")
+
+
+def _claim_evidence_counts(payload: Mapping[str, Any]) -> tuple[int, int]:
+    """Return (total claims, claims linked to at least one evidence id)."""
+    claims = payload.get("answer_claims")
+    if not isinstance(claims, list):
+        return (0, 0)
+    total = 0
+    supported = 0
+    for claim in claims:
+        if not isinstance(claim, Mapping):
+            continue
+        total += 1
+        if _claim_has_evidence(claim):
+            supported += 1
+    return (total, supported)
+
+
+def _claim_has_evidence(claim: Mapping[str, Any]) -> bool:
+    for key in _EVIDENCE_LINK_KEYS:
+        value = claim.get(key)
+        if isinstance(value, str) and value.strip():
+            return True
+        if isinstance(value, (list, tuple)) and any(
+            isinstance(item, str) and item.strip() for item in value
+        ):
+            return True
+    return False
+
+
+def _evidence_status(
+    *,
+    finalization_count: int,
+    evidence_linked_finalization_count: int,
+) -> str:
+    """Distinguish 'has a trace' from 'has an evidence-linked trace'.
+
+    coverage_status can be ``complete`` while evidence_status is ``thin`` — that
+    gap is the signal that the repair path is emitting reference-only finalizations
+    instead of grounded answer_claims (D5).
+    """
+    if finalization_count == 0:
+        return "none"
+    if evidence_linked_finalization_count > 0:
+        return "linked"
+    return "thin"
 
 
 def _coverage_status(

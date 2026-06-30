@@ -115,11 +115,40 @@ def _build_decision_trace_section() -> str:
         [
             "# Decision Trace",
             "",
-            "Use the `trace` tool for meaningful intent, decision, observation, "
-            "uncertainty, stop condition, and finalization breadcrumbs.",
-            "Keep trace payloads structured and concise.",
-            "Do not put chain-of-thought, secrets, or private raw content in trace payloads.",
-            "Prefer summaries, evidence ids, refs, hashes, and artifact paths.",
+            "On non-trivial turns, record decision-trace breadcrumbs with the `trace` "
+            "tool *as you work* — this is a structured flight recorder, not narration. "
+            "Call it at these moments:",
+            "",
+            "- `trace_decision` at a real fork: when you choose between tools/approaches "
+            "or commit to a plan. Include `chosen`, a one-line `reason`, and the "
+            "`options_considered` you rejected.",
+            "- `trace_observation` when a tool result changes what you believe or do. "
+            "Set `related_tool_call_id` to the tool_call_id that produced it and give a "
+            "short `summary` plus `confidence`.",
+            "- `trace_uncertainty` when you answer with something unverified or "
+            "assumed.",
+            "- `trace_finalization` before your final answer: map every user-visible "
+            "claim to the evidence that supports it via `answer_claims`.",
+            "",
+            "The finalization payload links claims to the tool_call_ids of your "
+            "observations — do not re-paste raw tool output, reference its id:",
+            "",
+            "```json",
+            "{",
+            '  "schema_version": 1,',
+            '  "trace_event_id": "tr_final_1",',
+            '  "answer_claims": [',
+            '    {"claim": "SimpleWine on Komendantsky is closed today",',
+            '     "supported_by": ["toolu_maps_1", "toolu_web_2"]}',
+            "  ],",
+            '  "uncertainties": ["exact holiday hours not confirmed"]',
+            "}",
+            "```",
+            "",
+            "Keep payloads compact and structured. Never put chain-of-thought, secrets, "
+            "or private raw content in a trace; prefer summaries, evidence ids, refs, "
+            "hashes, and artifact paths. A claim with no supporting observation belongs "
+            "in `uncertainties`, not `answer_claims`.",
         ]
     )
 

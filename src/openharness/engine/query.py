@@ -9,7 +9,7 @@ import logging
 import re
 import time
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, AsyncIterator, Awaitable, Callable, Protocol
 from uuid import uuid4
@@ -150,12 +150,30 @@ class _TraceRequirement:
     signals: tuple[str, ...] = ()
 
 
+@dataclass(frozen=True)
+class _TraceObservation:
+    tool_call_id: str
+    label: str
+    summary: str
+    is_error: bool
+
+
+# Cap how many observations are offered back in the repair prompt so the nudge
+# stays compact (the repair model call is bounded to 1024 tokens).
+_TRACE_REPAIR_MAX_OBSERVATIONS = 12
+_TRACE_OBSERVATION_SUMMARY_CHARS = 160
+
+
 @dataclass
 class _DecisionTraceRunState:
     successful_model_trace: bool = False
     tool_call_count: int = 0
     tool_result_count: int = 0
     failed_tool_result_count: int = 0
+    # Per-turn observation index: (tool_call_id, capability label, summary, is_error).
+    # Offered back to the model in the repair prompt so finalization claims can be
+    # linked to concrete evidence ids without re-embedding raw tool output (D5).
+    observations: list["_TraceObservation"] = field(default_factory=list)
 
 
 def _is_prompt_too_long_error(exc: Exception) -> bool:
@@ -548,22 +566,103 @@ def _classify_trace_requirement(
     return _TraceRequirement(True, signals[0], tuple(signals))
 
 
+def _record_trace_observation(
+    run_state: _DecisionTraceRunState,
+    tool_call: Any,
+    result: Any,
+) -> None:
+    """Index a completed non-trace tool call as a linkable evidence observation."""
+    name = getattr(tool_call, "name", "") or ""
+    if name == _TRACE_TOOL_NAME:
+        return
+    call_id = getattr(tool_call, "id", None)
+    if not call_id:
+        return
+    # Local import: openharness.evals.__init__ imports back into this module
+    # (executor -> engine.query), so a top-level import would be circular.
+    from openharness.evals.tool_labels import effective_tool_label
+
+    label = effective_tool_label(name, getattr(tool_call, "input", None))
+    content = getattr(result, "content", "")
+    summary = _compact_text_summary(
+        content if isinstance(content, str) else str(content),
+        limit=_TRACE_OBSERVATION_SUMMARY_CHARS,
+    )
+    run_state.observations.append(
+        _TraceObservation(
+            tool_call_id=str(call_id),
+            label=label,
+            summary=summary,
+            is_error=bool(getattr(result, "is_error", False)),
+        )
+    )
+
+
+def _format_repair_observations(observations: list[_TraceObservation]) -> str:
+    """Render the turn's observations as an id-keyed evidence list for the prompt."""
+    shown = observations[-_TRACE_REPAIR_MAX_OBSERVATIONS:]
+    lines = []
+    for obs in shown:
+        flag = " [ERROR]" if obs.is_error else ""
+        lines.append(f"- {obs.tool_call_id} | {obs.label}{flag} | {obs.summary}")
+    return "\n".join(lines)
+
+
 def _decision_trace_repair_instruction(
     final_message: ConversationMessage,
     requirement: _TraceRequirement,
+    observations: list[_TraceObservation],
 ) -> str:
     trace_event_id = f"trace_repair_{uuid4().hex}"
-    return (
-        "The previous assistant response needs one concise decision-trace "
-        "breadcrumb before finalization. Call only the `trace` tool exactly once "
-        "with kind `trace_finalization`. Use payload fields "
-        f"`schema_version: 1`, `trace_event_id: \"{trace_event_id}\"`, "
-        "`reason`, and a short `final_answer_summary`. Do not write prose. "
-        "Do not include chain-of-thought, secrets, or private raw content.\n\n"
-        f"Trace requirement reason: {requirement.reason}\n"
-        f"Signals: {', '.join(requirement.signals)}\n"
-        f"Final answer summary: {_compact_text_summary(final_message.text)}"
+    has_failure = "failed_tool_result" in requirement.signals
+    has_obs = bool(observations)
+
+    parts = [
+        "The previous assistant response needs a structured decision-trace "
+        "breadcrumb before finalization. Use the `trace` tool. Do not write prose, "
+        "chain-of-thought, secrets, or private raw content. Keep payloads compact.",
+        "",
+    ]
+
+    if has_failure:
+        parts.append(
+            "1. First call `trace` with kind `trace_observation` for the tool that "
+            "failed this turn: payload `schema_version: 1`, a unique `trace_event_id`, "
+            "`related_tool_call_id` (the failing tool_call_id below), a short "
+            "`summary` of what failed, and `confidence`."
+        )
+
+    finalization_step = "2." if has_failure else "1."
+    parts.append(
+        f"{finalization_step} Call `trace` with kind `trace_finalization`: payload "
+        f"`schema_version: 1`, `trace_event_id: \"{trace_event_id}\"`, `reason`, a short "
+        "`final_answer_summary`, and `answer_claims`: a list of "
+        "`{\"claim\": <short claim>, \"supported_by\": [<tool_call_id>, ...]}`. "
+        "Each user-visible claim in the final answer MUST map to the tool_call_id(s) "
+        "of the observation(s) below that support it. Add an `uncertainties` list "
+        "(empty if none) for claims you could not ground in an observation."
     )
+
+    if has_obs:
+        parts.append("")
+        parts.append(
+            "Observations from this turn (use these tool_call_ids as evidence — do "
+            "not invent ids, do not copy raw output):"
+        )
+        parts.append(_format_repair_observations(observations))
+    else:
+        parts.append("")
+        parts.append(
+            "No tool observations were recorded this turn; ground `answer_claims` in "
+            "the user request and leave `supported_by` empty where there is no "
+            "tool evidence."
+        )
+
+    parts.append("")
+    parts.append(f"Trace requirement reason: {requirement.reason}")
+    parts.append(f"Signals: {', '.join(requirement.signals)}")
+    parts.append(f"Final answer summary: {_compact_text_summary(final_message.text)}")
+    return "\n".join(parts)
 
 
 def _record_trace_missing_required(
@@ -600,6 +699,7 @@ async def _attempt_decision_trace_repair(
     *,
     final_message: ConversationMessage,
     requirement: _TraceRequirement,
+    observations: list[_TraceObservation],
     effective_max_tokens: int,
 ) -> bool:
     if context.decision_trace_recorder is None:
@@ -612,7 +712,7 @@ async def _attempt_decision_trace_repair(
     repair_messages = [
         *messages,
         ConversationMessage.from_user_text(
-            _decision_trace_repair_instruction(final_message, requirement)
+            _decision_trace_repair_instruction(final_message, requirement, observations)
         ),
     ]
     repair_message: ConversationMessage | None = None
@@ -1408,6 +1508,7 @@ async def run_query(
                     messages,
                     final_message=final_message,
                     requirement=trace_requirement,
+                    observations=trace_run_state.observations,
                     effective_max_tokens=effective_max_tokens,
                 )
                 if not trace_run_state.successful_model_trace:
@@ -1461,6 +1562,7 @@ async def run_query(
                 trace_run_state.failed_tool_result_count += 1
             if tc.name == _TRACE_TOOL_NAME and not result.is_error:
                 trace_run_state.successful_model_trace = True
+            _record_trace_observation(trace_run_state, tc, result)
             _record_decision_trace_structural(
                 context.decision_trace_recorder,
                 _TRACE_KIND_TOOL_COMPLETED,
@@ -1532,6 +1634,7 @@ async def run_query(
                     trace_run_state.failed_tool_result_count += 1
                 if tc.name == _TRACE_TOOL_NAME and not result.is_error:
                     trace_run_state.successful_model_trace = True
+                _record_trace_observation(trace_run_state, tc, result)
 
             for tc, result, duration_ms in zip(tool_calls, tool_results, durations_ms):
                 _record_decision_trace_structural(
