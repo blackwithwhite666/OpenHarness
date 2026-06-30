@@ -383,6 +383,7 @@ def _case_summary(
             case_id=case_id,
             fallback=metadata_sample_count,
         ),
+        "flaky": bool(case_metadata.get("flaky")),
         "goldEpisodeId": _string_value(context.get("episode_id")),
         "spansCount": 1 + len(tool_calls),
     }
@@ -810,11 +811,14 @@ def _case_badges(
     pass_count: int,
     sample_count: int,
 ) -> list[dict[str, str]]:
-    return [
+    badges = [
         {"label": f"score {_label_value(score)}"},
         {"label": _string_value(case.get("status")) or ""},
         {"label": f"{_label_value(pass_count)}/{_label_value(sample_count)}"},
     ]
+    if _mapping(case.get("metadata")).get("flaky"):
+        badges.append({"label": "flaky"})
+    return badges
 
 
 def _json_or_none(value: Any) -> str | None:

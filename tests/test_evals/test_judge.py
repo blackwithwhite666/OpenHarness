@@ -85,6 +85,57 @@ def test_trajectory_judge_scores_verdicts_metadata_only(
     assert api_client.requests[0].tools == []
 
 
+class _SequenceJudgeApiClient:
+    def __init__(self, texts: list[str]) -> None:
+        self._texts = list(texts)
+        self.calls = 0
+
+    async def stream_message(self, request):
+        text = self._texts[min(self.calls, len(self._texts) - 1)]
+        self.calls += 1
+        yield ApiMessageCompleteEvent(
+            message=ConversationMessage(
+                role="assistant",
+                content=[TextBlock(text=text)],
+            ),
+            usage=UsageSnapshot(input_tokens=1, output_tokens=1),
+        )
+
+
+@pytest.mark.parametrize(
+    ("texts", "expected_passed", "expected_verdict", "expected_pass_votes"),
+    [
+        (["PASS a", "PASS b", "FAIL c"], True, "pass", 2),
+        (["FAIL a", "FAIL b", "PASS c"], False, "fail", 1),
+        (["PASS a", "FAIL b", "FAIL c"], False, "fail", 1),
+    ],
+)
+def test_trajectory_judge_majority_vote(
+    tmp_path: Path,
+    texts: list[str],
+    expected_passed: bool,
+    expected_verdict: str,
+    expected_pass_votes: int,
+):
+    api_client = _SequenceJudgeApiClient(texts)
+    scorer = TrajectoryJudgeScorer(api_client=api_client, model="judge-model", votes=3)
+
+    result = scorer.score(
+        context=_context(tmp_path),
+        executor_result=EvalExecutorResult(
+            final_text="answer",
+            tool_path=("web_fetch",),
+            tool_calls=(),
+        ),
+    )
+
+    assert api_client.calls == 3
+    assert result.passed is expected_passed
+    assert result.metadata["verdict"] == expected_verdict
+    assert result.metadata["judge_votes"] == 3
+    assert result.metadata["judge_pass_votes"] == expected_pass_votes
+
+
 def _context(tmp_path: Path) -> EvalExecutionContext:
     store = EvalStore(tmp_path / "evals")
     case = EvalRunPackCase(

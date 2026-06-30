@@ -155,6 +155,7 @@ def run_ohmo_eval_report(
     scorer: str | None = None,
     judge_profile: str | None = None,
     judge_model: str | None = None,
+    judge_votes: int = 3,
     synth_profile: str | None = None,
     synth_model: str | None = None,
     history_profile: str | None = None,
@@ -193,6 +194,7 @@ def run_ohmo_eval_report(
         selected_scorer = TrajectoryJudgeScorer(
             api_client=judge_config.api_client,
             model=judge_config.model,
+            votes=judge_votes,
         )
     elif scorer:
         selected_scorer = resolve_execution_scorer(scorer)
@@ -927,6 +929,7 @@ def _run_session_report_case_sampled(
                 "sample_count": samples,
                 "pass_count": pass_count,
                 "pass_rate": pass_count / samples,
+                "flaky": 0 < pass_count < samples,
             },
         }
     )

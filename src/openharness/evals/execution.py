@@ -66,6 +66,8 @@ _CAPABILITY_METADATA_KEYS = (
 _JUDGE_METADATA_KEYS = (
     "judge_model",
     "verdict",
+    "judge_votes",
+    "judge_pass_votes",
     "reason_hash",
     "reason_length",
     "observed_capability_count",
@@ -712,6 +714,10 @@ def _execute_case_sampled(
             )
         )
     pass_count = sum(1 for sample_case in sample_cases if sample_case.status == "passed")
+    # A split (neither unanimous pass nor unanimous fail) marks a flaky case:
+    # the verdict is a coin-flip, not a stable signal. Surface it so the gate can
+    # treat it as pass-with-warning rather than a hard pass/fail.
+    flaky = 0 < pass_count < samples
     return first.model_copy(
         update={
             "status": "passed" if pass_count * 2 > samples else "failed",
@@ -721,6 +727,7 @@ def _execute_case_sampled(
                 "sample_count": samples,
                 "pass_count": pass_count,
                 "pass_rate": pass_count / samples,
+                "flaky": flaky,
             },
         }
     )

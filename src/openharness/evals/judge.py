@@ -33,8 +33,13 @@ DEFAULT_TRAJECTORY_JUDGE_SYSTEM_PROMPT = (
     "actually asked -- even if it is shorter, organized differently, or omits "
     "extra facts the gold happened to include. Tolerate a different-but-valid "
     "tool path. FAIL only if the answer is wrong, off-topic, or omits something "
-    "the USER EXPLICITLY asked for. Reply with the first word PASS or FAIL, then "
-    "one short sentence explaining why."
+    "the USER EXPLICITLY asked for. "
+    "ABSENCE-CLAIM RULE: if the answer says information is unavailable / not "
+    "found / inaccessible, treat that as a substantive claim -- PASS it only when "
+    "the information is genuinely absent; FAIL it when the reference or the "
+    "observed trajectory shows the information was in fact reachable. "
+    "Be decisive and consistent: identical answers must get the same verdict. "
+    "Reply with the first word PASS or FAIL, then one short sentence explaining why."
 )
 _VERDICT_RE = re.compile(r"^\s*([A-Za-z]+)\b(.*)$", re.DOTALL)
 
@@ -53,12 +58,14 @@ class TrajectoryJudgeScorer:
         system_prompt: str = DEFAULT_TRAJECTORY_JUDGE_SYSTEM_PROMPT,
         max_tokens: int = 512,
         min_chars: int = 1,
+        votes: int = 3,
     ) -> None:
         self._api_client = api_client
         self._model = model
         self._system_prompt = system_prompt
         self._max_tokens = max_tokens
         self._min_chars = min_chars
+        self._votes = max(1, int(votes))
 
     def score(
         self,
@@ -75,8 +82,30 @@ class TrajectoryJudgeScorer:
             final_answer=executor_result.final_text,
             accepted_outcome=context.expected_final_text,
         )
-        response = _run_eval_coroutine(self._complete(prompt))
-        passed, verdict, reason = _parse_verdict(response, min_chars=self._min_chars)
+        # Judge the SAME trajectory N times and take the majority verdict; an
+        # LLM judge flips on borderline-equivalent answers, so a single vote is
+        # the dominant source of run-to-run flap. Ties resolve to FAIL.
+        verdicts: list[tuple[bool, str, str]] = [
+            _parse_verdict(
+                _run_eval_coroutine(self._complete(prompt)),
+                min_chars=self._min_chars,
+            )
+            for _ in range(self._votes)
+        ]
+        pass_votes = sum(1 for _, v, _ in verdicts if v == "pass")
+        fail_votes = sum(1 for _, v, _ in verdicts if v == "fail")
+        if pass_votes + fail_votes == 0:
+            # Every vote was unparseable -> preserve the distinct error verdict.
+            passed = False
+            verdict = "error"
+        else:
+            passed = pass_votes > fail_votes  # tie among valid votes -> fail
+            verdict = "pass" if passed else "fail"
+        # Surface a reason from the winning side (fall back to any reason).
+        reason = next(
+            (r for p, v, r in verdicts if v == verdict and r),
+            next((r for _, _, r in verdicts if r), ""),
+        )
         return EvalExecutionScorerResult(
             passed=passed,
             score=1.0 if passed else 0.0,
@@ -84,6 +113,8 @@ class TrajectoryJudgeScorer:
             metadata={
                 "judge_model": self._model,
                 "verdict": verdict,
+                "judge_votes": self._votes,
+                "judge_pass_votes": pass_votes,
                 "reason_hash": _hash_text(reason),
                 "reason_length": len(reason),
                 "observed_capability_count": len(observed),
@@ -145,8 +176,10 @@ def _judge_prompt(
         "NOT similarity to the reference. PASS a correct, responsive answer even "
         "if it is shorter or organized differently than the reference; FAIL only "
         "if it is wrong, off-topic, or misses something the user EXPLICITLY asked "
-        "for. Tolerate a different-but-valid tool path. Reply with the FIRST word "
-        "PASS or FAIL, then one short sentence why.\n\n"
+        "for. Tolerate a different-but-valid tool path. If the answer claims the "
+        "info is unavailable/not found, FAIL when the reference or trajectory shows "
+        "it was reachable. Reply with the FIRST word PASS or FAIL, then one short "
+        "sentence why.\n\n"
         f"User goal:\n{user_goal.strip()}\n\n"
         f"Observed trajectory:\n{trajectory}\n\n"
         f"Agent final answer:\n{final_answer.strip()}"

@@ -1564,6 +1564,15 @@ def evals_run_cmd(
         "--judge-model",
         help="Model override for --scorer trajectory_judge_v1",
     ),
+    judge_votes: int = typer.Option(
+        3,
+        "--judge-votes",
+        min=1,
+        help=(
+            "Judge each trajectory N times and take the majority verdict "
+            "(stabilizes the LLM judge; default 3, pass 1 to disable)"
+        ),
+    ),
     synth_profile: str | None = typer.Option(
         None,
         "--synth-profile",
@@ -1694,6 +1703,7 @@ def evals_run_cmd(
             "scorer": scorer,
             "fixture_match": fixture_match,
             "max_turns": max_turns,
+            "judge_votes": judge_votes,
         }
         if (
             sandbox_net_mode != "none"
