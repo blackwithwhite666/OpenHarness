@@ -37,6 +37,21 @@ Root causes found (grounded in per-sample judge reasons):
 
 All seven implemented + deployed on the `deploy` branch.
 
+**Re-baseline effect (full 59, samples-3).** OLD harness (single judge vote,
+pre-fix) vs NEW (majority-of-3 + absence rubric + F1/F6), pass_count `/3`:
+
+| | 3/3 | 2/3 | 1/3 | 0/3 | flap band (1–2/3) | decisive (3/3+0/3) |
+|---|---|---|---|---|---|---|
+| OLD | 45 | 6 | 5 | 3 | 11 | 48 |
+| NEW | 42 | 7 | 2 | 8 | **9** | **50** |
+
+Flap band shrank 11→9 and the worst (1/3) band 5→2; decisiveness rose 48→50.
+Pass count dipped 51→49 because the stricter absence rubric now *correctly*
+fails answers that claimed "not found" while the info was reachable (0/3 rose
+3→8) — the gate got honest, not worse. Residual flap (9) is dominated by live
+retrieval variance, addressed by the F2 live lane (agent-side F6 only fully
+lands in prod after a gateway restart).
+
 - **F7** — `--samples` already defaults to 3 (gate is samples-3); confirmed.
 - **F4** — `e0e96d8`: majority-of-3 judge votes (`--judge-votes`, default 3) +
   absence-claim rubric; ties→fail, all-unparseable→error.
