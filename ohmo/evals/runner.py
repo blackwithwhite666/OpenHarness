@@ -127,7 +127,7 @@ SUPPORTED_EVAL_AGENT_RUNNER_NAMES = (
     "fs-sandbox",
     "sandbox",
 )
-SUPPORTED_FIXTURE_MATCH_MODES = ("order", "arguments", "synth")
+SUPPORTED_FIXTURE_MATCH_MODES = ("order", "arguments", "args_then_order", "synth")
 _SUPPORTED_EXECUTORS = {
     "replay-tools": ReplayToolsExecutor,
     "replay_tools": ReplayToolsExecutor,

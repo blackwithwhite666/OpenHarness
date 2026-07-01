@@ -211,6 +211,62 @@ def test_validate_replay_match_mode_accepts_synth():
     _validate_replay_match_mode("synth")
 
 
+def test_validate_replay_match_mode_accepts_args_then_order():
+    _validate_replay_match_mode("args_then_order")
+
+
+@pytest.mark.asyncio
+async def test_replay_fixture_tool_args_then_order_falls_back_to_next_unused(
+    tmp_path: Path,
+):
+    tool = ReplayFixtureTool(
+        tool_name="bash",
+        fixtures=(
+            _fixture("bash", "alpha", {"command": "cmd A"}),
+            _fixture("bash", "beta", {"command": "cmd B"}),
+        ),
+        match_mode="args_then_order",
+    )
+
+    # 1) exact arg match wins, position-independent
+    matched = await tool.execute(
+        ReplayToolInput.model_validate({"command": "cmd B"}),
+        ToolExecutionContext(cwd=tmp_path),
+    )
+    # 2) args that match nothing fall back to the next UNUSED fixture in order,
+    #    instead of an empty miss (keeps a divergent trajectory progressing)
+    fallback = await tool.execute(
+        ReplayToolInput.model_validate({"command": "unrecorded path"}),
+        ToolExecutionContext(cwd=tmp_path),
+    )
+    # 3) once all fixtures are consumed, degrade to an empty (non-error) miss
+    miss = await tool.execute(
+        ReplayToolInput.model_validate({"command": "still unrecorded"}),
+        ToolExecutionContext(cwd=tmp_path),
+    )
+
+    assert matched.output == "beta"
+    assert matched.metadata["match"] == "arguments"
+    assert fallback.output == "alpha"
+    assert fallback.metadata["match"] == "order_fallback"
+    assert miss.is_error is False
+    assert miss.metadata["replay_miss"] is True
+
+
+def test_build_replay_tool_registry_excludes_always_live_todo_write():
+    registry = build_replay_tool_registry(
+        (
+            _fixture("todo_write", "ok", {"item": "note"}),
+            _fixture("bash", "first", {"command": "first command"}),
+        ),
+        match_mode="order",
+    )
+
+    # todo_write is provided live by the query-engine runner, so no replay copy
+    assert registry.get("todo_write") is None
+    assert registry.get("bash") is not None
+
+
 def _fixture(
     tool_name: str,
     output: str,

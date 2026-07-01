@@ -381,6 +381,26 @@ class ReplayFixtureTool(BaseTool):
                     "call_key_hash": fixture.call_key_hash,
                 },
             )
+        if self._match_mode == "args_then_order":
+            # Position-independent match failed; fall back to the next unused
+            # fixture in recorded order instead of returning an empty miss. This
+            # keeps a divergent-but-plausible trajectory progressing (the agent
+            # took a valid path the gold didn't record verbatim) rather than
+            # stalling it. Tested against plain "order" for error_recovery /
+            # tool_workflow cases, where many valid paths exist.
+            for index, fixture in enumerate(self._fixtures):
+                if index in self._used_indexes:
+                    continue
+                self._used_indexes.add(index)
+                return ToolResult(
+                    output=fixture.output_text,
+                    is_error=fixture.is_error,
+                    metadata={
+                        "replayed": True,
+                        "match": "order_fallback",
+                        "call_key_hash": fixture.call_key_hash,
+                    },
+                )
         return ToolResult(
             output="",
             is_error=False,
@@ -396,6 +416,11 @@ class ReplayFixtureTool(BaseTool):
         return True
 
 
+# Local bookkeeping tools that are always provided live (deterministic, no
+# network) by the query-engine runner and must never be replayed from fixtures.
+_ALWAYS_LIVE_LOCAL_TOOLS = frozenset({"todo_write"})
+
+
 def build_replay_tool_registry(
     fixtures: tuple[EvalToolFixture, ...],
     *,
@@ -409,6 +434,13 @@ def build_replay_tool_registry(
     registry = ToolRegistry()
     by_name: dict[str, list[EvalToolFixture]] = {}
     for fixture in fixtures:
+        # Never build a replay fixture for always-live local tools: the
+        # query-engine runner injects a real (deterministic, no-network)
+        # todo_write over this registry, so a replay copy would just be dead
+        # weight and pollute the fixture accounting. todo_write is pure local
+        # bookkeeping — replaying its captured "ok" output carries no signal.
+        if fixture.tool_name in _ALWAYS_LIVE_LOCAL_TOOLS:
+            continue
         by_name.setdefault(fixture.tool_name, []).append(fixture)
     for tool_name, tool_fixtures in by_name.items():
         fixtures_tuple = tuple(tool_fixtures)
@@ -439,8 +471,10 @@ def build_replay_tool_registry(
 
 
 def _validate_replay_match_mode(match_mode: str) -> None:
-    if match_mode not in {"order", "arguments", "synth"}:
-        raise ValueError("fixture match mode must be one of: order, arguments, synth")
+    if match_mode not in {"order", "arguments", "args_then_order", "synth"}:
+        raise ValueError(
+            "fixture match mode must be one of: order, arguments, args_then_order, synth"
+        )
 
 
 def _run_eval_coroutine(
