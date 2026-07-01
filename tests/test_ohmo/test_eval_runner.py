@@ -70,7 +70,9 @@ def test_run_ohmo_eval_report_writes_metadata_replay_report(tmp_path: Path):
     assert result.report_only is True
     assert result.write.path == workspace.resolve() / "evals" / "reports" / "eval_report.json"
     assert result.write.report.metadata["executor_name"] == "replay-tools"
-    assert result.write.report.metadata["fixture_match"] == "order"
+    # Default fixture matching is args_then_order (arg-match, order fallback): it
+    # beat plain order on the pack (51/8 vs 45/14) without losing determinism.
+    assert result.write.report.metadata["fixture_match"] == "args_then_order"
     # max_turns is recorded so a run's turn budget is reproducible from the report
     assert result.write.report.metadata["max_turns"] == 23
     assert result.write.report.case_count == 1

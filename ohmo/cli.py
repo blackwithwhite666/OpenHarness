@@ -1637,7 +1637,7 @@ def evals_run_cmd(
         help="Model override for LLM-scoped history reconstruction",
     ),
     fixture_match: str = typer.Option(
-        "order",
+        "args_then_order",
         "--fixture-match",
         help=_FIXTURE_MATCH_HELP,
     ),
@@ -1847,7 +1847,7 @@ def evals_run_session_cmd(
         help="Model override for the hybrid user simulator",
     ),
     fixture_match: str = typer.Option(
-        "order",
+        "args_then_order",
         "--fixture-match",
         help=_FIXTURE_MATCH_HELP,
     ),

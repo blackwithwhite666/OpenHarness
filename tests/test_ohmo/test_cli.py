@@ -1603,7 +1603,7 @@ def test_ohmo_evals_run_command_runs_eval_report(tmp_path: Path, monkeypatch):
             "model": None,
             "provider_profile": None,
             "system_prompt": None,
-            "fixture_match": "order",
+            "fixture_match": "args_then_order",
         },
     ]
 
@@ -1691,7 +1691,7 @@ def test_ohmo_evals_run_command_threads_sandbox_agent_runner(
             "provider_profile": None,
             "system_prompt": None,
             "scorer": "state_outcome_oracle_v1",
-            "fixture_match": "order",
+            "fixture_match": "args_then_order",
         }
     ]
 
@@ -1836,7 +1836,7 @@ def test_ohmo_evals_run_command_threads_live_read_agent_runner(
             "scorer": None,
             "judge_profile": None,
             "judge_model": None,
-            "fixture_match": "order",
+            "fixture_match": "args_then_order",
         }
     ]
 
@@ -2060,7 +2060,7 @@ def test_ohmo_evals_run_command_passes_output_filename(tmp_path: Path, monkeypat
             "model": None,
             "provider_profile": None,
             "system_prompt": None,
-            "fixture_match": "order",
+            "fixture_match": "args_then_order",
         }
     ]
     assert "custom_eval_report.json" in result.output
@@ -2234,7 +2234,7 @@ def test_ohmo_evals_run_command_passes_query_engine_runner_options(
             "model": "eval-model",
             "provider_profile": "openai-compatible",
             "system_prompt": "eval system",
-            "fixture_match": "order",
+            "fixture_match": "args_then_order",
         }
     ]
 
@@ -2512,7 +2512,7 @@ def test_ohmo_evals_run_command_check_config_does_not_run_eval(
             "model": "eval-model",
             "provider_profile": "openai-compatible",
             "system_prompt": None,
-            "fixture_match": "order",
+            "fixture_match": "args_then_order",
         }
     ]
     assert "Eval run configuration is valid." in result.output

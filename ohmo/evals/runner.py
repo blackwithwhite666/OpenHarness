@@ -168,7 +168,7 @@ def run_ohmo_eval_report(
     history_profile: str | None = None,
     history_model: str | None = None,
     samples: int = 1,
-    fixture_match: str = "order",
+    fixture_match: str = "args_then_order",
     max_turns: int = 100,
     sandbox_net_mode: str = "none",
     sandbox_proxy_url: str | None = None,
@@ -324,7 +324,7 @@ def run_ohmo_session_eval(
     user_sim_profile: str | None = None,
     user_sim_model: str | None = None,
     clarification_allowed_by_session: Mapping[str, bool] | None = None,
-    fixture_match: str = "order",
+    fixture_match: str = "args_then_order",
     max_session_turns: int | None = None,
 ) -> OhmoSessionEvalRunResult:
     """Run P0 session replay checks over captured Ohmo eval episodes."""
@@ -478,7 +478,7 @@ def check_ohmo_eval_run_config(
     provider_profile: str | None = None,
     system_prompt: str | None = None,
     scorer: str | None = None,
-    fixture_match: str = "order",
+    fixture_match: str = "args_then_order",
 ) -> OhmoEvalRunConfigCheckResult:
     """Validate an eval run configuration without executing eval cases."""
     if limit is not None and limit <= 0:
@@ -526,7 +526,7 @@ def _build_executor(
         | FsSandboxAgentRunner
         | SandboxMutatingAgentRunner
     ),
-    fixture_match: str = "order",
+    fixture_match: str = "args_then_order",
     synth_context: SynthContext | None = None,
 ) -> ReplayToolsExecutor:
     fixture_match = _validate_fixture_match(fixture_match)
