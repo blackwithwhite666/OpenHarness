@@ -25,6 +25,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Set up user session (systemd --user / D-Bus)
+        # The bash/task tools sandbox subprocesses with `systemd-run --user
+        # --scope`; from the system-service runner that needs the user manager's
+        # bus, else every such test fails "Failed to connect to bus".
+        run: |
+          uid="$(id -u)"
+          echo "XDG_RUNTIME_DIR=/run/user/${uid}" >> "$GITHUB_ENV"
+          echo "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/${uid}/bus" >> "$GITHUB_ENV"
+
       - name: Create venv + install (dev extras)
         run: |
           python3 -m venv .ci-venv
