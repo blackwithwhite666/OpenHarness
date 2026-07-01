@@ -1,0 +1,63 @@
+name: Deploy (self-hosted)
+
+# Self-hosted runner on the ohmo agent host (93.77.160.211, ~/ci).
+#   push/PR -> deploy : tests (the live-web `eval` suite is excluded)
+#   push    -> deploy : redeploy the gateway (auto, after a green test job)
+#
+# Deploy = reinstall the pipx package from the pushed `deploy` HEAD, wait for the
+# gateway to be idle (so a restart doesn't drop an in-flight user turn), then
+# restart the user-systemd unit. See adrs/ci-cd.md and ci/wait_for_idle.sh.
+# (The upstream ci.yml still runs the GitHub-hosted matrix on main / PRs.)
+
+on:
+  push:
+    branches: [deploy]
+  pull_request:
+    branches: [deploy]
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: [self-hosted, linux, x64]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create venv + install (dev extras)
+        run: |
+          python3 -m venv .ci-venv
+          . .ci-venv/bin/activate
+          python -m pip install -q --upgrade pip
+          python -m pip install -q -e '.[dev]'
+
+      - name: Tests (excluding the live-web eval suite)
+        run: |
+          . .ci-venv/bin/activate
+          python -m pytest -m "not eval" --ignore=tests/eval -o addopts="" -q
+
+  deploy:
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/deploy'
+    runs-on: [self-hosted, linux, x64]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Reinstall openharness-ai from deploy HEAD
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          pipx install --force "git+https://github.com/blackwithwhite666/OpenHarness@deploy"
+
+      - name: Wait for the gateway to be idle
+        run: bash ci/wait_for_idle.sh
+
+      - name: Restart the gateway (user systemd)
+        run: |
+          uid="$(id -u)"
+          export XDG_RUNTIME_DIR="/run/user/${uid}"
+          export DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${uid}/bus"
+          systemctl --user restart ohmo-gateway.service
+          sleep 3
+          systemctl --user is-active ohmo-gateway.service
+          journalctl --user -u ohmo-gateway.service -n 15 --no-pager
