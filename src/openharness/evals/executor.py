@@ -209,6 +209,7 @@ class QueryEngineEvalAgentRunner:
         max_turns: int = 8,
         max_tokens: int = 4096,
         live_local_tool_factory: Callable[[Path], Sequence[BaseTool]] | None = None,
+        local_state_root: str | Path | None = None,
     ) -> None:
         self._api_client = api_client
         self._model = model
@@ -217,6 +218,13 @@ class QueryEngineEvalAgentRunner:
         self._max_turns = max_turns
         self._max_tokens = max_tokens
         self._live_local_tool_factory = live_local_tool_factory
+        # When set, live local tools (todo_write, ...) bind to this fixed path
+        # instead of a per-run mkdtemp. Some live tools echo their state's
+        # absolute path in tool output; a random temp dir makes that output —
+        # and every downstream request — differ run-to-run, which defeats the
+        # completion cache. A stable, per-run-cleaned root keeps outputs
+        # reproducible so cached re-runs hit.
+        self._local_state_root = Path(local_state_root) if local_state_root is not None else None
 
     def run(
         self,
@@ -228,9 +236,16 @@ class QueryEngineEvalAgentRunner:
         local_state_root: Path | None = None
         try:
             if self._live_local_tool_factory is not None:
-                local_state_root = Path(
-                    tempfile.mkdtemp(prefix="openharness-eval-local-tools-")
-                ).resolve()
+                if self._local_state_root is not None:
+                    local_state_root = self._local_state_root.resolve()
+                    # Start clean so the same call sequence regenerates the same
+                    # state (and the same paths in tool output) every run.
+                    shutil.rmtree(local_state_root, ignore_errors=True)
+                    local_state_root.mkdir(parents=True, exist_ok=True)
+                else:
+                    local_state_root = Path(
+                        tempfile.mkdtemp(prefix="openharness-eval-local-tools-")
+                    ).resolve()
                 for tool in self._live_local_tool_factory(local_state_root):
                     tool_registry.register(tool)
             return _run_eval_coroutine(

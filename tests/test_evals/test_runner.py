@@ -2094,3 +2094,65 @@ def _add_episode(
             payload={"text": final_text},
         )
     )
+
+
+def test_query_engine_runner_binds_live_tools_to_stable_state_root(tmp_path: Path):
+    # With a fixed local_state_root, the live-tool factory is bound to the SAME
+    # path on every run() (so tool output that echoes the path is reproducible).
+    seen: list[Path] = []
+
+    def factory(state_root: Path):
+        seen.append(state_root)
+        return ()
+
+    root = tmp_path / "fixed-state"
+    runner = QueryEngineEvalAgentRunner(
+        api_client=_FinalOnlyModelApiClient(final_text="done"),
+        model="eval-model",
+        system_prompt="eval system",
+        cwd=tmp_path,
+        max_turns=2,
+        live_local_tool_factory=factory,
+        local_state_root=root,
+    )
+
+    def _run():
+        return runner.run(
+            prompt="hello",
+            tool_registry=build_replay_tool_registry(()),
+            context=SimpleNamespace(events=()),
+        )
+
+    first = _run()
+    _run()
+
+    assert first.final_text == "done"
+    assert seen == [root.resolve(), root.resolve()]  # stable across runs
+
+
+def test_query_engine_runner_uses_fresh_temp_root_without_override(tmp_path: Path):
+    # Default behaviour is preserved: each run() gets its own mkdtemp isolation.
+    seen: list[Path] = []
+
+    def factory(state_root: Path):
+        seen.append(state_root)
+        return ()
+
+    runner = QueryEngineEvalAgentRunner(
+        api_client=_FinalOnlyModelApiClient(final_text="done"),
+        model="eval-model",
+        system_prompt="eval system",
+        cwd=tmp_path,
+        max_turns=2,
+        live_local_tool_factory=factory,
+    )
+    for _ in range(2):
+        runner.run(
+            prompt="hello",
+            tool_registry=build_replay_tool_registry(()),
+            context=SimpleNamespace(events=()),
+        )
+
+    assert len(seen) == 2
+    assert seen[0] != seen[1]  # random mkdtemp -> distinct per run
+    assert all("openharness-eval-local-tools-" in p.name for p in seen)

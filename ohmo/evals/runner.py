@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import tempfile
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,6 +17,8 @@ from openharness.api.resolver import (
 from openharness.config import load_settings
 from openharness.config.settings import Settings
 from openharness.evals import (
+    CachingApiClient,
+    CompletionCache,
     EvalExecutionReportWrite,
     EvalSessionReport,
     EvalSessionReportCase,
@@ -174,6 +177,9 @@ def run_ohmo_eval_report(
     sandbox_proxy_url: str | None = None,
     sandbox_browser_socket: str | None = None,
     sandbox_browser_name: str | None = None,
+    cache_completions: str | Path | None = None,
+    cache_strict: bool = False,
+    cache_prune_to: str | Path | None = None,
 ) -> OhmoEvalRunResult:
     """Run deterministic replay-tools execution checks over an Ohmo eval pack."""
     if max_turns < 1:
@@ -182,6 +188,13 @@ def run_ohmo_eval_report(
         raise ValueError("limit must be positive")
     fixture_match = _validate_fixture_match(fixture_match)
     workspace_root = Path(workspace).expanduser().resolve() if workspace else None
+    # One cache shared across the agent turns and the judge votes, so the
+    # reported hit-rate covers every model call in the suite run.
+    completion_cache = (
+        CompletionCache(cache_completions, strict_offline=cache_strict)
+        if cache_completions
+        else None
+    )
     selected_scorer = None
     judge_config: _AgentRunnerConfig | None = None
     synth_config: _AgentRunnerConfig | None = None
@@ -195,6 +208,7 @@ def run_ohmo_eval_report(
             model=judge_model or model,
             provider_profile=judge_profile or provider_profile,
             system_prompt=None,
+            completion_cache=completion_cache,
         )
         if judge_config.api_client is None:
             raise ValueError("trajectory_judge_v1 requires configured API authentication")
@@ -213,6 +227,7 @@ def run_ohmo_eval_report(
             model=synth_model or model,
             provider_profile=synth_profile or provider_profile,
             system_prompt=None,
+            completion_cache=completion_cache,
         )
         if synth_config.api_client is None:
             raise ValueError("synth fixture match requires configured API authentication")
@@ -245,6 +260,7 @@ def run_ohmo_eval_report(
                 or provider_profile
             ),
             system_prompt=None,
+            completion_cache=completion_cache,
         )
         if history_config.api_client is None:
             raise ValueError("history segmentation requires configured API authentication")
@@ -272,6 +288,7 @@ def run_ohmo_eval_report(
         provider_profile=provider_profile,
         system_prompt=system_prompt,
         max_turns=max_turns,
+        completion_cache=completion_cache,
         **agent_runner_kwargs,
     )
     executor = _build_executor(
@@ -282,17 +299,22 @@ def run_ohmo_eval_report(
     )
     store = get_eval_store(workspace)
     pack = read_run_pack(store, pack_filename=pack_filename)
-    write = run_execution_report(
-        store,
-        pack=pack,
-        report_filename=report_filename,
-        limit=limit,
-        samples=samples,
-        max_turns=max_turns,
-        executor=executor,
-        scorer=selected_scorer,
-        history_context=history_context,
-    )
+    try:
+        write = run_execution_report(
+            store,
+            pack=pack,
+            report_filename=report_filename,
+            limit=limit,
+            samples=samples,
+            max_turns=max_turns,
+            executor=executor,
+            scorer=selected_scorer,
+            history_context=history_context,
+        )
+    finally:
+        # Persist even on partial failure so a crashed cold run is resumable.
+        if completion_cache is not None:
+            completion_cache.save()
     if judge_config is not None:
         write.report.metadata["judge_model"] = judge_config.model
         write.report.metadata["judge_provider_profile"] = judge_config.provider_profile
@@ -302,10 +324,22 @@ def run_ohmo_eval_report(
     if history_config is not None:
         write.report.metadata["history_model"] = history_config.model
         write.report.metadata["history_provider_profile"] = history_config.provider_profile
+    if completion_cache is not None:
+        write.report.metadata["completion_cache"] = completion_cache.stats()
+        write.report.metadata["completion_cache_path"] = (
+            str(completion_cache.path) if completion_cache.path is not None else ""
+        )
+        if cache_prune_to is not None:
+            pruned = completion_cache.save_pruned(cache_prune_to)
+            write.report.metadata["completion_cache_pruned"] = {
+                **pruned,
+                "path": str(Path(cache_prune_to).expanduser().resolve()),
+            }
     if (
         judge_config is not None
         or synth_config is not None
         or history_config is not None
+        or completion_cache is not None
     ):
         atomic_write_text(write.path, write.report.model_dump_json(indent=2) + "\n")
     return OhmoEvalRunResult(write=write, report_only=report_only)
@@ -624,6 +658,7 @@ def _build_agent_runner_config(
     sandbox_proxy_url: str | None = None,
     sandbox_browser_socket: str | None = None,
     sandbox_browser_name: str | None = None,
+    completion_cache: CompletionCache | None = None,
 ) -> _AgentRunnerConfig:
     normalized = agent_runner_name.strip().lower()
     if normalized not in _SUPPORTED_AGENT_RUNNERS:
@@ -650,6 +685,11 @@ def _build_agent_runner_config(
         raise ValueError(
             f"{normalized} eval runner requires configured API authentication"
         ) from exc
+    if completion_cache is not None:
+        # Inner-loop cache: replay recorded model completions on unchanged
+        # prompts; record live completions on a cold run. Same wrapper for the
+        # agent turns and the judge votes, so they share one hit/miss counter.
+        api_client = CachingApiClient(api_client, completion_cache)
     resolved_prompt = _resolve_eval_system_prompt(
         settings, workspace=workspace, system_prompt=system_prompt
     )
@@ -726,6 +766,7 @@ def _build_agent_runner_config(
             cwd=workspace,
             max_turns=max_turns,
             live_local_tool_factory=_make_live_local_tool_factory(workspace),
+            local_state_root=_stable_local_state_root(completion_cache),
         ),
         agent_runner_name="query-engine",
         model=settings.model,
@@ -734,6 +775,27 @@ def _build_agent_runner_config(
         system_prompt=resolved_prompt,
         cwd=workspace,
     )
+
+
+_CACHED_EVAL_LOCAL_STATE_DIR = "openharness-eval-local-state"
+
+
+def _stable_local_state_root(completion_cache: CompletionCache | None) -> Path | None:
+    """A fixed local-state dir for cached runs.
+
+    Live local tools (todo_write) echo their state's absolute path in tool
+    output, which becomes part of the completion-cache key. A random per-run
+    mkdtemp — OR a path derived from the cache file — makes that output differ
+    between record and replay (or on a different machine/CI where the cache lives
+    elsewhere), which breaks the cache. So use ONE fixed path: identical every
+    run, every machine, regardless of where the cache file sits, which is exactly
+    what a portable, committable cache needs. Eval runs are sequential and each
+    run wipes this dir at start, so a shared constant is safe. Returns None when
+    caching is off, preserving the mkdtemp isolation for normal runs.
+    """
+    if completion_cache is None:
+        return None
+    return Path(tempfile.gettempdir()) / _CACHED_EVAL_LOCAL_STATE_DIR
 
 
 def _ohmo_todo_write_tool_factory(state_root: Path) -> Sequence[BaseTool]:

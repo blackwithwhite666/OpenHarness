@@ -234,6 +234,7 @@ def test_run_ohmo_session_eval_hybrid_user_sim_profile_records_metrics(
         provider_profile,
         system_prompt,
         max_turns: int = 8,
+        **_kwargs,
     ):
         build_calls.append(
             {
@@ -300,6 +301,7 @@ def test_run_ohmo_session_eval_rejects_shared_user_sim_profile(
         provider_profile,
         system_prompt,
         max_turns: int = 8,
+        **_kwargs,
     ):
         return runner_module._AgentRunnerConfig(
             agent_runner=object(),
@@ -471,6 +473,7 @@ def respond(arguments, captured):
         provider_profile,
         system_prompt,
         max_turns: int = 8,
+        **_kwargs,
     ):
         config_calls.append(
             {
@@ -550,6 +553,7 @@ def test_run_ohmo_eval_report_history_builds_segment_context(
         provider_profile,
         system_prompt,
         max_turns: int = 8,
+        **_kwargs,
     ):
         config_calls.append(
             {
@@ -625,6 +629,7 @@ def test_run_ohmo_eval_report_threads_max_turns_to_agent_runner(
         provider_profile,
         system_prompt,
         max_turns: int = 8,
+        **_kwargs,
     ):
         seen_max_turns.append(max_turns)
         return runner_module._AgentRunnerConfig(
@@ -673,6 +678,7 @@ def test_run_ohmo_eval_report_without_history_flags_does_not_build_history_clien
         provider_profile,
         system_prompt,
         max_turns: int = 8,
+        **_kwargs,
     ):
         del workspace, model, provider_profile, system_prompt
         config_calls.append(agent_runner_name)
@@ -756,6 +762,7 @@ def test_run_ohmo_eval_report_trajectory_judge_scores_metadata_only(
         provider_profile,
         system_prompt,
         max_turns: int = 8,
+        **_kwargs,
     ):
         config_calls.append(
             {
@@ -1530,3 +1537,22 @@ def test_eval_system_prompt_honors_explicit_override(tmp_path: Path):
         Settings(), workspace=workspace, system_prompt="EXPLICIT_OVERRIDE"
     )
     assert resolved == "EXPLICIT_OVERRIDE"
+
+
+def test_stable_local_state_root_is_fixed_and_path_independent(tmp_path):
+    from openharness.evals import CompletionCache
+
+    from ohmo.evals.runner import _stable_local_state_root
+
+    # No caching -> no override (preserves per-run mkdtemp isolation).
+    assert _stable_local_state_root(None) is None
+
+    # A FIXED path, independent of where the cache file lives — this is what makes
+    # the recorded cache portable (record on one host/path, replay in CI on
+    # another): live-tool output that echoes this path stays byte-identical.
+    root_a = _stable_local_state_root(CompletionCache(tmp_path / "a.json"))
+    root_b = _stable_local_state_root(CompletionCache(tmp_path / "sub" / "b.json"))
+    root_mem = _stable_local_state_root(CompletionCache())  # in-memory, no path
+
+    assert root_a is not None
+    assert root_a == root_b == root_mem  # same fixed dir regardless of cache path

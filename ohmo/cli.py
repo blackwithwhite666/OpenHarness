@@ -1656,6 +1656,17 @@ def evals_run_cmd(
         "--system-prompt",
         help="Override ohmo's real system prompt for --agent-runner query-engine",
     ),
+    system_prompt_file: str | None = typer.Option(
+        None,
+        "--system-prompt-file",
+        help=(
+            "Read the agent system prompt from a file (pins it). The live prompt "
+            "embeds the current date and the local skills catalog, so it changes "
+            "day-to-day and machine-to-machine — pinning it is required for a "
+            "self-contained, reproducible run whose --cache-completions actually "
+            "hits. Mutually exclusive with --system-prompt."
+        ),
+    ),
     max_turns: int = typer.Option(
         100,
         "--max-turns",
@@ -1682,6 +1693,35 @@ def evals_run_cmd(
         "--sandbox-browser-name",
         help="BROWSER_CLI_NAME injected into fs-sandbox bash",
     ),
+    cache_completions: str | None = typer.Option(
+        None,
+        "--cache-completions",
+        help=(
+            "Path to a completion-cache file for the inner loop. A cold run "
+            "records every model completion (agent turns + judge votes); re-runs "
+            "with unchanged prompts serve them from disk with zero model calls "
+            "and zero flap. Hit-rate is printed and stored in the report."
+        ),
+    ),
+    cache_strict: bool = typer.Option(
+        False,
+        "--cache-strict",
+        help=(
+            "Offline mode for --cache-completions: on a cache miss, do NOT call "
+            "the model — yield an empty stub so the turn ends. Use in CI (no "
+            "model access) and to measure hit-rate cheaply; a prompt/code change "
+            "that invalidates the cache surfaces as misses (re-record needed)."
+        ),
+    ),
+    cache_prune_to: str | None = typer.Option(
+        None,
+        "--cache-prune-to",
+        help=(
+            "After the run, write a minimal cache to this path containing only "
+            "the completions actually served (drops stale/other-run keys). The "
+            "committable, self-contained artifact for the CI inner-eval gate."
+        ),
+    ),
     report_only: bool = typer.Option(
         False,
         "--report-only",
@@ -1698,6 +1738,20 @@ def evals_run_cmd(
 
     Agent runner to use inside the executor is selected with --agent-runner.
     """
+    if system_prompt_file is not None:
+        if system_prompt is not None:
+            print(
+                "--system-prompt and --system-prompt-file are mutually exclusive",
+                file=sys.stderr,
+            )
+            raise typer.Exit(1)
+        try:
+            system_prompt = Path(system_prompt_file).expanduser().read_text(
+                encoding="utf-8"
+            )
+        except OSError as exc:
+            print(f"cannot read --system-prompt-file: {exc}", file=sys.stderr)
+            raise typer.Exit(1)
     workspace_root = initialize_workspace(workspace)
     try:
         if check_config:
@@ -1771,6 +1825,11 @@ def evals_run_cmd(
             run_kwargs["history_profile"] = history_profile
         if history_model is not None:
             run_kwargs["history_model"] = history_model
+        if cache_completions is not None:
+            run_kwargs["cache_completions"] = cache_completions
+            run_kwargs["cache_strict"] = cache_strict
+            if cache_prune_to is not None:
+                run_kwargs["cache_prune_to"] = cache_prune_to
         result = run_ohmo_eval_report(**run_kwargs)
     except (FileNotFoundError, ValueError) as exc:
         print(str(exc), file=sys.stderr)
@@ -1795,6 +1854,15 @@ def evals_run_cmd(
         f"blocked={getattr(report, 'blocked_count', 0)} "
         f"error={getattr(report, 'error_count', 0)}"
     )
+    cache_stats = (getattr(report, "metadata", {}) or {}).get("completion_cache")
+    if cache_stats:
+        print(
+            "Completion cache: "
+            f"hit_rate={cache_stats.get('hit_rate', 0.0):.1%} "
+            f"hits={cache_stats.get('hits', 0)} "
+            f"misses={cache_stats.get('misses', 0)} "
+            f"keys={cache_stats.get('keys', 0)}"
+        )
     if result.report_only:
         print("Report-only mode: failures did not fail the command")
         return

@@ -174,6 +174,11 @@ from openharness.evals.session_user_simulator import (
     UserTurn,
     replay_matches,
 )
+from openharness.evals.completion_cache import (
+    CachingApiClient,
+    CompletionCache,
+    request_cache_key,
+)
 from openharness.evals.synth_fixture import (
     SYNTH_CODEGEN_SYSTEM_PROMPT,
     SynthesizedFixtureTool,
@@ -247,9 +252,12 @@ __all__ = [
     "EvalExecutorResult",
     "EvalObservedCall",
     "CapabilityCoverageOracleV1",
+    "CachingApiClient",
     "CapabilityTraceOracleV1",
+    "CompletionCache",
     "ExactMatchEvalScorer",
     "HistoryContext",
+    "request_cache_key",
     "StateOutcomeOracleV1",
     "StateOracleV1",
     "SYNTH_CODEGEN_SYSTEM_PROMPT",
