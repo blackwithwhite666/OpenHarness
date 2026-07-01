@@ -127,7 +127,13 @@ SUPPORTED_EVAL_AGENT_RUNNER_NAMES = (
     "fs-sandbox",
     "sandbox",
 )
-SUPPORTED_FIXTURE_MATCH_MODES = ("order", "arguments", "args_then_order", "synth")
+SUPPORTED_FIXTURE_MATCH_MODES = (
+    "order",
+    "arguments",
+    "args_then_order",
+    "synth",
+    "synth_state",
+)
 _SUPPORTED_EXECUTORS = {
     "replay-tools": ReplayToolsExecutor,
     "replay_tools": ReplayToolsExecutor,
@@ -200,7 +206,7 @@ def run_ohmo_eval_report(
         )
     elif scorer:
         selected_scorer = resolve_execution_scorer(scorer)
-    if fixture_match == "synth":
+    if fixture_match in ("synth", "synth_state"):
         synth_config = _build_agent_runner_config(
             "query-engine",
             workspace=workspace_root,
@@ -347,7 +353,7 @@ def run_ohmo_session_eval(
             api_client=agent_runner_config.api_client,
             model=agent_runner_config.model,
         )
-        if fixture_match == "synth"
+        if fixture_match in ("synth", "synth_state")
         else None
     )
 

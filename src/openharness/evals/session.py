@@ -125,9 +125,18 @@ class SessionReplayRunner:
         fixture_match_mode: str = "order",
         synth_context: SynthContext | None = None,
     ) -> None:
-        if fixture_match_mode not in {"order", "arguments", "synth"}:
-            raise ValueError("fixture match mode must be one of: order, arguments, synth")
-        if fixture_match_mode == "synth" and synth_context is None:
+        if fixture_match_mode not in {
+            "order",
+            "arguments",
+            "args_then_order",
+            "synth",
+            "synth_state",
+        }:
+            raise ValueError(
+                "fixture match mode must be one of: order, arguments, "
+                "args_then_order, synth, synth_state"
+            )
+        if fixture_match_mode in {"synth", "synth_state"} and synth_context is None:
             raise ValueError("synth fixture match requires a SynthContext")
         self._api_client = api_client
         self._model = model

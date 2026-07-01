@@ -248,6 +248,50 @@ def respond(arguments, captured):
     assert captured["payload"]["captured"][0]["output"] == "frozen output"
 
 
+@pytest.mark.asyncio
+async def test_synth_fixture_stateful_threads_state_across_calls(tmp_path: Path):
+    # respond() sees a `state` dict that persists across calls to this tool, so
+    # it can model error-then-recovery (a stateless respond cannot tell call #1
+    # from call #2 for identical args).
+    api_client = _StaticCodegenApiClient(
+        """
+def respond(arguments, captured, state):
+    n = state.get("n", 0) + 1
+    state["n"] = n
+    if n == 1:
+        return "attempt-1-transient-error"
+    return "attempt-" + str(n) + "-ok"
+""".strip()
+    )
+    tool = SynthesizedFixtureTool(
+        tool_name="bash",
+        fixtures=(_fixture(),),
+        api_client=api_client,
+        model="codegen-model",
+        stateful=True,
+    )
+
+    first = await tool.execute(
+        ReplayToolInput.model_validate({"query": "x"}),
+        ToolExecutionContext(cwd=tmp_path),
+    )
+    second = await tool.execute(
+        ReplayToolInput.model_validate({"query": "x"}),
+        ToolExecutionContext(cwd=tmp_path),
+    )
+    third = await tool.execute(
+        ReplayToolInput.model_validate({"query": "x"}),
+        ToolExecutionContext(cwd=tmp_path),
+    )
+
+    assert first.output == "attempt-1-transient-error"
+    assert second.output == "attempt-2-ok"
+    assert third.output == "attempt-3-ok"
+    assert first.metadata["lane"] == "synth"
+    # codegen runs once; the persisted state (not a re-codegen) drives the change
+    assert len(api_client.requests) == 1
+
+
 def _tool(
     *,
     api_client,

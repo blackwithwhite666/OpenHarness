@@ -87,10 +87,68 @@ except Exception as exc:
     print(json.dumps({"ok": False, "error": repr(exc)}))
 """
 
+SYNTH_STATE_CODEGEN_SYSTEM_PROMPT = """\
+You write deterministic Python replay fixture adapters WITH STATE.
+
+Output ONLY the source of:
+
+def respond(arguments, captured, state):
+    ...
+
+Contract:
+- arguments is a dict containing the agent's tool arguments for THIS call.
+- captured is a list of dicts {"input": str, "output": str, "is_error": bool}
+  containing the real captured examples for this tool.
+- state is a dict that PERSISTS across calls to THIS tool within one eval case.
+  It starts as {} on the first call. Mutate it IN PLACE to remember anything you
+  need across calls. It must stay JSON-serializable.
+- respond returns ONE string: the tool output.
+
+Use state to model call-order-dependent behavior a stateless function cannot:
+- Recovery: if captured shows a transient error then a success for the same
+  request, return the error on the first matching call and the success on the
+  retry -- track a per-request attempt counter in state.
+- Pagination / progression: advance a cursor kept in state.
+- Effects of earlier calls to THIS tool (e.g. an item added earlier shows up in
+  a later listing).
+
+Rules:
+- Ground every returned FACT in captured; never invent names/numbers/URLs/results
+  absent from captured. state holds only control info (counters, cursors, seen
+  keys/ids) and values you already grounded in captured.
+- If arguments ask for something not present, return the most relevant captured
+  output or a short honest "no data" string -- never invent.
+- Standard library only; deterministic given (arguments, captured, state); no
+  network/file/OS access; no I/O; no randomness; no wall-clock time.
+- Output ONLY the function source (no markdown fences, no prose).
+"""
+
+RUNNER_STATE = r"""
+import json
+import sys
+
+try:
+    payload = json.loads(sys.stdin.read())
+    namespace = {}
+    exec(payload["code"], namespace)
+    respond = namespace["respond"]
+    state = payload.get("state") or {}
+    result = respond(payload.get("arguments") or {}, payload.get("captured") or [], state)
+    output = result
+    new_state = state
+    if isinstance(result, (list, tuple)) and len(result) == 2 and isinstance(result[1], dict):
+        output, new_state = result[0], result[1]
+    print(json.dumps({"ok": True, "output": str(output), "state": new_state}))
+except Exception as exc:
+    print(json.dumps({"ok": False, "error": repr(exc)}))
+"""
+
 
 def _codegen_prompt(
     tool_name: str,
     fixtures: tuple[EvalToolFixture, ...],
+    *,
+    stateful: bool = False,
 ) -> str:
     examples = [
         {
@@ -100,9 +158,14 @@ def _codegen_prompt(
         }
         for fixture in fixtures
     ]
+    signature = (
+        "respond(arguments, captured, state)"
+        if stateful
+        else "respond(arguments, captured)"
+    )
     return (
-        "Write a deterministic respond(arguments, captured) function for this "
-        "replay tool. Use only the captured examples below as factual ground.\n\n"
+        f"Write a deterministic {signature} function for this replay tool. Use "
+        "only the captured examples below as factual ground.\n\n"
         f"Tool name: {tool_name}\n\n"
         "Captured examples (input/output truncated for prompt budget only; the "
         "runtime receives full captured values):\n"
@@ -121,9 +184,10 @@ class SynthesizedFixtureTool(ReplayFixtureTool):
         api_client: SupportsStreamingMessages,
         model: str,
         fallback_match_mode: str = "order",
-        system_prompt: str = SYNTH_CODEGEN_SYSTEM_PROMPT,
+        system_prompt: str | None = None,
         codegen_max_tokens: int = 2048,
         exec_timeout: float = 20.0,
+        stateful: bool = False,
     ) -> None:
         super().__init__(
             tool_name=tool_name,
@@ -132,11 +196,18 @@ class SynthesizedFixtureTool(ReplayFixtureTool):
         )
         self._api_client = api_client
         self._model = model
-        self._system_prompt = system_prompt
+        self._stateful = stateful
+        self._system_prompt = system_prompt or (
+            SYNTH_STATE_CODEGEN_SYSTEM_PROMPT if stateful else SYNTH_CODEGEN_SYSTEM_PROMPT
+        )
         self._codegen_max_tokens = codegen_max_tokens
         self._exec_timeout = exec_timeout
         self._code: str | None = None
         self._codegen_attempted = False
+        # Per-tool state that persists across calls within one eval case. Only
+        # used in stateful mode; lets the synthesized adapter model recovery
+        # (error-then-retry), pagination, and effects of earlier same-tool calls.
+        self._state: dict[str, Any] = {}
 
     async def execute(
         self,
@@ -179,7 +250,9 @@ class SynthesizedFixtureTool(ReplayFixtureTool):
             return self._code
         self._codegen_attempted = True
         try:
-            text = await self._complete(_codegen_prompt(self.name, self._fixtures))
+            text = await self._complete(
+                _codegen_prompt(self.name, self._fixtures, stateful=self._stateful)
+            )
             text = _strip_code_fences(text)
             if "def respond(" not in text:
                 self._code = None
@@ -219,10 +292,14 @@ class SynthesizedFixtureTool(ReplayFixtureTool):
             }
             for fixture in self._fixtures
         ]
-        payload = json.dumps(
-            {"code": code, "arguments": arguments, "captured": captured},
-            ensure_ascii=False,
-        ).encode("utf-8")
+        request: dict[str, Any] = {
+            "code": code,
+            "arguments": arguments,
+            "captured": captured,
+        }
+        if self._stateful:
+            request["state"] = self._state
+        payload = json.dumps(request, ensure_ascii=False).encode("utf-8")
         tmp = tempfile.mkdtemp(prefix="openharness-synth-fixture-")
         try:
             process = await asyncio.create_subprocess_exec(
@@ -230,7 +307,7 @@ class SynthesizedFixtureTool(ReplayFixtureTool):
                 "-I",
                 "-S",
                 "-c",
-                RUNNER,
+                RUNNER_STATE if self._stateful else RUNNER,
                 cwd=tmp,
                 env={"PATH": os.environ.get("PATH", "")},
                 stdin=asyncio.subprocess.PIPE,
@@ -254,6 +331,9 @@ class SynthesizedFixtureTool(ReplayFixtureTool):
                 return None
             if not isinstance(result, dict) or result.get("ok") is not True:
                 return None
+            if self._stateful and isinstance(result.get("state"), dict):
+                # Carry the mutated state forward to the next call to this tool.
+                self._state = result["state"]
             return _truncate_output(str(result.get("output", "")))
         except OSError:
             logger.warning(
@@ -294,7 +374,9 @@ def _truncate_output(output: str) -> str:
 
 __all__ = [
     "RUNNER",
+    "RUNNER_STATE",
     "SYNTH_CODEGEN_SYSTEM_PROMPT",
+    "SYNTH_STATE_CODEGEN_SYSTEM_PROMPT",
     "SynthContext",
     "SynthesizedFixtureTool",
     "_codegen_prompt",

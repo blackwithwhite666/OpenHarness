@@ -429,7 +429,7 @@ def build_replay_tool_registry(
 ) -> ToolRegistry:
     """Build a replay-only registry from captured tool fixtures."""
     _validate_replay_match_mode(match_mode)
-    if match_mode == "synth" and synth_context is None:
+    if match_mode in {"synth", "synth_state"} and synth_context is None:
         raise ValueError("synth fixture match requires a SynthContext")
     registry = ToolRegistry()
     by_name: dict[str, list[EvalToolFixture]] = {}
@@ -444,7 +444,7 @@ def build_replay_tool_registry(
         by_name.setdefault(fixture.tool_name, []).append(fixture)
     for tool_name, tool_fixtures in by_name.items():
         fixtures_tuple = tuple(tool_fixtures)
-        if match_mode == "synth":
+        if match_mode in {"synth", "synth_state"}:
             assert synth_context is not None
             from openharness.evals.synth_fixture import (  # noqa: PLC0415
                 SynthesizedFixtureTool,
@@ -457,6 +457,7 @@ def build_replay_tool_registry(
                     api_client=synth_context.api_client,
                     model=synth_context.model,
                     fallback_match_mode="order",
+                    stateful=match_mode == "synth_state",
                 )
             )
         else:
@@ -471,9 +472,10 @@ def build_replay_tool_registry(
 
 
 def _validate_replay_match_mode(match_mode: str) -> None:
-    if match_mode not in {"order", "arguments", "args_then_order", "synth"}:
+    if match_mode not in {"order", "arguments", "args_then_order", "synth", "synth_state"}:
         raise ValueError(
-            "fixture match mode must be one of: order, arguments, args_then_order, synth"
+            "fixture match mode must be one of: order, arguments, args_then_order, "
+            "synth, synth_state"
         )
 
 
