@@ -576,8 +576,16 @@ def run_execution_report(
     limit: int | None = None,
     samples: int = 1,
     max_turns: int | None = None,
+    conversation_histories: dict[str, tuple[tuple[str, str], ...]] | None = None,
 ) -> EvalExecutionReportWrite:
-    """Run executor-based checks over a runnable eval pack."""
+    """Run executor-based checks over a runnable eval pack.
+
+    ``conversation_histories`` (case_id -> ((role, text), ...)), when given,
+    overrides the per-case session history that would otherwise be recomputed
+    from the store. Recomputation reads the whole store's episodes + order, so it
+    is not portable; baking the history makes a committed bundle replay the same
+    turn-1 prefix on any machine.
+    """
     if limit is not None and limit <= 0:
         raise ValueError("limit must be positive")
     if samples < 1:
@@ -664,6 +672,7 @@ def run_execution_report(
             samples=samples,
             scorer_override=scorer_override,
             history_context=history_context,
+            conversation_histories=conversation_histories,
             traces_root=traces_root,
             run_id=report_id,
         )
@@ -703,6 +712,7 @@ def _execute_case_sampled(
     samples: int,
     scorer_override: EvalExecutionScorer | None = None,
     history_context: HistoryContext | None = None,
+    conversation_histories: dict[str, tuple[tuple[str, str], ...]] | None = None,
     traces_root: Path,
     run_id: str,
 ) -> EvalExecutionReportCase:
@@ -715,6 +725,7 @@ def _execute_case_sampled(
         default_scorer,
         scorer_override=scorer_override,
         history_context=history_context,
+        conversation_histories=conversation_histories,
         traces_root=traces_root,
         run_id=run_id,
         sample_index=0,
@@ -734,6 +745,7 @@ def _execute_case_sampled(
                 default_scorer,
                 scorer_override=scorer_override,
                 history_context=history_context,
+                conversation_histories=conversation_histories,
                 traces_root=traces_root,
                 run_id=run_id,
                 sample_index=sample_index,
@@ -971,6 +983,7 @@ def _execute_case(
     *,
     scorer_override: EvalExecutionScorer | None = None,
     history_context: HistoryContext | None = None,
+    conversation_histories: dict[str, tuple[tuple[str, str], ...]] | None = None,
     traces_root: Path,
     run_id: str,
     sample_index: int,
@@ -1040,11 +1053,16 @@ def _execute_case(
             unreplayable_reason=unreplayable_reason,
         )
 
-    conversation_history = _session_conversation_history(
-        store,
-        episode,
-        history_context=history_context,
-    )
+    if conversation_histories is not None and case.case_id in conversation_histories:
+        # Baked (portable) history — see run_execution_report. Avoids recomputing
+        # from the store, whose episode set/order isn't portable to a slim bundle.
+        conversation_history = conversation_histories[case.case_id]
+    else:
+        conversation_history = _session_conversation_history(
+            store,
+            episode,
+            history_context=history_context,
+        )
     execution_context = EvalExecutionContext(
         store=store,
         pack=pack,

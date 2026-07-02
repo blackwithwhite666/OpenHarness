@@ -1722,6 +1722,26 @@ def evals_run_cmd(
             "committable, self-contained artifact for the CI inner-eval gate."
         ),
     ),
+    histories_file: str | None = typer.Option(
+        None,
+        "--histories-file",
+        help=(
+            "Baked per-case conversation history (case_id -> [[role, text], ...]). "
+            "Overrides the session history that would be recomputed from the store "
+            "— required for a portable bundle, since the recompute reads the whole "
+            "store's episode set/order."
+        ),
+    ),
+    no_live_skill: bool = typer.Option(
+        False,
+        "--no-live-skill",
+        help=(
+            "Don't inject the live skill tool; replay skill from fixtures instead. "
+            "Live skill reads the workspace's SKILL.md files (host-dependent, huge), "
+            "so a portable/committed cache must replay skill from the captured "
+            "fixtures. Use for the CI inner-eval bundle."
+        ),
+    ),
     report_only: bool = typer.Option(
         False,
         "--report-only",
@@ -1830,6 +1850,10 @@ def evals_run_cmd(
             run_kwargs["cache_strict"] = cache_strict
             if cache_prune_to is not None:
                 run_kwargs["cache_prune_to"] = cache_prune_to
+        if histories_file is not None:
+            run_kwargs["histories_file"] = histories_file
+        if no_live_skill:
+            run_kwargs["live_skill"] = False
         result = run_ohmo_eval_report(**run_kwargs)
     except (FileNotFoundError, ValueError) as exc:
         print(str(exc), file=sys.stderr)

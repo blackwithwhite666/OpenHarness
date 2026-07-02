@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import tempfile
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -180,6 +181,8 @@ def run_ohmo_eval_report(
     cache_completions: str | Path | None = None,
     cache_strict: bool = False,
     cache_prune_to: str | Path | None = None,
+    histories_file: str | Path | None = None,
+    live_skill: bool = True,
 ) -> OhmoEvalRunResult:
     """Run deterministic replay-tools execution checks over an Ohmo eval pack."""
     if max_turns < 1:
@@ -289,6 +292,7 @@ def run_ohmo_eval_report(
         system_prompt=system_prompt,
         max_turns=max_turns,
         completion_cache=completion_cache,
+        live_skill=live_skill,
         **agent_runner_kwargs,
     )
     executor = _build_executor(
@@ -299,6 +303,7 @@ def run_ohmo_eval_report(
     )
     store = get_eval_store(workspace)
     pack = read_run_pack(store, pack_filename=pack_filename)
+    conversation_histories = _load_conversation_histories(histories_file)
     try:
         write = run_execution_report(
             store,
@@ -310,6 +315,7 @@ def run_ohmo_eval_report(
             executor=executor,
             scorer=selected_scorer,
             history_context=history_context,
+            conversation_histories=conversation_histories,
         )
     finally:
         # Persist even on partial failure so a crashed cold run is resumable.
@@ -659,6 +665,7 @@ def _build_agent_runner_config(
     sandbox_browser_socket: str | None = None,
     sandbox_browser_name: str | None = None,
     completion_cache: CompletionCache | None = None,
+    live_skill: bool = True,
 ) -> _AgentRunnerConfig:
     normalized = agent_runner_name.strip().lower()
     if normalized not in _SUPPORTED_AGENT_RUNNERS:
@@ -703,7 +710,7 @@ def _build_agent_runner_config(
                 max_turns=max_turns,
                 live_mcp_server_names=("google_search",),
                 live_typed_read_tool_names=("read_file", "glob", "grep"),
-                live_local_tool_factory=_make_live_local_tool_factory(workspace),
+                live_local_tool_factory=_make_live_local_tool_factory(workspace, include_skill=live_skill),
                 live_read_passthrough_roots=(
                     (get_attachments_dir(workspace),) if workspace is not None else ()
                 ),
@@ -765,7 +772,7 @@ def _build_agent_runner_config(
             system_prompt=resolved_prompt,
             cwd=workspace,
             max_turns=max_turns,
-            live_local_tool_factory=_make_live_local_tool_factory(workspace),
+            live_local_tool_factory=_make_live_local_tool_factory(workspace, include_skill=live_skill),
             local_state_root=_stable_local_state_root(completion_cache),
         ),
         agent_runner_name="query-engine",
@@ -796,6 +803,24 @@ def _stable_local_state_root(completion_cache: CompletionCache | None) -> Path |
     if completion_cache is None:
         return None
     return Path(tempfile.gettempdir()) / _CACHED_EVAL_LOCAL_STATE_DIR
+
+
+def _load_conversation_histories(
+    histories_file: str | Path | None,
+) -> dict[str, tuple[tuple[str, str], ...]] | None:
+    """Load baked per-case conversation history: {case_id: [[role, text], ...]}.
+
+    Committed in the eval bundle so a slim store replays the same seeded session
+    history the full store produced (the recompute reads the whole store's
+    episode set/order and isn't portable). See run_execution_report.
+    """
+    if not histories_file:
+        return None
+    raw = json.loads(Path(histories_file).expanduser().read_text(encoding="utf-8"))
+    return {
+        case_id: tuple((str(role), str(text)) for role, text in turns)
+        for case_id, turns in raw.items()
+    }
 
 
 def _ohmo_todo_write_tool_factory(state_root: Path) -> Sequence[BaseTool]:
@@ -836,6 +861,8 @@ class _MockSendTelegramMessageTool(BaseTool):
 
 def _make_live_local_tool_factory(
     workspace: Path | None,
+    *,
+    include_skill: bool = True,
 ) -> Callable[[Path], Sequence[BaseTool]]:
     """Inject real, deterministic, local tools over the replay registry.
 
@@ -860,17 +887,24 @@ def _make_live_local_tool_factory(
         plugin_roots = ()
 
     def factory(state_root: Path) -> Sequence[BaseTool]:
-        return (
-            *_ohmo_todo_write_tool_factory(state_root),
-            _ToolContextMetadataWrapper(
-                SkillTool(),
-                metadata={
-                    "extra_skill_dirs": skill_dirs,
-                    "extra_plugin_roots": plugin_roots,
-                },
-            ),
-            _MockSendTelegramMessageTool(),
-        )
+        tools: list[BaseTool] = [*_ohmo_todo_write_tool_factory(state_root)]
+        if include_skill:
+            # Live skill reads the workspace's SKILL.md files. That output is
+            # workspace-dependent, so a portable/committed cache must instead
+            # replay skill from the captured fixtures (include_skill=False) —
+            # otherwise a CI host without the skills dir gets "Skill not found"
+            # and the cache misses.
+            tools.append(
+                _ToolContextMetadataWrapper(
+                    SkillTool(),
+                    metadata={
+                        "extra_skill_dirs": skill_dirs,
+                        "extra_plugin_roots": plugin_roots,
+                    },
+                )
+            )
+        tools.append(_MockSendTelegramMessageTool())
+        return tuple(tools)
 
     return factory
 

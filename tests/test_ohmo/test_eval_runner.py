@@ -1539,6 +1539,24 @@ def test_eval_system_prompt_honors_explicit_override(tmp_path: Path):
     assert resolved == "EXPLICIT_OVERRIDE"
 
 
+def test_live_local_tool_factory_can_exclude_skill(tmp_path):
+    from ohmo.evals.runner import _make_live_local_tool_factory
+
+    with_skill = _make_live_local_tool_factory(tmp_path, include_skill=True)(tmp_path)
+    without_skill = _make_live_local_tool_factory(tmp_path, include_skill=False)(tmp_path)
+
+    def names(tools):
+        return {getattr(t, "name", type(t).__name__) for t in tools}
+
+    # Live skill reads the workspace skills dir (host-dependent) — a portable
+    # cache excludes it and replays skill from fixtures instead.
+    assert "skill" in names(with_skill)
+    assert "skill" not in names(without_skill)
+    # todo_write / send stay in both.
+    assert "todo_write" in names(without_skill)
+    assert len(without_skill) == len(with_skill) - 1
+
+
 def test_stable_local_state_root_is_fixed_and_path_independent(tmp_path):
     from openharness.evals import CompletionCache
 
