@@ -2156,3 +2156,37 @@ def test_query_engine_runner_uses_fresh_temp_root_without_override(tmp_path: Pat
     assert len(seen) == 2
     assert seen[0] != seen[1]  # random mkdtemp -> distinct per run
     assert all("openharness-eval-local-tools-" in p.name for p in seen)
+
+
+def test_replay_registry_applies_skill_schema_override():
+    # "mock skill": the skill fixture tool wears a real schema over replayed output,
+    # so the agent sees a genuine tool interface (it under-invokes a generic one).
+    from pydantic import BaseModel
+
+    class _SkillLike(BaseModel):
+        name: str = ""
+
+    fx = (
+        EvalToolFixture(
+            tool_name="skill",
+            call_key_hash="h",
+            input_text='{"name": "maps"}',
+            output_text="SKILL CONTENT",
+            input_key="k",
+        ),
+    )
+    reg = build_replay_tool_registry(
+        fx,
+        match_mode="args_then_order",
+        schema_overrides={"skill": ("Invoke a skill by name", _SkillLike)},
+    )
+    tool = reg.get("skill")
+    assert tool.description == "Invoke a skill by name"
+    assert tool.input_model is _SkillLike
+
+    # a non-overridden fixture keeps the generic replay schema
+    reg2 = build_replay_tool_registry(
+        (EvalToolFixture(tool_name="bash", call_key_hash="h2", output_text="x", input_key="k2"),),
+        match_mode="order",
+    )
+    assert reg2.get("bash").description == "Replay-only eval tool backed by captured outputs."

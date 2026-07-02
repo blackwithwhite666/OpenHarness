@@ -156,11 +156,13 @@ class ReplayToolsExecutor:
         agent_runner: EvalAgentRunner | None = None,
         match_mode: str = "order",
         synth_context: SynthContext | None = None,
+        schema_overrides: dict[str, tuple[str, type[BaseModel]]] | None = None,
     ) -> None:
         _validate_replay_match_mode(match_mode)
         self._agent_runner = agent_runner or ReplayScriptAgentRunner()
         self._match_mode = match_mode
         self._synth_context = synth_context
+        self._schema_overrides = schema_overrides
 
     @property
     def fixture_match_mode(self) -> str:
@@ -173,6 +175,7 @@ class ReplayToolsExecutor:
                 context.tool_fixtures,
                 match_mode=self._match_mode,
                 synth_context=self._synth_context,
+                schema_overrides=self._schema_overrides,
             ),
             context=context,
         )
@@ -347,9 +350,19 @@ class ReplayFixtureTool(BaseTool):
         tool_name: str,
         fixtures: tuple[EvalToolFixture, ...],
         match_mode: str = "order",
+        description: str | None = None,
+        input_model: type[BaseModel] | None = None,
     ) -> None:
         _validate_replay_match_mode(match_mode)
         self.name = tool_name
+        # Present a real tool's schema over replayed output — the "mock" mode: e.g.
+        # the `skill` fixture keeps replaying captured SKILL.md content but shows
+        # the agent the genuine SkillTool description/params, so it invokes skills
+        # the way it does in prod (the generic replay schema makes it under-call).
+        if description is not None:
+            self.description = description
+        if input_model is not None:
+            self.input_model = input_model
         self._fixtures = fixtures
         self._match_mode = match_mode
         self._next_index = 0
@@ -441,8 +454,14 @@ def build_replay_tool_registry(
     *,
     match_mode: str = "order",
     synth_context: SynthContext | None = None,
+    schema_overrides: dict[str, tuple[str, type[BaseModel]]] | None = None,
 ) -> ToolRegistry:
-    """Build a replay-only registry from captured tool fixtures."""
+    """Build a replay-only registry from captured tool fixtures.
+
+    ``schema_overrides`` (tool_name -> (description, input_model)) makes a replay
+    fixture present a real tool's schema over its captured output (the "mock"
+    mode; see ReplayFixtureTool).
+    """
     _validate_replay_match_mode(match_mode)
     if match_mode in {"synth", "synth_state"} and synth_context is None:
         raise ValueError("synth fixture match requires a SynthContext")
@@ -476,11 +495,14 @@ def build_replay_tool_registry(
                 )
             )
         else:
+            override = (schema_overrides or {}).get(tool_name)
             registry.register(
                 ReplayFixtureTool(
                     tool_name=tool_name,
                     fixtures=fixtures_tuple,
                     match_mode=match_mode,
+                    description=override[0] if override else None,
+                    input_model=override[1] if override else None,
                 )
             )
     return registry

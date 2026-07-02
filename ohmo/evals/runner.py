@@ -49,7 +49,7 @@ from openharness.evals.runner import _report_output_path, _stable_id
 from openharness.evals.state import compute_episode_state_delta, extract_state_keys
 from openharness.prompts import build_runtime_system_prompt
 from openharness.tools.base import BaseTool, ToolExecutionContext, ToolResult
-from openharness.tools.skill_tool import SkillTool
+from openharness.tools.skill_tool import SkillTool, SkillToolInput
 from openharness.utils.fs import atomic_write_text
 
 from ohmo.evals.adapter import get_eval_store
@@ -301,6 +301,7 @@ def run_ohmo_eval_report(
         agent_runner=agent_runner_config.agent_runner,
         fixture_match=fixture_match,
         synth_context=synth_context,
+        schema_overrides=_mock_skill_schema_overrides(live_skill),
     )
     store = get_eval_store(workspace)
     pack = read_run_pack(store, pack_filename=pack_filename)
@@ -569,6 +570,7 @@ def _build_executor(
     ),
     fixture_match: str = "args_then_order",
     synth_context: SynthContext | None = None,
+    schema_overrides: dict[str, tuple[str, type]] | None = None,
 ) -> ReplayToolsExecutor:
     fixture_match = _validate_fixture_match(fixture_match)
     normalized = executor_name.strip().lower()
@@ -582,7 +584,18 @@ def _build_executor(
         agent_runner=agent_runner,
         match_mode=fixture_match,
         synth_context=synth_context,
+        schema_overrides=schema_overrides,
     )
+
+
+def _mock_skill_schema_overrides(live_skill: bool) -> dict[str, tuple[str, type]] | None:
+    """When skill isn't injected live, make its replay fixture wear the real
+    SkillTool schema (description + params) — the "mock" skill: captured SKILL.md
+    output, genuine tool interface, no ~/.ohmo/skills dependency. Without this the
+    replayed skill shows a generic schema and the agent under-invokes it."""
+    if live_skill:
+        return None
+    return {"skill": (SkillTool.description, SkillToolInput)}
 
 
 def _validate_fixture_match(fixture_match: str) -> str:
