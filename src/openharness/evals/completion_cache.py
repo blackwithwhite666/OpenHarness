@@ -249,3 +249,21 @@ class CachingApiClient:
                 self._cache.record(key, event)
                 recorded = True
             yield event
+
+
+class NullApiClient:
+    """A model client that refuses to be called.
+
+    In strict/offline replay (``--cache-strict``) the model is never invoked: hits
+    come from the cache and misses yield a stub. So the underlying client is only
+    a placeholder — using this one means an offline run needs no API auth, and a
+    real call (a bug) fails loudly instead of silently going live.
+    """
+
+    async def stream_message(
+        self, request: ApiMessageRequest
+    ) -> AsyncIterator[ApiStreamEvent]:
+        raise RuntimeError(
+            "model call in strict-offline eval (cache miss with no model available)"
+        )
+        yield  # pragma: no cover - makes this an async generator

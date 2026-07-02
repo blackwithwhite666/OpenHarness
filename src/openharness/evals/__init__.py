@@ -177,6 +177,7 @@ from openharness.evals.session_user_simulator import (
 from openharness.evals.completion_cache import (
     CachingApiClient,
     CompletionCache,
+    NullApiClient,
     request_cache_key,
 )
 from openharness.evals.synth_fixture import (
@@ -255,6 +256,7 @@ __all__ = [
     "CachingApiClient",
     "CapabilityTraceOracleV1",
     "CompletionCache",
+    "NullApiClient",
     "ExactMatchEvalScorer",
     "HistoryContext",
     "request_cache_key",

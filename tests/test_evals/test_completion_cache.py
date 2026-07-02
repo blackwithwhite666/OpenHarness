@@ -11,7 +11,12 @@ from openharness.api.client import (
 )
 from openharness.api.usage import UsageSnapshot
 from openharness.engine.messages import ConversationMessage, TextBlock
-from openharness.evals import CachingApiClient, CompletionCache, request_cache_key
+from openharness.evals import (
+    CachingApiClient,
+    CompletionCache,
+    NullApiClient,
+    request_cache_key,
+)
 
 
 def _req(
@@ -199,6 +204,29 @@ async def test_strict_offline_miss_yields_stub_without_calling_inner(tmp_path: P
     assert complete and complete[0].message.text == ""
     assert complete[0].stop_reason == "cache_miss_strict"
     assert cache.misses == 1 and cache.hits == 0
+
+
+@pytest.mark.asyncio
+async def test_null_api_client_refuses_to_be_called():
+    # Offline strict mode never calls the model; if it ever does (a bug), fail loud.
+    with pytest.raises(RuntimeError, match="strict-offline"):
+        async for _ in NullApiClient().stream_message(_req("q")):
+            pass
+
+
+@pytest.mark.asyncio
+async def test_strict_cache_hit_never_touches_null_inner(tmp_path: Path):
+    # A hit is served from the cache, so even a refusing inner client is fine.
+    path = tmp_path / "c.json"
+    seed = CompletionCache(path)
+    key = request_cache_key(_req("q"))
+    seed.record(key, _complete("A"))
+    seed.save()
+    cache = CompletionCache(path, strict_offline=True)
+    client = CachingApiClient(NullApiClient(), cache)
+    events = [ev async for ev in client.stream_message(_req("q"))]
+    assert [e.message.text for e in events if isinstance(e, ApiMessageCompleteEvent)] == ["A"]
+    assert cache.hits == 1
 
 
 def test_save_pruned_drops_unserved_keys(tmp_path: Path):

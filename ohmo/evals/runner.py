@@ -20,6 +20,7 @@ from openharness.config.settings import Settings
 from openharness.evals import (
     CachingApiClient,
     CompletionCache,
+    NullApiClient,
     EvalExecutionReportWrite,
     EvalSessionReport,
     EvalSessionReportCase,
@@ -686,12 +687,19 @@ def _build_agent_runner_config(
         active_profile=provider_profile,
     )
     settings = settings.materialize_active_profile()
-    try:
-        api_client = resolve_api_client_from_settings(settings)
-    except (ApiClientResolutionError, SystemExit) as exc:
-        raise ValueError(
-            f"{normalized} eval runner requires configured API authentication"
-        ) from exc
+    if completion_cache is not None and completion_cache.strict_offline:
+        # Offline replay (--cache-strict): the model is never called (hits from
+        # cache, misses -> stub), so don't require API auth — a CI host with no
+        # provider credentials can still run the frozen bundle. Pin --model so the
+        # cache key matches the recording.
+        api_client: SupportsStreamingMessages = NullApiClient()
+    else:
+        try:
+            api_client = resolve_api_client_from_settings(settings)
+        except (ApiClientResolutionError, SystemExit) as exc:
+            raise ValueError(
+                f"{normalized} eval runner requires configured API authentication"
+            ) from exc
     if completion_cache is not None:
         # Inner-loop cache: replay recorded model completions on unchanged
         # prompts; record live completions on a cold run. Same wrapper for the
