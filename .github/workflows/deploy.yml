@@ -51,6 +51,28 @@ jobs:
           python -m pytest -m "not eval" --ignore=tests/eval -o addopts="" -q \
             --deselect "tests/test_ohmo/test_cli.py::test_ohmo_evals_run_command_help_lists_supported_executor_and_runner_ids"
 
+      - name: Inner-loop eval gate (offline; ohmo golden bundle)
+        # Before shipping a new agent, replay the frozen ohmo inner-loop bundle
+        # with THIS build and require it to still pass. The bundle is private
+        # (real session slices) so it lives in the private agents-playgroud repo,
+        # already checked out on this host; extract it read-only via git archive.
+        # Offline (--cache-strict): no model API / no ~/.ohmo. See that repo's
+        # evals/README.md and adrs/ohmo-eval-goldens-flywheel.md.
+        run: |
+          . .ci-venv/bin/activate
+          BUNDLE="$HOME/agents-playgroud"
+          git -C "$BUNDLE" fetch origin -q
+          WS="$(mktemp -d)"; mkdir -p "$WS/evals"
+          git -C "$BUNDLE" archive origin/main evals | tar -x -C "$WS"
+          ohmo evals run --workspace "$WS" \
+            --agent-runner query-engine --scorer trajectory_judge_v1 --model gpt-5.5 \
+            --fixture-match args_then_order --samples 1 \
+            --system-prompt-file "$WS/evals/system_prompt.txt" \
+            --histories-file "$WS/evals/histories.json" --no-live-skill \
+            --cache-completions "$WS/evals/completions.json" --cache-strict \
+            --output inner_eval_report.json --report-only
+          python3 "$WS/evals/check_inner_eval.py" "$WS/evals/reports/inner_eval_report.json"
+
   deploy:
     needs: test
     if: github.event_name == 'push' && github.ref == 'refs/heads/deploy'
