@@ -56,7 +56,11 @@ jobs:
         # with THIS build and require it to still pass. The bundle is private
         # (real session slices) so it lives in the private agents-playgroud repo,
         # already checked out on this host; extract it read-only via git archive.
-        # Offline (--cache-strict): no model API / no ~/.ohmo. See that repo's
+        # The bundle's evals/spec.json pins the whole run as the `inner` preset
+        # (offline cache-replay + mock skill + pinned prompt/history + gate
+        # thresholds), so this is a one-liner and can't drift from the recording.
+        # `--gate` sets the exit code from the preset's thresholds (not per-case
+        # failures). Offline: no model API / no ~/.ohmo. See that repo's
         # evals/README.md and adrs/ohmo-eval-goldens-flywheel.md.
         run: |
           . .ci-venv/bin/activate
@@ -64,14 +68,8 @@ jobs:
           git -C "$BUNDLE" fetch origin -q
           WS="$(mktemp -d)"; mkdir -p "$WS/evals"
           git -C "$BUNDLE" archive origin/main evals | tar -x -C "$WS"
-          ohmo evals run --workspace "$WS" \
-            --agent-runner query-engine --scorer trajectory_judge_v1 --model gpt-5.5 \
-            --fixture-match args_then_order --samples 1 \
-            --system-prompt-file "$WS/evals/system_prompt.txt" \
-            --histories-file "$WS/evals/histories.json" --no-live-skill \
-            --cache-completions "$WS/evals/completions.json" --cache-strict \
+          ohmo evals run --workspace "$WS" --preset inner --gate \
             --output inner_eval_report.json --report-only
-          python3 "$WS/evals/check_inner_eval.py" "$WS/evals/reports/inner_eval_report.json"
 
   deploy:
     needs: test

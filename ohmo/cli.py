@@ -41,6 +41,13 @@ from ohmo.evals import (
     write_ohmo_eval_mine,
     write_ohmo_eval_review_manifest,
 )
+from ohmo.evals.spec import (
+    CACHE_MODES,
+    SpecError,
+    default_spec_path,
+    evaluate_gate,
+    resolve_run,
+)
 from ohmo.memory import add_memory_entry, remove_memory_entry
 from ohmo.memory_judge import (
     load_removal_proposals,
@@ -1551,8 +1558,65 @@ def evals_smoke_cmd(
         raise typer.Exit(1)
 
 
+def _cli_explicit(ctx: typer.Context, name: str) -> bool:
+    """True if ``name`` was passed on the command line (not left at its default).
+
+    Lets an explicit CLI flag override its preset value while an untouched flag
+    yields to the preset. Compares Click's parameter-source by name to stay
+    robust across Click versions.
+    """
+    try:
+        source = ctx.get_parameter_source(name)
+    except Exception:  # pragma: no cover - defensive
+        return False
+    return getattr(source, "name", "") == "COMMANDLINE"
+
+
+def _preset_overrides_from_cli(
+    ctx: typer.Context, values: dict[str, object]
+) -> dict[str, object]:
+    """Collect the preset fields an explicit CLI flag overrode (ResolvedRun keys)."""
+    field_by_param = {
+        "pack_filename": "pack_filename",
+        "agent_runner_name": "agent_runner_name",
+        "scorer": "scorer",
+        "model": "model",
+        "provider_profile": "provider_profile",
+        "fixture_match": "fixture_match",
+        "samples": "samples",
+        "judge_votes": "judge_votes",
+        "system_prompt_file": "system_prompt_file",
+        "histories_file": "histories_file",
+        "cache_completions": "cache_completions",
+        "cache_prune_to": "cache_prune_to",
+        "cache_mode": "cache_mode",
+    }
+    path_fields = {
+        "system_prompt_file",
+        "histories_file",
+        "cache_completions",
+        "cache_prune_to",
+    }
+    overrides: dict[str, object] = {}
+    for param, field in field_by_param.items():
+        if not _cli_explicit(ctx, param):
+            continue
+        value = values[param]
+        if field in path_fields and value is not None:
+            value = str(Path(str(value)).expanduser())
+        overrides[field] = value
+    # Bool store-true flags: only override when explicitly set truthy; else the
+    # preset decides.
+    if _cli_explicit(ctx, "no_live_skill") and values.get("no_live_skill"):
+        overrides["live_skill"] = False
+    if _cli_explicit(ctx, "judge_grounding") and values.get("judge_grounding"):
+        overrides["judge_grounding"] = True
+    return overrides
+
+
 @evals_app.command("run")
 def evals_run_cmd(
+    ctx: typer.Context,
     workspace: str | None = typer.Option(None, "--workspace", help=_WORKSPACE_HELP),
     pack_filename: str = typer.Option(
         "eval_pack.json",
@@ -1742,6 +1806,43 @@ def evals_run_cmd(
             "fixtures. Use for the CI inner-eval bundle."
         ),
     ),
+    spec: str | None = typer.Option(
+        None,
+        "--spec",
+        help=(
+            "Path to an eval spec (freezes runner/scorer/model/fixture-match + the "
+            "frozen-input files as named presets). Defaults to "
+            "<workspace>/evals/spec.json when --preset is given. Requires --preset."
+        ),
+    ),
+    preset: str | None = typer.Option(
+        None,
+        "--preset",
+        help=(
+            "Named preset from the eval spec (e.g. 'inner' = offline cache-replay, "
+            "'faithful' = live). Pins every eval-identity option so runs don't "
+            "drift; explicit flags still override. See the bundle's spec.json."
+        ),
+    ),
+    cache_mode: str | None = typer.Option(
+        None,
+        "--cache-mode",
+        help=(
+            "Unified cache knob: 'off' | 'record' (cold, writes the cache) | "
+            "'strict' (offline replay, no model call on a miss). Overrides the "
+            "preset's cache.mode; needs a cache file (preset or --cache-completions)."
+        ),
+    ),
+    gate: bool = typer.Option(
+        False,
+        "--gate",
+        help=(
+            "Enforce the preset's gate: exit non-zero if the completion-cache "
+            "hit-rate drops below hit_floor or passed-count regresses below "
+            "passed_baseline. The gate (not per-case failures) sets the exit code, "
+            "so expected failures don't fail the run. Requires --preset."
+        ),
+    ),
     report_only: bool = typer.Option(
         False,
         "--report-only",
@@ -1758,13 +1859,108 @@ def evals_run_cmd(
 
     Agent runner to use inside the executor is selected with --agent-runner.
     """
-    if system_prompt_file is not None:
-        if system_prompt is not None:
+    if system_prompt is not None and system_prompt_file is not None:
+        print(
+            "--system-prompt and --system-prompt-file are mutually exclusive",
+            file=sys.stderr,
+        )
+        raise typer.Exit(1)
+    workspace_root = initialize_workspace(workspace)
+
+    # --- resolve a spec preset (freezes the eval-identity options) ----------
+    gate_thresholds = None
+    if preset is not None or spec is not None:
+        if preset is None:
+            print("--spec requires --preset NAME", file=sys.stderr)
+            raise typer.Exit(1)
+        spec_path = (
+            Path(spec).expanduser() if spec else default_spec_path(workspace_root)
+        )
+        if spec_path is None:
             print(
-                "--system-prompt and --system-prompt-file are mutually exclusive",
+                "--preset needs an eval spec; none found at "
+                f"{workspace_root}/evals/spec.json — pass --spec PATH",
                 file=sys.stderr,
             )
             raise typer.Exit(1)
+        try:
+            resolved = resolve_run(
+                spec_path,
+                preset,
+                overrides=_preset_overrides_from_cli(
+                    ctx,
+                    {
+                        "pack_filename": pack_filename,
+                        "agent_runner_name": agent_runner_name,
+                        "scorer": scorer,
+                        "model": model,
+                        "provider_profile": provider_profile,
+                        "fixture_match": fixture_match,
+                        "samples": samples,
+                        "judge_grounding": judge_grounding,
+                        "judge_votes": judge_votes,
+                        "system_prompt_file": system_prompt_file,
+                        "histories_file": histories_file,
+                        "cache_completions": cache_completions,
+                        "cache_prune_to": cache_prune_to,
+                        "cache_mode": cache_mode,
+                        "no_live_skill": no_live_skill,
+                    },
+                ),
+            )
+        except SpecError as exc:
+            print(str(exc), file=sys.stderr)
+            raise typer.Exit(1)
+        pack_filename = resolved.pack_filename
+        agent_runner_name = resolved.agent_runner_name
+        scorer = resolved.scorer
+        model = resolved.model
+        provider_profile = resolved.provider_profile
+        fixture_match = resolved.fixture_match
+        samples = resolved.samples
+        judge_grounding = resolved.judge_grounding
+        judge_votes = resolved.judge_votes
+        system_prompt_file = resolved.system_prompt_file
+        histories_file = resolved.histories_file
+        no_live_skill = not resolved.live_skill
+        cache_completions = resolved.cache_completions
+        cache_prune_to = resolved.cache_prune_to
+        cache_mode = resolved.cache_mode
+        gate_thresholds = resolved.gate
+
+    # --- normalize the cache knobs to (cache_completions, cache_strict) ------
+    if cache_mode is not None:
+        cache_mode = cache_mode.strip().lower()
+        if cache_mode not in CACHE_MODES:
+            print(
+                f"--cache-mode must be one of: {', '.join(CACHE_MODES)}",
+                file=sys.stderr,
+            )
+            raise typer.Exit(1)
+        if cache_mode == "off":
+            cache_completions = None
+            cache_strict = False
+        else:
+            if cache_completions is None:
+                print(
+                    f"--cache-mode {cache_mode} needs a cache file "
+                    "(--cache-completions or a preset cache.completions)",
+                    file=sys.stderr,
+                )
+                raise typer.Exit(1)
+            cache_strict = cache_mode == "strict"
+
+    if gate and gate_thresholds is None:
+        print(
+            "--gate needs a preset that defines gate thresholds "
+            "(hit_floor / passed_baseline)",
+            file=sys.stderr,
+        )
+        raise typer.Exit(1)
+
+    # Read the (possibly preset-supplied) system-prompt file unless an inline
+    # --system-prompt was given.
+    if system_prompt is None and system_prompt_file is not None:
         try:
             system_prompt = Path(system_prompt_file).expanduser().read_text(
                 encoding="utf-8"
@@ -1772,7 +1968,7 @@ def evals_run_cmd(
         except OSError as exc:
             print(f"cannot read --system-prompt-file: {exc}", file=sys.stderr)
             raise typer.Exit(1)
-    workspace_root = initialize_workspace(workspace)
+
     try:
         if check_config:
             check = check_ohmo_eval_run_config(
@@ -1860,8 +2056,33 @@ def evals_run_cmd(
         raise typer.Exit(1)
 
     report = result.write.report
+    gate_result = None
+    if gate and gate_thresholds is not None:
+        cache = (getattr(report, "metadata", {}) or {}).get("completion_cache") or {}
+        gate_result = evaluate_gate(
+            gate_thresholds,
+            hit_rate=float(cache.get("hit_rate", 0.0)),
+            hits=int(cache.get("hits", 0)),
+            misses=int(cache.get("misses", 0)),
+            passed=int(report.passed_count),
+            total=int(report.case_count),
+        )
+
     if json_output:
-        _print_json_summary(_eval_run_summary(result))
+        summary = _eval_run_summary(result)
+        if gate_result is not None:
+            summary["gate"] = {
+                "preset": preset,
+                "ok": gate_result.ok,
+                "hit_rate": gate_result.hit_rate,
+                "hit_floor": gate_result.thresholds.hit_floor,
+                "passed": gate_result.passed,
+                "passed_baseline": gate_result.thresholds.passed_baseline,
+                "reasons": list(gate_result.reasons),
+            }
+        _print_json_summary(summary)
+        if gate_result is not None:
+            raise typer.Exit(0 if gate_result.ok else 1)
         if not result.report_only and (
             report.failed_count
             + getattr(report, "blocked_count", 0)
@@ -1887,6 +2108,10 @@ def evals_run_cmd(
             f"misses={cache_stats.get('misses', 0)} "
             f"keys={cache_stats.get('keys', 0)}"
         )
+    if gate_result is not None:
+        # The gate — not the per-case failures — sets the exit code.
+        print(gate_result.describe(preset or "eval"))
+        raise typer.Exit(0 if gate_result.ok else 1)
     if result.report_only:
         print("Report-only mode: failures did not fail the command")
         return
