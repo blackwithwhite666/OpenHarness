@@ -38,12 +38,14 @@ from ohmo.evals.review import (
 from ohmo.evals.runner import (
     OhmoEvalRunConfigCheckResult,
     OhmoEvalRunResult,
+    OhmoRubricDeriveResult,
     OhmoSessionEvalReportWrite,
     OhmoSessionEvalRunResult,
     SUPPORTED_EVAL_AGENT_RUNNER_NAMES,
     SUPPORTED_EVAL_EXECUTOR_NAMES,
     SUPPORTED_FIXTURE_MATCH_MODES,
     check_ohmo_eval_run_config,
+    derive_ohmo_case_rubrics,
     run_ohmo_eval_report,
     run_ohmo_session_eval,
 )
@@ -63,6 +65,8 @@ __all__ = [
     "OhmoEvalReviewResult",
     "OhmoEvalRunConfigCheckResult",
     "OhmoEvalRunResult",
+    "OhmoRubricDeriveResult",
+    "derive_ohmo_case_rubrics",
     "OhmoSessionEvalReportWrite",
     "OhmoSessionEvalRunResult",
     "OhmoEvalSmokeResult",

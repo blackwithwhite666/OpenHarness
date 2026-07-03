@@ -62,6 +62,7 @@ from openharness.evals.embeddings import EvalEmbeddingIndexWrite, write_embeddin
 from openharness.evals.execution import (
     CapabilityCoverageOracleV1,
     CapabilityTraceOracleV1,
+    build_gold_reference,
     EVAL_EXECUTION_SCORERS,
     EvalExecutionReportWrite,
     EvalExecutionScorer,
@@ -93,7 +94,11 @@ from openharness.evals.executor import (
 from openharness.evals.facets import EvalTextFacetInput, collect_text_facets
 from openharness.evals.graph import build_usage_graph, write_usage_graph
 from openharness.evals.inference import DEFAULT_INFERENCE_URL, InferenceClient
-from openharness.evals.judge import TrajectoryJudgeScorer
+from openharness.evals.judge import (
+    TrajectoryJudgeScorer,
+    TrajectoryJudgeScorerV2,
+    derive_case_rubric,
+)
 from openharness.evals.live_read import (
     READ_LIVE_BASH_ALLOWLIST,
     LiveReadAgentRunner,
@@ -267,6 +272,9 @@ __all__ = [
     "SynthesizedFixtureTool",
     "ToolTraceOracleV1",
     "TrajectoryJudgeScorer",
+    "TrajectoryJudgeScorerV2",
+    "derive_case_rubric",
+    "build_gold_reference",
     "EVAL_EXECUTION_SCORERS",
     "resolve_execution_scorer",
     "EvalAgentRunner",

@@ -37,7 +37,11 @@ from openharness.evals import (
     SessionReplayRunner,
     SynthContext,
     TrajectoryJudgeScorer,
+    TrajectoryJudgeScorerV2,
     UserSimulator,
+    build_gold_reference,
+    collect_text_facets,
+    derive_case_rubric,
     gold_capabilities_for_session,
     group_episodes_into_sessions,
     read_run_pack,
@@ -183,6 +187,7 @@ def run_ohmo_eval_report(
     cache_strict: bool = False,
     cache_prune_to: str | Path | None = None,
     histories_file: str | Path | None = None,
+    rubrics_file: str | Path | None = None,
     live_skill: bool = True,
 ) -> OhmoEvalRunResult:
     """Run deterministic replay-tools execution checks over an Ohmo eval pack."""
@@ -205,7 +210,7 @@ def run_ohmo_eval_report(
     history_config: _AgentRunnerConfig | None = None
     synth_context: SynthContext | None = None
     history_context: HistoryContext | None = None
-    if scorer == TrajectoryJudgeScorer.name:
+    if scorer in (TrajectoryJudgeScorer.name, TrajectoryJudgeScorerV2.name):
         judge_config = _build_agent_runner_config(
             "query-engine",
             workspace=workspace_root,
@@ -215,13 +220,21 @@ def run_ohmo_eval_report(
             completion_cache=completion_cache,
         )
         if judge_config.api_client is None:
-            raise ValueError("trajectory_judge_v1 requires configured API authentication")
-        selected_scorer = TrajectoryJudgeScorer(
-            api_client=judge_config.api_client,
-            model=judge_config.model,
-            votes=judge_votes,
-            grounding_mode=judge_grounding,
-        )
+            raise ValueError(f"{scorer} requires configured API authentication")
+        if scorer == TrajectoryJudgeScorerV2.name:
+            selected_scorer = TrajectoryJudgeScorerV2(
+                api_client=judge_config.api_client,
+                model=judge_config.model,
+                votes=judge_votes,
+                rubrics=_load_case_rubrics(rubrics_file),
+            )
+        else:
+            selected_scorer = TrajectoryJudgeScorer(
+                api_client=judge_config.api_client,
+                model=judge_config.model,
+                votes=judge_votes,
+                grounding_mode=judge_grounding,
+            )
     elif scorer:
         selected_scorer = resolve_execution_scorer(scorer)
     if fixture_match in ("synth", "synth_state"):
@@ -842,6 +855,86 @@ def _load_conversation_histories(
         case_id: tuple((str(role), str(text)) for role, text in turns)
         for case_id, turns in raw.items()
     }
+
+
+def _load_case_rubrics(
+    rubrics_file: str | Path | None,
+) -> dict[str, dict[str, object]] | None:
+    """Load per-case derived checklists: {case_id: {task_completion:[...], grounding:[...]}}.
+
+    Committed in the bundle (evals/rubrics.json) so trajectory_judge_v2 grades the
+    two hard-gate aspects (task_completion, grounding) against requirements
+    distilled offline from the gold episode (see ``derive_ohmo_case_rubrics``).
+    """
+    if not rubrics_file:
+        return None
+    raw = json.loads(Path(rubrics_file).expanduser().read_text(encoding="utf-8"))
+    return {str(case_id): value for case_id, value in raw.items()}
+
+
+@dataclass(frozen=True)
+class OhmoRubricDeriveResult:
+    """Summary of an offline rubric-derivation pass."""
+
+    path: Path
+    case_count: int
+    derived_count: int
+
+
+def derive_ohmo_case_rubrics(
+    *,
+    output_path: str | Path,
+    workspace: str | Path | None = None,
+    pack_filename: str = "eval_pack.json",
+    model: str | None = None,
+    provider_profile: str | None = None,
+    limit: int | None = None,
+) -> OhmoRubricDeriveResult:
+    """Distil per-case task_completion + grounding checklists from gold episodes.
+
+    Offline live-model step (like recording the completion cache): reads each
+    pack case's gold reference (goal + gold trajectory + gold answer), asks the
+    model to extract path-independent requirements, and writes
+    ``evals/rubrics.json`` for ``trajectory_judge_v2`` to gate against. Run once
+    on a host with model auth; commit the result to the bundle.
+    """
+    if limit is not None and limit <= 0:
+        raise ValueError("limit must be positive")
+    workspace_root = Path(workspace).expanduser().resolve() if workspace else None
+    judge_config = _build_agent_runner_config(
+        "query-engine",
+        workspace=workspace_root,
+        model=model,
+        provider_profile=provider_profile,
+        system_prompt=None,
+    )
+    if judge_config.api_client is None:
+        raise ValueError("rubric derivation requires configured API authentication")
+    store = get_eval_store(workspace)
+    pack = read_run_pack(store, pack_filename=pack_filename)
+    cases = pack.cases[:limit] if limit is not None else pack.cases
+    facet_inputs_by_id = {item.facet.facet_id: item for item in collect_text_facets(store)}
+    rubrics: dict[str, dict[str, list[dict[str, str]]]] = {}
+    for case in cases:
+        reference = build_gold_reference(store, case, facet_inputs_by_id)
+        if reference is None:
+            continue
+        goal, gold_answer, gold_trajectory = reference
+        checklist = derive_case_rubric(
+            api_client=judge_config.api_client,
+            model=judge_config.model,
+            goal=goal,
+            gold_trajectory=gold_trajectory,
+            gold_answer=gold_answer,
+        )
+        if checklist:
+            rubrics[case.case_id] = checklist
+    out = Path(output_path).expanduser()
+    out.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_text(out, json.dumps(rubrics, ensure_ascii=False, indent=2) + "\n")
+    return OhmoRubricDeriveResult(
+        path=out, case_count=len(cases), derived_count=len(rubrics)
+    )
 
 
 def _ohmo_todo_write_tool_factory(state_root: Path) -> Sequence[BaseTool]:
