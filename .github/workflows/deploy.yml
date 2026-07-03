@@ -21,6 +21,10 @@ concurrency:
 
 jobs:
   test:
+    # Same-repo push/PR only — a fork PR must never reach the self-hosted
+    # runner (host holds the private agents-playgroud checkout + live
+    # gateway). Forks still get the GitHub-hosted matrix in ci.yml.
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, linux, x64]
     steps:
       - uses: actions/checkout@v4
