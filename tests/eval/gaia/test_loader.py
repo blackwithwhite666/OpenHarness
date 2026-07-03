@@ -9,7 +9,6 @@ assert the offline parser handles parsing, the ``0-0-0-0-0`` skip, and
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 import pytest

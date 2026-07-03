@@ -5,8 +5,6 @@ from openharness.memory import add_memory_entry as add_project_memory_entry
 from openharness.prompts import build_runtime_system_prompt
 
 from ohmo.memory import add_memory_entry as add_ohmo_memory_entry
-from ohmo.memory import list_memory_files as list_ohmo_memory_files
-from ohmo.memory import remove_memory_entry as remove_ohmo_memory_entry
 from ohmo.prompts import build_ohmo_system_prompt
 from ohmo.workspace import (
     get_bootstrap_path,
