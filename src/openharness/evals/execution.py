@@ -21,7 +21,7 @@ from openharness.api.client import (
 )
 from openharness.engine.messages import ConversationMessage
 from openharness.evals.facets import EvalTextFacetInput, collect_text_facets
-from openharness.evals.judge import TrajectoryJudgeScorer
+from openharness.evals.judge import TrajectoryJudgeScorer, TrajectoryJudgeScorerV2
 from openharness.evals.executor import (
     EvalExecutionContext,
     EvalExecutor,
@@ -73,7 +73,21 @@ _JUDGE_METADATA_KEYS = (
     "observed_capability_count",
     "had_tool_error",
 )
-_SCORER_REPORT_METADATA_KEYS = _CAPABILITY_METADATA_KEYS + _JUDGE_METADATA_KEYS
+_JUDGE_V2_METADATA_KEYS = (
+    "judge_parsed_votes",
+    "judge_v2_graded_score",
+    "judge_v2_gate_failures",
+    "judge_v2_used_checklist",
+    "aspect.task_completion",
+    "aspect.grounding",
+    "aspect.tool_use",
+    "aspect.answer_quality",
+    "aspect.error_recovery",
+    "aspect.efficiency",
+)
+_SCORER_REPORT_METADATA_KEYS = (
+    _CAPABILITY_METADATA_KEYS + _JUDGE_METADATA_KEYS + _JUDGE_V2_METADATA_KEYS
+)
 _EXECUTOR_REPORT_METADATA_KEYS = (
     "seeded_history_message_count",
     "materialized_file_count",
@@ -131,6 +145,11 @@ class EvalExecutionScorerResult:
     # metadata-only report (only reason_hash/length go to metadata); the D7
     # trace recorder reads this for the rich eval trace.
     raw_reason: str | None = None
+    # When set, this graded [0,1] quality score becomes the case score (instead
+    # of the pass-fraction of gating checks). Multi-aspect scorers set it;
+    # binary scorers leave it None so the legacy case-score composition is
+    # byte-identical (keeps the inner-loop gate baseline stable).
+    graded_score: float | None = None
 
 
 class EvalExecutionScorer(Protocol):
@@ -544,6 +563,23 @@ class _TrajectoryJudgeSentinel:
         )
 
 
+class _TrajectoryJudgeV2Sentinel:
+    name = TrajectoryJudgeScorerV2.name
+    requires_exact_tool_sequence = False
+
+    def score(
+        self,
+        *,
+        context: EvalExecutionContext,
+        executor_result: EvalExecutorResult,
+    ) -> EvalExecutionScorerResult:
+        del context, executor_result
+        raise RuntimeError(
+            "trajectory_judge_v2 requires an api_client; run via "
+            "'ohmo evals run --scorer trajectory_judge_v2'"
+        )
+
+
 EVAL_EXECUTION_SCORERS: dict[str, EvalExecutionScorer] = {
     ExactMatchEvalScorer.name: ExactMatchEvalScorer(),
     ToolTraceOracleV1.name: ToolTraceOracleV1(),
@@ -552,6 +588,7 @@ EVAL_EXECUTION_SCORERS: dict[str, EvalExecutionScorer] = {
     StateOracleV1.name: StateOracleV1(),
     StateOutcomeOracleV1.name: StateOutcomeOracleV1(),
     TrajectoryJudgeScorer.name: _TrajectoryJudgeSentinel(),
+    TrajectoryJudgeScorerV2.name: _TrajectoryJudgeV2Sentinel(),
 }
 
 
@@ -973,6 +1010,52 @@ def _episode_gateway_final_text(store: EvalStore, episode_id: str) -> str:
     return text
 
 
+def build_gold_reference(
+    store: EvalStore,
+    case: EvalRunPackCase,
+    facet_inputs_by_id: dict[str, EvalTextFacetInput],
+    *,
+    output_excerpt_chars: int = 400,
+) -> tuple[str, str, str] | None:
+    """Return ``(goal, gold_answer, gold_trajectory_json)`` for one case.
+
+    Distilled from the recorded gold episode for offline rubric derivation (the
+    reference solution the checklist is extracted from). Returns ``None`` when
+    the episode is missing. This reads raw gold text and MUST only be used
+    offline to author a committed rubric — never persisted into a report.
+    """
+    episode = store.get_episode(case.episode_id)
+    if episode is None:
+        return None
+    events = list(store.iter_events(case.episode_id))
+    resolved_inputs = tuple(
+        facet
+        for facet_id in case.input_facet_ids
+        if (facet := facet_inputs_by_id.get(facet_id)) is not None
+    )
+    resolved_expected = tuple(
+        facet
+        for facet_id in case.expected_facet_ids
+        if (facet := facet_inputs_by_id.get(facet_id)) is not None
+    )
+    goal = _select_facet_text(resolved_inputs, ("user_goal", "user_request"))
+    gold_answer = _select_facet_text(
+        resolved_expected, ("assistant_final", "gateway_error", "tool_output")
+    )
+    trajectory = json.dumps(
+        [
+            {
+                "tool": fixture.tool_name,
+                "is_error": fixture.is_error,
+                "output": (fixture.output_text or "")[:output_excerpt_chars],
+            }
+            for fixture in _tool_fixtures(events)
+        ],
+        ensure_ascii=True,
+    )
+    return goal, gold_answer, trajectory
+
+
 def _execute_case(
     store: EvalStore,
     pack: EvalRunPack,
@@ -1160,11 +1243,18 @@ def _execute_case(
         error_hash="",
         metadata=observed_trace_metadata,
     )
+    # Multi-aspect scorers (trajectory_judge_v2) supply a graded quality score;
+    # binary scorers leave it None -> keep the legacy gating-fraction score.
+    case_score = (
+        scorer_result.graded_score
+        if scorer_result.graded_score is not None
+        else _score(gating_checks)
+    )
     return EvalExecutionReportCase(
         gold_case_id=case.gold_case_id,
         case_id=case.case_id,
         status="passed" if all(gating_checks.values()) else "failed",
-        score=_score(gating_checks),
+        score=case_score,
         max_score=1.0,
         checks=all_checks,
         warnings=[name for name, passed in all_checks.items() if not passed],

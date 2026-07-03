@@ -44,6 +44,7 @@ OVERRIDABLE_FIELDS = (
     "judge_votes",
     "system_prompt_file",
     "histories_file",
+    "rubrics_file",
     "live_skill",
     "cache_completions",
     "cache_mode",
@@ -113,6 +114,7 @@ class ResolvedRun:
     judge_votes: int
     system_prompt_file: str | None
     histories_file: str | None
+    rubrics_file: str | None
     live_skill: bool
     cache_completions: str | None
     cache_mode: str
@@ -243,6 +245,7 @@ def resolve_run(
         judge_votes=int(merged.get("judge_votes", 3)),
         system_prompt_file=_abs(merged.get("system_prompt_file")),
         histories_file=_abs(merged.get("histories_file")),
+        rubrics_file=_abs(merged.get("rubrics_file")),
         live_skill=bool(merged.get("live_skill", True)),
         cache_completions=_abs(cache_cfg.get("completions")),
         cache_mode=cache_mode,

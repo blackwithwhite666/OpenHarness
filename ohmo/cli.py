@@ -32,6 +32,7 @@ from ohmo.evals import (
     list_ohmo_eval_baselines,
     promote_ohmo_eval_case_drafts,
     review_ohmo_eval_case_drafts,
+    derive_ohmo_case_rubrics,
     run_ohmo_eval_report,
     run_ohmo_session_eval,
     run_ohmo_eval_smoke,
@@ -1587,6 +1588,7 @@ def _preset_overrides_from_cli(
         "judge_votes": "judge_votes",
         "system_prompt_file": "system_prompt_file",
         "histories_file": "histories_file",
+        "rubrics_file": "rubrics_file",
         "cache_completions": "cache_completions",
         "cache_prune_to": "cache_prune_to",
         "cache_mode": "cache_mode",
@@ -1594,6 +1596,7 @@ def _preset_overrides_from_cli(
     path_fields = {
         "system_prompt_file",
         "histories_file",
+        "rubrics_file",
         "cache_completions",
         "cache_prune_to",
     }
@@ -1796,6 +1799,16 @@ def evals_run_cmd(
             "store's episode set/order."
         ),
     ),
+    rubrics_file: str | None = typer.Option(
+        None,
+        "--rubrics-file",
+        help=(
+            "Per-case derived checklists (case_id -> {task_completion:[...], "
+            "grounding:[...]}) for --scorer trajectory_judge_v2. Distilled offline "
+            "from the gold episodes via `ohmo evals derive-rubrics`; the v2 judge "
+            "gates task_completion + grounding against them."
+        ),
+    ),
     no_live_skill: bool = typer.Option(
         False,
         "--no-live-skill",
@@ -1901,6 +1914,7 @@ def evals_run_cmd(
                         "judge_votes": judge_votes,
                         "system_prompt_file": system_prompt_file,
                         "histories_file": histories_file,
+                        "rubrics_file": rubrics_file,
                         "cache_completions": cache_completions,
                         "cache_prune_to": cache_prune_to,
                         "cache_mode": cache_mode,
@@ -1922,6 +1936,7 @@ def evals_run_cmd(
         judge_votes = resolved.judge_votes
         system_prompt_file = resolved.system_prompt_file
         histories_file = resolved.histories_file
+        rubrics_file = resolved.rubrics_file
         no_live_skill = not resolved.live_skill
         cache_completions = resolved.cache_completions
         cache_prune_to = resolved.cache_prune_to
@@ -2048,6 +2063,8 @@ def evals_run_cmd(
                 run_kwargs["cache_prune_to"] = cache_prune_to
         if histories_file is not None:
             run_kwargs["histories_file"] = histories_file
+        if rubrics_file is not None:
+            run_kwargs["rubrics_file"] = rubrics_file
         if no_live_skill:
             run_kwargs["live_skill"] = False
         result = run_ohmo_eval_report(**run_kwargs)
@@ -2121,6 +2138,48 @@ def evals_run_cmd(
         + getattr(report, "error_count", 0)
     ):
         raise typer.Exit(1)
+
+
+@evals_app.command("derive-rubrics")
+def evals_derive_rubrics_cmd(
+    workspace: str | None = typer.Option(None, "--workspace", help=_WORKSPACE_HELP),
+    pack_filename: str = typer.Option(
+        "eval_pack.json", "--pack", help="Runnable pack filename under evals/packs"
+    ),
+    output: str | None = typer.Option(
+        None,
+        "--output",
+        help="Where to write the derived rubrics (default <workspace>/evals/rubrics.json)",
+    ),
+    model: str | None = typer.Option(None, "--model", help="Model override for the deriver"),
+    provider_profile: str | None = typer.Option(
+        None, "--profile", help="Provider profile override for the deriver"
+    ),
+    limit: int | None = typer.Option(None, "--limit", min=1, help="Derive a subset of cases"),
+) -> None:
+    """Distil per-case task_completion + grounding checklists from gold episodes.
+
+    Offline live-model step for --scorer trajectory_judge_v2: reads each pack
+    case's gold reference (goal + gold trajectory + gold answer) and extracts
+    path-independent requirements the v2 judge gates against. Run once on a host
+    with model auth, then commit the output into the eval bundle.
+    """
+    workspace_root = initialize_workspace(workspace)
+    out_path = output or str(Path(workspace_root) / "evals" / "rubrics.json")
+    try:
+        result = derive_ohmo_case_rubrics(
+            output_path=out_path,
+            workspace=workspace_root,
+            pack_filename=pack_filename,
+            model=model,
+            provider_profile=provider_profile,
+            limit=limit,
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        print(str(exc), file=sys.stderr)
+        raise typer.Exit(1)
+    print(f"Wrote rubrics: {result.path}")
+    print(f"Derived {result.derived_count}/{result.case_count} case checklists")
 
 
 @evals_app.command("run-session")
