@@ -21,7 +21,7 @@ from openharness.api.client import (
 )
 from openharness.engine.messages import ConversationMessage
 from openharness.evals.facets import EvalTextFacetInput, collect_text_facets
-from openharness.evals.judge import TrajectoryJudgeScorer, TrajectoryJudgeScorerV2
+from openharness.evals.judge import FreezingJudgeScorer, RubricJudgeScorer
 from openharness.evals.executor import (
     EvalExecutionContext,
     EvalExecutor,
@@ -73,11 +73,11 @@ _JUDGE_METADATA_KEYS = (
     "observed_capability_count",
     "had_tool_error",
 )
-_JUDGE_V2_METADATA_KEYS = (
+_RUBRIC_JUDGE_METADATA_KEYS = (
     "judge_parsed_votes",
-    "judge_v2_graded_score",
-    "judge_v2_gate_failures",
-    "judge_v2_used_checklist",
+    "rubric_graded_score",
+    "rubric_gate_failures",
+    "rubric_used_checklist",
     "aspect.task_completion",
     "aspect.grounding",
     "aspect.tool_use",
@@ -86,7 +86,7 @@ _JUDGE_V2_METADATA_KEYS = (
     "aspect.efficiency",
 )
 _SCORER_REPORT_METADATA_KEYS = (
-    _CAPABILITY_METADATA_KEYS + _JUDGE_METADATA_KEYS + _JUDGE_V2_METADATA_KEYS
+    _CAPABILITY_METADATA_KEYS + _JUDGE_METADATA_KEYS + _RUBRIC_JUDGE_METADATA_KEYS
 )
 _EXECUTOR_REPORT_METADATA_KEYS = (
     "seeded_history_message_count",
@@ -546,8 +546,8 @@ class StateOutcomeOracleV1:
         )
 
 
-class _TrajectoryJudgeSentinel:
-    name = TrajectoryJudgeScorer.name
+class _FreezingJudgeSentinel:
+    name = FreezingJudgeScorer.name
     requires_exact_tool_sequence = False
 
     def score(
@@ -558,13 +558,13 @@ class _TrajectoryJudgeSentinel:
     ) -> EvalExecutionScorerResult:
         del context, executor_result
         raise RuntimeError(
-            "trajectory_judge_v1 requires an api_client; run via "
-            "'ohmo evals run --scorer trajectory_judge_v1'"
+            "freezing_judge requires an api_client; run via "
+            "'ohmo evals run --scorer freezing_judge'"
         )
 
 
-class _TrajectoryJudgeV2Sentinel:
-    name = TrajectoryJudgeScorerV2.name
+class _RubricJudgeSentinel:
+    name = RubricJudgeScorer.name
     requires_exact_tool_sequence = False
 
     def score(
@@ -575,8 +575,8 @@ class _TrajectoryJudgeV2Sentinel:
     ) -> EvalExecutionScorerResult:
         del context, executor_result
         raise RuntimeError(
-            "trajectory_judge_v2 requires an api_client; run via "
-            "'ohmo evals run --scorer trajectory_judge_v2'"
+            "rubric_judge requires an api_client; run via "
+            "'ohmo evals run --scorer rubric_judge'"
         )
 
 
@@ -587,8 +587,13 @@ EVAL_EXECUTION_SCORERS: dict[str, EvalExecutionScorer] = {
     CapabilityCoverageOracleV1.name: CapabilityCoverageOracleV1(),
     StateOracleV1.name: StateOracleV1(),
     StateOutcomeOracleV1.name: StateOutcomeOracleV1(),
-    TrajectoryJudgeScorer.name: _TrajectoryJudgeSentinel(),
-    TrajectoryJudgeScorerV2.name: _TrajectoryJudgeV2Sentinel(),
+    FreezingJudgeScorer.name: _FreezingJudgeSentinel(),
+    RubricJudgeScorer.name: _RubricJudgeSentinel(),
+    # Back-compat aliases for the pre-rename scorer names (trajectory_judge_v1 =
+    # freezing_judge, v2 = rubric_judge) so a bundle spec.json or a recorded
+    # report still on the old names keeps resolving. Drop once nothing uses them.
+    "trajectory_judge_v1": _FreezingJudgeSentinel(),
+    "trajectory_judge_v2": _RubricJudgeSentinel(),
 }
 
 
@@ -1243,7 +1248,7 @@ def _execute_case(
         error_hash="",
         metadata=observed_trace_metadata,
     )
-    # Multi-aspect scorers (trajectory_judge_v2) supply a graded quality score;
+    # Multi-aspect scorers (rubric_judge) supply a graded quality score;
     # binary scorers leave it None -> keep the legacy gating-fraction score.
     case_score = (
         scorer_result.graded_score

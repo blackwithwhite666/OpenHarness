@@ -26,7 +26,7 @@ _SPEC = {
     "presets": {
         "inner": {
             "agent_runner": "query-engine",
-            "scorer": "trajectory_judge_v1",
+            "scorer": "freezing_judge",
             "model": "gpt-5.5",
             "system_prompt_file": "system_prompt.txt",
             "histories_file": "histories.json",
@@ -56,7 +56,7 @@ def test_resolve_inner_pins_identity_and_resolves_paths_relative_to_spec(tmp_pat
     run = resolve_run(spec_path, "inner")
 
     assert run.agent_runner_name == "query-engine"
-    assert run.scorer == "trajectory_judge_v1"
+    assert run.scorer == "freezing_judge"
     assert run.model == "gpt-5.5"
     assert run.fixture_match == "args_then_order"  # from defaults
     assert run.samples == 1

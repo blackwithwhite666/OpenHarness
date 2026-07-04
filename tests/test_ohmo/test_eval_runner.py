@@ -798,7 +798,7 @@ def test_run_ohmo_eval_report_trajectory_judge_scores_metadata_only(
 
     result = run_ohmo_eval_report(
         workspace=workspace,
-        scorer="trajectory_judge_v1",
+        scorer="freezing_judge",
         judge_profile="judge-profile",
         judge_model="judge-model",
         limit=1,
@@ -811,7 +811,7 @@ def test_run_ohmo_eval_report_trajectory_judge_scores_metadata_only(
         "provider_profile": "judge-profile",
         "system_prompt": None,
     }
-    assert result.write.report.metadata["scorer_name"] == "trajectory_judge_v1"
+    assert result.write.report.metadata["scorer_name"] == "freezing_judge"
     assert result.write.report.metadata["judge_model"] == "judge-model"
     assert result.write.report.metadata["judge_provider_profile"] == "judge-profile"
     assert result.write.report.passed_count == 1

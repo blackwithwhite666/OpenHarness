@@ -2273,7 +2273,7 @@ def test_ohmo_evals_run_command_threads_judge_options(
             "--workspace",
             str(workspace),
             "--scorer",
-            "trajectory_judge_v1",
+            "freezing_judge",
             "--judge-profile",
             "judge-profile",
             "--judge-model",
@@ -2282,7 +2282,7 @@ def test_ohmo_evals_run_command_threads_judge_options(
     )
 
     assert result.exit_code == 0
-    assert calls[0]["scorer"] == "trajectory_judge_v1"
+    assert calls[0]["scorer"] == "freezing_judge"
     assert calls[0]["judge_profile"] == "judge-profile"
     assert calls[0]["judge_model"] == "judge-model"
 

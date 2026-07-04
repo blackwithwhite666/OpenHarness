@@ -25,7 +25,7 @@ if TYPE_CHECKING:
     from openharness.evals.execution import EvalExecutionScorerResult
 
 
-DEFAULT_TRAJECTORY_JUDGE_SYSTEM_PROMPT = (
+FREEZING_JUDGE_SYSTEM_PROMPT = (
     "You are an evaluation judge. Decide whether the agent ACCOMPLISHED THE "
     "USER'S REQUEST, judging from the observed trajectory and the final answer. "
     "The gold answer is ONE acceptable reference, NOT a required template: the "
@@ -42,7 +42,7 @@ DEFAULT_TRAJECTORY_JUDGE_SYSTEM_PROMPT = (
     "Be decisive and consistent: identical answers must get the same verdict. "
     "Reply with the first word PASS or FAIL, then one short sentence explaining why."
 )
-GROUNDING_TRAJECTORY_JUDGE_SYSTEM_PROMPT = (
+GROUNDING_FREEZING_JUDGE_SYSTEM_PROMPT = (
     "You are an evaluation judge for a TIME-SENSITIVE / live task whose facts "
     "change over time, so the reference answer may be STALE. Judge METHOD and "
     "GROUNDING, not fact-match. PASS when the agent consulted appropriate "
@@ -56,10 +56,10 @@ GROUNDING_TRAJECTORY_JUDGE_SYSTEM_PROMPT = (
 _VERDICT_RE = re.compile(r"^\s*([A-Za-z]+)\b(.*)$", re.DOTALL)
 
 
-class TrajectoryJudgeScorer:
+class FreezingJudgeScorer:
     """Score success by asking an LLM to judge trajectory plus outcome."""
 
-    name = "trajectory_judge_v1"
+    name = "freezing_judge"
     requires_exact_tool_sequence = False
 
     def __init__(
@@ -77,9 +77,9 @@ class TrajectoryJudgeScorer:
         self._model = model
         self._grounding = grounding_mode
         self._system_prompt = system_prompt or (
-            GROUNDING_TRAJECTORY_JUDGE_SYSTEM_PROMPT
+            GROUNDING_FREEZING_JUDGE_SYSTEM_PROMPT
             if grounding_mode
-            else DEFAULT_TRAJECTORY_JUDGE_SYSTEM_PROMPT
+            else FREEZING_JUDGE_SYSTEM_PROMPT
         )
         self._max_tokens = max_tokens
         self._min_chars = min_chars
@@ -248,7 +248,7 @@ def _hash_text(text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# trajectory_judge_v2 — multi-aspect, checklist-gated quality judge
+# rubric_judge — multi-aspect, checklist-gated quality judge
 # ---------------------------------------------------------------------------
 #
 # v1 returns a single binary PASS/FAIL. v2 grades the run across quality
@@ -270,7 +270,7 @@ class _AspectSpec:
 
 
 # Weights sum to 1.0. task_completion + grounding are the hard gates.
-TRAJECTORY_JUDGE_V2_ASPECTS: tuple[_AspectSpec, ...] = (
+RUBRIC_JUDGE_ASPECTS: tuple[_AspectSpec, ...] = (
     _AspectSpec(
         "task_completion", 0.35, 0.5, True,
         "Did the agent accomplish EVERYTHING the user asked -- correct, "
@@ -306,7 +306,7 @@ TRAJECTORY_JUDGE_V2_ASPECTS: tuple[_AspectSpec, ...] = (
     ),
 )
 
-TRAJECTORY_JUDGE_V2_SYSTEM_PROMPT = (
+RUBRIC_JUDGE_SYSTEM_PROMPT = (
     "You are a rigorous evaluation judge for a live AI agent. Score the agent's "
     "task execution across quality ASPECTS, judging from the user's request, the "
     "observed trajectory (tool calls AND their outputs), and the final answer. "
@@ -334,10 +334,10 @@ _VERDICT_SCORE = {
 }
 
 
-class TrajectoryJudgeScorerV2:
+class RubricJudgeScorer:
     """Multi-aspect, checklist-gated LLM judge returning a graded [0,1] score."""
 
-    name = "trajectory_judge_v2"
+    name = "rubric_judge"
     requires_exact_tool_sequence = False
 
     def __init__(
@@ -355,7 +355,7 @@ class TrajectoryJudgeScorerV2:
         self._api_client = api_client
         self._model = model
         self._rubrics = rubrics or {}
-        self._system_prompt = system_prompt or TRAJECTORY_JUDGE_V2_SYSTEM_PROMPT
+        self._system_prompt = system_prompt or RUBRIC_JUDGE_SYSTEM_PROMPT
         self._max_tokens = max_tokens
         self._votes = max(1, int(votes))
         self._pass_threshold = pass_threshold
@@ -392,9 +392,9 @@ class TrajectoryJudgeScorerV2:
             "verdict": verdict,
             "judge_votes": self._votes,
             "judge_parsed_votes": sum(1 for v in votes if v),
-            "judge_v2_graded_score": round(graded, 4),
-            "judge_v2_gate_failures": list(gate_fails),
-            "judge_v2_used_checklist": bool(rubric),
+            "rubric_graded_score": round(graded, 4),
+            "rubric_gate_failures": list(gate_fails),
+            "rubric_used_checklist": bool(rubric),
         }
         for key, value in aspects.items():
             metadata[f"aspect.{key}"] = round(value, 4)
@@ -484,7 +484,7 @@ def _v2_judge_prompt(
     rubric: dict[str, object],
 ) -> str:
     aspect_lines = []
-    for spec in TRAJECTORY_JUDGE_V2_ASPECTS:
+    for spec in RUBRIC_JUDGE_ASPECTS:
         block = _checklist_block(rubric, spec.key) if spec.checklist else ""
         scale = (
             'per-item verdict' if block else 'a "score" of 0, 0.5, or 1'
@@ -567,7 +567,7 @@ def _parse_v2_scores(text: str) -> dict[str, float]:
     if not parsed:
         return {}
     scores: dict[str, float] = {}
-    for spec in TRAJECTORY_JUDGE_V2_ASPECTS:
+    for spec in RUBRIC_JUDGE_ASPECTS:
         if spec.key in parsed:
             value = _aspect_vote_score(parsed[spec.key])
             if value is not None:
@@ -580,22 +580,22 @@ def _aggregate_v2(
 ) -> tuple[dict[str, float], float, bool, tuple[str, ...]]:
     """Average aspect scores across votes -> (aspects, graded, passed, gate_failures)."""
     aspects: dict[str, float] = {}
-    for spec in TRAJECTORY_JUDGE_V2_ASPECTS:
+    for spec in RUBRIC_JUDGE_ASPECTS:
         vals = [v[spec.key] for v in votes if spec.key in v]
         if vals:
             aspects[spec.key] = sum(vals) / len(vals)
     if not aspects:
         return {}, 0.0, False, ()
-    total_weight = sum(spec.weight for spec in TRAJECTORY_JUDGE_V2_ASPECTS if spec.key in aspects)
+    total_weight = sum(spec.weight for spec in RUBRIC_JUDGE_ASPECTS if spec.key in aspects)
     graded = (
-        sum(spec.weight * aspects[spec.key] for spec in TRAJECTORY_JUDGE_V2_ASPECTS if spec.key in aspects)
+        sum(spec.weight * aspects[spec.key] for spec in RUBRIC_JUDGE_ASPECTS if spec.key in aspects)
         / total_weight
         if total_weight
         else 0.0
     )
     gate_failures = tuple(
         spec.key
-        for spec in TRAJECTORY_JUDGE_V2_ASPECTS
+        for spec in RUBRIC_JUDGE_ASPECTS
         if spec.gate_floor is not None
         and spec.key in aspects
         and aspects[spec.key] < spec.gate_floor

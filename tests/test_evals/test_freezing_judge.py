@@ -16,7 +16,7 @@ from openharness.evals import (
     EvalRunPack,
     EvalRunPackCase,
     EvalStore,
-    TrajectoryJudgeScorer,
+    FreezingJudgeScorer,
 )
 
 
@@ -51,7 +51,7 @@ def test_trajectory_judge_scores_verdicts_metadata_only(
     expected_verdict: str,
 ):
     api_client = _StaticJudgeApiClient(response)
-    scorer = TrajectoryJudgeScorer(api_client=api_client, model="judge-model")
+    scorer = FreezingJudgeScorer(api_client=api_client, model="judge-model")
 
     result = scorer.score(
         context=_context(tmp_path),
@@ -70,7 +70,7 @@ def test_trajectory_judge_scores_verdicts_metadata_only(
 
     assert result.passed is expected_passed
     assert result.score == (1.0 if expected_passed else 0.0)
-    assert result.scorer_name == "trajectory_judge_v1"
+    assert result.scorer_name == "freezing_judge"
     assert result.metadata["judge_model"] == "judge-model"
     assert result.metadata["verdict"] == expected_verdict
     assert "reason_hash" in result.metadata
@@ -118,7 +118,7 @@ def test_trajectory_judge_majority_vote(
     expected_pass_votes: int,
 ):
     api_client = _SequenceJudgeApiClient(texts)
-    scorer = TrajectoryJudgeScorer(api_client=api_client, model="judge-model", votes=3)
+    scorer = FreezingJudgeScorer(api_client=api_client, model="judge-model", votes=3)
 
     result = scorer.score(
         context=_context(tmp_path),
@@ -138,7 +138,7 @@ def test_trajectory_judge_majority_vote(
 
 def test_trajectory_judge_grounding_mode_judges_method_not_facts(tmp_path: Path):
     api_client = _StaticJudgeApiClient("PASS - grounded in sources")
-    scorer = TrajectoryJudgeScorer(
+    scorer = FreezingJudgeScorer(
         api_client=api_client, model="judge-model", votes=1, grounding_mode=True
     )
 
