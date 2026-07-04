@@ -309,6 +309,15 @@ class FsSandboxBashTool(BaseTool):
         payload = arguments.model_dump()
         raw_command = payload.get("command") or payload.get("cmd") or ""
         command = raw_command if isinstance(raw_command, str) else ""
+        # Guarantee the skill-bin is on PATH for the command itself, and use a
+        # non-login shell: a login shell (-l) can re-source a profile that
+        # clobbers the jail's --setenv PATH, intermittently dropping skill CLIs
+        # to "command not found". Export inside the command is bwrap-env-proof.
+        if self._bin_dirs:
+            bins = ":".join(
+                str(Path(b).expanduser().resolve()) for b in self._bin_dirs
+            )
+            command = f'export PATH="{bins}:$PATH"; {command}'
         argv = build_bwrap_argv(
             sandbox_root=self._sandbox_root,
             cwd=self._cwd,
@@ -320,7 +329,7 @@ class FsSandboxBashTool(BaseTool):
             browser_socket=self._browser_socket,
             browser_cli_name=self._browser_cli_name,
             bin_dirs=self._bin_dirs,
-        ) + ["bash", "-lc", command]
+        ) + ["bash", "-c", command]
         metadata = {"lane": "fs-sandbox", "net_mode": self._net_mode}
         try:
             process = await asyncio.create_subprocess_exec(

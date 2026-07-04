@@ -276,7 +276,7 @@ async def test_fs_sandbox_bash_tool_runs_bwrap_argv_and_falls_back(
     assert calls
     assert calls[0][0] == "bwrap"
     assert "--unshare-net" in calls[0]
-    assert calls[0][-3:] == ("bash", "-lc", "echo hi")
+    assert calls[0][-3:] == ("bash", "-c", "echo hi")
     assert mock_tool.calls == []
 
     async def missing_exec(*args, **kwargs):
