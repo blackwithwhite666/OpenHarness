@@ -1659,12 +1659,12 @@ def evals_run_cmd(
     judge_profile: str | None = typer.Option(
         None,
         "--judge-profile",
-        help="Provider profile override for --scorer trajectory_judge_v1",
+        help="Provider profile override for --scorer freezing_judge",
     ),
     judge_model: str | None = typer.Option(
         None,
         "--judge-model",
-        help="Model override for --scorer trajectory_judge_v1",
+        help="Model override for --scorer freezing_judge",
     ),
     judge_votes: int = typer.Option(
         3,
@@ -1804,7 +1804,7 @@ def evals_run_cmd(
         "--rubrics-file",
         help=(
             "Per-case derived checklists (case_id -> {task_completion:[...], "
-            "grounding:[...]}) for --scorer trajectory_judge_v2. Distilled offline "
+            "grounding:[...]}) for --scorer rubric_judge. Distilled offline "
             "from the gold episodes via `ohmo evals derive-rubrics`; the v2 judge "
             "gates task_completion + grounding against them."
         ),
@@ -2159,7 +2159,7 @@ def evals_derive_rubrics_cmd(
 ) -> None:
     """Distil per-case task_completion + grounding checklists from gold episodes.
 
-    Offline live-model step for --scorer trajectory_judge_v2: reads each pack
+    Offline live-model step for --scorer rubric_judge: reads each pack
     case's gold reference (goal + gold trajectory + gold answer) and extracts
     path-independent requirements the v2 judge gates against. Run once on a host
     with model auth, then commit the output into the eval bundle.

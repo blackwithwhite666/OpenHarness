@@ -36,8 +36,8 @@ from openharness.evals import (
     SandboxMutatingAgentRunner,
     SessionReplayRunner,
     SynthContext,
-    TrajectoryJudgeScorer,
-    TrajectoryJudgeScorerV2,
+    FreezingJudgeScorer,
+    RubricJudgeScorer,
     UserSimulator,
     build_gold_reference,
     collect_text_facets,
@@ -210,7 +210,12 @@ def run_ohmo_eval_report(
     history_config: _AgentRunnerConfig | None = None
     synth_context: SynthContext | None = None
     history_context: HistoryContext | None = None
-    if scorer in (TrajectoryJudgeScorer.name, TrajectoryJudgeScorerV2.name):
+    if scorer in (
+        FreezingJudgeScorer.name,
+        RubricJudgeScorer.name,
+        "trajectory_judge_v1",  # back-compat aliases (pre-rename names)
+        "trajectory_judge_v2",
+    ):
         judge_config = _build_agent_runner_config(
             "query-engine",
             workspace=workspace_root,
@@ -221,15 +226,15 @@ def run_ohmo_eval_report(
         )
         if judge_config.api_client is None:
             raise ValueError(f"{scorer} requires configured API authentication")
-        if scorer == TrajectoryJudgeScorerV2.name:
-            selected_scorer = TrajectoryJudgeScorerV2(
+        if scorer in (RubricJudgeScorer.name, "trajectory_judge_v2"):
+            selected_scorer = RubricJudgeScorer(
                 api_client=judge_config.api_client,
                 model=judge_config.model,
                 votes=judge_votes,
                 rubrics=_load_case_rubrics(rubrics_file),
             )
         else:
-            selected_scorer = TrajectoryJudgeScorer(
+            selected_scorer = FreezingJudgeScorer(
                 api_client=judge_config.api_client,
                 model=judge_config.model,
                 votes=judge_votes,
@@ -862,7 +867,7 @@ def _load_case_rubrics(
 ) -> dict[str, dict[str, object]] | None:
     """Load per-case derived checklists: {case_id: {task_completion:[...], grounding:[...]}}.
 
-    Committed in the bundle (evals/rubrics.json) so trajectory_judge_v2 grades the
+    Committed in the bundle (evals/rubrics.json) so rubric_judge grades the
     two hard-gate aspects (task_completion, grounding) against requirements
     distilled offline from the gold episode (see ``derive_ohmo_case_rubrics``).
     """
@@ -895,7 +900,7 @@ def derive_ohmo_case_rubrics(
     Offline live-model step (like recording the completion cache): reads each
     pack case's gold reference (goal + gold trajectory + gold answer), asks the
     model to extract path-independent requirements, and writes
-    ``evals/rubrics.json`` for ``trajectory_judge_v2`` to gate against. Run once
+    ``evals/rubrics.json`` for ``rubric_judge`` to gate against. Run once
     on a host with model auth; commit the result to the bundle.
     """
     if limit is not None and limit <= 0:

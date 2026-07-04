@@ -95,8 +95,8 @@ from openharness.evals.facets import EvalTextFacetInput, collect_text_facets
 from openharness.evals.graph import build_usage_graph, write_usage_graph
 from openharness.evals.inference import DEFAULT_INFERENCE_URL, InferenceClient
 from openharness.evals.judge import (
-    TrajectoryJudgeScorer,
-    TrajectoryJudgeScorerV2,
+    FreezingJudgeScorer,
+    RubricJudgeScorer,
     derive_case_rubric,
 )
 from openharness.evals.live_read import (
@@ -271,8 +271,8 @@ __all__ = [
     "SynthContext",
     "SynthesizedFixtureTool",
     "ToolTraceOracleV1",
-    "TrajectoryJudgeScorer",
-    "TrajectoryJudgeScorerV2",
+    "FreezingJudgeScorer",
+    "RubricJudgeScorer",
     "derive_case_rubric",
     "build_gold_reference",
     "EVAL_EXECUTION_SCORERS",

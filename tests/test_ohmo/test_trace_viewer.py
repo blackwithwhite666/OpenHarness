@@ -525,7 +525,7 @@ def test_eval_report_lane_lists_and_renders_metadata_traces(tmp_path: Path) -> N
             "reportId": "report-x",
             "packId": "pack-x",
             "createdAt": created_at,
-            "scorer": "trajectory_judge_v1",
+            "scorer": "freezing_judge",
             "executor": "replay-tools",
             "samples": 3,
             "caseCount": 1,
@@ -589,7 +589,7 @@ def test_eval_case_to_trace_viewer_data_prefers_rich_trace(tmp_path: Path) -> No
     assert data["traceRecord"]["spansCount"] == 4
     assert data["traceRecord"]["durationMs"] == 600
     assert data["traceRecord"]["totalTokens"] == 40
-    assert data["traceRecord"]["agentDescription"] == "replay-tools · trajectory_judge_v1"
+    assert data["traceRecord"]["agentDescription"] == "replay-tools · freezing_judge"
     assert data["badges"] == [
         {"label": "score 0.9"},
         {"label": "failed"},
@@ -885,7 +885,7 @@ def _write_eval_report(store) -> None:
         "error_count": 0,
         "metadata": {
             "executor_name": "replay-tools",
-            "scorer_name": "trajectory_judge_v1",
+            "scorer_name": "freezing_judge",
             "fixture_match": "order",
             "samples": 3,
             "judge_model": "judge-model",
@@ -940,7 +940,7 @@ def _write_eval_report(store) -> None:
                     ],
                 },
                 "metadata": {
-                    "scorer_name": "trajectory_judge_v1",
+                    "scorer_name": "freezing_judge",
                     "executor_name": "replay-tools",
                     "pass_count": 1,
                     "sample_count": 3,
@@ -948,7 +948,7 @@ def _write_eval_report(store) -> None:
                     "tool_count": 2,
                     "rubric_count": 1,
                 },
-                "checks": ["trajectory_judge_v1"],
+                "checks": ["freezing_judge"],
                 "warnings": [],
             }
         ],

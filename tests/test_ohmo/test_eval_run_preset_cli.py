@@ -20,7 +20,7 @@ _SPEC = {
     "presets": {
         "inner": {
             "agent_runner": "query-engine",
-            "scorer": "trajectory_judge_v1",
+            "scorer": "freezing_judge",
             "model": "gpt-5.5",
             "system_prompt_file": "system_prompt.txt",
             "histories_file": "histories.json",
@@ -90,7 +90,7 @@ def test_preset_projects_frozen_inputs(tmp_path: Path, monkeypatch):
     assert len(fake.calls) == 1
     call = fake.calls[0]
     assert call["agent_runner_name"] == "query-engine"
-    assert call["scorer"] == "trajectory_judge_v1"
+    assert call["scorer"] == "freezing_judge"
     assert call["model"] == "gpt-5.5"
     assert call["fixture_match"] == "args_then_order"
     assert call["samples"] == 1

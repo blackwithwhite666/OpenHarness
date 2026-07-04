@@ -383,9 +383,9 @@ def test_resolve_execution_scorer_known_and_unknown():
 
 
 def test_trajectory_judge_sentinel_requires_api_client():
-    scorer = resolve_execution_scorer("trajectory_judge_v1")
+    scorer = resolve_execution_scorer("freezing_judge")
 
-    assert scorer is EVAL_EXECUTION_SCORERS["trajectory_judge_v1"]
+    assert scorer is EVAL_EXECUTION_SCORERS["freezing_judge"]
     assert scorer.requires_exact_tool_sequence is False
-    with pytest.raises(RuntimeError, match="trajectory_judge_v1 requires an api_client"):
+    with pytest.raises(RuntimeError, match="freezing_judge requires an api_client"):
         scorer.score(context=_ctx([]), executor_result=_result())

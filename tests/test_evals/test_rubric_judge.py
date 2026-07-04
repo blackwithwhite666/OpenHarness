@@ -14,7 +14,7 @@ from openharness.evals import (
     EvalRunPack,
     EvalRunPackCase,
     EvalStore,
-    TrajectoryJudgeScorerV2,
+    RubricJudgeScorer,
     derive_case_rubric,
 )
 from openharness.evals.judge import _aggregate_v2, _parse_v2_scores
@@ -53,7 +53,7 @@ _ALL_GOOD = _wrap(
 
 def test_v2_grades_aspects_and_passes(tmp_path: Path):
     api_client = _StaticJudgeApiClient(_ALL_GOOD)
-    scorer = TrajectoryJudgeScorerV2(api_client=api_client, model="judge-model", votes=1)
+    scorer = RubricJudgeScorer(api_client=api_client, model="judge-model", votes=1)
 
     result = scorer.score(
         context=_context(tmp_path),
@@ -71,7 +71,7 @@ def test_v2_grades_aspects_and_passes(tmp_path: Path):
     )
 
     assert result.passed is True
-    assert result.scorer_name == "trajectory_judge_v2"
+    assert result.scorer_name == "rubric_judge"
     # Graded, not binary: efficiency 0.5 pulls it below 1.0.
     assert 0.9 < result.score < 1.0
     assert result.graded_score == result.score
@@ -96,7 +96,7 @@ def test_v2_hard_gate_fails_even_with_high_soft_aspects(tmp_path: Path):
             }
         )
     )
-    scorer = TrajectoryJudgeScorerV2(api_client=api_client, model="judge-model", votes=1)
+    scorer = RubricJudgeScorer(api_client=api_client, model="judge-model", votes=1)
     result = scorer.score(
         context=_context(tmp_path),
         executor_result=EvalExecutorResult(final_text="a", tool_calls=()),
@@ -104,7 +104,7 @@ def test_v2_hard_gate_fails_even_with_high_soft_aspects(tmp_path: Path):
 
     assert result.passed is False  # task_completion below the gate floor
     assert result.metadata["aspect.task_completion"] == 0.0
-    assert "task_completion" in result.metadata["judge_v2_gate_failures"]
+    assert "task_completion" in result.metadata["rubric_gate_failures"]
     # Still graded (not zero): the soft aspects contribute.
     assert 0.6 < result.graded_score < 0.7
 
@@ -120,7 +120,7 @@ def test_v2_uses_derived_checklist_in_prompt(tmp_path: Path):
         }
     }
     api_client = _StaticJudgeApiClient(_ALL_GOOD)
-    scorer = TrajectoryJudgeScorerV2(
+    scorer = RubricJudgeScorer(
         api_client=api_client, model="judge-model", votes=1, rubrics=rubrics
     )
     result = scorer.score(
@@ -128,14 +128,14 @@ def test_v2_uses_derived_checklist_in_prompt(tmp_path: Path):
         executor_result=EvalExecutorResult(final_text="ok", tool_calls=()),
     )
 
-    assert result.metadata["judge_v2_used_checklist"] is True
+    assert result.metadata["rubric_used_checklist"] is True
     prompt = api_client.requests[0].messages[0].text
     assert "Due time is tomorrow at 09:00" in prompt
     assert "A reminder was created" in prompt
 
 
 def test_v2_all_votes_unparseable_is_error(tmp_path: Path):
-    scorer = TrajectoryJudgeScorerV2(
+    scorer = RubricJudgeScorer(
         api_client=_StaticJudgeApiClient("no json here"), model="m", votes=2
     )
     result = scorer.score(

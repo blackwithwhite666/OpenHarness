@@ -34,7 +34,7 @@ from openharness.evals import (
     TRACE_DECISION,
     TRACE_MISSING_REQUIRED,
     TRACE_UNCERTAINTY,
-    TrajectoryJudgeScorer,
+    FreezingJudgeScorer,
     build_case_candidates,
     build_case_drafts,
     build_replay_tool_registry,
@@ -454,7 +454,7 @@ def test_execution_report_query_engine_writes_rich_trace_and_keeps_report_privat
                     cwd=tmp_path,
                 )
             ),
-            scorer=TrajectoryJudgeScorer(
+            scorer=FreezingJudgeScorer(
                 api_client=_FinalOnlyModelApiClient(
                     final_text=f"PASS {raw_judge_reason}"
                 ),
