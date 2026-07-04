@@ -541,3 +541,36 @@ class _WriteReadApiClient:
             ),
             usage=UsageSnapshot(input_tokens=1, output_tokens=1),
         )
+
+
+def test_build_bwrap_argv_bin_dirs_on_path_and_ro_bound(tmp_path):
+    from openharness.evals.fs_sandbox import build_bwrap_argv
+
+    bindir = tmp_path / "skillbin"
+    bindir.mkdir()
+    argv = build_bwrap_argv(
+        sandbox_root=tmp_path, cwd=tmp_path, home=tmp_path,
+        ro_binds=[], rw_binds=[], net_mode="host", bin_dirs=[bindir],
+    )
+    resolved = str(bindir.resolve())
+    assert resolved in argv  # ro-bound
+    assert argv[argv.index("PATH") + 1] == f"{resolved}:/usr/bin:/bin"  # prepended
+    assert "--unshare-net" not in argv  # host net
+
+
+def test_build_sandbox_skill_bin_mocks_publisher(tmp_path):
+    from ohmo.evals.runner import _build_sandbox_skill_bin
+    from ohmo.workspace import get_skills_dir
+
+    assert _build_sandbox_skill_bin(None, live_skill=False) == ()
+    ws = tmp_path / "ws"
+    skills = get_skills_dir(ws)
+    (skills / "static_publisher").mkdir(parents=True)
+    (skills / "maps").mkdir(parents=True)
+    (skills / "static_publisher" / "static_publisher-cli").write_text("real")
+    (skills / "maps" / "maps-cli").write_text("real")
+    dirs = _build_sandbox_skill_bin(ws, live_skill=True)
+    mock_pub = dirs[0] / "static_publisher-cli"
+    assert mock_pub.exists() and (mock_pub.stat().st_mode & 0o111)
+    assert "mock" in mock_pub.read_text()
+    assert (dirs[1] / "maps-cli").exists()  # flat symlink to the real nested CLI

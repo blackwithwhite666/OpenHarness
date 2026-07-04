@@ -684,6 +684,74 @@ def _resolve_eval_system_prompt(
     )
 
 
+_MOCK_STATIC_PUBLISHER_SH = """#!/bin/bash
+# Eval-only mock of static_publisher-cli: returns a content-addressed
+# https://worfalomey.top/static/<hash>/ URL WITHOUT uploading (no network, no
+# side effect). Mirrors _MockSendTelegramMessageTool — the real publisher's
+# ACL/upload is tested elsewhere; in fs-sandbox eval we only need the publish
+# step to yield a stable, groundable URL.
+cmd="${1:-}"
+if [ "$cmd" = "publish" ]; then
+  shift || true
+  dir="."
+  if [ $# -ge 1 ]; then case "$1" in -*) ;; *) dir="$1";; esac; fi
+  json=0
+  for a in "$@"; do [ "$a" = "--json" ] && json=1; done
+  slug=$( { find "$dir" -type f -exec cat {} + 2>&-; printf '%s' "$dir"; } | sha256sum | cut -c1-16 )
+  url="https://worfalomey.top/static/$slug/"
+  if [ "$json" = "1" ]; then
+    printf '{"url": "%s", "hash": "%s", "mock": true}\\n' "$url" "$slug"
+  else
+    printf 'Published: %s\\n' "$url"
+  fi
+elif [ "$cmd" = "list" ]; then
+  printf '%s\\n' "$@" | grep -q -- --json && echo "[]" || echo "(mock static_publisher: no entries)"
+else
+  echo "mock static_publisher-cli: $*"
+fi
+"""
+
+
+def _build_sandbox_skill_bin(
+    workspace: Path | None, *, live_skill: bool
+) -> tuple[Path, ...]:
+    """Expose skill CLIs on the fs-sandbox PATH, with a mocked publisher.
+
+    Skill CLIs live nested (``skills/<name>/<name>-cli``), so a bare invocation
+    resolves as "command not found" inside the jail even though the dir is
+    ro-bound (PATH is only ``/usr/bin:/bin``). Symlink them flat, and shadow the
+    side-effecting ``static_publisher-cli`` with a deterministic mock (a
+    content-addressed ``worfalomey.top/static/<hash>/`` URL, no upload) so the
+    faithful lane's publish step yields a groundable URL without a real side
+    effect. Returns bin dirs to prepend to PATH (mock dir first, so it wins).
+    No-op unless ``live_skill`` (the faithful lane).
+    """
+    if not live_skill or workspace is None:
+        return ()
+    skills_dir = get_skills_dir(workspace)
+    bin_root = Path(tempfile.mkdtemp(prefix="openharness-eval-skillbin-"))
+    mock_dir = bin_root / "mock"
+    flat_dir = bin_root / "skills"
+    mock_dir.mkdir()
+    flat_dir.mkdir()
+    if skills_dir.is_dir():
+        for cli in skills_dir.glob("*/*-cli"):
+            link = flat_dir / cli.name
+            if not link.exists():
+                try:
+                    link.symlink_to(cli.resolve())
+                except OSError:
+                    continue
+    mock_publisher = mock_dir / "static_publisher-cli"
+    mock_publisher.write_text(_MOCK_STATIC_PUBLISHER_SH, encoding="utf-8")
+    mock_publisher.chmod(0o755)
+    dirs = [mock_dir, flat_dir]
+    home_bin = Path.home() / "bin"
+    if home_bin.is_dir():
+        dirs.append(home_bin)
+    return tuple(dirs)
+
+
 def _build_agent_runner_config(
     agent_runner_name: str,
     *,
@@ -774,6 +842,9 @@ def _build_agent_runner_config(
                 proxy_url=sandbox_proxy_url,
                 browser_socket=sandbox_browser_socket,
                 browser_cli_name=sandbox_browser_name,
+                sandbox_bin_dirs=_build_sandbox_skill_bin(
+                    workspace, live_skill=live_skill
+                ),
                 live_mcp_server_names=(
                     ("google_search",) if sandbox_net_mode.startswith("netns:") else ()
                 ),

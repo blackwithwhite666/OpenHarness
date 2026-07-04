@@ -80,8 +80,15 @@ def build_bwrap_argv(
     proxy_url: str | None = None,
     browser_socket: str | None = None,
     browser_cli_name: str | None = None,
+    bin_dirs: Iterable[str | Path] = (),
 ) -> list[str]:
-    """Build the bubblewrap argv used for real bash execution."""
+    """Build the bubblewrap argv used for real bash execution.
+
+    ``bin_dirs`` are ro-bound AND prepended to PATH, so skill CLIs (which live
+    nested under ``skills/<name>/<name>-cli`` and would otherwise be present-but-
+    unreachable — bare invocations resolve as "command not found") become
+    runnable in the jail.
+    """
     del sandbox_root
     bwrap_argv = [
         "bwrap",
@@ -89,6 +96,10 @@ def build_bwrap_argv(
         "--unshare-pid",
         "--unshare-ipc",
         "--unshare-uts",
+        # A minimal /dev (null, zero, urandom, tty, ...); without it skill CLIs
+        # (and their `2>/dev/null` / randomness) fail on a missing device node.
+        "--dev",
+        "/dev",
     ]
     netns_name: str | None = None
     if net_mode == "none":
@@ -122,6 +133,15 @@ def build_bwrap_argv(
             text = str(path)
             bwrap_argv.extend(["--ro-bind", text, text])
 
+    sandbox_bin_paths: list[str] = []
+    for raw_bin in bin_dirs:
+        bin_path = Path(raw_bin).expanduser()
+        if bin_path.is_dir():
+            text = str(bin_path.resolve())
+            if text not in sandbox_bin_paths:
+                bwrap_argv.extend(["--ro-bind", text, text])
+                sandbox_bin_paths.append(text)
+
     for raw_src, raw_dest in rw_binds:
         src = Path(raw_src).expanduser()
         dest = Path(raw_dest).expanduser()
@@ -138,7 +158,7 @@ def build_bwrap_argv(
             str(Path(home).expanduser().resolve()),
             "--setenv",
             "PATH",
-            "/usr/bin:/bin",
+            ":".join([*sandbox_bin_paths, "/usr/bin", "/bin"]),
         ]
     )
     if proxy_url:
@@ -262,6 +282,7 @@ class FsSandboxBashTool(BaseTool):
         proxy_url: str | None = None,
         browser_socket: str | None = None,
         browser_cli_name: str | None = None,
+        bin_dirs: Iterable[str | Path] = (),
         timeout: float = 120.0,
     ) -> None:
         self._mock_tool = mock_tool
@@ -277,6 +298,7 @@ class FsSandboxBashTool(BaseTool):
         self._proxy_url = proxy_url
         self._browser_socket = browser_socket
         self._browser_cli_name = browser_cli_name
+        self._bin_dirs = tuple(bin_dirs)
         self._timeout = timeout
 
     async def execute(
@@ -297,6 +319,7 @@ class FsSandboxBashTool(BaseTool):
             proxy_url=self._proxy_url,
             browser_socket=self._browser_socket,
             browser_cli_name=self._browser_cli_name,
+            bin_dirs=self._bin_dirs,
         ) + ["bash", "-lc", command]
         metadata = {"lane": "fs-sandbox", "net_mode": self._net_mode}
         try:
@@ -478,6 +501,7 @@ class FsSandboxAgentRunner:
         live_mcp_server_names: tuple[str, ...] = (),
         mutable_dirs: Iterable[str | Path] = ("memory", "todos", "reminders", "user.md"),
         ro_source_dirs: Iterable[str | Path] | None = None,
+        sandbox_bin_dirs: Iterable[str | Path] = (),
     ) -> None:
         self._api_client = api_client
         self._model = model
@@ -497,6 +521,7 @@ class FsSandboxAgentRunner:
             if ro_source_dirs is not None
             else (Path.home() / ".ohmo" / "skills", Path.home() / "bin", Path(sys.prefix))
         )
+        self._sandbox_bin_dirs = tuple(sandbox_bin_dirs)
         self._home = Path.home().resolve()
 
     def run(
@@ -582,6 +607,7 @@ class FsSandboxAgentRunner:
                         proxy_url=self._proxy_url,
                         browser_socket=self._browser_socket,
                         browser_cli_name=self._browser_cli_name,
+                        bin_dirs=self._sandbox_bin_dirs,
                         timeout=self._timeout,
                     )
                 )
