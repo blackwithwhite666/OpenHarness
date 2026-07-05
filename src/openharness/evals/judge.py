@@ -323,27 +323,39 @@ RUBRIC_JUDGE_SYSTEM_PROMPT = (
 # adrs/ohmo-eval-verification-grounding.md. Two orchestrated LLM calls (extract
 # claims, then verdict-against-evidence) with a web_search in between.
 GROUNDING_EXTRACT_SYSTEM_PROMPT = (
-    "You extract the checkable FACTUAL CLAIMS from an AI agent's answer so they "
-    "can be INDEPENDENTLY verified against the live web. A claim is a concrete "
-    "assertion of fact the answer makes: a price, time, rating, address, phone, "
-    "identity, count, code, opening hours, or an explicit 'X is unavailable / not "
-    "found'. IGNORE hedges, opinions, offers, recommendations, and meta-talk. "
-    "Mark each claim public=true if it is verifiable on the open web, or "
-    "public=false if it is about the USER'S OWN private data (their chats, "
-    "calendar, files, config, memory) and cannot be web-verified. If the answer "
-    "makes NO substantive factual assertion because a required INPUT was missing "
-    "-- it only asks a clarifying question, or says it cannot open/read an "
-    "attachment/file -- set sandbox_blocked=true. Output ONE fenced ```json block."
+    "You extract the checkable CLAIMS from an AI agent's answer so they can be "
+    "verified. A claim is a concrete assertion: a price, time, rating, address, "
+    "identity, count, code, opening hours, an explicit 'X is unavailable', OR an "
+    "assertion that the agent itself did/produced something. IGNORE hedges, "
+    "opinions, offers, recommendations, and meta-talk. For each claim set:\n"
+    "- kind: 'action' if it asserts something the AGENT ITSELF did or produced "
+    "(created/wrote a file, published a URL, sent a message, saved data); else "
+    "'fact'.\n"
+    "- public: for a 'fact', true if verifiable on the open web, false if it is "
+    "about the USER'S OWN private data (chats, calendar, files, config, memory). "
+    "('action' claims are checked against the agent's own trajectory, not the "
+    "web -- set public=false for them.)\n"
+    "- relevant: true ONLY if the claim is central to answering the user's "
+    "request (or matches one of the task's key facts); false for incidental or "
+    "padding trivia that does not address what the user actually asked.\n"
+    "If the answer makes NO substantive claim because a required INPUT was "
+    "missing -- it only asks a clarifying question, or says it cannot open/read "
+    "an attachment/file -- set sandbox_blocked=true. Output ONE fenced ```json block."
 )
 GROUNDING_VERDICT_SYSTEM_PROMPT = (
-    "You verify factual claims against retrieved web evidence. For each claim, "
-    "given its search results, decide: 'verified' (the evidence supports it, OR "
-    "the claim correctly reports that something is genuinely unavailable), "
-    "'refuted' (the evidence contradicts it), or 'unverifiable' (the evidence is "
-    "insufficient either way). Judge TRUTH, not phrasing. Time-sensitive values "
-    "(prices, schedules, ratings) that are plausible and consistent with a cited "
-    "source count as verified even if fresh results differ slightly -- do not "
-    "punish drift the agent could not foresee. Output ONE fenced ```json block."
+    "You verify claims against evidence. Each claim carries its kind and its "
+    "evidence. Decide 'verified', 'refuted', or 'unverifiable' (insufficient):\n"
+    "- kind 'fact': evidence is web search results. verified = supported (or the "
+    "claim correctly reports something genuinely unavailable); refuted = "
+    "contradicted. Time-sensitive values (prices, schedules, ratings) consistent "
+    "with a cited source count as verified even if fresh results differ slightly "
+    "-- do not punish drift the agent could not foresee.\n"
+    "- kind 'action': evidence is the AGENT'S OWN TRAJECTORY (its tool calls and "
+    "outputs). verified ONLY if a successful tool call there actually performed "
+    "the claimed action/artifact; refuted if the answer asserts a result (a "
+    "created file, a published URL, a sent message) that the trajectory does NOT "
+    "show succeeding -- that is a fabricated result.\n"
+    "Judge TRUTH, not phrasing. Output ONE fenced ```json block."
 )
 
 RUBRIC_DERIVE_SYSTEM_PROMPT = (
@@ -432,6 +444,7 @@ class RubricJudgeScorer:
                     self._model,
                     task=context.primary_prompt,
                     answer=executor_result.final_text,
+                    trajectory=_v2_trajectory(executor_result, excerpt=self._excerpt),
                     checklist_items=_checklist_texts(rubric),
                     search=self._search,
                     max_claims=self._max_claims,
@@ -698,36 +711,115 @@ def _checklist_texts(rubric: dict[str, object], aspect: str = "grounding", limit
 def _grounding_extract_prompt(*, task: str, answer: str, checklist_items: list[str]) -> str:
     seed = ""
     if checklist_items:
-        seed = "\n\nThe facts that matter for this task (verify these where the answer asserts them):\n" + "\n".join(
-            f"- {t}" for t in checklist_items
+        seed = (
+            "\n\nThe facts that matter for this task (a claim is 'relevant' if it "
+            "addresses one of these or the user's core request):\n"
+            + "\n".join(f"- {t}" for t in checklist_items)
         )
     return (
         f"User request:\n{task.strip()}\n\n"
         f"Agent final answer:\n{answer.strip()}"
         f"{seed}\n\n"
-        "Extract the answer's checkable factual claims. For each, give a web "
-        "search query that would confirm or refute it. Schema:\n"
+        "Extract the answer's checkable claims. For a 'fact' claim give a web "
+        "search query that would confirm or refute it (empty for private/action "
+        "claims). Schema:\n"
         '```json\n{"sandbox_blocked": false, "claims": [{"id": "c1", '
-        '"text": "the concrete claim", "public": true, "query": "search query"}]}\n```'
+        '"text": "the concrete claim", "kind": "fact", "public": true, '
+        '"relevant": true, "query": "search query"}]}\n```'
     )
 
 
 def _grounding_verdict_prompt(*, claims: list[dict], evidence: dict[str, str]) -> str:
     blocks = []
     for claim in claims:
-        ev = evidence.get(claim["id"], "(no results)")
-        blocks.append(f"[{claim['id']}] CLAIM: {claim['text']}\nEVIDENCE:\n{ev}")
+        ev = evidence.get(claim["id"], "(no evidence)")
+        blocks.append(
+            f"[{claim['id']}] kind={claim.get('kind', 'fact')} CLAIM: {claim['text']}\nEVIDENCE:\n{ev}"
+        )
     joined = "\n\n".join(blocks)
     return (
         f"{joined}\n\n"
-        "For each claim id, return a verdict against its evidence. Schema:\n"
+        "For each claim id, return a verdict against its evidence, applying the "
+        "kind-specific standard (fact=web evidence, action=trajectory must show "
+        "the claimed result actually succeeded). Schema:\n"
         '```json\n{"verdicts": [{"id": "c1", '
         '"verdict": "verified|refuted|unverifiable", "evidence": "one short phrase"}]}\n```'
     )
 
 
-async def _default_grounding_search(query: str, *, max_results: int = 4) -> str:
-    """Best-effort independent retrieval for the verify-grounding judge."""
+_SEARCH_MEM: dict[str, str] = {}
+
+
+def _search_cache_file(cache_key: str):
+    import os
+    from pathlib import Path
+
+    root = os.environ.get("OPENHARNESS_SEARCH_CACHE")
+    base = Path(root) if root else (Path.home() / ".cache" / "openharness" / "serper")
+    base.mkdir(parents=True, exist_ok=True)
+    return base / f"{cache_key}.txt"
+
+
+async def _serper_search(query: str, *, max_results: int = 5, api_key: str | None = None) -> str:
+    """Google results via Serper.dev (google_search MCP backend), cached by query.
+
+    Identical (query, max_results) is fetched once: served from an in-process map,
+    then a persistent on-disk cache (``OPENHARNESS_SEARCH_CACHE``, default
+    ``~/.cache/openharness/serper``), so re-runs, repeated claims, and judge votes
+    never re-bill the API. Transient errors are not cached.
+    """
+    import os
+
+    import httpx
+
+    key = api_key or os.environ.get("SERPER_API_KEY", "")
+    if not key:
+        return "(serper not configured)"
+    cache_key = hashlib.sha256(f"{query}|{max_results}".encode("utf-8")).hexdigest()[:32]
+    if cache_key in _SEARCH_MEM:
+        return _SEARCH_MEM[cache_key]
+    cache_file = _search_cache_file(cache_key)
+    if cache_file.exists():
+        cached = cache_file.read_text(encoding="utf-8")
+        _SEARCH_MEM[cache_key] = cached
+        return cached
+    n = max(1, min(int(max_results), 10))
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            resp = await client.post(
+                "https://google.serper.dev/search",
+                json={"q": query, "num": n},
+                headers={"X-API-KEY": key, "Content-Type": "application/json"},
+            )
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as exc:  # transient -> return but do NOT cache
+        return f"(search error: {exc})"
+    lines = [f"Google results for: {query}"]
+    ab = data.get("answerBox")
+    if isinstance(ab, dict) and (ab.get("answer") or ab.get("snippet")):
+        lines.append(f"[answer] {ab.get('answer') or ab.get('snippet')}")
+    kg = data.get("knowledgeGraph")
+    if isinstance(kg, dict) and kg.get("description"):
+        lines.append(f"[kg] {kg.get('title', '')}: {kg.get('description')}")
+    for i, item in enumerate((data.get("organic") or [])[:n], 1):
+        snippet = (item.get("snippet", "") or "").replace("\n", " ").strip()
+        lines.append(f"{i}. {item.get('title', '')}\n   URL: {item.get('link', '')}\n   {snippet}")
+    result = "\n".join(lines)
+    try:
+        cache_file.write_text(result, encoding="utf-8")
+    except OSError:
+        pass
+    _SEARCH_MEM[cache_key] = result
+    return result
+
+
+async def _default_grounding_search(query: str, *, max_results: int = 5) -> str:
+    """Independent retrieval: Google (Serper) when SERPER_API_KEY is set, else DuckDuckGo."""
+    import os
+
+    if os.environ.get("SERPER_API_KEY"):
+        return await _serper_search(query, max_results=max_results)
     from pathlib import Path
 
     from openharness.tools.base import ToolExecutionContext
@@ -735,7 +827,7 @@ async def _default_grounding_search(query: str, *, max_results: int = 4) -> str:
 
     try:
         result = await WebSearchTool().execute(
-            WebSearchToolInput(query=query, max_results=max_results),
+            WebSearchToolInput(query=query, max_results=min(max_results, 10)),
             ToolExecutionContext(cwd=Path(".")),
         )
     except Exception as exc:  # retrieval is best-effort; a miss -> unverifiable
@@ -749,18 +841,21 @@ async def _verify_grounding(
     *,
     task: str,
     answer: str,
+    trajectory: str,
     checklist_items: list[str],
     search,
     max_claims: int = 8,
-    max_results: int = 4,
+    max_results: int = 5,
     max_tokens: int = 1200,
 ) -> dict:
-    """Score grounding as truth-vs-independent-retrieval.
+    """Score grounding as truth-vs-independent-retrieval, over task-relevant claims.
 
-    Returns {score, status, verified, refuted, claims}. ``score`` is None when
-    there is nothing to verify (private_fallback / no_claims / unverifiable) so
-    the caller keeps the process-grounding value; ``status='sandbox_blocked'``
-    forces grounding=0 but stays in the metric denominator.
+    Only claims marked ``relevant`` count (closes the pad-with-true-trivia hack).
+    ``fact`` claims are checked against web retrieval; ``action`` claims (the agent
+    asserting it did/produced something) against the ``trajectory`` (catches a
+    fabricated "done / created a file"). Returns {score, status, verified, refuted,
+    claims}: ``score`` is None (caller keeps process-grounding) when nothing is
+    checkable; ``status='sandbox_blocked'`` forces grounding=0 but stays in denom.
     """
     answer = (answer or "").strip()
     if not answer:
@@ -777,28 +872,37 @@ async def _verify_grounding(
         return {"score": 0.0, "status": "sandbox_blocked", "verified": 0, "refuted": 0, "claims": []}
     raw_claims = parsed.get("claims") if isinstance(parsed.get("claims"), list) else []
     claims = [c for c in raw_claims if isinstance(c, dict) and c.get("id") and c.get("text")][:max_claims]
-    if not claims:
-        return {"score": None, "status": "no_claims", "verified": 0, "refuted": 0, "claims": []}
-    public = [c for c in claims if c.get("public")]
-    private = [c for c in claims if not c.get("public")]
+    relevant = [c for c in claims if c.get("relevant")]
+    if not relevant:
+        # no task-relevant claim to verify (e.g. pure padding) -> keep process
+        return {"score": None, "status": "no_relevant_claims", "verified": 0, "refuted": 0, "claims": []}
 
-    def _private_rows() -> list[dict]:
-        return [
-            {"id": c["id"], "claim": f"sha:{_hash_text(str(c['text']))[:12]}", "verdict": "unverifiable_private", "evidence": ""}
-            for c in private
-        ]
+    def _priv_row(claim: dict) -> dict:
+        return {
+            "id": claim["id"],
+            "claim": f"sha:{_hash_text(str(claim['text']))[:12]}",
+            "verdict": "unverifiable_private",
+            "evidence": "",
+        }
 
-    if not public:
-        # nothing web-checkable -> fall back to process-grounding (E-path)
-        return {"score": None, "status": "private_fallback", "verified": 0, "refuted": 0, "claims": _private_rows()}
+    facts_public = [c for c in relevant if c.get("kind") != "action" and c.get("public")]
+    actions = [c for c in relevant if c.get("kind") == "action"]
+    facts_private = [c for c in relevant if c.get("kind") != "action" and not c.get("public")]
+    checkable = facts_public + actions
+    if not checkable:
+        # every relevant claim is a private fact -> fall back to process-grounding
+        return {"score": None, "status": "private_fallback", "verified": 0, "refuted": 0,
+                "claims": [_priv_row(c) for c in facts_private]}
     evidence: dict[str, str] = {}
-    for claim in public:
+    for claim in facts_public:
         evidence[claim["id"]] = await search(str(claim.get("query") or claim["text"]), max_results=max_results)
+    for claim in actions:
+        evidence[claim["id"]] = f"AGENT TRAJECTORY (tool calls and outputs):\n{trajectory}"
     verdict_raw = await _complete_text(
         api_client,
         model,
         system_prompt=GROUNDING_VERDICT_SYSTEM_PROMPT,
-        prompt=_grounding_verdict_prompt(claims=public, evidence=evidence),
+        prompt=_grounding_verdict_prompt(claims=checkable, evidence=evidence),
         max_tokens=max_tokens,
     )
     vparsed = _extract_json(verdict_raw) or {}
@@ -806,7 +910,7 @@ async def _verify_grounding(
     vmap = {v.get("id"): v for v in vlist if isinstance(v, dict)}
     per_claim: list[dict] = []
     supported = refuted = 0
-    for claim in public:
+    for claim in checkable:
         vote = vmap.get(claim["id"], {})
         verdict = vote.get("verdict")
         if verdict not in ("verified", "refuted", "unverifiable"):
@@ -818,12 +922,13 @@ async def _verify_grounding(
         per_claim.append(
             {
                 "id": claim["id"],
+                "kind": claim.get("kind", "fact"),
                 "claim": str(claim["text"])[:160],
                 "verdict": verdict,
                 "evidence": str(vote.get("evidence") or "")[:160],
             }
         )
-    per_claim.extend(_private_rows())
+    per_claim.extend(_priv_row(c) for c in facts_private)
     denom = supported + refuted
     if denom == 0:
         return {"score": None, "status": "unverifiable", "verified": 0, "refuted": 0, "claims": per_claim}

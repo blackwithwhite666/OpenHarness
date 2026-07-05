@@ -229,7 +229,7 @@ class _RoutedJudgeApiClient:
         sp = (request.system_prompt or "").lower()
         if "extract the checkable" in sp:
             text = self._extract
-        elif "verify factual claims" in sp:
+        elif "verify claims against evidence" in sp:
             text = self._verdict
         else:
             text = self._rubric
@@ -267,8 +267,8 @@ def test_verify_grounding_overrides_true_answer_to_high(tmp_path: Path):
         {
             "sandbox_blocked": False,
             "claims": [
-                {"id": "c1", "text": "Salmon dish is 950 rub", "public": True, "query": "salmon 950"},
-                {"id": "c2", "text": "Open daily 12-23", "public": True, "query": "hours"},
+                {"id": "c1", "text": "Salmon dish is 950 rub", "kind": "fact", "public": True, "relevant": True, "query": "salmon 950"},
+                {"id": "c2", "text": "Open daily 12-23", "kind": "fact", "public": True, "relevant": True, "query": "hours"},
             ],
         }
     )
@@ -300,8 +300,8 @@ def test_verify_grounding_refuted_lowers_score(tmp_path: Path):
         {
             "sandbox_blocked": False,
             "claims": [
-                {"id": "c1", "text": "A", "public": True, "query": "a"},
-                {"id": "c2", "text": "B", "public": True, "query": "b"},
+                {"id": "c1", "text": "A", "kind": "fact", "public": True, "relevant": True, "query": "a"},
+                {"id": "c2", "text": "B", "kind": "fact", "public": True, "relevant": True, "query": "b"},
             ],
         }
     )
@@ -350,7 +350,7 @@ def test_verify_grounding_private_falls_back_to_process(tmp_path: Path):
     extract = _wrap(
         {
             "sandbox_blocked": False,
-            "claims": [{"id": "c1", "text": "PRIVATE my chat said hello", "public": False, "query": ""}],
+            "claims": [{"id": "c1", "text": "PRIVATE my chat said hello", "kind": "fact", "public": False, "relevant": True, "query": ""}],
         }
     )
     scorer = _verify_scorer(_RoutedJudgeApiClient(rubric=rubric_pass_grounding, extract=extract))
@@ -374,3 +374,64 @@ def test_verify_grounding_default_process_mode_leaves_no_verify_metadata(tmp_pat
     assert result.metadata["aspect.grounding"] == 0.0  # process score, unchanged
     assert "grounding_mode" not in result.metadata
     assert "grounding_status" not in result.metadata
+
+
+def test_verify_grounding_action_claim_refuted_against_trajectory(tmp_path: Path):
+    # answer claims it created a file; the trajectory shows no such success -> refuted
+    extract = _wrap(
+        {
+            "sandbox_blocked": False,
+            "claims": [
+                {"id": "a1", "text": "Created report.html with the results", "kind": "action",
+                 "public": False, "relevant": True, "query": ""},
+            ],
+        }
+    )
+    verdict = _wrap({"verdicts": [{"id": "a1", "verdict": "refuted", "evidence": "no write_file success in trajectory"}]})
+    scorer = _verify_scorer(_RoutedJudgeApiClient(rubric=_LOW_GROUNDING, extract=extract, verdict=verdict))
+    result = scorer.score(
+        context=_context(tmp_path),
+        executor_result=EvalExecutorResult(final_text="Готово, сделал report.html", tool_calls=()),
+    )
+    assert result.metadata["aspect.grounding"] == 0.0  # 0 verified / 1 refuted
+    assert result.metadata["grounding_status"] == "scored"
+    assert result.metadata["grounding_refuted"] == 1
+    assert result.metadata["grounding_claims"][0]["kind"] == "action"
+
+
+def test_verify_grounding_irrelevant_padding_claims_excluded(tmp_path: Path):
+    # one task-relevant (verified) + one irrelevant padding claim -> only relevant counts
+    extract = _wrap(
+        {
+            "sandbox_blocked": False,
+            "claims": [
+                {"id": "c1", "text": "The price is 950", "kind": "fact", "public": True, "relevant": True, "query": "price"},
+                {"id": "pad", "text": "Paris is the capital of France", "kind": "fact", "public": True, "relevant": False, "query": "paris"},
+            ],
+        }
+    )
+    verdict = _wrap({"verdicts": [{"id": "c1", "verdict": "verified", "evidence": "matches"}]})
+    scorer = _verify_scorer(_RoutedJudgeApiClient(rubric=_LOW_GROUNDING, extract=extract, verdict=verdict))
+    result = scorer.score(
+        context=_context(tmp_path),
+        executor_result=EvalExecutorResult(final_text="ans", tool_calls=()),
+    )
+    assert result.metadata["aspect.grounding"] == 1.0
+    assert {c["id"] for c in result.metadata["grounding_claims"]} == {"c1"}  # padding excluded
+    assert result.metadata["grounding_verified"] == 1
+
+
+def test_serper_search_serves_from_cache_without_network(tmp_path: Path, monkeypatch):
+    import hashlib
+
+    from openharness.evals.executor import _run_eval_coroutine
+    from openharness.evals.judge import _SEARCH_MEM, _serper_search
+
+    monkeypatch.setenv("OPENHARNESS_SEARCH_CACHE", str(tmp_path))
+    monkeypatch.setenv("SERPER_API_KEY", "test-key")
+    _SEARCH_MEM.clear()
+    key = hashlib.sha256("q|5".encode("utf-8")).hexdigest()[:32]
+    (tmp_path / f"{key}.txt").write_text("CACHED RESULT", encoding="utf-8")
+    # on-disk hit -> no httpx call; then promoted to the in-process map
+    assert _run_eval_coroutine(_serper_search("q", max_results=5)) == "CACHED RESULT"
+    assert _SEARCH_MEM[key] == "CACHED RESULT"
