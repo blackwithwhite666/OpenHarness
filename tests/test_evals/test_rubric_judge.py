@@ -212,3 +212,165 @@ def _context(tmp_path: Path) -> EvalExecutionContext:
         expected_final_text="PRIVATE ACCEPTED OUTCOME",
         resource_snapshot_status="absent",
     )
+
+
+# --- verification-grounding (grounding_mode="verify") -------------------------
+
+
+class _RoutedJudgeApiClient:
+    """Route stream_message by system_prompt: rubric-score / extract / verdict."""
+
+    def __init__(self, *, rubric: str, extract: str = "", verdict: str = "") -> None:
+        self._rubric, self._extract, self._verdict = rubric, extract, verdict
+        self.requests: list = []
+
+    async def stream_message(self, request):
+        self.requests.append(request)
+        sp = (request.system_prompt or "").lower()
+        if "extract the checkable" in sp:
+            text = self._extract
+        elif "verify factual claims" in sp:
+            text = self._verdict
+        else:
+            text = self._rubric
+        yield ApiMessageCompleteEvent(
+            message=ConversationMessage(role="assistant", content=[TextBlock(text=text)]),
+            usage=UsageSnapshot(input_tokens=1, output_tokens=1),
+        )
+
+
+async def _search_ok(query, *, max_results=4):
+    return f"Search results for: {query}\n1. Source\n   confirms it."
+
+
+# rubric response with a FAILING grounding (process=0) so the verify override is visible.
+_LOW_GROUNDING = _wrap(
+    {
+        "task_completion": {"items": {"tc1": "pass"}},
+        "grounding": {"items": {"g1": "fail"}},
+        "tool_use": {"score": 1},
+        "answer_quality": {"score": 1},
+        "error_recovery": {"score": 1},
+        "efficiency": {"score": 1},
+    }
+)
+
+
+def _verify_scorer(api_client, **kw):
+    return RubricJudgeScorer(
+        api_client=api_client, model="m", votes=1, grounding_mode="verify", search=_search_ok, **kw
+    )
+
+
+def test_verify_grounding_overrides_true_answer_to_high(tmp_path: Path):
+    extract = _wrap(
+        {
+            "sandbox_blocked": False,
+            "claims": [
+                {"id": "c1", "text": "Salmon dish is 950 rub", "public": True, "query": "salmon 950"},
+                {"id": "c2", "text": "Open daily 12-23", "public": True, "query": "hours"},
+            ],
+        }
+    )
+    verdict = _wrap(
+        {
+            "verdicts": [
+                {"id": "c1", "verdict": "verified", "evidence": "matches menu"},
+                {"id": "c2", "verdict": "verified", "evidence": "matches"},
+            ]
+        }
+    )
+    scorer = _verify_scorer(_RoutedJudgeApiClient(rubric=_LOW_GROUNDING, extract=extract, verdict=verdict))
+    result = scorer.score(
+        context=_context(tmp_path),
+        executor_result=EvalExecutorResult(final_text="ans", tool_calls=()),
+    )
+    # process grounding was 0.0 (fail); verify lifts it to 1.0 (2/2 verified)
+    assert result.metadata["aspect.grounding"] == 1.0
+    assert result.metadata["grounding_mode"] == "verify"
+    assert result.metadata["grounding_status"] == "scored"
+    assert result.metadata["grounding_verified"] == 2
+    assert result.metadata["grounding_refuted"] == 0
+    assert "grounding" not in result.metadata["rubric_gate_failures"]
+    assert {c["id"] for c in result.metadata["grounding_claims"]} == {"c1", "c2"}
+
+
+def test_verify_grounding_refuted_lowers_score(tmp_path: Path):
+    extract = _wrap(
+        {
+            "sandbox_blocked": False,
+            "claims": [
+                {"id": "c1", "text": "A", "public": True, "query": "a"},
+                {"id": "c2", "text": "B", "public": True, "query": "b"},
+            ],
+        }
+    )
+    verdict = _wrap(
+        {
+            "verdicts": [
+                {"id": "c1", "verdict": "verified", "evidence": "ok"},
+                {"id": "c2", "verdict": "refuted", "evidence": "contradicted"},
+            ]
+        }
+    )
+    scorer = _verify_scorer(_RoutedJudgeApiClient(rubric=_LOW_GROUNDING, extract=extract, verdict=verdict))
+    result = scorer.score(
+        context=_context(tmp_path),
+        executor_result=EvalExecutorResult(final_text="ans", tool_calls=()),
+    )
+    assert result.metadata["aspect.grounding"] == 0.5  # 1 verified / (1 verified + 1 refuted)
+
+
+def test_verify_grounding_sandbox_blocked_scores_zero_kept_in_denom(tmp_path: Path):
+    extract = _wrap({"sandbox_blocked": True, "claims": []})
+    scorer = _verify_scorer(_RoutedJudgeApiClient(rubric=_LOW_GROUNDING, extract=extract))
+    result = scorer.score(
+        context=_context(tmp_path),
+        executor_result=EvalExecutorResult(final_text="can't open the attachment", tool_calls=()),
+    )
+    assert result.metadata["aspect.grounding"] == 0.0
+    assert result.metadata["grounding_status"] == "sandbox_blocked"
+    assert "grounding" in result.metadata["rubric_gate_failures"]
+    assert result.passed is False
+    # kept in the denominator: still graded from the other aspects (not dropped)
+    assert result.graded_score > 0.0
+
+
+def test_verify_grounding_private_falls_back_to_process(tmp_path: Path):
+    rubric_pass_grounding = _wrap(
+        {
+            "task_completion": {"items": {"tc1": "pass"}},
+            "grounding": {"items": {"g1": "pass"}},
+            "tool_use": {"score": 1},
+            "answer_quality": {"score": 1},
+            "error_recovery": {"score": 1},
+            "efficiency": {"score": 1},
+        }
+    )
+    extract = _wrap(
+        {
+            "sandbox_blocked": False,
+            "claims": [{"id": "c1", "text": "PRIVATE my chat said hello", "public": False, "query": ""}],
+        }
+    )
+    scorer = _verify_scorer(_RoutedJudgeApiClient(rubric=rubric_pass_grounding, extract=extract))
+    result = scorer.score(
+        context=_context(tmp_path),
+        executor_result=EvalExecutorResult(final_text="ans", tool_calls=()),
+    )
+    assert result.metadata["grounding_status"] == "private_fallback"
+    assert result.metadata["aspect.grounding"] == 1.0  # unchanged process score
+    # private claim is hashed, never leaked into the report
+    assert "PRIVATE" not in json.dumps(result.metadata, sort_keys=True)
+    assert any(c["verdict"] == "unverifiable_private" for c in result.metadata["grounding_claims"])
+
+
+def test_verify_grounding_default_process_mode_leaves_no_verify_metadata(tmp_path: Path):
+    scorer = RubricJudgeScorer(api_client=_StaticJudgeApiClient(_LOW_GROUNDING), model="m", votes=1)
+    result = scorer.score(
+        context=_context(tmp_path),
+        executor_result=EvalExecutorResult(final_text="ans", tool_calls=()),
+    )
+    assert result.metadata["aspect.grounding"] == 0.0  # process score, unchanged
+    assert "grounding_mode" not in result.metadata
+    assert "grounding_status" not in result.metadata

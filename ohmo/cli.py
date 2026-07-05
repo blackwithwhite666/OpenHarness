@@ -1809,6 +1809,18 @@ def evals_run_cmd(
             "gates task_completion + grounding against them."
         ),
     ),
+    grounding_mode: str = typer.Option(
+        "process",
+        "--grounding-mode",
+        help=(
+            "How --scorer rubric_judge scores the `grounding` aspect. 'process' "
+            "(default) = is every claim backed by an observed tool output. "
+            "'verify' = is the answer TRUE, checked against independent web "
+            "retrieval; honest 'unavailable' = grounded, missing-input case scores "
+            "0 (kept in denom), private facts fall back to process. See ADR "
+            "ohmo-eval-verification-grounding."
+        ),
+    ),
     no_live_skill: bool = typer.Option(
         False,
         "--no-live-skill",
@@ -1915,6 +1927,7 @@ def evals_run_cmd(
                         "system_prompt_file": system_prompt_file,
                         "histories_file": histories_file,
                         "rubrics_file": rubrics_file,
+                        "grounding_mode": grounding_mode,
                         "cache_completions": cache_completions,
                         "cache_prune_to": cache_prune_to,
                         "cache_mode": cache_mode,
@@ -1937,6 +1950,7 @@ def evals_run_cmd(
         system_prompt_file = resolved.system_prompt_file
         histories_file = resolved.histories_file
         rubrics_file = resolved.rubrics_file
+        grounding_mode = resolved.grounding_mode
         no_live_skill = not resolved.live_skill
         cache_completions = resolved.cache_completions
         cache_prune_to = resolved.cache_prune_to
@@ -2033,6 +2047,7 @@ def evals_run_cmd(
             "max_turns": max_turns,
             "judge_votes": judge_votes,
             "judge_grounding": judge_grounding,
+            "grounding_mode": grounding_mode,
         }
         if (
             sandbox_net_mode != "none"

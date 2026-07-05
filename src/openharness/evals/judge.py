@@ -318,6 +318,34 @@ RUBRIC_JUDGE_SYSTEM_PROMPT = (
     "block. Be decisive and consistent: identical executions get identical scores."
 )
 
+# verification-grounding — score the TRUTH of the answer's factual claims against
+# INDEPENDENT web retrieval, not whether each claim was tool-cited. See ADR
+# adrs/ohmo-eval-verification-grounding.md. Two orchestrated LLM calls (extract
+# claims, then verdict-against-evidence) with a web_search in between.
+GROUNDING_EXTRACT_SYSTEM_PROMPT = (
+    "You extract the checkable FACTUAL CLAIMS from an AI agent's answer so they "
+    "can be INDEPENDENTLY verified against the live web. A claim is a concrete "
+    "assertion of fact the answer makes: a price, time, rating, address, phone, "
+    "identity, count, code, opening hours, or an explicit 'X is unavailable / not "
+    "found'. IGNORE hedges, opinions, offers, recommendations, and meta-talk. "
+    "Mark each claim public=true if it is verifiable on the open web, or "
+    "public=false if it is about the USER'S OWN private data (their chats, "
+    "calendar, files, config, memory) and cannot be web-verified. If the answer "
+    "makes NO substantive factual assertion because a required INPUT was missing "
+    "-- it only asks a clarifying question, or says it cannot open/read an "
+    "attachment/file -- set sandbox_blocked=true. Output ONE fenced ```json block."
+)
+GROUNDING_VERDICT_SYSTEM_PROMPT = (
+    "You verify factual claims against retrieved web evidence. For each claim, "
+    "given its search results, decide: 'verified' (the evidence supports it, OR "
+    "the claim correctly reports that something is genuinely unavailable), "
+    "'refuted' (the evidence contradicts it), or 'unverifiable' (the evidence is "
+    "insufficient either way). Judge TRUTH, not phrasing. Time-sensitive values "
+    "(prices, schedules, ratings) that are plausible and consistent with a cited "
+    "source count as verified even if fresh results differ slightly -- do not "
+    "punish drift the agent could not foresee. Output ONE fenced ```json block."
+)
+
 RUBRIC_DERIVE_SYSTEM_PROMPT = (
     "You extract an evaluation checklist from ONE correct reference solution of "
     "an agent task. Produce atomic, path-independent, verifiable requirements: "
@@ -351,6 +379,10 @@ class RubricJudgeScorer:
         votes: int = 3,
         pass_threshold: float = 0.75,
         output_excerpt_chars: int = 400,
+        grounding_mode: str = "process",
+        search=None,
+        max_claims: int = 8,
+        max_search_results: int = 4,
     ) -> None:
         self._api_client = api_client
         self._model = model
@@ -360,6 +392,12 @@ class RubricJudgeScorer:
         self._votes = max(1, int(votes))
         self._pass_threshold = pass_threshold
         self._excerpt = output_excerpt_chars
+        # process = original checklist-citation grounding; verify = truth-vs-web
+        # (see ADR ohmo-eval-verification-grounding). Default stays process.
+        self._grounding_mode = grounding_mode
+        self._search = search or _default_grounding_search
+        self._max_claims = max_claims
+        self._max_search_results = max_search_results
 
     def _rubric_for(self, context: EvalExecutionContext) -> dict[str, object]:
         case = context.case
@@ -386,6 +424,34 @@ class RubricJudgeScorer:
         )
         votes = [_parse_v2_scores(_run_eval_coroutine(self._complete(prompt))) for _ in range(self._votes)]
         aspects, graded, passed, gate_fails = _aggregate_v2(votes)
+        grounding_meta: dict[str, object] = {}
+        if self._grounding_mode == "verify" and aspects:
+            vg = _run_eval_coroutine(
+                _verify_grounding(
+                    self._api_client,
+                    self._model,
+                    task=context.primary_prompt,
+                    answer=executor_result.final_text,
+                    checklist_items=_checklist_texts(rubric),
+                    search=self._search,
+                    max_claims=self._max_claims,
+                    max_results=self._max_search_results,
+                )
+            )
+            status = vg["status"]
+            if status == "sandbox_blocked":
+                aspects["grounding"] = 0.0  # kept in denom (don't hide harness debt)
+            elif vg["score"] is not None:
+                aspects["grounding"] = vg["score"]
+            # else private_fallback / no_claims / unverifiable -> keep process grounding
+            graded, passed, gate_fails = _grade_aspects(aspects)
+            grounding_meta = {
+                "grounding_mode": "verify",
+                "grounding_status": status,
+                "grounding_verified": vg["verified"],
+                "grounding_refuted": vg["refuted"],
+                "grounding_claims": vg["claims"],
+            }
         verdict = "pass" if passed else ("error" if not aspects else "fail")
         metadata: dict[str, object] = {
             "judge_model": self._model,
@@ -395,6 +461,7 @@ class RubricJudgeScorer:
             "rubric_graded_score": round(graded, 4),
             "rubric_gate_failures": list(gate_fails),
             "rubric_used_checklist": bool(rubric),
+            **grounding_meta,
         }
         for key, value in aspects.items():
             metadata[f"aspect.{key}"] = round(value, 4)
@@ -575,17 +642,12 @@ def _parse_v2_scores(text: str) -> dict[str, float]:
     return scores
 
 
-def _aggregate_v2(
-    votes: list[dict[str, float]],
-) -> tuple[dict[str, float], float, bool, tuple[str, ...]]:
-    """Average aspect scores across votes -> (aspects, graded, passed, gate_failures)."""
-    aspects: dict[str, float] = {}
-    for spec in RUBRIC_JUDGE_ASPECTS:
-        vals = [v[spec.key] for v in votes if spec.key in v]
-        if vals:
-            aspects[spec.key] = sum(vals) / len(vals)
-    if not aspects:
-        return {}, 0.0, False, ()
+def _grade_aspects(aspects: dict[str, float]) -> tuple[float, bool, tuple[str, ...]]:
+    """Weighted-mean graded score + hard-gate check over the present aspects.
+
+    Split out of ``_aggregate_v2`` so the verify-grounding path can override the
+    grounding aspect and re-grade without re-running the judge votes.
+    """
     total_weight = sum(spec.weight for spec in RUBRIC_JUDGE_ASPECTS if spec.key in aspects)
     graded = (
         sum(spec.weight * aspects[spec.key] for spec in RUBRIC_JUDGE_ASPECTS if spec.key in aspects)
@@ -601,7 +663,171 @@ def _aggregate_v2(
         and aspects[spec.key] < spec.gate_floor
     )
     # A pass needs the weighted quality bar AND every hard gate satisfied.
-    return aspects, graded, (not gate_failures and graded >= 0.75), gate_failures
+    return graded, (not gate_failures and graded >= 0.75), gate_failures
+
+
+def _aggregate_v2(
+    votes: list[dict[str, float]],
+) -> tuple[dict[str, float], float, bool, tuple[str, ...]]:
+    """Average aspect scores across votes -> (aspects, graded, passed, gate_failures)."""
+    aspects: dict[str, float] = {}
+    for spec in RUBRIC_JUDGE_ASPECTS:
+        vals = [v[spec.key] for v in votes if spec.key in v]
+        if vals:
+            aspects[spec.key] = sum(vals) / len(vals)
+    if not aspects:
+        return {}, 0.0, False, ()
+    graded, passed, gate_failures = _grade_aspects(aspects)
+    return aspects, graded, passed, gate_failures
+
+
+# --- verification-grounding: extract claims -> web_search -> verdict ----------
+
+def _checklist_texts(rubric: dict[str, object], aspect: str = "grounding", limit: int = 12) -> list[str]:
+    """The derived grounding checklist as plain text -- the seed list of facts."""
+    items = rubric.get(aspect) if isinstance(rubric, dict) else None
+    out: list[str] = []
+    if isinstance(items, list):
+        for item in items:
+            text = item.get("text") if isinstance(item, dict) else item
+            if isinstance(text, str) and text.strip():
+                out.append(text.strip())
+    return out[:limit]
+
+
+def _grounding_extract_prompt(*, task: str, answer: str, checklist_items: list[str]) -> str:
+    seed = ""
+    if checklist_items:
+        seed = "\n\nThe facts that matter for this task (verify these where the answer asserts them):\n" + "\n".join(
+            f"- {t}" for t in checklist_items
+        )
+    return (
+        f"User request:\n{task.strip()}\n\n"
+        f"Agent final answer:\n{answer.strip()}"
+        f"{seed}\n\n"
+        "Extract the answer's checkable factual claims. For each, give a web "
+        "search query that would confirm or refute it. Schema:\n"
+        '```json\n{"sandbox_blocked": false, "claims": [{"id": "c1", '
+        '"text": "the concrete claim", "public": true, "query": "search query"}]}\n```'
+    )
+
+
+def _grounding_verdict_prompt(*, claims: list[dict], evidence: dict[str, str]) -> str:
+    blocks = []
+    for claim in claims:
+        ev = evidence.get(claim["id"], "(no results)")
+        blocks.append(f"[{claim['id']}] CLAIM: {claim['text']}\nEVIDENCE:\n{ev}")
+    joined = "\n\n".join(blocks)
+    return (
+        f"{joined}\n\n"
+        "For each claim id, return a verdict against its evidence. Schema:\n"
+        '```json\n{"verdicts": [{"id": "c1", '
+        '"verdict": "verified|refuted|unverifiable", "evidence": "one short phrase"}]}\n```'
+    )
+
+
+async def _default_grounding_search(query: str, *, max_results: int = 4) -> str:
+    """Best-effort independent retrieval for the verify-grounding judge."""
+    from pathlib import Path
+
+    from openharness.tools.base import ToolExecutionContext
+    from openharness.tools.web_search_tool import WebSearchTool, WebSearchToolInput
+
+    try:
+        result = await WebSearchTool().execute(
+            WebSearchToolInput(query=query, max_results=max_results),
+            ToolExecutionContext(cwd=Path(".")),
+        )
+    except Exception as exc:  # retrieval is best-effort; a miss -> unverifiable
+        return f"(search error: {exc})"
+    return result.output
+
+
+async def _verify_grounding(
+    api_client: SupportsStreamingMessages,
+    model: str,
+    *,
+    task: str,
+    answer: str,
+    checklist_items: list[str],
+    search,
+    max_claims: int = 8,
+    max_results: int = 4,
+    max_tokens: int = 1200,
+) -> dict:
+    """Score grounding as truth-vs-independent-retrieval.
+
+    Returns {score, status, verified, refuted, claims}. ``score`` is None when
+    there is nothing to verify (private_fallback / no_claims / unverifiable) so
+    the caller keeps the process-grounding value; ``status='sandbox_blocked'``
+    forces grounding=0 but stays in the metric denominator.
+    """
+    answer = (answer or "").strip()
+    if not answer:
+        return {"score": 0.0, "status": "sandbox_blocked", "verified": 0, "refuted": 0, "claims": []}
+    extract_raw = await _complete_text(
+        api_client,
+        model,
+        system_prompt=GROUNDING_EXTRACT_SYSTEM_PROMPT,
+        prompt=_grounding_extract_prompt(task=task, answer=answer, checklist_items=checklist_items),
+        max_tokens=max_tokens,
+    )
+    parsed = _extract_json(extract_raw) or {}
+    if parsed.get("sandbox_blocked") is True:
+        return {"score": 0.0, "status": "sandbox_blocked", "verified": 0, "refuted": 0, "claims": []}
+    raw_claims = parsed.get("claims") if isinstance(parsed.get("claims"), list) else []
+    claims = [c for c in raw_claims if isinstance(c, dict) and c.get("id") and c.get("text")][:max_claims]
+    if not claims:
+        return {"score": None, "status": "no_claims", "verified": 0, "refuted": 0, "claims": []}
+    public = [c for c in claims if c.get("public")]
+    private = [c for c in claims if not c.get("public")]
+
+    def _private_rows() -> list[dict]:
+        return [
+            {"id": c["id"], "claim": f"sha:{_hash_text(str(c['text']))[:12]}", "verdict": "unverifiable_private", "evidence": ""}
+            for c in private
+        ]
+
+    if not public:
+        # nothing web-checkable -> fall back to process-grounding (E-path)
+        return {"score": None, "status": "private_fallback", "verified": 0, "refuted": 0, "claims": _private_rows()}
+    evidence: dict[str, str] = {}
+    for claim in public:
+        evidence[claim["id"]] = await search(str(claim.get("query") or claim["text"]), max_results=max_results)
+    verdict_raw = await _complete_text(
+        api_client,
+        model,
+        system_prompt=GROUNDING_VERDICT_SYSTEM_PROMPT,
+        prompt=_grounding_verdict_prompt(claims=public, evidence=evidence),
+        max_tokens=max_tokens,
+    )
+    vparsed = _extract_json(verdict_raw) or {}
+    vlist = vparsed.get("verdicts") if isinstance(vparsed.get("verdicts"), list) else []
+    vmap = {v.get("id"): v for v in vlist if isinstance(v, dict)}
+    per_claim: list[dict] = []
+    supported = refuted = 0
+    for claim in public:
+        vote = vmap.get(claim["id"], {})
+        verdict = vote.get("verdict")
+        if verdict not in ("verified", "refuted", "unverifiable"):
+            verdict = "unverifiable"
+        if verdict == "verified":
+            supported += 1
+        elif verdict == "refuted":
+            refuted += 1
+        per_claim.append(
+            {
+                "id": claim["id"],
+                "claim": str(claim["text"])[:160],
+                "verdict": verdict,
+                "evidence": str(vote.get("evidence") or "")[:160],
+            }
+        )
+    per_claim.extend(_private_rows())
+    denom = supported + refuted
+    if denom == 0:
+        return {"score": None, "status": "unverifiable", "verified": 0, "refuted": 0, "claims": per_claim}
+    return {"score": supported / denom, "status": "scored", "verified": supported, "refuted": refuted, "claims": per_claim}
 
 
 def _rubric_derive_prompt(*, goal: str, gold_trajectory: str, gold_answer: str) -> str:
