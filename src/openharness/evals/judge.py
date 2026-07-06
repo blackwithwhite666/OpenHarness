@@ -392,6 +392,7 @@ class RubricJudgeScorer:
         pass_threshold: float = 0.75,
         output_excerpt_chars: int = 400,
         grounding_mode: str = "process",
+        grounding_votes: int = 1,
         search=None,
         max_claims: int = 8,
         max_search_results: int = 4,
@@ -407,6 +408,10 @@ class RubricJudgeScorer:
         # process = original checklist-citation grounding; verify = truth-vs-web
         # (see ADR ohmo-eval-verification-grounding). Default stays process.
         self._grounding_mode = grounding_mode
+        # >1 vote-stabilizes the verify path (median-of-N over the extract+verdict
+        # flap); default 1 = single-shot, unchanged. Searches are cached, so votes
+        # cost extract+verdict tokens only.
+        self._grounding_votes = max(1, int(grounding_votes))
         self._search = search or _default_grounding_search
         self._max_claims = max_claims
         self._max_search_results = max_search_results
@@ -439,9 +444,10 @@ class RubricJudgeScorer:
         grounding_meta: dict[str, object] = {}
         if self._grounding_mode == "verify" and aspects:
             vg = _run_eval_coroutine(
-                _verify_grounding(
+                _verify_grounding_voted(
                     self._api_client,
                     self._model,
+                    votes=self._grounding_votes,
                     task=context.primary_prompt,
                     answer=executor_result.final_text,
                     trajectory=_v2_trajectory(executor_result, excerpt=self._excerpt),
@@ -461,6 +467,7 @@ class RubricJudgeScorer:
             grounding_meta = {
                 "grounding_mode": "verify",
                 "grounding_status": status,
+                "grounding_votes": vg.get("votes", self._grounding_votes),
                 "grounding_verified": vg["verified"],
                 "grounding_refuted": vg["refuted"],
                 "grounding_claims": vg["claims"],
@@ -933,6 +940,83 @@ async def _verify_grounding(
     if denom == 0:
         return {"score": None, "status": "unverifiable", "verified": 0, "refuted": 0, "claims": per_claim}
     return {"score": supported / denom, "status": "scored", "verified": supported, "refuted": refuted, "claims": per_claim}
+
+
+def _median(values: list[float]) -> float:
+    ordered = sorted(values)
+    n = len(ordered)
+    mid = n // 2
+    return ordered[mid] if n % 2 else (ordered[mid - 1] + ordered[mid]) / 2.0
+
+
+async def _verify_grounding_voted(
+    api_client: SupportsStreamingMessages,
+    model: str,
+    *,
+    votes: int,
+    task: str,
+    answer: str,
+    trajectory: str,
+    checklist_items: list[str],
+    search,
+    max_claims: int = 8,
+    max_results: int = 5,
+    max_tokens: int = 1200,
+) -> dict:
+    """Run :func:`_verify_grounding` ``votes`` times and aggregate, to kill the
+    single-shot extract/verdict flap (a lone run flips one claim
+    verified<->refuted between runs, so a 1-claim answer swings 0.0<->1.0).
+
+    Runs are SEQUENTIAL on purpose: run 1 warms the query cache and the rest serve
+    from it, so extra votes bill LLM tokens for extract+verdict, NOT search-API
+    calls. Aggregation is by OVERRIDE CLASS majority, then median of the numeric
+    scores: each run either carries a number (``scored``), forces 0
+    (``sandbox_blocked``), or declines to override (a None-status run keeps process
+    grounding). The class with the most runs wins; a tie prefers the class with the
+    most signal (scored > blocked > keep), so a single noisy ``scored`` run cannot
+    flip an otherwise keep-process majority. The reported per-claim breakdown comes
+    from the surviving run closest to the median. ``votes<=1`` is the original
+    single-shot path, unchanged.
+    """
+    n = max(1, int(votes))
+    runs = [
+        await _verify_grounding(
+            api_client,
+            model,
+            task=task,
+            answer=answer,
+            trajectory=trajectory,
+            checklist_items=checklist_items,
+            search=search,
+            max_claims=max_claims,
+            max_results=max_results,
+            max_tokens=max_tokens,
+        )
+        for _ in range(n)
+    ]
+    if n == 1:
+        return {**runs[0], "votes": 1}
+    scored = [r for r in runs if r["status"] == "scored" and r["score"] is not None]
+    blocked = [r for r in runs if r["status"] == "sandbox_blocked"]
+    keep = [r for r in runs if r["status"] not in ("scored", "sandbox_blocked")]
+    # Highest count wins; tie -> most-signal class (rank scored 3 > blocked 2 > keep 1).
+    winner = max(
+        (("scored", len(scored), 3), ("sandbox_blocked", len(blocked), 2), ("keep", len(keep), 1)),
+        key=lambda t: (t[1], t[2]),
+    )[0]
+    if winner == "scored":
+        med = _median([r["score"] for r in scored])
+        rep = min(scored, key=lambda r: abs(r["score"] - med))
+        return {"score": med, "status": "scored", "verified": rep["verified"],
+                "refuted": rep["refuted"], "claims": rep["claims"], "votes": n}
+    if winner == "sandbox_blocked":
+        return {"score": 0.0, "status": "sandbox_blocked", "verified": 0, "refuted": 0,
+                "claims": [], "votes": n}
+    statuses = [r["status"] for r in keep]
+    status = max(statuses, key=statuses.count)  # most common None-status (metadata only)
+    rep = next(r for r in keep if r["status"] == status)
+    return {"score": None, "status": status, "verified": 0, "refuted": 0,
+            "claims": rep["claims"], "votes": n}
 
 
 def _rubric_derive_prompt(*, goal: str, gold_trajectory: str, gold_answer: str) -> str:

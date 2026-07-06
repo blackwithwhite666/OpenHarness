@@ -87,6 +87,7 @@ _RUBRIC_JUDGE_METADATA_KEYS = (
     # verify-grounding (ADR ohmo-eval-verification-grounding)
     "grounding_mode",
     "grounding_status",
+    "grounding_votes",
     "grounding_verified",
     "grounding_refuted",
     "grounding_claims",

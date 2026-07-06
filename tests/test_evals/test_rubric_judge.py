@@ -435,3 +435,177 @@ def test_serper_search_serves_from_cache_without_network(tmp_path: Path, monkeyp
     # on-disk hit -> no httpx call; then promoted to the in-process map
     assert _run_eval_coroutine(_serper_search("q", max_results=5)) == "CACHED RESULT"
     assert _SEARCH_MEM[key] == "CACHED RESULT"
+
+
+# --- verify-grounding vote stabilization (grounding_votes > 1) -----------------
+
+
+class _SequencedJudgeClient:
+    """Like _RoutedJudgeApiClient, but the extract and verdict routes each hand
+    back the NEXT canned response per call, so a multi-vote verify run can be
+    driven through a flapping verdict (or a shifting claim set) deterministically.
+    Lists shorter than the vote count clamp to their last entry."""
+
+    def __init__(self, *, rubric: str, extracts: list[str], verdicts: list[str]) -> None:
+        self._rubric, self._extracts, self._verdicts = rubric, extracts, verdicts
+        self._ei = self._vi = 0
+        self.requests: list = []
+
+    async def stream_message(self, request):
+        self.requests.append(request)
+        sp = (request.system_prompt or "").lower()
+        if "extract the checkable" in sp:
+            text = self._extracts[min(self._ei, len(self._extracts) - 1)]
+            self._ei += 1
+        elif "verify claims against evidence" in sp:
+            text = self._verdicts[min(self._vi, len(self._verdicts) - 1)]
+            self._vi += 1
+        else:
+            text = self._rubric
+        yield ApiMessageCompleteEvent(
+            message=ConversationMessage(role="assistant", content=[TextBlock(text=text)]),
+            usage=UsageSnapshot(input_tokens=1, output_tokens=1),
+        )
+
+
+def _public_claim(query: str = "price") -> str:
+    return _wrap(
+        {
+            "sandbox_blocked": False,
+            "claims": [
+                {"id": "c1", "text": "The price is 950", "kind": "fact",
+                 "public": True, "relevant": True, "query": query},
+            ],
+        }
+    )
+
+
+def _private_claim() -> str:
+    return _wrap(
+        {
+            "sandbox_blocked": False,
+            "claims": [
+                {"id": "c1", "text": "PRIVATE my chat said hello", "kind": "fact",
+                 "public": False, "relevant": True, "query": ""},
+            ],
+        }
+    )
+
+
+def _verdict(v: str) -> str:
+    return _wrap({"verdicts": [{"id": "c1", "verdict": v, "evidence": "e"}]})
+
+
+def test_median_even_averages_two_middle():
+    from openharness.evals.judge import _median
+
+    assert _median([1.0]) == 1.0
+    assert _median([0.0, 1.0]) == 0.5
+    assert _median([0.0, 1.0, 1.0]) == 1.0
+    assert _median([0.2, 0.4, 0.6, 0.8]) == 0.5
+
+
+def test_verify_votes_median_smooths_verdict_flip(tmp_path: Path):
+    # one relevant public claim; the verdict flaps verified/refuted/verified across
+    # the 3 votes. A single shot would land 1.0 or 0.0 by luck; the median is 1.0.
+    client = _SequencedJudgeClient(
+        rubric=_LOW_GROUNDING,
+        extracts=[_public_claim()],  # stable claim set every vote
+        verdicts=[_verdict("verified"), _verdict("refuted"), _verdict("verified")],
+    )
+    scorer = _verify_scorer(client, grounding_votes=3)
+    result = scorer.score(
+        context=_context(tmp_path),
+        executor_result=EvalExecutorResult(final_text="ans", tool_calls=()),
+    )
+    assert result.metadata["aspect.grounding"] == 1.0  # median of 1.0 / 0.0 / 1.0
+    assert result.metadata["grounding_status"] == "scored"
+    assert result.metadata["grounding_votes"] == 3
+
+
+def test_verify_votes_refuted_majority_median_fails_gate(tmp_path: Path):
+    # the median swings the OTHER way when refuted dominates -> below the gate.
+    client = _SequencedJudgeClient(
+        rubric=_LOW_GROUNDING,
+        extracts=[_public_claim()],
+        verdicts=[_verdict("refuted"), _verdict("verified"), _verdict("refuted")],
+    )
+    scorer = _verify_scorer(client, grounding_votes=3)
+    result = scorer.score(
+        context=_context(tmp_path),
+        executor_result=EvalExecutorResult(final_text="ans", tool_calls=()),
+    )
+    assert result.metadata["aspect.grounding"] == 0.0  # median of 0.0 / 1.0 / 0.0
+    assert "grounding" in result.metadata["rubric_gate_failures"]
+    assert result.passed is False
+
+
+def test_verify_votes_minority_scored_keeps_process_grounding(tmp_path: Path):
+    # 2 runs go private_fallback, 1 goes scored -> class-majority keeps process,
+    # so a lone noisy scored run cannot flip the override.
+    rubric_pass = _wrap(
+        {
+            "task_completion": {"items": {"tc1": "pass"}},
+            "grounding": {"items": {"g1": "pass"}},
+            "tool_use": {"score": 1}, "answer_quality": {"score": 1},
+            "error_recovery": {"score": 1}, "efficiency": {"score": 1},
+        }
+    )
+    client = _SequencedJudgeClient(
+        rubric=rubric_pass,
+        extracts=[_private_claim(), _private_claim(), _public_claim()],
+        verdicts=[_verdict("verified")],  # only the one scored run reaches a verdict
+    )
+    scorer = _verify_scorer(client, grounding_votes=3)
+    result = scorer.score(
+        context=_context(tmp_path),
+        executor_result=EvalExecutorResult(final_text="ans", tool_calls=()),
+    )
+    assert result.metadata["grounding_status"] == "private_fallback"
+    assert result.metadata["aspect.grounding"] == 1.0  # untouched process grounding
+    assert result.metadata["grounding_votes"] == 3
+
+
+def test_verify_votes_tie_break_prefers_scored(tmp_path: Path):
+    # N=2, one scored + one private_fallback -> the tie resolves to scored.
+    client = _SequencedJudgeClient(
+        rubric=_LOW_GROUNDING,
+        extracts=[_public_claim(), _private_claim()],
+        verdicts=[_verdict("verified")],
+    )
+    scorer = _verify_scorer(client, grounding_votes=2)
+    result = scorer.score(
+        context=_context(tmp_path),
+        executor_result=EvalExecutorResult(final_text="ans", tool_calls=()),
+    )
+    assert result.metadata["grounding_status"] == "scored"
+    assert result.metadata["aspect.grounding"] == 1.0  # process 0.0 overridden
+    assert result.metadata["grounding_votes"] == 2
+
+
+def test_verify_votes_reuse_cached_search_across_votes(tmp_path: Path):
+    # 3 votes over the same claim/query -> a cached search fetches only once, which
+    # is why extra votes bill extract/verdict tokens but not extra search calls.
+    fetches = {"n": 0}
+    cache: dict[str, str] = {}
+
+    async def counting_search(query, *, max_results=4):
+        if query not in cache:
+            fetches["n"] += 1
+            cache[query] = f"results for {query}"
+        return cache[query]
+
+    client = _RoutedJudgeApiClient(
+        rubric=_LOW_GROUNDING, extract=_public_claim("price"), verdict=_verdict("verified")
+    )
+    scorer = RubricJudgeScorer(
+        api_client=client, model="m", votes=1, grounding_mode="verify",
+        search=counting_search, grounding_votes=3,
+    )
+    result = scorer.score(
+        context=_context(tmp_path),
+        executor_result=EvalExecutorResult(final_text="ans", tool_calls=()),
+    )
+    assert result.metadata["grounding_votes"] == 3
+    assert result.metadata["aspect.grounding"] == 1.0
+    assert fetches["n"] == 1  # cached across the 3 votes

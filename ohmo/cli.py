@@ -1589,6 +1589,8 @@ def _preset_overrides_from_cli(
         "system_prompt_file": "system_prompt_file",
         "histories_file": "histories_file",
         "rubrics_file": "rubrics_file",
+        "grounding_mode": "grounding_mode",
+        "grounding_votes": "grounding_votes",
         "cache_completions": "cache_completions",
         "cache_prune_to": "cache_prune_to",
         "cache_mode": "cache_mode",
@@ -1821,6 +1823,17 @@ def evals_run_cmd(
             "ohmo-eval-verification-grounding."
         ),
     ),
+    grounding_votes: int = typer.Option(
+        1,
+        "--grounding-votes",
+        min=1,
+        help=(
+            "Only for --grounding-mode verify: run the extract+verdict pass N "
+            "times and take the class-majority + median score (stabilizes the "
+            "single-shot verify flap; default 1 = off). Searches are cached, so "
+            "extra votes bill only extract/verdict tokens."
+        ),
+    ),
     no_live_skill: bool = typer.Option(
         False,
         "--no-live-skill",
@@ -1928,6 +1941,7 @@ def evals_run_cmd(
                         "histories_file": histories_file,
                         "rubrics_file": rubrics_file,
                         "grounding_mode": grounding_mode,
+                        "grounding_votes": grounding_votes,
                         "cache_completions": cache_completions,
                         "cache_prune_to": cache_prune_to,
                         "cache_mode": cache_mode,
@@ -1951,6 +1965,7 @@ def evals_run_cmd(
         histories_file = resolved.histories_file
         rubrics_file = resolved.rubrics_file
         grounding_mode = resolved.grounding_mode
+        grounding_votes = resolved.grounding_votes
         no_live_skill = not resolved.live_skill
         cache_completions = resolved.cache_completions
         cache_prune_to = resolved.cache_prune_to
@@ -2048,6 +2063,7 @@ def evals_run_cmd(
             "judge_votes": judge_votes,
             "judge_grounding": judge_grounding,
             "grounding_mode": grounding_mode,
+            "grounding_votes": grounding_votes,
         }
         if (
             sandbox_net_mode != "none"

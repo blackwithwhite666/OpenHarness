@@ -190,6 +190,7 @@ def run_ohmo_eval_report(
     rubrics_file: str | Path | None = None,
     live_skill: bool = True,
     grounding_mode: str = "process",
+    grounding_votes: int = 1,
 ) -> OhmoEvalRunResult:
     """Run deterministic replay-tools execution checks over an Ohmo eval pack."""
     if max_turns < 1:
@@ -234,6 +235,7 @@ def run_ohmo_eval_report(
                 votes=judge_votes,
                 rubrics=_load_case_rubrics(rubrics_file),
                 grounding_mode=grounding_mode,
+                grounding_votes=grounding_votes,
             )
         else:
             selected_scorer = FreezingJudgeScorer(
