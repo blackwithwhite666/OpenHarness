@@ -1509,6 +1509,7 @@ def test_ohmo_evals_run_command_runs_eval_report(tmp_path: Path, monkeypatch):
         max_turns: int = 8,
         judge_votes: int = 3,
         judge_grounding: bool = False,
+        **_kwargs,
     ):
         calls.append(
             {
@@ -1634,6 +1635,7 @@ def test_ohmo_evals_run_command_threads_sandbox_agent_runner(
         max_turns: int = 8,
         judge_votes: int = 3,
         judge_grounding: bool = False,
+        **_kwargs,
     ):
         calls.append(
             {
@@ -1777,6 +1779,7 @@ def test_ohmo_evals_run_command_threads_live_read_agent_runner(
         max_turns: int = 8,
         judge_votes: int = 3,
         judge_grounding: bool = False,
+        **_kwargs,
     ):
         calls.append(
             {
@@ -2003,6 +2006,7 @@ def test_ohmo_evals_run_command_passes_output_filename(tmp_path: Path, monkeypat
         max_turns: int = 8,
         judge_votes: int = 3,
         judge_grounding: bool = False,
+        **_kwargs,
     ):
         calls.append(
             {
@@ -2088,6 +2092,7 @@ def test_ohmo_evals_run_command_outputs_json_summary(tmp_path: Path, monkeypatch
         max_turns: int = 8,
         judge_votes: int = 3,
         judge_grounding: bool = False,
+        **_kwargs,
     ):
         del pack_filename, limit, executor_name, agent_runner_name
         del model, provider_profile, system_prompt, fixture_match
@@ -2171,6 +2176,7 @@ def test_ohmo_evals_run_command_passes_query_engine_runner_options(
         max_turns: int = 8,
         judge_votes: int = 3,
         judge_grounding: bool = False,
+        **_kwargs,
     ):
         calls.append(
             {
@@ -2445,6 +2451,7 @@ def test_ohmo_evals_run_command_check_config_does_not_run_eval(
         max_turns: int = 8,
         judge_votes: int = 3,
         judge_grounding: bool = False,
+        **_kwargs,
     ):
         check_calls.append(
             {
@@ -2543,6 +2550,7 @@ def test_ohmo_evals_run_command_check_config_outputs_json(
         max_turns: int = 8,
         judge_votes: int = 3,
         judge_grounding: bool = False,
+        **_kwargs,
     ):
         del workspace, pack_filename, limit, executor_name, agent_runner_name
         del model, provider_profile, system_prompt, fixture_match
@@ -2642,6 +2650,7 @@ def test_ohmo_evals_run_command_reports_blocked_and_error_counts(
         max_turns: int = 8,
         judge_votes: int = 3,
         judge_grounding: bool = False,
+        **_kwargs,
     ):
         del pack_filename, report_filename
         del agent_runner_name, model, provider_profile, system_prompt, fixture_match
