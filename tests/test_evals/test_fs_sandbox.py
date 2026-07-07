@@ -574,3 +574,49 @@ def test_build_sandbox_skill_bin_mocks_publisher(tmp_path):
     assert mock_pub.exists() and (mock_pub.stat().st_mode & 0o111)
     assert "mock" in mock_pub.read_text()
     assert (dirs[1] / "maps-cli").exists()  # flat symlink to the real nested CLI
+
+
+def test_build_bwrap_argv_bin_dirs_bound_after_tmp(tmp_path):
+    # Regression: a skill-bin dir lives under /tmp (mkdtemp), and /tmp is itself an
+    # rw-bind to the disposable sandbox tmp. The bin dir must be ro-bound AFTER the
+    # /tmp bind, else /tmp shadows it and every mocked/flat skill CLI becomes
+    # "command not found" in the jail.
+    from openharness.evals.fs_sandbox import build_bwrap_argv
+
+    tmp_bind = tmp_path / "sandbox-tmp"
+    tmp_bind.mkdir()
+    bindir = tmp_path / "skillbin"
+    bindir.mkdir()
+    argv = build_bwrap_argv(
+        sandbox_root=tmp_path,
+        cwd=tmp_path,
+        home=tmp_path,
+        ro_binds=[],
+        rw_binds=((tmp_bind, Path("/tmp")),),
+        net_mode="host",
+        bin_dirs=[bindir],
+    )
+    resolved = str(bindir.resolve())
+    tmp_idx = _subsequence_index(argv, ["--bind", str(tmp_bind), "/tmp"])
+    bin_idx = _subsequence_index(argv, ["--ro-bind", resolved, resolved])
+    assert bin_idx > tmp_idx  # bin dir bound after /tmp -> not shadowed
+
+
+def test_build_sandbox_skill_bin_mocks_dropbox(tmp_path):
+    from ohmo.evals.runner import _build_sandbox_skill_bin
+    from ohmo.workspace import get_skills_dir
+
+    ws = tmp_path / "ws"
+    get_skills_dir(ws).mkdir(parents=True)
+    dirs = _build_sandbox_skill_bin(ws, live_skill=True)
+    mock_dropbox = dirs[0] / "dropbox"  # shadows the real ~/bin/dropbox on PATH
+    assert mock_dropbox.exists() and (mock_dropbox.stat().st_mode & 0o111)
+    body = mock_dropbox.read_text()
+    assert "sharelink" in body and "dropbox.com/s/" in body
+
+
+def test_fs_sandbox_default_ro_source_dirs_include_attachments():
+    runner = FsSandboxAgentRunner(api_client=_WriteReadApiClient(), model="m")
+    tails = [str(p) for p in runner._ro_source_dirs]
+    assert any(t.endswith(".ohmo/attachments") for t in tails)
+    assert any(t.endswith(".ohmo/skills") for t in tails)
