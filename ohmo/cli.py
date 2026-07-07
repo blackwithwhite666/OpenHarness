@@ -1762,6 +1762,16 @@ def evals_run_cmd(
         "--sandbox-browser-name",
         help="BROWSER_CLI_NAME injected into fs-sandbox bash",
     ),
+    sandbox_ro_dir: list[str] = typer.Option(
+        [],
+        "--sandbox-ro-dir",
+        help=(
+            "Extra host directory to bind read-only into the fs-sandbox jail "
+            "(repeatable). Use for fixture inputs a case asks the agent to open "
+            "(e.g. a Dropbox subfolder of ticket PDFs). Personal paths stay out "
+            "of the committed bundle — pass them here from your private driver."
+        ),
+    ),
     cache_completions: str | None = typer.Option(
         None,
         "--cache-completions",
@@ -2070,11 +2080,13 @@ def evals_run_cmd(
             or sandbox_proxy_url is not None
             or sandbox_browser_socket is not None
             or sandbox_browser_name is not None
+            or sandbox_ro_dir
         ):
             run_kwargs["sandbox_net_mode"] = sandbox_net_mode
             run_kwargs["sandbox_proxy_url"] = sandbox_proxy_url
             run_kwargs["sandbox_browser_socket"] = sandbox_browser_socket
             run_kwargs["sandbox_browser_name"] = sandbox_browser_name
+            run_kwargs["sandbox_ro_dirs"] = tuple(sandbox_ro_dir)
         if judge_profile is not None:
             run_kwargs["judge_profile"] = judge_profile
         if judge_model is not None:

@@ -515,6 +515,7 @@ class FsSandboxAgentRunner:
         live_mcp_server_names: tuple[str, ...] = (),
         mutable_dirs: Iterable[str | Path] = ("memory", "todos", "reminders", "user.md"),
         ro_source_dirs: Iterable[str | Path] | None = None,
+        extra_ro_source_dirs: Iterable[str | Path] = (),
         sandbox_bin_dirs: Iterable[str | Path] = (),
     ) -> None:
         self._api_client = api_client
@@ -542,6 +543,13 @@ class FsSandboxAgentRunner:
                 Path.home() / "bin",
                 Path(sys.prefix),
             )
+        )
+        # Caller-supplied extra read-only mounts (e.g. a Dropbox subfolder holding
+        # ticket PDFs a case asks the agent to open). Appended so the built-in
+        # defaults above are never dropped. Personal paths stay out of this repo —
+        # they come from the private eval driver via --sandbox-ro-dir.
+        self._ro_source_dirs = self._ro_source_dirs + tuple(
+            Path(p).expanduser() for p in extra_ro_source_dirs
         )
         self._sandbox_bin_dirs = tuple(sandbox_bin_dirs)
         self._home = Path.home().resolve()
