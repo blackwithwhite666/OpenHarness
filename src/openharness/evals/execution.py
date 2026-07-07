@@ -84,6 +84,13 @@ _RUBRIC_JUDGE_METADATA_KEYS = (
     "aspect.answer_quality",
     "aspect.error_recovery",
     "aspect.efficiency",
+    # verify-grounding (ADR ohmo-eval-verification-grounding)
+    "grounding_mode",
+    "grounding_status",
+    "grounding_votes",
+    "grounding_verified",
+    "grounding_refuted",
+    "grounding_claims",
 )
 _SCORER_REPORT_METADATA_KEYS = (
     _CAPABILITY_METADATA_KEYS + _JUDGE_METADATA_KEYS + _RUBRIC_JUDGE_METADATA_KEYS
