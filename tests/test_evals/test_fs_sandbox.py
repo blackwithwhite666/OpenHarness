@@ -620,3 +620,18 @@ def test_fs_sandbox_default_ro_source_dirs_include_attachments():
     tails = [str(p) for p in runner._ro_source_dirs]
     assert any(t.endswith(".ohmo/attachments") for t in tails)
     assert any(t.endswith(".ohmo/skills") for t in tails)
+
+
+def test_fs_sandbox_extra_ro_source_dirs_appended_without_dropping_defaults():
+    runner = FsSandboxAgentRunner(
+        api_client=_WriteReadApiClient(),
+        model="m",
+        extra_ro_source_dirs=("/data/tickets", "~/fixtures/pdfs"),
+    )
+    tails = [str(p) for p in runner._ro_source_dirs]
+    # extras are present...
+    assert any(t.endswith("/data/tickets") for t in tails)
+    assert any(t.endswith("/fixtures/pdfs") for t in tails)  # ~ expanded
+    assert not any(t.startswith("~") for t in tails)
+    # ...and the built-in defaults are still there.
+    assert any(t.endswith(".ohmo/attachments") for t in tails)

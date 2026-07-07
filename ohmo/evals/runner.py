@@ -183,6 +183,7 @@ def run_ohmo_eval_report(
     sandbox_proxy_url: str | None = None,
     sandbox_browser_socket: str | None = None,
     sandbox_browser_name: str | None = None,
+    sandbox_ro_dirs: tuple[str, ...] = (),
     cache_completions: str | Path | None = None,
     cache_strict: bool = False,
     cache_prune_to: str | Path | None = None,
@@ -300,12 +301,14 @@ def run_ohmo_eval_report(
         or sandbox_proxy_url is not None
         or sandbox_browser_socket is not None
         or sandbox_browser_name is not None
+        or sandbox_ro_dirs
     ):
         agent_runner_kwargs = {
             "sandbox_net_mode": sandbox_net_mode,
             "sandbox_proxy_url": sandbox_proxy_url,
             "sandbox_browser_socket": sandbox_browser_socket,
             "sandbox_browser_name": sandbox_browser_name,
+            "sandbox_ro_dirs": sandbox_ro_dirs,
         }
     agent_runner_config = _build_agent_runner_config(
         agent_runner_name,
@@ -796,6 +799,7 @@ def _build_agent_runner_config(
     sandbox_proxy_url: str | None = None,
     sandbox_browser_socket: str | None = None,
     sandbox_browser_name: str | None = None,
+    sandbox_ro_dirs: tuple[str, ...] = (),
     completion_cache: CompletionCache | None = None,
     live_skill: bool = True,
 ) -> _AgentRunnerConfig:
@@ -874,6 +878,7 @@ def _build_agent_runner_config(
                 proxy_url=sandbox_proxy_url,
                 browser_socket=sandbox_browser_socket,
                 browser_cli_name=sandbox_browser_name,
+                extra_ro_source_dirs=sandbox_ro_dirs,
                 sandbox_bin_dirs=_build_sandbox_skill_bin(
                     workspace, live_skill=live_skill
                 ),
