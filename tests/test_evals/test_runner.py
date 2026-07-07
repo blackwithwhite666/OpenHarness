@@ -168,6 +168,26 @@ def test_replay_report_limit_changes_case_count_and_report_id(tmp_path: Path):
     assert full.report_id != limited.report_id
 
 
+def test_execution_report_id_distinguishes_output_filename(tmp_path: Path):
+    # Two runs over the SAME pack but different --output (report_filename) must
+    # get distinct report_ids. report_id doubles as the traces run_id
+    # (traces/<report_id>/), so a shared id makes the second run silently clobber
+    # the first run's per-case traces — which bit an A/B that pinned a different
+    # --system-prompt-file per arm and wrote to distinct --output files.
+    store = EvalStore(tmp_path / "evals")
+    _add_episode(store, episode_id="ep-1", user_text="req one", final_text="ans one")
+    drafts = build_case_drafts(store, build_case_candidates(store))
+    write_case_draft_pack(store, drafts)
+    promote_case_drafts(store)
+    pack = write_run_pack(store).pack
+
+    arm_a = run_execution_report(store, pack=pack, report_filename="arm_a.json")
+    arm_b = run_execution_report(store, pack=pack, report_filename="arm_b.json")
+
+    assert arm_a.relative_path != arm_b.relative_path
+    assert arm_a.report.report_id != arm_b.report.report_id
+
+
 def test_execution_report_replay_tools_writes_observed_trace_without_private_text(
     tmp_path: Path,
 ):

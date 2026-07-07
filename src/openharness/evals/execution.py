@@ -665,10 +665,17 @@ def run_execution_report(
     facet_inputs_by_id = {
         item.facet.facet_id: item for item in collect_text_facets(store)
     }
+    # Include report_filename so two runs over the same pack but with different
+    # agent configs (e.g. an A/B that pins a different --system-prompt-file and
+    # writes to a distinct --output) get distinct report_ids. report_id doubles
+    # as the traces run_id (traces/<report_id>/), so without this the second run
+    # silently overwrites the first run's per-case traces. Same output target =
+    # same id = intentional overwrite.
     report_id = _stable_id(
         "eval-exec",
         selected_executor.name,
         payload.pack_id,
+        report_filename,
         *(case.case_id for case in cases),
     )
     traces_root = store.root / "traces"
