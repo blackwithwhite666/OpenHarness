@@ -133,15 +133,6 @@ def build_bwrap_argv(
             text = str(path)
             bwrap_argv.extend(["--ro-bind", text, text])
 
-    sandbox_bin_paths: list[str] = []
-    for raw_bin in bin_dirs:
-        bin_path = Path(raw_bin).expanduser()
-        if bin_path.is_dir():
-            text = str(bin_path.resolve())
-            if text not in sandbox_bin_paths:
-                bwrap_argv.extend(["--ro-bind", text, text])
-                sandbox_bin_paths.append(text)
-
     for raw_src, raw_dest in rw_binds:
         src = Path(raw_src).expanduser()
         dest = Path(raw_dest).expanduser()
@@ -150,6 +141,20 @@ def build_bwrap_argv(
     if browser_socket:
         socket_path = str(Path(browser_socket).expanduser())
         bwrap_argv.extend(["--bind", socket_path, socket_path])
+
+    # bin_dirs are bound LAST, after the rw_binds above. The skill-bin dir is
+    # created under the host /tmp (mkdtemp) and /tmp is itself an rw-bind to the
+    # disposable sandbox tmp; binding the bin dir BEFORE that /tmp bind let the
+    # /tmp bind shadow it, so every mocked / flat skill CLI silently dropped to
+    # "command not found" in the jail. Binding after /tmp keeps them reachable.
+    sandbox_bin_paths: list[str] = []
+    for raw_bin in bin_dirs:
+        bin_path = Path(raw_bin).expanduser()
+        if bin_path.is_dir():
+            text = str(bin_path.resolve())
+            if text not in sandbox_bin_paths:
+                bwrap_argv.extend(["--ro-bind", text, text])
+                sandbox_bin_paths.append(text)
 
     bwrap_argv.extend(
         [
@@ -528,7 +533,15 @@ class FsSandboxAgentRunner:
         self._ro_source_dirs = (
             tuple(ro_source_dirs)
             if ro_source_dirs is not None
-            else (Path.home() / ".ohmo" / "skills", Path.home() / "bin", Path(sys.prefix))
+            else (
+                Path.home() / ".ohmo" / "skills",
+                # Message attachments (voice .ogg, PDFs, images) the agent is
+                # asked to open. Read-only: without this the jail can't see them
+                # and cases fail with "file not found" though the file exists.
+                Path.home() / ".ohmo" / "attachments",
+                Path.home() / "bin",
+                Path(sys.prefix),
+            )
         )
         self._sandbox_bin_dirs = tuple(sandbox_bin_dirs)
         self._home = Path.home().resolve()

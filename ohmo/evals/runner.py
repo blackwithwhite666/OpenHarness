@@ -716,6 +716,28 @@ fi
 """
 
 
+_MOCK_DROPBOX_SH = """#!/bin/bash
+# Eval-only mock of the dropbox CLI (nautilus-dropbox): returns a deterministic
+# https://www.dropbox.com/s/<hash>/<name> share link for `dropbox sharelink PATH`
+# WITHOUT a running Dropbox daemon or network. Mirrors the static_publisher mock —
+# the real share ACL/sync is tested elsewhere; in eval we only need the share step
+# to yield a stable, groundable URL so "give me a Dropbox link" cases can complete.
+cmd="${1:-}"
+case "$cmd" in
+  sharelink|share)
+    path="${2:-}"
+    if [ -z "$path" ]; then echo "dropbox $cmd: missing path" >&2; exit 1; fi
+    name=$(basename "$path")
+    hash=$(printf '%s' "$path" | sha256sum | cut -c1-15)
+    echo "https://www.dropbox.com/s/$hash/$name?dl=0"
+    ;;
+  status) echo "Up to date (mock)";;
+  running) exit 0;;
+  *) echo "mock dropbox: $*";;
+esac
+"""
+
+
 def _build_sandbox_skill_bin(
     workspace: Path | None, *, live_skill: bool
 ) -> tuple[Path, ...]:
@@ -749,6 +771,12 @@ def _build_sandbox_skill_bin(
     mock_publisher = mock_dir / "static_publisher-cli"
     mock_publisher.write_text(_MOCK_STATIC_PUBLISHER_SH, encoding="utf-8")
     mock_publisher.chmod(0o755)
+    # Shadow the real ~/bin/dropbox (nautilus daemon controller, needs a running
+    # daemon + creds) with a deterministic share-link mock; mock_dir is first on
+    # PATH so it wins.
+    mock_dropbox = mock_dir / "dropbox"
+    mock_dropbox.write_text(_MOCK_DROPBOX_SH, encoding="utf-8")
+    mock_dropbox.chmod(0o755)
     dirs = [mock_dir, flat_dir]
     home_bin = Path.home() / "bin"
     if home_bin.is_dir():
