@@ -163,6 +163,7 @@ from openharness.evals.review import (
 from openharness.evals.replay_integrity import replay_integrity
 from openharness.evals.runner import EvalReplayReportWrite, run_replay_report
 from openharness.evals.session import (
+    EvalConversation,
     EvalSessionGroup,
     EvalSessionRunResult,
     EvalSessionTurnResult,
@@ -170,6 +171,7 @@ from openharness.evals.session import (
     gold_capabilities_for_session,
     group_episodes_into_sessions,
     score_session,
+    segment_sessions_into_conversations,
 )
 from openharness.evals.session_user_simulator import (
     HybridUserSimulator,
@@ -353,6 +355,7 @@ __all__ = [
     "validate_decision_trace_payload",
     "validate_decision_trace_structural_payload",
     "copy_decision_trace_summary_fields",
+    "EvalConversation",
     "gold_capabilities_for_session",
     "group_episodes_into_sessions",
     "promote_case_drafts",
@@ -368,6 +371,7 @@ __all__ = [
     "replay_matches",
     "score_session",
     "select_case_drafts",
+    "segment_sessions_into_conversations",
     "summarize_decision_trace",
     "write_candidate_pack",
     "write_case_draft_pack",

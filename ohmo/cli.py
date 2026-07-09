@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import sys
+from dataclasses import asdict
 from pathlib import Path
 
 import typer
@@ -13,6 +14,10 @@ import typer
 from openharness.auth.manager import AuthManager
 from openharness.api.resolver import ApiClientResolutionError, resolve_api_client_from_settings
 from openharness.config import load_settings
+from openharness.evals import (
+    group_episodes_into_sessions,
+    segment_sessions_into_conversations,
+)
 
 from ohmo.gateway.config import load_gateway_config, save_gateway_config
 from ohmo.gateway.models import GatewayConfig
@@ -30,6 +35,7 @@ from ohmo.evals import (
     check_ohmo_eval_run_config,
     compare_ohmo_eval_reports,
     list_ohmo_eval_baselines,
+    get_eval_store,
     promote_ohmo_eval_case_drafts,
     review_ohmo_eval_case_drafts,
     derive_ohmo_case_rubrics,
@@ -1215,6 +1221,83 @@ def evals_mine_cmd(
         f"{result.candidates.manifest.record_count} candidates and "
         f"{result.cases.manifest.record_count} draft cases"
     )
+
+
+@evals_app.command("segment-sessions")
+def evals_segment_sessions_cmd(
+    workspace: str | None = typer.Option(None, "--workspace", help=_WORKSPACE_HELP),
+    gap_minutes: float = typer.Option(
+        30.0,
+        "--gap-minutes",
+        min=0.0,
+        help="Split when consecutive turns are more than this many minutes apart",
+    ),
+    min_turns: int = typer.Option(
+        1,
+        "--min-turns",
+        min=1,
+        help="Minimum turns required for an emitted conversation",
+    ),
+    app_name: str | None = typer.Option("ohmo", "--app", help="Eval app filter"),
+    output: str | None = typer.Option(
+        None,
+        "--output",
+        help="Write conversation segments as a JSON array to this path",
+    ),
+) -> None:
+    """Segment captured eval sessions into bounded conversations."""
+    workspace_root = initialize_workspace(workspace)
+    store = get_eval_store(workspace_root)
+    conversations = segment_sessions_into_conversations(
+        store,
+        app=app_name,
+        gap_minutes=gap_minutes,
+        min_turns=min_turns,
+    )
+
+    if output:
+        output_path = Path(output).expanduser()
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(
+            json.dumps(
+                [asdict(conversation) for conversation in conversations],
+                ensure_ascii=True,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        print(f"Wrote conversation segments: {output_path}")
+        return
+
+    threads = group_episodes_into_sessions(store, app=app_name)
+    histogram = _conversation_length_histogram(conversations)
+    print(f"threads: {len(threads)}")
+    print(f"conversations: {len(conversations)}")
+    print("length histogram:")
+    for label in ("1", "2", "3-5", "6-10", "11+"):
+        print(f"- {label}: {histogram[label]}")
+    print(
+        "conversations_with_3_plus_turns: "
+        f"{sum(1 for conversation in conversations if conversation.n_turns >= 3)}"
+    )
+
+
+def _conversation_length_histogram(conversations: object) -> dict[str, int]:
+    histogram = {"1": 0, "2": 0, "3-5": 0, "6-10": 0, "11+": 0}
+    for conversation in conversations:
+        n_turns = getattr(conversation, "n_turns")
+        if n_turns == 1:
+            histogram["1"] += 1
+        elif n_turns == 2:
+            histogram["2"] += 1
+        elif n_turns <= 5:
+            histogram["3-5"] += 1
+        elif n_turns <= 10:
+            histogram["6-10"] += 1
+        else:
+            histogram["11+"] += 1
+    return histogram
 
 
 @evals_cases_app.command("list")

@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -45,6 +46,17 @@ class EvalSessionGroup:
 
     session_id: str
     episode_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class EvalConversation:
+    """Bounded contiguous task conversation inside a coarse session thread."""
+
+    session_id: str
+    segment_index: int
+    episode_ids: tuple[str, ...]
+    n_turns: int
+    span_minutes: float
 
 
 @dataclass(frozen=True)
@@ -105,6 +117,108 @@ def group_episodes_into_sessions(
             )
         )
     return sorted(out, key=lambda group: (first_index[group.session_id], group.session_id))
+
+
+def segment_sessions_into_conversations(
+    store: EvalStore,
+    *,
+    app: str | None = None,
+    source: str | None = None,
+    gap_minutes: float = 30.0,
+    min_turns: int = 1,
+) -> list[EvalConversation]:
+    """Split coarse session threads into bounded time-gap conversations."""
+    conversations: list[EvalConversation] = []
+    for group in group_episodes_into_sessions(store, app=app, source=source):
+        episodes: list[EvalEpisode] = []
+        for episode_id in group.episode_ids:
+            episode = store.get_episode(episode_id)
+            if episode is not None:
+                episodes.append(episode)
+
+        for segment_index, segment in enumerate(
+            _time_gap_conversation_segments(episodes, gap_minutes=gap_minutes)
+        ):
+            if len(segment) < min_turns:
+                continue
+            conversations.append(
+                EvalConversation(
+                    session_id=group.session_id,
+                    segment_index=segment_index,
+                    episode_ids=tuple(episode.episode_id for episode in segment),
+                    n_turns=len(segment),
+                    span_minutes=_conversation_span_minutes(segment),
+                )
+            )
+    return conversations
+
+
+def _time_gap_conversation_segments(
+    episodes: Sequence[EvalEpisode],
+    *,
+    gap_minutes: float,
+) -> list[tuple[EvalEpisode, ...]]:
+    """Split ordered episodes on capture-time gaps.
+
+    NOTE: This helper is the seam for a future topic-aware LLM refinement that
+    can use ``_segment_conversation`` / ``HistoryContext`` from ``execution.py``.
+    The current implementation is intentionally deterministic and time-gap only.
+    """
+    if not episodes:
+        return []
+
+    segments: list[tuple[EvalEpisode, ...]] = []
+    current: list[EvalEpisode] = [episodes[0]]
+    previous = episodes[0]
+    for episode in episodes[1:]:
+        if _conversation_gap_exceeds(previous, episode, gap_minutes=gap_minutes):
+            segments.append(tuple(current))
+            current = []
+        current.append(episode)
+        previous = episode
+    segments.append(tuple(current))
+    return segments
+
+
+def _conversation_gap_exceeds(
+    previous: EvalEpisode,
+    current: EvalEpisode,
+    *,
+    gap_minutes: float,
+) -> bool:
+    previous_at = _parse_conversation_timestamp(previous.created_at)
+    current_at = _parse_conversation_timestamp(current.created_at)
+    if previous_at is None or current_at is None:
+        return True
+    return (current_at - previous_at).total_seconds() / 60.0 > gap_minutes
+
+
+def _conversation_span_minutes(episodes: Sequence[EvalEpisode]) -> float:
+    if len(episodes) < 2:
+        return 0.0
+    first_at = _parse_conversation_timestamp(episodes[0].created_at)
+    last_at = _parse_conversation_timestamp(episodes[-1].created_at)
+    if first_at is None or last_at is None:
+        return 0.0
+    return max(0.0, (last_at - first_at).total_seconds() / 60.0)
+
+
+def _parse_conversation_timestamp(value: Any) -> datetime | None:
+    try:
+        if isinstance(value, datetime):
+            timestamp = value
+        elif isinstance(value, str):
+            text = value.strip()
+            if text.endswith("Z"):
+                text = f"{text[:-1]}+00:00"
+            timestamp = datetime.fromisoformat(text)
+        else:
+            return None
+    except (TypeError, ValueError):
+        return None
+    if timestamp.tzinfo is None or timestamp.utcoffset() is None:
+        return timestamp.replace(tzinfo=timezone.utc)
+    return timestamp.astimezone(timezone.utc)
 
 
 class SessionReplayRunner:
