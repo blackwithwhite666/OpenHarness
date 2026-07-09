@@ -12,11 +12,18 @@ from openharness.evals.judge import _complete_text, _extract_json
 
 BLAME_LABELS = ("model", "harness_boundary", "harness_rubric", "infra", "judge_fault")
 HARNESS_LABELS = {"harness_boundary", "harness_rubric", "infra", "judge_fault"}
+MAX_TRAJ_CALLS = 24
+MAX_CALL_CHARS = 240
+MAX_ANSWER_CHARS = 3000
+MAX_RUBRIC_CHARS = 1500
 _STRONG_HARNESS_SIGNALS = ("command not found", "не смонтир", "не установлен")
 _SCHEMA_JSON = (
     '{"blame":"model|harness_boundary|harness_rubric|infra|judge_fault",'
     '"subtype":null,"confidence":0.0,"evidence":"short grounded explanation"}'
 )
+_TRAJ_HEAD_CALLS = 12
+_TRAJ_TAIL_CALLS = 8
+_TRUNCATION_MARKER = "…[truncated]…"
 
 META_JUDGE_SYSTEM_PROMPT = (
     "You are an adversarial meta-judge for failed AI-agent evals. Given ONLY the harness this agent ran in "
@@ -45,11 +52,16 @@ class MetaJudgeAttributor:
         aspect_scores: dict,
         gate_failures: list,
     ) -> dict:
-        prompt = _attribution_prompt(
-            task=task,
+        bounded = _bounded_prompt_inputs(
             rubric=rubric,
             answer=answer,
             trajectory=trajectory,
+        )
+        prompt = _attribution_prompt(
+            task=task,
+            rubric=bounded["rubric"],
+            answer=bounded["answer"],
+            trajectory=bounded["trajectory"],
             aspect_scores=aspect_scores,
             gate_failures=gate_failures,
             signal_hint=signal_prefilter(trajectory, answer),
@@ -114,9 +126,9 @@ def summarize_attributions(items: list[dict]) -> dict:
 def _attribution_prompt(
     *,
     task: str,
-    rubric: dict,
+    rubric: object,
     answer: str,
-    trajectory: list,
+    trajectory: object,
     aspect_scores: dict,
     gate_failures: list,
     signal_hint: str | None,
@@ -148,6 +160,93 @@ def _attribution_prompt(
         f"Return strict JSON only matching this schema:\n{_SCHEMA_JSON}",
     ]
     return "\n\n".join(sections)
+
+
+def _bounded_prompt_inputs(*, rubric: dict, answer: str, trajectory: list) -> dict[str, object]:
+    return {
+        "rubric": _bounded_rubric(rubric),
+        "answer": _truncate_head_tail(answer.strip(), MAX_ANSWER_CHARS),
+        "trajectory": _bounded_trajectory(trajectory),
+    }
+
+
+def _bounded_trajectory(trajectory: list) -> list[object]:
+    indexed_steps = list(enumerate(trajectory or [], 1))
+    if len(indexed_steps) > MAX_TRAJ_CALLS:
+        elided = len(indexed_steps) - _TRAJ_HEAD_CALLS - _TRAJ_TAIL_CALLS
+        marker = f"… {elided} calls elided …"
+        indexed_steps = (
+            indexed_steps[:_TRAJ_HEAD_CALLS]
+            + [(None, marker)]
+            + indexed_steps[-_TRAJ_TAIL_CALLS:]
+        )
+
+    bounded: list[object] = []
+    for index, step in indexed_steps:
+        if index is None:
+            bounded.append(step)
+            continue
+        bounded.append(
+            {
+                "index": index,
+                "is_error": _is_error_step(step),
+                "entry": _truncate_right(_safe_json(step), MAX_CALL_CHARS),
+            }
+        )
+    return bounded
+
+
+def _bounded_rubric(rubric: dict) -> list[str]:
+    texts: list[str] = []
+    if isinstance(rubric, dict):
+        for aspect in ("task_completion", "grounding"):
+            _collect_rubric_texts(rubric.get(aspect), texts)
+
+    bounded: list[str] = []
+    remaining = MAX_RUBRIC_CHARS
+    for text in texts:
+        text = text.strip()
+        if not text or remaining <= 0:
+            continue
+        if len(text) <= remaining:
+            bounded.append(text)
+            remaining -= len(text)
+        else:
+            bounded.append(_truncate_head_tail(text, remaining))
+            break
+    return bounded
+
+
+def _collect_rubric_texts(value: object, texts: list[str]) -> None:
+    if isinstance(value, dict):
+        text = value.get("text")
+        if text not in (None, ""):
+            texts.append(str(text))
+        for child in value.values():
+            if child is not text:
+                _collect_rubric_texts(child, texts)
+    elif isinstance(value, list):
+        for child in value:
+            _collect_rubric_texts(child, texts)
+
+
+def _truncate_head_tail(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    if limit <= len(_TRUNCATION_MARKER):
+        return text[:limit]
+    keep = limit - len(_TRUNCATION_MARKER)
+    head = keep // 2
+    tail = keep - head
+    return f"{text[:head]}{_TRUNCATION_MARKER}{text[-tail:]}"
+
+
+def _truncate_right(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    if limit <= len(_TRUNCATION_MARKER):
+        return text[:limit]
+    return f"{text[:limit - len(_TRUNCATION_MARKER)]}{_TRUNCATION_MARKER}"
 
 
 def _parse_vote(text: str) -> dict | None:
