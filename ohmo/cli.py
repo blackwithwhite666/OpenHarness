@@ -16,8 +16,11 @@ from openharness.api.resolver import ApiClientResolutionError, resolve_api_clien
 from openharness.config import load_settings
 from openharness.evals import (
     group_episodes_into_sessions,
+    read_execution_report,
     segment_sessions_into_conversations,
 )
+from openharness.evals.meta_judge import MetaJudgeAttributor, summarize_attributions
+from openharness.utils.fs import atomic_write_text
 
 from ohmo.gateway.config import load_gateway_config, save_gateway_config
 from ohmo.gateway.models import GatewayConfig
@@ -55,6 +58,7 @@ from ohmo.evals.spec import (
     evaluate_gate,
     resolve_run,
 )
+from ohmo.evals.runner import _build_agent_runner_config, _load_case_rubrics
 from ohmo.memory import add_memory_entry, remove_memory_entry
 from ohmo.memory_judge import (
     load_removal_proposals,
@@ -2264,6 +2268,212 @@ def evals_run_cmd(
         + getattr(report, "error_count", 0)
     ):
         raise typer.Exit(1)
+
+
+def _meta_report_traces_dir(
+    traces_dir: str | None,
+    *,
+    workspace_root: Path,
+    report: object,
+) -> Path:
+    if traces_dir:
+        return Path(traces_dir).expanduser().resolve()
+    metadata = getattr(report, "metadata", {}) or {}
+    run_id = str(
+        metadata.get("execution_id")
+        or metadata.get("report_id")
+        or getattr(report, "report_id")
+    )
+    return (workspace_root / "evals" / "traces" / run_id).resolve()
+
+
+def _meta_report_trace_path(traces_dir: Path, case_id: str) -> Path:
+    exact = traces_dir / f"{case_id}-0.json"
+    if exact.is_file():
+        return exact
+    prefix = f"{case_id}-"
+    suffix = ".json"
+    matches: list[tuple[int, Path]] = []
+    if traces_dir.is_dir():
+        for path in traces_dir.rglob(f"*{suffix}"):
+            relative_name = path.relative_to(traces_dir).as_posix()
+            if (
+                not path.is_file()
+                or not relative_name.startswith(prefix)
+                or not relative_name.endswith(suffix)
+            ):
+                continue
+            sample_text = relative_name[len(prefix) : -len(suffix)]
+            try:
+                matches.append((int(sample_text), path))
+            except ValueError:
+                continue
+    if matches:
+        return sorted(matches, key=lambda item: item[0])[0][1]
+    raise FileNotFoundError(f"trace not found for case {case_id}: {traces_dir}")
+
+
+def _read_meta_report_trace(traces_dir: Path, case_id: str) -> dict[str, object]:
+    path = _meta_report_trace_path(traces_dir, case_id)
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(value, dict):
+        raise ValueError(f"trace is not a JSON object: {path}")
+    return value
+
+
+def _meta_report_list(value: object) -> list[object]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    return [value]
+
+
+def _meta_report_attribute_case(
+    case: object,
+    *,
+    trace_root: Path,
+    rubrics: dict[str, dict[str, object]],
+    attributor: object,
+) -> dict[str, object]:
+    case_id = str(getattr(case, "case_id"))
+    trace = _read_meta_report_trace(trace_root, case_id)
+    observed = getattr(case, "observed_trace", None)
+    metadata = dict(observed.metadata) if observed is not None else {}
+    aspect_scores = {
+        "task_completion": metadata.get("aspect.task_completion"),
+        "grounding": metadata.get("aspect.grounding"),
+    }
+    rubric = rubrics.get(case_id) or {}
+    if not isinstance(rubric, dict):
+        rubric = {}
+    tool_calls = trace.get("tool_calls")
+    if not isinstance(tool_calls, list):
+        tool_calls = []
+    gate_failures = _meta_report_list(metadata.get("rubric_gate_failures"))
+    attribution = attributor.attribute(
+        task=str(trace.get("prompt") or ""),
+        rubric=rubric,
+        answer=str(trace.get("final_text") or ""),
+        trajectory=tool_calls,
+        aspect_scores=aspect_scores,
+        gate_failures=gate_failures,
+    )
+    item: dict[str, object] = {
+        "case_id": case_id,
+        "status": getattr(case, "status"),
+        "aspect_scores": aspect_scores,
+        "gate_failures": gate_failures,
+        "final_text_hash": observed.final_text_hash if observed is not None else "",
+    }
+    item.update(attribution)
+    return item
+
+
+@evals_app.command("meta-report")
+def evals_meta_report_cmd(
+    report_path: str = typer.Option(
+        ...,
+        "--report",
+        help="Path to an execution report JSON written by `ohmo evals run`",
+    ),
+    traces_dir: str | None = typer.Option(
+        None,
+        "--traces-dir",
+        help="Directory containing per-case trace files; defaults to evals/traces/<report_id>",
+    ),
+    rubrics_file: str | None = typer.Option(
+        None,
+        "--rubrics-file",
+        help="Rubrics JSON: case_id -> {task_completion, grounding}",
+    ),
+    model: str | None = typer.Option(None, "--model", help="Model override for the meta-judge"),
+    meta_votes: int = typer.Option(
+        1,
+        "--meta-votes",
+        min=1,
+        help="Meta-judge votes per failed case",
+    ),
+    output: str | None = typer.Option(None, "--output", help="Write attributions JSON"),
+    workspace: str | None = typer.Option(None, "--workspace", help=_WORKSPACE_HELP),
+) -> None:
+    """Route failed eval cases to model vs harness debt using the meta-judge."""
+    workspace_root = initialize_workspace(workspace)
+    try:
+        report = read_execution_report(report_path)
+        rubrics = _load_case_rubrics(rubrics_file) or {}
+        trace_root = _meta_report_traces_dir(
+            traces_dir,
+            workspace_root=workspace_root,
+            report=report,
+        )
+        failed_cases = [case for case in report.cases if case.status != "passed"]
+        attributions: list[dict[str, object]] = []
+        attributor = None
+        if failed_cases:
+            judge_config = _build_agent_runner_config(
+                "query-engine",
+                workspace=workspace_root,
+                model=model,
+                provider_profile=None,
+                system_prompt=None,
+            )
+            if judge_config.api_client is None:
+                raise ValueError("meta-report requires configured API authentication")
+            attributor = MetaJudgeAttributor(
+                api_client=judge_config.api_client,
+                model=judge_config.model,
+                votes=meta_votes,
+            )
+        for case in failed_cases:
+            assert attributor is not None
+            attributions.append(
+                _meta_report_attribute_case(
+                    case,
+                    trace_root=trace_root,
+                    rubrics=rubrics,
+                    attributor=attributor,
+                )
+            )
+    except (FileNotFoundError, OSError, ValueError) as exc:
+        print(str(exc), file=sys.stderr)
+        raise typer.Exit(1)
+
+    summary = summarize_attributions(attributions)
+    print("cid | tc | g | blame | subtype | evidence[:60]")
+    for item in attributions:
+        aspect_scores = item.get("aspect_scores") if isinstance(item, dict) else {}
+        if not isinstance(aspect_scores, dict):
+            aspect_scores = {}
+        evidence = str(item.get("evidence") or "")[:60]
+        print(
+            f"{item.get('case_id')} | {aspect_scores.get('task_completion')} | "
+            f"{aspect_scores.get('grounding')} | {item.get('blame')} | "
+            f"{item.get('subtype') or '-'} | {evidence}"
+        )
+    print("summary:")
+    print(f"counts: {json.dumps(summary['counts'], sort_keys=True, ensure_ascii=True)}")
+    print(f"harness_debt_pct: {summary['harness_debt_pct']}")
+    print(f"model_signal_pct: {summary['model_signal_pct']}")
+    print(f"subtypes: {json.dumps(summary['subtypes'], sort_keys=True, ensure_ascii=True)}")
+    if output:
+        output_path = Path(output).expanduser()
+        atomic_write_text(
+            output_path,
+            json.dumps(
+                {
+                    "report_id": report.report_id,
+                    "failed_count": len(attributions),
+                    "attributions": attributions,
+                    "summary": summary,
+                },
+                ensure_ascii=False,
+                indent=2,
+                default=str,
+            )
+            + "\n",
+        )
+        print(f"Wrote meta-report JSON: {output_path}")
 
 
 @evals_app.command("derive-rubrics")
