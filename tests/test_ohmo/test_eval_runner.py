@@ -16,8 +16,11 @@ from openharness.evals import (
     EvalEpisode,
     EvalEvent,
     EvalExecutionContext,
+)
+from openharness.evals import (
     FsSandboxAgentRunner,
     LiveReadAgentRunner,
+    IronUserSpec,
     ReplayToolsExecutor,
     SynthContext,
     promote_case_drafts,
@@ -28,6 +31,7 @@ from openharness.evals import (
     collect_text_facets,
     write_run_pack,
 )
+from openharness.evals.executor import EvalExecutorResult, EvalObservedCall
 import ohmo.evals.runner as runner_module
 from ohmo.evals import (
     build_ohmo_eval_pack,
@@ -200,6 +204,190 @@ def test_run_ohmo_session_eval_writes_metadata_only_report(
     assert "private raw tool output" not in serialized
     assert "private model final" not in serialized
     assert "SECRET_CITY" not in serialized
+
+
+class _FaithfulSessionEvalFsRunner:
+    def __init__(self, workspace: Path) -> None:
+        self._cwd = workspace
+        self.workspaces: list[Path] = [workspace]
+        self.prompts: list[str] = []
+
+    @property
+    def name(self) -> str:
+        return "fake-faithful-fs-runner"
+
+    def run(
+        self,
+        *,
+        prompt: str,
+        tool_registry: object,
+        context: object,
+    ) -> EvalExecutorResult:
+        del tool_registry, context
+        self.prompts.append(prompt)
+        self.workspaces.append(self._cwd)
+        marker = self._cwd / "run.marker"
+        if marker.exists():
+            marker_value = marker.read_text(encoding="utf-8")
+            calls = (
+                EvalObservedCall(
+                    tool_name="read_marker",
+                    arguments={"value": marker_value},
+                ),
+            )
+            final_text = f"read {marker_value}"
+        else:
+            marker.write_text("ok", encoding="utf-8")
+            calls = (
+                EvalObservedCall(
+                    tool_name="write_marker",
+                    arguments={},
+                ),
+            )
+            final_text = "wrote ok"
+        return EvalExecutorResult(
+            final_text=final_text,
+            tool_calls=tuple(calls),
+        )
+
+
+def test_run_ohmo_session_eval_faithful_preset_records_sandbox_state_delta(
+    tmp_path: Path,
+    monkeypatch,
+):
+    workspace = tmp_path / "workspace"
+    store = get_eval_store(workspace)
+    _append_session_episode(
+        store,
+        episode_id="ep-1",
+        session_id="session-1",
+        user_text="private ohmo first request",
+        tool_call_id="tool-1",
+    )
+    _append_session_episode(
+        store,
+        episode_id="ep-2",
+        session_id="session-1",
+        user_text="private ohmo second request",
+        tool_call_id="tool-2",
+    )
+    api_client = _PerTurnToolModelApiClient()
+    runner_instances: list[_FaithfulSessionEvalFsRunner] = []
+    runner_calls: list[dict[str, object]] = []
+
+    def fake_build_agent_runner_config(agent_runner_name, *, workspace, **_kwargs):
+        runner_calls.append(
+            {
+                "agent_runner_name": agent_runner_name,
+                "workspace": workspace,
+            }
+        )
+        if agent_runner_name == "fs-sandbox":
+            fake_runner = _FaithfulSessionEvalFsRunner(workspace)
+            runner_instances.append(fake_runner)
+            return runner_module._AgentRunnerConfig(
+                agent_runner=fake_runner,
+                agent_runner_name="fs-sandbox",
+                model="fake-model",
+                provider_profile="fake-profile",
+                api_client=api_client,
+                system_prompt="REAL_OHMO_PROMPT",
+                cwd=workspace,
+            )
+        if agent_runner_name == "query-engine":
+            return runner_module._AgentRunnerConfig(
+                agent_runner=object(),
+                agent_runner_name="query-engine",
+                model="fake-model",
+                provider_profile="fake-profile",
+                api_client=api_client,
+                system_prompt="REAL_OHMO_PROMPT",
+                cwd=workspace,
+            )
+        raise ValueError(f"unexpected runner: {agent_runner_name}")
+
+    monkeypatch.setattr(
+        "ohmo.evals.runner.resolve_api_client_from_settings",
+        lambda settings: api_client,
+    )
+    monkeypatch.setattr(
+        "ohmo.evals.runner.build_ohmo_system_prompt",
+        lambda *args, **kwargs: "REAL_OHMO_PROMPT",
+    )
+    monkeypatch.setattr(
+        "ohmo.evals.runner._build_agent_runner_config",
+        fake_build_agent_runner_config,
+    )
+    async def fake_spec(*_args, **_kwargs):
+        return IronUserSpec(
+            intent="find weather",
+            known_info=("city is hidden",),
+            constraints=("be concise",),
+        )
+
+    async def fake_judge(*_args, **_kwargs):
+        return {
+            "intent_met": True,
+            "constraints_held": True,
+            "evidence": "goal reached",
+            "votes": 1,
+        }
+
+    async def fake_grounding(*_args, **_kwargs):
+        return {
+            "score": 0.9,
+            "status": "scored",
+            "verified": 1,
+            "refuted": 0,
+            "claims": [],
+            "votes": 1,
+        }
+
+    monkeypatch.setattr("openharness.evals.session.derive_ironuser_spec", fake_spec)
+    monkeypatch.setattr("openharness.evals.session.judge_intent_met", fake_judge)
+    monkeypatch.setattr("openharness.evals.session._verify_grounding_voted", fake_grounding)
+
+    faithful_result = run_ohmo_session_eval(
+        workspace=workspace,
+        limit=1,
+        fixture_match="arguments",
+        preset="faithful",
+    )
+
+    assert faithful_result.write.report.metadata["runner_name"] == (
+        "session-query-engine-faithful"
+    )
+    faithful_case = faithful_result.write.report.cases[0]
+    assert set(faithful_case.checks.keys()) == {
+        "intent_met",
+        "constraints_held",
+        "grounding_ok",
+    }
+    assert faithful_case.checks["intent_met"] is True
+    assert faithful_case.checks["constraints_held"] is True
+    assert faithful_case.checks["grounding_ok"] is True
+    assert faithful_case.checks.get("capability_coverage") is None
+    assert faithful_case.metadata["state_delta"] is not None
+    assert faithful_case.turn_count == 2
+    assert runner_calls[0]["agent_runner_name"] == "fs-sandbox"
+    assert len(runner_instances) == 1
+    assert len(runner_instances[0].prompts) == 2
+    assert "assistant: wrote ok" in runner_instances[0].prompts[1]
+    assert len(set(runner_instances[0].workspaces)) == 1
+    assert not runner_instances[0].workspaces[0].exists()
+
+    inner_result = run_ohmo_session_eval(
+        workspace=workspace,
+        limit=1,
+        fixture_match="arguments",
+        preset="inner",
+    )
+
+    assert inner_result.write.report.metadata["runner_name"] == "session-query-engine"
+    inner_case = inner_result.write.report.cases[0]
+    assert "state_delta" not in inner_case.metadata
+    assert len(runner_calls) == 2
+    assert runner_calls[1]["agent_runner_name"] == "query-engine"
 
 
 def test_run_ohmo_session_eval_hybrid_user_sim_profile_records_metrics(

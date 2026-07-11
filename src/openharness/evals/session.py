@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
+import shutil
+import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +24,7 @@ from openharness.engine.stream_events import (
 from openharness.evals.execution import _INCIDENTAL_CAPABILITIES, _tool_fixtures
 from openharness.evals.executor import (
     EvalToolFixture,
+    EvalExecutorResult,
     SynthContext,
     _run_eval_coroutine,
     build_replay_tool_registry,
@@ -28,14 +32,18 @@ from openharness.evals.executor import (
 from openharness.evals.models import EvalEpisode
 from openharness.evals.session_user_simulator import (
     ReplayUserSimulator,
+    derive_ironuser_spec,
     UserSimulator,
     _resolve_user_turn,
     _simulator_ended_reason,
 )
+from openharness.evals.judge import _verify_grounding_voted, judge_intent_met
 from openharness.evals.store import EvalStore
 from openharness.evals.tool_labels import effective_tool_label
+from openharness.evals.state import compute_state_delta
 from openharness.permissions.checker import PermissionChecker
 from openharness.permissions.modes import PermissionMode
+from openharness.tools.base import ToolRegistry
 
 log = logging.getLogger(__name__)
 
@@ -80,6 +88,78 @@ class EvalSessionRunResult:
     final_text: str = ""
     turn_count: int = 0
     metadata: dict[str, Any] = field(default_factory=dict)
+
+
+async def score_faithful_session(
+    api_client: SupportsStreamingMessages,
+    model: str,
+    *,
+    captured_prompts: Sequence[str],
+    transcript: Sequence[tuple[str, str]],
+    final_text: str,
+    search: Callable[[str], Awaitable[str]],
+    judge_votes: int = 1,
+    grounding_votes: int = 1,
+    max_tokens: int = 600,
+) -> dict[str, Any]:
+    """Score a faithful session by outcome and grounded final answer.
+
+    The scorer uses intent extraction from captured prompts to judge whether the
+    final request intent was met, constraints were respected, and whether the
+    final answer is sufficiently grounded.
+    """
+    spec = await derive_ironuser_spec(
+        api_client,
+        model,
+        captured_prompts=captured_prompts,
+        max_tokens=max_tokens,
+    )
+    transcript_tuple = tuple(
+        (str(role), str(text)) for role, text in transcript if role is not None
+    )
+    intent = await judge_intent_met(
+        api_client,
+        model,
+        intent=spec.intent,
+        constraints=spec.constraints,
+        transcript=transcript_tuple,
+        votes=judge_votes,
+        max_tokens=max_tokens,
+    )
+    intent_met = bool(intent.get("intent_met"))
+    constraints_held = bool(intent.get("constraints_held"))
+
+    checklist_items = tuple(
+        item.strip() for item in (spec.intent, *spec.constraints) if item.strip()
+    )
+    grounding = await _verify_grounding_voted(
+        api_client,
+        model,
+        votes=grounding_votes,
+        task=spec.intent,
+        answer=final_text,
+        trajectory=final_text,
+        checklist_items=checklist_items,
+        search=search,
+    )
+    grounding_score = grounding.get("score")
+    grounding_ok = grounding_score is None or grounding_score >= 0.6
+
+    checks = {
+        "intent_met": intent_met,
+        "constraints_held": constraints_held,
+        "grounding_ok": grounding_ok,
+    }
+    return {
+        "passed": all(checks.values()),
+        "score": sum(1 for value in checks.values() if value) / len(checks),
+        "checks": checks,
+        "missing_capabilities": [],
+        "observed_capabilities": [],
+        "turn_count": len(transcript_tuple) // 2,
+        "intent_evidence": str(intent.get("evidence") or ""),
+        "grounding": grounding,
+    }
 
 
 def group_episodes_into_sessions(
@@ -273,17 +353,20 @@ class SessionReplayRunner:
         store: EvalStore,
         user_simulator: UserSimulator | None = None,
     ) -> EvalSessionRunResult:
-        """Replay one captured session with selected replay fixture matching."""
         return _run_eval_coroutine(
-            self._run(group=group, store=store, user_simulator=user_simulator)
+            self.run_session(
+                group=group,
+                store=store,
+                user_simulator=user_simulator,
+            )
         )
 
-    async def _run(
+    async def run_session(
         self,
         *,
         group: EvalSessionGroup,
         store: EvalStore,
-        user_simulator: UserSimulator | None,
+        user_simulator: UserSimulator | None = None,
     ) -> EvalSessionRunResult:
         if not group.episode_ids:
             raise ValueError("session group must contain episodes")
@@ -310,12 +393,14 @@ class SessionReplayRunner:
                     for fixture in episode_fixtures
                 )
             )
+
         captured_prompts = tuple(_episode_prompt(episode) for episode in episodes)
+        fixture_records = tuple(fixtures)
 
         engine = QueryEngine(
             api_client=self._api_client,
             tool_registry=build_replay_tool_registry(
-                tuple(fixtures),
+                fixture_records,
                 match_mode=self._fixture_match_mode,
                 synth_context=self._synth_context,
             ),
@@ -367,7 +452,7 @@ class SessionReplayRunner:
             transcript.append(("user", user_turn.text))
             turn = await consume_engine_turn(
                 engine,
-                user_turn.text,
+                prompt=user_turn.text,
                 episode_id=episode_id,
             )
             turns.append(turn)
@@ -411,8 +496,275 @@ class SessionReplayRunner:
                 "llm_fallback_count": llm_fallback_count,
                 "replay_hit_rate": replay_hit_rate,
                 "ended_reason": ended_reason,
+                "transcript": tuple(transcript),
             },
         )
+
+
+class FaithfulSessionRunner:
+    """Run an ordered episode group through one persistent fs-sandbox runner."""
+
+    name = "session-query-engine-faithful"
+
+    def __init__(
+        self,
+        *,
+        api_client: SupportsStreamingMessages,
+        model: str,
+        system_prompt: str,
+        cwd: str | Path | None = None,
+        max_turns: int = 8,
+        max_tokens: int = 4096,
+        max_session_turns: int | None = None,
+        fixture_match_mode: str = "order",
+        synth_context: SynthContext | None = None,
+        agent_runner_factory: Callable[[Path], object] | None = None,
+        agent_runner: object | None = None,
+        sandbox_tool_factory: Callable[[Path], object] | None = None,
+        sandbox_state_fn: Callable[[Path], dict[str, Any]] | None = None,
+    ) -> None:
+        if fixture_match_mode not in {
+            "order",
+            "arguments",
+            "args_then_order",
+            "synth",
+            "synth_state",
+        }:
+            raise ValueError(
+                "fixture match mode must be one of: order, arguments, "
+                "args_then_order, synth, synth_state"
+            )
+        if fixture_match_mode in {"synth", "synth_state"} and synth_context is None:
+            raise ValueError("synth fixture match requires a SynthContext")
+        if agent_runner_factory is None and agent_runner is None:
+            raise ValueError(
+                "faithful session runner requires an agent_runner or agent_runner_factory"
+            )
+        self._api_client = api_client
+        self._model = model
+        self._system_prompt = system_prompt
+        self._cwd = Path(cwd).resolve() if cwd is not None else Path.cwd().resolve()
+        self._max_turns = max_turns
+        self._max_tokens = max_tokens
+        self._max_session_turns = max_session_turns
+        self._fixture_match_mode = fixture_match_mode
+        self._synth_context = synth_context
+        self._agent_runner_factory = agent_runner_factory
+        self._agent_runner = agent_runner
+        self._sandbox_tool_factory = sandbox_tool_factory
+        self._sandbox_state_fn = sandbox_state_fn or (lambda _path: {})
+
+    @property
+    def fixture_match_mode(self) -> str:
+        return self._fixture_match_mode
+
+    def run(
+        self,
+        *,
+        group: EvalSessionGroup,
+        store: EvalStore,
+        user_simulator: UserSimulator | None = None,
+    ) -> EvalSessionRunResult:
+        return _run_eval_coroutine(
+            self.run_session(
+                group=group,
+                store=store,
+                user_simulator=user_simulator,
+            )
+        )
+
+    def _build_default_agent_runner(self, workspace: Path):
+        if self._agent_runner_factory is not None:
+            return self._agent_runner_factory(workspace)
+        if self._agent_runner is None:
+            raise ValueError("faithful session runner missing agent runner")
+        runner = self._agent_runner
+        if hasattr(runner, "workspaces") and isinstance(runner.workspaces, list):
+            runner.workspaces[:] = [workspace]
+        if hasattr(runner, "_cwd"):
+            setattr(runner, "_cwd", workspace)
+        if hasattr(runner, "workspace"):
+            setattr(runner, "workspace", workspace)
+        return runner
+
+    async def run_session(
+        self,
+        *,
+        group: EvalSessionGroup,
+        store: EvalStore,
+        user_simulator: UserSimulator | None = None,
+    ) -> EvalSessionRunResult:
+        if not group.episode_ids:
+            raise ValueError("session group must contain episodes")
+
+        episodes: list[EvalEpisode] = []
+        fixtures: list[EvalToolFixture] = []
+        captured_capabilities: list[tuple[str, ...]] = []
+        source_event_count = 0
+        for episode_id in group.episode_ids:
+            episode = store.get_episode(episode_id)
+            if episode is None:
+                raise ValueError(f"episode not found: {episode_id}")
+            events = list(store.iter_events(episode_id))
+            source_event_count += len(events)
+            episode_fixtures = _tool_fixtures(events)
+            episodes.append(episode)
+            fixtures.extend(episode_fixtures)
+            captured_capabilities.append(
+                tuple(
+                    effective_tool_label(
+                        fixture.tool_name,
+                        _fixture_arguments(events, fixture),
+                    )
+                    for fixture in episode_fixtures
+                )
+            )
+
+        captured_prompts = tuple(_episode_prompt(episode) for episode in episodes)
+        fixture_records = tuple(fixtures)
+        session_workspace = Path(
+            tempfile.mkdtemp(prefix="openharness-eval-faithful-session-")
+        ).resolve()
+        agent_runner = self._build_default_agent_runner(session_workspace)
+
+        turns: list[EvalSessionTurnResult] = []
+        user_turn_sources: list[str] = []
+        transcript: list[tuple[str, str]] = []
+        simulator = user_simulator or ReplayUserSimulator(captured_prompts)
+        max_session_turns = self._max_session_turns or _default_max_session_turns(
+            len(captured_prompts)
+        )
+        ended_reason = "model_done"
+        last_turn: EvalSessionTurnResult | None = None
+        context = SimpleNamespace(
+            events=(),
+            conversation_history=(),
+            tool_fixtures=fixture_records,
+        )
+        before_state = self._sandbox_state_fn(session_workspace)
+        try:
+            while len(turns) < max_session_turns:
+                user_turn = await _resolve_user_turn(
+                    simulator.next_turn(
+                        transcript=tuple(transcript),
+                        captured_prompts=captured_prompts,
+                        captured_capabilities=tuple(captured_capabilities),
+                        index=len(turns),
+                        last_turn=last_turn,
+                    )
+                )
+                if user_turn is None:
+                    ended_reason = _simulator_ended_reason(
+                        simulator,
+                        default=(
+                            "captured_exhausted"
+                            if len(turns) >= len(captured_prompts)
+                            else "model_done"
+                        ),
+                    )
+                    break
+
+                episode_id = (
+                    episodes[len(turns)].episode_id
+                    if user_turn.source == "replay" and len(turns) < len(episodes)
+                    else ""
+                )
+                transcript.append(("user", user_turn.text))
+                executor_result = agent_runner.run(
+                    prompt=_serialize_transcript_for_turn(
+                        transcript=transcript,
+                    ),
+                    tool_registry=ToolRegistry(),
+                    context=context,
+                )
+                turn = _executor_result_to_turn_result(
+                    episode_id=episode_id,
+                    result=executor_result,
+                )
+                turns.append(turn)
+                user_turn_sources.append(user_turn.source)
+                transcript.append(("assistant", turn.final_text))
+                last_turn = turn
+            else:
+                ended_reason = "budget"
+                log.info(
+                    "session faithful stopped by budget session_id=%s max_session_turns=%d",
+                    group.session_id,
+                    max_session_turns,
+                )
+        finally:
+            after_state = self._sandbox_state_fn(session_workspace)
+            state_delta = compute_state_delta(before_state, after_state)
+            shutil.rmtree(session_workspace, ignore_errors=True)
+
+        union_capabilities = sorted(
+            {capability for turn in turns for capability in turn.capabilities}
+        )
+        final_text = turns[-1].final_text if turns else ""
+        replay_hit_count = sum(1 for source in user_turn_sources if source == "replay")
+        llm_fallback_count = sum(
+            1 for source in user_turn_sources if source == "llm_fallback"
+        )
+        replay_hit_rate = (
+            replay_hit_count / len(user_turn_sources) if user_turn_sources else 0.0
+        )
+        return EvalSessionRunResult(
+            session_id=group.session_id,
+            turns=tuple(turns),
+            union_capabilities=tuple(union_capabilities),
+            final_text=final_text,
+            turn_count=len(turns),
+            metadata={
+                "agent_runner": self.name,
+                "fixture_match": self._fixture_match_mode,
+                "episode_count": len(episodes),
+                "fixture_count": len(fixtures),
+                "source_event_count": source_event_count,
+                "user_turn_sources": user_turn_sources,
+                "replay_hit_count": replay_hit_count,
+                "llm_fallback_count": llm_fallback_count,
+                "replay_hit_rate": replay_hit_rate,
+                "ended_reason": ended_reason,
+                "transcript": tuple(transcript),
+                "state_delta": state_delta,
+            },
+        )
+
+
+def _serialize_transcript_for_turn(
+    transcript: Sequence[tuple[str, str]],
+) -> str:
+    return "\n".join(
+        f"{role}: {text.strip()}"
+        for role, text in transcript
+        if text.strip()
+    )
+
+
+def _executor_result_to_turn_result(
+    *,
+    episode_id: str,
+    result: EvalExecutorResult,
+) -> EvalSessionTurnResult:
+    tool_calls = result.tool_calls or ()
+    if tool_calls:
+        tool_path = tuple(call.tool_name for call in tool_calls)
+        capabilities = tuple(
+            effective_tool_label(call.tool_name, dict(call.arguments))
+            for call in tool_calls
+        )
+        tool_error = any(call.is_error for call in tool_calls)
+    else:
+        tool_path = tuple(result.tool_path)
+        capabilities = tuple(result.tool_path)
+        tool_error = False
+    return EvalSessionTurnResult(
+        episode_id=episode_id,
+        tool_path=tool_path,
+        capabilities=capabilities,
+        tool_error=tool_error,
+        final_text=result.final_text,
+    )
 
 
 async def consume_engine_turn(

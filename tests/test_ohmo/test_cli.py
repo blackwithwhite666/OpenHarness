@@ -1869,6 +1869,12 @@ def test_ohmo_evals_run_session_command_runs_session_eval(tmp_path: Path, monkey
         segment: bool = True,
         gap_minutes: float = 30.0,
         min_turns: int = 2,
+        preset: str = "inner",
+        sandbox_net_mode: str = "none",
+        sandbox_proxy_url: str | None = None,
+        sandbox_browser_socket: str | None = None,
+        sandbox_browser_name: str | None = None,
+        sandbox_ro_dirs: tuple[str, ...] = (),
     ):
         calls.append(
             {
@@ -1890,6 +1896,12 @@ def test_ohmo_evals_run_session_command_runs_session_eval(tmp_path: Path, monkey
                 "segment": segment,
                 "gap_minutes": gap_minutes,
                 "min_turns": min_turns,
+                "preset": preset,
+                "sandbox_net_mode": sandbox_net_mode,
+                "sandbox_proxy_url": sandbox_proxy_url,
+                "sandbox_browser_socket": sandbox_browser_socket,
+                "sandbox_browser_name": sandbox_browser_name,
+                "sandbox_ro_dirs": sandbox_ro_dirs,
             }
         )
         return SimpleNamespace(
@@ -1934,6 +1946,20 @@ def test_ohmo_evals_run_session_command_runs_session_eval(tmp_path: Path, monkey
             "--no-user-sim-goal-anchored",
             "--fixture-match",
             "arguments",
+            "--preset",
+            "faithful",
+            "--sandbox-net-mode",
+            "host",
+            "--sandbox-proxy-url",
+            "http://10.77.0.1:3128",
+            "--sandbox-browser-socket",
+            "/tmp/b.sock",
+            "--sandbox-browser-name",
+            "ohmo",
+            "--sandbox-ro-dir",
+            "/a",
+            "--sandbox-ro-dir",
+            "/b",
             "--max-session-turns",
             "5",
             "--max-turns",
@@ -1969,6 +1995,12 @@ def test_ohmo_evals_run_session_command_runs_session_eval(tmp_path: Path, monkey
             "segment": True,
             "gap_minutes": 45.0,
             "min_turns": 3,
+            "preset": "faithful",
+            "sandbox_net_mode": "host",
+            "sandbox_proxy_url": "http://10.77.0.1:3128",
+            "sandbox_browser_socket": "/tmp/b.sock",
+            "sandbox_browser_name": "ohmo",
+            "sandbox_ro_dirs": ("/a", "/b"),
         }
     ]
 

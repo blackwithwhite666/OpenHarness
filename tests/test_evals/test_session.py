@@ -4,7 +4,6 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
-
 from openharness.api.client import ApiMessageCompleteEvent
 from openharness.api.usage import UsageSnapshot
 from openharness.engine.messages import (
@@ -23,14 +22,18 @@ from openharness.evals import (
     HybridUserSimulator,
     IronUserSpec,
     LlmUserSimulator,
+    FaithfulSessionRunner,
     ReplayUserSimulator,
     SessionReplayRunner,
     UserTurn,
     derive_ironuser_spec,
+    score_faithful_session,
     group_episodes_into_sessions,
     replay_matches,
     score_session,
 )
+from openharness.evals.executor import EvalExecutorResult, EvalObservedCall
+from openharness.evals.judge import judge_intent_met
 
 
 def test_group_episodes_into_sessions_orders_shared_and_singleton(tmp_path: Path):
@@ -106,6 +109,146 @@ def test_session_replay_runner_reuses_one_engine_across_turns(tmp_path: Path):
         if message.role == "user" and message.text.startswith("private")
     ]
     assert user_texts == ["private first turn", "private second turn"]
+
+
+class _FaithfulSessionWorkspaceRunner:
+    def __init__(self, workspace: Path) -> None:
+        self.workspace = workspace
+        self.prompts: list[str] = []
+        self.calls: list[tuple[str, ...]] = []
+
+    def run(self, *, prompt: str, tool_registry: object, context: object) -> EvalExecutorResult:
+        del tool_registry, context
+        self.prompts.append(prompt)
+        state_file = self.workspace / "state.txt"
+        if not state_file.exists():
+            state_file.write_text("persisted", encoding="utf-8")
+            self.calls.append(("write_state",))
+            calls = (
+                EvalObservedCall(
+                    tool_name="write_state",
+                    arguments={"value": "persisted"},
+                ),
+            )
+            final_text = "wrote state"
+        else:
+            state = state_file.read_text(encoding="utf-8")
+            self.calls.append(("read_state",))
+            calls = (
+                EvalObservedCall(
+                    tool_name="read_state",
+                    arguments={"value": state},
+                ),
+            )
+            final_text = f"read state: {state}"
+        return EvalExecutorResult(
+            final_text=final_text,
+            tool_calls=tuple(calls),
+        )
+
+
+class _CannedUserSimulator:
+    def __init__(self) -> None:
+        self._turns = [
+            UserTurn("private first turn", "llm_fallback"),
+            UserTurn("private second turn", "llm_fallback"),
+        ]
+        self.ended_reason = ""
+
+    def next_turn(self, **_kwargs):
+        if not self._turns:
+            self.ended_reason = "model_done"
+            return None
+        return self._turns.pop(0)
+
+
+class _WriteThenReadToolModelClient:
+    def __init__(self) -> None:
+        self.requests = []
+        self._tool_calls = 0
+        self._final_count = 0
+
+    async def stream_message(self, request):
+        self.requests.append(request)
+        last_message = request.messages[-1]
+        if any(isinstance(block, ToolResultBlock) for block in last_message.content):
+            self._final_count += 1
+            yield ApiMessageCompleteEvent(
+                message=ConversationMessage(
+                    role="assistant",
+                    content=[TextBlock(text=f"session final {self._final_count}")],
+                ),
+                usage=UsageSnapshot(input_tokens=1, output_tokens=1),
+            )
+            return
+
+        tool_name = "write_state" if self._tool_calls == 0 else "read_state"
+        self._tool_calls += 1
+        yield ApiMessageCompleteEvent(
+            message=ConversationMessage(
+                role="assistant",
+                content=[
+                    ToolUseBlock(
+                        id=f"toolu-faithful-{self._tool_calls}",
+                        name=tool_name,
+                        input={"value": "persisted"},
+                    )
+                ],
+            ),
+            usage=UsageSnapshot(input_tokens=1, output_tokens=1),
+        )
+
+
+def test_faithful_session_runner_uses_persistent_workspace_between_turns(
+    tmp_path: Path,
+):
+    store = EvalStore(tmp_path / "evals")
+    _append_tool_episode(
+        store,
+        episode_id="ep-1",
+        session_id="session-1",
+        user_text="private first turn",
+        tool_call_id="tool-1",
+    )
+    _append_tool_episode(
+        store,
+        episode_id="ep-2",
+        session_id="session-1",
+        user_text="private second turn",
+        tool_call_id="tool-2",
+    )
+    runner_instances: list[_FaithfulSessionWorkspaceRunner] = []
+
+    def fake_runner_factory(root: Path) -> _FaithfulSessionWorkspaceRunner:
+        runner = _FaithfulSessionWorkspaceRunner(root)
+        runner_instances.append(runner)
+        return runner
+
+    def fake_state(root: Path) -> dict[str, object]:
+        return {str(root): {"checked": True}}
+
+    result = FaithfulSessionRunner(
+        api_client=_WriteThenReadToolModelClient(),
+        model="eval-model",
+        system_prompt="faithful system",
+        cwd=tmp_path,
+        agent_runner_factory=fake_runner_factory,
+        sandbox_state_fn=fake_state,
+    ).run(
+        group=EvalSessionGroup("session-1", ("ep-1", "ep-2")),
+        store=store,
+        user_simulator=_CannedUserSimulator(),
+    )
+
+    assert result.turn_count == 2
+    assert result.turn_count == 2
+    assert result.metadata["fixture_count"] == 2
+    assert len(runner_instances) == 1
+    assert not runner_instances[0].workspace.exists()
+    assert len(runner_instances[0].prompts) == 2
+    assert runner_instances[0].prompts[0] == "user: private first turn"
+    assert "user: private second turn" in runner_instances[0].prompts[1]
+    assert "assistant: wrote state" in runner_instances[0].prompts[1]
 
 
 def test_session_replay_runner_default_matches_replay_simulator(tmp_path: Path):
@@ -198,6 +341,97 @@ async def test_derive_ironuser_spec_falls_back_on_unparseable_output():
         known_info=(),
         constraints=(),
     )
+
+
+@pytest.mark.asyncio
+async def test_judge_intent_met_uses_votes_and_majority_with_parse_fallback(monkeypatch):
+    responses = iter(
+        (
+            '{"intent_met": true, "constraints_held": true, "evidence": "signal one"}',
+            "not json",
+            '{"intent_met": false, "constraints_held": false, "evidence": "signal three"}',
+        )
+    )
+
+    async def fake_complete_text(*_args, **_kwargs):
+        return next(responses)
+
+    monkeypatch.setattr("openharness.evals.judge._complete_text", fake_complete_text)
+    result = await judge_intent_met(
+        object(),
+        "sim-model",
+        intent="book dinner",
+        constraints=("seafood only",),
+        transcript=(("user", "book dinner"), ("assistant", "done")),
+        votes=3,
+    )
+
+    assert result["intent_met"] is False
+    assert result["constraints_held"] is False
+    assert result["evidence"] == "signal one"
+    assert result["votes"] == 3
+
+
+@pytest.mark.asyncio
+async def test_score_faithful_session_uses_and_checks_intent_and_grounding(monkeypatch):
+    async def fake_derive_ironuser_spec(*_args, **_kwargs):
+        return IronUserSpec(
+            intent="book dinner",
+            known_info=("date after tonight",),
+            constraints=("seafood only",),
+        )
+
+    async def fake_judge_intent_met(*_args, **_kwargs):
+        return {
+            "intent_met": True,
+            "constraints_held": True,
+            "evidence": "met via different tool path",
+            "votes": 1,
+        }
+
+    async def fake_verify_grounding(*_args, **_kwargs):
+        return {
+            "score": 0.8,
+            "status": "scored",
+            "verified": 1,
+            "refuted": 0,
+            "claims": [],
+            "votes": 2,
+        }
+
+    monkeypatch.setattr("openharness.evals.session.derive_ironuser_spec", fake_derive_ironuser_spec)
+    monkeypatch.setattr("openharness.evals.session.judge_intent_met", fake_judge_intent_met)
+    monkeypatch.setattr(
+        "openharness.evals.session._verify_grounding_voted", fake_verify_grounding
+    )
+
+    result = await score_faithful_session(
+        object(),
+        "agent-model",
+        captured_prompts=(
+            "find a seafood place",
+            "then book an available table",
+        ),
+        transcript=(
+            ("user", "find a place"),
+            ("assistant", "I looked up options and made notes"),
+            ("user", "proceed with booking"),
+            ("assistant", "booked with maps tool"),
+        ),
+        final_text="done",
+        search=lambda q: "search: " + q,
+        judge_votes=1,
+        grounding_votes=2,
+    )
+
+    assert result["passed"] is True
+    assert result["score"] == 1.0
+    assert result["checks"] == {
+        "intent_met": True,
+        "constraints_held": True,
+        "grounding_ok": True,
+    }
+    assert result["intent_evidence"] == "met via different tool path"
 
 
 @pytest.mark.asyncio

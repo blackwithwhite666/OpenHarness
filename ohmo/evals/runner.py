@@ -17,6 +17,7 @@ from openharness.api.resolver import (
 )
 from openharness.config import load_settings
 from openharness.config.settings import Settings
+from openharness.evals.executor import _run_eval_coroutine
 from openharness.evals import (
     CachingApiClient,
     CompletionCache,
@@ -28,6 +29,7 @@ from openharness.evals import (
     HistoryContext,
     HybridUserSimulator,
     EvalSessionGroup,
+    FaithfulSessionRunner,
     LiveReadAgentRunner,
     LlmUserSimulator,
     QueryEngineEvalAgentRunner,
@@ -45,12 +47,14 @@ from openharness.evals import (
     derive_case_rubric,
     gold_capabilities_for_session,
     group_episodes_into_sessions,
+    score_faithful_session,
     read_run_pack,
     resolve_execution_scorer,
     run_execution_report,
     score_session,
     segment_sessions_into_conversations,
 )
+from openharness.evals.judge import _default_grounding_search
 from openharness.evals.runner import _report_output_path, _stable_id
 from openharness.evals.state import compute_episode_state_delta, extract_state_keys
 from openharness.prompts import build_runtime_system_prompt
@@ -400,6 +404,14 @@ def run_ohmo_session_eval(
     gap_minutes: float = 30.0,
     min_turns: int = 2,
     user_sim_goal_anchored: bool = True,
+    judge_votes: int = 1,
+    grounding_votes: int = 1,
+    preset: str = "inner",
+    sandbox_net_mode: str = "none",
+    sandbox_proxy_url: str | None = None,
+    sandbox_browser_socket: str | None = None,
+    sandbox_browser_name: str | None = None,
+    sandbox_ro_dirs: tuple[str, ...] = (),
 ) -> OhmoSessionEvalRunResult:
     """Run P0 session replay checks over captured Ohmo eval episodes.
 
@@ -423,17 +435,30 @@ def run_ohmo_session_eval(
         raise ValueError("gap_minutes must be positive")
     if min_turns < 1:
         raise ValueError("min_turns must be positive")
+    if judge_votes < 1:
+        raise ValueError("judge_votes must be positive")
+    if grounding_votes < 1:
+        raise ValueError("grounding_votes must be positive")
     fixture_match = _validate_fixture_match(fixture_match)
+    preset = preset.strip().lower()
+    if preset not in {"inner", "faithful"}:
+        raise ValueError("session preset must be one of: inner, faithful")
     if user_sim_model is not None and user_sim_profile is None:
         raise ValueError("user_sim_model requires user_sim_profile")
 
     workspace_root = Path(workspace).expanduser().resolve() if workspace else None
+    agent_runner_name = "fs-sandbox" if preset == "faithful" else "query-engine"
     agent_runner_config = _build_agent_runner_config(
-        "query-engine",
+        agent_runner_name,
         workspace=workspace_root,
         model=model,
         provider_profile=provider_profile,
         system_prompt=system_prompt,
+        sandbox_net_mode=sandbox_net_mode,
+        sandbox_proxy_url=sandbox_proxy_url,
+        sandbox_browser_socket=sandbox_browser_socket,
+        sandbox_browser_name=sandbox_browser_name,
+        sandbox_ro_dirs=sandbox_ro_dirs,
     )
     if agent_runner_config.api_client is None:
         raise ValueError("session eval runner requires configured API authentication")
@@ -500,16 +525,61 @@ def run_ohmo_session_eval(
     if not groups:
         raise ValueError("eval store must contain ohmo sessions")
 
-    runner = SessionReplayRunner(
-        api_client=agent_runner_config.api_client,
-        model=agent_runner_config.model,
-        system_prompt=agent_runner_config.system_prompt,
-        cwd=agent_runner_config.cwd,
-        fixture_match_mode=fixture_match,
-        max_session_turns=max_session_turns,
-        max_turns=max_turns,
-        synth_context=synth_context,
-    )
+    if preset == "faithful":
+        base_faithful_runner = agent_runner_config.agent_runner
+
+        def _faithful_agent_runner_factory(workspace: Path) -> FsSandboxAgentRunner:
+            if isinstance(base_faithful_runner, FsSandboxAgentRunner):
+                return FsSandboxAgentRunner(
+                    api_client=agent_runner_config.api_client,
+                    model=agent_runner_config.model,
+                    system_prompt=agent_runner_config.system_prompt,
+                    cwd=workspace,
+                    max_turns=max_turns,
+                    max_tokens=base_faithful_runner._max_tokens,
+                    timeout=base_faithful_runner._timeout,
+                    net_mode=base_faithful_runner._net_mode,
+                    proxy_url=base_faithful_runner._proxy_url,
+                    browser_socket=base_faithful_runner._browser_socket,
+                    browser_cli_name=base_faithful_runner._browser_cli_name,
+                    live_mcp_server_names=base_faithful_runner._live_mcp_server_names,
+                    mutable_dirs=base_faithful_runner._mutable_dirs,
+                    ro_source_dirs=base_faithful_runner._ro_source_dirs,
+                    extra_ro_source_dirs=(),
+                    sandbox_bin_dirs=base_faithful_runner._sandbox_bin_dirs,
+                    persist_cwd=True,
+                )
+            return base_faithful_runner
+
+        runner = FaithfulSessionRunner(
+            api_client=agent_runner_config.api_client,
+            model=agent_runner_config.model,
+            system_prompt=agent_runner_config.system_prompt,
+            cwd=agent_runner_config.cwd,
+            fixture_match_mode=fixture_match,
+            max_session_turns=max_session_turns,
+            max_turns=max_turns,
+            synth_context=synth_context,
+            agent_runner_factory=_faithful_agent_runner_factory
+            if isinstance(base_faithful_runner, FsSandboxAgentRunner)
+            else None,
+            agent_runner=base_faithful_runner
+            if not isinstance(base_faithful_runner, FsSandboxAgentRunner)
+            else None,
+            sandbox_tool_factory=_ohmo_sandbox_tool_factory,
+            sandbox_state_fn=_ohmo_sandbox_state,
+        )
+    else:
+        runner = SessionReplayRunner(
+            api_client=agent_runner_config.api_client,
+            model=agent_runner_config.model,
+            system_prompt=agent_runner_config.system_prompt,
+            cwd=agent_runner_config.cwd,
+            fixture_match_mode=fixture_match,
+            max_session_turns=max_session_turns,
+            max_turns=max_turns,
+            synth_context=synth_context,
+        )
     cases = [
         _run_session_report_case_sampled(
             store=store,
@@ -519,6 +589,8 @@ def run_ohmo_session_eval(
             gold_capabilities_by_session=gold_capabilities_by_session,
             user_simulator_factory=user_simulator_factory,
             clarification_allowed_by_session=clarification_allowed_by_session,
+            judge_votes=judge_votes,
+            grounding_votes=grounding_votes,
         )
         for group in groups
     ]
@@ -542,7 +614,7 @@ def run_ohmo_session_eval(
         metadata={
             "privacy": "metadata_only",
             "mode": "session_replay",
-            "runner_name": SessionReplayRunner.name,
+            "runner_name": runner.name,
             "fixture_match": fixture_match,
             "model": agent_runner_config.model,
             "provider_profile": agent_runner_config.provider_profile,
@@ -560,6 +632,8 @@ def run_ohmo_session_eval(
             ),
             "limit": limit or 0,
             "samples": samples,
+            "judge_votes": judge_votes,
+            "grounding_votes": grounding_votes,
         },
     )
     path = _report_output_path(store, report_filename)
@@ -1263,11 +1337,13 @@ def _run_session_report_case_sampled(
     *,
     store,
     group,
-    runner: SessionReplayRunner,
+    runner: SessionReplayRunner | FaithfulSessionRunner,
     samples: int,
     gold_capabilities_by_session: Mapping[str, Sequence[str]] | None,
     user_simulator_factory: Callable[[], UserSimulator] | None,
     clarification_allowed_by_session: Mapping[str, bool] | None,
+    judge_votes: int,
+    grounding_votes: int,
 ) -> EvalSessionReportCase:
     first = _run_session_report_case(
         store=store,
@@ -1276,6 +1352,8 @@ def _run_session_report_case_sampled(
         gold_capabilities_by_session=gold_capabilities_by_session,
         user_simulator_factory=user_simulator_factory,
         clarification_allowed_by_session=clarification_allowed_by_session,
+        judge_votes=judge_votes,
+        grounding_votes=grounding_votes,
     )
     if samples == 1:
         return first
@@ -1290,6 +1368,8 @@ def _run_session_report_case_sampled(
                 gold_capabilities_by_session=gold_capabilities_by_session,
                 user_simulator_factory=user_simulator_factory,
                 clarification_allowed_by_session=clarification_allowed_by_session,
+                judge_votes=judge_votes,
+                grounding_votes=grounding_votes,
             )
         )
     pass_count = sum(1 for case in sample_cases if case.status == "passed")
@@ -1312,10 +1392,12 @@ def _run_session_report_case(
     *,
     store,
     group,
-    runner: SessionReplayRunner,
+    runner: SessionReplayRunner | FaithfulSessionRunner,
     gold_capabilities_by_session: Mapping[str, Sequence[str]] | None,
     user_simulator_factory: Callable[[], UserSimulator] | None,
     clarification_allowed_by_session: Mapping[str, bool] | None,
+    judge_votes: int,
+    grounding_votes: int,
 ) -> EvalSessionReportCase:
     gold_source = (
         "provided"
@@ -1332,23 +1414,58 @@ def _run_session_report_case(
     state_changed = (
         None if state_delta is None else bool(state_delta.get("changed") is True)
     )
-    result = runner.run(
-        group=group,
-        store=store,
-        user_simulator=(
-            user_simulator_factory() if user_simulator_factory is not None else None
-        ),
+    user_simulator = (
+        user_simulator_factory() if user_simulator_factory is not None else None
     )
+    result = (
+        runner.run(
+            group=group,
+            store=store,
+            user_simulator=user_simulator,
+        )
+        if not isinstance(runner, FaithfulSessionRunner)
+        else _run_eval_coroutine(
+            runner.run_session(
+                group=group,
+                store=store,
+                user_simulator=user_simulator,
+            )
+        )
+    )
+    captured_prompts_list: list[str] = []
+    for episode_id in group.episode_ids:
+        episode = store.get_episode(episode_id)
+        if episode is None:
+            captured_prompts_list.append("")
+        else:
+            captured_prompts_list.append(episode.user_goal or episode.user_text)
+    captured_prompts = tuple(captured_prompts_list)
     clarification_allowed = bool(
         clarification_allowed_by_session
         and clarification_allowed_by_session.get(group.session_id, False)
     )
-    score_payload = score_session(
-        result,
-        gold_capabilities=gold_capabilities,
-        state_changed=state_changed,
-        clarification_allowed=clarification_allowed,
-    )
+    score_payload: dict
+    if isinstance(runner, FaithfulSessionRunner):
+        transcript = result.metadata.get("transcript", ())
+        score_payload = _run_eval_coroutine(
+            score_faithful_session(
+                runner._api_client,
+                runner._model,
+                captured_prompts=captured_prompts,
+                transcript=transcript,
+                final_text=result.final_text,
+                search=_default_grounding_search,
+                judge_votes=judge_votes,
+                grounding_votes=grounding_votes,
+            )
+        )
+    else:
+        score_payload = score_session(
+            result,
+            gold_capabilities=gold_capabilities,
+            state_changed=state_changed,
+            clarification_allowed=clarification_allowed,
+        )
     metadata = {
         "episode_count": len(group.episode_ids),
         "gold_source": gold_source,
@@ -1372,6 +1489,8 @@ def _run_session_report_case(
             score_payload.get("terminal_clarification", False)
         ),
     }
+    if "state_delta" in result.metadata:
+        metadata["state_delta"] = result.metadata["state_delta"]
     warnings = list(score_payload.get("warnings", []))
     if warnings:
         metadata["warnings"] = warnings

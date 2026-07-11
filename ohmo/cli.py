@@ -2548,6 +2548,41 @@ def evals_run_session_cmd(
         "--system-prompt",
         help="Override ohmo's real system prompt for the session query-engine runner",
     ),
+    preset: str = typer.Option(
+        "inner",
+        "--preset",
+        help="Session replay preset (inner = offline history/fixtures, faithful = live)",
+    ),
+    sandbox_net_mode: str = typer.Option(
+        "none",
+        "--sandbox-net-mode",
+        help="Network mode for --agent-runner fs-sandbox (none, host, or netns:<name>)",
+    ),
+    sandbox_proxy_url: str | None = typer.Option(
+        None,
+        "--sandbox-proxy-url",
+        help="Proxy URL injected into fs-sandbox bash as HTTP(S)_PROXY",
+    ),
+    sandbox_browser_socket: str | None = typer.Option(
+        None,
+        "--sandbox-browser-socket",
+        help="browser-cli daemon AF_UNIX socket bind-mounted into fs-sandbox bash",
+    ),
+    sandbox_browser_name: str | None = typer.Option(
+        None,
+        "--sandbox-browser-name",
+        help="BROWSER_CLI_NAME injected into fs-sandbox bash",
+    ),
+    sandbox_ro_dir: list[str] = typer.Option(
+        [],
+        "--sandbox-ro-dir",
+        help=(
+            "Extra host directory to bind read-only into the fs-sandbox jail "
+            "(repeatable). Use for fixture inputs a case asks the agent to open "
+            "(e.g. a Dropbox subfolder of ticket PDFs). Personal paths stay out "
+            "of the committed bundle — pass them here from your private driver."
+        ),
+    ),
     user_sim_profile: str | None = typer.Option(
         None,
         "--user-sim-profile",
@@ -2619,6 +2654,7 @@ def evals_run_session_cmd(
             report_filename=report_filename,
             limit=limit,
             samples=samples,
+            preset=preset,
             model=model,
             provider_profile=provider_profile,
             system_prompt=system_prompt,
@@ -2631,6 +2667,11 @@ def evals_run_session_cmd(
             segment=segment,
             gap_minutes=gap_minutes,
             min_turns=min_turns,
+            sandbox_net_mode=sandbox_net_mode,
+            sandbox_proxy_url=sandbox_proxy_url,
+            sandbox_browser_socket=sandbox_browser_socket,
+            sandbox_browser_name=sandbox_browser_name,
+            sandbox_ro_dirs=tuple(sandbox_ro_dir),
         )
     except (FileNotFoundError, ValueError) as exc:
         print(str(exc), file=sys.stderr)
