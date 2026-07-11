@@ -28,6 +28,7 @@ def trace_text_fields(
         or trace.get("task")
         or trace.get("prompt")
         or trace_metadata.get("intent")
+        or metadata.get("grounding_task")
         or metadata.get("intent")
         or ""
     )
@@ -35,6 +36,7 @@ def trace_text_fields(
         trace.get("final_text")
         or trace.get("answer")
         or trace_metadata.get("final_text")
+        or metadata.get("grounding_answer")
         or metadata.get("final_text")
         or ""
     )

@@ -16,6 +16,16 @@ from openharness.evals.grounding_trace import read_session_trace, trace_text_fie
 MAX_REFUTED_FACT_CLAIMS = 6
 MAX_CLAIM_CHARS = 240
 MAX_EVIDENCE_CHARS = 240
+MAX_GROUNDING_CONTEXT_CHARS = 1500
+GROUNDING_ATTRIBUTION_RUBRIC = {
+    "grounding": {
+        "text": (
+            "Final answer factual claims must be supported by independent retrieval "
+            "evidence; an answer that asserts a fact the evidence contradicts is a "
+            "MODEL fabrication, not a harness fault."
+        )
+    }
+}
 
 _BOUNDARY_STATUSES = {
     "sandbox_blocked",
@@ -34,15 +44,29 @@ _RETRIEVAL_EMPTY_MARKERS = (
 )
 
 
-def grounding_report_metadata(grounding: object) -> dict[str, object]:
+def grounding_report_metadata(
+    grounding: object,
+    *,
+    task: object | None = None,
+    answer: object | None = None,
+) -> dict[str, object]:
     """Return bounded report-case metadata extracted from a grounding result."""
     if not isinstance(grounding, dict):
         grounding = {}
-    return {
+    metadata = {
         "grounding_status": str(grounding.get("status") or ""),
         "grounding_score": grounding.get("score"),
         "grounding_refuted_fact_claims": _refuted_fact_claims(grounding),
     }
+    if task is not None:
+        metadata["grounding_task"] = _truncate_right(
+            str(task), MAX_GROUNDING_CONTEXT_CHARS
+        )
+    if answer is not None:
+        metadata["grounding_answer"] = _truncate_right(
+            str(answer), MAX_GROUNDING_CONTEXT_CHARS
+        )
+    return metadata
 
 
 def read_faithful_session_report(path: str | Path) -> EvalSessionReport:
@@ -93,9 +117,7 @@ def attribute_faithful_grounding_report(
             fields = trace_text_fields(trace, case.metadata)
             attribution = attributor.attribute(
                 task=fields["task"],
-                rubric={
-                    "grounding": "Final answer factual claims must be supported by retrieval evidence."
-                },
+                rubric=GROUNDING_ATTRIBUTION_RUBRIC,
                 answer=fields["answer"],
                 trajectory=_grounding_trajectory(detail),
                 aspect_scores={

@@ -1502,7 +1502,16 @@ def _run_session_report_case(
     if "state_delta" in result.metadata:
         metadata["state_delta"] = result.metadata["state_delta"]
     if isinstance(runner, FaithfulSessionRunner):
-        metadata.update(grounding_report_metadata(score_payload.get("grounding")))
+        grounding_task = score_payload.get("grounding_task")
+        if grounding_task is None:
+            grounding_task = captured_prompts[-1] if captured_prompts else ""
+        metadata.update(
+            grounding_report_metadata(
+                score_payload.get("grounding"),
+                task=grounding_task,
+                answer=result.final_text,
+            )
+        )
     warnings = list(score_payload.get("warnings", []))
     if warnings:
         metadata["warnings"] = warnings

@@ -14,7 +14,10 @@ from openharness.evals import (
     EvalSessionRunResult,
     FaithfulSessionRunner,
 )
-from openharness.evals.grounding_blame import attribute_faithful_grounding_report
+from openharness.evals.grounding_blame import (
+    GROUNDING_ATTRIBUTION_RUBRIC,
+    attribute_faithful_grounding_report,
+)
 from openharness.evals.meta_judge import MetaJudgeAttributor
 from ohmo.evals import get_eval_store
 import ohmo.evals.runner as runner_module
@@ -34,6 +37,40 @@ class _SequenceJudgeApiClient:
             message=ConversationMessage(
                 role="assistant",
                 content=[TextBlock(text=text)],
+            ),
+            usage=UsageSnapshot(input_tokens=1, output_tokens=1),
+        )
+
+
+class _ConditionalJudgeApiClient:
+    def __init__(self, *, required_task: str, required_rubric_text: str) -> None:
+        self.required_task = required_task
+        self.required_rubric_text = required_rubric_text
+        self.calls = 0
+        self.requests = []
+
+    async def stream_message(self, request):
+        self.requests.append(request)
+        self.calls += 1
+        prompt = request.messages[0].text
+        if self.required_task in prompt and self.required_rubric_text in prompt:
+            payload = {
+                "blame": "model",
+                "subtype": "fabricated_fact",
+                "confidence": 0.88,
+                "evidence": "The answer asserts a fact contradicted by retrieval evidence.",
+            }
+        else:
+            payload = {
+                "blame": "harness_rubric",
+                "subtype": "empty_rubric_or_task",
+                "confidence": 0.92,
+                "evidence": "The task or rubric was missing.",
+            }
+        yield ApiMessageCompleteEvent(
+            message=ConversationMessage(
+                role="assistant",
+                content=[TextBlock(text=json.dumps(payload))],
             ),
             usage=UsageSnapshot(input_tokens=1, output_tokens=1),
         )
@@ -94,6 +131,44 @@ def test_grounding_blame_model_for_refuted_fabricated_fact(tmp_path: Path) -> No
     prompt = api_client.requests[0].messages[0].text
     assert "The Eiffel Tower is in Berlin." in prompt
     assert "Sources say the Eiffel Tower is in Paris" in prompt
+
+
+def test_grounding_blame_model_for_refuted_fact_from_persisted_metadata() -> None:
+    task = "How tall is the Eiffel Tower?"
+    answer = "The Eiffel Tower is 500m tall."
+    rubric_text = GROUNDING_ATTRIBUTION_RUBRIC["grounding"]["text"]
+    report = _faithful_report(
+        "s-metadata-only",
+        metadata={
+            "grounding_status": "unverifiable",
+            "grounding_score": 0.0,
+            "grounding_refuted_fact_claims": [
+                {
+                    "claim": "The Eiffel Tower is 500m tall.",
+                    "evidence": "Search results say the Eiffel Tower is 330m tall.",
+                }
+            ],
+            "grounding_task": task,
+            "grounding_answer": answer,
+        },
+    )
+    api_client = _ConditionalJudgeApiClient(
+        required_task=task,
+        required_rubric_text=rubric_text,
+    )
+    attributor = MetaJudgeAttributor(api_client=api_client, model="judge-model")
+
+    result = attribute_faithful_grounding_report(report, attributor=attributor)
+
+    item = result["attributions"][0]
+    assert item["session_id"] == "s-metadata-only"
+    assert item["blame"] == "model"
+    assert item["subtype"] == "fabricated_fact"
+    assert api_client.calls == 1
+    prompt = api_client.requests[0].messages[0].text
+    assert task in prompt
+    assert rubric_text in prompt
+    assert answer in prompt
 
 
 def test_grounding_blame_harness_boundary_for_sandbox_blocked_shortcut() -> None:
@@ -182,11 +257,12 @@ def test_faithful_report_case_metadata_persists_bounded_grounding_detail(
         system_prompt="",
         agent_runner=object(),
     )
+    final_answer = "private final " * 200
 
     async def fake_run_session(**_kwargs):
         return EvalSessionRunResult(
             session_id="s-grounding",
-            final_text="private final",
+            final_text=final_answer,
             turn_count=1,
             metadata={
                 "transcript": (
@@ -207,6 +283,7 @@ def test_faithful_report_case_metadata_persists_bounded_grounding_detail(
             },
             "observed_capabilities": [],
             "missing_capabilities": [],
+            "grounding_task": "derived private request intent",
             "grounding": {
                 "score": 0.0,
                 "status": "scored",
@@ -249,6 +326,9 @@ def test_faithful_report_case_metadata_persists_bounded_grounding_detail(
 
     assert case.metadata["grounding_status"] == "scored"
     assert case.metadata["grounding_score"] == 0.0
+    assert case.metadata["grounding_task"] == "derived private request intent"
+    assert str(case.metadata["grounding_answer"]).startswith("private final ")
+    assert len(str(case.metadata["grounding_answer"])) <= 1500
     claims = case.metadata["grounding_refuted_fact_claims"]
     assert len(claims) == 6
     assert claims[0]["claim"] == "fabricated fact 0"
