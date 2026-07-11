@@ -180,7 +180,6 @@ def test_assemble_fs_persists_cwd_state_with_persist_cwd(tmp_path: Path):
     root = tmp_path / "sandbox"
     home = tmp_path / "home"
     cwd = tmp_path / "case"
-    user_file = cwd / "state.txt"
     cwd.mkdir(parents=True)
     home.mkdir()
 

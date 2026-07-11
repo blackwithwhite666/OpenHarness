@@ -407,6 +407,11 @@ def run_ohmo_session_eval(
     judge_votes: int = 1,
     grounding_votes: int = 1,
     preset: str = "inner",
+    sandbox_net_mode: str = "none",
+    sandbox_proxy_url: str | None = None,
+    sandbox_browser_socket: str | None = None,
+    sandbox_browser_name: str | None = None,
+    sandbox_ro_dirs: tuple[str, ...] = (),
 ) -> OhmoSessionEvalRunResult:
     """Run P0 session replay checks over captured Ohmo eval episodes.
 
@@ -449,6 +454,11 @@ def run_ohmo_session_eval(
         model=model,
         provider_profile=provider_profile,
         system_prompt=system_prompt,
+        sandbox_net_mode=sandbox_net_mode,
+        sandbox_proxy_url=sandbox_proxy_url,
+        sandbox_browser_socket=sandbox_browser_socket,
+        sandbox_browser_name=sandbox_browser_name,
+        sandbox_ro_dirs=sandbox_ro_dirs,
     )
     if agent_runner_config.api_client is None:
         raise ValueError("session eval runner requires configured API authentication")
