@@ -2572,6 +2572,16 @@ def evals_run_session_cmd(
             "default scales with the captured turn count)"
         ),
     ),
+    max_turns: int = typer.Option(
+        100,
+        "--max-turns",
+        min=1,
+        help=(
+            "Per-agent-response tool-call budget (the query engine's max_turns). "
+            "Real ohmo tasks need many tool calls; the low legacy default of 8 "
+            "aborts a session mid-task with MaxTurnsExceeded."
+        ),
+    ),
     json_output: bool = typer.Option(False, "--json", help="Print a JSON summary"),
 ) -> None:
     """Run session-level replay checks over captured Ohmo eval episodes."""
@@ -2589,6 +2599,7 @@ def evals_run_session_cmd(
             user_sim_model=user_sim_model,
             fixture_match=fixture_match,
             max_session_turns=max_session_turns,
+            max_turns=max_turns,
         )
     except (FileNotFoundError, ValueError) as exc:
         print(str(exc), file=sys.stderr)

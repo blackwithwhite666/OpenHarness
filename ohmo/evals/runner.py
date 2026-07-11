@@ -393,6 +393,7 @@ def run_ohmo_session_eval(
     clarification_allowed_by_session: Mapping[str, bool] | None = None,
     fixture_match: str = "args_then_order",
     max_session_turns: int | None = None,
+    max_turns: int = 100,
 ) -> OhmoSessionEvalRunResult:
     """Run P0 session replay checks over captured Ohmo eval episodes."""
     if limit is not None and limit <= 0:
@@ -401,6 +402,8 @@ def run_ohmo_session_eval(
         raise ValueError("samples must be positive")
     if max_session_turns is not None and max_session_turns <= 0:
         raise ValueError("max_session_turns must be positive")
+    if max_turns < 1:
+        raise ValueError("max_turns must be positive")
     fixture_match = _validate_fixture_match(fixture_match)
     if user_sim_model is not None and user_sim_profile is None:
         raise ValueError("user_sim_model requires user_sim_profile")
@@ -469,6 +472,7 @@ def run_ohmo_session_eval(
         cwd=agent_runner_config.cwd,
         fixture_match_mode=fixture_match,
         max_session_turns=max_session_turns,
+        max_turns=max_turns,
         synth_context=synth_context,
     )
     cases = [
