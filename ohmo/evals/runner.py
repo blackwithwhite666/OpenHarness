@@ -28,6 +28,7 @@ from openharness.evals import (
     HistoryContext,
     HybridUserSimulator,
     EvalSessionGroup,
+    FaithfulSessionRunner,
     LiveReadAgentRunner,
     LlmUserSimulator,
     QueryEngineEvalAgentRunner,
@@ -400,6 +401,7 @@ def run_ohmo_session_eval(
     gap_minutes: float = 30.0,
     min_turns: int = 2,
     user_sim_goal_anchored: bool = True,
+    preset: str = "inner",
 ) -> OhmoSessionEvalRunResult:
     """Run P0 session replay checks over captured Ohmo eval episodes.
 
@@ -424,6 +426,9 @@ def run_ohmo_session_eval(
     if min_turns < 1:
         raise ValueError("min_turns must be positive")
     fixture_match = _validate_fixture_match(fixture_match)
+    preset = preset.strip().lower()
+    if preset not in {"inner", "faithful"}:
+        raise ValueError("session preset must be one of: inner, faithful")
     if user_sim_model is not None and user_sim_profile is None:
         raise ValueError("user_sim_model requires user_sim_profile")
 
@@ -500,16 +505,30 @@ def run_ohmo_session_eval(
     if not groups:
         raise ValueError("eval store must contain ohmo sessions")
 
-    runner = SessionReplayRunner(
-        api_client=agent_runner_config.api_client,
-        model=agent_runner_config.model,
-        system_prompt=agent_runner_config.system_prompt,
-        cwd=agent_runner_config.cwd,
-        fixture_match_mode=fixture_match,
-        max_session_turns=max_session_turns,
-        max_turns=max_turns,
-        synth_context=synth_context,
-    )
+    if preset == "faithful":
+        runner = FaithfulSessionRunner(
+            api_client=agent_runner_config.api_client,
+            model=agent_runner_config.model,
+            system_prompt=agent_runner_config.system_prompt,
+            cwd=agent_runner_config.cwd,
+            fixture_match_mode=fixture_match,
+            max_session_turns=max_session_turns,
+            max_turns=max_turns,
+            synth_context=synth_context,
+            sandbox_tool_factory=_ohmo_sandbox_tool_factory,
+            sandbox_state_fn=_ohmo_sandbox_state,
+        )
+    else:
+        runner = SessionReplayRunner(
+            api_client=agent_runner_config.api_client,
+            model=agent_runner_config.model,
+            system_prompt=agent_runner_config.system_prompt,
+            cwd=agent_runner_config.cwd,
+            fixture_match_mode=fixture_match,
+            max_session_turns=max_session_turns,
+            max_turns=max_turns,
+            synth_context=synth_context,
+        )
     cases = [
         _run_session_report_case_sampled(
             store=store,
@@ -542,7 +561,7 @@ def run_ohmo_session_eval(
         metadata={
             "privacy": "metadata_only",
             "mode": "session_replay",
-            "runner_name": SessionReplayRunner.name,
+            "runner_name": runner.name,
             "fixture_match": fixture_match,
             "model": agent_runner_config.model,
             "provider_profile": agent_runner_config.provider_profile,
@@ -1263,7 +1282,7 @@ def _run_session_report_case_sampled(
     *,
     store,
     group,
-    runner: SessionReplayRunner,
+    runner: SessionReplayRunner | FaithfulSessionRunner,
     samples: int,
     gold_capabilities_by_session: Mapping[str, Sequence[str]] | None,
     user_simulator_factory: Callable[[], UserSimulator] | None,
@@ -1312,7 +1331,7 @@ def _run_session_report_case(
     *,
     store,
     group,
-    runner: SessionReplayRunner,
+    runner: SessionReplayRunner | FaithfulSessionRunner,
     gold_capabilities_by_session: Mapping[str, Sequence[str]] | None,
     user_simulator_factory: Callable[[], UserSimulator] | None,
     clarification_allowed_by_session: Mapping[str, bool] | None,
@@ -1372,6 +1391,8 @@ def _run_session_report_case(
             score_payload.get("terminal_clarification", False)
         ),
     }
+    if "state_delta" in result.metadata:
+        metadata["state_delta"] = result.metadata["state_delta"]
     warnings = list(score_payload.get("warnings", []))
     if warnings:
         metadata["warnings"] = warnings

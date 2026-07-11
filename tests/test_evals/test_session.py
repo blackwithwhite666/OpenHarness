@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
+from pydantic import BaseModel
 
 from openharness.api.client import ApiMessageCompleteEvent
 from openharness.api.usage import UsageSnapshot
@@ -23,6 +24,7 @@ from openharness.evals import (
     HybridUserSimulator,
     IronUserSpec,
     LlmUserSimulator,
+    FaithfulSessionRunner,
     ReplayUserSimulator,
     SessionReplayRunner,
     UserTurn,
@@ -31,6 +33,7 @@ from openharness.evals import (
     replay_matches,
     score_session,
 )
+from openharness.tools.base import BaseTool, ToolExecutionContext, ToolResult
 
 
 def test_group_episodes_into_sessions_orders_shared_and_singleton(tmp_path: Path):
@@ -106,6 +109,152 @@ def test_session_replay_runner_reuses_one_engine_across_turns(tmp_path: Path):
         if message.role == "user" and message.text.startswith("private")
     ]
     assert user_texts == ["private first turn", "private second turn"]
+
+
+class _FaithfulTurnInput(BaseModel):
+    value: str = ""
+
+
+class _WriteStateTool(BaseTool):
+    name = "write_state"
+    description = "Write a marker value into the persistent session workspace."
+    input_model = _FaithfulTurnInput
+
+    def __init__(self, workspace: Path, seen: list[str]) -> None:
+        self._workspace = workspace
+        self._seen = seen
+
+    async def execute(
+        self,
+        arguments: _FaithfulTurnInput,
+        context: ToolExecutionContext,
+    ) -> ToolResult:
+        del context
+        (self._workspace / "state.txt").write_text(arguments.value, encoding="utf-8")
+        self._seen.append("write")
+        return ToolResult(output="state written")
+
+
+class _ReadStateTool(BaseTool):
+    name = "read_state"
+    description = "Read back the marker value from the session workspace."
+    input_model = _FaithfulTurnInput
+
+    def __init__(self, workspace: Path, seen: list[str]) -> None:
+        self._workspace = workspace
+        self._seen = seen
+
+    async def execute(
+        self,
+        arguments: _FaithfulTurnInput,
+        context: ToolExecutionContext,
+    ) -> ToolResult:
+        del arguments, context
+        state_path = self._workspace / "state.txt"
+        _ = state_path.read_text(encoding="utf-8")
+        self._seen.append("read")
+        return ToolResult(output="state read")
+
+
+class _CannedUserSimulator:
+    def __init__(self) -> None:
+        self._turns = [
+            UserTurn("private first turn", "llm_fallback"),
+            UserTurn("private second turn", "llm_fallback"),
+        ]
+        self.ended_reason = ""
+
+    def next_turn(self, **_kwargs):
+        if not self._turns:
+            self.ended_reason = "model_done"
+            return None
+        return self._turns.pop(0)
+
+
+class _WriteThenReadToolModelClient:
+    def __init__(self) -> None:
+        self.requests = []
+        self._tool_calls = 0
+        self._final_count = 0
+
+    async def stream_message(self, request):
+        self.requests.append(request)
+        last_message = request.messages[-1]
+        if any(isinstance(block, ToolResultBlock) for block in last_message.content):
+            self._final_count += 1
+            yield ApiMessageCompleteEvent(
+                message=ConversationMessage(
+                    role="assistant",
+                    content=[TextBlock(text=f"session final {self._final_count}")],
+                ),
+                usage=UsageSnapshot(input_tokens=1, output_tokens=1),
+            )
+            return
+
+        tool_name = "write_state" if self._tool_calls == 0 else "read_state"
+        self._tool_calls += 1
+        yield ApiMessageCompleteEvent(
+            message=ConversationMessage(
+                role="assistant",
+                content=[
+                    ToolUseBlock(
+                        id=f"toolu-faithful-{self._tool_calls}",
+                        name=tool_name,
+                        input={"value": "persisted"},
+                    )
+                ],
+            ),
+            usage=UsageSnapshot(input_tokens=1, output_tokens=1),
+        )
+
+
+def test_faithful_session_runner_uses_persistent_workspace_between_turns(
+    tmp_path: Path,
+):
+    store = EvalStore(tmp_path / "evals")
+    _append_tool_episode(
+        store,
+        episode_id="ep-1",
+        session_id="session-1",
+        user_text="private first turn",
+        tool_call_id="tool-1",
+    )
+    _append_tool_episode(
+        store,
+        episode_id="ep-2",
+        session_id="session-1",
+        user_text="private second turn",
+        tool_call_id="tool-2",
+    )
+    observed_tool_calls: list[str] = []
+    tool_roots: list[Path] = []
+
+    def fake_tool_factory(root: Path) -> list[BaseTool]:
+        tool_roots.append(root)
+        return [_WriteStateTool(root, observed_tool_calls), _ReadStateTool(root, observed_tool_calls)]
+
+    def fake_state(_root: Path) -> dict[str, object]:
+        return {}
+
+    result = FaithfulSessionRunner(
+        api_client=_WriteThenReadToolModelClient(),
+        model="eval-model",
+        system_prompt="faithful system",
+        cwd=tmp_path,
+        sandbox_tool_factory=fake_tool_factory,
+        sandbox_state_fn=fake_state,
+    ).run(
+        group=EvalSessionGroup("session-1", ("ep-1", "ep-2")),
+        store=store,
+        user_simulator=_CannedUserSimulator(),
+    )
+
+    assert result.turn_count == 2
+    assert result.metadata["fixture_count"] == 2
+    assert tool_roots
+    assert len(set(tool_roots)) == 1
+    assert not tool_roots[0].exists()
+    assert observed_tool_calls == ["write", "read"]
 
 
 def test_session_replay_runner_default_matches_replay_simulator(tmp_path: Path):

@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
+import shutil
+import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -34,8 +36,10 @@ from openharness.evals.session_user_simulator import (
 )
 from openharness.evals.store import EvalStore
 from openharness.evals.tool_labels import effective_tool_label
+from openharness.evals.state import compute_state_delta
 from openharness.permissions.checker import PermissionChecker
 from openharness.permissions.modes import PermissionMode
+from openharness.tools.base import BaseTool, ToolRegistry
 
 log = logging.getLogger(__name__)
 
@@ -411,6 +415,214 @@ class SessionReplayRunner:
                 "llm_fallback_count": llm_fallback_count,
                 "replay_hit_rate": replay_hit_rate,
                 "ended_reason": ended_reason,
+            },
+        )
+
+
+class FaithfulSessionRunner:
+    """Run an ordered episode group through one persistent QueryEngine workspace."""
+
+    name = "session-query-engine-faithful"
+
+    def __init__(
+        self,
+        *,
+        api_client: SupportsStreamingMessages,
+        model: str,
+        system_prompt: str,
+        sandbox_tool_factory: Callable[[Path], Sequence[BaseTool]],
+        sandbox_state_fn: Callable[[Path], dict[str, Any]],
+        cwd: str | Path | None = None,
+        max_turns: int = 8,
+        max_tokens: int = 4096,
+        max_session_turns: int | None = None,
+        fixture_match_mode: str = "order",
+        synth_context: SynthContext | None = None,
+    ) -> None:
+        if fixture_match_mode not in {
+            "order",
+            "arguments",
+            "args_then_order",
+            "synth",
+            "synth_state",
+        }:
+            raise ValueError(
+                "fixture match mode must be one of: order, arguments, "
+                "args_then_order, synth, synth_state"
+            )
+        if fixture_match_mode in {"synth", "synth_state"} and synth_context is None:
+            raise ValueError("synth fixture match requires a SynthContext")
+        self._api_client = api_client
+        self._model = model
+        self._system_prompt = system_prompt
+        self._sandbox_tool_factory = sandbox_tool_factory
+        self._sandbox_state_fn = sandbox_state_fn
+        self._cwd = Path(cwd).resolve() if cwd is not None else Path.cwd().resolve()
+        self._max_turns = max_turns
+        self._max_tokens = max_tokens
+        self._max_session_turns = max_session_turns
+        self._fixture_match_mode = fixture_match_mode
+        self._synth_context = synth_context
+
+    @property
+    def fixture_match_mode(self) -> str:
+        return self._fixture_match_mode
+
+    def run(
+        self,
+        *,
+        group: EvalSessionGroup,
+        store: EvalStore,
+        user_simulator: UserSimulator | None = None,
+    ) -> EvalSessionRunResult:
+        return _run_eval_coroutine(
+            self.run_session(
+                group=group,
+                store=store,
+                user_simulator=user_simulator,
+            )
+        )
+
+    async def run_session(
+        self,
+        *,
+        group: EvalSessionGroup,
+        store: EvalStore,
+        user_simulator: UserSimulator | None = None,
+    ) -> EvalSessionRunResult:
+        if not group.episode_ids:
+            raise ValueError("session group must contain episodes")
+
+        episodes: list[EvalEpisode] = []
+        fixtures: list[EvalToolFixture] = []
+        captured_capabilities: list[tuple[str, ...]] = []
+        source_event_count = 0
+        for episode_id in group.episode_ids:
+            episode = store.get_episode(episode_id)
+            if episode is None:
+                raise ValueError(f"episode not found: {episode_id}")
+            events = list(store.iter_events(episode_id))
+            source_event_count += len(events)
+            episode_fixtures = _tool_fixtures(events)
+            episodes.append(episode)
+            fixtures.extend(episode_fixtures)
+            captured_capabilities.append(
+                tuple(
+                    effective_tool_label(
+                        fixture.tool_name,
+                        _fixture_arguments(events, fixture),
+                    )
+                    for fixture in episode_fixtures
+                )
+            )
+        captured_prompts = tuple(_episode_prompt(episode) for episode in episodes)
+
+        sandbox_ws = Path(tempfile.mkdtemp(prefix="openharness-eval-faithful-session-"))
+        tool_registry = ToolRegistry()
+        for tool in self._sandbox_tool_factory(sandbox_ws):
+            tool_registry.register(tool)
+        engine = QueryEngine(
+            api_client=self._api_client,
+            tool_registry=tool_registry,
+            permission_checker=PermissionChecker(
+                PermissionSettings(mode=PermissionMode.FULL_AUTO)
+            ),
+            cwd=self._cwd,
+            model=self._model,
+            system_prompt=self._system_prompt,
+            max_turns=self._max_turns,
+            max_tokens=self._max_tokens,
+        )
+
+        turns: list[EvalSessionTurnResult] = []
+        user_turn_sources: list[str] = []
+        transcript: list[tuple[str, str]] = []
+        simulator = user_simulator or ReplayUserSimulator(captured_prompts)
+        max_session_turns = self._max_session_turns or _default_max_session_turns(
+            len(captured_prompts)
+        )
+        ended_reason = "model_done"
+        last_turn: EvalSessionTurnResult | None = None
+        before_state = self._sandbox_state_fn(sandbox_ws)
+        try:
+            while len(turns) < max_session_turns:
+                user_turn = await _resolve_user_turn(
+                    simulator.next_turn(
+                        transcript=tuple(transcript),
+                        captured_prompts=captured_prompts,
+                        captured_capabilities=tuple(captured_capabilities),
+                        index=len(turns),
+                        last_turn=last_turn,
+                    )
+                )
+                if user_turn is None:
+                    ended_reason = _simulator_ended_reason(
+                        simulator,
+                        default=(
+                            "captured_exhausted"
+                            if len(turns) >= len(captured_prompts)
+                            else "model_done"
+                        ),
+                    )
+                    break
+
+                episode_id = (
+                    episodes[len(turns)].episode_id
+                    if user_turn.source == "replay" and len(turns) < len(episodes)
+                    else ""
+                )
+                transcript.append(("user", user_turn.text))
+                turn = await consume_engine_turn(
+                    engine,
+                    user_turn.text,
+                    episode_id=episode_id,
+                )
+                turns.append(turn)
+                user_turn_sources.append(user_turn.source)
+                transcript.append(("assistant", turn.final_text))
+                last_turn = turn
+            else:
+                ended_reason = "budget"
+                log.info(
+                    "session replay stopped by budget session_id=%s max_session_turns=%d",
+                    group.session_id,
+                    max_session_turns,
+                )
+        finally:
+            after_state = self._sandbox_state_fn(sandbox_ws)
+            state_delta = compute_state_delta(before_state, after_state)
+            shutil.rmtree(sandbox_ws, ignore_errors=True)
+
+        union_capabilities = sorted(
+            {capability for turn in turns for capability in turn.capabilities}
+        )
+        final_text = turns[-1].final_text if turns else ""
+        replay_hit_count = sum(1 for source in user_turn_sources if source == "replay")
+        llm_fallback_count = sum(
+            1 for source in user_turn_sources if source == "llm_fallback"
+        )
+        replay_hit_rate = (
+            replay_hit_count / len(user_turn_sources) if user_turn_sources else 0.0
+        )
+        return EvalSessionRunResult(
+            session_id=group.session_id,
+            turns=tuple(turns),
+            union_capabilities=tuple(union_capabilities),
+            final_text=final_text,
+            turn_count=len(turns),
+            metadata={
+                "agent_runner": self.name,
+                "fixture_match": self._fixture_match_mode,
+                "episode_count": len(episodes),
+                "fixture_count": len(fixtures),
+                "source_event_count": source_event_count,
+                "engine_message_count": len(engine.messages),
+                "user_turn_sources": user_turn_sources,
+                "replay_hit_count": replay_hit_count,
+                "llm_fallback_count": llm_fallback_count,
+                "replay_hit_rate": replay_hit_rate,
+                "ended_reason": ended_reason,
+                "state_delta": state_delta,
             },
         )
 

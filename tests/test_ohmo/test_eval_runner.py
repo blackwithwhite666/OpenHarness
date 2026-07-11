@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from pydantic import BaseModel
 
 from openharness.api.client import ApiMessageCompleteEvent
 from openharness.api.usage import UsageSnapshot
@@ -38,6 +39,7 @@ from ohmo.evals import (
     write_ohmo_eval_mine,
 )
 from openharness.config.settings import Settings
+from openharness.tools.base import BaseTool, ToolExecutionContext, ToolResult
 from ohmo.evals.runner import _build_agent_runner, _resolve_eval_system_prompt
 from ohmo.workspace import get_reminders_path, get_skills_dir, initialize_workspace
 
@@ -202,6 +204,103 @@ def test_run_ohmo_session_eval_writes_metadata_only_report(
     assert "SECRET_CITY" not in serialized
 
 
+class _FaithfulSessionEvalToolInput(BaseModel):
+    command: str = "forecast"
+
+
+class _FaithfulSessionEvalBashTool(BaseTool):
+    name = "bash"
+    description = "Persist to workspace for faithful session harness tests."
+    input_model = _FaithfulSessionEvalToolInput
+
+    def __init__(self, workspace: Path, calls: list[str]) -> None:
+        self._workspace = workspace
+        self._calls = calls
+
+    async def execute(
+        self,
+        arguments: _FaithfulSessionEvalToolInput,
+        context: ToolExecutionContext,
+    ) -> ToolResult:
+        del arguments, context
+        (self._workspace / "run.marker").write_text("ok", encoding="utf-8")
+        self._calls.append("bash")
+        return ToolResult(output="ok")
+
+
+def test_run_ohmo_session_eval_faithful_preset_records_sandbox_state_delta(
+    tmp_path: Path,
+    monkeypatch,
+):
+    workspace = tmp_path / "workspace"
+    store = get_eval_store(workspace)
+    _append_session_episode(
+        store,
+        episode_id="ep-1",
+        session_id="session-1",
+        user_text="private ohmo first request",
+        tool_call_id="tool-1",
+    )
+    _append_session_episode(
+        store,
+        episode_id="ep-2",
+        session_id="session-1",
+        user_text="private ohmo second request",
+        tool_call_id="tool-2",
+    )
+    api_client = _PerTurnToolModelApiClient()
+    tool_calls: list[str] = []
+    tool_roots: list[Path] = []
+    state_calls: list[Path] = []
+
+    def _fake_tool_factory(sandbox_ws: Path) -> tuple[BaseTool, ...]:
+        tool_roots.append(sandbox_ws.resolve())
+        return (_FaithfulSessionEvalBashTool(sandbox_ws, tool_calls),)
+
+    def _fake_state(sandbox_ws: Path) -> dict[str, object]:
+        state_calls.append(sandbox_ws.resolve())
+        return {}
+
+    monkeypatch.setattr(
+        "ohmo.evals.runner.resolve_api_client_from_settings",
+        lambda settings: api_client,
+    )
+    monkeypatch.setattr(
+        "ohmo.evals.runner.build_ohmo_system_prompt",
+        lambda *args, **kwargs: "REAL_OHMO_PROMPT",
+    )
+    monkeypatch.setattr(runner_module, "_ohmo_sandbox_tool_factory", _fake_tool_factory)
+    monkeypatch.setattr(runner_module, "_ohmo_sandbox_state", _fake_state)
+
+    faithful_result = run_ohmo_session_eval(
+        workspace=workspace,
+        limit=1,
+        fixture_match="arguments",
+        preset="faithful",
+    )
+
+    assert faithful_result.write.report.metadata["runner_name"] == (
+        "session-query-engine-faithful"
+    )
+    faithful_case = faithful_result.write.report.cases[0]
+    assert faithful_case.metadata["state_delta"] is not None
+    assert faithful_case.turn_count == 2
+    assert tool_calls == ["bash", "bash"]
+    assert len(tool_roots) == 1
+    assert len(state_calls) == 2
+    assert not tool_roots[0].exists()
+
+    inner_result = run_ohmo_session_eval(
+        workspace=workspace,
+        limit=1,
+        fixture_match="arguments",
+        preset="inner",
+    )
+
+    assert inner_result.write.report.metadata["runner_name"] == "session-query-engine"
+    inner_case = inner_result.write.report.cases[0]
+    assert "state_delta" not in inner_case.metadata
+    assert len(state_calls) == 2
 def test_run_ohmo_session_eval_hybrid_user_sim_profile_records_metrics(
     tmp_path: Path,
     monkeypatch,
