@@ -1865,6 +1865,9 @@ def test_ohmo_evals_run_session_command_runs_session_eval(tmp_path: Path, monkey
         fixture_match: str = "order",
         max_session_turns: int | None = None,
         max_turns: int = 100,
+        segment: bool = True,
+        gap_minutes: float = 30.0,
+        min_turns: int = 2,
     ):
         calls.append(
             {
@@ -1882,6 +1885,9 @@ def test_ohmo_evals_run_session_command_runs_session_eval(tmp_path: Path, monkey
                 "fixture_match": fixture_match,
                 "max_session_turns": max_session_turns,
                 "max_turns": max_turns,
+                "segment": segment,
+                "gap_minutes": gap_minutes,
+                "min_turns": min_turns,
             }
         )
         return SimpleNamespace(
@@ -1929,6 +1935,11 @@ def test_ohmo_evals_run_session_command_runs_session_eval(tmp_path: Path, monkey
             "5",
             "--max-turns",
             "12",
+            "--segment",
+            "--gap-minutes",
+            "45",
+            "--min-turns",
+            "3",
         ],
     )
 
@@ -1951,6 +1962,9 @@ def test_ohmo_evals_run_session_command_runs_session_eval(tmp_path: Path, monkey
             "fixture_match": "arguments",
             "max_session_turns": 5,
             "max_turns": 12,
+            "segment": True,
+            "gap_minutes": 45.0,
+            "min_turns": 3,
         }
     ]
 

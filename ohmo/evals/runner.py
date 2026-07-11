@@ -27,6 +27,7 @@ from openharness.evals import (
     FsSandboxAgentRunner,
     HistoryContext,
     HybridUserSimulator,
+    EvalSessionGroup,
     LiveReadAgentRunner,
     LlmUserSimulator,
     QueryEngineEvalAgentRunner,
@@ -48,6 +49,7 @@ from openharness.evals import (
     resolve_execution_scorer,
     run_execution_report,
     score_session,
+    segment_sessions_into_conversations,
 )
 from openharness.evals.runner import _report_output_path, _stable_id
 from openharness.evals.state import compute_episode_state_delta, extract_state_keys
@@ -394,8 +396,20 @@ def run_ohmo_session_eval(
     fixture_match: str = "args_then_order",
     max_session_turns: int | None = None,
     max_turns: int = 100,
+    segment: bool = False,
+    gap_minutes: float = 30.0,
+    min_turns: int = 2,
 ) -> OhmoSessionEvalRunResult:
-    """Run P0 session replay checks over captured Ohmo eval episodes."""
+    """Run P0 session replay checks over captured Ohmo eval episodes.
+
+    With ``segment=True`` the coarse per-chat threads are cut into bounded
+    same-task conversations via a time-gap split before replaying — a
+    ``session_id`` groups an entire chat's unrelated tasks (e.g. "restaurant
+    reviews" then, days later, "schedule a 1-1"), so replaying it whole makes
+    the user simulator improvise across topics and the capability union is
+    unsatisfiable. Segmenting is opt-in (default off) to preserve the legacy
+    whole-thread behaviour for existing callers.
+    """
     if limit is not None and limit <= 0:
         raise ValueError("limit must be positive")
     if samples < 1:
@@ -404,6 +418,10 @@ def run_ohmo_session_eval(
         raise ValueError("max_session_turns must be positive")
     if max_turns < 1:
         raise ValueError("max_turns must be positive")
+    if gap_minutes <= 0:
+        raise ValueError("gap_minutes must be positive")
+    if min_turns < 1:
+        raise ValueError("min_turns must be positive")
     fixture_match = _validate_fixture_match(fixture_match)
     if user_sim_model is not None and user_sim_profile is None:
         raise ValueError("user_sim_model requires user_sim_profile")
@@ -460,7 +478,22 @@ def run_ohmo_session_eval(
         user_simulator_factory = _new_user_simulator
 
     store = get_eval_store(workspace)
-    groups = group_episodes_into_sessions(store, app="ohmo")
+    if segment:
+        # L2: cut each coarse per-chat thread into bounded same-task
+        # conversations, so a "session" is one coherent task rather than a
+        # whole chat's grab-bag of unrelated requests.
+        conversations = segment_sessions_into_conversations(
+            store, app="ohmo", gap_minutes=gap_minutes, min_turns=min_turns
+        )
+        groups = [
+            EvalSessionGroup(
+                session_id=f"{conversation.session_id}#{conversation.segment_index}",
+                episode_ids=conversation.episode_ids,
+            )
+            for conversation in conversations
+        ]
+    else:
+        groups = group_episodes_into_sessions(store, app="ohmo")
     groups = groups[:limit] if limit is not None else groups
     if not groups:
         raise ValueError("eval store must contain ohmo sessions")
