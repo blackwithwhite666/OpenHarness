@@ -19,6 +19,11 @@ from openharness.evals import (
     read_execution_report,
     segment_sessions_into_conversations,
 )
+from openharness.evals.grounding_blame import (
+    attribute_faithful_grounding_report,
+    default_grounding_blame_output_path,
+    read_faithful_session_report,
+)
 from openharness.evals.meta_judge import MetaJudgeAttributor, summarize_attributions
 from openharness.utils.fs import atomic_write_text
 
@@ -2394,12 +2399,92 @@ def evals_meta_report_cmd(
         min=1,
         help="Meta-judge votes per failed case",
     ),
+    lane: str = typer.Option(
+        "execution",
+        "--lane",
+        help="Report lane to attribute: execution or faithful",
+    ),
+    check: str = typer.Option(
+        "all",
+        "--check",
+        help="Failed check to attribute; faithful supports grounding",
+    ),
     output: str | None = typer.Option(None, "--output", help="Write attributions JSON"),
     workspace: str | None = typer.Option(None, "--workspace", help=_WORKSPACE_HELP),
 ) -> None:
     """Route failed eval cases to model vs harness debt using the meta-judge."""
     workspace_root = initialize_workspace(workspace)
+    lane_value = lane.strip().lower()
+    check_value = check.strip().lower()
     try:
+        if lane_value == "faithful":
+            if check_value not in {"grounding", "grounding_ok"}:
+                raise ValueError("faithful meta-report currently supports --check grounding")
+            report = read_faithful_session_report(report_path)
+            selected_cases = [
+                case for case in report.cases if case.checks.get("grounding_ok") is False
+            ]
+            attributor = None
+            judge_config = None
+            needs_model = any(
+                case.metadata.get("grounding_status") != "sandbox_blocked"
+                for case in selected_cases
+            )
+            if needs_model:
+                judge_config = _build_agent_runner_config(
+                    "query-engine",
+                    workspace=workspace_root,
+                    model=model,
+                    provider_profile=None,
+                    system_prompt=None,
+                )
+                if judge_config.api_client is None:
+                    raise ValueError("meta-report requires configured API authentication")
+                attributor = MetaJudgeAttributor(
+                    api_client=judge_config.api_client,
+                    model=judge_config.model,
+                    votes=meta_votes,
+                )
+            payload = attribute_faithful_grounding_report(
+                report,
+                attributor=attributor,
+                api_client=judge_config.api_client if judge_config is not None else None,
+                model=judge_config.model if judge_config is not None else (model or ""),
+                trace_root=Path(traces_dir).expanduser().resolve()
+                if traces_dir
+                else None,
+            )
+            attributions = payload["attributions"]
+            summary = payload["summary"]
+            print("session_id | g | status | blame | subtype | evidence[:60]")
+            for item in attributions if isinstance(attributions, list) else []:
+                evidence = str(item.get("evidence") or "")[:60]
+                print(
+                    f"{item.get('session_id')} | {item.get('grounding_score')} | "
+                    f"{item.get('grounding_status')} | {item.get('blame')} | "
+                    f"{item.get('subtype') or '-'} | {evidence}"
+                )
+            print("summary:")
+            print(f"counts: {json.dumps(summary['counts'], sort_keys=True, ensure_ascii=True)}")
+            print(f"harness_debt_pct: {summary['harness_debt_pct']}")
+            print(f"model_signal_pct: {summary['model_signal_pct']}")
+            print(
+                f"grounding_harness_debt_pct: {summary['grounding_harness_debt_pct']}"
+            )
+            print(f"subtypes: {json.dumps(summary['subtypes'], sort_keys=True, ensure_ascii=True)}")
+            output_path = (
+                Path(output).expanduser()
+                if output
+                else default_grounding_blame_output_path(report_path)
+            )
+            atomic_write_text(
+                output_path,
+                json.dumps(payload, ensure_ascii=False, indent=2, default=str) + "\n",
+            )
+            print(f"Wrote meta-report JSON: {output_path}")
+            return
+        if lane_value != "execution":
+            raise ValueError("meta-report --lane must be execution or faithful")
         report = read_execution_report(report_path)
         rubrics = _load_case_rubrics(rubrics_file) or {}
         trace_root = _meta_report_traces_dir(

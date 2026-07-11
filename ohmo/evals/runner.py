@@ -54,6 +54,7 @@ from openharness.evals import (
     score_session,
     segment_sessions_into_conversations,
 )
+from openharness.evals.grounding_blame import grounding_report_metadata
 from openharness.evals.judge import _default_grounding_search
 from openharness.evals.runner import _report_output_path, _stable_id
 from openharness.evals.state import compute_episode_state_delta, extract_state_keys
@@ -1500,6 +1501,8 @@ def _run_session_report_case(
     }
     if "state_delta" in result.metadata:
         metadata["state_delta"] = result.metadata["state_delta"]
+    if isinstance(runner, FaithfulSessionRunner):
+        metadata.update(grounding_report_metadata(score_payload.get("grounding")))
     warnings = list(score_payload.get("warnings", []))
     if warnings:
         metadata["warnings"] = warnings
