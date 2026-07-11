@@ -1861,6 +1861,7 @@ def test_ohmo_evals_run_session_command_runs_session_eval(tmp_path: Path, monkey
         gold_capabilities_by_session=None,
         user_sim_profile: str | None = None,
         user_sim_model: str | None = None,
+        user_sim_goal_anchored: bool = True,
         clarification_allowed_by_session=None,
         fixture_match: str = "order",
         max_session_turns: int | None = None,
@@ -1881,6 +1882,7 @@ def test_ohmo_evals_run_session_command_runs_session_eval(tmp_path: Path, monkey
                 "gold_capabilities_by_session": gold_capabilities_by_session,
                 "user_sim_profile": user_sim_profile,
                 "user_sim_model": user_sim_model,
+                "user_sim_goal_anchored": user_sim_goal_anchored,
                 "clarification_allowed_by_session": clarification_allowed_by_session,
                 "fixture_match": fixture_match,
                 "max_session_turns": max_session_turns,
@@ -1929,6 +1931,7 @@ def test_ohmo_evals_run_session_command_runs_session_eval(tmp_path: Path, monkey
             "user-profile",
             "--user-sim-model",
             "user-model",
+            "--no-user-sim-goal-anchored",
             "--fixture-match",
             "arguments",
             "--max-session-turns",
@@ -1958,6 +1961,7 @@ def test_ohmo_evals_run_session_command_runs_session_eval(tmp_path: Path, monkey
             "gold_capabilities_by_session": None,
             "user_sim_profile": "user-profile",
             "user_sim_model": "user-model",
+            "user_sim_goal_anchored": False,
             "clarification_allowed_by_session": None,
             "fixture_match": "arguments",
             "max_session_turns": 5,
@@ -1967,6 +1971,21 @@ def test_ohmo_evals_run_session_command_runs_session_eval(tmp_path: Path, monkey
             "min_turns": 3,
         }
     ]
+
+    calls.clear()
+    explicit_true = runner.invoke(
+        app,
+        [
+            "evals",
+            "run-session",
+            "--workspace",
+            str(workspace),
+            "--user-sim-goal-anchored",
+        ],
+    )
+
+    assert explicit_true.exit_code == 0
+    assert calls[0]["user_sim_goal_anchored"] is True
 
 
 def test_ohmo_evals_fixture_match_rejects_invalid_value(tmp_path: Path):

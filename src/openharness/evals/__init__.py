@@ -175,10 +175,12 @@ from openharness.evals.session import (
 )
 from openharness.evals.session_user_simulator import (
     HybridUserSimulator,
+    IronUserSpec,
     LlmUserSimulator,
     ReplayUserSimulator,
     UserSimulator,
     UserTurn,
+    derive_ironuser_spec,
     replay_matches,
 )
 from openharness.evals.completion_cache import (
@@ -315,6 +317,7 @@ __all__ = [
     "EvalUsageGraphMotif",
     "EvalUsageGraphNode",
     "HybridUserSimulator",
+    "IronUserSpec",
     "InferenceClient",
     "FsSandboxAgentRunner",
     "FsSandboxBashTool",
@@ -341,6 +344,7 @@ __all__ = [
     "build_case_drafts",
     "build_run_pack",
     "build_usage_graph",
+    "derive_ironuser_spec",
     "compare_execution_reports",
     "collect_text_facets",
     "classify_bash_command",
