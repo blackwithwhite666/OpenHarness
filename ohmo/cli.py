@@ -2582,6 +2582,28 @@ def evals_run_session_cmd(
             "aborts a session mid-task with MaxTurnsExceeded."
         ),
     ),
+    segment: bool = typer.Option(
+        False,
+        "--segment/--no-segment",
+        help=(
+            "Cut each coarse per-chat thread into bounded same-task conversations "
+            "before replaying. A session_id spans a whole chat's unrelated tasks, "
+            "so replaying it whole makes the user simulator improvise across "
+            "topics; --segment keeps each session one coherent task. Opt-in "
+            "(default off) to preserve legacy whole-thread behaviour."
+        ),
+    ),
+    gap_minutes: float = typer.Option(
+        30.0,
+        "--gap-minutes",
+        help="Idle gap (minutes) that starts a new conversation when --segment",
+    ),
+    min_turns: int = typer.Option(
+        2,
+        "--min-turns",
+        min=1,
+        help="Drop conversations shorter than this many turns when --segment",
+    ),
     json_output: bool = typer.Option(False, "--json", help="Print a JSON summary"),
 ) -> None:
     """Run session-level replay checks over captured Ohmo eval episodes."""
@@ -2600,6 +2622,9 @@ def evals_run_session_cmd(
             fixture_match=fixture_match,
             max_session_turns=max_session_turns,
             max_turns=max_turns,
+            segment=segment,
+            gap_minutes=gap_minutes,
+            min_turns=min_turns,
         )
     except (FileNotFoundError, ValueError) as exc:
         print(str(exc), file=sys.stderr)

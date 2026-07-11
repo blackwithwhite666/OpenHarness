@@ -366,6 +366,22 @@ def test_run_ohmo_session_eval_rejects_nonpositive_max_turns(tmp_path: Path):
         )
 
 
+def test_run_ohmo_session_eval_rejects_nonpositive_gap_minutes(tmp_path: Path):
+    with pytest.raises(ValueError, match="gap_minutes must be positive"):
+        run_ohmo_session_eval(
+            workspace=tmp_path / "workspace",
+            gap_minutes=0,
+        )
+
+
+def test_run_ohmo_session_eval_rejects_nonpositive_min_turns(tmp_path: Path):
+    with pytest.raises(ValueError, match="min_turns must be positive"):
+        run_ohmo_session_eval(
+            workspace=tmp_path / "workspace",
+            min_turns=0,
+        )
+
+
 def test_check_ohmo_eval_run_config_validates_pack_without_running(tmp_path: Path):
     workspace = tmp_path / "workspace"
     store = get_eval_store(workspace)
