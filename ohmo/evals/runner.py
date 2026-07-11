@@ -1373,6 +1373,14 @@ def _run_session_report_case_sampled(
             )
         )
     pass_count = sum(1 for case in sample_cases if case.status == "passed")
+    check_keys: set[str] = set()
+    for case in sample_cases:
+        check_keys.update((case.checks or {}).keys())
+    check_rates = {
+        key: sum(1 for case in sample_cases if (case.checks or {}).get(key))
+        / samples
+        for key in sorted(check_keys)
+    }
     return first.model_copy(
         update={
             "status": "passed" if pass_count * 2 > samples else "failed",
@@ -1383,6 +1391,7 @@ def _run_session_report_case_sampled(
                 "pass_count": pass_count,
                 "pass_rate": pass_count / samples,
                 "flaky": 0 < pass_count < samples,
+                "check_rates": check_rates,
             },
         }
     )
