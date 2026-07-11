@@ -3,7 +3,6 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from pydantic import BaseModel
 
 from openharness.api.client import ApiMessageCompleteEvent
 from openharness.api.usage import UsageSnapshot
@@ -17,6 +16,8 @@ from openharness.evals import (
     EvalEpisode,
     EvalEvent,
     EvalExecutionContext,
+)
+from openharness.evals import (
     FsSandboxAgentRunner,
     LiveReadAgentRunner,
     IronUserSpec,
@@ -30,6 +31,7 @@ from openharness.evals import (
     collect_text_facets,
     write_run_pack,
 )
+from openharness.evals.executor import EvalExecutorResult, EvalObservedCall
 import ohmo.evals.runner as runner_module
 from ohmo.evals import (
     build_ohmo_eval_pack,
@@ -40,7 +42,6 @@ from ohmo.evals import (
     write_ohmo_eval_mine,
 )
 from openharness.config.settings import Settings
-from openharness.tools.base import BaseTool, ToolExecutionContext, ToolResult
 from ohmo.evals.runner import _build_agent_runner, _resolve_eval_system_prompt
 from ohmo.workspace import get_reminders_path, get_skills_dir, initialize_workspace
 
@@ -205,28 +206,49 @@ def test_run_ohmo_session_eval_writes_metadata_only_report(
     assert "SECRET_CITY" not in serialized
 
 
-class _FaithfulSessionEvalToolInput(BaseModel):
-    command: str = "forecast"
+class _FaithfulSessionEvalFsRunner:
+    def __init__(self, workspace: Path) -> None:
+        self._cwd = workspace
+        self.workspaces: list[Path] = [workspace]
+        self.prompts: list[str] = []
 
+    @property
+    def name(self) -> str:
+        return "fake-faithful-fs-runner"
 
-class _FaithfulSessionEvalBashTool(BaseTool):
-    name = "bash"
-    description = "Persist to workspace for faithful session harness tests."
-    input_model = _FaithfulSessionEvalToolInput
-
-    def __init__(self, workspace: Path, calls: list[str]) -> None:
-        self._workspace = workspace
-        self._calls = calls
-
-    async def execute(
+    def run(
         self,
-        arguments: _FaithfulSessionEvalToolInput,
-        context: ToolExecutionContext,
-    ) -> ToolResult:
-        del arguments, context
-        (self._workspace / "run.marker").write_text("ok", encoding="utf-8")
-        self._calls.append("bash")
-        return ToolResult(output="ok")
+        *,
+        prompt: str,
+        tool_registry: object,
+        context: object,
+    ) -> EvalExecutorResult:
+        del tool_registry, context
+        self.prompts.append(prompt)
+        self.workspaces.append(self._cwd)
+        marker = self._cwd / "run.marker"
+        if marker.exists():
+            marker_value = marker.read_text(encoding="utf-8")
+            calls = (
+                EvalObservedCall(
+                    tool_name="read_marker",
+                    arguments={"value": marker_value},
+                ),
+            )
+            final_text = f"read {marker_value}"
+        else:
+            marker.write_text("ok", encoding="utf-8")
+            calls = (
+                EvalObservedCall(
+                    tool_name="write_marker",
+                    arguments={},
+                ),
+            )
+            final_text = "wrote ok"
+        return EvalExecutorResult(
+            final_text=final_text,
+            tool_calls=tuple(calls),
+        )
 
 
 def test_run_ohmo_session_eval_faithful_preset_records_sandbox_state_delta(
@@ -250,17 +272,39 @@ def test_run_ohmo_session_eval_faithful_preset_records_sandbox_state_delta(
         tool_call_id="tool-2",
     )
     api_client = _PerTurnToolModelApiClient()
-    tool_calls: list[str] = []
-    tool_roots: list[Path] = []
-    state_calls: list[Path] = []
+    runner_instances: list[_FaithfulSessionEvalFsRunner] = []
+    runner_calls: list[dict[str, object]] = []
 
-    def _fake_tool_factory(sandbox_ws: Path) -> tuple[BaseTool, ...]:
-        tool_roots.append(sandbox_ws.resolve())
-        return (_FaithfulSessionEvalBashTool(sandbox_ws, tool_calls),)
-
-    def _fake_state(sandbox_ws: Path) -> dict[str, object]:
-        state_calls.append(sandbox_ws.resolve())
-        return {}
+    def fake_build_agent_runner_config(agent_runner_name, *, workspace, **_kwargs):
+        runner_calls.append(
+            {
+                "agent_runner_name": agent_runner_name,
+                "workspace": workspace,
+            }
+        )
+        if agent_runner_name == "fs-sandbox":
+            fake_runner = _FaithfulSessionEvalFsRunner(workspace)
+            runner_instances.append(fake_runner)
+            return runner_module._AgentRunnerConfig(
+                agent_runner=fake_runner,
+                agent_runner_name="fs-sandbox",
+                model="fake-model",
+                provider_profile="fake-profile",
+                api_client=api_client,
+                system_prompt="REAL_OHMO_PROMPT",
+                cwd=workspace,
+            )
+        if agent_runner_name == "query-engine":
+            return runner_module._AgentRunnerConfig(
+                agent_runner=object(),
+                agent_runner_name="query-engine",
+                model="fake-model",
+                provider_profile="fake-profile",
+                api_client=api_client,
+                system_prompt="REAL_OHMO_PROMPT",
+                cwd=workspace,
+            )
+        raise ValueError(f"unexpected runner: {agent_runner_name}")
 
     monkeypatch.setattr(
         "ohmo.evals.runner.resolve_api_client_from_settings",
@@ -270,8 +314,10 @@ def test_run_ohmo_session_eval_faithful_preset_records_sandbox_state_delta(
         "ohmo.evals.runner.build_ohmo_system_prompt",
         lambda *args, **kwargs: "REAL_OHMO_PROMPT",
     )
-    monkeypatch.setattr(runner_module, "_ohmo_sandbox_tool_factory", _fake_tool_factory)
-    monkeypatch.setattr(runner_module, "_ohmo_sandbox_state", _fake_state)
+    monkeypatch.setattr(
+        "ohmo.evals.runner._build_agent_runner_config",
+        fake_build_agent_runner_config,
+    )
     async def fake_spec(*_args, **_kwargs):
         return IronUserSpec(
             intent="find weather",
@@ -323,10 +369,12 @@ def test_run_ohmo_session_eval_faithful_preset_records_sandbox_state_delta(
     assert faithful_case.checks.get("capability_coverage") is None
     assert faithful_case.metadata["state_delta"] is not None
     assert faithful_case.turn_count == 2
-    assert tool_calls == ["bash", "bash"]
-    assert len(tool_roots) == 1
-    assert len(state_calls) == 2
-    assert not tool_roots[0].exists()
+    assert runner_calls[0]["agent_runner_name"] == "fs-sandbox"
+    assert len(runner_instances) == 1
+    assert len(runner_instances[0].prompts) == 2
+    assert "assistant: wrote ok" in runner_instances[0].prompts[1]
+    assert len(set(runner_instances[0].workspaces)) == 1
+    assert not runner_instances[0].workspaces[0].exists()
 
     inner_result = run_ohmo_session_eval(
         workspace=workspace,
@@ -338,7 +386,10 @@ def test_run_ohmo_session_eval_faithful_preset_records_sandbox_state_delta(
     assert inner_result.write.report.metadata["runner_name"] == "session-query-engine"
     inner_case = inner_result.write.report.cases[0]
     assert "state_delta" not in inner_case.metadata
-    assert len(state_calls) == 2
+    assert len(runner_calls) == 2
+    assert runner_calls[1]["agent_runner_name"] == "query-engine"
+
+
 def test_run_ohmo_session_eval_hybrid_user_sim_profile_records_metrics(
     tmp_path: Path,
     monkeypatch,

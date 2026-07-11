@@ -199,13 +199,18 @@ def assemble_fs(
     ro_source_dirs: Iterable[str | Path],
     cwd: str | Path | None = None,
     cwd_name: str = "work",
+    persist_cwd: bool = False,
 ) -> SandboxPlan:
     """Create disposable copies and path mappings for the eval filesystem."""
     root = Path(sandbox_root).expanduser().resolve()
     home_path = Path(home).expanduser().resolve()
     real_cwd = Path(cwd).expanduser().resolve() if cwd is not None else Path.cwd().resolve()
-    state_root = root / "state"
-    work = root / cwd_name
+    work = real_cwd if persist_cwd else root / cwd_name
+    state_root = (
+        real_cwd / ".openharness-eval-fs-state"
+        if persist_cwd
+        else root / "state"
+    )
     tmp = root / "tmp"
 
     work.mkdir(parents=True, exist_ok=True)
@@ -221,12 +226,21 @@ def assemble_fs(
         name = entry.name
         real_path = entry.resolve() if entry.is_absolute() else (ohmo_root / name).resolve()
         copy_path = state_root / name
-        if real_path.exists() and real_path.is_dir():
-            shutil.copytree(real_path, copy_path, dirs_exist_ok=True)
-        elif real_path.exists() and real_path.is_file():
-            copy_path.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(real_path, copy_path)
-        else:
+        if real_path.exists():
+            if persist_cwd:
+                if not copy_path.exists():
+                    if real_path.is_dir():
+                        shutil.copytree(real_path, copy_path, dirs_exist_ok=True)
+                    elif real_path.is_file():
+                        copy_path.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(real_path, copy_path)
+            else:
+                if real_path.is_dir():
+                    shutil.copytree(real_path, copy_path, dirs_exist_ok=True)
+                elif real_path.is_file():
+                    copy_path.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(real_path, copy_path)
+        elif not copy_path.exists():
             copy_path.mkdir(parents=True, exist_ok=True)
         remap[real_path] = copy_path.resolve()
         rw_binds.append((copy_path.resolve(), real_path))
@@ -235,6 +249,10 @@ def assemble_fs(
         if name == "reminders":
             real_reminders_file = (ohmo_root / "reminders.json").resolve()
             if real_reminders_file.exists():
+                if persist_cwd and copy_path.exists():
+                    (state_root / "reminders.json").parent.mkdir(parents=True, exist_ok=True)
+                if persist_cwd and (state_root / "reminders.json").exists():
+                    continue
                 shutil.copy2(real_reminders_file, state_root / "reminders.json")
 
     remap[Path("/tmp")] = tmp.resolve()
@@ -242,7 +260,8 @@ def assemble_fs(
     if resolved_tmp != Path("/tmp"):
         remap[resolved_tmp] = tmp.resolve()
     remap[real_cwd] = work.resolve()
-    rw_binds.extend(((tmp.resolve(), Path("/tmp")), (work.resolve(), real_cwd)))
+    rw_binds.extend(((tmp.resolve(), Path("/tmp")),))
+    rw_binds.append((work.resolve(), real_cwd))
 
     ro_binds: list[Path] = []
     seen_ro: set[Path] = set()
@@ -512,6 +531,7 @@ class FsSandboxAgentRunner:
         proxy_url: str | None = None,
         browser_socket: str | None = None,
         browser_cli_name: str | None = None,
+        persist_cwd: bool = False,
         live_mcp_server_names: tuple[str, ...] = (),
         mutable_dirs: Iterable[str | Path] = ("memory", "todos", "reminders", "user.md"),
         ro_source_dirs: Iterable[str | Path] | None = None,
@@ -529,6 +549,7 @@ class FsSandboxAgentRunner:
         self._proxy_url = proxy_url
         self._browser_socket = browser_socket
         self._browser_cli_name = browser_cli_name
+        self._persist_cwd = persist_cwd
         self._live_mcp_server_names = tuple(live_mcp_server_names)
         self._mutable_dirs = tuple(mutable_dirs)
         self._ro_source_dirs = (
@@ -574,6 +595,7 @@ class FsSandboxAgentRunner:
                     mutable_dirs=self._mutable_dirs,
                     ro_source_dirs=self._ro_source_dirs,
                     cwd=self._cwd,
+                    persist_cwd=self._persist_cwd,
                 )
                 real_registry: ToolRegistry | None = None
                 if self._live_mcp_server_names:

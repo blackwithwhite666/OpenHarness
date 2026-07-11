@@ -176,6 +176,49 @@ def test_assemble_fs_copies_mutable_dirs_and_builds_remap(tmp_path: Path):
     assert plan.mutable_copies == ("memory", "todos", "user.md")
 
 
+def test_assemble_fs_persists_cwd_state_with_persist_cwd(tmp_path: Path):
+    root = tmp_path / "sandbox"
+    home = tmp_path / "home"
+    cwd = tmp_path / "case"
+    user_file = cwd / "state.txt"
+    cwd.mkdir(parents=True)
+    home.mkdir()
+
+    first_plan = assemble_fs(
+        root,
+        home=home,
+        mutable_dirs=(),
+        ro_source_dirs=(),
+        cwd=cwd,
+        persist_cwd=True,
+    )
+    assert first_plan.work == cwd.resolve()
+    first_plan.work.mkdir(parents=True, exist_ok=True)
+    (first_plan.work / "state.txt").write_text("persisted", encoding="utf-8")
+
+    second_plan = assemble_fs(
+        tmp_path / "sandbox-next",
+        home=home,
+        mutable_dirs=(),
+        ro_source_dirs=(),
+        cwd=cwd,
+        persist_cwd=True,
+    )
+    assert second_plan.work == cwd.resolve()
+    assert (second_plan.work / "state.txt").read_text(encoding="utf-8") == "persisted"
+
+    disposable_plan = assemble_fs(
+        tmp_path / "sandbox-disposable",
+        home=home,
+        mutable_dirs=(),
+        ro_source_dirs=(),
+        cwd=cwd,
+        persist_cwd=False,
+    )
+    assert disposable_plan.work != cwd
+    assert not (disposable_plan.work / "state.txt").exists()
+
+
 @pytest.mark.asyncio
 async def test_sandbox_fs_tool_round_trips_writes_and_confines_live_paths(
     tmp_path: Path,

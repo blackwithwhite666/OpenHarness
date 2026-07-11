@@ -442,8 +442,9 @@ def run_ohmo_session_eval(
         raise ValueError("user_sim_model requires user_sim_profile")
 
     workspace_root = Path(workspace).expanduser().resolve() if workspace else None
+    agent_runner_name = "fs-sandbox" if preset == "faithful" else "query-engine"
     agent_runner_config = _build_agent_runner_config(
-        "query-engine",
+        agent_runner_name,
         workspace=workspace_root,
         model=model,
         provider_profile=provider_profile,
@@ -515,6 +516,31 @@ def run_ohmo_session_eval(
         raise ValueError("eval store must contain ohmo sessions")
 
     if preset == "faithful":
+        base_faithful_runner = agent_runner_config.agent_runner
+
+        def _faithful_agent_runner_factory(workspace: Path) -> FsSandboxAgentRunner:
+            if isinstance(base_faithful_runner, FsSandboxAgentRunner):
+                return FsSandboxAgentRunner(
+                    api_client=agent_runner_config.api_client,
+                    model=agent_runner_config.model,
+                    system_prompt=agent_runner_config.system_prompt,
+                    cwd=workspace,
+                    max_turns=max_turns,
+                    max_tokens=base_faithful_runner._max_tokens,
+                    timeout=base_faithful_runner._timeout,
+                    net_mode=base_faithful_runner._net_mode,
+                    proxy_url=base_faithful_runner._proxy_url,
+                    browser_socket=base_faithful_runner._browser_socket,
+                    browser_cli_name=base_faithful_runner._browser_cli_name,
+                    live_mcp_server_names=base_faithful_runner._live_mcp_server_names,
+                    mutable_dirs=base_faithful_runner._mutable_dirs,
+                    ro_source_dirs=base_faithful_runner._ro_source_dirs,
+                    extra_ro_source_dirs=(),
+                    sandbox_bin_dirs=base_faithful_runner._sandbox_bin_dirs,
+                    persist_cwd=True,
+                )
+            return base_faithful_runner
+
         runner = FaithfulSessionRunner(
             api_client=agent_runner_config.api_client,
             model=agent_runner_config.model,
@@ -524,6 +550,12 @@ def run_ohmo_session_eval(
             max_session_turns=max_session_turns,
             max_turns=max_turns,
             synth_context=synth_context,
+            agent_runner_factory=_faithful_agent_runner_factory
+            if isinstance(base_faithful_runner, FsSandboxAgentRunner)
+            else None,
+            agent_runner=base_faithful_runner
+            if not isinstance(base_faithful_runner, FsSandboxAgentRunner)
+            else None,
             sandbox_tool_factory=_ohmo_sandbox_tool_factory,
             sandbox_state_fn=_ohmo_sandbox_state,
         )
