@@ -6,6 +6,7 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass
+from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 from openharness.api.client import (
@@ -525,6 +526,88 @@ async def _complete_text(
         if isinstance(event, ApiMessageCompleteEvent):
             text = event.message.text.strip()
     return text
+
+
+def _format_transcript_for_intent_judge(
+    transcript: Sequence[tuple[str, str]],
+) -> str:
+    lines: list[str] = []
+    for role, text in transcript:
+        r = role.strip() if isinstance(role, str) else ""
+        t = text.strip() if isinstance(text, str) else ""
+        if t:
+            lines.append(f"{r}: {t}")
+    return "\n".join(lines) if lines else "(no conversation yet)"
+
+
+def _format_checklist(items: Sequence[str]) -> str:
+    return "\n".join(f"- {item}" for item in items if item.strip())
+
+
+def _coerce_bool(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"true", "yes", "1", "y", "on"}:
+            return True
+        if lowered in {"false", "no", "0", "n", "off"}:
+            return False
+    return False
+
+
+async def judge_intent_met(
+    api_client: SupportsStreamingMessages,
+    model: str,
+    *,
+    intent: str,
+    constraints: Sequence[str],
+    transcript: Sequence[tuple[str, str]],
+    votes: int = 1,
+    max_tokens: int = 600,
+) -> dict[str, object]:
+    prompt = (
+        "You are a strict outcome judge for a task execution transcript.\n\n"
+        f"Intent: {intent or '(unspecified)'}\n"
+        f"Constraints: {_format_checklist(constraints) or '- (none)'}\n\n"
+        "Transcript (role: text per line):\n"
+        f"{_format_transcript_for_intent_judge(transcript)}\n\n"
+        'Return only ONE JSON object with keys:\n'
+        '{"intent_met": true|false, "constraints_held": true|false, '
+        '"evidence": "brief evidence snippets"}\n'
+        "intent_met is true only when the assistant achieved the user's final objective.\n"
+        "constraints_held is true only when no stated constraints were violated.\n"
+        "Do not ask clarifying questions; decide from the transcript as-is."
+    )
+    run_count = max(1, int(votes))
+    intent_votes: list[bool] = []
+    constraints_votes: list[bool] = []
+    evidences: list[str] = []
+    for _ in range(run_count):
+        text = await _complete_text(
+            api_client,
+            model,
+            system_prompt="You are an objective judge. Return strict JSON only.",
+            prompt=prompt,
+            max_tokens=max_tokens,
+        )
+        parsed = _extract_json(text) or {}
+        i_met = _coerce_bool(parsed.get("intent_met"))
+        c_held = _coerce_bool(parsed.get("constraints_held"))
+        intent_votes.append(bool(i_met))
+        constraints_votes.append(bool(c_held))
+        evidence = parsed.get("evidence")
+        if isinstance(evidence, str):
+            e = evidence.strip()
+            if e:
+                evidences.append(e)
+
+    return {
+        "intent_met": sum(intent_votes) > run_count / 2,
+        "constraints_held": sum(constraints_votes) > run_count / 2,
+        "evidence": evidences[0] if evidences else "",
+        "votes": run_count,
+    }
 
 
 def _v2_trajectory(executor_result: EvalExecutorResult, *, excerpt: int) -> str:

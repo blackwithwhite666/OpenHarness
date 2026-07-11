@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 import shutil
 import tempfile
 from dataclasses import dataclass, field
@@ -30,10 +30,12 @@ from openharness.evals.executor import (
 from openharness.evals.models import EvalEpisode
 from openharness.evals.session_user_simulator import (
     ReplayUserSimulator,
+    derive_ironuser_spec,
     UserSimulator,
     _resolve_user_turn,
     _simulator_ended_reason,
 )
+from openharness.evals.judge import _verify_grounding_voted, judge_intent_met
 from openharness.evals.store import EvalStore
 from openharness.evals.tool_labels import effective_tool_label
 from openharness.evals.state import compute_state_delta
@@ -84,6 +86,78 @@ class EvalSessionRunResult:
     final_text: str = ""
     turn_count: int = 0
     metadata: dict[str, Any] = field(default_factory=dict)
+
+
+async def score_faithful_session(
+    api_client: SupportsStreamingMessages,
+    model: str,
+    *,
+    captured_prompts: Sequence[str],
+    transcript: Sequence[tuple[str, str]],
+    final_text: str,
+    search: Callable[[str], Awaitable[str]],
+    judge_votes: int = 1,
+    grounding_votes: int = 1,
+    max_tokens: int = 600,
+) -> dict[str, Any]:
+    """Score a faithful session by outcome and grounded final answer.
+
+    The scorer uses intent extraction from captured prompts to judge whether the
+    final request intent was met, constraints were respected, and whether the
+    final answer is sufficiently grounded.
+    """
+    spec = await derive_ironuser_spec(
+        api_client,
+        model,
+        captured_prompts=captured_prompts,
+        max_tokens=max_tokens,
+    )
+    transcript_tuple = tuple(
+        (str(role), str(text)) for role, text in transcript if role is not None
+    )
+    intent = await judge_intent_met(
+        api_client,
+        model,
+        intent=spec.intent,
+        constraints=spec.constraints,
+        transcript=transcript_tuple,
+        votes=judge_votes,
+        max_tokens=max_tokens,
+    )
+    intent_met = bool(intent.get("intent_met"))
+    constraints_held = bool(intent.get("constraints_held"))
+
+    checklist_items = tuple(
+        item.strip() for item in (spec.intent, *spec.constraints) if item.strip()
+    )
+    grounding = await _verify_grounding_voted(
+        api_client,
+        model,
+        votes=grounding_votes,
+        task=spec.intent,
+        answer=final_text,
+        trajectory=final_text,
+        checklist_items=checklist_items,
+        search=search,
+    )
+    grounding_score = grounding.get("score")
+    grounding_ok = grounding_score is None or grounding_score >= 0.6
+
+    checks = {
+        "intent_met": intent_met,
+        "constraints_held": constraints_held,
+        "grounding_ok": grounding_ok,
+    }
+    return {
+        "passed": all(checks.values()),
+        "score": sum(1 for value in checks.values() if value) / len(checks),
+        "checks": checks,
+        "missing_capabilities": [],
+        "observed_capabilities": [],
+        "turn_count": len(transcript_tuple) // 2,
+        "intent_evidence": str(intent.get("evidence") or ""),
+        "grounding": grounding,
+    }
 
 
 def group_episodes_into_sessions(
@@ -622,6 +696,7 @@ class FaithfulSessionRunner:
                 "llm_fallback_count": llm_fallback_count,
                 "replay_hit_rate": replay_hit_rate,
                 "ended_reason": ended_reason,
+                "transcript": tuple(transcript),
                 "state_delta": state_delta,
             },
         )

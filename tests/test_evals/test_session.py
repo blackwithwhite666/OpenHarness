@@ -29,10 +29,12 @@ from openharness.evals import (
     SessionReplayRunner,
     UserTurn,
     derive_ironuser_spec,
+    score_faithful_session,
     group_episodes_into_sessions,
     replay_matches,
     score_session,
 )
+from openharness.evals.judge import judge_intent_met
 from openharness.tools.base import BaseTool, ToolExecutionContext, ToolResult
 
 
@@ -347,6 +349,97 @@ async def test_derive_ironuser_spec_falls_back_on_unparseable_output():
         known_info=(),
         constraints=(),
     )
+
+
+@pytest.mark.asyncio
+async def test_judge_intent_met_uses_votes_and_majority_with_parse_fallback(monkeypatch):
+    responses = iter(
+        (
+            '{"intent_met": true, "constraints_held": true, "evidence": "signal one"}',
+            "not json",
+            '{"intent_met": false, "constraints_held": false, "evidence": "signal three"}',
+        )
+    )
+
+    async def fake_complete_text(*_args, **_kwargs):
+        return next(responses)
+
+    monkeypatch.setattr("openharness.evals.judge._complete_text", fake_complete_text)
+    result = await judge_intent_met(
+        object(),
+        "sim-model",
+        intent="book dinner",
+        constraints=("seafood only",),
+        transcript=(("user", "book dinner"), ("assistant", "done")),
+        votes=3,
+    )
+
+    assert result["intent_met"] is False
+    assert result["constraints_held"] is False
+    assert result["evidence"] == "signal one"
+    assert result["votes"] == 3
+
+
+@pytest.mark.asyncio
+async def test_score_faithful_session_uses_and_checks_intent_and_grounding(monkeypatch):
+    async def fake_derive_ironuser_spec(*_args, **_kwargs):
+        return IronUserSpec(
+            intent="book dinner",
+            known_info=("date after tonight",),
+            constraints=("seafood only",),
+        )
+
+    async def fake_judge_intent_met(*_args, **_kwargs):
+        return {
+            "intent_met": True,
+            "constraints_held": True,
+            "evidence": "met via different tool path",
+            "votes": 1,
+        }
+
+    async def fake_verify_grounding(*_args, **_kwargs):
+        return {
+            "score": 0.8,
+            "status": "scored",
+            "verified": 1,
+            "refuted": 0,
+            "claims": [],
+            "votes": 2,
+        }
+
+    monkeypatch.setattr("openharness.evals.session.derive_ironuser_spec", fake_derive_ironuser_spec)
+    monkeypatch.setattr("openharness.evals.session.judge_intent_met", fake_judge_intent_met)
+    monkeypatch.setattr(
+        "openharness.evals.session._verify_grounding_voted", fake_verify_grounding
+    )
+
+    result = await score_faithful_session(
+        object(),
+        "agent-model",
+        captured_prompts=(
+            "find a seafood place",
+            "then book an available table",
+        ),
+        transcript=(
+            ("user", "find a place"),
+            ("assistant", "I looked up options and made notes"),
+            ("user", "proceed with booking"),
+            ("assistant", "booked with maps tool"),
+        ),
+        final_text="done",
+        search=lambda q: "search: " + q,
+        judge_votes=1,
+        grounding_votes=2,
+    )
+
+    assert result["passed"] is True
+    assert result["score"] == 1.0
+    assert result["checks"] == {
+        "intent_met": True,
+        "constraints_held": True,
+        "grounding_ok": True,
+    }
+    assert result["intent_evidence"] == "met via different tool path"
 
 
 @pytest.mark.asyncio

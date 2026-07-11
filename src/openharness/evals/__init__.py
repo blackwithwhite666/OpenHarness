@@ -171,6 +171,7 @@ from openharness.evals.session import (
     SessionReplayRunner,
     gold_capabilities_for_session,
     group_episodes_into_sessions,
+    score_faithful_session,
     score_session,
     segment_sessions_into_conversations,
 )
@@ -375,6 +376,7 @@ __all__ = [
     "run_execution_report",
     "run_replay_report",
     "replay_matches",
+    "score_faithful_session",
     "score_session",
     "select_case_drafts",
     "segment_sessions_into_conversations",

@@ -19,6 +19,7 @@ from openharness.evals import (
     EvalExecutionContext,
     FsSandboxAgentRunner,
     LiveReadAgentRunner,
+    IronUserSpec,
     ReplayToolsExecutor,
     SynthContext,
     promote_case_drafts,
@@ -271,6 +272,34 @@ def test_run_ohmo_session_eval_faithful_preset_records_sandbox_state_delta(
     )
     monkeypatch.setattr(runner_module, "_ohmo_sandbox_tool_factory", _fake_tool_factory)
     monkeypatch.setattr(runner_module, "_ohmo_sandbox_state", _fake_state)
+    async def fake_spec(*_args, **_kwargs):
+        return IronUserSpec(
+            intent="find weather",
+            known_info=("city is hidden",),
+            constraints=("be concise",),
+        )
+
+    async def fake_judge(*_args, **_kwargs):
+        return {
+            "intent_met": True,
+            "constraints_held": True,
+            "evidence": "goal reached",
+            "votes": 1,
+        }
+
+    async def fake_grounding(*_args, **_kwargs):
+        return {
+            "score": 0.9,
+            "status": "scored",
+            "verified": 1,
+            "refuted": 0,
+            "claims": [],
+            "votes": 1,
+        }
+
+    monkeypatch.setattr("openharness.evals.session.derive_ironuser_spec", fake_spec)
+    monkeypatch.setattr("openharness.evals.session.judge_intent_met", fake_judge)
+    monkeypatch.setattr("openharness.evals.session._verify_grounding_voted", fake_grounding)
 
     faithful_result = run_ohmo_session_eval(
         workspace=workspace,
@@ -283,6 +312,15 @@ def test_run_ohmo_session_eval_faithful_preset_records_sandbox_state_delta(
         "session-query-engine-faithful"
     )
     faithful_case = faithful_result.write.report.cases[0]
+    assert set(faithful_case.checks.keys()) == {
+        "intent_met",
+        "constraints_held",
+        "grounding_ok",
+    }
+    assert faithful_case.checks["intent_met"] is True
+    assert faithful_case.checks["constraints_held"] is True
+    assert faithful_case.checks["grounding_ok"] is True
+    assert faithful_case.checks.get("capability_coverage") is None
     assert faithful_case.metadata["state_delta"] is not None
     assert faithful_case.turn_count == 2
     assert tool_calls == ["bash", "bash"]

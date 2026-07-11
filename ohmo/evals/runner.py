@@ -17,6 +17,7 @@ from openharness.api.resolver import (
 )
 from openharness.config import load_settings
 from openharness.config.settings import Settings
+from openharness.evals.executor import _run_eval_coroutine
 from openharness.evals import (
     CachingApiClient,
     CompletionCache,
@@ -46,12 +47,14 @@ from openharness.evals import (
     derive_case_rubric,
     gold_capabilities_for_session,
     group_episodes_into_sessions,
+    score_faithful_session,
     read_run_pack,
     resolve_execution_scorer,
     run_execution_report,
     score_session,
     segment_sessions_into_conversations,
 )
+from openharness.evals.judge import _default_grounding_search
 from openharness.evals.runner import _report_output_path, _stable_id
 from openharness.evals.state import compute_episode_state_delta, extract_state_keys
 from openharness.prompts import build_runtime_system_prompt
@@ -401,6 +404,8 @@ def run_ohmo_session_eval(
     gap_minutes: float = 30.0,
     min_turns: int = 2,
     user_sim_goal_anchored: bool = True,
+    judge_votes: int = 1,
+    grounding_votes: int = 1,
     preset: str = "inner",
 ) -> OhmoSessionEvalRunResult:
     """Run P0 session replay checks over captured Ohmo eval episodes.
@@ -425,6 +430,10 @@ def run_ohmo_session_eval(
         raise ValueError("gap_minutes must be positive")
     if min_turns < 1:
         raise ValueError("min_turns must be positive")
+    if judge_votes < 1:
+        raise ValueError("judge_votes must be positive")
+    if grounding_votes < 1:
+        raise ValueError("grounding_votes must be positive")
     fixture_match = _validate_fixture_match(fixture_match)
     preset = preset.strip().lower()
     if preset not in {"inner", "faithful"}:
@@ -538,6 +547,8 @@ def run_ohmo_session_eval(
             gold_capabilities_by_session=gold_capabilities_by_session,
             user_simulator_factory=user_simulator_factory,
             clarification_allowed_by_session=clarification_allowed_by_session,
+            judge_votes=judge_votes,
+            grounding_votes=grounding_votes,
         )
         for group in groups
     ]
@@ -579,6 +590,8 @@ def run_ohmo_session_eval(
             ),
             "limit": limit or 0,
             "samples": samples,
+            "judge_votes": judge_votes,
+            "grounding_votes": grounding_votes,
         },
     )
     path = _report_output_path(store, report_filename)
@@ -1287,6 +1300,8 @@ def _run_session_report_case_sampled(
     gold_capabilities_by_session: Mapping[str, Sequence[str]] | None,
     user_simulator_factory: Callable[[], UserSimulator] | None,
     clarification_allowed_by_session: Mapping[str, bool] | None,
+    judge_votes: int,
+    grounding_votes: int,
 ) -> EvalSessionReportCase:
     first = _run_session_report_case(
         store=store,
@@ -1295,6 +1310,8 @@ def _run_session_report_case_sampled(
         gold_capabilities_by_session=gold_capabilities_by_session,
         user_simulator_factory=user_simulator_factory,
         clarification_allowed_by_session=clarification_allowed_by_session,
+        judge_votes=judge_votes,
+        grounding_votes=grounding_votes,
     )
     if samples == 1:
         return first
@@ -1309,6 +1326,8 @@ def _run_session_report_case_sampled(
                 gold_capabilities_by_session=gold_capabilities_by_session,
                 user_simulator_factory=user_simulator_factory,
                 clarification_allowed_by_session=clarification_allowed_by_session,
+                judge_votes=judge_votes,
+                grounding_votes=grounding_votes,
             )
         )
     pass_count = sum(1 for case in sample_cases if case.status == "passed")
@@ -1335,6 +1354,8 @@ def _run_session_report_case(
     gold_capabilities_by_session: Mapping[str, Sequence[str]] | None,
     user_simulator_factory: Callable[[], UserSimulator] | None,
     clarification_allowed_by_session: Mapping[str, bool] | None,
+    judge_votes: int,
+    grounding_votes: int,
 ) -> EvalSessionReportCase:
     gold_source = (
         "provided"
@@ -1351,23 +1372,58 @@ def _run_session_report_case(
     state_changed = (
         None if state_delta is None else bool(state_delta.get("changed") is True)
     )
-    result = runner.run(
-        group=group,
-        store=store,
-        user_simulator=(
-            user_simulator_factory() if user_simulator_factory is not None else None
-        ),
+    user_simulator = (
+        user_simulator_factory() if user_simulator_factory is not None else None
     )
+    result = (
+        runner.run(
+            group=group,
+            store=store,
+            user_simulator=user_simulator,
+        )
+        if not isinstance(runner, FaithfulSessionRunner)
+        else _run_eval_coroutine(
+            runner.run_session(
+                group=group,
+                store=store,
+                user_simulator=user_simulator,
+            )
+        )
+    )
+    captured_prompts_list: list[str] = []
+    for episode_id in group.episode_ids:
+        episode = store.get_episode(episode_id)
+        if episode is None:
+            captured_prompts_list.append("")
+        else:
+            captured_prompts_list.append(episode.user_goal or episode.user_text)
+    captured_prompts = tuple(captured_prompts_list)
     clarification_allowed = bool(
         clarification_allowed_by_session
         and clarification_allowed_by_session.get(group.session_id, False)
     )
-    score_payload = score_session(
-        result,
-        gold_capabilities=gold_capabilities,
-        state_changed=state_changed,
-        clarification_allowed=clarification_allowed,
-    )
+    score_payload: dict
+    if isinstance(runner, FaithfulSessionRunner):
+        transcript = result.metadata.get("transcript", ())
+        score_payload = _run_eval_coroutine(
+            score_faithful_session(
+                runner._api_client,
+                runner._model,
+                captured_prompts=captured_prompts,
+                transcript=transcript,
+                final_text=result.final_text,
+                search=_default_grounding_search,
+                judge_votes=judge_votes,
+                grounding_votes=grounding_votes,
+            )
+        )
+    else:
+        score_payload = score_session(
+            result,
+            gold_capabilities=gold_capabilities,
+            state_changed=state_changed,
+            clarification_allowed=clarification_allowed,
+        )
     metadata = {
         "episode_count": len(group.episode_ids),
         "gold_source": gold_source,
