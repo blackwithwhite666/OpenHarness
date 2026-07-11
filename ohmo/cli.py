@@ -2558,6 +2558,11 @@ def evals_run_session_cmd(
         "--user-sim-model",
         help="Model override for the hybrid user simulator",
     ),
+    user_sim_goal_anchored: bool = typer.Option(
+        True,
+        "--user-sim-goal-anchored/--no-user-sim-goal-anchored",
+        help="Keep the hybrid user simulator anchored to the captured user intent",
+    ),
     fixture_match: str = typer.Option(
         "args_then_order",
         "--fixture-match",
@@ -2619,6 +2624,7 @@ def evals_run_session_cmd(
             system_prompt=system_prompt,
             user_sim_profile=user_sim_profile,
             user_sim_model=user_sim_model,
+            user_sim_goal_anchored=user_sim_goal_anchored,
             fixture_match=fixture_match,
             max_session_turns=max_session_turns,
             max_turns=max_turns,

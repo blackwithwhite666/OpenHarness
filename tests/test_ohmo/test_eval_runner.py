@@ -281,6 +281,10 @@ def test_run_ohmo_session_eval_hybrid_user_sim_profile_records_metrics(
     assert case.metadata["replay_hit_rate"] == 0.5
     assert case.metadata["llm_fallback_count"] == 1
     assert case.metadata["ended_reason"] == "captured_exhausted"
+    assert len(user_client.requests) == 2
+    fallback_prompt = user_client.requests[1].messages[0].text
+    assert "reveal known_info only when asked" in fallback_prompt.lower()
+    assert "do not volunteer" in fallback_prompt.lower()
 
     serialized = result.write.path.read_text(encoding="utf-8")
     assert "private ohmo first request" not in serialized

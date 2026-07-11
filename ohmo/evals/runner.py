@@ -399,6 +399,7 @@ def run_ohmo_session_eval(
     segment: bool = False,
     gap_minutes: float = 30.0,
     min_turns: int = 2,
+    user_sim_goal_anchored: bool = True,
 ) -> OhmoSessionEvalRunResult:
     """Run P0 session replay checks over captured Ohmo eval episodes.
 
@@ -472,6 +473,7 @@ def run_ohmo_session_eval(
                     api_client=user_sim_config.api_client,
                     model=user_sim_config.model,
                     system_prompt=user_sim_config.system_prompt,
+                    goal_anchored=user_sim_goal_anchored,
                 ),
             )
 

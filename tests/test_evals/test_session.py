@@ -3,6 +3,8 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import pytest
+
 from openharness.api.client import ApiMessageCompleteEvent
 from openharness.api.usage import UsageSnapshot
 from openharness.engine.messages import (
@@ -19,9 +21,12 @@ from openharness.evals import (
     EvalSessionTurnResult,
     EvalStore,
     HybridUserSimulator,
+    IronUserSpec,
+    LlmUserSimulator,
     ReplayUserSimulator,
     SessionReplayRunner,
     UserTurn,
+    derive_ironuser_spec,
     group_episodes_into_sessions,
     replay_matches,
     score_session,
@@ -151,6 +156,86 @@ def test_replay_matches_core_capability_sets():
         ("bash:calendar-cli create",),
         ("bash:weather-cli forecast",),
     )
+
+
+@pytest.mark.asyncio
+async def test_derive_ironuser_spec_extracts_json_fields():
+    client = _RecordingTextApiClient(
+        '{"intent":"Book a seafood dinner after the 29th.",'
+        '"known_info":["the date must be after the 29th","the restaurant is Vinci"],'
+        '"constraints":["seafood only","cite the source page"]}'
+    )
+
+    spec = await derive_ironuser_spec(
+        client,
+        "sim-model",
+        captured_prompts=(
+            "Find a seafood restaurant.",
+            "After the 29th, and it is Vinci not Vince.",
+        ),
+    )
+
+    assert spec.intent == "Book a seafood dinner after the 29th."
+    assert spec.known_info == (
+        "the date must be after the 29th",
+        "the restaurant is Vinci",
+    )
+    assert spec.constraints == ("seafood only", "cite the source page")
+
+
+@pytest.mark.asyncio
+async def test_derive_ironuser_spec_falls_back_on_unparseable_output():
+    client = _RecordingTextApiClient("not json")
+
+    spec = await derive_ironuser_spec(
+        client,
+        "sim-model",
+        captured_prompts=("Find a seafood restaurant.",),
+    )
+
+    assert spec == IronUserSpec(
+        intent="Find a seafood restaurant.",
+        known_info=(),
+        constraints=(),
+    )
+
+
+@pytest.mark.asyncio
+async def test_goal_anchored_llm_user_simulator_prompts_from_spec_and_ends():
+    client = _RecordingTextApiClient(
+        '{"intent":"Book a seafood dinner after the 29th.",'
+        '"known_info":["the date must be after the 29th"],'
+        '"constraints":["seafood only"]}',
+        '{"message": null, "ended_reason": "intent_met"}',
+    )
+    simulator = LlmUserSimulator(
+        api_client=client,
+        model="sim-model",
+        system_prompt="SIM_SYSTEM",
+        goal_anchored=True,
+    )
+
+    turn = await simulator.next_turn(
+        transcript=(
+            ("user", "Find a seafood restaurant."),
+            ("assistant", "Booked a seafood dinner after the 29th."),
+        ),
+        captured_prompts=(
+            "Find a seafood restaurant.",
+            "After the 29th, and seafood only.",
+        ),
+        captured_capabilities=(),
+        index=1,
+        last_turn=None,
+    )
+
+    assert turn is None
+    assert simulator.ended_reason == "intent_met"
+    assert len(client.requests) == 2
+    prompt = client.requests[1].messages[0].text
+    assert "Book a seafood dinner after the 29th." in prompt
+    assert "reveal known_info only when asked" in prompt.lower()
+    assert "do not volunteer" in prompt.lower()
 
 
 def test_hybrid_user_simulator_falls_back_after_divergence(tmp_path: Path):
@@ -402,6 +487,23 @@ class _OneTurnUserSimulator:
             return UserTurn("private synthetic answer", "llm_fallback")
         self.ended_reason = "model_done"
         return None
+
+
+class _RecordingTextApiClient:
+    def __init__(self, *responses: str) -> None:
+        self.responses = list(responses)
+        self.requests = []
+
+    async def stream_message(self, request):
+        self.requests.append(request)
+        text = self.responses.pop(0) if self.responses else ""
+        yield ApiMessageCompleteEvent(
+            message=ConversationMessage(
+                role="assistant",
+                content=[TextBlock(text=text)],
+            ),
+            usage=UsageSnapshot(input_tokens=1, output_tokens=1),
+        )
 
 
 def _append_episode(
