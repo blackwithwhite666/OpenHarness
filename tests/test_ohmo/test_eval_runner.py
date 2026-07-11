@@ -16,6 +16,7 @@ from openharness.evals import (
     EvalEpisode,
     EvalEvent,
     EvalExecutionContext,
+    EvalSessionReportCase,
 )
 from openharness.evals import (
     FsSandboxAgentRunner,
@@ -373,6 +374,7 @@ def test_run_ohmo_session_eval_faithful_preset_records_sandbox_state_delta(
     assert len(runner_instances) == 1
     assert len(runner_instances[0].prompts) == 2
     assert "assistant: wrote ok" in runner_instances[0].prompts[1]
+
     assert len(set(runner_instances[0].workspaces)) == 1
     assert not runner_instances[0].workspaces[0].exists()
 
@@ -388,6 +390,56 @@ def test_run_ohmo_session_eval_faithful_preset_records_sandbox_state_delta(
     assert "state_delta" not in inner_case.metadata
     assert len(runner_calls) == 2
     assert runner_calls[1]["agent_runner_name"] == "query-engine"
+
+
+def test_run_session_report_case_sampled_includes_check_rates(monkeypatch):
+    cases = (
+        EvalSessionReportCase(
+            session_id="session-id",
+            status="passed",
+            score=1.0,
+            checks={"intent_met": True, "grounding_ok": True},
+        ),
+        EvalSessionReportCase(
+            session_id="session-id",
+            status="failed",
+            score=0.0,
+            checks={"intent_met": True, "grounding_ok": False},
+        ),
+        EvalSessionReportCase(
+            session_id="session-id",
+            status="passed",
+            score=1.0,
+            checks={"intent_met": False, "grounding_ok": False},
+        ),
+    )
+    iterator = iter(cases)
+
+    def fake_run_session_report_case(*args, **kwargs):
+        return next(iterator)
+
+    monkeypatch.setattr(
+        "ohmo.evals.runner._run_session_report_case", fake_run_session_report_case
+    )
+
+    case = runner_module._run_session_report_case_sampled(
+        store=object(),
+        group=object(),
+        runner=object(),
+        samples=3,
+        gold_capabilities_by_session=None,
+        user_simulator_factory=None,
+        clarification_allowed_by_session=None,
+        judge_votes=1,
+        grounding_votes=1,
+    )
+
+    assert case.metadata["sample_count"] == 3
+    assert case.metadata["pass_count"] == 2
+    assert case.metadata["pass_rate"] == pytest.approx(2 / 3)
+    assert case.metadata["flaky"] is True
+    assert case.metadata["check_rates"]["intent_met"] == pytest.approx(2 / 3)
+    assert case.metadata["check_rates"]["grounding_ok"] == pytest.approx(1 / 3)
 
 
 def test_run_ohmo_session_eval_hybrid_user_sim_profile_records_metrics(
