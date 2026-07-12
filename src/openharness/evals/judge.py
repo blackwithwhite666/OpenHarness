@@ -339,9 +339,14 @@ GROUNDING_EXTRACT_SYSTEM_PROMPT = (
     "- relevant: true ONLY if the claim is central to answering the user's "
     "request (or matches one of the task's key facts); false for incidental or "
     "padding trivia that does not address what the user actually asked.\n"
+    "If the answer says the agent created, wrote, saved, attached, or published "
+    "an artifact/file/URL, extract that as kind='action' so it can be checked "
+    "against the trajectory; do NOT set sandbox_blocked merely because a file, "
+    "attachment, or artifact is mentioned.\n"
     "If the answer makes NO substantive claim because a required INPUT was "
     "missing -- it only asks a clarifying question, or says it cannot open/read "
-    "an attachment/file -- set sandbox_blocked=true. Output ONE fenced ```json block."
+    "an attachment/file -- set sandbox_blocked=true. Also set sandbox_blocked=true "
+    "for an empty answer. Output ONE fenced ```json block."
 )
 GROUNDING_VERDICT_SYSTEM_PROMPT = (
     "You verify claims against evidence. Each claim carries its kind and its "
