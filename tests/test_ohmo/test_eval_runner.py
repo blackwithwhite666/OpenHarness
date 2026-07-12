@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -205,6 +206,93 @@ def test_run_ohmo_session_eval_writes_metadata_only_report(
     assert "private raw tool output" not in serialized
     assert "private model final" not in serialized
     assert "SECRET_CITY" not in serialized
+
+
+def test_run_ohmo_session_eval_appends_progress_per_sampled_session(
+    tmp_path: Path,
+    monkeypatch,
+):
+    workspace = tmp_path / "workspace"
+    store = get_eval_store(workspace)
+    for number in (1, 2):
+        store.append_episode(
+            EvalEpisode(
+                episode_id=f"ep-{number}",
+                source="gateway",
+                app="ohmo",
+                session_id=f"session-{number}",
+                user_text=f"private ohmo request {number}",
+            )
+        )
+    report_path = workspace.resolve() / "evals/reports/custom_session_report.json"
+    progress_path = workspace.resolve() / "evals/reports/custom_session_report.progress.jsonl"
+    cases = [
+        EvalSessionReportCase(
+            session_id="session-1", status="passed", score=2 / 3,
+            checks={"intent_met": True},
+            metadata={"pass_rate": 2 / 3, "flaky": True, "check_rates": {"intent_met": 2 / 3}},
+        ),
+        EvalSessionReportCase(
+            session_id="session-2", status="failed", score=0.0,
+            checks={"intent_met": False},
+            metadata={"pass_rate": 0.0, "check_rates": {"intent_met": 0.0}},
+        ),
+    ]
+    calls: list[str] = []
+
+    def fake_build_agent_runner_config(agent_runner_name, *, workspace, **_kwargs):
+        return runner_module._AgentRunnerConfig(
+            agent_runner=object(),
+            agent_runner_name=agent_runner_name,
+            model="fake-model",
+            provider_profile="fake-profile",
+            api_client=object(),
+            system_prompt="FAKE_PROMPT",
+            cwd=workspace,
+        )
+
+    def fake_run_session_report_case_sampled(*, group, **_kwargs):
+        if calls:
+            assert json.loads(progress_path.read_text().splitlines()[0])["session_id"] == (
+                "session-1"
+            )
+        calls.append(group.session_id)
+        return cases[len(calls) - 1]
+
+    monkeypatch.setattr(
+        runner_module,
+        "_build_agent_runner_config",
+        fake_build_agent_runner_config,
+    )
+    monkeypatch.setattr(
+        runner_module,
+        "_run_session_report_case_sampled",
+        fake_run_session_report_case_sampled,
+    )
+
+    result = run_ohmo_session_eval(
+        workspace=workspace,
+        report_filename="custom_session_report.json",
+        samples=3,
+    )
+
+    assert result.write.path == report_path
+    assert result.write.report.passed_count == 1
+    assert result.write.report.failed_count == 1
+    assert calls == ["session-1", "session-2"]
+    assert result.write.report.cases[0].metadata["pass_rate"] == pytest.approx(2 / 3)
+
+    records = [json.loads(line) for line in progress_path.read_text().splitlines()]
+    assert len(records) == 2
+    assert records[0]["index"] == 1
+    assert records[0]["total"] == 2
+    assert records[0]["session_id"] == "session-1"
+    assert records[0]["pass_rate"] == pytest.approx(2 / 3)
+    assert records[0]["flaky"] is True
+    assert records[0]["checks"]["intent_met"] == pytest.approx(2 / 3)
+    assert records[1]["session_id"] == "session-2"
+    assert records[1]["pass_rate"] == 0.0
+    assert records[1]["checks"] == {"intent_met": 0.0}
 
 
 class _FaithfulSessionEvalFsRunner:

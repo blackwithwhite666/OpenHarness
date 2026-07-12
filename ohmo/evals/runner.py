@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import tempfile
+import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -160,6 +161,46 @@ _USER_SIM_SYSTEM_PROMPT = (
     "original user goal and the conversation so far, reply as the user would. "
     "Return only the next user message."
 )
+
+
+def _session_progress_path(report_path: Path) -> Path:
+    return report_path.with_name(f"{report_path.stem}.progress.jsonl")
+
+
+def _append_session_progress(
+    progress_path: Path,
+    *,
+    index: int,
+    total: int,
+    case: EvalSessionReportCase,
+) -> None:
+    metadata = case.metadata or {}
+    checks = metadata.get("check_rates") or case.checks or {}
+    try:
+        progress_path.parent.mkdir(parents=True, exist_ok=True)
+        with progress_path.open("a", encoding="utf-8") as progress_file:
+            progress_file.write(
+                json.dumps(
+                    {
+                        "index": index,
+                        "total": total,
+                        "session_id": case.session_id,
+                        "status": case.status,
+                        "checks": dict(checks),
+                        "pass_rate": metadata.get(
+                            "pass_rate",
+                            1.0 if case.status == "passed" else 0.0,
+                        ),
+                        "flaky": bool(metadata.get("flaky", False)),
+                        "ts": time.time(),
+                    },
+                    sort_keys=True,
+                )
+                + "\n"
+            )
+            progress_file.flush()
+    except Exception:
+        pass
 
 
 def run_ohmo_eval_report(
@@ -581,8 +622,12 @@ def run_ohmo_session_eval(
             max_turns=max_turns,
             synth_context=synth_context,
         )
-    cases = [
-        _run_session_report_case_sampled(
+    path = _report_output_path(store, report_filename)
+    progress_path = _session_progress_path(path)
+    cases = []
+    total = len(groups)
+    for index, group in enumerate(groups, start=1):
+        case = _run_session_report_case_sampled(
             store=store,
             group=group,
             runner=runner,
@@ -593,8 +638,13 @@ def run_ohmo_session_eval(
             judge_votes=judge_votes,
             grounding_votes=grounding_votes,
         )
-        for group in groups
-    ]
+        cases.append(case)
+        _append_session_progress(
+            progress_path,
+            index=index,
+            total=total,
+            case=case,
+        )
     passed_count = sum(1 for case in cases if case.status == "passed")
     failed_count = len(cases) - passed_count
     mean_replay_hit_rate = (
@@ -637,7 +687,6 @@ def run_ohmo_session_eval(
             "grounding_votes": grounding_votes,
         },
     )
-    path = _report_output_path(store, report_filename)
     atomic_write_text(path, report.model_dump_json(indent=2) + "\n")
     return OhmoSessionEvalRunResult(
         write=OhmoSessionEvalReportWrite(
