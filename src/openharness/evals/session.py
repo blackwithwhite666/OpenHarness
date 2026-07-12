@@ -138,7 +138,7 @@ async def score_faithful_session(
         votes=grounding_votes,
         task=spec.intent,
         answer=final_text,
-        trajectory=final_text,
+        trajectory=_serialize_transcript_for_grounding(transcript_tuple),
         checklist_items=checklist_items,
         search=search,
     )
@@ -158,8 +158,21 @@ async def score_faithful_session(
         "observed_capabilities": [],
         "turn_count": len(transcript_tuple) // 2,
         "intent_evidence": str(intent.get("evidence") or ""),
+        "grounding_task": spec.intent,
+        "constraints": list(spec.constraints),
         "grounding": grounding,
     }
+
+
+def _serialize_transcript_for_grounding(
+    transcript: Sequence[tuple[str, str]],
+) -> str:
+    lines = [
+        f"{role}: {text.strip()}"
+        for role, text in transcript
+        if str(text).strip()
+    ]
+    return "\n".join(lines) if lines else "No observed transcript."
 
 
 def group_episodes_into_sessions(

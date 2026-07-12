@@ -389,7 +389,10 @@ async def test_score_faithful_session_uses_and_checks_intent_and_grounding(monke
             "votes": 1,
         }
 
-    async def fake_verify_grounding(*_args, **_kwargs):
+    grounding_kwargs = {}
+
+    async def fake_verify_grounding(*_args, **kwargs):
+        grounding_kwargs.update(kwargs)
         return {
             "score": 0.8,
             "status": "scored",
@@ -432,6 +435,14 @@ async def test_score_faithful_session_uses_and_checks_intent_and_grounding(monke
         "grounding_ok": True,
     }
     assert result["intent_evidence"] == "met via different tool path"
+    assert result["constraints"] == ["seafood only"]
+    assert grounding_kwargs["answer"] == "done"
+    assert grounding_kwargs["trajectory"] == (
+        "user: find a place\n"
+        "assistant: I looked up options and made notes\n"
+        "user: proceed with booking\n"
+        "assistant: booked with maps tool"
+    )
 
 
 @pytest.mark.asyncio

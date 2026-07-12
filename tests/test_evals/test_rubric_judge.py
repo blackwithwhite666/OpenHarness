@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from openharness.api.client import ApiMessageCompleteEvent
 from openharness.api.usage import UsageSnapshot
 from openharness.engine.messages import ConversationMessage, TextBlock
@@ -17,7 +19,7 @@ from openharness.evals import (
     RubricJudgeScorer,
     derive_case_rubric,
 )
-from openharness.evals.judge import _aggregate_v2, _parse_v2_scores
+from openharness.evals.judge import _aggregate_v2, _parse_v2_scores, _verify_grounding
 
 
 class _StaticJudgeApiClient:
@@ -397,6 +399,144 @@ def test_verify_grounding_action_claim_refuted_against_trajectory(tmp_path: Path
     assert result.metadata["grounding_status"] == "scored"
     assert result.metadata["grounding_refuted"] == 1
     assert result.metadata["grounding_claims"][0]["kind"] == "action"
+
+
+@pytest.mark.asyncio
+async def test_verify_grounding_artifact_action_supported_by_trajectory() -> None:
+    extract = _wrap(
+        {
+            "sandbox_blocked": False,
+            "claims": [
+                {
+                    "id": "a1",
+                    "text": "Created and published index.html at https://example.test/index.html",
+                    "kind": "action",
+                    "public": False,
+                    "relevant": True,
+                    "query": "",
+                }
+            ],
+        }
+    )
+    verdict = _wrap(
+        {
+            "verdicts": [
+                {
+                    "id": "a1",
+                    "verdict": "verified",
+                    "evidence": "write_file and publish succeeded",
+                }
+            ]
+        }
+    )
+    client = _RoutedJudgeApiClient(rubric="", extract=extract, verdict=verdict)
+    search_queries: list[str] = []
+
+    async def fake_search(query: str, *, max_results: int = 5) -> str:
+        del max_results
+        search_queries.append(query)
+        return "unexpected web search"
+
+    result = await _verify_grounding(
+        client,
+        "m",
+        task="Create and publish an HTML page.",
+        answer="Created and published index.html at https://example.test/index.html",
+        trajectory=(
+            "tool: write_file args={'path': 'index.html'} output=ok\n"
+            "tool: publish args={'path': 'index.html'} "
+            "output=https://example.test/index.html"
+        ),
+        checklist_items=[],
+        search=fake_search,
+    )
+
+    assert result["status"] == "scored"
+    assert result["score"] == 1.0
+    assert result["verified"] == 1
+    assert result["refuted"] == 0
+    assert result["claims"][0]["kind"] == "action"
+    assert search_queries == []
+    verdict_prompt = client.requests[-1].messages[0].text
+    assert "write_file" in verdict_prompt
+    assert "https://example.test/index.html" in verdict_prompt
+
+
+@pytest.mark.asyncio
+async def test_verify_grounding_artifact_action_fabricated_without_trajectory() -> None:
+    extract = _wrap(
+        {
+            "sandbox_blocked": False,
+            "claims": [
+                {
+                    "id": "a1",
+                    "text": "Created and published index.html at https://example.test/index.html",
+                    "kind": "action",
+                    "public": False,
+                    "relevant": True,
+                    "query": "",
+                }
+            ],
+        }
+    )
+    verdict = _wrap(
+        {
+            "verdicts": [
+                {
+                    "id": "a1",
+                    "verdict": "refuted",
+                    "evidence": "trajectory has no create or publish action",
+                }
+            ]
+        }
+    )
+    client = _RoutedJudgeApiClient(rubric="", extract=extract, verdict=verdict)
+
+    async def fake_search(query: str, *, max_results: int = 5) -> str:
+        raise AssertionError(f"action claims should not web-search: {query} {max_results}")
+
+    result = await _verify_grounding(
+        client,
+        "m",
+        task="Create and publish an HTML page.",
+        answer="Created and published index.html at https://example.test/index.html",
+        trajectory="user: Create and publish an HTML page.\nassistant: I can do that.",
+        checklist_items=[],
+        search=fake_search,
+    )
+
+    assert result["status"] == "scored"
+    assert result["score"] == 0.0
+    assert result["verified"] == 0
+    assert result["refuted"] == 1
+    assert result["claims"][0]["verdict"] == "refuted"
+
+
+@pytest.mark.asyncio
+async def test_verify_grounding_empty_answer_still_sandbox_blocked() -> None:
+    client = _RoutedJudgeApiClient(rubric="", extract="", verdict="")
+
+    async def fake_search(query: str, *, max_results: int = 5) -> str:
+        raise AssertionError(f"empty answers should not web-search: {query} {max_results}")
+
+    result = await _verify_grounding(
+        client,
+        "m",
+        task="Create and publish an HTML page.",
+        answer="",
+        trajectory="tool: write_file args={'path': 'index.html'} output=ok",
+        checklist_items=[],
+        search=fake_search,
+    )
+
+    assert result == {
+        "score": 0.0,
+        "status": "sandbox_blocked",
+        "verified": 0,
+        "refuted": 0,
+        "claims": [],
+    }
+    assert client.requests == []
 
 
 def test_verify_grounding_irrelevant_padding_claims_excluded(tmp_path: Path):
