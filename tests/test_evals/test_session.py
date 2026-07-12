@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -249,6 +250,16 @@ def test_faithful_session_runner_uses_persistent_workspace_between_turns(
     assert runner_instances[0].prompts[0] == "user: private first turn"
     assert "user: private second turn" in runner_instances[0].prompts[1]
     assert "assistant: wrote state" in runner_instances[0].prompts[1]
+    assert result.tool_calls == (
+        EvalObservedCall(
+            tool_name="write_state",
+            arguments={"value": "persisted"},
+        ),
+        EvalObservedCall(
+            tool_name="read_state",
+            arguments={"value": "persisted"},
+        ),
+    )
 
 
 def test_session_replay_runner_default_matches_replay_simulator(tmp_path: Path):
@@ -422,6 +433,13 @@ async def test_score_faithful_session_uses_and_checks_intent_and_grounding(monke
             ("assistant", "booked with maps tool"),
         ),
         final_text="done",
+        tool_calls=(
+            EvalObservedCall(
+                tool_name="maps",
+                arguments={"query": "seafood table"},
+                output="booked with maps tool",
+            ),
+        ),
         search=lambda q: "search: " + q,
         judge_votes=1,
         grounding_votes=2,
@@ -437,12 +455,91 @@ async def test_score_faithful_session_uses_and_checks_intent_and_grounding(monke
     assert result["intent_evidence"] == "met via different tool path"
     assert result["constraints"] == ["seafood only"]
     assert grounding_kwargs["answer"] == "done"
-    assert grounding_kwargs["trajectory"] == (
-        "user: find a place\n"
-        "assistant: I looked up options and made notes\n"
-        "user: proceed with booking\n"
-        "assistant: booked with maps tool"
+    assert grounding_kwargs["trajectory"].startswith("TOOL CALLS:\n1. tool=maps")
+    assert '"query": "seafood table"' in grounding_kwargs["trajectory"]
+    assert "output=booked with maps tool" in grounding_kwargs["trajectory"]
+    assert "TRANSCRIPT:" in grounding_kwargs["trajectory"]
+    assert "assistant: booked with maps tool" in grounding_kwargs["trajectory"]
+
+
+@pytest.mark.asyncio
+async def test_score_faithful_session_action_supported_by_tool_call_log(monkeypatch):
+    _patch_faithful_session_goal_judges(monkeypatch)
+    client = _GatewayActionGroundingApiClient()
+    search_queries: list[str] = []
+
+    async def fake_search(query: str, *, max_results: int = 5) -> str:
+        del max_results
+        search_queries.append(query)
+        return "unexpected web search"
+
+    result = await score_faithful_session(
+        client,
+        "agent-model",
+        captured_prompts=("Read gateway.json and report access.",),
+        transcript=(("user", "Read gateway.json"),),
+        final_text=(
+            "I read gateway.json and it allows @blackwithwhite2 "
+            "(id 565123456), message count 42."
+        ),
+        tool_calls=(
+            EvalObservedCall(
+                tool_name="bash",
+                arguments={"cmd": "cat ~/.ohmo/gateway.json"},
+                output=(
+                    '{"telegram_id": 565123456, "username": "@blackwithwhite2", '
+                    '"message_count": 42}'
+                ),
+            ),
+        ),
+        search=fake_search,
     )
+
+    grounding = result["grounding"]
+    assert grounding["status"] == "scored"
+    assert grounding["verified"] == 1
+    assert grounding["refuted"] == 0
+    assert result["checks"]["grounding_ok"] is True
+    assert search_queries == []
+    verdict_prompt = client.requests[-1].messages[0].text
+    assert "TOOL CALLS:" in verdict_prompt
+    assert "cat ~/.ohmo/gateway.json" in verdict_prompt
+    assert "@blackwithwhite2" in verdict_prompt
+    assert "565123456" in verdict_prompt
+    assert "message_count" in verdict_prompt
+
+
+@pytest.mark.asyncio
+async def test_score_faithful_session_action_fabricated_without_tool_call_log(monkeypatch):
+    _patch_faithful_session_goal_judges(monkeypatch)
+    client = _GatewayActionGroundingApiClient()
+
+    async def fake_search(query: str, *, max_results: int = 5) -> str:
+        raise AssertionError(f"action claims should not web-search: {query} {max_results}")
+
+    result = await score_faithful_session(
+        client,
+        "agent-model",
+        captured_prompts=("Read gateway.json and report access.",),
+        transcript=(
+            ("user", "Read gateway.json"),
+            ("assistant", "I can inspect it."),
+        ),
+        final_text=(
+            "I read gateway.json and it allows @blackwithwhite2 "
+            "(id 565123456), message count 42."
+        ),
+        tool_calls=(),
+        search=fake_search,
+    )
+
+    grounding = result["grounding"]
+    assert grounding["status"] == "scored"
+    assert grounding["verified"] == 0
+    assert grounding["refuted"] == 1
+    assert result["checks"]["grounding_ok"] is False
+    verdict_prompt = client.requests[-1].messages[0].text
+    assert "No observed tool calls." in verdict_prompt
 
 
 @pytest.mark.asyncio
@@ -749,6 +846,98 @@ class _RecordingTextApiClient:
             ),
             usage=UsageSnapshot(input_tokens=1, output_tokens=1),
         )
+
+
+class _GatewayActionGroundingApiClient:
+    def __init__(self) -> None:
+        self.requests = []
+
+    async def stream_message(self, request):
+        self.requests.append(request)
+        system_prompt = (request.system_prompt or "").lower()
+        if "extract the checkable" in system_prompt:
+            text = _wrap_grounding_json(
+                {
+                    "sandbox_blocked": False,
+                    "claims": [
+                        {
+                            "id": "a1",
+                            "text": (
+                                "The agent read gateway.json and found access for "
+                                "@blackwithwhite2 id 565123456 with message count 42"
+                            ),
+                            "kind": "action",
+                            "public": False,
+                            "relevant": True,
+                            "query": "",
+                        }
+                    ],
+                }
+            )
+        elif "verify claims against evidence" in system_prompt:
+            prompt = request.messages[0].text
+            has_tool_evidence = (
+                "TOOL CALLS:" in prompt
+                and "cat ~/.ohmo/gateway.json" in prompt
+                and "@blackwithwhite2" in prompt
+                and "565123456" in prompt
+                and "message_count" in prompt
+                and "No observed tool calls." not in prompt
+            )
+            text = _wrap_grounding_json(
+                {
+                    "verdicts": [
+                        {
+                            "id": "a1",
+                            "verdict": "verified" if has_tool_evidence else "refuted",
+                            "evidence": (
+                                "gateway tool output supports claim"
+                                if has_tool_evidence
+                                else "no gateway tool output in trajectory"
+                            ),
+                        }
+                    ]
+                }
+            )
+        else:
+            text = "{}"
+        yield ApiMessageCompleteEvent(
+            message=ConversationMessage(
+                role="assistant",
+                content=[TextBlock(text=text)],
+            ),
+            usage=UsageSnapshot(input_tokens=1, output_tokens=1),
+        )
+
+
+def _patch_faithful_session_goal_judges(monkeypatch) -> None:
+    async def fake_derive_ironuser_spec(*_args, **_kwargs):
+        return IronUserSpec(
+            intent="Read gateway.json and report who is allowed.",
+            known_info=(),
+            constraints=(),
+        )
+
+    async def fake_judge_intent_met(*_args, **_kwargs):
+        return {
+            "intent_met": True,
+            "constraints_held": True,
+            "evidence": "answer addresses the gateway request",
+            "votes": 1,
+        }
+
+    monkeypatch.setattr(
+        "openharness.evals.session.derive_ironuser_spec",
+        fake_derive_ironuser_spec,
+    )
+    monkeypatch.setattr(
+        "openharness.evals.session.judge_intent_met",
+        fake_judge_intent_met,
+    )
+
+
+def _wrap_grounding_json(payload: dict) -> str:
+    return "Reasoning about grounding.\n```json\n" + json.dumps(payload) + "\n```"
 
 
 def _append_episode(

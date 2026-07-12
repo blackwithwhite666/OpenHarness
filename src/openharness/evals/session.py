@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 import shutil
@@ -25,6 +26,7 @@ from openharness.evals.execution import _INCIDENTAL_CAPABILITIES, _tool_fixtures
 from openharness.evals.executor import (
     EvalToolFixture,
     EvalExecutorResult,
+    EvalObservedCall,
     SynthContext,
     _run_eval_coroutine,
     build_replay_tool_registry,
@@ -84,6 +86,7 @@ class EvalSessionRunResult:
 
     session_id: str
     turns: tuple[EvalSessionTurnResult, ...] = ()
+    tool_calls: tuple[EvalObservedCall, ...] = ()
     union_capabilities: tuple[str, ...] = ()
     final_text: str = ""
     turn_count: int = 0
@@ -97,6 +100,7 @@ async def score_faithful_session(
     captured_prompts: Sequence[str],
     transcript: Sequence[tuple[str, str]],
     final_text: str,
+    tool_calls: Sequence[EvalObservedCall | Mapping[str, Any]] = (),
     search: Callable[[str], Awaitable[str]],
     judge_votes: int = 1,
     grounding_votes: int = 1,
@@ -138,7 +142,10 @@ async def score_faithful_session(
         votes=grounding_votes,
         task=spec.intent,
         answer=final_text,
-        trajectory=_serialize_transcript_for_grounding(transcript_tuple),
+        trajectory=_serialize_session_trajectory_for_grounding(
+            tool_calls=tool_calls,
+            transcript=transcript_tuple,
+        ),
         checklist_items=checklist_items,
         search=search,
     )
@@ -173,6 +180,102 @@ def _serialize_transcript_for_grounding(
         if str(text).strip()
     ]
     return "\n".join(lines) if lines else "No observed transcript."
+
+
+def _serialize_session_trajectory_for_grounding(
+    *,
+    tool_calls: Sequence[EvalObservedCall | Mapping[str, Any]],
+    transcript: Sequence[tuple[str, str]],
+    max_calls: int = 40,
+    max_output_chars: int = 240,
+    max_arg_chars: int = 160,
+    max_total_chars: int = 16_000,
+) -> str:
+    tool_block = _serialize_tool_calls_for_grounding(
+        tool_calls,
+        max_calls=max_calls,
+        max_output_chars=max_output_chars,
+        max_arg_chars=max_arg_chars,
+    )
+    trajectory = (
+        "TOOL CALLS:\n"
+        f"{tool_block}\n\n"
+        "TRANSCRIPT:\n"
+        f"{_serialize_transcript_for_grounding(transcript)}"
+    )
+    if len(trajectory) > max_total_chars:
+        return trajectory[:max_total_chars] + "\n... [trajectory truncated]"
+    return trajectory
+
+
+def _serialize_tool_calls_for_grounding(
+    tool_calls: Sequence[EvalObservedCall | Mapping[str, Any]],
+    *,
+    max_calls: int,
+    max_output_chars: int,
+    max_arg_chars: int,
+) -> str:
+    if not tool_calls:
+        return "No observed tool calls."
+
+    rows: list[str] = []
+    for index, call in enumerate(tool_calls[:max_calls], 1):
+        tool_name = str(_tool_call_field(call, "tool_name", "") or _tool_call_field(call, "name", ""))
+        arguments = _tool_call_field(call, "arguments", None)
+        if arguments is None:
+            arguments = _tool_call_field(call, "args", None)
+        if arguments is None:
+            arguments = _tool_call_field(call, "input", {})
+        output = _tool_call_field(call, "output", None)
+        if output is None:
+            output = _tool_call_field(call, "result", "")
+        is_error = bool(_tool_call_field(call, "is_error", False))
+        rows.append(
+            f"{index}. tool={tool_name or '<unknown>'} "
+            f"args={_format_tool_arguments(arguments, max_arg_chars=max_arg_chars)} "
+            f"is_error={str(is_error).lower()} "
+            f"output={_truncate_for_grounding(output, max_output_chars)}"
+        )
+
+    if len(tool_calls) > max_calls:
+        rows.append(f"... [{len(tool_calls) - max_calls} tool calls omitted]")
+    return "\n".join(rows)
+
+
+def _tool_call_field(
+    call: EvalObservedCall | Mapping[str, Any],
+    name: str,
+    default: Any,
+) -> Any:
+    if isinstance(call, Mapping):
+        return call.get(name, default)
+    return getattr(call, name, default)
+
+
+def _format_tool_arguments(arguments: Any, *, max_arg_chars: int) -> str:
+    if isinstance(arguments, Mapping):
+        compact = {
+            str(key): _truncate_for_grounding(value, max_arg_chars)
+            for key, value in list(arguments.items())[:8]
+        }
+        text = json.dumps(compact, ensure_ascii=True, sort_keys=True)
+        if len(arguments) > 8:
+            text = text[:-1] + ', "...": "arguments omitted"}'
+        return text
+    return _truncate_for_grounding(arguments, max_arg_chars)
+
+
+def _truncate_for_grounding(value: Any, max_chars: int) -> str:
+    if isinstance(value, str):
+        text = value.strip().replace("\n", " ")
+    else:
+        try:
+            text = json.dumps(value, ensure_ascii=True, sort_keys=True, default=str)
+        except TypeError:
+            text = str(value)
+    if len(text) > max_chars:
+        return text[:max_chars] + "..."
+    return text
 
 
 def group_episodes_into_sessions(
@@ -641,6 +744,7 @@ class FaithfulSessionRunner:
         agent_runner = self._build_default_agent_runner(session_workspace)
 
         turns: list[EvalSessionTurnResult] = []
+        session_tool_calls: list[EvalObservedCall] = []
         user_turn_sources: list[str] = []
         transcript: list[tuple[str, str]] = []
         simulator = user_simulator or ReplayUserSimulator(captured_prompts)
@@ -694,6 +798,7 @@ class FaithfulSessionRunner:
                     episode_id=episode_id,
                     result=executor_result,
                 )
+                session_tool_calls.extend(executor_result.tool_calls or ())
                 turns.append(turn)
                 user_turn_sources.append(user_turn.source)
                 transcript.append(("assistant", turn.final_text))
@@ -724,6 +829,7 @@ class FaithfulSessionRunner:
         return EvalSessionRunResult(
             session_id=group.session_id,
             turns=tuple(turns),
+            tool_calls=tuple(session_tool_calls),
             union_capabilities=tuple(union_capabilities),
             final_text=final_text,
             turn_count=len(turns),
