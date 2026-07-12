@@ -28,6 +28,10 @@ from openharness.evals.grounding_blame import (
     default_grounding_blame_output_path,
     read_faithful_session_report,
 )
+from openharness.evals.intent_blame import (
+    attribute_faithful_intent_report,
+    default_intent_blame_output_path,
+)
 from openharness.evals.meta_judge import MetaJudgeAttributor, summarize_attributions
 from openharness.utils.fs import atomic_write_text
 
@@ -2433,7 +2437,7 @@ def evals_meta_report_cmd(
     check: str = typer.Option(
         "all",
         "--check",
-        help="Failed check to attribute; faithful supports grounding or constraints",
+        help="Failed check to attribute; faithful supports intent, grounding, or constraints",
     ),
     output: str | None = typer.Option(None, "--output", help="Write attributions JSON"),
     workspace: str | None = typer.Option(None, "--workspace", help=_WORKSPACE_HELP),
@@ -2514,10 +2518,63 @@ def evals_meta_report_cmd(
                 )
                 print(f"Wrote meta-report JSON: {output_path}")
                 return
+            if check_value in {"intent", "intent_met"}:
+                selected_cases = [
+                    case for case in report.cases if case.checks.get("intent_met") is False
+                ]
+                attributor = None
+                if selected_cases:
+                    judge_config = _build_agent_runner_config(
+                        "query-engine",
+                        workspace=workspace_root,
+                        model=model,
+                        provider_profile=None,
+                        system_prompt=None,
+                    )
+                    if judge_config.api_client is None:
+                        raise ValueError("meta-report requires configured API authentication")
+                    attributor = MetaJudgeAttributor(
+                        api_client=judge_config.api_client,
+                        model=judge_config.model,
+                        votes=meta_votes,
+                    )
+                payload = attribute_faithful_intent_report(
+                    report,
+                    attributor=attributor,
+                )
+                attributions = payload["attributions"]
+                summary = payload["summary"]
+                print("session_id | intent[:60] | blame | subtype | evidence[:60]")
+                for item in attributions if isinstance(attributions, list) else []:
+                    evidence = str(item.get("evidence") or "")[:60]
+                    intent = str(item.get("intent") or "")[:60]
+                    print(
+                        f"{item.get('session_id')} | {intent} | "
+                        f"{item.get('blame')} | {item.get('subtype') or '-'} | "
+                        f"{evidence}"
+                    )
+                print("summary:")
+                print(f"counts: {json.dumps(summary['counts'], sort_keys=True, ensure_ascii=True)}")
+                print(f"harness_debt_pct: {summary['harness_debt_pct']}")
+                print(f"model_signal_pct: {summary['model_signal_pct']}")
+                print(f"intent_harness_debt_pct: {summary['intent_harness_debt_pct']}")
+                print(f"subtypes: {json.dumps(summary['subtypes'], sort_keys=True, ensure_ascii=True)}")
+                output_path = (
+                    Path(output).expanduser()
+                    if output
+                    else default_intent_blame_output_path(report_path)
+                )
+                atomic_write_text(
+                    output_path,
+                    json.dumps(payload, ensure_ascii=False, indent=2, default=str)
+                    + "\n",
+                )
+                print(f"Wrote meta-report JSON: {output_path}")
+                return
             if check_value not in {"grounding", "grounding_ok"}:
                 raise ValueError(
-                    "faithful meta-report currently supports --check grounding "
-                    "or --check constraints"
+                    "faithful meta-report currently supports --check grounding, "
+                    "--check constraints, or --check intent"
                 )
             selected_cases = [
                 case for case in report.cases if case.checks.get("grounding_ok") is False
