@@ -56,6 +56,7 @@ from openharness.evals import (
     segment_sessions_into_conversations,
 )
 from openharness.evals.grounding_blame import grounding_report_metadata
+from openharness.evals.constraint_blame import constraint_report_metadata
 from openharness.evals.judge import _default_grounding_search
 from openharness.evals.runner import _report_output_path, _stable_id
 from openharness.evals.state import compute_episode_state_delta, extract_state_keys
@@ -1554,6 +1555,12 @@ def _run_session_report_case(
         grounding_task = score_payload.get("grounding_task")
         if grounding_task is None:
             grounding_task = captured_prompts[-1] if captured_prompts else ""
+        metadata.update(
+            constraint_report_metadata(
+                constraints=score_payload.get("constraints", ()),
+                intent_evidence=score_payload.get("intent_evidence", ""),
+            )
+        )
         metadata.update(
             grounding_report_metadata(
                 score_payload.get("grounding"),

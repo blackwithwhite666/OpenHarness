@@ -432,6 +432,7 @@ async def test_score_faithful_session_uses_and_checks_intent_and_grounding(monke
         "grounding_ok": True,
     }
     assert result["intent_evidence"] == "met via different tool path"
+    assert result["constraints"] == ["seafood only"]
 
 
 @pytest.mark.asyncio

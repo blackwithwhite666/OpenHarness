@@ -159,6 +159,7 @@ async def score_faithful_session(
         "turn_count": len(transcript_tuple) // 2,
         "intent_evidence": str(intent.get("evidence") or ""),
         "grounding_task": spec.intent,
+        "constraints": list(spec.constraints),
         "grounding": grounding,
     }
 

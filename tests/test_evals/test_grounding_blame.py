@@ -283,6 +283,8 @@ def test_faithful_report_case_metadata_persists_bounded_grounding_detail(
             },
             "observed_capabilities": [],
             "missing_capabilities": [],
+            "constraints": ["include citations"],
+            "intent_evidence": "the answer missed a citation constraint",
             "grounding_task": "derived private request intent",
             "grounding": {
                 "score": 0.0,
@@ -326,6 +328,8 @@ def test_faithful_report_case_metadata_persists_bounded_grounding_detail(
 
     assert case.metadata["grounding_status"] == "scored"
     assert case.metadata["grounding_score"] == 0.0
+    assert case.metadata["constraints"] == ["include citations"]
+    assert case.metadata["intent_evidence"] == "the answer missed a citation constraint"
     assert case.metadata["grounding_task"] == "derived private request intent"
     assert str(case.metadata["grounding_answer"]).startswith("private final ")
     assert len(str(case.metadata["grounding_answer"])) <= 1500

@@ -19,6 +19,10 @@ from openharness.evals import (
     read_execution_report,
     segment_sessions_into_conversations,
 )
+from openharness.evals.constraint_blame import (
+    attribute_faithful_constraints_report,
+    default_constraint_blame_output_path,
+)
 from openharness.evals.grounding_blame import (
     attribute_faithful_grounding_report,
     default_grounding_blame_output_path,
@@ -2292,6 +2296,28 @@ def _meta_report_traces_dir(
     return (workspace_root / "evals" / "traces" / run_id).resolve()
 
 
+def _meta_report_workspace_root(
+    workspace: str | None,
+    *,
+    report_path: str | Path,
+) -> Path:
+    if workspace:
+        return initialize_workspace(workspace)
+    inferred = _workspace_from_report_path(report_path)
+    if inferred is not None:
+        return initialize_workspace(inferred)
+    return initialize_workspace(None)
+
+
+def _workspace_from_report_path(report_path: str | Path) -> Path | None:
+    path = Path(report_path).expanduser().resolve()
+    reports_dir = path.parent
+    evals_dir = reports_dir.parent
+    if reports_dir.name == "reports" and evals_dir.name == "evals":
+        return evals_dir.parent
+    return None
+
+
 def _meta_report_trace_path(traces_dir: Path, case_id: str) -> Path:
     exact = traces_dir / f"{case_id}-0.json"
     if exact.is_file():
@@ -2407,20 +2433,92 @@ def evals_meta_report_cmd(
     check: str = typer.Option(
         "all",
         "--check",
-        help="Failed check to attribute; faithful supports grounding",
+        help="Failed check to attribute; faithful supports grounding or constraints",
     ),
     output: str | None = typer.Option(None, "--output", help="Write attributions JSON"),
     workspace: str | None = typer.Option(None, "--workspace", help=_WORKSPACE_HELP),
 ) -> None:
     """Route failed eval cases to model vs harness debt using the meta-judge."""
-    workspace_root = initialize_workspace(workspace)
+    workspace_root = _meta_report_workspace_root(workspace, report_path=report_path)
     lane_value = lane.strip().lower()
     check_value = check.strip().lower()
     try:
         if lane_value == "faithful":
-            if check_value not in {"grounding", "grounding_ok"}:
-                raise ValueError("faithful meta-report currently supports --check grounding")
             report = read_faithful_session_report(report_path)
+            if check_value in {"constraints", "constraints_held"}:
+                selected_cases = [
+                    case
+                    for case in report.cases
+                    if case.checks.get("constraints_held") is False
+                ]
+                attributor = None
+                judge_config = None
+                if selected_cases:
+                    judge_config = _build_agent_runner_config(
+                        "query-engine",
+                        workspace=workspace_root,
+                        model=model,
+                        provider_profile=None,
+                        system_prompt=None,
+                    )
+                    if judge_config.api_client is None:
+                        raise ValueError("meta-report requires configured API authentication")
+                    attributor = MetaJudgeAttributor(
+                        api_client=judge_config.api_client,
+                        model=judge_config.model,
+                        votes=meta_votes,
+                    )
+                payload = attribute_faithful_constraints_report(
+                    report,
+                    attributor=attributor,
+                    api_client=judge_config.api_client
+                    if judge_config is not None
+                    else None,
+                    model=judge_config.model if judge_config is not None else (model or ""),
+                    store=get_eval_store(workspace_root),
+                    trace_root=Path(traces_dir).expanduser().resolve()
+                    if traces_dir
+                    else None,
+                    app="ohmo",
+                )
+                attributions = payload["attributions"]
+                summary = payload["summary"]
+                print("session_id | constraints | blame | subtype | evidence[:60]")
+                for item in attributions if isinstance(attributions, list) else []:
+                    evidence = str(item.get("evidence") or "")[:60]
+                    constraints = item.get("constraints")
+                    constraint_count = len(constraints) if isinstance(constraints, list) else 0
+                    print(
+                        f"{item.get('session_id')} | {constraint_count} | "
+                        f"{item.get('blame')} | {item.get('subtype') or '-'} | "
+                        f"{evidence}"
+                    )
+                print("summary:")
+                print(f"counts: {json.dumps(summary['counts'], sort_keys=True, ensure_ascii=True)}")
+                print(f"harness_debt_pct: {summary['harness_debt_pct']}")
+                print(f"model_signal_pct: {summary['model_signal_pct']}")
+                print(
+                    "constraint_harness_debt_pct: "
+                    f"{summary['constraint_harness_debt_pct']}"
+                )
+                print(f"subtypes: {json.dumps(summary['subtypes'], sort_keys=True, ensure_ascii=True)}")
+                output_path = (
+                    Path(output).expanduser()
+                    if output
+                    else default_constraint_blame_output_path(report_path)
+                )
+                atomic_write_text(
+                    output_path,
+                    json.dumps(payload, ensure_ascii=False, indent=2, default=str)
+                    + "\n",
+                )
+                print(f"Wrote meta-report JSON: {output_path}")
+                return
+            if check_value not in {"grounding", "grounding_ok"}:
+                raise ValueError(
+                    "faithful meta-report currently supports --check grounding "
+                    "or --check constraints"
+                )
             selected_cases = [
                 case for case in report.cases if case.checks.get("grounding_ok") is False
             ]
