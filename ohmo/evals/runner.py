@@ -1514,6 +1514,7 @@ def _run_session_report_case(
                 captured_prompts=captured_prompts,
                 transcript=transcript,
                 final_text=result.final_text,
+                tool_calls=result.tool_calls,
                 search=_default_grounding_search,
                 judge_votes=judge_votes,
                 grounding_votes=grounding_votes,
