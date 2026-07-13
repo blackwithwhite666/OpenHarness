@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -47,6 +49,38 @@ def test_store_add_get_list_remove(tmp_path: Path):
     assert [e.name for e in store.list()] == ["timezone.md"]
     assert store.remove("timezone").ok
     assert store.get("timezone") is None
+
+
+def test_remove_archives_entry_and_excludes_it_from_active_store(tmp_path: Path):
+    store = MemoryStore(tmp_path, entry_char_limit=100, store_char_budget=20)
+    assert store.add("old", "x" * 20).ok
+
+    result = store.remove("old")
+
+    memory_dir = tmp_path / "memory"
+    assert result.ok
+    assert result.message == "Archived memory old.md."
+    assert not (memory_dir / "old.md").exists()
+    assert (memory_dir / "archive" / "old.md").read_text(encoding="utf-8") == "x" * 20 + "\n"
+    assert "(old.md)" not in (memory_dir / "MEMORY.md").read_text(encoding="utf-8")
+    assert store.entry_paths() == []
+    assert store.list() == []
+    assert store.total_chars() == 0
+    assert store.add("new", "y" * 20).ok  # archived chars do not consume active budget
+
+
+def test_remove_archives_name_collisions_with_incrementing_suffix(tmp_path: Path):
+    store = MemoryStore(tmp_path)
+    assert store.add("Timezone", "User prefers UTC.").ok
+    assert store.remove("timezone").ok
+    assert store.add("Timezone", "User prefers Moscow time.").ok
+
+    result = store.remove("timezone")
+
+    archive_dir = tmp_path / "memory" / "archive"
+    assert (archive_dir / "timezone.md").read_text(encoding="utf-8") == "User prefers UTC.\n"
+    assert (archive_dir / "timezone-2.md").read_text(encoding="utf-8") == "User prefers Moscow time.\n"
+    assert result.message == "Archived memory timezone-2.md."
 
 
 def test_store_dedup_exact_duplicate_is_noop(tmp_path: Path):
@@ -107,6 +141,22 @@ def test_get_path_traversal_guard(tmp_path: Path):
 def test_survives_a_fresh_store(tmp_path: Path):
     MemoryStore(tmp_path).add("tz", "UTC")
     assert MemoryStore(tmp_path).get("tz").content == "UTC"  # restart idiom
+
+
+def test_prompt_recall_records_usage_index(tmp_path: Path):
+    store = MemoryStore(tmp_path)
+    assert store.add("Timezone", "User prefers UTC.").ok
+
+    prompt = load_memory_prompt(tmp_path)
+
+    assert "User prefers UTC." in prompt
+    usage_path = tmp_path / "memory" / "usage_index.json"
+    assert usage_path.exists()
+    usage = json.loads(usage_path.read_text(encoding="utf-8"))
+    assert usage["timezone.md"]["use_count"] == 1
+    assert usage["timezone.md"]["last_used_at"]
+    assert datetime.fromisoformat(usage["timezone.md"]["last_used_at"].replace("Z", "+00:00")).tzinfo
+    assert store.usage("timezone") == usage["timezone.md"]
 
 
 # ----------------------------- the tool -------------------------------------
@@ -374,7 +424,7 @@ def test_record_use_ignores_unknown_entry(tmp_path: Path):
 def test_usage_tolerates_corrupt_sidecar(tmp_path: Path):
     store = MemoryStore(tmp_path)
     store.add("tz", "UTC")
-    (tmp_path / "memory" / ".usage.json").write_text("not json{", encoding="utf-8")
+    (tmp_path / "memory" / "usage_index.json").write_text("not json{", encoding="utf-8")
     assert store.usage() == {}  # corrupt -> empty, not a crash
     store.record_use("tz")  # still records (overwrites the junk)
     assert store.usage() == {"tz.md": 1}
@@ -385,7 +435,7 @@ def test_usage_sidecar_is_not_a_memory_entry(tmp_path: Path):
     store.add("tz", "UTC")
     store.record_use("tz")
     names = [p.name for p in store.entry_paths()]
-    assert ".usage.json" not in names  # the .json sidecar is never an entry
+    assert "usage_index.json" not in names  # the .json sidecar is never an entry
     assert store.get(".usage") is None  # and not resolvable as one
 
 

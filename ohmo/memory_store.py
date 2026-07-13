@@ -30,6 +30,9 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
+from openharness.utils.file_lock import SwarmLockError, exclusive_file_lock
+from openharness.utils.fs import atomic_write_text
+
 from ohmo.threat_patterns import first_threat_message
 from ohmo.workspace import get_memory_dir, get_memory_index_path
 
@@ -47,7 +50,9 @@ _MAX_TITLE_CHARS = 256  # bound the (otherwise unbounded) title fed to the scann
 # case-insensitively so a "Memory"-titled entry can't collide with it on a
 # case-insensitive filesystem (macOS).
 _RESERVED_NAMES = {"memory.md"}
-_USAGE_FILE = ".usage.json"  # per-entry access counts (frequency signal for injection ranking)
+_ARCHIVE_DIR = "archive"
+_USAGE_FILE = "usage_index.json"
+_USAGE_LOCK_FILE = f"{_USAGE_FILE}.lock"
 
 # Matches an index link line: "- [Title](slug.md)" (tolerant of bullet/space).
 _LINK_RE = re.compile(r"^\s*[-*]\s*\[(?P<title>.*?)\]\((?P<name>[^)]+)\)\s*$")
@@ -108,6 +113,9 @@ class MemoryStore:
     def _index_path(self) -> Path:
         return get_memory_index_path(self._workspace)
 
+    def _archive_dir(self) -> Path:
+        return self._dir() / _ARCHIVE_DIR
+
     # -- reads --------------------------------------------------------------
     def _index_titles(self) -> dict[str, str]:
         """Map ``slug.md`` -> title label from MEMORY.md."""
@@ -121,15 +129,16 @@ class MemoryStore:
         return titles
 
     def entry_paths(self) -> list[Path]:
-        """Entry file paths — excludes the MEMORY.md index and symlinks (a symlink
-        planted in the dir must not be read/injected into the system prompt)."""
+        """Active entry paths — direct children only, excluding ``MEMORY.md``,
+        ``archive/``, and symlinks (which must not be read into the prompt)."""
         memory_dir = self._dir()
         if not memory_dir.exists():
             return []
+        archive_dir = self._archive_dir()
         files = [
             p
             for p in memory_dir.glob("*.md")
-            if p.name.lower() not in _RESERVED_NAMES and not p.is_symlink()
+            if p.parent != archive_dir and p.name.lower() not in _RESERVED_NAMES and not p.is_symlink()
         ]
         return sorted(files)
 
@@ -200,8 +209,40 @@ class MemoryStore:
     def _usage_path(self) -> Path:
         return self._dir() / _USAGE_FILE
 
-    def usage(self) -> dict[str, int]:
-        """Read the access-count sidecar as ``{entry_name: count}`` (``{}`` on miss)."""
+    def _usage_lock_path(self) -> Path:
+        return self._dir() / _USAGE_LOCK_FILE
+
+    def usage_stats(self) -> dict[str, dict[str, int | str]]:
+        """Read per-entry usage as ``{filename: {use_count, last_used_at}}``.
+
+        A malformed or missing sidecar is treated as no telemetry. Writers hold
+        ``usage_index.json.lock`` and publish with an atomic replace, so readers
+        see either a complete old document or a complete new document.
+        """
+        return self._read_usage_stats()
+
+    def usage(
+        self, slug: str | None = None
+    ) -> dict[str, int] | dict[str, int | str] | None:
+        """Return one entry's usage, or legacy filename-to-count totals.
+
+        ``usage("timezone")`` is the public detailed accessor. Calling it
+        without an argument retains the former lightweight count view for
+        callers that only need injection-ranking totals.
+        """
+        all_stats = self.usage_stats()
+        if slug is None:
+            return {name: int(stats["use_count"]) for name, stats in all_stats.items()}
+        raw = (slug or "").strip()
+        if not raw:
+            return None
+        requested = raw if raw.endswith(".md") else f"{slugify(raw)}.md"
+        for filename, stats in all_stats.items():
+            if filename.lower() == requested.lower():
+                return dict(stats)
+        return None
+
+    def _read_usage_stats(self) -> dict[str, dict[str, int | str]]:
         path = self._usage_path()
         if not path.exists():
             return {}
@@ -211,55 +252,80 @@ class MemoryStore:
             return {}
         if not isinstance(data, dict):
             return {}
-        return {
-            str(k): int(v)
-            for k, v in data.items()
-            if isinstance(v, (int, float)) and not isinstance(v, bool)
-        }
+        stats: dict[str, dict[str, int | str]] = {}
+        for name, value in data.items():
+            if not isinstance(name, str) or not isinstance(value, dict):
+                continue
+            count = value.get("use_count")
+            last_used_at = value.get("last_used_at")
+            if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+                continue
+            if not isinstance(last_used_at, str):
+                continue
+            stats[name] = {"use_count": count, "last_used_at": last_used_at}
+        return stats
+
+    @staticmethod
+    def _usage_timestamp() -> str:
+        """Return an ISO 8601 UTC timestamp with an explicit ``Z`` suffix."""
+        from datetime import UTC, datetime
+
+        return datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
     def record_use(self, name: str) -> None:
         """Bump the access counter for the entry resolved from NAME (best-effort).
 
-        Called when the agent reads an entry (``memory action='get'``) — i.e. it
-        needed that fact. Counts rank injection so frequently-used entries are
-        injected ahead of cold ones once the corpus exceeds the prompt budget.
-        No-op for unknown names; never raises (telemetry must not break a read).
+        The runtime prompt renderer calls this for every entry it injects, and
+        the ``memory action='get'`` path also uses it. The read-modify-write is
+        serialised by a lock file and the resulting index is atomically replaced
+        so concurrent agent processes cannot lose increments or expose partial
+        JSON. No-op for unknown names; telemetry never breaks a read.
         """
-        path = self._resolve_path(name)
-        if path is None or not path.exists():
-            return
-        # Canonicalize to the real on-disk entry name: a case-insensitive
-        # filesystem resolves e.g. "Timezone.md" to timezone.md but reports the
-        # requested casing, which would split the counter across keys (and miss the
-        # match against entry_paths() at injection ranking time).
-        canonical = next(
-            (p.name for p in self._dir().glob("*.md") if p.name.lower() == path.name.lower()),
-            path.name,
-        )
-        counts = self.usage()
-        counts[canonical] = counts.get(canonical, 0) + 1
-        self._write_usage(counts)
+        try:
+            with exclusive_file_lock(self._usage_lock_path()):
+                path = self._resolve_path(name)
+                if path is None or not path.exists():
+                    return
+                # Canonicalize to the real on-disk entry name: a case-insensitive
+                # filesystem resolves e.g. "Timezone.md" to timezone.md but reports
+                # the requested casing, which would split the counter across keys.
+                canonical = next(
+                    (p.name for p in self._dir().glob("*.md") if p.name.lower() == path.name.lower()),
+                    path.name,
+                )
+                stats = self._read_usage_stats()
+                previous = stats.get(canonical, {})
+                previous_count = previous.get("use_count", 0)
+                count = previous_count if isinstance(previous_count, int) else 0
+                stats[canonical] = {
+                    "use_count": count + 1,
+                    "last_used_at": self._usage_timestamp(),
+                }
+                self._write_usage(stats)
+        except (OSError, SwarmLockError):
+            pass
 
     def _drop_usage(self, filename: str) -> None:
         """Prune an entry's counter on removal so a recreated slug does not inherit
         a dead entry's hot count (and the sidecar does not accrue orphan keys)."""
-        counts = self.usage()
-        stale = [k for k in counts if k.lower() == filename.lower()]
-        if not stale:
-            return
-        for k in stale:
-            counts.pop(k, None)
-        self._write_usage(counts)
-
-    def _write_usage(self, counts: dict[str, int]) -> None:
         try:
-            usage_path = self._usage_path()
-            usage_path.parent.mkdir(parents=True, exist_ok=True)
-            usage_path.write_text(
-                json.dumps(counts, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-            )
-        except OSError:
+            with exclusive_file_lock(self._usage_lock_path()):
+                stats = self._read_usage_stats()
+                stale = [name for name in stats if name.lower() == filename.lower()]
+                if not stale:
+                    return
+                for name in stale:
+                    stats.pop(name, None)
+                self._write_usage(stats)
+        except (OSError, SwarmLockError):
             pass
+
+    def _write_usage(self, stats: dict[str, dict[str, int | str]]) -> None:
+        usage_path = self._usage_path()
+        atomic_write_text(
+            usage_path,
+            json.dumps(stats, ensure_ascii=False, indent=2) + "\n",
+        )
 
     # -- writes -------------------------------------------------------------
     def add(self, title: str, content: str) -> MemoryOpResult:
@@ -370,10 +436,17 @@ class MemoryStore:
         if path is None or not path.exists():
             return MemoryOpResult(False, f"No memory entry {name!r}.")
         filename = path.name
-        path.unlink(missing_ok=True)
+        archive_dir = self._archive_dir()
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        archived_path = archive_dir / filename
+        suffix = 2
+        while archived_path.exists():
+            archived_path = archive_dir / f"{path.stem}-{suffix}{path.suffix}"
+            suffix += 1
+        path.rename(archived_path)
         self._drop_index(filename)
         self._drop_usage(filename)
-        return MemoryOpResult(True, f"Removed memory {filename}.")
+        return MemoryOpResult(True, f"Archived memory {archived_path.name}.")
 
     def add_legacy(self, title: str, content: str) -> Path:
         """Permissive writer for the ``/memory`` slash command + CLI.

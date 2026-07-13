@@ -6,21 +6,7 @@ import os
 from pathlib import Path
 
 from openharness.commands import MemoryCommandBackend
-from openharness.memory.scan import scan_memory_files
-from openharness.memory.schema import (
-    SCHEMA_VERSION,
-    coerce_int,
-    compute_memory_signature,
-    first_content_line,
-    format_datetime,
-    generate_memory_id,
-    memory_metadata_from_path,
-    render_memory_file,
-    split_memory_file,
-    utc_now,
-)
-from openharness.utils.file_lock import exclusive_file_lock
-from openharness.utils.fs import atomic_write_text
+from openharness.memory.schema import compute_memory_signature, split_memory_file
 
 from ohmo.memory_store import MemoryStore
 from ohmo.threat_patterns import scan_for_threats
@@ -115,10 +101,11 @@ def load_memory_prompt(
     # ones, so when the corpus overflows the char budget the important entries stay
     # in-context and the unused tail drops to the index. A small corpus fits whole,
     # so the order is invisible; it only matters once memory exceeds the budget.
-    usage = MemoryStore(workspace).usage()
+    store = MemoryStore(workspace)
+    usage = store.usage_stats()
     entries = sorted(
         list_memory_files(workspace),
-        key=lambda p: (-usage.get(p.name, 0), p.name),
+        key=lambda p: (-int(usage.get(p.name, {}).get("use_count", 0)), p.name),
     )
     used = 0
     shown = 0
@@ -153,6 +140,9 @@ def load_memory_prompt(
                 )
             break
         lines.extend(["", f"## {path.name}", "```md", body, "```"])
+        # Each body added above is a recalled memory. Record it only after it is
+        # selected for injection so skipped entries do not acquire usage.
+        store.record_use(path.name)
         used += len(body)
         shown += 1
 
