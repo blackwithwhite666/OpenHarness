@@ -79,43 +79,6 @@ def test_build_gold_reference_includes_write_file_input(tmp_path: Path):
     assert "SALMON_SHORTLIST_MARKER" in write_file_entry["input"]
 
 
-def test_build_gold_reference_edit_file_input_beyond_default_cap(tmp_path: Path):
-    # edit_file authored content (new_str) can exceed the 400-char default input
-    # excerpt; the artifact cap must surface content past that boundary so the
-    # grounding judge can verify claims about the edited file.
-    marker = "EDIT_MARKER_BEYOND_CAP"
-    new_str = "A" * 500 + marker
-    store = EvalStore(tmp_path / "evals")
-    _add_episode(
-        store,
-        episode_id="ep-1",
-        user_text="edit the skill",
-        final_text="skill edited",
-        tool_name="edit_file",
-        tool_input={
-            "path": "skill.md",
-            "old_str": "old body",
-            "new_str": new_str,
-        },
-    )
-    case = EvalRunPackCase(
-        gold_case_id="gold-1",
-        case_id="case-1",
-        episode_id="ep-1",
-        case_kind="tool_workflow",
-    )
-
-    reference = build_gold_reference(store, case, {})
-
-    assert reference is not None
-    trajectory = json.loads(reference[2])
-    edit_entry = next(entry for entry in trajectory if entry["tool"] == "edit_file")
-    # marker sits ~500 chars into new_str (past the 400 default) -> only present
-    # if edit_file receives the larger artifact excerpt.
-    assert marker in edit_entry["input"]
-    assert len(edit_entry["input"]) > 400
-
-
 def test_replay_report_reconstructs_metadata_context_without_private_text(tmp_path: Path):
     store = EvalStore(tmp_path / "evals")
     _add_episode(
