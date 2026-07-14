@@ -268,9 +268,9 @@ class MemoryStore:
     @staticmethod
     def _usage_timestamp() -> str:
         """Return an ISO 8601 UTC timestamp with an explicit ``Z`` suffix."""
-        from datetime import UTC, datetime
+        from datetime import datetime, timezone
 
-        return datetime.now(UTC).isoformat().replace("+00:00", "Z")
+        return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
     def record_use(self, name: str) -> None:
         """Bump the access counter for the entry resolved from NAME (best-effort).
