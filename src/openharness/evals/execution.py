@@ -1034,6 +1034,7 @@ def build_gold_reference(
     case: EvalRunPackCase,
     facet_inputs_by_id: dict[str, EvalTextFacetInput],
     *,
+    input_excerpt_chars: int = 400,
     output_excerpt_chars: int = 400,
 ) -> tuple[str, str, str] | None:
     """Return ``(goal, gold_answer, gold_trajectory_json)`` for one case.
@@ -1066,6 +1067,7 @@ def build_gold_reference(
             {
                 "tool": fixture.tool_name,
                 "is_error": fixture.is_error,
+                "input": (fixture.input_text or "")[:input_excerpt_chars],
                 "output": (fixture.output_text or "")[:output_excerpt_chars],
             }
             for fixture in _tool_fixtures(events)

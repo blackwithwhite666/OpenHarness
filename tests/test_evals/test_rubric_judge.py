@@ -402,6 +402,74 @@ def test_verify_grounding_action_claim_refuted_against_trajectory(tmp_path: Path
 
 
 @pytest.mark.asyncio
+async def test_grounding_verifies_write_file_artifact_claim() -> None:
+    extract = _wrap(
+        {
+            "sandbox_blocked": False,
+            "claims": [
+                {
+                    "id": "a1",
+                    "text": "The report contains a shortlist for salmon",
+                    "kind": "action",
+                    "public": False,
+                    "relevant": True,
+                    "query": "",
+                }
+            ],
+        }
+    )
+    verdict = _wrap(
+        {
+            "verdicts": [
+                {
+                    "id": "a1",
+                    "verdict": "verified",
+                    "evidence": "write_file input contains the salmon shortlist",
+                }
+            ]
+        }
+    )
+    client = _RoutedJudgeApiClient(rubric="", extract=extract, verdict=verdict)
+    search_queries: list[str] = []
+
+    async def fake_search(query: str, *, max_results: int = 5) -> str:
+        del max_results
+        search_queries.append(query)
+        return "unexpected web search"
+
+    trajectory = json.dumps(
+        [
+            {
+                "tool": "write_file",
+                "is_error": False,
+                "input": "<h2>Shortlist for salmon</h2>",
+                "output": "wrote 4213 bytes",
+            }
+        ]
+    )
+    result = await _verify_grounding(
+        client,
+        "m",
+        task="Make an HTML report with a salmon shortlist.",
+        answer="The report contains a shortlist for salmon.",
+        trajectory=trajectory,
+        checklist_items=[],
+        search=fake_search,
+    )
+
+    assert result["status"] == "scored"
+    assert result["score"] == 1.0
+    assert result["verified"] == 1
+    assert result["refuted"] == 0
+    assert result["claims"][0]["kind"] == "action"
+    assert result["claims"][0]["verdict"] == "verified"
+    assert search_queries == []
+    verdict_prompt = client.requests[-1].messages[0].text
+    assert "Shortlist for salmon" in verdict_prompt
+    assert '"input"' in verdict_prompt
+
+
+@pytest.mark.asyncio
 async def test_verify_grounding_artifact_action_supported_by_trajectory() -> None:
     extract = _wrap(
         {
