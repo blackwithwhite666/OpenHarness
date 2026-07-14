@@ -35,6 +35,7 @@ from openharness.evals import (
     TRACE_MISSING_REQUIRED,
     TRACE_UNCERTAINTY,
     FreezingJudgeScorer,
+    build_gold_reference,
     build_case_candidates,
     build_case_drafts,
     build_replay_tool_registry,
@@ -48,6 +49,34 @@ from openharness.evals import (
 from openharness.evals.execution import HistoryContext, _session_conversation_history
 from openharness.evals.executor import _run_query_engine_replay
 from openharness.tools.base import ToolRegistry
+
+
+def test_build_gold_reference_includes_write_file_input(tmp_path: Path):
+    store = EvalStore(tmp_path / "evals")
+    _add_episode(
+        store,
+        episode_id="ep-1",
+        user_text="create the shortlist",
+        final_text="shortlist created",
+        tool_name="write_file",
+        tool_input={
+            "path": "shortlist.md",
+            "content": "SALMON_SHORTLIST_MARKER",
+        },
+    )
+    case = EvalRunPackCase(
+        gold_case_id="gold-1",
+        case_id="case-1",
+        episode_id="ep-1",
+        case_kind="tool_workflow",
+    )
+
+    reference = build_gold_reference(store, case, {})
+
+    assert reference is not None
+    trajectory = json.loads(reference[2])
+    write_file_entry = next(entry for entry in trajectory if entry["tool"] == "write_file")
+    assert "SALMON_SHORTLIST_MARKER" in write_file_entry["input"]
 
 
 def test_replay_report_reconstructs_metadata_context_without_private_text(tmp_path: Path):

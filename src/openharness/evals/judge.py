@@ -330,8 +330,12 @@ GROUNDING_EXTRACT_SYSTEM_PROMPT = (
     "assertion that the agent itself did/produced something. IGNORE hedges, "
     "opinions, offers, recommendations, and meta-talk. For each claim set:\n"
     "- kind: 'action' if it asserts something the AGENT ITSELF did or produced "
-    "(created/wrote a file, published a URL, sent a message, saved data); else "
-    "'fact'.\n"
+    "(created/wrote/edited a file, published a URL or path, sent a message, saved "
+    "data). This includes the CONTENT, STRUCTURE, or EXISTENCE of a file, report, "
+    "or artifact the agent created or edited with write_file/edit_file. Example: "
+    "'The report/file contains X' -> kind='action'. Use 'fact' for claims about "
+    "the external world that are checkable on the public web, not for the agent's "
+    "own authored artifact.\n"
     "- public: for a 'fact', true if verifiable on the open web, false if it is "
     "about the USER'S OWN private data (chats, calendar, files, config, memory). "
     "('action' claims are checked against the agent's own trajectory, not the "
@@ -356,11 +360,15 @@ GROUNDING_VERDICT_SYSTEM_PROMPT = (
     "contradicted. Time-sensitive values (prices, schedules, ratings) consistent "
     "with a cited source count as verified even if fresh results differ slightly "
     "-- do not punish drift the agent could not foresee.\n"
-    "- kind 'action': evidence is the AGENT'S OWN TRAJECTORY (its tool calls and "
-    "outputs). verified ONLY if a successful tool call there actually performed "
-    "the claimed action/artifact; refuted if the answer asserts a result (a "
-    "created file, a published URL, a sent message) that the trajectory does NOT "
-    "show succeeding -- that is a fabricated result.\n"
+    "- kind 'action': evidence is the AGENT'S OWN TRAJECTORY, including tool-call "
+    "inputs and outputs. For write_file/edit_file, each entry's 'input' field can "
+    "contain the actual authored file content. Return verified when the relevant "
+    "write_file/edit_file/publish input or output supports the claimed content, "
+    "structure, existence, URL, or path. Return refuted only when the trajectory "
+    "contradicts the claim; do NOT return refuted for a claimed URL or path that "
+    "literally appears anywhere in the trajectory input or output, because its "
+    "presence is supporting evidence. Return unverifiable only when the trajectory "
+    "genuinely lacks evidence either way.\n"
     "Judge TRUTH, not phrasing. Output ONE fenced ```json block."
 )
 
@@ -817,7 +825,9 @@ def _grounding_extract_prompt(*, task: str, answer: str, checklist_items: list[s
         f"{seed}\n\n"
         "Extract the answer's checkable claims. For a 'fact' claim give a web "
         "search query that would confirm or refute it (empty for private/action "
-        "claims). Schema:\n"
+        "claims). Claims about the content, structure, or existence of an "
+        "agent-created/edited file or report are 'action' claims; for example, "
+        "'the report/file contains X' has kind='action'. Schema:\n"
         '```json\n{"sandbox_blocked": false, "claims": [{"id": "c1", '
         '"text": "the concrete claim", "kind": "fact", "public": true, '
         '"relevant": true, "query": "search query"}]}\n```'
@@ -835,8 +845,10 @@ def _grounding_verdict_prompt(*, claims: list[dict], evidence: dict[str, str]) -
     return (
         f"{joined}\n\n"
         "For each claim id, return a verdict against its evidence, applying the "
-        "kind-specific standard (fact=web evidence, action=trajectory must show "
-        "the claimed result actually succeeded). Schema:\n"
+        "kind-specific standard (fact=web evidence; action=trajectory input/output, "
+        "including authored content in write_file/edit_file 'input', must support "
+        "the claim). A URL/path that literally appears in the trajectory supports "
+        "the action claim and must not be called refuted. Schema:\n"
         '```json\n{"verdicts": [{"id": "c1", '
         '"verdict": "verified|refuted|unverifiable", "evidence": "one short phrase"}]}\n```'
     )
@@ -992,7 +1004,9 @@ async def _verify_grounding(
     for claim in facts_public:
         evidence[claim["id"]] = await search(str(claim.get("query") or claim["text"]), max_results=max_results)
     for claim in actions:
-        evidence[claim["id"]] = f"AGENT TRAJECTORY (tool calls and outputs):\n{trajectory}"
+        evidence[claim["id"]] = (
+            f"AGENT TRAJECTORY (tool-call inputs and outputs):\n{trajectory}"
+        )
     verdict_raw = await _complete_text(
         api_client,
         model,
