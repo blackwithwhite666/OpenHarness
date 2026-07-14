@@ -19,7 +19,12 @@ from openharness.evals import (
     RubricJudgeScorer,
     derive_case_rubric,
 )
-from openharness.evals.judge import _aggregate_v2, _parse_v2_scores, _verify_grounding
+from openharness.evals.judge import (
+    _aggregate_v2,
+    _parse_v2_scores,
+    _v2_trajectory,
+    _verify_grounding,
+)
 
 
 class _StaticJudgeApiClient:
@@ -817,3 +822,25 @@ def test_verify_votes_reuse_cached_search_across_votes(tmp_path: Path):
     assert result.metadata["grounding_votes"] == 3
     assert result.metadata["aspect.grounding"] == 1.0
     assert fetches["n"] == 1  # cached across the 3 votes
+
+
+def test_v2_trajectory_surfaces_tool_input_arguments():
+    # Many action claims are grounded ONLY by the tool INPUT (a queued meeting's
+    # title, edit_file's new content, a published path) — the tool OUTPUT never
+    # echoes them. The verdict prompt tells the judge to check "trajectory
+    # input/output", so _v2_trajectory must surface the input or those claims get
+    # falsely refuted as "not shown in trajectory".
+    result = EvalExecutorResult(
+        tool_path=("mcp__worfalomey__add_planned_events",),
+        tool_calls=(
+            EvalObservedCall(
+                "mcp__worfalomey__add_planned_events",
+                {"title": "1-1 MEETING_TITLE_MARKER", "window": "Jun 29 - Jul 3"},
+                False,
+                "queued 1 planned event",  # output does NOT contain the title
+            ),
+        ),
+    )
+    trajectory = _v2_trajectory(result, excerpt=400)
+    assert '"input"' in trajectory
+    assert "MEETING_TITLE_MARKER" in trajectory  # present only via the input

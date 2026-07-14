@@ -629,11 +629,26 @@ def _v2_trajectory(executor_result: EvalExecutorResult, *, excerpt: int) -> str:
         output = (call.output or "").strip().replace("\n", " ")
         if len(output) > excerpt:
             output = output[:excerpt] + "…"
+        # Tool INPUT arguments carry the ground truth for many action claims that
+        # the tool OUTPUT never echoes — a queued meeting's title, an edit_file's
+        # new content, a published path. The verdict prompt already tells the
+        # judge to check "trajectory input/output", so surface the input here
+        # (same excerpt) or those claims get falsely refuted as "not shown".
+        # Transient/score-time only — never persisted (report keeps metadata-only
+        # tool labels; EvalObservedCall.arguments is explicitly transient).
+        arguments = (
+            json.dumps(call.arguments, ensure_ascii=True, sort_keys=True)
+            if call.arguments
+            else ""
+        ).replace("\n", " ")
+        if len(arguments) > excerpt:
+            arguments = arguments[:excerpt] + "…"
         rows.append(
             {
                 "step": index,
                 "tool": effective_tool_label(call.tool_name, call.arguments),
                 "is_error": bool(call.is_error),
+                "input": arguments,
                 "output": output,
             }
         )
