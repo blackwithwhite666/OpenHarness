@@ -369,6 +369,16 @@ GROUNDING_VERDICT_SYSTEM_PROMPT = (
     "literally appears anywhere in the trajectory input or output, because its "
     "presence is supporting evidence. Return unverifiable only when the trajectory "
     "genuinely lacks evidence either way.\n"
+    "- kind 'private': the claim reports the USER'S OWN private data (from files, "
+    "chats, calendar, attachments, memory) that cannot be web-checked. Evidence is "
+    "the agent's trajectory. verified = the trajectory shows the agent SUCCESSFULLY "
+    "read a source that plausibly holds this information (a "
+    "read_file/glob/grep/pdf-extract/db tool with is_error=false on a matching path "
+    "or query); a successful read of the relevant source is sufficient support even "
+    "when the exact value is truncated in the shown output. unverifiable = the "
+    "answer asserts private data but NO supporting read appears in the trajectory "
+    "(possible fabrication) -- do NOT reward it. refuted = a read output in the "
+    "trajectory contradicts the claim.\n"
     "Judge TRUTH, not phrasing. Output ONE fenced ```json block."
 )
 
@@ -862,8 +872,10 @@ def _grounding_verdict_prompt(*, claims: list[dict], evidence: dict[str, str]) -
         "For each claim id, return a verdict against its evidence, applying the "
         "kind-specific standard (fact=web evidence; action=trajectory input/output, "
         "including authored content in write_file/edit_file 'input', must support "
-        "the claim). A URL/path that literally appears in the trajectory supports "
-        "the action claim and must not be called refuted. Schema:\n"
+        "the claim; private=trajectory must show the agent successfully READ a "
+        "matching private source, else unverifiable). A URL/path that literally "
+        "appears in the trajectory supports the action claim and must not be called "
+        "refuted. Schema:\n"
         '```json\n{"verdicts": [{"id": "c1", '
         '"verdict": "verified|refuted|unverifiable", "evidence": "one short phrase"}]}\n```'
     )
@@ -999,29 +1011,31 @@ async def _verify_grounding(
         # no task-relevant claim to verify (e.g. pure padding) -> keep process
         return {"score": None, "status": "no_relevant_claims", "verified": 0, "refuted": 0, "claims": []}
 
-    def _priv_row(claim: dict) -> dict:
-        return {
-            "id": claim["id"],
-            "claim": f"sha:{_hash_text(str(claim['text']))[:12]}",
-            "verdict": "unverifiable_private",
-            "evidence": "",
-        }
+    def _priv_hash(claim: dict) -> str:
+        return f"sha:{_hash_text(str(claim['text']))[:12]}"
 
     facts_public = [c for c in relevant if c.get("kind") != "action" and c.get("public")]
     actions = [c for c in relevant if c.get("kind") == "action"]
     facts_private = [c for c in relevant if c.get("kind") != "action" and not c.get("public")]
-    checkable = facts_public + actions
+    # Private facts are process-grounded against the trajectory: a private value the
+    # agent demonstrably READ from a real source (read_file/glob/grep/pdf-extract) is
+    # grounded, not a hallucination -- even though it can't be web-verified. Route
+    # them through the same trajectory verdict as actions (tagged 'private' so the
+    # judge applies the read-a-matching-source standard), but keep them HASHED in the
+    # metadata-only report. A private fact with NO supporting read stays unverifiable
+    # -> out of denom: the honest "can't confirm" floor is preserved; we just stop
+    # scoring 0 for private files the agent actually opened.
+    for claim in facts_private:
+        claim["kind"] = "private"
+    checkable = facts_public + actions + facts_private
     if not checkable:
-        # every relevant claim is a private fact -> fall back to process-grounding
-        return {"score": None, "status": "private_fallback", "verified": 0, "refuted": 0,
-                "claims": [_priv_row(c) for c in facts_private]}
+        return {"score": None, "status": "no_relevant_claims", "verified": 0, "refuted": 0, "claims": []}
+    trajectory_evidence = f"AGENT TRAJECTORY (tool-call inputs and outputs):\n{trajectory}"
     evidence: dict[str, str] = {}
     for claim in facts_public:
         evidence[claim["id"]] = await search(str(claim.get("query") or claim["text"]), max_results=max_results)
-    for claim in actions:
-        evidence[claim["id"]] = (
-            f"AGENT TRAJECTORY (tool-call inputs and outputs):\n{trajectory}"
-        )
+    for claim in actions + facts_private:
+        evidence[claim["id"]] = trajectory_evidence
     verdict_raw = await _complete_text(
         api_client,
         model,
@@ -1043,19 +1057,31 @@ async def _verify_grounding(
             supported += 1
         elif verdict == "refuted":
             refuted += 1
-        per_claim.append(
-            {
-                "id": claim["id"],
-                "kind": claim.get("kind", "fact"),
-                "claim": str(claim["text"])[:160],
-                "verdict": verdict,
-                "evidence": str(vote.get("evidence") or "")[:160],
-            }
-        )
-    per_claim.extend(_priv_row(c) for c in facts_private)
+        if claim.get("kind") == "private":
+            # never persist private content: hash the claim text, keep the verdict.
+            per_claim.append(
+                {
+                    "id": claim["id"],
+                    "kind": "private",
+                    "claim": _priv_hash(claim),
+                    "verdict": verdict if verdict in ("verified", "refuted") else "unverifiable_private",
+                    "evidence": "",
+                }
+            )
+        else:
+            per_claim.append(
+                {
+                    "id": claim["id"],
+                    "kind": claim.get("kind", "fact"),
+                    "claim": str(claim["text"])[:160],
+                    "verdict": verdict,
+                    "evidence": str(vote.get("evidence") or "")[:160],
+                }
+            )
     denom = supported + refuted
     if denom == 0:
-        return {"score": None, "status": "unverifiable", "verified": 0, "refuted": 0, "claims": per_claim}
+        status = "private_fallback" if facts_private and not facts_public and not actions else "unverifiable"
+        return {"score": None, "status": status, "verified": 0, "refuted": 0, "claims": per_claim}
     return {"score": supported / denom, "status": "scored", "verified": supported, "refuted": refuted, "claims": per_claim}
 
 
