@@ -586,6 +586,104 @@ async def test_verify_grounding_artifact_action_fabricated_without_trajectory() 
 
 
 @pytest.mark.asyncio
+async def test_verify_grounding_private_fact_read_from_file_is_grounded() -> None:
+    # A private value the agent READ from a real source is process-grounded against
+    # the trajectory (not a hallucination), so it scores as verified instead of the
+    # old unverifiable_private=0. It is never web-searched and never leaks the value.
+    extract = _wrap(
+        {
+            "sandbox_blocked": False,
+            "claims": [
+                {
+                    "id": "c1",
+                    "text": "Your resting heart rate on 2026-07-01 was 58 bpm",
+                    "kind": "fact",
+                    "public": False,
+                    "relevant": True,
+                    "query": "",
+                }
+            ],
+        }
+    )
+    verdict = _wrap(
+        {"verdicts": [{"id": "c1", "verdict": "verified", "evidence": "read_file health.csv shows 58"}]}
+    )
+    client = _RoutedJudgeApiClient(rubric="", extract=extract, verdict=verdict)
+
+    async def fake_search(query: str, *, max_results: int = 5) -> str:
+        raise AssertionError(f"private facts must not web-search: {query} {max_results}")
+
+    result = await _verify_grounding(
+        client,
+        "m",
+        task="What was my resting heart rate on 2026-07-01?",
+        answer="Your resting heart rate on 2026-07-01 was 58 bpm.",
+        trajectory=(
+            "step 0 tool: read_file is_error=False "
+            "input={'path': '/home/u/Dropbox/health.csv'} output=date,hr 2026-07-01,58"
+        ),
+        checklist_items=[],
+        search=fake_search,
+    )
+
+    assert result["status"] == "scored"
+    assert result["score"] == 1.0
+    assert result["verified"] == 1
+    row = result["claims"][0]
+    assert row["kind"] == "private"
+    assert row["verdict"] == "verified"
+    assert row["claim"].startswith("sha:")  # hashed — the bpm value never leaks
+    assert "58" not in json.dumps(result["claims"])
+    # evidence given to the judge was the trajectory, not a web snippet
+    assert "read_file" in client.requests[-1].messages[0].text
+
+
+@pytest.mark.asyncio
+async def test_verify_grounding_private_fact_without_supporting_read_stays_unverifiable() -> None:
+    # Anti-fabrication guard: a private claim with NO supporting read in the
+    # trajectory is NOT rewarded — it stays unverifiable_private -> private_fallback
+    # (score None keeps process grounding), preserving the honest "can't confirm" floor.
+    extract = _wrap(
+        {
+            "sandbox_blocked": False,
+            "claims": [
+                {
+                    "id": "c1",
+                    "text": "Your resting heart rate on 2026-07-01 was 58 bpm",
+                    "kind": "fact",
+                    "public": False,
+                    "relevant": True,
+                    "query": "",
+                }
+            ],
+        }
+    )
+    verdict = _wrap(
+        {"verdicts": [{"id": "c1", "verdict": "unverifiable", "evidence": "no health read in trajectory"}]}
+    )
+    client = _RoutedJudgeApiClient(rubric="", extract=extract, verdict=verdict)
+
+    async def fake_search(query: str, *, max_results: int = 5) -> str:
+        raise AssertionError("private facts must not web-search")
+
+    result = await _verify_grounding(
+        client,
+        "m",
+        task="What was my resting heart rate on 2026-07-01?",
+        answer="Your resting heart rate on 2026-07-01 was 58 bpm.",
+        trajectory="step 0 tool: web_search is_error=False input={'q': 'weather'} output=sunny",
+        checklist_items=[],
+        search=fake_search,
+    )
+
+    assert result["status"] == "private_fallback"
+    assert result["score"] is None  # kept out of denom — not rewarded
+    assert result["claims"][0]["verdict"] == "unverifiable_private"
+    assert result["claims"][0]["claim"].startswith("sha:")
+    assert "58" not in json.dumps(result["claims"])
+
+
+@pytest.mark.asyncio
 async def test_verify_grounding_empty_answer_still_sandbox_blocked() -> None:
     client = _RoutedJudgeApiClient(rubric="", extract="", verdict="")
 
@@ -754,8 +852,9 @@ def test_verify_votes_refuted_majority_median_fails_gate(tmp_path: Path):
 
 
 def test_verify_votes_minority_scored_keeps_process_grounding(tmp_path: Path):
-    # 2 runs go private_fallback, 1 goes scored -> class-majority keeps process,
-    # so a lone noisy scored run cannot flip the override.
+    # 2 runs go private_fallback (private claim with no supporting read -> unverifiable),
+    # 1 goes scored -> class-majority keeps process, so a lone noisy scored run cannot
+    # flip the override.
     rubric_pass = _wrap(
         {
             "task_completion": {"items": {"tc1": "pass"}},
@@ -767,7 +866,8 @@ def test_verify_votes_minority_scored_keeps_process_grounding(tmp_path: Path):
     client = _SequencedJudgeClient(
         rubric=rubric_pass,
         extracts=[_private_claim(), _private_claim(), _public_claim()],
-        verdicts=[_verdict("verified")],  # only the one scored run reaches a verdict
+        # runs 1-2: private + unverifiable -> private_fallback; run 3: public + verified -> scored
+        verdicts=[_verdict("unverifiable"), _verdict("unverifiable"), _verdict("verified")],
     )
     scorer = _verify_scorer(client, grounding_votes=3)
     result = scorer.score(
@@ -780,11 +880,12 @@ def test_verify_votes_minority_scored_keeps_process_grounding(tmp_path: Path):
 
 
 def test_verify_votes_tie_break_prefers_scored(tmp_path: Path):
-    # N=2, one scored + one private_fallback -> the tie resolves to scored.
+    # N=2, one scored (public verified) + one private_fallback (private unverifiable)
+    # -> the tie resolves to scored.
     client = _SequencedJudgeClient(
         rubric=_LOW_GROUNDING,
         extracts=[_public_claim(), _private_claim()],
-        verdicts=[_verdict("verified")],
+        verdicts=[_verdict("verified"), _verdict("unverifiable")],
     )
     scorer = _verify_scorer(client, grounding_votes=2)
     result = scorer.score(
