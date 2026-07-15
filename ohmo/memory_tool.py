@@ -12,13 +12,21 @@ policy so the model saves the right things.
 
 from __future__ import annotations
 
+import asyncio
+import json
+import os
+from contextlib import suppress
+from pathlib import Path
+
 from pydantic import BaseModel, Field
 
 from openharness.tools.base import BaseTool, ToolExecutionContext, ToolResult
 
 from ohmo.memory_store import MemoryOpResult, MemoryStore
 
-_READ_ACTIONS = {"list", "get"}
+_DOCUMENT_SEARCH_CLI = os.environ.get("OHMO_DOCUMENT_SEARCH_CLI", "document_search-cli")
+_MEMORY_SEARCH_COLLECTIONS = os.environ.get("OHMO_MEMORY_SEARCH_COLLECTIONS", "memory,archive")
+_READ_ACTIONS = {"list", "get", "search"}
 
 
 class OhmoMemoryToolInput(BaseModel):
@@ -26,7 +34,7 @@ class OhmoMemoryToolInput(BaseModel):
         description=(
             "One of: 'add' (new durable fact), 'update' (replace an existing "
             "entry's content), 'remove' (delete an entry), 'list' (titles + sizes), "
-            "'get' (read one entry's full text)."
+            "'get' (read one entry's full text), 'search' (semantic recall)."
         )
     )
     title: str = Field(
@@ -44,6 +52,8 @@ class OhmoMemoryToolInput(BaseModel):
         default="",
         description="For action='add'/'update': the memory body. A DECLARATIVE fact, not a self-instruction.",
     )
+    query: str = Field(default="", description="For action='search': the natural-language recall query.")
+    top_k: int = Field(default=5, description="Search result count (clamped to 1..10).")
 
 
 class OhmoMemoryTool(BaseTool):
@@ -59,7 +69,8 @@ class OhmoMemoryTool(BaseTool):
         "prefers UTC timestamps'), not self-instructions ('always use UTC'). Entries are "
         "bounded; if the store is full, the tool tells you to consolidate (update/remove) "
         "in the same turn. Prefer this tool over writing memory files by hand. "
-        "actions: add(title, content) · update(name, content) · remove(name) · list · get(name)."
+        "actions: add(title, content) · update(name, content) · remove(name) · list · get(name) "
+        "· search(query) — semantically recall durable memory + archive when a fact is not visible."
     )
     input_model = OhmoMemoryToolInput
 
@@ -96,6 +107,11 @@ class OhmoMemoryTool(BaseTool):
                 metadata={"memory_used": entry.name},
             )
 
+        if action == "search":
+            if not arguments.query.strip():
+                return ToolResult(output="Provide 'query' for action='search'.", is_error=True)
+            return await _search_memory(arguments.query, max(1, min(arguments.top_k, 10)))
+
         if action == "add":
             return self._result(self._store.add(arguments.title, arguments.content))
 
@@ -112,7 +128,7 @@ class OhmoMemoryTool(BaseTool):
             return self._result(self._store.remove(arguments.name))
 
         return ToolResult(
-            output=f"Unknown action {action!r}. Use add | update | remove | list | get.",
+            output=f"Unknown action {action!r}. Use add | update | remove | list | get | search.",
             is_error=True,
         )
 
@@ -125,3 +141,59 @@ class OhmoMemoryTool(BaseTool):
             )
             output = f"{output}\n\nCurrent entries:\n{listing}" if listing else output
         return ToolResult(output=output, is_error=not result.ok)
+
+
+async def _search_memory(query: str, top_k: int) -> ToolResult:
+    try:
+        process = await asyncio.create_subprocess_exec(
+            _DOCUMENT_SEARCH_CLI,
+            "search",
+            query,
+            "--collection",
+            _MEMORY_SEARCH_COLLECTIONS,
+            "--top-k",
+            str(top_k),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except FileNotFoundError:
+        return ToolResult(output="Memory search is unavailable: document_search CLI not found.", is_error=True)
+    except Exception:
+        return ToolResult(output="Memory search could not be started.", is_error=True)
+
+    try:
+        stdout, _ = await asyncio.wait_for(process.communicate(), timeout=30)
+    except TimeoutError:
+        with suppress(Exception):
+            process.kill()
+            await process.wait()
+        return ToolResult(output="Memory search timed out after 30 seconds.", is_error=True)
+    except Exception:
+        return ToolResult(output="Memory search failed while reading results.", is_error=True)
+
+    if process.returncode != 0:
+        return ToolResult(output=f"Memory search failed with exit status {process.returncode}.", is_error=True)
+
+    try:
+        hits = json.loads(stdout.decode("utf-8"))
+        if not isinstance(hits, list):
+            raise ValueError("search output is not a list")
+        lines = [f"{len(hits)} memory hits for {query!r}:"]
+        names: list[str] = []
+        for hit in hits:
+            source_path = hit["source_path"]
+            score = float(hit["score"])
+            snippet = hit["snippet"]
+            if not isinstance(source_path, str) or not isinstance(snippet, str):
+                raise ValueError("invalid search hit")
+            path = Path(source_path)
+            name = path.stem if path.name.lower().endswith(".md") else path.name
+            compact_snippet = " ".join(snippet.split())
+            if len(compact_snippet) > 240:
+                compact_snippet = compact_snippet[:237].rstrip() + "..."
+            names.append(name)
+            lines.append(f"- {name} (score {score:.2f}): {compact_snippet}")
+    except Exception:
+        return ToolResult(output="Memory search returned invalid JSON results.", is_error=True)
+
+    return ToolResult(output="\n".join(lines), metadata={"memory_search_hits": names})

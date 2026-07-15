@@ -33,6 +33,7 @@ from pathlib import Path
 from openharness.utils.file_lock import SwarmLockError, exclusive_file_lock
 from openharness.utils.fs import atomic_write_text
 
+from ohmo.document_search import reindex
 from ohmo.threat_patterns import first_threat_message
 from ohmo.workspace import get_memory_dir, get_memory_index_path
 
@@ -392,6 +393,10 @@ class MemoryStore:
         memory_dir.mkdir(parents=True, exist_ok=True)
         (memory_dir / name).write_text(content + "\n", encoding="utf-8")
         self._upsert_index(name, title)
+        try:
+            reindex(memory_dir / name, collection="memory")
+        except Exception:
+            pass
         return MemoryOpResult(True, f"Saved memory {name}.")
 
     def update(self, name: str, content: str, *, title: str | None = None) -> MemoryOpResult:
@@ -429,6 +434,10 @@ class MemoryStore:
         path.write_text(content + "\n", encoding="utf-8")
         if title and title.strip():
             self._upsert_index(path.name, title.strip())
+        try:
+            reindex(path, collection="memory")
+        except Exception:
+            pass
         return MemoryOpResult(True, f"Updated memory {path.name}.")
 
     def remove(self, name: str) -> MemoryOpResult:
@@ -446,6 +455,11 @@ class MemoryStore:
         path.rename(archived_path)
         self._drop_index(filename)
         self._drop_usage(filename)
+        # The old hit remains in the memory collection until a separate reconciliation.
+        try:
+            reindex(archived_path, collection="archive")
+        except Exception:
+            pass
         return MemoryOpResult(True, f"Archived memory {archived_path.name}.")
 
     def add_legacy(self, title: str, content: str) -> Path:
