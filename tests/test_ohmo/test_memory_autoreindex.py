@@ -96,3 +96,18 @@ def test_reindex_missing_cli_is_silent(monkeypatch, tmp_path: Path):
     monkeypatch.setattr("ohmo.document_search.subprocess.Popen", missing_popen)
 
     assert reindex(tmp_path / "timezone.md") is None
+
+
+def test_real_mutations_never_spawn_under_test_env(monkeypatch, tmp_path: Path):
+    # Regression: a real add/remove (reindex NOT mocked) must NOT spawn the
+    # document_search CLI under the test env — the autouse conftest fixture keeps
+    # OHMO_MEMORY_AUTOINDEX=0. Without it, pytest on a host that has the CLI (the
+    # self-hosted CI runner) polluted the SHARED ~/.document_search index.
+    import ohmo.document_search as ds
+
+    calls: list = []
+    monkeypatch.setattr(ds.subprocess, "Popen", lambda *a, **k: calls.append(a))
+    store = MemoryStore(tmp_path)
+    assert store.add("Timezone", "User prefers UTC.").ok
+    assert store.remove("timezone").ok
+    assert calls == []  # auto-index disabled by the conftest fixture -> no CLI spawn
