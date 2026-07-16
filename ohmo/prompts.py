@@ -170,6 +170,8 @@ def build_ohmo_system_prompt(
             "# ohmo Workspace",
             f"- Personal workspace root: {root}",
             "- Personal memory and sessions live under the shared ohmo workspace root.",
+            "- When a needed fact is not visible in the injected memory index, use "
+            "the memory tool's `search` action for semantic recall.",
             "- Resume only within ohmo sessions; do not assume interoperability with plain OpenHarness sessions.",
         ]
     )

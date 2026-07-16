@@ -202,6 +202,7 @@ async def test_tool_is_read_only_for_reads(tmp_path: Path):
     tool = OhmoMemoryTool(MemoryStore(tmp_path))
     assert tool.is_read_only(OhmoMemoryToolInput(action="list")) is True
     assert tool.is_read_only(OhmoMemoryToolInput(action="get", name="x")) is True
+    assert tool.is_read_only(OhmoMemoryToolInput(action="search", query="x")) is True
     assert tool.is_read_only(OhmoMemoryToolInput(action="add", title="x", content="y")) is False
 
 
@@ -219,6 +220,88 @@ async def test_tool_update_forwards_title_relabels_index(tmp_path: Path):
     )
     index = (tmp_path / "memory" / "MEMORY.md").read_text()
     assert "[TZ MSK](tz.md)" in index and index.count("(tz.md)") == 1
+
+
+class _FakeSearchProcess:
+    def __init__(self, stdout: bytes, *, returncode: int = 0) -> None:
+        self.stdout = stdout
+        self.returncode = returncode
+        self.killed = False
+
+    async def communicate(self):
+        return self.stdout, b""
+
+    def kill(self) -> None:
+        self.killed = True
+
+    async def wait(self):
+        return self.returncode
+
+
+async def test_tool_search_returns_ranked_hits(monkeypatch, tmp_path: Path):
+    hits = [
+        {
+            "source_path": "/home/me/.ohmo/memory/timezone.md",
+            "collection": "memory",
+            "score": 0.923,
+            "snippet": "User prefers UTC timestamps.",
+        },
+        {
+            "source_path": "/home/me/.ohmo/memory/archive/editor.md",
+            "collection": "archive",
+            "score": 0.801,
+            "snippet": "User used Vim for editing.",
+        },
+    ]
+    argv: tuple[str, ...] = ()
+
+    async def fake_exec(*args, **kwargs):
+        nonlocal argv
+        argv = args
+        return _FakeSearchProcess(json.dumps(hits).encode())
+
+    monkeypatch.setattr("ohmo.memory_tool.asyncio.create_subprocess_exec", fake_exec)
+    tool = OhmoMemoryTool(MemoryStore(tmp_path))
+
+    result = await tool.execute(
+        OhmoMemoryToolInput(action="search", query="what timezone and editor?", top_k=2),
+        _ctx(tmp_path),
+    )
+
+    assert not result.is_error
+    assert "timezone (score 0.92)" in result.output
+    assert "editor (score 0.80)" in result.output
+    assert result.metadata["memory_search_hits"] == ["timezone", "editor"]
+    assert argv[1:3] == ("search", "what timezone and editor?")
+    assert argv[-2:] == ("--top-k", "2")
+
+
+async def test_tool_search_requires_query_without_spawning(monkeypatch, tmp_path: Path):
+    async def unexpected_exec(*args, **kwargs):
+        raise AssertionError("empty search must not spawn a subprocess")
+
+    monkeypatch.setattr("ohmo.memory_tool.asyncio.create_subprocess_exec", unexpected_exec)
+    tool = OhmoMemoryTool(MemoryStore(tmp_path))
+
+    result = await tool.execute(OhmoMemoryToolInput(action="search", query="  "), _ctx(tmp_path))
+
+    assert result.is_error
+    assert result.output == "Provide 'query' for action='search'."
+
+
+async def test_tool_search_missing_cli_fails_soft(monkeypatch, tmp_path: Path):
+    async def missing_exec(*args, **kwargs):
+        raise FileNotFoundError
+
+    monkeypatch.setattr("ohmo.memory_tool.asyncio.create_subprocess_exec", missing_exec)
+    tool = OhmoMemoryTool(MemoryStore(tmp_path))
+
+    result = await tool.execute(
+        OhmoMemoryToolInput(action="search", query="old preference"), _ctx(tmp_path)
+    )
+
+    assert result.is_error
+    assert "unavailable" in result.output.lower()
 
 
 # ---------------------- legacy /memory + CLI path (routed via store) ---------
