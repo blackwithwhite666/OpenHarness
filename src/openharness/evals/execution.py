@@ -1534,6 +1534,17 @@ def _tool_fixtures(events: Sequence[EvalEvent]) -> list[EvalToolFixture]:
     return [EvalToolFixture(**fixtures[key]) for key in order]
 
 
+# The model-authored decision-trace breadcrumb tool ("trace") is emitted by the
+# engine with a tool_completed event but NO tool_started (it is synchronous and
+# records a decision-trace event, not an external call), so its captured fixture is
+# started=False / completed=True. Requiring `started` for it wrongly blocks an
+# otherwise-complete gold episode purely because the agent left a decision-trace
+# breadcrumb. Exempt it from the started requirement ONLY (completed is still
+# required); every other tool must be both started and completed so a genuinely
+# truncated capture (a call that started but never completed) still fails.
+_STARTLESS_TOOLS = frozenset({"trace"})
+
+
 def _tool_trace_complete(
     fixtures: Sequence[EvalToolFixture],
     expected_tool_names: Sequence[str],
@@ -1553,7 +1564,8 @@ def _tool_trace_complete(
         if match_index is None:
             return False
         fixture = remaining.pop(match_index)
-        if not fixture.started or not fixture.completed:
+        started_ok = fixture.started or tool_name in _STARTLESS_TOOLS
+        if not started_ok or not fixture.completed:
             return False
     return True
 
