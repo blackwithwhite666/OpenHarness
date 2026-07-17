@@ -2239,3 +2239,47 @@ def test_replay_registry_applies_skill_schema_override():
         match_mode="order",
     )
     assert reg2.get("bash").description == "Replay-only eval tool backed by captured outputs."
+
+
+def test_tool_trace_complete_exempts_startless_trace_breadcrumb():
+    # The model-authored "trace" decision-trace tool is captured with completed=True
+    # but started=False (the engine emits no tool_started for the synchronous
+    # breadcrumb). It must NOT block an otherwise-complete gold episode. Regression:
+    # 7 high-scoring faithful cases were marked "blocked" purely because the agent
+    # left trace breadcrumbs, suppressing +7pp of pass-rate.
+    from openharness.evals.execution import _tool_trace_complete
+
+    complete_with_trace = [
+        EvalToolFixture(
+            tool_name="web_fetch", call_key_hash="h1", started=True, completed=True
+        ),
+        EvalToolFixture(
+            tool_name="trace", call_key_hash="h2", started=False, completed=True
+        ),
+    ]
+    assert _tool_trace_complete(complete_with_trace, ["web_fetch", "trace"]) is True
+
+    # trace with no completed event is still incomplete (completed IS still required)
+    trace_never_completed = [
+        EvalToolFixture(
+            tool_name="trace", call_key_hash="h3", started=False, completed=False
+        ),
+    ]
+    assert _tool_trace_complete(trace_never_completed, ["trace"]) is False
+
+    # a genuinely truncated NON-trace call (started, never completed) still blocks,
+    # so the exemption does not mask real capture truncations.
+    truncated_real_tool = [
+        EvalToolFixture(
+            tool_name="mcp__worfalomey__list_merged_events",
+            call_key_hash="h4",
+            started=True,
+            completed=False,
+        ),
+    ]
+    assert (
+        _tool_trace_complete(
+            truncated_real_tool, ["mcp__worfalomey__list_merged_events"]
+        )
+        is False
+    )
