@@ -3,17 +3,31 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from ohmo.memory_backend import MemoryBackend
 from ohmo.prompts import _build_ohmo_workspace_sections
+
+if TYPE_CHECKING:
+    from ohmo.gateway.turn_context import TurnContext
 
 _MEMORY_HEADING = "# ohmo Memory"
 _MEMORY_DIRECTORY_PREFIX = "- Personal memory directory: "
 _REMINDERS_SECTION = "# Reminders"
 
 
-async def prepare_turn(backend: MemoryBackend, *, budget: int | None = None) -> str:
-    """Read a fresh backend-rendered memory snapshot for one submitted turn."""
+async def prepare_turn(
+    backend: MemoryBackend,
+    *,
+    budget: int | None = None,
+    turn_ctx: TurnContext | None = None,
+) -> str:
+    """Read a fresh backend-rendered memory snapshot for one submitted turn.
+
+    ``turn_ctx`` is identity plumbing for future backends and confidentiality
+    enforcement. The Phase-0 file backend intentionally ignores it.
+    """
+    del turn_ctx
     return await backend.render_prompt(budget)
 
 
