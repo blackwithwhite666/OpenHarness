@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import builtins
+import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from time import perf_counter
 from typing import TYPE_CHECKING, Protocol, cast
 
 from ohmo.memory import (
@@ -22,6 +24,10 @@ from ohmo.workspace import get_memory_dir
 
 if TYPE_CHECKING:
     from ohmo.gateway.models import GatewayConfig
+    from ohmo.memory_service.honcho_client import HonchoClient
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -246,6 +252,120 @@ class CatalogMemoryBackend(MemoryBackend):
         del role, text
 
 
+from ohmo.memory_service.shadow import (  # noqa: E402 - avoids package import cycle
+    SHADOW_COMPARISON_LOG_FILENAME,
+    append_shadow_record,
+    build_shadow_record,
+    shadow_report as shadow_report,
+)
+
+
+class ShadowMemoryBackend(MemoryBackend):
+    """Catalog backend with strictly off-path, read-only Honcho comparison."""
+
+    def __init__(
+        self,
+        base: CatalogMemoryBackend,
+        honcho_client: HonchoClient | None = None,
+        *,
+        observer: str = "ohmo-curated",
+        observed: str = "owner",
+        comparison_log_path: str | Path | None = None,
+        is_owner: bool = True,
+    ) -> None:
+        self._base = base
+        self._honcho_client = honcho_client if is_owner else None
+        self._observer = observer
+        self._observed = observed
+        self._comparison_log_path = (
+            Path(comparison_log_path)
+            if comparison_log_path is not None
+            else base._memory_dir / SHADOW_COMPARISON_LOG_FILENAME
+        )
+        self._pending: set[asyncio.Task[None]] = set()
+        self._log_lock = asyncio.Lock()
+
+    async def list(self) -> list[MemoryEntry]:
+        return await self._base.list()
+
+    async def get(self, name: str) -> MemoryEntry | None:
+        return await self._base.get(name)
+
+    async def search(self, query: str, top_k: int) -> builtins.list[MemoryHit]:
+        started = perf_counter()
+        catalog_hits = await self._base.search(query, top_k)
+        catalog_latency_ms = (perf_counter() - started) * 1_000
+        if self._honcho_client is not None:
+            task = asyncio.create_task(
+                self._compare(
+                    query=query,
+                    top_k=top_k,
+                    catalog_hits=catalog_hits,
+                    catalog_latency_ms=catalog_latency_ms,
+                ),
+                name="ohmo-shadow-recall",
+            )
+            self._pending.add(task)
+            task.add_done_callback(self._pending.discard)
+        return catalog_hits
+
+    async def add(self, title: str, content: str) -> MemoryOpResult:
+        return await self._base.add(title, content)
+
+    async def update(self, name: str, content: str) -> MemoryOpResult:
+        return await self._base.update(name, content)
+
+    async def remove(self, name: str) -> MemoryOpResult:
+        return await self._base.remove(name)
+
+    async def render_prompt(self, budget: int | None = None) -> str:
+        return await self._base.render_prompt(budget)
+
+    async def append_turn(self, role: str, text: str) -> None:
+        await self._base.append_turn(role, text)
+
+    async def await_pending(self) -> None:
+        """Drain all comparisons scheduled before or while this call runs."""
+        while self._pending:
+            await asyncio.gather(*tuple(self._pending), return_exceptions=True)
+
+    async def _compare(
+        self,
+        *,
+        query: str,
+        top_k: int,
+        catalog_hits: builtins.list[MemoryHit],
+        catalog_latency_ms: float,
+    ) -> None:
+        honcho_client = self._honcho_client
+        if honcho_client is None:
+            return
+        try:
+            started = perf_counter()
+            honcho_hits = await honcho_client.query_conclusions(
+                query,
+                observer=self._observer,
+                observed=self._observed,
+                top_k=top_k,
+            )
+            honcho_latency_ms = (perf_counter() - started) * 1_000
+            record = build_shadow_record(
+                query=query,
+                catalog_hits=[(hit.name, hit.rank, hit.snippet) for hit in catalog_hits],
+                honcho_hits=honcho_hits,
+                catalog_latency_ms=catalog_latency_ms,
+                honcho_latency_ms=honcho_latency_ms,
+            )
+            async with self._log_lock:
+                await asyncio.to_thread(
+                    append_shadow_record,
+                    self._comparison_log_path,
+                    record,
+                )
+        except Exception:  # noqa: BLE001 - shadow failures never reach the model path
+            logger.warning("ohmo shadow recall comparison failed", exc_info=True)
+
+
 def _content_excerpt(content: str) -> str:
     snippet = " ".join(content.split())
     if len(snippet) > 240:
@@ -273,6 +393,28 @@ def make_memory_backend(
         return FileMemoryBackend(MemoryStore(workspace))
     if cfg.memory_backend == "catalog":
         return CatalogMemoryBackend(MemoryCatalog(workspace), workspace)
+    if cfg.memory_backend == "shadow":
+        base = CatalogMemoryBackend(MemoryCatalog(workspace), workspace)
+        honcho_client = None
+        if (
+            cfg.owner_principals
+            and cfg.honcho_base_url
+            and cfg.honcho_api_key
+            and cfg.honcho_workspace
+        ):
+            from ohmo.memory_service.honcho_client import HonchoClient
+
+            honcho_client = HonchoClient(
+                cfg.honcho_base_url,
+                cfg.honcho_api_key,
+                cfg.honcho_workspace,
+            )
+        return ShadowMemoryBackend(
+            base,
+            honcho_client=honcho_client,
+            comparison_log_path=(get_memory_dir(workspace) / SHADOW_COMPARISON_LOG_FILENAME),
+            is_owner=bool(cfg.owner_principals),
+        )
     if cfg.memory_backend == "service":
         if not cfg.memory_service_socket or not cfg.memory_service_secret_file:
             raise ValueError(
