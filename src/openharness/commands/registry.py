@@ -126,6 +126,7 @@ class MemoryCommandBackend:
     list_files: Callable[[], list[Path]]
     add_entry: Callable[[str, str], Path]
     remove_entry: Callable[[str], bool]
+    backend_kind: str = "file"
 
 
 @dataclass
@@ -583,6 +584,8 @@ def create_default_command_registry(
         )
 
     async def _dream_handler(args: str, context: CommandContext) -> CommandResult:
+        if context.memory_backend is not None and context.memory_backend.backend_kind == "honcho":
+            return CommandResult(message="/dream is not supported on the honcho backend.")
         settings = getattr(context.engine, "_settings", None) or load_settings().materialize_active_profile()
         parts = args.split()
         action = parts[0] if parts else "run"
@@ -675,6 +678,8 @@ def create_default_command_registry(
 
     async def _memory_handler(args: str, context: CommandContext) -> CommandResult:
         backend = _memory_backend_for_context(context)
+        if backend.backend_kind == "honcho":
+            return CommandResult(message="/memory is not supported on the honcho backend.")
         tokens = args.split(maxsplit=1)
         if not tokens:
             return CommandResult(

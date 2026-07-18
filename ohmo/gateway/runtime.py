@@ -40,12 +40,15 @@ from ohmo.gateway.config import load_gateway_config
 from ohmo.gateway.group_tool import CreateFeishuGroup, OhmoCreateFeishuGroupTool, PublishGroupWelcome
 from ohmo.gateway.provider_commands import handle_gateway_model_command, handle_gateway_provider_command
 from ohmo.gateway.send_message_tool import SendTelegramMessageTool
+from ohmo.gateway.turn_context import TurnContext, build_turn_context
 from ohmo.group_registry import load_managed_group_record, normalize_cwd
 from ohmo.contact_registry import ContactStore
 from ohmo.memory import create_memory_command_backend
+from ohmo.memory_backend import make_memory_backend
 from ohmo.memory_store import MemoryStore
 from ohmo.memory_judge import judge_enabled, judge_interval, run_memory_judge
 from ohmo.memory_tool import OhmoMemoryTool
+from ohmo.prompt_seam import compose_runtime_prompt, prepare_turn
 from ohmo.prompts import build_ohmo_system_prompt
 from ohmo.reminders.store import ReminderStore
 from ohmo.reminders.tool import RemindCancelTool, RemindCreateTool, RemindListTool
@@ -197,6 +200,7 @@ class OhmoSessionRuntimePool:
         self._session_backend = OhmoSessionBackend(self._workspace)
         self._todo_store = TodoStore(self._workspace)
         self._memory_store = MemoryStore(self._workspace)
+        self._prompt_memory_backend = make_memory_backend(self._gateway_config, self._workspace)
         self._judge_turn_counts: dict[str, int] = {}
         self._judge_tasks: dict[str, asyncio.Task] = {}
         self._reminder_store = ReminderStore(workspace=self._workspace)
@@ -262,7 +266,6 @@ class OhmoSessionRuntimePool:
                     bundle.session_id,
                     _content_snippet(latest_user_prompt or ""),
                 )
-                bundle.engine.set_system_prompt(self._runtime_system_prompt(bundle, latest_user_prompt))
                 return bundle
 
         snapshot = self._session_backend.load_latest_for_session_key(session_key)
@@ -276,7 +279,12 @@ class OhmoSessionRuntimePool:
             cwd=session_cwd,
             model=self._model,
             max_turns=self._max_turns,
-            system_prompt=build_ohmo_system_prompt(session_cwd, workspace=self._workspace, extra_prompt=None),
+            system_prompt=build_ohmo_system_prompt(
+                session_cwd,
+                workspace=self._workspace,
+                extra_prompt=None,
+                include_ohmo_memory=False,
+            ),
             active_profile=self._provider_profile,
             session_backend=self._session_backend,
             enforce_max_turns=True,  # cap each prompt at settings.max_turns by default (was unlimited)
@@ -284,7 +292,10 @@ class OhmoSessionRuntimePool:
             restore_tool_metadata=_sanitize_group_command_metadata(snapshot.get("tool_metadata") if snapshot else None),
             extra_skill_dirs=(str(get_skills_dir(self._workspace)),),
             extra_plugin_roots=(str(get_plugins_dir(self._workspace)),),
-            memory_backend=create_memory_command_backend(self._workspace),
+            memory_backend=create_memory_command_backend(
+                self._workspace,
+                backend_kind=self._gateway_config.memory_backend,
+            ),
             include_project_memory=False,
             autodream_context={
                 "memory_dir": str(get_memory_dir(self._workspace)),
@@ -297,7 +308,9 @@ class OhmoSessionRuntimePool:
             bundle.session_id = str(snapshot["session_id"])
         self._register_gateway_tools(bundle)
         await start_runtime(bundle)
-        bundle.engine.set_system_prompt(self._runtime_system_prompt(bundle, latest_user_prompt))
+        bundle.engine.set_system_prompt(
+            await self._runtime_system_prompt(bundle, latest_user_prompt)
+        )
         logger.info(
             "ohmo runtime started session_key=%s session_id=%s restored_messages=%s",
             session_key,
@@ -360,6 +373,20 @@ class OhmoSessionRuntimePool:
         command_prompt = (message.content or "").strip()
         session_cwd = self._cwd_for_message(message, session_key)
         bundle = await self.get_bundle(session_key, latest_user_prompt=user_prompt, cwd=session_cwd)
+        turn_ctx = build_turn_context(
+            message,
+            session_id=bundle.session_id,
+            owner_principals=self._gateway_config.owner_principals,
+        )
+        logger.debug(
+            "ohmo turn identity principal=%s owner=%s private=%s channel=%s chat_id=%s session_id=%s",
+            turn_ctx.principal,
+            turn_ctx.is_owner,
+            turn_ctx.is_private,
+            turn_ctx.channel,
+            turn_ctx.chat_id,
+            turn_ctx.session_id,
+        )
         engine_metadata = getattr(bundle.engine, "tool_metadata", None)
         if isinstance(engine_metadata, dict):
             engine_metadata["ohmo_reminder_ctx"] = {
@@ -443,7 +470,10 @@ class OhmoSessionRuntimePool:
                         session_id=getattr(bundle, "session_id", None),
                         extra_skill_dirs=getattr(bundle, "extra_skill_dirs", ()),
                         extra_plugin_roots=getattr(bundle, "extra_plugin_roots", ()),
-                        memory_backend=create_memory_command_backend(self._workspace),
+                        memory_backend=create_memory_command_backend(
+                            self._workspace,
+                            backend_kind=self._gateway_config.memory_backend,
+                        ),
                         include_project_memory=False,
                     )
                 return command_context
@@ -465,6 +495,7 @@ class OhmoSessionRuntimePool:
                             session_key=session_key,
                             user_prompt=user_prompt,
                             result=result,
+                            turn_ctx=turn_ctx,
                             recorder=recorder,
                         )
                     ):
@@ -491,6 +522,7 @@ class OhmoSessionRuntimePool:
                             session_key=session_key,
                             user_prompt=user_prompt,
                             result=result,
+                            turn_ctx=turn_ctx,
                             recorder=recorder,
                         )
                     ):
@@ -507,6 +539,7 @@ class OhmoSessionRuntimePool:
                         session_key=session_key,
                         user_prompt=user_prompt,
                         result=result,
+                        turn_ctx=turn_ctx,
                         recorder=recorder,
                     )
                 ):
@@ -520,6 +553,7 @@ class OhmoSessionRuntimePool:
                     session_key=session_key,
                     user_prompt=user_prompt,
                     user_message=user_message,
+                    turn_ctx=turn_ctx,
                     recorder=recorder,
                 )
             ):
@@ -548,10 +582,16 @@ class OhmoSessionRuntimePool:
         session_key: str,
         user_prompt: str,
         result,
+        turn_ctx: TurnContext,
         recorder: GatewayEvalRecorder | None = None,
     ):
         if result.refresh_runtime:
-            bundle = await self._refresh_bundle(session_key, bundle, user_prompt)
+            bundle = await self._refresh_bundle(
+                session_key,
+                bundle,
+                user_prompt,
+                turn_ctx=turn_ctx,
+            )
 
         if result.message:
             yield GatewayStreamUpdate(
@@ -571,6 +611,7 @@ class OhmoSessionRuntimePool:
                     session_key=session_key,
                     user_prompt=result.submit_prompt,
                     user_message=result.submit_prompt,
+                    turn_ctx=turn_ctx,
                     recorder=recorder,
                 ):
                     yield update
@@ -584,7 +625,11 @@ class OhmoSessionRuntimePool:
             if bundle.enforce_max_turns:
                 bundle.engine.set_max_turns(settings.max_turns)
             bundle.engine.set_system_prompt(
-                self._runtime_system_prompt(bundle, _last_user_text(bundle.engine.messages))
+                await self._runtime_system_prompt(
+                    bundle,
+                    _last_user_text(bundle.engine.messages),
+                    turn_ctx=turn_ctx,
+                )
             )
             turns = result.continue_turns if result.continue_turns is not None else bundle.engine.max_turns
             reply_parts: list[str] = []
@@ -633,9 +678,12 @@ class OhmoSessionRuntimePool:
         session_key: str,
         user_prompt: str,
         user_message: ConversationMessage | str,
+        turn_ctx: TurnContext,
         recorder: GatewayEvalRecorder | None = None,
     ):
-        bundle.engine.set_system_prompt(self._runtime_system_prompt(bundle, user_prompt))
+        bundle.engine.set_system_prompt(
+            await self._runtime_system_prompt(bundle, user_prompt, turn_ctx=turn_ctx)
+        )
         reply_parts: list[str] = []
         emitted_media: set[str] = set()
         yield GatewayStreamUpdate(
@@ -953,10 +1001,13 @@ class OhmoSessionRuntimePool:
                 bundle.engine.load_messages(messages)
             else:
                 bundle.engine.messages = messages
+        active_system_prompt = getattr(bundle.engine, "system_prompt", None)
+        if not isinstance(active_system_prompt, str):
+            active_system_prompt = await self._runtime_system_prompt(bundle, user_prompt)
         self._session_backend.save_snapshot(
             cwd=getattr(bundle, "cwd", self._cwd),
             model=bundle.current_settings().model,
-            system_prompt=self._runtime_system_prompt(bundle, user_prompt),
+            system_prompt=active_system_prompt,
             messages=messages,
             usage=bundle.engine.total_usage,
             session_id=bundle.session_id,
@@ -975,6 +1026,8 @@ class OhmoSessionRuntimePool:
         session_key: str,
         bundle: RuntimeBundle,
         latest_user_prompt: str | None,
+        *,
+        turn_ctx: TurnContext | None = None,
     ) -> RuntimeBundle:
         snapshot = sanitize_conversation_messages(list(bundle.engine.messages))
         prior_session_id = bundle.session_id
@@ -984,7 +1037,12 @@ class OhmoSessionRuntimePool:
             cwd=bundle_cwd,
             model=self._model,
             max_turns=self._max_turns,
-            system_prompt=build_ohmo_system_prompt(bundle_cwd, workspace=self._workspace, extra_prompt=None),
+            system_prompt=build_ohmo_system_prompt(
+                bundle_cwd,
+                workspace=self._workspace,
+                extra_prompt=None,
+                include_ohmo_memory=False,
+            ),
             active_profile=self._provider_profile,
             session_backend=self._session_backend,
             enforce_max_turns=True,  # cap each prompt at settings.max_turns by default (was unlimited)
@@ -992,7 +1050,10 @@ class OhmoSessionRuntimePool:
             restore_tool_metadata=_sanitize_group_command_metadata(getattr(bundle.engine, "tool_metadata", {}) or {}),
             extra_skill_dirs=(str(get_skills_dir(self._workspace)),),
             extra_plugin_roots=(str(get_plugins_dir(self._workspace)),),
-            memory_backend=create_memory_command_backend(self._workspace),
+            memory_backend=create_memory_command_backend(
+                self._workspace,
+                backend_kind=self._gateway_config.memory_backend,
+            ),
             include_project_memory=False,
             autodream_context={
                 "memory_dir": str(get_memory_dir(self._workspace)),
@@ -1004,7 +1065,13 @@ class OhmoSessionRuntimePool:
         refreshed.session_id = prior_session_id
         self._register_gateway_tools(refreshed)
         await start_runtime(refreshed)
-        refreshed.engine.set_system_prompt(self._runtime_system_prompt(refreshed, latest_user_prompt))
+        refreshed.engine.set_system_prompt(
+            await self._runtime_system_prompt(
+                refreshed,
+                latest_user_prompt,
+                turn_ctx=turn_ctx,
+            )
+        )
         self._bundles[session_key] = refreshed
         logger.info(
             "ohmo runtime refreshed session_key=%s session_id=%s message_count=%s",
@@ -1014,15 +1081,32 @@ class OhmoSessionRuntimePool:
         )
         return refreshed
 
-    def _runtime_system_prompt(self, bundle: RuntimeBundle, latest_user_prompt: str | None) -> str:
+    async def _runtime_system_prompt(
+        self,
+        bundle: RuntimeBundle,
+        latest_user_prompt: str | None,
+        *,
+        turn_ctx: TurnContext | None = None,
+    ) -> str:
         bundle_cwd = str(Path(getattr(bundle, "cwd", self._cwd)).resolve())
+        memory_free_base = build_ohmo_system_prompt(
+            bundle_cwd,
+            workspace=self._workspace,
+            extra_prompt=None,
+            include_ohmo_memory=False,
+        )
+        snapshot = await prepare_turn(self._prompt_memory_backend, turn_ctx=turn_ctx)
         if not hasattr(bundle, "current_settings"):
-            return build_ohmo_system_prompt(bundle_cwd, workspace=self._workspace, extra_prompt=None)
+            return compose_runtime_prompt(memory_free_base, snapshot)
         settings = bundle.current_settings()
         if not hasattr(settings, "system_prompt"):
-            return build_ohmo_system_prompt(bundle_cwd, workspace=self._workspace, extra_prompt=None)
+            return compose_runtime_prompt(memory_free_base, snapshot)
+        base = settings.system_prompt or memory_free_base
+        composed_settings = settings.model_copy(
+            update={"system_prompt": compose_runtime_prompt(base, snapshot)}
+        )
         return build_runtime_system_prompt(
-            settings,
+            composed_settings,
             cwd=bundle_cwd,
             latest_user_prompt=latest_user_prompt,
             extra_skill_dirs=getattr(bundle, "extra_skill_dirs", ()),
@@ -1075,13 +1159,14 @@ class OhmoSessionRuntimePool:
         registry = getattr(bundle, "tool_registry", None)
         if registry is None:
             return
+        # Phase 1: route the model tool through the async memory backend.
         registry.register(OhmoMemoryTool(self._memory_store))
 
     def _maybe_schedule_memory_judge(self, bundle: RuntimeBundle, session_key: str) -> None:
         """Schedule the background memory judge off the hot path, on a per-session
         turn cadence. Opt-in via OHMO_MEMORY_JUDGE; never blocks the reply (the
         snapshot of inputs is taken now, the LLM call runs in a tracked task)."""
-        if not judge_enabled():
+        if self._gateway_config.memory_backend != "file" or not judge_enabled():
             return
         count = self._judge_turn_counts.get(session_key, 0) + 1
         self._judge_turn_counts[session_key] = count
@@ -1116,6 +1201,8 @@ class OhmoSessionRuntimePool:
         task.add_done_callback(_pop)
 
     async def _run_memory_judge_task(self, session_key, api_client, model, messages, timeout) -> None:
+        if self._gateway_config.memory_backend != "file":
+            return
         try:
             outcome = await run_memory_judge(
                 api_client=api_client,

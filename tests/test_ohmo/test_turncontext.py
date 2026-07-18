@@ -1,0 +1,116 @@
+"""Tests for gateway-authenticated per-turn identity plumbing."""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from types import SimpleNamespace
+
+from openharness.channels.bus.events import InboundMessage
+
+from ohmo.gateway.config import load_gateway_config
+from ohmo.gateway.models import GatewayConfig
+from ohmo.gateway.runtime import OhmoSessionRuntimePool
+from ohmo.gateway.turn_context import (
+    TurnContext,
+    build_turn_context,
+    canonical_principal,
+    is_private_message,
+)
+from ohmo.workspace import initialize_workspace
+
+
+def _message(*, sender_id: str = "12345|alice", metadata: dict | None = None) -> InboundMessage:
+    return InboundMessage(
+        channel="telegram",
+        sender_id=sender_id,
+        chat_id="12345",
+        content="hello",
+        metadata=metadata or {},
+    )
+
+
+def test_telegram_canonical_principal_ignores_mutable_username() -> None:
+    original = canonical_principal("telegram", "12345|alice")
+    renamed = canonical_principal("telegram", "12345|alice_renamed")
+
+    assert original == renamed == "12345"
+
+
+def test_owner_status_uses_only_configured_canonical_principal() -> None:
+    config = GatewayConfig(owner_principals=("12345",))
+
+    owner = build_turn_context(
+        _message(sender_id="12345|alice"),
+        session_id="session-owner",
+        owner_principals=config.owner_principals,
+    )
+    non_owner = build_turn_context(
+        _message(sender_id="67890|bob"),
+        session_id="session-other",
+        owner_principals=config.owner_principals,
+    )
+
+    assert owner.is_owner is True
+    assert non_owner.is_owner is False
+
+
+def test_load_gateway_config_parses_owner_principals(tmp_path: Path) -> None:
+    workspace = tmp_path / ".ohmo-home"
+    workspace.mkdir()
+    (workspace / "gateway.json").write_text(
+        json.dumps({"owner_principals": ["12345", "ou_owner"]}) + "\n",
+        encoding="utf-8",
+    )
+
+    assert load_gateway_config(workspace).owner_principals == ("12345", "ou_owner")
+
+
+def test_private_status_requires_genuine_non_forwarded_private_signal() -> None:
+    group = _message(metadata={"is_group": True})
+    forwarded = _message(metadata={"is_group": False, "is_forwarded": True})
+    unknown = _message(metadata={})
+    private = _message(metadata={"is_group": False})
+
+    assert is_private_message(group) is False
+    assert is_private_message(forwarded) is False
+    assert is_private_message(unknown) is False
+    assert is_private_message(private) is True
+
+
+async def test_runtime_prompt_threads_turn_context_into_prepare_turn(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    workspace = tmp_path / ".ohmo-home"
+    initialize_workspace(workspace)
+    pool = OhmoSessionRuntimePool(
+        cwd=tmp_path,
+        workspace=workspace,
+        provider_profile="codex",
+    )
+    turn_ctx = TurnContext(
+        principal="12345",
+        is_owner=True,
+        is_private=True,
+        channel="telegram",
+        chat_id="12345",
+        session_id="session-owner",
+    )
+    captured: dict[str, object] = {}
+
+    async def fake_prepare_turn(backend, *, budget=None, turn_ctx=None):
+        captured["backend"] = backend
+        captured["budget"] = budget
+        captured["turn_ctx"] = turn_ctx
+        return ""
+
+    monkeypatch.setattr("ohmo.gateway.runtime.prepare_turn", fake_prepare_turn)
+
+    await pool._runtime_system_prompt(
+        SimpleNamespace(cwd=str(tmp_path)),
+        "hello",
+        turn_ctx=turn_ctx,
+    )
+
+    assert captured["turn_ctx"] is turn_ctx
