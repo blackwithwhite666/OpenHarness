@@ -8,8 +8,10 @@ from pathlib import Path
 from openharness.commands import MemoryCommandBackend
 from openharness.memory.schema import compute_memory_signature, split_memory_file
 
-from ohmo.memory_store import MemoryStore
+from ohmo.memory_catalog import MemoryCatalog
+from ohmo.memory_store import MemoryStore, slugify
 from ohmo.threat_patterns import scan_for_threats
+from ohmo.tools.migrate_memory_to_catalog import inventory, migrate
 from ohmo.workspace import get_memory_dir, get_memory_index_path
 
 # Always-on memory injection budget: inject entry bodies until their cumulative
@@ -51,6 +53,32 @@ def add_memory_entry(workspace: str | Path | None, title: str, content: str) -> 
 def remove_memory_entry(workspace: str | Path | None, name: str) -> bool:
     """Delete a memory file and remove its index entry."""
     return MemoryStore(workspace).remove(name).ok
+
+
+def read_memory_entry(workspace: str | Path | None, name: str) -> str | None:
+    """Read one file-backed entry without normalizing its contents."""
+    entry = MemoryStore(workspace).get(name)
+    if entry is None:
+        return None
+    return entry.path.read_text(encoding="utf-8")
+
+
+def ensure_catalog_migrated(
+    workspace: str | Path | None,
+) -> MemoryCatalog:
+    """Copy legacy Markdown memory into an empty workspace catalog once."""
+    catalog = MemoryCatalog(workspace)
+    if catalog.list(include_archived=True):
+        return catalog
+
+    active, archived = inventory(workspace)
+    if active or archived:
+        migrate(
+            workspace,
+            dry_run=False,
+            db_path=catalog.db_path,
+        )
+    return catalog
 
 
 def load_memory_prompt(
@@ -156,6 +184,57 @@ def create_memory_command_backend(
 ) -> MemoryCommandBackend:
     """Return a ``/memory`` backend bound to ohmo's personal memory store."""
 
+    if backend_kind == "catalog":
+        catalog = ensure_catalog_migrated(workspace)
+        memory_dir = get_memory_dir(workspace)
+
+        def add_catalog_entry(title: str, content: str) -> Path:
+            result = catalog.add(title, content, source="curated")
+            if not result.ok:
+                raise ValueError(result.message)
+            record = catalog.get(slugify(title))
+            if record is None:
+                clean_content = content.strip()
+                record = next(
+                    (
+                        item
+                        for item in catalog.list(include_archived=False)
+                        if item.content == clean_content
+                    ),
+                    None,
+                )
+            if record is None:
+                raise ValueError(result.message)
+            return memory_dir / f"{record.slug}.md"
+
+        def read_catalog_entry(name: str) -> str | None:
+            record = catalog.get(name)
+            if record is None or record.archive_status != "active":
+                return None
+            return record.content
+
+        def update_catalog_entry(name: str, content: str) -> bool:
+            result = catalog.update(name, content)
+            if not result.ok:
+                raise ValueError(result.message)
+            return True
+
+        return MemoryCommandBackend(
+            label="ohmo personal memory",
+            default_type="personal",
+            default_category="preference",
+            get_memory_dir=lambda: memory_dir,
+            get_entrypoint=lambda: catalog.db_path,
+            list_files=lambda: [
+                memory_dir / f"{record.slug}.md" for record in catalog.list(include_archived=False)
+            ],
+            add_entry=add_catalog_entry,
+            remove_entry=lambda name: catalog.remove(name).ok,
+            backend_kind=backend_kind,
+            read_entry=read_catalog_entry,
+            update_entry=update_catalog_entry,
+        )
+
     return MemoryCommandBackend(
         label="ohmo personal memory",
         default_type="personal",
@@ -166,6 +245,7 @@ def create_memory_command_backend(
         add_entry=lambda title, content: add_memory_entry(workspace, title, content),
         remove_entry=lambda name: remove_memory_entry(workspace, name),
         backend_kind=backend_kind,
+        read_entry=lambda name: read_memory_entry(workspace, name),
     )
 
 

@@ -8,6 +8,7 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
@@ -127,6 +128,8 @@ class MemoryCommandBackend:
     add_entry: Callable[[str, str], Path]
     remove_entry: Callable[[str], bool]
     backend_kind: str = "file"
+    read_entry: Callable[[str], str | None] | None = None
+    update_entry: Callable[[str, str], bool] | None = None
 
 
 @dataclass
@@ -586,6 +589,8 @@ def create_default_command_registry(
     async def _dream_handler(args: str, context: CommandContext) -> CommandResult:
         if context.memory_backend is not None and context.memory_backend.backend_kind == "honcho":
             return CommandResult(message="/dream is not supported on the honcho backend.")
+        if context.memory_backend is not None and context.memory_backend.backend_kind == "catalog":
+            return CommandResult(message="/dream is not applicable on the catalog backend.")
         settings = getattr(context.engine, "_settings", None) or load_settings().materialize_active_profile()
         parts = args.split()
         action = parts[0] if parts else "run"
@@ -731,15 +736,26 @@ def create_default_command_registry(
                 lines.append("Failed files: " + ", ".join(summary.failed_files))
             return CommandResult(message="\n".join(lines))
         if action == "show" and rest:
-            memory_dir = backend.get_memory_dir()
-            path, invalid = _resolve_memory_entry_path(memory_dir, rest)
-            if invalid:
-                return CommandResult(message="Memory entry path must stay within the configured memory directory.")
-            if path is None:
+            if backend.backend_kind == "file":
+                memory_dir = backend.get_memory_dir()
+                path, invalid = _resolve_memory_entry_path(memory_dir, rest)
+                if invalid:
+                    return CommandResult(
+                        message="Memory entry path must stay within the configured memory directory."
+                    )
+                if path is None:
+                    return CommandResult(message=f"Memory entry not found: {rest}")
+                if not path.exists():
+                    return CommandResult(message=f"Memory entry not found: {rest}")
+                content = (
+                    backend.read_entry(str(path))
+                    if backend.read_entry is not None
+                    else path.read_text(encoding="utf-8")
+                )
+            else:
+                content = backend.read_entry(rest) if backend.read_entry is not None else None
+            if content is None:
                 return CommandResult(message=f"Memory entry not found: {rest}")
-            if not path.exists():
-                return CommandResult(message=f"Memory entry not found: {rest}")
-            content = path.read_text(encoding="utf-8")
             metadata, _, _, _ = split_memory_file(content)
             if is_disabled_metadata(metadata) or is_memory_expired(metadata):
                 return CommandResult(message=f"Memory entry not found: {rest}")
@@ -2593,6 +2609,9 @@ def _handle_memory_edit_command(
     context: CommandContext,
     backend: MemoryCommandBackend,
 ) -> CommandResult:
+    if backend.backend_kind == "catalog":
+        return _handle_catalog_memory_edit_command(args, context, backend)
+
     memory_dir = backend.get_memory_dir()
     target = backend.get_entrypoint()
     if args.strip():
@@ -2611,6 +2630,50 @@ def _handle_memory_edit_command(
     if result.returncode != 0:
         return CommandResult(message=f"Editor exited with status {result.returncode}: {editor}")
     return CommandResult(message=f"Edited memory file: {target}")
+
+
+def _handle_catalog_memory_edit_command(
+    args: str,
+    context: CommandContext,
+    backend: MemoryCommandBackend,
+) -> CommandResult:
+    """Edit one catalog entry through a temporary editor buffer."""
+
+    name = args.strip()
+    if not name:
+        return CommandResult(message="Usage: /memory edit NAME")
+    content = backend.read_entry(name) if backend.read_entry is not None else None
+    if content is None:
+        return CommandResult(message=f"Memory entry not found: {name}")
+    editor = os.environ.get("VISUAL") or os.environ.get("EDITOR")
+    if not editor:
+        return CommandResult(
+            message=(
+                f"Catalog memory entry ready: {name}\n"
+                "Set $VISUAL or $EDITOR to open it from /memory edit."
+            )
+        )
+    if backend.update_entry is None:
+        return CommandResult(message="Catalog memory editing is not configured.")
+
+    filename = Path(name).name
+    if not filename.lower().endswith(".md"):
+        filename = f"{filename}.md"
+    with tempfile.TemporaryDirectory(prefix="openharness-memory-edit-") as temp_dir:
+        target = Path(temp_dir) / filename
+        target.write_text(content, encoding="utf-8")
+        result = subprocess.run([editor, str(target)], cwd=context.cwd, check=False)
+        if result.returncode != 0:
+            return CommandResult(message=f"Editor exited with status {result.returncode}: {editor}")
+        updated_content = target.read_text(encoding="utf-8")
+
+    try:
+        updated = backend.update_entry(name, updated_content)
+    except ValueError as exc:
+        return CommandResult(message=str(exc))
+    if not updated:
+        return CommandResult(message=f"Memory entry not found: {name}")
+    return CommandResult(message=f"Edited catalog memory entry: {name}")
 
 
 def _parse_memory_add_flags(args: str):
@@ -2779,7 +2842,15 @@ def _memory_backend_for_context(context: CommandContext) -> MemoryCommandBackend
         list_files=lambda: list_memory_files(cwd),
         add_entry=lambda title, content: add_memory_entry(cwd, title, content),
         remove_entry=lambda name: remove_memory_entry(cwd, name),
+        read_entry=lambda name: _read_memory_entry(get_project_memory_dir(cwd), name),
     )
+
+
+def _read_memory_entry(memory_dir: Path, name: str) -> str | None:
+    path, invalid = _resolve_memory_entry_path(memory_dir, name)
+    if invalid or path is None or not path.exists():
+        return None
+    return path.read_text(encoding="utf-8")
 
 
 def _resolve_memory_candidate(memory_dir: Path, candidate: str) -> tuple[Path | None, bool]:

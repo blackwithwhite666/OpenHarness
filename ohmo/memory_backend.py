@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Protocol, cast
 from ohmo.memory import (
     DEFAULT_MEMORY_INJECT_CHARS,
     _MEMORY_ENTRY_RENDER_CHARS,
+    ensure_catalog_migrated,
     load_memory_prompt as load_ohmo_memory_prompt,
 )
 from ohmo.memory_catalog import CatalogRecord, MemoryCatalog
@@ -392,9 +393,9 @@ def make_memory_backend(
     if cfg.memory_backend == "file":
         return FileMemoryBackend(MemoryStore(workspace))
     if cfg.memory_backend == "catalog":
-        return CatalogMemoryBackend(MemoryCatalog(workspace), workspace)
+        return CatalogMemoryBackend(ensure_catalog_migrated(workspace), workspace)
     if cfg.memory_backend == "shadow":
-        base = CatalogMemoryBackend(MemoryCatalog(workspace), workspace)
+        base = CatalogMemoryBackend(ensure_catalog_migrated(workspace), workspace)
         honcho_client = None
         if (
             cfg.owner_principals
