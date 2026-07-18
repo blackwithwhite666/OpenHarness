@@ -43,7 +43,7 @@ from ohmo.gateway.send_message_tool import SendTelegramMessageTool
 from ohmo.group_registry import load_managed_group_record, normalize_cwd
 from ohmo.contact_registry import ContactStore
 from ohmo.memory import create_memory_command_backend
-from ohmo.memory_backend import FileMemoryBackend
+from ohmo.memory_backend import make_memory_backend
 from ohmo.memory_store import MemoryStore
 from ohmo.memory_judge import judge_enabled, judge_interval, run_memory_judge
 from ohmo.memory_tool import OhmoMemoryTool
@@ -199,7 +199,7 @@ class OhmoSessionRuntimePool:
         self._session_backend = OhmoSessionBackend(self._workspace)
         self._todo_store = TodoStore(self._workspace)
         self._memory_store = MemoryStore(self._workspace)
-        self._prompt_memory_backend = FileMemoryBackend(self._memory_store)
+        self._prompt_memory_backend = make_memory_backend(self._gateway_config, self._workspace)
         self._judge_turn_counts: dict[str, int] = {}
         self._judge_tasks: dict[str, asyncio.Task] = {}
         self._reminder_store = ReminderStore(workspace=self._workspace)
@@ -1111,13 +1111,14 @@ class OhmoSessionRuntimePool:
         registry = getattr(bundle, "tool_registry", None)
         if registry is None:
             return
+        # Phase 1: route the model tool through the async memory backend.
         registry.register(OhmoMemoryTool(self._memory_store))
 
     def _maybe_schedule_memory_judge(self, bundle: RuntimeBundle, session_key: str) -> None:
         """Schedule the background memory judge off the hot path, on a per-session
         turn cadence. Opt-in via OHMO_MEMORY_JUDGE; never blocks the reply (the
         snapshot of inputs is taken now, the LLM call runs in a tracked task)."""
-        if not judge_enabled():
+        if self._gateway_config.memory_backend != "file" or not judge_enabled():
             return
         count = self._judge_turn_counts.get(session_key, 0) + 1
         self._judge_turn_counts[session_key] = count
@@ -1152,6 +1153,8 @@ class OhmoSessionRuntimePool:
         task.add_done_callback(_pop)
 
     async def _run_memory_judge_task(self, session_key, api_client, model, messages, timeout) -> None:
+        if self._gateway_config.memory_backend != "file":
+            return
         try:
             outcome = await run_memory_judge(
                 api_client=api_client,

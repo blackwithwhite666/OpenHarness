@@ -5,11 +5,15 @@ from __future__ import annotations
 import asyncio
 import builtins
 from dataclasses import dataclass
-from typing import Protocol, cast
+from pathlib import Path
+from typing import TYPE_CHECKING, Protocol, cast
 
 from ohmo.memory import load_memory_prompt as load_ohmo_memory_prompt
 from ohmo.memory_store import MemoryEntry, MemoryOpResult, MemoryStore
 from ohmo.memory_tool import _search_memory
+
+if TYPE_CHECKING:
+    from ohmo.gateway.models import GatewayConfig
 
 
 @dataclass(frozen=True)
@@ -104,3 +108,15 @@ class FileMemoryBackend(MemoryBackend):
 
     async def append_turn(self, role: str, text: str) -> None:
         del role, text
+
+
+def make_memory_backend(
+    cfg: GatewayConfig,
+    workspace: str | Path | None,
+) -> MemoryBackend:
+    """Build the configured workspace-scoped memory backend."""
+    if cfg.memory_backend == "file":
+        return FileMemoryBackend(MemoryStore(workspace))
+    if cfg.memory_backend == "honcho":
+        raise NotImplementedError("honcho memory backend not built in Phase 0")
+    raise ValueError(f"unsupported memory backend: {cfg.memory_backend!r}")
