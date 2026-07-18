@@ -50,6 +50,7 @@ def build_ohmo_system_prompt(
     workspace: str | Path | None = None,
     extra_prompt: str | None = None,
     include_project_memory: bool = False,
+    include_ohmo_memory: bool = True,
 ) -> str:
     """Build the custom base prompt for ohmo sessions."""
     root = get_workspace_root(workspace)
@@ -165,16 +166,8 @@ def build_ohmo_system_prompt(
         ]
     )
 
-    sections.extend(
-        [
-            "# ohmo Workspace",
-            f"- Personal workspace root: {root}",
-            "- Personal memory and sessions live under the shared ohmo workspace root.",
-            "- When a needed fact is not visible in the injected memory index, use "
-            "the memory tool's `search` action for semantic recall.",
-            "- Resume only within ohmo sessions; do not assume interoperability with plain OpenHarness sessions.",
-        ]
-    )
+    if include_ohmo_memory:
+        sections.extend(_build_ohmo_workspace_sections(root))
 
     sections.extend(
         [
@@ -196,8 +189,9 @@ def build_ohmo_system_prompt(
         ]
     )
 
-    if ohmo_memory := load_ohmo_memory_prompt(root):
-        sections.append(ohmo_memory)
+    if include_ohmo_memory:
+        if ohmo_memory := load_ohmo_memory_prompt(root):
+            sections.append(ohmo_memory)
 
     if include_project_memory:
         project_memory = load_project_memory_prompt(cwd)
@@ -205,3 +199,14 @@ def build_ohmo_system_prompt(
             sections.append(project_memory)
 
     return "\n\n".join(section for section in sections if section and section.strip())
+
+
+def _build_ohmo_workspace_sections(root: str | Path) -> tuple[str, ...]:
+    return (
+        "# ohmo Workspace",
+        f"- Personal workspace root: {root}",
+        "- Personal memory and sessions live under the shared ohmo workspace root.",
+        "- When a needed fact is not visible in the injected memory index, use "
+        "the memory tool's `search` action for semantic recall.",
+        "- Resume only within ohmo sessions; do not assume interoperability with plain OpenHarness sessions.",
+    )
