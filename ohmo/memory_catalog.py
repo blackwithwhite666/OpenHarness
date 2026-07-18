@@ -32,6 +32,7 @@ _MAX_TITLE_CHARS = 256
 _BUSY_TIMEOUT_MS = 5_000
 _RESERVED_NAMES = {"memory.md"}
 _SOURCES = {"curated", "derived"}
+_ARCHIVE_STATUSES = {"active", "archived"}
 
 
 @dataclass(frozen=True)
@@ -64,10 +65,11 @@ class MemoryCatalog:
         entry_char_limit: int | None = None,
         store_char_budget: int | None = None,
     ) -> None:
+        self._memory_dir = get_memory_dir(workspace)
         self._db_path = (
             Path(db_path).expanduser()
             if db_path is not None
-            else get_memory_dir(workspace) / "catalog.sqlite3"
+            else self._memory_dir / "catalog.sqlite3"
         )
         self._entry_char_limit = (
             entry_char_limit
@@ -278,6 +280,77 @@ class MemoryCatalog:
                 ),
             )
             return MemoryOpResult(True, f"Saved memory {name}.")
+
+    def import_entry(
+        self,
+        slug: str,
+        title: str,
+        content: str,
+        *,
+        source: str = "curated",
+        archive_status: str = "active",
+        created_at: str | None = None,
+        updated_at: str | None = None,
+    ) -> MemoryOpResult:
+        """Import one trusted legacy entry without applying model-write limits.
+
+        This low-level migration primitive deliberately bypasses threat scanning,
+        per-entry limits, deduplication by content, and the active-store budget.
+        Callers must threat-scan untrusted content before invoking it. A repeated
+        import is a no-op only when the existing row at ``slug`` has identical
+        content; conflicting content is never overwritten.
+        """
+        clean_slug = _slug_reference(slug)
+
+        with self._write_connection() as connection:
+            if not clean_slug:
+                return MemoryOpResult(False, "An import slug is required.")
+            if source not in _SOURCES:
+                return MemoryOpResult(False, f"Invalid memory source {source!r}.")
+            if archive_status not in _ARCHIVE_STATUSES:
+                return MemoryOpResult(
+                    False,
+                    f"Invalid memory archive status {archive_status!r}.",
+                )
+
+            existing = connection.execute(
+                "SELECT content FROM memories WHERE slug = ?",
+                (clean_slug,),
+            ).fetchone()
+            if existing is not None:
+                if existing["content"] == content:
+                    return MemoryOpResult(
+                        True,
+                        f"Already imported {clean_slug}.md; nothing changed.",
+                    )
+                return MemoryOpResult(
+                    False,
+                    f"Import conflict for {clean_slug}.md: existing content differs; "
+                    "nothing changed.",
+                )
+
+            timestamp = _utc_timestamp()
+            effective_created_at = timestamp if created_at is None else created_at
+            effective_updated_at = timestamp if updated_at is None else updated_at
+            connection.execute(
+                """
+                INSERT INTO memories (
+                    slug, title, content, size, source, archive_status,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    clean_slug,
+                    title,
+                    content,
+                    len(content),
+                    source,
+                    archive_status,
+                    effective_created_at,
+                    effective_updated_at,
+                ),
+            )
+            return MemoryOpResult(True, f"Imported memory {clean_slug}.md.")
 
     def update(self, slug: str, content: str, *, title: str | None = None) -> MemoryOpResult:
         clean_slug = _slug_reference(slug)
