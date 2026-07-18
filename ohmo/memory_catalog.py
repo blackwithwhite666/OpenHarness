@@ -1,10 +1,4 @@
-"""Transactional SQLite catalog for ohmo personal memory.
-
-The catalog is a workspace-scoped authority that lives alongside the legacy
-Markdown store during migration.  Every mutation is serialized with
-``BEGIN IMMEDIATE``; validation, deduplication, and budget checks therefore see
-the same database state that is committed by the mutation.
-"""
+"""Transactional SQLite catalog and authoritative store for ohmo personal memory."""
 
 from __future__ import annotations
 
@@ -16,7 +10,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator, cast
+from typing import Any, Iterator, Sequence, cast
 
 from ohmo.memory_store import (
     DEFAULT_ENTRY_CHAR_LIMIT,
@@ -27,7 +21,7 @@ from ohmo.memory_store import (
 from ohmo.threat_patterns import first_threat_message
 from ohmo.workspace import get_memory_dir
 
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 _MAX_TITLE_CHARS = 256
 _BUSY_TIMEOUT_MS = 5_000
 _RESERVED_NAMES = {"memory.md"}
@@ -89,7 +83,6 @@ class MemoryCatalog:
         """The SQLite file backing this catalog."""
         return self._db_path
 
-    # -- connection and schema ---------------------------------------------
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(
             self._db_path,
@@ -124,8 +117,6 @@ class MemoryCatalog:
             connection.close()
 
     def _initialize_schema(self) -> None:
-        # The write lock covers the version check and all migration DDL, so two
-        # processes constructing a catalog cannot both apply a migration.
         with self._write_connection() as connection:
             version = cast(int, connection.execute("PRAGMA user_version").fetchone()[0])
             if version > _SCHEMA_VERSION:
@@ -135,7 +126,11 @@ class MemoryCatalog:
                 )
             if version < 1:
                 self._migrate_to_v1(connection)
-                connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
+                version = 1
+            if version < 2:
+                self._migrate_to_v2(connection)
+                version = 2
+            connection.execute(f"PRAGMA user_version = {version}")
 
     @staticmethod
     def _migrate_to_v1(connection: sqlite3.Connection) -> None:
@@ -189,11 +184,13 @@ class MemoryCatalog:
         for statement in statements:
             connection.execute(statement)
 
-    # -- writes -------------------------------------------------------------
+    @staticmethod
+    def _migrate_to_v2(connection: sqlite3.Connection) -> None:
+        _outbox_module()._OutboxCatalogMixin._migrate_to_v2(connection)
+
     def add(self, title: str, content: str, *, source: str = "curated") -> MemoryOpResult:
         clean_title = (title or "").strip()
         clean_content = (content or "").strip()
-
         with self._write_connection() as connection:
             if not clean_title:
                 return MemoryOpResult(False, "A title is required.")
@@ -213,11 +210,9 @@ class MemoryCatalog:
                 )
             if source not in _SOURCES:
                 return MemoryOpResult(False, f"Invalid memory source {source!r}.")
-
             threat = first_threat_message(f"{clean_title}\n{clean_content}", scope="strict")
             if threat:
                 return MemoryOpResult(False, threat)
-
             slug = slugify(clean_title)
             name = f"{slug}.md"
             if name.lower() in _RESERVED_NAMES:
@@ -225,7 +220,6 @@ class MemoryCatalog:
                     False,
                     "That title is reserved for the memory index — choose a more specific title.",
                 )
-
             duplicate = connection.execute(
                 "SELECT slug FROM memories WHERE content = ? ORDER BY slug LIMIT 1",
                 (clean_content,),
@@ -279,6 +273,8 @@ class MemoryCatalog:
                     timestamp,
                 ),
             )
+            if source == "curated":
+                self._enqueue_outbox(connection, "add", slug, clean_content, timestamp=timestamp)
             return MemoryOpResult(True, f"Saved memory {name}.")
 
     def import_entry(
@@ -292,14 +288,7 @@ class MemoryCatalog:
         created_at: str | None = None,
         updated_at: str | None = None,
     ) -> MemoryOpResult:
-        """Import one trusted legacy entry without applying model-write limits.
-
-        This low-level migration primitive deliberately bypasses threat scanning,
-        per-entry limits, deduplication by content, and the active-store budget.
-        Callers must threat-scan untrusted content before invoking it. A repeated
-        import is a no-op only when the existing row at ``slug`` has identical
-        content; conflicting content is never overwritten.
-        """
+        """Import trusted legacy content without enqueueing or model-write limits."""
         clean_slug = _slug_reference(slug)
 
         with self._write_connection() as connection:
@@ -356,7 +345,6 @@ class MemoryCatalog:
         clean_slug = _slug_reference(slug)
         clean_content = (content or "").strip()
         clean_title = (title or "").strip() if title is not None else None
-
         with self._write_connection() as connection:
             if not clean_content:
                 return MemoryOpResult(False, "Content cannot be empty.")
@@ -372,11 +360,9 @@ class MemoryCatalog:
                     f"{self._entry_char_limit:,}-char per-entry limit. "
                     "Shorten it or split into focused entries.",
                 )
-
             threat = first_threat_message(f"{clean_title or ''}\n{clean_content}", scope="strict")
             if threat:
                 return MemoryOpResult(False, threat)
-
             row = connection.execute(
                 "SELECT * FROM memories WHERE slug = ?",
                 (clean_slug,),
@@ -410,11 +396,28 @@ class MemoryCatalog:
                 """,
                 (effective_title, clean_content, len(clean_content), _utc_timestamp(), clean_slug),
             )
+            if row["source"] == "curated":
+                self._enqueue_outbox(
+                    connection,
+                    "update",
+                    clean_slug,
+                    clean_content,
+                    old_conclusion_ids=cast(str, row["honcho_conclusion_ids"]),
+                )
             return MemoryOpResult(True, f"Updated memory {clean_slug}.md.")
 
     def remove(self, slug: str) -> MemoryOpResult:
         clean_slug = _slug_reference(slug)
         with self._write_connection() as connection:
+            row = connection.execute(
+                """
+                SELECT source, honcho_conclusion_ids FROM memories
+                WHERE slug = ? AND archive_status = 'active'
+                """,
+                (clean_slug,),
+            ).fetchone()
+            if row is None:
+                return MemoryOpResult(False, f"No memory entry {slug!r}.")
             cursor = connection.execute(
                 """
                 UPDATE memories
@@ -423,9 +426,43 @@ class MemoryCatalog:
                 """,
                 (_utc_timestamp(), clean_slug),
             )
-            if cursor.rowcount == 0:
-                return MemoryOpResult(False, f"No memory entry {slug!r}.")
+            if cursor.rowcount != 1:
+                raise RuntimeError(f"failed to archive memory {clean_slug!r}")
+            if row["source"] == "curated":
+                self._enqueue_outbox(
+                    connection,
+                    "remove",
+                    clean_slug,
+                    None,
+                    old_conclusion_ids=cast(str, row["honcho_conclusion_ids"]),
+                )
             return MemoryOpResult(True, f"Archived memory {clean_slug}.md.")
+
+    def _enqueue_outbox(self, *args: Any, **kwargs: Any) -> None:
+        _outbox_module()._OutboxCatalogMixin._enqueue_outbox(*args, **kwargs)
+
+    def lease_outbox(self, limit: int, lease_seconds: float) -> list[sqlite3.Row]:
+        return cast(
+            list[sqlite3.Row],
+            _outbox_module()._OutboxCatalogMixin.lease_outbox(self, limit, lease_seconds),
+        )
+
+    def mark_outbox_done(self, outbox_id: int) -> None:
+        _outbox_module()._OutboxCatalogMixin.mark_outbox_done(self, outbox_id)
+
+    def mark_outbox_retry(self, outbox_id: int) -> None:
+        _outbox_module()._OutboxCatalogMixin.mark_outbox_retry(self, outbox_id)
+
+    def set_conclusion_ids(self, slug: str, conclusion_ids: Sequence[str]) -> None:
+        _outbox_module()._OutboxCatalogMixin.set_conclusion_ids(self, slug, conclusion_ids)
+
+    def append_conclusion_id(self, slug: str, conclusion_id: str) -> None:
+        _outbox_module()._OutboxCatalogMixin.append_conclusion_id(self, slug, conclusion_id)
+
+    def reconcile_outbox(self) -> dict[str, int]:
+        return cast(
+            dict[str, int], _outbox_module()._OutboxCatalogMixin.reconcile_outbox(self)
+        )
 
     def record_use(self, slug: str) -> None:
         clean_slug = _slug_reference(slug)
@@ -439,7 +476,6 @@ class MemoryCatalog:
                 (_utc_timestamp(), clean_slug),
             )
 
-    # -- reads --------------------------------------------------------------
     def get(self, slug: str) -> CatalogRecord | None:
         clean_slug = _slug_reference(slug)
         with self._read_connection() as connection:
@@ -482,14 +518,7 @@ class MemoryCatalog:
         return cast(int, row["total"])
 
     def search(self, query: str, top_k: int) -> builtins.list[CatalogRecord]:
-        """Return FTS5 hits across active and archived rows.
-
-        FTS5's lower-is-better BM25 score (title weight 2, content weight 1) is
-        blended with a bounded usage boost of ``0.25 * usage / (usage + 4)``.
-        The bounded boost lets frequently injected entries win close matches
-        without allowing an unbounded counter to erase textual relevance.
-        Slug is the final deterministic tie-breaker.
-        """
+        """Return active and archived FTS5 hits with a bounded usage boost."""
         clean_query = (query or "").strip()
         if not clean_query or top_k <= 0:
             return []
@@ -559,6 +588,12 @@ def _env_int(name: str, default: int) -> int:
         return int(raw)
     except ValueError:
         return default
+
+
+def _outbox_module() -> Any:
+    from ohmo.memory_service import outbox
+
+    return outbox
 
 
 __all__ = ["CatalogRecord", "MemoryCatalog"]

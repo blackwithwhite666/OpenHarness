@@ -188,5 +188,5 @@ def test_schema_migration_and_env_limits(monkeypatch, tmp_path: Path):
     assert catalog.add("Too long", "1234").ok is False
     assert catalog.add("Overflow", "xy").ok is False
     with sqlite3.connect(db_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 1
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
         assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
