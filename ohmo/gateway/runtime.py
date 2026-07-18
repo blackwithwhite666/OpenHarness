@@ -291,7 +291,10 @@ class OhmoSessionRuntimePool:
             restore_tool_metadata=_sanitize_group_command_metadata(snapshot.get("tool_metadata") if snapshot else None),
             extra_skill_dirs=(str(get_skills_dir(self._workspace)),),
             extra_plugin_roots=(str(get_plugins_dir(self._workspace)),),
-            memory_backend=create_memory_command_backend(self._workspace),
+            memory_backend=create_memory_command_backend(
+                self._workspace,
+                backend_kind=self._gateway_config.memory_backend,
+            ),
             include_project_memory=False,
             autodream_context={
                 "memory_dir": str(get_memory_dir(self._workspace)),
@@ -452,7 +455,10 @@ class OhmoSessionRuntimePool:
                         session_id=getattr(bundle, "session_id", None),
                         extra_skill_dirs=getattr(bundle, "extra_skill_dirs", ()),
                         extra_plugin_roots=getattr(bundle, "extra_plugin_roots", ()),
-                        memory_backend=create_memory_command_backend(self._workspace),
+                        memory_backend=create_memory_command_backend(
+                            self._workspace,
+                            backend_kind=self._gateway_config.memory_backend,
+                        ),
                         include_project_memory=False,
                     )
                 return command_context
@@ -1013,7 +1019,10 @@ class OhmoSessionRuntimePool:
             restore_tool_metadata=_sanitize_group_command_metadata(getattr(bundle.engine, "tool_metadata", {}) or {}),
             extra_skill_dirs=(str(get_skills_dir(self._workspace)),),
             extra_plugin_roots=(str(get_plugins_dir(self._workspace)),),
-            memory_backend=create_memory_command_backend(self._workspace),
+            memory_backend=create_memory_command_backend(
+                self._workspace,
+                backend_kind=self._gateway_config.memory_backend,
+            ),
             include_project_memory=False,
             autodream_context={
                 "memory_dir": str(get_memory_dir(self._workspace)),

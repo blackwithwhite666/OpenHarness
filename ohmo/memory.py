@@ -149,7 +149,11 @@ def load_memory_prompt(
     return "\n".join(lines)
 
 
-def create_memory_command_backend(workspace: str | Path | None = None) -> MemoryCommandBackend:
+def create_memory_command_backend(
+    workspace: str | Path | None = None,
+    *,
+    backend_kind: str = "file",
+) -> MemoryCommandBackend:
     """Return a ``/memory`` backend bound to ohmo's personal memory store."""
 
     return MemoryCommandBackend(
@@ -161,6 +165,7 @@ def create_memory_command_backend(workspace: str | Path | None = None) -> Memory
         list_files=lambda: list_memory_files(workspace),
         add_entry=lambda title, content: add_memory_entry(workspace, title, content),
         remove_entry=lambda name: remove_memory_entry(workspace, name),
+        backend_kind=backend_kind,
     )
 
 
