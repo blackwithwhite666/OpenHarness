@@ -273,6 +273,18 @@ def make_memory_backend(
         return FileMemoryBackend(MemoryStore(workspace))
     if cfg.memory_backend == "catalog":
         return CatalogMemoryBackend(MemoryCatalog(workspace), workspace)
+    if cfg.memory_backend == "service":
+        if not cfg.memory_service_socket or not cfg.memory_service_secret_file:
+            raise ValueError(
+                "service memory backend requires memory_service_socket and "
+                "memory_service_secret_file"
+            )
+        from ohmo.memory_service.client import MemoryServiceClient
+
+        return MemoryServiceClient(
+            cfg.memory_service_socket,
+            cfg.memory_service_secret_file,
+        )
     if cfg.memory_backend == "honcho":
         raise NotImplementedError("honcho memory backend not built in Phase 0")
     raise ValueError(f"unsupported memory backend: {cfg.memory_backend!r}")

@@ -29,6 +29,8 @@ class GatewayConfig(BaseModel):
     message_coalesce_max: int = 20
     evals_capture: bool = True
     memory_backend: str = "file"
+    memory_service_socket: str | None = None
+    memory_service_secret_file: str | None = None
     owner_principals: tuple[str, ...] = ()
     honcho_base_url: str | None = None
     honcho_api_key: str | None = None

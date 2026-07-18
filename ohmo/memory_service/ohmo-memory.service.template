@@ -1,0 +1,20 @@
+# ADR §4.4 separate-UID memory boundary. The OS-attested tool sandbox with a
+# positive recursive allowlist is a Phase-2 prerequisite for user-visible recall
+# and is intentionally not built here.
+
+[Unit]
+Description=ohmo curated-memory service (separate UID)
+After=local-fs.target
+
+[Service]
+Type=simple
+User=<DISTINCT-SERVICE-UID>
+UMask=0077
+ExecStart=<PYTHON> -m ohmo.memory_service.server --socket <SOCKET-PATH> --workspace <WORKSPACE> --secret-file <SECRET-FILE>
+Restart=on-failure
+NoNewPrivileges=yes
+PrivateTmp=yes
+RestrictAddressFamilies=AF_UNIX
+
+[Install]
+WantedBy=default.target
