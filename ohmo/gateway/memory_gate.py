@@ -7,10 +7,15 @@ from dataclasses import dataclass
 
 from ohmo.gateway.models import GatewayConfig
 from ohmo.gateway.turn_context import TurnContext, canonical_principal
+from ohmo.memory_audit import memory_audit_event
 
 _OWNER_CONJUNCT = "is_canonical_owner"
 _PRIVATE_CONJUNCT = "is_trusted_private_chat"
 _ISOLATED_CONJUNCT = "principal_isolated_session"
+_TURN_CONTEXT_CONJUNCT = "turn_context_present"
+_PRINCIPAL_CONJUNCT = "canonical_principal_present"
+_RECOGNIZED_CONJUNCT = "principal_has_memory_tenant"
+_ENABLED_CONJUNCT = "tenant_memory_enabled"
 
 
 @dataclass(frozen=True)
@@ -37,10 +42,12 @@ def resolve_memory_scope(
 ) -> MemoryScope | None:
     """Resolve the turn's authorized memory audience, denying by default."""
     if turn_ctx is None:
+        _audit_scope_denial("unknown", (_TURN_CONTEXT_CONJUNCT,))
         return None
 
     principal = canonical_principal(turn_ctx.channel, turn_ctx.principal)
     if not principal:
+        _audit_scope_denial("unknown", (_PRINCIPAL_CONJUNCT,))
         return None
     owner_principals = {
         canonical_principal(turn_ctx.channel, owner) for owner in cfg.owner_principals
@@ -52,21 +59,58 @@ def resolve_memory_scope(
         tenant = cfg.family_principals.get(principal)
 
     if tenant is None:
+        _audit_scope_denial("unrecognized", (_RECOGNIZED_CONJUNCT,))
         return None
-    if turn_ctx.is_private is not True or principal_isolated is not True:
-        return None
+
+    failing_conjuncts = []
+    if turn_ctx.is_private is not True:
+        failing_conjuncts.append(_PRIVATE_CONJUNCT)
+    if principal_isolated is not True:
+        failing_conjuncts.append(_ISOLATED_CONJUNCT)
 
     legacy_owner_mode = not cfg.family_principals and not cfg.enabled_memory_tenants
-    if legacy_owner_mode:
-        if tenant != "owner":
-            return None
-        return MemoryScope(private_tenant="owner", shared_tenants=())
+    if legacy_owner_mode and tenant != "owner":
+        failing_conjuncts.append(_OWNER_CONJUNCT)
+    elif not legacy_owner_mode and tenant not in cfg.enabled_memory_tenants:
+        failing_conjuncts.append(_ENABLED_CONJUNCT)
 
-    if tenant not in cfg.enabled_memory_tenants:
+    if failing_conjuncts:
+        _audit_scope_denial(
+            tenant,
+            tuple(failing_conjuncts),
+            cross_scope=tenant != "owner",
+        )
         return None
-    return MemoryScope(
-        private_tenant=tenant,
-        shared_tenants=cfg.shared_tenants,
+
+    if legacy_owner_mode:
+        scope = MemoryScope(private_tenant="owner", shared_tenants=())
+    else:
+        scope = MemoryScope(
+            private_tenant=tenant,
+            shared_tenants=cfg.shared_tenants,
+        )
+    memory_audit_event(
+        "memory_gate",
+        tenant_id=tenant,
+        requester_tenant=tenant,
+        outcome="allow",
+    )
+    return scope
+
+
+def _audit_scope_denial(
+    requester_tenant: str,
+    failing_conjuncts: tuple[str, ...],
+    *,
+    cross_scope: bool = False,
+) -> None:
+    memory_audit_event(
+        "memory_gate",
+        tenant_id=requester_tenant,
+        requester_tenant=requester_tenant,
+        outcome="deny",
+        failing_conjuncts=failing_conjuncts,
+        cross_scope_denial=cross_scope,
     )
 
 

@@ -56,7 +56,7 @@ def test_schema_v1_migrates_to_latest_idempotently(tmp_path: Path):
     MemoryCatalog(db_path=db_path)
 
     with sqlite3.connect(db_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
         columns = {
             row[1] for row in connection.execute("PRAGMA table_info(outbox)").fetchall()
         }

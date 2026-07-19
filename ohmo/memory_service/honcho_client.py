@@ -17,6 +17,8 @@ from urllib.parse import quote
 
 import httpx
 
+from ohmo.memory_audit import memory_audit_event
+
 JSONValue: TypeAlias = None | bool | int | float | str | list["JSONValue"] | dict[str, "JSONValue"]
 JSONObject: TypeAlias = dict[str, JSONValue]
 QueryValue: TypeAlias = str | int | float | bool | None
@@ -485,6 +487,12 @@ class HonchoClient:
         json: object = _MISSING,
         params: Mapping[str, QueryValue] | None = None,
     ) -> JSONValue:
+        memory_audit_event(
+            "honcho_request",
+            outcome="attempt",
+            operation=method.lower(),
+            workspace=self.workspace,
+        )
         try:
             if json is _MISSING:
                 response = await self._client.request(method, path, params=params)

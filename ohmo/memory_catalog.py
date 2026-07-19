@@ -14,6 +14,7 @@ from typing import Any, Iterator, Sequence, cast
 
 import numpy as np
 
+from ohmo.memory_audit import memory_audit_event
 from ohmo.memory_store import (
     DEFAULT_ENTRY_CHAR_LIMIT,
     DEFAULT_STORE_CHAR_BUDGET,
@@ -23,7 +24,7 @@ from ohmo.memory_store import (
 from ohmo.threat_patterns import first_threat_message
 from ohmo.workspace import get_memory_dir
 
-_SCHEMA_VERSION = 5
+_SCHEMA_VERSION = 6
 _MAX_TITLE_CHARS = 256
 _BUSY_TIMEOUT_MS = 5_000
 _RESERVED_NAMES = {"memory.md"}
@@ -159,6 +160,9 @@ class MemoryCatalog:
             if version < 5:
                 self._migrate_to_v5(connection)
                 version = 5
+            if version < 6:
+                self._migrate_to_v6(connection)
+                version = 6
             connection.execute(f"PRAGMA user_version = {version}")
 
     @staticmethod
@@ -411,9 +415,26 @@ class MemoryCatalog:
             """
         )
 
+    @staticmethod
+    def _migrate_to_v6(connection: sqlite3.Connection) -> None:
+        """Add explicit, per-principal consent records for private tenants."""
+        connection.execute(
+            """
+            CREATE TABLE tenant_consent (
+                tenant_id TEXT NOT NULL REFERENCES tenants(tenant_id) ON DELETE CASCADE,
+                principal TEXT NOT NULL,
+                consented INTEGER NOT NULL CHECK (consented IN (0, 1)),
+                consented_at TEXT NOT NULL,
+                note TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (tenant_id, principal)
+            )
+            """
+        )
+
     def ensure_tenant(self, tenant_id: str, kind: str) -> None:
         """Create a tenant, rejecting empty ids and incompatible redefinitions."""
         clean_tenant_id = _tenant_reference(tenant_id)
+        _audit_catalog_op(clean_tenant_id, "ensure_tenant")
         if kind not in {"private", "shared"}:
             raise ValueError(f"invalid tenant kind {kind!r}")
         with self._write_connection() as connection:
@@ -432,6 +453,119 @@ class MemoryCatalog:
                 (clean_tenant_id, kind, _utc_timestamp()),
             )
 
+    def record_consent(self, tenant_id: str, principal: str, note: str = "") -> None:
+        """Record or renew affirmative consent for one canonical principal."""
+        clean_tenant_id = _tenant_reference(tenant_id)
+        clean_principal = (principal or "").strip()
+        if not clean_principal:
+            raise ValueError("a consenting principal is required")
+        _audit_catalog_op(clean_tenant_id, "record_consent")
+        with self._write_connection() as connection:
+            if connection.execute(
+                "SELECT 1 FROM tenants WHERE tenant_id = ?",
+                (clean_tenant_id,),
+            ).fetchone() is None:
+                raise KeyError(f"unknown tenant {clean_tenant_id!r}")
+            connection.execute(
+                """
+                INSERT INTO tenant_consent (
+                    tenant_id, principal, consented, consented_at, note
+                ) VALUES (?, ?, 1, ?, ?)
+                ON CONFLICT(tenant_id, principal) DO UPDATE SET
+                    consented = 1,
+                    consented_at = excluded.consented_at,
+                    note = excluded.note
+                """,
+                (clean_tenant_id, clean_principal, _utc_timestamp(), note or ""),
+            )
+
+    def has_consent(self, tenant_id: str) -> bool:
+        """Return whether a tenant has at least one affirmative consent record."""
+        clean_tenant_id = _tenant_reference(tenant_id)
+        _audit_catalog_op(clean_tenant_id, "has_consent")
+        with self._read_connection() as connection:
+            row = connection.execute(
+                """
+                SELECT 1 FROM tenant_consent
+                WHERE tenant_id = ? AND consented = 1
+                LIMIT 1
+                """,
+                (clean_tenant_id,),
+            ).fetchone()
+        return row is not None
+
+    def export_tenant(self, tenant_id: str) -> dict[str, object]:
+        """Return a deterministic, content-complete DR export for one tenant."""
+        clean_tenant_id = _tenant_reference(tenant_id)
+        _audit_catalog_op(clean_tenant_id, "export_tenant")
+        with self._read_connection() as connection:
+            tenant = connection.execute(
+                """
+                SELECT tenant_id, kind, created_at FROM tenants
+                WHERE tenant_id = ?
+                """,
+                (clean_tenant_id,),
+            ).fetchone()
+            consent = connection.execute(
+                """
+                SELECT tenant_id, principal, consented, consented_at, note
+                FROM tenant_consent WHERE tenant_id = ?
+                ORDER BY principal
+                """,
+                (clean_tenant_id,),
+            ).fetchall()
+            memories = connection.execute(
+                """
+                SELECT * FROM memories WHERE tenant_id = ?
+                ORDER BY slug
+                """,
+                (clean_tenant_id,),
+            ).fetchall()
+        return {
+            "schema_version": _SCHEMA_VERSION,
+            "tenant_id": clean_tenant_id,
+            "tenant": dict(tenant) if tenant is not None else None,
+            "consent": [dict(row) for row in consent],
+            "memories": [dict(row) for row in memories],
+        }
+
+    def delete_tenant(self, tenant_id: str) -> bool:
+        """Hard-delete one non-owner tenant from the local catalog idempotently.
+
+        This deliberately does not contact Honcho. Operators must separately
+        delete the workspace named in that tenant's gateway binding.
+        """
+        clean_tenant_id = _tenant_reference(tenant_id)
+        if clean_tenant_id == "owner":
+            raise ValueError("the owner tenant cannot be deleted")
+        _audit_catalog_op(clean_tenant_id, "delete_tenant")
+        with self._write_connection() as connection:
+            existed = connection.execute(
+                "SELECT 1 FROM tenants WHERE tenant_id = ?",
+                (clean_tenant_id,),
+            ).fetchone()
+            connection.execute(
+                "DELETE FROM outbox WHERE tenant_id = ?",
+                (clean_tenant_id,),
+            )
+            connection.execute(
+                "DELETE FROM share_ledger WHERE source_tenant_id = ?",
+                (clean_tenant_id,),
+            )
+            connection.execute(
+                "DELETE FROM tenant_consent WHERE tenant_id = ?",
+                (clean_tenant_id,),
+            )
+            connection.execute(
+                "DELETE FROM memories WHERE tenant_id = ?",
+                (clean_tenant_id,),
+            )
+            connection.execute(
+                "DELETE FROM tenants WHERE tenant_id = ?",
+                (clean_tenant_id,),
+            )
+        return existed is not None
+
     def add(
         self,
         tenant_id: str,
@@ -441,6 +575,7 @@ class MemoryCatalog:
         source: str = "curated",
     ) -> MemoryOpResult:
         clean_tenant_id = _tenant_reference(tenant_id)
+        _audit_catalog_op(clean_tenant_id, "add")
         clean_title = (title or "").strip()
         clean_content = (content or "").strip()
         with self._write_connection() as connection:
@@ -570,6 +705,7 @@ class MemoryCatalog:
     ) -> MemoryOpResult:
         """Import trusted legacy content without enqueueing or model-write limits."""
         clean_tenant_id = _tenant_reference(tenant_id)
+        _audit_catalog_op(clean_tenant_id, "import_entry")
         clean_slug = _slug_reference(slug)
 
         with self._write_connection() as connection:
@@ -663,6 +799,7 @@ class MemoryCatalog:
         """Record one completed share operation, returning false for a duplicate op id."""
         clean_op_id = (op_id or "").strip()
         clean_source_tenant_id = _tenant_reference(source_tenant_id)
+        _audit_catalog_op(clean_source_tenant_id, "record_share")
         clean_source_slug = _slug_reference(source_slug)
         clean_source_digest = (source_digest or "").strip()
         clean_actor_principal = (actor_principal or "").strip()
@@ -706,6 +843,7 @@ class MemoryCatalog:
         title: str | None = None,
     ) -> MemoryOpResult:
         clean_tenant_id = _tenant_reference(tenant_id)
+        _audit_catalog_op(clean_tenant_id, "update")
         clean_slug = _slug_reference(slug)
         clean_content = (content or "").strip()
         clean_title = (title or "").strip() if title is not None else None
@@ -788,6 +926,7 @@ class MemoryCatalog:
 
     def remove(self, tenant_id: str, slug: str) -> MemoryOpResult:
         clean_tenant_id = _tenant_reference(tenant_id)
+        _audit_catalog_op(clean_tenant_id, "remove")
         clean_slug = _slug_reference(slug)
         with self._write_connection() as connection:
             row = connection.execute(
@@ -867,6 +1006,7 @@ class MemoryCatalog:
 
     def record_use(self, tenant_id: str, slug: str) -> None:
         clean_tenant_id = _tenant_reference(tenant_id)
+        _audit_catalog_op(clean_tenant_id, "record_use")
         clean_slug = _slug_reference(slug)
         with self._write_connection() as connection:
             connection.execute(
@@ -880,6 +1020,7 @@ class MemoryCatalog:
 
     def get(self, tenant_id: str, slug: str) -> CatalogRecord | None:
         clean_tenant_id = _tenant_reference(tenant_id)
+        _audit_catalog_op(clean_tenant_id, "get")
         clean_slug = _slug_reference(slug)
         with self._read_connection() as connection:
             row = connection.execute(
@@ -895,6 +1036,7 @@ class MemoryCatalog:
         include_archived: bool = False,
     ) -> list[CatalogRecord]:
         clean_tenant_id = _tenant_reference(tenant_id)
+        _audit_catalog_op(clean_tenant_id, "list")
         with self._read_connection() as connection:
             return self._list_records(
                 connection,
@@ -922,6 +1064,7 @@ class MemoryCatalog:
 
     def total_chars(self, tenant_id: str, *, active_only: bool = True) -> int:
         clean_tenant_id = _tenant_reference(tenant_id)
+        _audit_catalog_op(clean_tenant_id, "total_chars")
         with self._read_connection() as connection:
             return self._total_chars(
                 connection,
@@ -939,6 +1082,7 @@ class MemoryCatalog:
     ) -> bool:
         """Store a vector iff it still describes the current active record generation."""
         clean_tenant_id = _tenant_reference(tenant_id)
+        _audit_catalog_op(clean_tenant_id, "store_embedding")
         clean_slug = _slug_reference(slug)
         clean_model = (model or "").strip()
         array = np.asarray(vector, dtype="<f4")
@@ -995,6 +1139,7 @@ class MemoryCatalog:
     ) -> dict[str, tuple[builtins.list[float], str, int]]:
         """Return one tenant's vectors as ``slug -> (vector, model, generation)``."""
         clean_tenant_id = _tenant_reference(tenant_id)
+        _audit_catalog_op(clean_tenant_id, "get_embeddings")
         with self._read_connection() as connection:
             rows = connection.execute(
                 """
@@ -1043,6 +1188,7 @@ class MemoryCatalog:
     ) -> builtins.list[CatalogRecord]:
         """Return active and archived FTS5 hits with a bounded usage boost."""
         clean_tenant_id = _tenant_reference(tenant_id)
+        _audit_catalog_op(clean_tenant_id, "search")
         clean_query = (query or "").strip()
         if not clean_query or top_k <= 0:
             return []
@@ -1104,6 +1250,39 @@ def _record_from_row(row: sqlite3.Row) -> CatalogRecord:
         outbox_state=cast(str | None, row["outbox_state"]),
         created_at=cast(str, row["created_at"]),
         updated_at=cast(str, row["updated_at"]),
+    )
+
+
+def record_consent(
+    catalog: MemoryCatalog,
+    tenant_id: str,
+    principal: str,
+    note: str = "",
+) -> None:
+    """Record consent through the catalog's transactional store."""
+    catalog.record_consent(tenant_id, principal, note)
+
+
+def has_consent(catalog: MemoryCatalog, tenant_id: str) -> bool:
+    """Return whether the tenant has an affirmative consent record."""
+    return catalog.has_consent(tenant_id)
+
+
+def export_tenant(catalog: MemoryCatalog, tenant_id: str) -> dict[str, object]:
+    """Return one tenant's deterministic disaster-recovery export."""
+    return catalog.export_tenant(tenant_id)
+
+
+def delete_tenant(catalog: MemoryCatalog, tenant_id: str) -> bool:
+    """Delete one non-owner tenant locally without contacting Honcho."""
+    return catalog.delete_tenant(tenant_id)
+
+
+def _audit_catalog_op(tenant_id: str, operation: str) -> None:
+    memory_audit_event(
+        "catalog_op",
+        tenant_id=tenant_id,
+        operation=operation,
     )
 
 
