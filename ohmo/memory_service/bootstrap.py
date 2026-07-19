@@ -22,6 +22,17 @@ class BootstrapResult:
     session: Session
 
 
+@dataclass(frozen=True, slots=True)
+class TenantOnboarding:
+    """Provisioned resources and runtime binding for one tenant."""
+
+    workspace: str
+    jwt: str
+    observed_peer: str
+    peers: tuple[Peer, ...]
+    session: Session
+
+
 async def bootstrap_workspace(
     client: HonchoClient,
     *,
@@ -69,6 +80,47 @@ async def bootstrap_workspace(
         peers=peer_configuration,
     )
     return BootstrapResult(workspace_result, peer_results, session_result)
+
+
+async def onboard_tenant(
+    *,
+    base_url: str,
+    admin_jwt: str,
+    workspace: str,
+    person_peer: str,
+    ttl: dt.timedelta | int | float,
+) -> TenantOnboarding:
+    """Provision one person's workspace and mint its runtime-scoped JWT.
+
+    The admin credential is accepted only as an explicit maintenance input; it
+    is used to create the tenant resources and key and is not retained in the
+    returned runtime binding.
+    """
+    if not admin_jwt:
+        raise ValueError("admin_jwt is required for tenant onboarding")
+    _validate_resource_name(workspace, "workspace")
+    _validate_resource_name(person_peer, "person peer")
+    expiry = dt.datetime.now(dt.timezone.utc) + _coerce_ttl(ttl)
+
+    async with HonchoClient(
+        base_url=base_url,
+        jwt=admin_jwt,
+        workspace=workspace,
+    ) as client:
+        resources = await bootstrap_workspace(
+            client,
+            peers=("ohmo", "ohmo-curated", person_peer),
+            session=_DEFAULT_SESSION,
+        )
+        scoped_jwt = await client.create_key(expires_at=expiry)
+
+    return TenantOnboarding(
+        workspace=workspace,
+        jwt=scoped_jwt,
+        observed_peer=person_peer,
+        peers=resources.peers,
+        session=resources.session,
+    )
 
 
 async def provision_eval_workspace(
@@ -122,4 +174,10 @@ def _validate_resource_name(value: str, description: str) -> None:
         raise ValueError(f"{description} must contain only letters, digits, '_' or '-'")
 
 
-__all__ = ["BootstrapResult", "bootstrap_workspace", "provision_eval_workspace"]
+__all__ = [
+    "BootstrapResult",
+    "TenantOnboarding",
+    "bootstrap_workspace",
+    "onboard_tenant",
+    "provision_eval_workspace",
+]

@@ -14,7 +14,12 @@ import httpx
 import pytest
 
 from ohmo.memory_service import bootstrap as bootstrap_module
-from ohmo.memory_service.bootstrap import bootstrap_workspace, provision_eval_workspace
+from ohmo.memory_service.bootstrap import (
+    TenantOnboarding,
+    bootstrap_workspace,
+    onboard_tenant,
+    provision_eval_workspace,
+)
 from ohmo.memory_service.honcho_client import HonchoClient, HonchoError
 
 _NOW = "2026-07-18T09:00:00Z"
@@ -458,6 +463,103 @@ async def test_eval_provisioning_rejects_missing_admin_credential() -> None:
             run="run",
             case="case",
             sample=1,
+            ttl=60,
+        )
+
+
+async def test_tenant_onboarding_is_idempotent_and_returns_runtime_binding(
+    fake_honcho: FakeHoncho,
+) -> None:
+    constructed: list[dict[str, object]] = []
+
+    def client_factory(**kwargs: object) -> HonchoClient:
+        constructed.append(dict(kwargs))
+        return HonchoClient(**kwargs, transport=fake_honcho.transport())  # type: ignore[arg-type]
+
+    with patch.object(bootstrap_module, "HonchoClient", side_effect=client_factory):
+        first = await onboard_tenant(
+            base_url="https://honcho.test",
+            admin_jwt="admin-jwt",
+            workspace="ohmo-prod-marina",
+            person_peer="marina",
+            ttl=dt.timedelta(days=30),
+        )
+        second = await onboard_tenant(
+            base_url="https://honcho.test",
+            admin_jwt="admin-jwt",
+            workspace="ohmo-prod-marina",
+            person_peer="marina",
+            ttl=3600,
+        )
+
+    assert first == TenantOnboarding(
+        workspace="ohmo-prod-marina",
+        jwt=fake_honcho.minted_key,
+        observed_peer="marina",
+        peers=first.peers,
+        session=first.session,
+    )
+    assert [peer.id for peer in first.peers] == ["ohmo", "ohmo-curated", "marina"]
+    assert second.workspace == first.workspace
+    assert second.jwt
+    assert second.observed_peer == "marina"
+    assert fake_honcho.sessions[("ohmo-prod-marina", "ohmo")] == {
+        "ohmo": {"observe_others": True, "observe_me": False},
+        "ohmo-curated": {"observe_others": False, "observe_me": False},
+        "marina": {"observe_others": False, "observe_me": True},
+    }
+    assert fake_honcho.side_effects == Counter(
+        {"peer": 3, "key": 2, "workspace": 1, "session": 1}
+    )
+    assert constructed == [
+        {
+            "base_url": "https://honcho.test",
+            "jwt": "admin-jwt",
+            "workspace": "ohmo-prod-marina",
+        },
+        {
+            "base_url": "https://honcho.test",
+            "jwt": "admin-jwt",
+            "workspace": "ohmo-prod-marina",
+        },
+    ]
+    assert all(
+        request.headers["Authorization"] == "Bearer admin-jwt"
+        for request in fake_honcho.requests
+    )
+    assert "admin-jwt" not in repr(first)
+    assert inspect.signature(onboard_tenant).parameters["admin_jwt"].default is inspect.Parameter.empty
+
+
+@pytest.mark.parametrize(
+    ("workspace", "person_peer", "message"),
+    [
+        ("invalid workspace", "marina", "workspace must contain only"),
+        ("ohmo-prod-marina", "marina.person", "person peer must contain only"),
+    ],
+)
+async def test_tenant_onboarding_validates_resource_names(
+    workspace: str,
+    person_peer: str,
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        await onboard_tenant(
+            base_url="https://honcho.test",
+            admin_jwt="admin-jwt",
+            workspace=workspace,
+            person_peer=person_peer,
+            ttl=60,
+        )
+
+
+async def test_tenant_onboarding_rejects_missing_admin_credential() -> None:
+    with pytest.raises(ValueError, match="admin_jwt is required"):
+        await onboard_tenant(
+            base_url="https://honcho.test",
+            admin_jwt="",
+            workspace="ohmo-prod-marina",
+            person_peer="marina",
             ttl=60,
         )
 
