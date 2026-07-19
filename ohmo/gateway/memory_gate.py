@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Collection
 from dataclasses import dataclass
 
 from ohmo.gateway.turn_context import TurnContext
@@ -17,6 +18,19 @@ class GateDecision:
 
     allowed: bool
     reasons: tuple[str, ...]
+
+
+def memory_engaged(
+    owner_principals: Collection[str],
+    gate_decision: GateDecision,
+) -> bool:
+    """Return whether authoritative memory is available for this turn.
+
+    An empty owner list is the legacy single-user configuration, where memory
+    remains unconditionally available. Once owners are configured, every
+    model-facing memory surface requires a green confidentiality gate.
+    """
+    return not owner_principals or gate_decision.allowed
 
 
 def evaluate_memory_gate(

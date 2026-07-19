@@ -51,9 +51,12 @@ def build_ohmo_system_prompt(
     extra_prompt: str | None = None,
     include_project_memory: bool = False,
     include_ohmo_memory: bool = True,
+    include_ohmo_workspace: bool | None = None,
 ) -> str:
     """Build the custom base prompt for ohmo sessions."""
     root = get_workspace_root(workspace)
+    if include_ohmo_workspace is None:
+        include_ohmo_workspace = include_ohmo_memory
     sections = [get_base_system_prompt()]
 
     if extra_prompt:
@@ -166,7 +169,7 @@ def build_ohmo_system_prompt(
         ]
     )
 
-    if include_ohmo_memory:
+    if include_ohmo_workspace:
         sections.extend(_build_ohmo_workspace_sections(root))
 
     sections.extend(

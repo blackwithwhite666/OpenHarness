@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from ohmo.gateway.memory_gate import GateDecision, evaluate_memory_gate
+from ohmo.gateway.memory_gate import GateDecision, evaluate_memory_gate, memory_engaged
 from ohmo.memory_backend import MemoryBackend, ShadowMemoryBackend, _inject_char_budget
 from ohmo.prompts import _build_ohmo_workspace_sections
 
@@ -13,6 +13,7 @@ if TYPE_CHECKING:
     from ohmo.gateway.turn_context import TurnContext
 
 _MEMORY_HEADING = "# ohmo Memory"
+_WORKSPACE_HEADING = "# ohmo Workspace"
 _MEMORY_DIRECTORY_PREFIX = "- Personal memory directory: "
 _REMINDERS_SECTION = "# Reminders"
 _DERIVED_RECALL_TIMEOUT_SECONDS = 0.5
@@ -27,15 +28,18 @@ class TurnSnapshot(str):
     """
 
     gate_decision: GateDecision
+    memory_engaged: bool
 
     def __new__(
         cls,
         memory_block: str,
         *,
         gate_decision: GateDecision,
+        memory_engaged: bool,
     ) -> TurnSnapshot:
         snapshot = super().__new__(cls, memory_block)
         snapshot.gate_decision = gate_decision
+        snapshot.memory_engaged = memory_engaged
         return snapshot
 
     @property
@@ -53,19 +57,22 @@ async def prepare_turn(
     visible_recall: bool = False,
     latest_user_prompt: str | None = None,
     derived_recall_timeout: float = _DERIVED_RECALL_TIMEOUT_SECONDS,
+    owner_principals: tuple[str, ...] = (),
 ) -> TurnSnapshot:
     """Read a fresh backend-rendered memory snapshot for one submitted turn.
 
-    The authoritative catalog block is always rendered first. Honcho derived
-    recall is queried with the latest user-turn text and appended only after an
-    explicit opt-in and a green confidentiality gate. Any Honcho failure leaves
-    the catalog-only block byte-for-byte unchanged.
+    With no configured owners, the authoritative catalog block is rendered as
+    before. Once owners are configured, it is rendered only after a green
+    confidentiality gate. Honcho derived recall additionally requires explicit
+    opt-in. Any Honcho failure leaves the catalog-only block byte-for-byte
+    unchanged.
     """
     gate_decision = evaluate_memory_gate(
         turn_ctx,
         principal_isolated=principal_isolated,
     )
-    memory_block = await backend.render_prompt(budget)
+    engaged = memory_engaged(owner_principals, gate_decision)
+    memory_block = await backend.render_prompt(budget) if engaged else ""
     if (
         visible_recall is True
         and gate_decision.allowed
@@ -85,10 +92,16 @@ async def prepare_turn(
     return TurnSnapshot(
         memory_block,
         gate_decision=gate_decision,
+        memory_engaged=engaged,
     )
 
 
-def compose_runtime_prompt(memory_free_base: str, snapshot: str) -> str:
+def compose_runtime_prompt(
+    memory_free_base: str,
+    snapshot: str,
+    *,
+    memory_engaged: bool = True,
+) -> str:
     """Compose one snapshot into a memory-free ohmo persona.
 
     The file renderer carries the memory directory in its scaffold. That lets
@@ -97,13 +110,17 @@ def compose_runtime_prompt(memory_free_base: str, snapshot: str) -> str:
     already-composed input is returned unchanged rather than duplicating the
     standing memory block.
     """
+    if not memory_engaged:
+        return _strip_memory_surfaces(memory_free_base)
     if _has_memory_block(memory_free_base):
         return memory_free_base
     if not snapshot or not snapshot.strip():
         return memory_free_base
 
     base = memory_free_base
-    if workspace_root := _workspace_root_from_snapshot(snapshot):
+    if not _has_workspace_section(base) and (
+        workspace_root := _workspace_root_from_snapshot(snapshot)
+    ):
         reminders_marker = f"\n\n{_REMINDERS_SECTION}\n"
         if reminders_marker in base:
             before, after = base.rsplit(reminders_marker, 1)
@@ -122,6 +139,26 @@ def compose_runtime_prompt(memory_free_base: str, snapshot: str) -> str:
 
 def _has_memory_block(prompt: str) -> bool:
     return any(line == _MEMORY_HEADING for line in prompt.splitlines())
+
+
+def _has_workspace_section(prompt: str) -> bool:
+    return any(line == _WORKSPACE_HEADING for line in prompt.splitlines())
+
+
+def _strip_memory_surfaces(prompt: str) -> str:
+    """Remove authoritative memory and its workspace instructions from a base."""
+    workspace_marker = f"\n\n{_WORKSPACE_HEADING}\n"
+    reminders_marker = f"\n\n{_REMINDERS_SECTION}\n"
+    if workspace_marker in prompt:
+        before, after_workspace = prompt.split(workspace_marker, 1)
+        if reminders_marker in f"\n\n{after_workspace}":
+            _, after = f"\n\n{after_workspace}".split(reminders_marker, 1)
+            prompt = f"{before}{reminders_marker}{after}"
+
+    memory_marker = f"\n\n{_MEMORY_HEADING}\n"
+    if memory_marker in prompt:
+        prompt = prompt.split(memory_marker, 1)[0]
+    return prompt
 
 
 def _workspace_root_from_snapshot(snapshot: str) -> Path | None:

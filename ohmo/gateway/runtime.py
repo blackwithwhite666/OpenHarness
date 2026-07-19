@@ -38,7 +38,12 @@ from openharness.ui.runtime import RuntimeBundle, _last_user_text, build_runtime
 from ohmo.evals import GatewayEvalRecorder
 from ohmo.gateway.config import load_gateway_config
 from ohmo.gateway.group_tool import CreateFeishuGroup, OhmoCreateFeishuGroupTool, PublishGroupWelcome
-from ohmo.gateway.memory_gate import principal_isolated_session
+from ohmo.gateway.memory_gate import (
+    GateDecision,
+    evaluate_memory_gate,
+    memory_engaged,
+    principal_isolated_session,
+)
 from ohmo.gateway.provider_commands import handle_gateway_model_command, handle_gateway_provider_command
 from ohmo.gateway.router import session_key_for_message
 from ohmo.gateway.send_message_tool import SendTelegramMessageTool
@@ -310,16 +315,19 @@ class OhmoSessionRuntimePool:
                 backend_kind=self._gateway_config.memory_backend,
             ),
             include_project_memory=False,
-            autodream_context={
-                "memory_dir": str(get_memory_dir(self._workspace)),
-                "session_dir": str(get_sessions_dir(self._workspace)),
-                "app_label": "ohmo personal memory",
-                "runner_module": "ohmo",
-            },
+            autodream_context=(
+                self._autodream_context()
+                if not self._gateway_config.owner_principals
+                else None
+            ),
         )
         if snapshot and snapshot.get("session_id"):
             bundle.session_id = str(snapshot["session_id"])
-        self._register_gateway_tools(bundle)
+        self._register_gateway_tools(
+            bundle,
+            memory_engaged=not self._gateway_config.owner_principals,
+        )
+        self._configure_turn_memory_surfaces(bundle, None)
         await start_runtime(bundle)
         bundle.engine.set_system_prompt(
             await self._runtime_system_prompt(bundle, latest_user_prompt)
@@ -421,6 +429,7 @@ class OhmoSessionRuntimePool:
             owner_principals=self._gateway_config.owner_principals,
         )
         self._bind_session_owner(message, session_key, turn_ctx)
+        self._configure_turn_memory_surfaces(bundle, turn_ctx)
         logger.debug(
             "ohmo turn identity principal=%s owner=%s private=%s channel=%s chat_id=%s session_id=%s",
             turn_ctx.principal,
@@ -814,7 +823,11 @@ class OhmoSessionRuntimePool:
         self._restore_group_request_context(bundle, previous_group_request)
         self._clear_reminder_context(bundle)
         await self._save_snapshot(bundle, session_key, user_prompt)
-        self._maybe_schedule_memory_judge(bundle, session_key)
+        self._maybe_schedule_memory_judge(
+            bundle,
+            session_key,
+            turn_ctx=turn_ctx,
+        )
         reply = "".join(reply_parts).strip()
         if reply:
             await self._append_conversation_turn(
@@ -848,10 +861,7 @@ class OhmoSessionRuntimePool:
     ) -> None:
         if self._gateway_config.conversation_learning is not True:
             return
-        if turn_ctx.is_owner is not True or turn_ctx.is_private is not True:
-            return
-        session_owner_principal = self._session_owner_principals.get(turn_ctx.session_id)
-        if not principal_isolated_session(turn_ctx, session_owner_principal):
+        if not self._memory_gate_decision(turn_ctx).allowed:
             return
         await self._prompt_memory_backend.append_turn("user", user_text)
         await self._prompt_memory_backend.append_turn("assistant", assistant_text)
@@ -1097,6 +1107,7 @@ class OhmoSessionRuntimePool:
         snapshot = sanitize_conversation_messages(list(bundle.engine.messages))
         prior_session_id = bundle.session_id
         bundle_cwd = str(Path(getattr(bundle, "cwd", self._cwd)).resolve())
+        engaged = self._memory_engaged(turn_ctx)
         await close_runtime(bundle)
         refreshed = await build_runtime(
             cwd=bundle_cwd,
@@ -1120,15 +1131,11 @@ class OhmoSessionRuntimePool:
                 backend_kind=self._gateway_config.memory_backend,
             ),
             include_project_memory=False,
-            autodream_context={
-                "memory_dir": str(get_memory_dir(self._workspace)),
-                "session_dir": str(get_sessions_dir(self._workspace)),
-                "app_label": "ohmo personal memory",
-                "runner_module": "ohmo",
-            },
+            autodream_context=self._autodream_context() if engaged else None,
         )
         refreshed.session_id = prior_session_id
-        self._register_gateway_tools(refreshed)
+        self._register_gateway_tools(refreshed, memory_engaged=engaged)
+        self._configure_turn_memory_surfaces(refreshed, turn_ctx)
         await start_runtime(refreshed)
         refreshed.engine.set_system_prompt(
             await self._runtime_system_prompt(
@@ -1154,11 +1161,13 @@ class OhmoSessionRuntimePool:
         turn_ctx: TurnContext | None = None,
     ) -> str:
         bundle_cwd = str(Path(getattr(bundle, "cwd", self._cwd)).resolve())
+        engaged = self._memory_engaged(turn_ctx)
         memory_free_base = build_ohmo_system_prompt(
             bundle_cwd,
             workspace=self._workspace,
             extra_prompt=None,
             include_ohmo_memory=False,
+            include_ohmo_workspace=engaged,
         )
         session_owner_principal = (
             self._session_owner_principals.get(turn_ctx.session_id)
@@ -1174,6 +1183,7 @@ class OhmoSessionRuntimePool:
             ),
             visible_recall=self._gateway_config.visible_recall,
             latest_user_prompt=latest_user_prompt,
+            owner_principals=self._gateway_config.owner_principals,
         )
         gate_decision = getattr(snapshot, "gate_decision", None)
         if gate_decision is not None:
@@ -1184,13 +1194,27 @@ class OhmoSessionRuntimePool:
                 turn_ctx.session_id if turn_ctx is not None else "",
             )
         if not hasattr(bundle, "current_settings"):
-            return compose_runtime_prompt(memory_free_base, snapshot)
+            return compose_runtime_prompt(
+                memory_free_base,
+                snapshot,
+                memory_engaged=engaged,
+            )
         settings = bundle.current_settings()
         if not hasattr(settings, "system_prompt"):
-            return compose_runtime_prompt(memory_free_base, snapshot)
+            return compose_runtime_prompt(
+                memory_free_base,
+                snapshot,
+                memory_engaged=engaged,
+            )
         base = settings.system_prompt or memory_free_base
         composed_settings = settings.model_copy(
-            update={"system_prompt": compose_runtime_prompt(base, snapshot)}
+            update={
+                "system_prompt": compose_runtime_prompt(
+                    base,
+                    snapshot,
+                    memory_engaged=engaged,
+                )
+            }
         )
         return build_runtime_system_prompt(
             composed_settings,
@@ -1231,14 +1255,69 @@ class OhmoSessionRuntimePool:
         relative ``[[attach: …]]`` path against the same dir the agent wrote into."""
         return self._cwd_for_message(message, session_key)
 
-    def _register_gateway_tools(self, bundle: RuntimeBundle) -> None:
+    def _memory_gate_decision(self, turn_ctx: TurnContext | None) -> GateDecision:
+        session_owner_principal = (
+            self._session_owner_principals.get(turn_ctx.session_id)
+            if turn_ctx is not None
+            else None
+        )
+        return evaluate_memory_gate(
+            turn_ctx,
+            principal_isolated=principal_isolated_session(
+                turn_ctx,
+                session_owner_principal,
+            ),
+        )
+
+    def _memory_engaged(self, turn_ctx: TurnContext | None) -> bool:
+        return memory_engaged(
+            self._gateway_config.owner_principals,
+            self._memory_gate_decision(turn_ctx),
+        )
+
+    def _autodream_context(self) -> dict[str, object]:
+        return {
+            "memory_dir": str(get_memory_dir(self._workspace)),
+            "session_dir": str(get_sessions_dir(self._workspace)),
+            "app_label": "ohmo personal memory",
+            "runner_module": "ohmo",
+        }
+
+    def _configure_turn_memory_surfaces(
+        self,
+        bundle: RuntimeBundle,
+        turn_ctx: TurnContext | None,
+    ) -> bool:
+        engaged = self._memory_engaged(turn_ctx)
+        self._register_memory_tool(bundle, memory_engaged=engaged)
+        autodream_context = self._autodream_context() if engaged else None
+        bundle.autodream_context = autodream_context
+        metadata = getattr(getattr(bundle, "engine", None), "tool_metadata", None)
+        if isinstance(metadata, dict):
+            if autodream_context is None:
+                metadata.pop("autodream_context", None)
+            else:
+                metadata["autodream_context"] = autodream_context
+        return engaged
+
+    def _register_gateway_tools(
+        self,
+        bundle: RuntimeBundle,
+        *,
+        memory_engaged: bool = True,
+    ) -> None:
         self._unregister_group_tool(bundle)
         self._register_todo_tool(bundle)
-        self._register_memory_tool(bundle)
+        self._register_memory_tool(bundle, memory_engaged=memory_engaged)
         self._register_reminder_tools(bundle)
         self._register_send_message_tool(bundle)
 
-    def _register_memory_tool(self, bundle: RuntimeBundle) -> None:
+    def _register_memory_tool(
+        self,
+        bundle: RuntimeBundle,
+        *,
+        memory_engaged: bool = True,
+    ) -> None:
         """Register the model-callable ``memory`` tool — disciplined curation
         (unicode-safe slugs, dedup, per-entry + store char bounds with
         consolidate-on-overflow) through the same configured backend that
@@ -1246,12 +1325,25 @@ class OhmoSessionRuntimePool:
         registry = getattr(bundle, "tool_registry", None)
         if registry is None:
             return
+        if not memory_engaged:
+            tools = getattr(registry, "_tools", None)
+            if isinstance(tools, dict):
+                tools.pop(OhmoMemoryTool.name, None)
+            return
         registry.register(OhmoMemoryTool(self._prompt_memory_backend))
 
-    def _maybe_schedule_memory_judge(self, bundle: RuntimeBundle, session_key: str) -> None:
+    def _maybe_schedule_memory_judge(
+        self,
+        bundle: RuntimeBundle,
+        session_key: str,
+        *,
+        turn_ctx: TurnContext | None = None,
+    ) -> None:
         """Schedule the background memory judge off the hot path, on a per-session
         turn cadence. Opt-in via OHMO_MEMORY_JUDGE; never blocks the reply (the
         snapshot of inputs is taken now, the LLM call runs in a tracked task)."""
+        if not self._memory_engaged(turn_ctx):
+            return
         if self._gateway_config.memory_backend != "file" or not judge_enabled():
             return
         count = self._judge_turn_counts.get(session_key, 0) + 1
