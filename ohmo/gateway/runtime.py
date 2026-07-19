@@ -807,6 +807,11 @@ class OhmoSessionRuntimePool:
         self._maybe_schedule_memory_judge(bundle, session_key)
         reply = "".join(reply_parts).strip()
         if reply:
+            await self._append_conversation_turn(
+                turn_ctx=turn_ctx,
+                user_text=message.content or user_prompt,
+                assistant_text=reply,
+            )
             logger.info(
                 "ohmo runtime processing complete session_key=%s session_id=%s reply=%r",
                 session_key,
@@ -823,6 +828,23 @@ class OhmoSessionRuntimePool:
                 metadata=metadata,
                 media=final_media or None,
             )
+
+    async def _append_conversation_turn(
+        self,
+        *,
+        turn_ctx: TurnContext,
+        user_text: str,
+        assistant_text: str,
+    ) -> None:
+        if self._gateway_config.conversation_learning is not True:
+            return
+        if turn_ctx.is_owner is not True or turn_ctx.is_private is not True:
+            return
+        session_owner_principal = self._session_owner_principals.get(turn_ctx.session_id)
+        if not principal_isolated_session(turn_ctx, session_owner_principal):
+            return
+        await self._prompt_memory_backend.append_turn("user", user_text)
+        await self._prompt_memory_backend.append_turn("assistant", assistant_text)
 
     async def _convert_stream_event(
         self,

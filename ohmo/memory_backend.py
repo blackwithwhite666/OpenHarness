@@ -262,7 +262,7 @@ from ohmo.memory_service.shadow import (  # noqa: E402 - avoids package import c
 
 
 class ShadowMemoryBackend(MemoryBackend):
-    """Catalog backend with strictly off-path, read-only Honcho comparison."""
+    """Catalog backend with off-path Honcho comparison and optional learning."""
 
     def __init__(
         self,
@@ -271,6 +271,9 @@ class ShadowMemoryBackend(MemoryBackend):
         *,
         observer: str = "ohmo-curated",
         observed: str = "owner",
+        conversation_learning: bool = False,
+        session: str = "ohmo",
+        assistant_peer: str = "ohmo",
         comparison_log_path: str | Path | None = None,
         is_owner: bool = True,
     ) -> None:
@@ -278,6 +281,9 @@ class ShadowMemoryBackend(MemoryBackend):
         self._honcho_client = honcho_client if is_owner else None
         self._observer = observer
         self._observed = observed
+        self._conversation_learning = conversation_learning
+        self._session = session
+        self._assistant_peer = assistant_peer
         self._comparison_log_path = (
             Path(comparison_log_path)
             if comparison_log_path is not None
@@ -285,6 +291,7 @@ class ShadowMemoryBackend(MemoryBackend):
         )
         self._pending: set[asyncio.Task[None]] = set()
         self._log_lock = asyncio.Lock()
+        self._ingest_lock = asyncio.Lock()
 
     async def list(self) -> list[MemoryEntry]:
         return await self._base.list()
@@ -323,10 +330,23 @@ class ShadowMemoryBackend(MemoryBackend):
         return await self._base.render_prompt(budget)
 
     async def append_turn(self, role: str, text: str) -> None:
-        await self._base.append_turn(role, text)
+        honcho_client = self._honcho_client
+        if not self._conversation_learning or honcho_client is None:
+            await self._base.append_turn(role, text)
+            return
+
+        peer_id = {"user": self._observed, "assistant": self._assistant_peer}.get(role)
+        if peer_id is None:
+            return
+        task = asyncio.create_task(
+            self._ingest_turn(role=role, text=text, peer_id=peer_id),
+            name="ohmo-conversation-learning",
+        )
+        self._pending.add(task)
+        task.add_done_callback(self._pending.discard)
 
     async def await_pending(self) -> None:
-        """Drain all comparisons scheduled before or while this call runs."""
+        """Drain all shadow work scheduled before or while this call runs."""
         while self._pending:
             await asyncio.gather(*tuple(self._pending), return_exceptions=True)
 
@@ -365,6 +385,25 @@ class ShadowMemoryBackend(MemoryBackend):
                 )
         except Exception:  # noqa: BLE001 - shadow failures never reach the model path
             logger.warning("ohmo shadow recall comparison failed", exc_info=True)
+
+    async def _ingest_turn(self, *, role: str, text: str, peer_id: str) -> None:
+        honcho_client = self._honcho_client
+        if honcho_client is None:
+            return
+        try:
+            async with self._ingest_lock:
+                await honcho_client.create_messages(
+                    self._session,
+                    [
+                        {
+                            "content": text,
+                            "peer_id": peer_id,
+                            "metadata": {"role": role},
+                        }
+                    ],
+                )
+        except Exception:  # noqa: BLE001 - learning failures never reach the turn path
+            logger.warning("ohmo conversation learning ingestion failed", exc_info=True)
 
 
 def _content_excerpt(content: str) -> str:
@@ -413,6 +452,7 @@ def make_memory_backend(
         return ShadowMemoryBackend(
             base,
             honcho_client=honcho_client,
+            conversation_learning=cfg.conversation_learning,
             comparison_log_path=(get_memory_dir(workspace) / SHADOW_COMPARISON_LOG_FILENAME),
             is_owner=bool(cfg.owner_principals),
         )
