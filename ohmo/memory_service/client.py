@@ -52,6 +52,11 @@ class MemoryServiceClient(MemoryBackend):
             return None
         return memory_entry_from_dict(_mapping(result))
 
+    async def record_use(self, name: str) -> None:
+        result = await self._request("record_use", {"name": name})
+        if result is not None:
+            raise MemoryServiceProtocolError("record_use result must be null")
+
     async def search(self, query: str, top_k: int) -> builtins.list[MemoryHit]:
         result = await self._request("search", {"query": query, "top_k": top_k})
         return [memory_hit_from_dict(_mapping(item)) for item in _list(result)]
@@ -60,8 +65,17 @@ class MemoryServiceClient(MemoryBackend):
         result = await self._request("add", {"title": title, "content": content})
         return memory_op_result_from_dict(_mapping(result))
 
-    async def update(self, name: str, content: str) -> MemoryOpResult:
-        result = await self._request("update", {"name": name, "content": content})
+    async def update(
+        self,
+        name: str,
+        content: str,
+        *,
+        title: str | None = None,
+    ) -> MemoryOpResult:
+        result = await self._request(
+            "update",
+            {"name": name, "content": content, "title": title},
+        )
         return memory_op_result_from_dict(_mapping(result))
 
     async def remove(self, name: str) -> MemoryOpResult:

@@ -24,7 +24,17 @@ from ohmo.memory_service.protocol import (
 )
 
 _AUTHORIZED_OPERATIONS = frozenset(
-    {"list", "get", "search", "add", "update", "remove", "render_prompt", "append_turn"}
+    {
+        "list",
+        "get",
+        "record_use",
+        "search",
+        "add",
+        "update",
+        "remove",
+        "render_prompt",
+        "append_turn",
+    }
 )
 
 
@@ -169,6 +179,9 @@ class MemoryServiceServer:
         if op == "get":
             entry = await backend.get(_str_arg(args, "name"))
             return None if entry is None else memory_entry_to_dict(entry)
+        if op == "record_use":
+            await backend.record_use(_str_arg(args, "name"))
+            return None
         if op == "search":
             hits = await backend.search(_str_arg(args, "query"), _int_arg(args, "top_k"))
             return [memory_hit_to_dict(hit) for hit in hits]
@@ -176,7 +189,11 @@ class MemoryServiceServer:
             result = await backend.add(_str_arg(args, "title"), _str_arg(args, "content"))
             return memory_op_result_to_dict(result)
         if op == "update":
-            result = await backend.update(_str_arg(args, "name"), _str_arg(args, "content"))
+            result = await backend.update(
+                _str_arg(args, "name"),
+                _str_arg(args, "content"),
+                title=_optional_str_arg(args, "title"),
+            )
             return memory_op_result_to_dict(result)
         if op == "remove":
             return memory_op_result_to_dict(await backend.remove(_str_arg(args, "name")))
@@ -195,6 +212,13 @@ def _str_arg(args: Mapping[str, object], name: str) -> str:
     value = args[name]
     if not isinstance(value, str):
         raise TypeError(f"{name} must be a string")
+    return value
+
+
+def _optional_str_arg(args: Mapping[str, object], name: str) -> str | None:
+    value = args.get(name)
+    if value is not None and not isinstance(value, str):
+        raise TypeError(f"{name} must be a string or null")
     return value
 
 

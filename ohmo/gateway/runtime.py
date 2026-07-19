@@ -1232,13 +1232,12 @@ class OhmoSessionRuntimePool:
     def _register_memory_tool(self, bundle: RuntimeBundle) -> None:
         """Register the model-callable ``memory`` tool — disciplined curation
         (unicode-safe slugs, dedup, per-entry + store char bounds with
-        consolidate-on-overflow) over the workspace-shared ``~/.ohmo/memory``
-        store, so the agent self-curates instead of writing memory files by hand."""
+        consolidate-on-overflow) through the same configured backend that
+        supplies prompt recall, so writes are visible on the next turn."""
         registry = getattr(bundle, "tool_registry", None)
         if registry is None:
             return
-        # Phase 1: route the model tool through the async memory backend.
-        registry.register(OhmoMemoryTool(self._memory_store))
+        registry.register(OhmoMemoryTool(self._prompt_memory_backend))
 
     def _maybe_schedule_memory_judge(self, bundle: RuntimeBundle, session_key: str) -> None:
         """Schedule the background memory judge off the hot path, on a per-session

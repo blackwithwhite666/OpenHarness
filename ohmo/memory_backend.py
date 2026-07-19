@@ -54,11 +54,19 @@ class MemoryBackend(Protocol):
 
     async def get(self, name: str) -> MemoryEntry | None: ...
 
+    async def record_use(self, name: str) -> None: ...
+
     async def search(self, query: str, top_k: int) -> builtins.list[MemoryHit]: ...
 
     async def add(self, title: str, content: str) -> MemoryOpResult: ...
 
-    async def update(self, name: str, content: str) -> MemoryOpResult: ...
+    async def update(
+        self,
+        name: str,
+        content: str,
+        *,
+        title: str | None = None,
+    ) -> MemoryOpResult: ...
 
     async def remove(self, name: str) -> MemoryOpResult: ...
 
@@ -78,6 +86,9 @@ class FileMemoryBackend(MemoryBackend):
 
     async def get(self, name: str) -> MemoryEntry | None:
         return await asyncio.to_thread(self._store.get, name)
+
+    async def record_use(self, name: str) -> None:
+        await asyncio.to_thread(self._store.record_use, name)
 
     async def search(self, query: str, top_k: int) -> builtins.list[MemoryHit]:
         result = await _search_memory(query, top_k)
@@ -113,8 +124,14 @@ class FileMemoryBackend(MemoryBackend):
     async def add(self, title: str, content: str) -> MemoryOpResult:
         return await asyncio.to_thread(self._store.add, title, content)
 
-    async def update(self, name: str, content: str) -> MemoryOpResult:
-        return await asyncio.to_thread(self._store.update, name, content)
+    async def update(
+        self,
+        name: str,
+        content: str,
+        *,
+        title: str | None = None,
+    ) -> MemoryOpResult:
+        return await asyncio.to_thread(self._store.update, name, content, title=title)
 
     async def remove(self, name: str) -> MemoryOpResult:
         return await asyncio.to_thread(self._store.remove, name)
@@ -159,6 +176,9 @@ class CatalogMemoryBackend(MemoryBackend):
         record = await asyncio.to_thread(self._catalog.get, name)
         return self._entry(record) if record is not None else None
 
+    async def record_use(self, name: str) -> None:
+        await asyncio.to_thread(self._catalog.record_use, name)
+
     async def search(self, query: str, top_k: int) -> builtins.list[MemoryHit]:
         records = await asyncio.to_thread(self._catalog.search, query, top_k)
         return [
@@ -175,8 +195,14 @@ class CatalogMemoryBackend(MemoryBackend):
         result = await asyncio.to_thread(self._catalog.add, title, content, source="curated")
         return self._result(result)
 
-    async def update(self, name: str, content: str) -> MemoryOpResult:
-        result = await asyncio.to_thread(self._catalog.update, name, content)
+    async def update(
+        self,
+        name: str,
+        content: str,
+        *,
+        title: str | None = None,
+    ) -> MemoryOpResult:
+        result = await asyncio.to_thread(self._catalog.update, name, content, title=title)
         return self._result(result)
 
     async def remove(self, name: str) -> MemoryOpResult:
@@ -307,6 +333,9 @@ class ShadowMemoryBackend(MemoryBackend):
     async def get(self, name: str) -> MemoryEntry | None:
         return await self._base.get(name)
 
+    async def record_use(self, name: str) -> None:
+        await self._base.record_use(name)
+
     async def search(self, query: str, top_k: int) -> builtins.list[MemoryHit]:
         started = perf_counter()
         catalog_hits = await self._base.search(query, top_k)
@@ -328,8 +357,14 @@ class ShadowMemoryBackend(MemoryBackend):
     async def add(self, title: str, content: str) -> MemoryOpResult:
         return await self._base.add(title, content)
 
-    async def update(self, name: str, content: str) -> MemoryOpResult:
-        return await self._base.update(name, content)
+    async def update(
+        self,
+        name: str,
+        content: str,
+        *,
+        title: str | None = None,
+    ) -> MemoryOpResult:
+        return await self._base.update(name, content, title=title)
 
     async def remove(self, name: str) -> MemoryOpResult:
         return await self._base.remove(name)

@@ -1,9 +1,9 @@
 """Model-callable ``memory`` tool for the ohmo gateway.
 
 Gives the agent a disciplined way to curate its own durable memory — the layer
-Hermes calls "agent self-curation". Backed by :class:`ohmo.memory_store.MemoryStore`
-(workspace-scoped, shared across this owner's chats), so entries land in the same
-``~/.ohmo/memory/`` files the system prompt injects and ``/memory`` reads.
+Hermes calls "agent self-curation". It accepts either the legacy file store or
+the configured async memory backend, keeping tool writes and prompt recall on
+the same workspace-scoped storage path.
 
 Replaces ad-hoc ``write_file`` into ``memory/`` (which hit the ASCII-slug clobber
 bug and had no bounds/dedup). The tool's description carries the collect/refuse
@@ -17,12 +17,16 @@ import json
 import os
 from contextlib import suppress
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, Field
 
 from openharness.tools.base import BaseTool, ToolExecutionContext, ToolResult
 
 from ohmo.memory_store import MemoryOpResult, MemoryStore
+
+if TYPE_CHECKING:
+    from ohmo.memory_backend import MemoryBackend
 
 _DOCUMENT_SEARCH_CLI = os.environ.get("OHMO_DOCUMENT_SEARCH_CLI", "document_search-cli")
 _MEMORY_SEARCH_COLLECTIONS = os.environ.get("OHMO_MEMORY_SEARCH_COLLECTIONS", "memory,archive")
@@ -74,7 +78,7 @@ class OhmoMemoryTool(BaseTool):
     )
     input_model = OhmoMemoryToolInput
 
-    def __init__(self, store: MemoryStore) -> None:
+    def __init__(self, store: MemoryStore | MemoryBackend) -> None:
         self._store = store
 
     def is_read_only(self, arguments: BaseModel) -> bool:
@@ -86,22 +90,34 @@ class OhmoMemoryTool(BaseTool):
         action = (arguments.action or "").strip().lower()
 
         if action == "list":
-            entries = self._store.list()
+            entries = (
+                self._store.list()
+                if isinstance(self._store, MemoryStore)
+                else await self._store.list()
+            )
             if not entries:
                 return ToolResult(output="Memory is empty.")
-            lines = [f"{len(entries)} memory entries ({self._store.total_chars():,} chars):"]
+            total_chars = sum(len(entry.content) for entry in entries)
+            lines = [f"{len(entries)} memory entries ({total_chars:,} chars):"]
             lines += [f"- {e.name} — {e.title} ({len(e.content):,} chars)" for e in entries]
             return ToolResult(output="\n".join(lines))
 
         if action == "get":
             if not arguments.name.strip():
                 return ToolResult(output="Provide 'name' for action='get'.", is_error=True)
-            entry = self._store.get(arguments.name)
+            entry = (
+                self._store.get(arguments.name)
+                if isinstance(self._store, MemoryStore)
+                else await self._store.get(arguments.name)
+            )
             if entry is None:
                 return ToolResult(output=f"No memory entry {arguments.name!r}.", is_error=True)
             # The agent pulled this fact → it was useful. Bump its access count so
             # load_memory_prompt injects it ahead of cold entries next time.
-            self._store.record_use(entry.name)
+            if isinstance(self._store, MemoryStore):
+                self._store.record_use(entry.name)
+            else:
+                await self._store.record_use(entry.name)
             return ToolResult(
                 output=f"# {entry.title} ({entry.name})\n\n{entry.content}",
                 metadata={"memory_used": entry.name},
@@ -110,22 +126,54 @@ class OhmoMemoryTool(BaseTool):
         if action == "search":
             if not arguments.query.strip():
                 return ToolResult(output="Provide 'query' for action='search'.", is_error=True)
+            if not isinstance(self._store, MemoryStore):
+                hits = await self._store.search(
+                    arguments.query,
+                    max(1, min(arguments.top_k, 10)),
+                )
+                lines = [f"{len(hits)} memory hits for {arguments.query!r}:"]
+                lines.extend(f"- {hit.name} (rank {hit.rank}): {hit.snippet}" for hit in hits)
+                return ToolResult(
+                    output="\n".join(lines),
+                    metadata={"memory_search_hits": [hit.name for hit in hits]},
+                )
             return await _search_memory(arguments.query, max(1, min(arguments.top_k, 10)))
 
         if action == "add":
-            return self._result(self._store.add(arguments.title, arguments.content))
+            result = (
+                self._store.add(arguments.title, arguments.content)
+                if isinstance(self._store, MemoryStore)
+                else await self._store.add(arguments.title, arguments.content)
+            )
+            return self._result(result)
 
         if action == "update":
             if not arguments.name.strip():
                 return ToolResult(output="Provide 'name' for action='update'.", is_error=True)
-            return self._result(
-                self._store.update(arguments.name, arguments.content, title=arguments.title or None)
+            result = (
+                self._store.update(
+                    arguments.name,
+                    arguments.content,
+                    title=arguments.title or None,
+                )
+                if isinstance(self._store, MemoryStore)
+                else await self._store.update(
+                    arguments.name,
+                    arguments.content,
+                    title=arguments.title or None,
+                )
             )
+            return self._result(result)
 
         if action == "remove":
             if not arguments.name.strip():
                 return ToolResult(output="Provide 'name' for action='remove'.", is_error=True)
-            return self._result(self._store.remove(arguments.name))
+            result = (
+                self._store.remove(arguments.name)
+                if isinstance(self._store, MemoryStore)
+                else await self._store.remove(arguments.name)
+            )
+            return self._result(result)
 
         return ToolResult(
             output=f"Unknown action {action!r}. Use add | update | remove | list | get | search.",
