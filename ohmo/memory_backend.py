@@ -9,7 +9,10 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 from time import perf_counter
-from typing import TYPE_CHECKING, Protocol, cast
+from typing import TYPE_CHECKING, Protocol, Sequence, cast
+
+import numpy as np
+from numpy.typing import NDArray
 
 from openharness.untrusted import UNTRUSTED_BANNER
 
@@ -20,12 +23,14 @@ from ohmo.memory import (
     load_memory_prompt as load_ohmo_memory_prompt,
 )
 from ohmo.memory_catalog import CatalogRecord, MemoryCatalog
-from ohmo.memory_store import MemoryEntry, MemoryOpResult, MemoryStore
+from ohmo.memory_store import MemoryEntry, MemoryOpResult, MemoryStore, slugify
 from ohmo.memory_tool import _search_memory
 from ohmo.threat_patterns import scan_for_threats
 from ohmo.workspace import get_memory_dir
 
 if TYPE_CHECKING:
+    from openharness.evals.embeddings import EmbeddingClient
+
     from ohmo.gateway.models import GatewayConfig
     from ohmo.memory_service.honcho_client import HonchoClient
 
@@ -37,6 +42,10 @@ _DERIVED_RECALL_PROVENANCE = (
     "_The catalog memory above is curated; these additive hits are derived from conversations._"
 )
 _DERIVED_RECALL_TOP_K = 10
+_DEFAULT_EMBEDDING_MODEL = "BAAI/bge-m3"
+_DEFAULT_EMBEDDING_TIMEOUT_SECONDS = 2.0
+_EMBEDDING_BACKFILL_LIMIT = 128
+_SEMANTIC_SIMILARITY_FLOOR = 0.5
 
 
 @dataclass(frozen=True)
@@ -157,9 +166,16 @@ class CatalogMemoryBackend(MemoryBackend):
         self,
         catalog: MemoryCatalog,
         workspace: str | Path | None,
+        *,
+        embedder: EmbeddingClient | None = None,
+        model: str = _DEFAULT_EMBEDDING_MODEL,
+        embedding_timeout: float = _DEFAULT_EMBEDDING_TIMEOUT_SECONDS,
     ) -> None:
         self._catalog = catalog
         self._memory_dir = get_memory_dir(workspace)
+        self._embedder = embedder
+        self._embedding_model = model.strip()
+        self._embedding_timeout = embedding_timeout
 
     def _entry(self, record: CatalogRecord) -> MemoryEntry:
         return MemoryEntry(
@@ -182,7 +198,26 @@ class CatalogMemoryBackend(MemoryBackend):
         await asyncio.to_thread(self._catalog.record_use, name)
 
     async def search(self, query: str, top_k: int) -> builtins.list[MemoryHit]:
-        records = await asyncio.to_thread(self._catalog.search, query, top_k)
+        """Rank FTS hits first, then semantic-only hits by cosine and slug."""
+        fts_records = await asyncio.to_thread(self._catalog.search, query, top_k)
+        records = fts_records
+        if self._embedder is not None and self._embedding_model and query.strip() and top_k > 0:
+            try:
+                semantic_records = await self._semantic_records(query, top_k)
+            except Exception:
+                # FTS is authoritative: semantic failures must not alter its exact result.
+                logger.debug("catalog semantic search failed open to FTS", exc_info=True)
+            else:
+                # Ranking rule: unchanged FTS order first, followed by semantic-only
+                # records in descending cosine order (slug breaks ties).
+                seen = {record.slug for record in fts_records}
+                records = [*fts_records]
+                for record in semantic_records:
+                    if record.slug in seen:
+                        continue
+                    seen.add(record.slug)
+                    records.append(record)
+                records = records[:top_k]
         return [
             MemoryHit(
                 name=f"{record.slug}.md",
@@ -195,6 +230,8 @@ class CatalogMemoryBackend(MemoryBackend):
 
     async def add(self, title: str, content: str) -> MemoryOpResult:
         result = await asyncio.to_thread(self._catalog.add, title, content, source="curated")
+        if result.ok and result.message.startswith("Saved memory "):
+            await self._best_effort_embed_name(slugify(title))
         return self._result(result)
 
     async def update(
@@ -205,10 +242,120 @@ class CatalogMemoryBackend(MemoryBackend):
         title: str | None = None,
     ) -> MemoryOpResult:
         result = await asyncio.to_thread(self._catalog.update, name, content, title=title)
+        if result.ok:
+            await self._best_effort_embed_name(name)
         return self._result(result)
 
     async def remove(self, name: str) -> MemoryOpResult:
         return await asyncio.to_thread(self._catalog.remove, name)
+
+    async def _best_effort_embed_name(self, name: str) -> None:
+        if self._embedder is None or not self._embedding_model:
+            return
+        try:
+            record = await asyncio.to_thread(self._catalog.get, name)
+        except Exception:
+            logger.debug("catalog embed-on-write lookup failed open", exc_info=True)
+            return
+        if record is not None:
+            await self._best_effort_embed(record)
+
+    async def _best_effort_embed(self, record: CatalogRecord) -> None:
+        if (
+            self._embedder is None
+            or not self._embedding_model
+            or record.archive_status != "active"
+        ):
+            return
+        try:
+            vectors = await self._embed_texts([_embedding_text(record)])
+            await asyncio.to_thread(
+                self._catalog.store_embedding,
+                record.slug,
+                self._embedding_model,
+                vectors[0].tolist(),
+                record.generation,
+            )
+        except Exception:
+            logger.debug("catalog embed-on-write failed open", exc_info=True)
+
+    async def _semantic_records(
+        self,
+        query: str,
+        top_k: int,
+    ) -> builtins.list[CatalogRecord]:
+        active_records = await asyncio.to_thread(self._catalog.list, include_archived=False)
+        if not active_records:
+            return []
+
+        embeddings = await asyncio.to_thread(self._catalog.get_embeddings)
+        missing = [
+            record
+            for record in active_records
+            if not _embedding_is_current(
+                embeddings.get(record.slug),
+                model=self._embedding_model,
+                generation=record.generation,
+            )
+        ][:_EMBEDDING_BACKFILL_LIMIT]
+        if missing:
+            vectors = await self._embed_texts([_embedding_text(record) for record in missing])
+            for record, vector in zip(missing, vectors, strict=True):
+                stored = await asyncio.to_thread(
+                    self._catalog.store_embedding,
+                    record.slug,
+                    self._embedding_model,
+                    vector.tolist(),
+                    record.generation,
+                )
+                if stored:
+                    embeddings[record.slug] = (
+                        vector.astype(float).tolist(),
+                        self._embedding_model,
+                        record.generation,
+                    )
+
+        query_vector = (await self._embed_texts([query]))[0]
+        query_norm = float(np.linalg.norm(query_vector))
+        if query_norm == 0.0:
+            return []
+
+        scored: builtins.list[tuple[float, CatalogRecord]] = []
+        for record in active_records:
+            embedding = embeddings.get(record.slug)
+            if not _embedding_is_current(
+                embedding,
+                model=self._embedding_model,
+                generation=record.generation,
+            ):
+                continue
+            assert embedding is not None
+            vector = np.asarray(embedding[0], dtype=np.float32)
+            if vector.shape != query_vector.shape:
+                continue
+            denominator = query_norm * float(np.linalg.norm(vector))
+            if denominator == 0.0:
+                continue
+            similarity = float(np.dot(query_vector, vector) / denominator)
+            if similarity >= _SEMANTIC_SIMILARITY_FLOOR:
+                scored.append((similarity, record))
+
+        scored.sort(key=lambda item: (-item[0], item[1].slug))
+        return [record for _, record in scored[:top_k]]
+
+    async def _embed_texts(self, texts: builtins.list[str]) -> builtins.list[NDArray[np.float32]]:
+        if self._embedder is None:
+            raise RuntimeError("catalog semantic embedder is not configured")
+        response = await asyncio.wait_for(
+            self._embedder.embed(
+                texts,
+                return_dense=True,
+                return_sparse=False,
+                batch_size=len(texts),
+            ),
+            timeout=self._embedding_timeout,
+        )
+        return _dense_vectors(response, expected_count=len(texts))
 
     async def render_prompt(self, budget: int | None = None) -> str:
         return await asyncio.to_thread(self._render_prompt, budget)
@@ -514,6 +661,47 @@ class ShadowMemoryBackend(MemoryBackend):
                 )
         except Exception:  # noqa: BLE001 - learning failures never reach the turn path
             logger.warning("ohmo conversation learning ingestion failed", exc_info=True)
+
+
+def _embedding_text(record: CatalogRecord) -> str:
+    return f"{record.title}\n{record.content}"
+
+
+def _embedding_is_current(
+    embedding: tuple[Sequence[float], str, int] | None,
+    *,
+    model: str,
+    generation: int,
+) -> bool:
+    return embedding is not None and embedding[1] == model and embedding[2] == generation
+
+
+def _dense_vectors(
+    response: dict[str, object],
+    *,
+    expected_count: int,
+) -> list[NDArray[np.float32]]:
+    count = response.get("count")
+    if count is not None and count != expected_count:
+        raise RuntimeError("embedding response count does not match input texts")
+    dense = response.get("dense")
+    if not isinstance(dense, list) or len(dense) != expected_count:
+        raise RuntimeError("embedding response dense vector count does not match input texts")
+
+    vectors: list[NDArray[np.float32]] = []
+    dimensions: int | None = None
+    for value in dense:
+        if not isinstance(value, list):
+            raise RuntimeError("embedding response vectors must be lists")
+        vector = np.asarray(value, dtype=np.float32)
+        if vector.ndim != 1 or vector.size == 0 or not np.isfinite(vector).all():
+            raise RuntimeError("embedding vectors must be non-empty finite one-dimensional lists")
+        if dimensions is None:
+            dimensions = int(vector.size)
+        elif vector.size != dimensions:
+            raise RuntimeError("embedding vector dimensions changed within one response")
+        vectors.append(vector)
+    return vectors
 
 
 def _content_excerpt(content: str) -> str:

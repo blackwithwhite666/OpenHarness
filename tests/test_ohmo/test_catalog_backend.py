@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import sqlite3
 from pathlib import Path
 
@@ -17,6 +18,57 @@ from ohmo.memory_backend import (
 )
 from ohmo.memory_catalog import MemoryCatalog
 from ohmo.memory_store import MemoryEntry, MemoryStore
+
+
+class FakeEmbeddingClient:
+    def __init__(self, vectors: dict[str, list[float]]) -> None:
+        self.vectors = vectors
+        self.calls: list[list[str]] = []
+
+    async def embed(
+        self,
+        texts: list[str],
+        *,
+        return_dense: bool = True,
+        return_sparse: bool = False,
+        batch_size: int | None = None,
+    ) -> dict[str, object]:
+        assert return_dense is True
+        assert return_sparse is False
+        assert batch_size == len(texts)
+        self.calls.append(texts)
+        return {
+            "model": "fake-v1",
+            "count": len(texts),
+            "dense": [self.vectors[text] for text in texts],
+        }
+
+
+class RaisingEmbeddingClient:
+    async def embed(
+        self,
+        texts: list[str],
+        *,
+        return_dense: bool = True,
+        return_sparse: bool = False,
+        batch_size: int | None = None,
+    ) -> dict[str, object]:
+        del texts, return_dense, return_sparse, batch_size
+        raise RuntimeError("embedding service unavailable")
+
+
+class HangingEmbeddingClient:
+    async def embed(
+        self,
+        texts: list[str],
+        *,
+        return_dense: bool = True,
+        return_sparse: bool = False,
+        batch_size: int | None = None,
+    ) -> dict[str, object]:
+        del texts, return_dense, return_sparse, batch_size
+        await asyncio.sleep(1)
+        raise AssertionError("embedding timeout did not cancel the request")
 
 
 def _entry_values(entries: list[MemoryEntry]) -> list[tuple[str, str, str, str]]:
@@ -107,6 +159,128 @@ async def test_catalog_backend_search_maps_ranked_compact_excerpts(tmp_path: Pat
             rank=2,
         ),
     ]
+
+
+async def test_catalog_semantic_search_recalls_keyword_tail(tmp_path: Path):
+    catalog = MemoryCatalog(tmp_path)
+    assert catalog.add("Friday ritual", "Orders ramen on Fridays.").ok
+    query = "what food do I like?"
+    embedder = FakeEmbeddingClient(
+        {
+            "Friday ritual\nOrders ramen on Fridays.": [1.0, 0.0],
+            query: [1.0, 0.0],
+        }
+    )
+
+    assert await CatalogMemoryBackend(catalog, tmp_path).search(query, 5) == []
+    hits = await CatalogMemoryBackend(
+        catalog,
+        tmp_path,
+        embedder=embedder,
+        model="fake-v1",
+    ).search(query, 5)
+
+    assert [hit.name for hit in hits] == ["friday_ritual.md"]
+    assert "friday_ritual" in catalog.get_embeddings()
+
+
+async def test_catalog_blend_keeps_fts_first_and_deduplicates(tmp_path: Path):
+    catalog = MemoryCatalog(tmp_path)
+    assert catalog.add("Exact note", "Frobnication settings live here.").ok
+    assert catalog.add("Dinner note", "Orders ramen on Fridays.").ok
+    query = "frobnication"
+    embedder = FakeEmbeddingClient(
+        {
+            "Exact note\nFrobnication settings live here.": [0.6, 0.8],
+            "Dinner note\nOrders ramen on Fridays.": [1.0, 0.0],
+            query: [1.0, 0.0],
+        }
+    )
+    backend = CatalogMemoryBackend(catalog, tmp_path, embedder=embedder, model="fake-v1")
+
+    hits = await backend.search(query, 2)
+
+    assert [hit.name for hit in hits] == ["exact_note.md", "dinner_note.md"]
+    assert [hit.rank for hit in hits] == [1, 2]
+    assert sum(hit.name == "exact_note.md" for hit in hits) == 1
+
+
+async def test_catalog_semantic_search_fails_open_on_error_and_timeout(tmp_path: Path):
+    catalog = MemoryCatalog(tmp_path)
+    assert catalog.add("Editor", "User prefers Neovim.").ok
+    baseline = await CatalogMemoryBackend(catalog, tmp_path).search("Neovim", 5)
+
+    error_backend = CatalogMemoryBackend(
+        catalog,
+        tmp_path,
+        embedder=RaisingEmbeddingClient(),
+        model="fake-v1",
+    )
+    timeout_backend = CatalogMemoryBackend(
+        catalog,
+        tmp_path,
+        embedder=HangingEmbeddingClient(),
+        model="fake-v1",
+        embedding_timeout=0.01,
+    )
+
+    assert await error_backend.search("Neovim", 5) == baseline
+    assert await timeout_backend.search("Neovim", 5) == baseline
+    assert (await error_backend.add("Shell", "User prefers zsh.")).ok
+    assert (await error_backend.update("shell", "User prefers fish.")).ok
+
+
+async def test_catalog_embed_on_write_update_backfill_and_remove(tmp_path: Path):
+    catalog = MemoryCatalog(tmp_path)
+    assert catalog.add("Legacy note", "Keeps a fountain pen nearby.").ok
+    query = "what writing tool is nearby?"
+    embedder = FakeEmbeddingClient(
+        {
+            "Favorite meal\nOrders ramen on Fridays.": [1.0, 0.0],
+            "Favorite meal\nOrders udon on Fridays.": [0.8, 0.2],
+            "Legacy note\nKeeps a fountain pen nearby.": [0.0, 1.0],
+            query: [0.0, 1.0],
+        }
+    )
+    backend = CatalogMemoryBackend(catalog, tmp_path, embedder=embedder, model="fake-v1")
+
+    assert (await backend.add("Favorite meal", "Orders ramen on Fridays.")).ok
+    added = catalog.get_embeddings()["favorite_meal"]
+    assert added[0] == pytest.approx([1.0, 0.0])
+    assert added[2] == 1
+
+    assert (await backend.update("favorite_meal", "Orders udon on Fridays.")).ok
+    updated_record = catalog.get("favorite_meal")
+    updated_embedding = catalog.get_embeddings()["favorite_meal"]
+    assert updated_record is not None
+    assert updated_record.generation == updated_embedding[2] == 2
+    assert updated_embedding[0] == pytest.approx([0.8, 0.2])
+
+    assert "legacy_note" not in catalog.get_embeddings()
+    hits = await backend.search(query, 5)
+    assert hits[0].name == "legacy_note.md"
+    assert catalog.get_embeddings()["legacy_note"][2] == 1
+
+    assert (await backend.remove("favorite_meal")).ok
+    assert "favorite_meal" not in catalog.get_embeddings()
+
+
+async def test_catalog_default_backend_does_not_embed(tmp_path: Path):
+    catalog = MemoryCatalog(tmp_path)
+    backend = CatalogMemoryBackend(catalog, tmp_path)
+
+    assert (await backend.add("Timezone", "User prefers UTC.")).ok
+
+    assert catalog.get_embeddings() == {}
+    assert await backend.search("UTC", 5) == [
+        MemoryHit(
+            name="timezone.md",
+            title="Timezone",
+            snippet="User prefers UTC.",
+            rank=1,
+        )
+    ]
+    assert catalog.get_embeddings() == {}
 
 
 async def test_catalog_render_prompt_matches_file_structure_order_truncation_and_tail(

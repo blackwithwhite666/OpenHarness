@@ -7,6 +7,8 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Barrier
 
+import pytest
+
 from ohmo.memory_catalog import CatalogRecord, MemoryCatalog
 from ohmo.memory_store import MemoryOpResult
 
@@ -178,6 +180,26 @@ def test_record_use_bumps_usage_and_reorders_search(tmp_path: Path):
     assert [entry.slug for entry in catalog.list()] == ["bravo", "alpha"]
 
 
+def test_embedding_storage_tracks_generation_and_remove(tmp_path: Path):
+    catalog = MemoryCatalog(db_path=tmp_path / "catalog.sqlite3")
+    assert catalog.add("Friday meal", "Orders ramen on Fridays.").ok
+
+    assert catalog.store_embedding("friday_meal", "fake-v1", [0.25, 0.75], 1) is True
+    vector, model, generation = catalog.get_embeddings()["friday_meal"]
+    assert vector == pytest.approx([0.25, 0.75])
+    assert model == "fake-v1"
+    assert generation == 1
+
+    assert catalog.update("friday_meal", "Orders noodles on Fridays.").ok
+    assert catalog.get("friday_meal").generation == 2
+    assert catalog.get_embeddings()["friday_meal"][2] == 1
+    assert catalog.store_embedding("friday_meal", "fake-v1", [1.0, 0.0], 1) is False
+    assert catalog.store_embedding("friday_meal", "fake-v1", [0.0, 1.0], 2) is True
+
+    assert catalog.remove("friday_meal").ok
+    assert "friday_meal" not in catalog.get_embeddings()
+
+
 def test_schema_migration_and_env_limits(monkeypatch, tmp_path: Path):
     monkeypatch.setenv("OHMO_MEMORY_ENTRY_CHARS", "3")
     monkeypatch.setenv("OHMO_MEMORY_STORE_CHARS", "4")
@@ -188,5 +210,8 @@ def test_schema_migration_and_env_limits(monkeypatch, tmp_path: Path):
     assert catalog.add("Too long", "1234").ok is False
     assert catalog.add("Overflow", "xy").ok is False
     with sqlite3.connect(db_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
         assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+        assert connection.execute(
+            "SELECT name FROM sqlite_master WHERE name = 'memory_embeddings'"
+        ).fetchone() == ("memory_embeddings",)

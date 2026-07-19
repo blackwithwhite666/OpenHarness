@@ -46,7 +46,7 @@ def _expire_leases(catalog: MemoryCatalog) -> None:
         )
 
 
-def test_schema_v1_migrates_to_v2_idempotently(tmp_path: Path):
+def test_schema_v1_migrates_to_latest_idempotently(tmp_path: Path):
     db_path = tmp_path / "catalog.sqlite3"
     with sqlite3.connect(db_path, isolation_level=None) as connection:
         MemoryCatalog._migrate_to_v1(connection)
@@ -56,9 +56,12 @@ def test_schema_v1_migrates_to_v2_idempotently(tmp_path: Path):
     MemoryCatalog(db_path=db_path)
 
     with sqlite3.connect(db_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
         columns = {
             row[1] for row in connection.execute("PRAGMA table_info(outbox)").fetchall()
+        }
+        embedding_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(memory_embeddings)").fetchall()
         }
     assert columns == {
         "id",
@@ -70,6 +73,14 @@ def test_schema_v1_migrates_to_v2_idempotently(tmp_path: Path):
         "attempts",
         "lease_expires_at",
         "created_at",
+        "updated_at",
+    }
+    assert embedding_columns == {
+        "slug",
+        "model",
+        "dim",
+        "vector",
+        "generation",
         "updated_at",
     }
 

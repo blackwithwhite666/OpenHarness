@@ -12,6 +12,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator, Sequence, cast
 
+import numpy as np
+
 from ohmo.memory_store import (
     DEFAULT_ENTRY_CHAR_LIMIT,
     DEFAULT_STORE_CHAR_BUDGET,
@@ -21,7 +23,7 @@ from ohmo.memory_store import (
 from ohmo.threat_patterns import first_threat_message
 from ohmo.workspace import get_memory_dir
 
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 3
 _MAX_TITLE_CHARS = 256
 _BUSY_TIMEOUT_MS = 5_000
 _RESERVED_NAMES = {"memory.md"}
@@ -92,6 +94,7 @@ class MemoryCatalog:
         connection.row_factory = sqlite3.Row
         connection.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS}")
         connection.execute("PRAGMA journal_mode = WAL")
+        connection.execute("PRAGMA foreign_keys = ON")
         return connection
 
     @contextmanager
@@ -130,6 +133,9 @@ class MemoryCatalog:
             if version < 2:
                 self._migrate_to_v2(connection)
                 version = 2
+            if version < 3:
+                self._migrate_to_v3(connection)
+                version = 3
             connection.execute(f"PRAGMA user_version = {version}")
 
     @staticmethod
@@ -187,6 +193,21 @@ class MemoryCatalog:
     @staticmethod
     def _migrate_to_v2(connection: sqlite3.Connection) -> None:
         _outbox_module()._OutboxCatalogMixin._migrate_to_v2(connection)
+
+    @staticmethod
+    def _migrate_to_v3(connection: sqlite3.Connection) -> None:
+        connection.execute(
+            """
+            CREATE TABLE memory_embeddings (
+                slug TEXT PRIMARY KEY REFERENCES memories(slug) ON DELETE CASCADE,
+                model TEXT NOT NULL,
+                dim INTEGER NOT NULL CHECK (dim > 0),
+                vector BLOB NOT NULL,
+                generation INTEGER NOT NULL CHECK (generation >= 1),
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
 
     def add(self, title: str, content: str, *, source: str = "curated") -> MemoryOpResult:
         clean_title = (title or "").strip()
@@ -428,6 +449,10 @@ class MemoryCatalog:
             )
             if cursor.rowcount != 1:
                 raise RuntimeError(f"failed to archive memory {clean_slug!r}")
+            connection.execute(
+                "DELETE FROM memory_embeddings WHERE slug = ?",
+                (clean_slug,),
+            )
             if row["source"] == "curated":
                 self._enqueue_outbox(
                     connection,
@@ -508,6 +533,83 @@ class MemoryCatalog:
     def total_chars(self, *, active_only: bool = True) -> int:
         with self._read_connection() as connection:
             return self._total_chars(connection, active_only=active_only)
+
+    def store_embedding(
+        self,
+        slug: str,
+        model: str,
+        vector: Sequence[float],
+        generation: int,
+    ) -> bool:
+        """Store a vector iff it still describes the current active record generation."""
+        clean_slug = _slug_reference(slug)
+        clean_model = (model or "").strip()
+        array = np.asarray(vector, dtype="<f4")
+        if not clean_slug:
+            raise ValueError("an embedding slug is required")
+        if not clean_model:
+            raise ValueError("an embedding model is required")
+        if array.ndim != 1 or array.size == 0:
+            raise ValueError("an embedding vector must be one-dimensional and non-empty")
+        if not np.isfinite(array).all():
+            raise ValueError("embedding vector values must be finite")
+
+        with self._write_connection() as connection:
+            record = connection.execute(
+                "SELECT generation, archive_status FROM memories WHERE slug = ?",
+                (clean_slug,),
+            ).fetchone()
+            if (
+                record is None
+                or record["archive_status"] != "active"
+                or cast(int, record["generation"]) != generation
+            ):
+                return False
+            connection.execute(
+                """
+                INSERT INTO memory_embeddings (
+                    slug, model, dim, vector, generation, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(slug) DO UPDATE SET
+                    model = excluded.model,
+                    dim = excluded.dim,
+                    vector = excluded.vector,
+                    generation = excluded.generation,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    clean_slug,
+                    clean_model,
+                    int(array.size),
+                    sqlite3.Binary(array.tobytes()),
+                    generation,
+                    _utc_timestamp(),
+                ),
+            )
+        return True
+
+    def get_embeddings(self) -> dict[str, tuple[builtins.list[float], str, int]]:
+        """Return all stored vectors as ``slug -> (vector, model, generation)``."""
+        with self._read_connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT slug, model, dim, vector, generation
+                FROM memory_embeddings
+                ORDER BY slug ASC
+                """
+            ).fetchall()
+
+        embeddings: dict[str, tuple[builtins.list[float], str, int]] = {}
+        for row in rows:
+            vector = np.frombuffer(row["vector"], dtype="<f4")
+            if vector.size != row["dim"]:
+                raise RuntimeError(f"invalid stored embedding dimension for {row['slug']!r}")
+            embeddings[cast(str, row["slug"])] = (
+                vector.astype(float).tolist(),
+                cast(str, row["model"]),
+                cast(int, row["generation"]),
+            )
+        return embeddings
 
     @staticmethod
     def _total_chars(connection: sqlite3.Connection, *, active_only: bool) -> int:
