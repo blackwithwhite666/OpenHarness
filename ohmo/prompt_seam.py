@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from ohmo.gateway.memory_gate import GateDecision, evaluate_memory_gate
-from ohmo.memory_backend import MemoryBackend
+from ohmo.memory_backend import MemoryBackend, ShadowMemoryBackend, _inject_char_budget
 from ohmo.prompts import _build_ohmo_workspace_sections
 
 if TYPE_CHECKING:
@@ -15,14 +15,15 @@ if TYPE_CHECKING:
 _MEMORY_HEADING = "# ohmo Memory"
 _MEMORY_DIRECTORY_PREFIX = "- Personal memory directory: "
 _REMINDERS_SECTION = "# Reminders"
+_DERIVED_RECALL_TIMEOUT_SECONDS = 0.5
 
 
 class TurnSnapshot(str):
     """Rendered memory block plus the decision governing future recall.
 
     This remains a ``str`` so the current prompt-injection path stays byte-for-
-    byte compatible. The later visible-recall step can inspect
-    ``gate_decision`` without changing today's rendering behavior.
+    byte compatible. Callers can inspect ``gate_decision`` without parsing
+    prompt text.
     """
 
     gate_decision: GateDecision
@@ -50,19 +51,41 @@ async def prepare_turn(
     turn_ctx: TurnContext | None = None,
     tools_confined: bool | None = None,
     principal_isolated: bool | None = None,
+    visible_recall: bool = False,
+    latest_user_prompt: str | None = None,
+    derived_recall_timeout: float = _DERIVED_RECALL_TIMEOUT_SECONDS,
 ) -> TurnSnapshot:
     """Read a fresh backend-rendered memory snapshot for one submitted turn.
 
-    The gate decision is deliberately metadata only in this step: the backend
-    block is still rendered and injected exactly as before.
+    The authoritative catalog block is always rendered first. Honcho derived
+    recall is queried with the latest user-turn text and appended only after an
+    explicit opt-in and a green confidentiality gate. Any Honcho failure leaves
+    the catalog-only block byte-for-byte unchanged.
     """
     gate_decision = evaluate_memory_gate(
         turn_ctx,
         tools_confined=tools_confined,
         principal_isolated=principal_isolated,
     )
+    memory_block = await backend.render_prompt(budget)
+    if (
+        visible_recall is True
+        and gate_decision.allowed
+        and isinstance(backend, ShadowMemoryBackend)
+        and isinstance(latest_user_prompt, str)
+    ):
+        separator = "\n\n" if memory_block.strip() else ""
+        composite_budget = budget if budget is not None else _inject_char_budget()
+        derived_budget = composite_budget - len(memory_block) - len(separator)
+        derived_block = await backend.derived_recall_block(
+            latest_user_prompt,
+            budget=derived_budget,
+            timeout=derived_recall_timeout,
+        )
+        if derived_block is not None:
+            memory_block = f"{memory_block}{separator}{derived_block}"
     return TurnSnapshot(
-        await backend.render_prompt(budget),
+        memory_block,
         gate_decision=gate_decision,
     )
 

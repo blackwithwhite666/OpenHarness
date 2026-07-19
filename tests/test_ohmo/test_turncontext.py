@@ -106,12 +106,17 @@ async def test_runtime_prompt_threads_turn_context_into_prepare_turn(
         turn_ctx=None,
         tools_confined=None,
         principal_isolated=None,
+        visible_recall=False,
+        latest_user_prompt=None,
+        derived_recall_timeout=0.5,
     ):
         captured["backend"] = backend
         captured["budget"] = budget
         captured["turn_ctx"] = turn_ctx
         captured["tools_confined"] = tools_confined
         captured["principal_isolated"] = principal_isolated
+        captured["visible_recall"] = visible_recall
+        captured["latest_user_prompt"] = latest_user_prompt
         return ""
 
     monkeypatch.setattr("ohmo.gateway.runtime.prepare_turn", fake_prepare_turn)
@@ -125,3 +130,5 @@ async def test_runtime_prompt_threads_turn_context_into_prepare_turn(
     assert captured["turn_ctx"] is turn_ctx
     assert captured["tools_confined"] is False
     assert captured["principal_isolated"] is False
+    assert captured["visible_recall"] is False
+    assert captured["latest_user_prompt"] == "hello"

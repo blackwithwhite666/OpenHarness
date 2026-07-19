@@ -1163,6 +1163,8 @@ class OhmoSessionRuntimePool:
                 turn_ctx,
                 session_owner_principal,
             ),
+            visible_recall=self._gateway_config.visible_recall,
+            latest_user_prompt=latest_user_prompt,
         )
         gate_decision = getattr(snapshot, "gate_decision", None)
         if gate_decision is not None:

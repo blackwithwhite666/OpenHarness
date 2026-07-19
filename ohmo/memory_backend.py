@@ -30,6 +30,12 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_DERIVED_RECALL_HEADING = "## Recalled (honcho, derived — may be imperfect)"
+_DERIVED_RECALL_PROVENANCE = (
+    "_The catalog memory above is curated; these additive hits are derived from conversations._"
+)
+_DERIVED_RECALL_TOP_K = 10
+
 
 @dataclass(frozen=True)
 class MemoryHit:
@@ -270,6 +276,7 @@ class ShadowMemoryBackend(MemoryBackend):
         honcho_client: HonchoClient | None = None,
         *,
         observer: str = "ohmo-curated",
+        derived_observer: str = "ohmo",
         observed: str = "owner",
         conversation_learning: bool = False,
         session: str = "ohmo",
@@ -280,6 +287,7 @@ class ShadowMemoryBackend(MemoryBackend):
         self._base = base
         self._honcho_client = honcho_client if is_owner else None
         self._observer = observer
+        self._derived_observer = derived_observer
         self._observed = observed
         self._conversation_learning = conversation_learning
         self._session = session
@@ -328,6 +336,67 @@ class ShadowMemoryBackend(MemoryBackend):
 
     async def render_prompt(self, budget: int | None = None) -> str:
         return await self._base.render_prompt(budget)
+
+    async def derived_recall_block(
+        self,
+        query: str,
+        *,
+        budget: int,
+        timeout: float,
+    ) -> str | None:
+        """Render bounded derived hits, or omit them when Honcho is unavailable.
+
+        ``query`` is the latest user-turn text supplied by the gateway. This
+        keeps recall relevant to the submitted turn without adding a second
+        Honcho working-representation read to the prompt path.
+        """
+        honcho_client = self._honcho_client
+        query = query.strip()
+        if honcho_client is None or not query or budget <= 0 or timeout <= 0:
+            return None
+
+        try:
+            hits = await asyncio.wait_for(
+                honcho_client.query_conclusions(
+                    query,
+                    observer=self._derived_observer,
+                    observed=self._observed,
+                    top_k=_DERIVED_RECALL_TOP_K,
+                ),
+                timeout=timeout,
+            )
+        except TimeoutError:
+            logger.warning("ohmo visible Honcho recall timed out")
+            return None
+        except Exception:  # noqa: BLE001 - derived recall is additive only
+            logger.warning("ohmo visible Honcho recall failed", exc_info=True)
+            return None
+
+        prefix = f"{_DERIVED_RECALL_HEADING}\n{_DERIVED_RECALL_PROVENANCE}"
+        if len(prefix) >= budget:
+            return None
+
+        lines = [prefix]
+        for hit in hits:
+            content = getattr(hit, "content", None)
+            if not isinstance(content, str):
+                continue
+            content = " ".join(content.split())
+            if not content or scan_for_threats(content, scope="all"):
+                continue
+
+            available = budget - len("\n".join(lines)) - len("\n- ")
+            if available <= 0:
+                break
+            if len(content) > available:
+                if available <= 3:
+                    break
+                content = content[: available - 3].rstrip() + "..."
+            lines.append(f"- {content}")
+            if len("\n".join(lines)) >= budget:
+                break
+
+        return "\n".join(lines) if len(lines) > 1 else None
 
     async def append_turn(self, role: str, text: str) -> None:
         honcho_client = self._honcho_client
