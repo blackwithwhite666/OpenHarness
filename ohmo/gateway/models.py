@@ -29,6 +29,9 @@ class GatewayConfig(BaseModel):
     message_coalesce_max: int = 20
     evals_capture: bool = True
     memory_backend: str = "file"
+    semantic_search: bool = False
+    inference_url: str | None = None
+    embedding_model: str | None = None
     visible_recall: bool = False
     conversation_learning: bool = False
     memory_service_socket: str | None = None

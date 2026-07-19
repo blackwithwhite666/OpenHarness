@@ -168,14 +168,29 @@ class CatalogMemoryBackend(MemoryBackend):
         workspace: str | Path | None,
         *,
         embedder: EmbeddingClient | None = None,
+        owns_embedder: bool = False,
         model: str = _DEFAULT_EMBEDDING_MODEL,
         embedding_timeout: float = _DEFAULT_EMBEDDING_TIMEOUT_SECONDS,
     ) -> None:
         self._catalog = catalog
         self._memory_dir = get_memory_dir(workspace)
         self._embedder = embedder
+        self._owns_embedder = owns_embedder and embedder is not None
         self._embedding_model = model.strip()
         self._embedding_timeout = embedding_timeout
+
+    async def aclose(self) -> None:
+        """Close a factory-owned embedder without making shutdown fragile."""
+        if not self._owns_embedder:
+            return
+        self._owns_embedder = False
+        close = getattr(self._embedder, "aclose", None)
+        if not callable(close):
+            return
+        try:
+            await close()
+        except Exception:
+            logger.debug("catalog semantic embedder close failed", exc_info=True)
 
     def _entry(self, record: CatalogRecord) -> MemoryEntry:
         return MemoryEntry(
@@ -607,6 +622,10 @@ class ShadowMemoryBackend(MemoryBackend):
         while self._pending:
             await asyncio.gather(*tuple(self._pending), return_exceptions=True)
 
+    async def aclose(self) -> None:
+        """Close resources owned by the catalog backend."""
+        await self._base.aclose()
+
     async def _compare(
         self,
         *,
@@ -730,9 +749,9 @@ def make_memory_backend(
     if cfg.memory_backend == "file":
         return FileMemoryBackend(MemoryStore(workspace))
     if cfg.memory_backend == "catalog":
-        return CatalogMemoryBackend(ensure_catalog_migrated(workspace), workspace)
+        return _make_catalog_memory_backend(cfg, workspace)
     if cfg.memory_backend == "shadow":
-        base = CatalogMemoryBackend(ensure_catalog_migrated(workspace), workspace)
+        base = _make_catalog_memory_backend(cfg, workspace)
         honcho_client = None
         if (
             cfg.owner_principals
@@ -769,3 +788,34 @@ def make_memory_backend(
     if cfg.memory_backend == "honcho":
         raise NotImplementedError("honcho memory backend not built in Phase 0")
     raise ValueError(f"unsupported memory backend: {cfg.memory_backend!r}")
+
+
+def _make_catalog_memory_backend(
+    cfg: GatewayConfig,
+    workspace: str | Path | None,
+) -> CatalogMemoryBackend:
+    catalog = ensure_catalog_migrated(workspace)
+    if not cfg.semantic_search:
+        return CatalogMemoryBackend(catalog, workspace)
+
+    from openharness.evals.inference import InferenceClient
+
+    embedder = (
+        InferenceClient(cfg.inference_url)
+        if cfg.inference_url is not None
+        else InferenceClient.from_env()
+    )
+    if cfg.embedding_model is None:
+        return CatalogMemoryBackend(
+            catalog,
+            workspace,
+            embedder=embedder,
+            owns_embedder=True,
+        )
+    return CatalogMemoryBackend(
+        catalog,
+        workspace,
+        embedder=embedder,
+        owns_embedder=True,
+        model=cfg.embedding_model,
+    )

@@ -217,6 +217,16 @@ class OhmoSessionRuntimePool:
     def active_sessions(self) -> int:
         return len(self._bundles)
 
+    async def aclose(self) -> None:
+        """Close resources owned by the shared prompt-memory backend."""
+        close = getattr(self._prompt_memory_backend, "aclose", None)
+        if not callable(close):
+            return
+        try:
+            await close()
+        except Exception:
+            logger.warning("ohmo memory backend close failed", exc_info=True)
+
     def _remote_admin_allowed(self, command) -> bool:
         if not getattr(command, "remote_admin_opt_in", False):
             return False
