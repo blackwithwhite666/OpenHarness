@@ -60,6 +60,7 @@ async def prepare_turn(
     owner_principals: tuple[str, ...] = (),
     memory_engaged_override: bool | None = None,
     derived_backend: ShadowMemoryBackend | None = None,
+    derived_recall_allowed_override: bool | None = None,
 ) -> TurnSnapshot:
     """Read a fresh backend-rendered memory snapshot for one submitted turn.
 
@@ -82,9 +83,14 @@ async def prepare_turn(
     recall_backend = derived_backend
     if recall_backend is None and isinstance(backend, ShadowMemoryBackend):
         recall_backend = backend
+    derived_recall_allowed = (
+        gate_decision.allowed
+        if derived_recall_allowed_override is None
+        else derived_recall_allowed_override is True
+    )
     if (
         visible_recall is True
-        and gate_decision.allowed
+        and derived_recall_allowed
         and recall_backend is not None
         and isinstance(latest_user_prompt, str)
     ):

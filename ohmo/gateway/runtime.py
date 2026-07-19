@@ -58,6 +58,7 @@ from ohmo.memory_backend import (
     MemoryBackend,
     ShadowMemoryBackend,
     make_memory_backend,
+    make_tenant_shadow_backend,
 )
 from ohmo.memory_store import MemoryStore
 from ohmo.memory_judge import judge_enabled, judge_interval, run_memory_judge
@@ -217,6 +218,7 @@ class OhmoSessionRuntimePool:
         self._memory_store = MemoryStore(self._workspace)
         self._prompt_memory_backend = make_memory_backend(self._gateway_config, self._workspace)
         self._catalog_memory_backends: dict[tuple[str, str | None], CatalogMemoryBackend] = {}
+        self._tenant_shadow_backends: dict[str, ShadowMemoryBackend] = {}
         self._judge_turn_counts: dict[str, int] = {}
         self._judge_tasks: dict[str, asyncio.Task] = {}
         self._reminder_store = ReminderStore(workspace=self._workspace)
@@ -902,17 +904,13 @@ class OhmoSessionRuntimePool:
         if self._gateway_config.conversation_learning is not True:
             return
         scope = self._coerce_memory_scope(turn_ctx, memory_scope)
-        # TODO(family-memory): create per-tenant Honcho workspaces and ingest
-        # non-owner conversations in the next step. The current Honcho/shadow
-        # workspace remains strictly owner-bound.
-        if (
-            scope is None
-            or scope.private_tenant != "owner"
-            or not self._memory_gate_decision(turn_ctx).allowed
-        ):
+        if scope is None or not self._honcho_turn_allowed(turn_ctx, scope):
             return
-        await self._prompt_memory_backend.append_turn("user", user_text)
-        await self._prompt_memory_backend.append_turn("assistant", assistant_text)
+        shadow_backend = self._shadow_backend_for_scope(scope)
+        if shadow_backend is None:
+            return
+        await shadow_backend.append_turn("user", user_text)
+        await shadow_backend.append_turn("assistant", assistant_text)
 
     async def _convert_stream_event(
         self,
@@ -1236,15 +1234,7 @@ class OhmoSessionRuntimePool:
             if scope is not None
             else self._prompt_memory_backend
         )
-        derived_backend = (
-            self._prompt_memory_backend
-            if (
-                scope is not None
-                and scope.private_tenant == "owner"
-                and isinstance(self._prompt_memory_backend, ShadowMemoryBackend)
-            )
-            else None
-        )
+        derived_backend = self._shadow_backend_for_scope(scope) if scope is not None else None
         snapshot = await prepare_turn(
             backend,
             turn_ctx=turn_ctx,
@@ -1257,6 +1247,11 @@ class OhmoSessionRuntimePool:
             owner_principals=self._gateway_config.owner_principals,
             memory_engaged_override=engaged,
             derived_backend=derived_backend,
+            derived_recall_allowed_override=(
+                self._honcho_turn_allowed(turn_ctx, scope)
+                if scope is not None
+                else False
+            ),
         )
         gate_decision = getattr(snapshot, "gate_decision", None)
         if gate_decision is not None:
@@ -1341,6 +1336,16 @@ class OhmoSessionRuntimePool:
                 session_owner_principal,
             ),
         )
+
+    def _honcho_turn_allowed(
+        self,
+        turn_ctx: TurnContext | None,
+        scope: MemoryScope,
+    ) -> bool:
+        """Apply the legacy owner gate or require an exact resolved family scope."""
+        if scope.private_tenant == "owner":
+            return self._memory_gate_decision(turn_ctx).allowed
+        return self._resolve_turn_memory_scope(turn_ctx) == scope
 
     def _resolve_turn_memory_scope(
         self,
@@ -1428,6 +1433,36 @@ class OhmoSessionRuntimePool:
         ):
             return self._prompt_memory_backend
         return self._catalog_backend_for_scope(scope)
+
+    def _shadow_backend_for_scope(
+        self,
+        scope: MemoryScope,
+    ) -> ShadowMemoryBackend | None:
+        """Return one cached Honcho shadow bound only to the private tenant."""
+        source = self._prompt_memory_backend
+        if scope.private_tenant == "owner" and isinstance(source, ShadowMemoryBackend):
+            return source
+        if self._gateway_config.memory_backend != "shadow":
+            return None
+
+        cache = getattr(self, "_tenant_shadow_backends", None)
+        if cache is None:
+            cache = {}
+            self._tenant_shadow_backends = cache
+        cached = cache.get(scope.private_tenant)
+        if cached is not None:
+            return cached
+
+        backend = make_tenant_shadow_backend(
+            self._gateway_config,
+            self._catalog_backend_for_scope(scope),
+            self._workspace,
+            tenant_id=scope.private_tenant,
+        )
+        if backend._honcho_client is None:
+            return None
+        cache[scope.private_tenant] = backend
+        return backend
 
     def _memory_engaged(self, turn_ctx: TurnContext | None) -> bool:
         return self._resolve_turn_memory_scope(turn_ctx) is not None

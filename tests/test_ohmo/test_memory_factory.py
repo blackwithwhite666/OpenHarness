@@ -222,6 +222,13 @@ def test_gateway_config_memory_backend_defaults_and_round_trips(tmp_path: Path):
         honcho_base_url="https://honcho.invalid",
         honcho_api_key="secret",
         honcho_workspace="workspace",
+        tenant_honcho={
+            "marina": {
+                "workspace": "marina-workspace",
+                "api_key": "marina-secret",
+                "observed_peer": "marina-person",
+            }
+        },
     )
     save_gateway_config(expected, tmp_path)
 
@@ -233,3 +240,10 @@ def test_gateway_config_memory_backend_defaults_and_round_trips(tmp_path: Path):
     assert actual.honcho_base_url == "https://honcho.invalid"
     assert actual.honcho_api_key == "secret"
     assert actual.honcho_workspace == "workspace"
+    assert actual.tenant_honcho == {
+        "marina": {
+            "workspace": "marina-workspace",
+            "api_key": "marina-secret",
+            "observed_peer": "marina-person",
+        }
+    }

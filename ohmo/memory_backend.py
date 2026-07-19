@@ -58,6 +58,55 @@ class MemoryHit:
     rank: int
 
 
+@dataclass(frozen=True, slots=True)
+class TenantHonchoBinding:
+    """One private tenant's scoped Honcho credentials and person peer."""
+
+    tenant_id: str
+    base_url: str
+    api_key: str
+    workspace: str
+    observed_peer: str
+
+
+def resolve_tenant_honcho_binding(
+    cfg: GatewayConfig,
+    tenant_id: str,
+) -> TenantHonchoBinding | None:
+    """Resolve a complete tenant binding without borrowing another tenant's values."""
+    tenant_id = tenant_id.strip()
+    if not tenant_id or not cfg.honcho_base_url:
+        return None
+
+    raw_binding = cfg.tenant_honcho.get(tenant_id)
+    if raw_binding is None:
+        if tenant_id != "owner" or not cfg.owner_principals:
+            return None
+        workspace = cfg.honcho_workspace
+        api_key = cfg.honcho_api_key
+        observed_peer = "owner"
+    else:
+        workspace = raw_binding.get("workspace")
+        api_key = raw_binding.get("api_key")
+        observed_peer = raw_binding.get("observed_peer", tenant_id)
+
+    if not all(
+        isinstance(value, str) and value.strip()
+        for value in (workspace, api_key, observed_peer)
+    ):
+        return None
+    assert isinstance(workspace, str)
+    assert isinstance(api_key, str)
+    assert isinstance(observed_peer, str)
+    return TenantHonchoBinding(
+        tenant_id=tenant_id,
+        base_url=cfg.honcho_base_url,
+        api_key=api_key,
+        workspace=workspace.strip(),
+        observed_peer=observed_peer.strip(),
+    )
+
+
 class MemoryBackend(Protocol):
     """Storage-neutral async interface for model-facing memory operations."""
 
@@ -806,7 +855,9 @@ class ShadowMemoryBackend(MemoryBackend):
     async def await_pending(self) -> None:
         """Drain all shadow work scheduled before or while this call runs."""
         while self._pending:
-            await asyncio.gather(*tuple(self._pending), return_exceptions=True)
+            pending = tuple(self._pending)
+            await asyncio.gather(*pending, return_exceptions=True)
+            self._pending.difference_update(pending)
 
     async def aclose(self) -> None:
         """Close resources owned by the catalog backend."""
@@ -930,34 +981,32 @@ def _inject_char_budget() -> int:
 def make_memory_backend(
     cfg: GatewayConfig,
     workspace: str | Path | None,
+    *,
+    tenant_id: str = "owner",
+    shared_tenant_id: str | None = None,
 ) -> MemoryBackend:
     """Build the configured workspace-scoped memory backend."""
     if cfg.memory_backend == "file":
         return FileMemoryBackend(MemoryStore(workspace))
     if cfg.memory_backend == "catalog":
-        return _make_catalog_memory_backend(cfg, workspace)
+        return _make_catalog_memory_backend(
+            cfg,
+            workspace,
+            tenant_id=tenant_id,
+            shared_tenant_id=shared_tenant_id,
+        )
     if cfg.memory_backend == "shadow":
-        base = _make_catalog_memory_backend(cfg, workspace)
-        honcho_client = None
-        if (
-            cfg.owner_principals
-            and cfg.honcho_base_url
-            and cfg.honcho_api_key
-            and cfg.honcho_workspace
-        ):
-            from ohmo.memory_service.honcho_client import HonchoClient
-
-            honcho_client = HonchoClient(
-                cfg.honcho_base_url,
-                cfg.honcho_api_key,
-                cfg.honcho_workspace,
-            )
-        return ShadowMemoryBackend(
+        base = _make_catalog_memory_backend(
+            cfg,
+            workspace,
+            tenant_id=tenant_id,
+            shared_tenant_id=shared_tenant_id,
+        )
+        return make_tenant_shadow_backend(
+            cfg,
             base,
-            honcho_client=honcho_client,
-            conversation_learning=cfg.conversation_learning,
-            comparison_log_path=(get_memory_dir(workspace) / SHADOW_COMPARISON_LOG_FILENAME),
-            is_owner=bool(cfg.owner_principals),
+            workspace,
+            tenant_id=tenant_id,
         )
     if cfg.memory_backend == "service":
         if not cfg.memory_service_socket or not cfg.memory_service_secret_file:
@@ -979,10 +1028,18 @@ def make_memory_backend(
 def _make_catalog_memory_backend(
     cfg: GatewayConfig,
     workspace: str | Path | None,
+    *,
+    tenant_id: str = "owner",
+    shared_tenant_id: str | None = None,
 ) -> CatalogMemoryBackend:
     catalog = ensure_catalog_migrated(workspace)
     if not cfg.semantic_search:
-        return CatalogMemoryBackend(catalog, workspace)
+        return CatalogMemoryBackend(
+            catalog,
+            workspace,
+            tenant_id=tenant_id,
+            shared_tenant_id=shared_tenant_id,
+        )
 
     from openharness.evals.inference import InferenceClient
 
@@ -995,13 +1052,47 @@ def _make_catalog_memory_backend(
         return CatalogMemoryBackend(
             catalog,
             workspace,
+            tenant_id=tenant_id,
+            shared_tenant_id=shared_tenant_id,
             embedder=embedder,
             owns_embedder=True,
         )
     return CatalogMemoryBackend(
         catalog,
         workspace,
+        tenant_id=tenant_id,
+        shared_tenant_id=shared_tenant_id,
         embedder=embedder,
         owns_embedder=True,
         model=cfg.embedding_model,
+    )
+
+
+def make_tenant_shadow_backend(
+    cfg: GatewayConfig,
+    base: CatalogMemoryBackend,
+    workspace: str | Path | None,
+    *,
+    tenant_id: str,
+) -> ShadowMemoryBackend:
+    """Wrap a scoped catalog with only that tenant's Honcho binding."""
+    binding = resolve_tenant_honcho_binding(cfg, tenant_id)
+    honcho_client = None
+    observed_peer = tenant_id
+    if binding is not None:
+        from ohmo.memory_service.honcho_client import HonchoClient
+
+        honcho_client = HonchoClient(
+            binding.base_url,
+            binding.api_key,
+            binding.workspace,
+        )
+        observed_peer = binding.observed_peer
+    return ShadowMemoryBackend(
+        base,
+        honcho_client=honcho_client,
+        observed=observed_peer,
+        conversation_learning=cfg.conversation_learning,
+        comparison_log_path=(get_memory_dir(workspace) / SHADOW_COMPARISON_LOG_FILENAME),
+        is_owner=honcho_client is not None,
     )

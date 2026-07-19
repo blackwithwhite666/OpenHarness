@@ -238,7 +238,7 @@ def test_shadow_factory_default_and_unbuilt_honcho_kinds(tmp_path: Path):
         make_memory_backend(GatewayConfig(memory_backend="honcho"), tmp_path / "honcho")
 
 
-def test_shadow_factory_builds_honcho_only_for_configured_owner(
+def test_shadow_factory_builds_honcho_only_for_configured_tenant(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ):
@@ -279,14 +279,37 @@ def test_shadow_factory_builds_honcho_only_for_configured_owner(
         ),
         tmp_path / "partial",
     )
+    family_backend = make_memory_backend(
+        GatewayConfig(
+            memory_backend="shadow",
+            owner_principals=("owner-id",),
+            honcho_base_url="https://honcho.test",
+            tenant_honcho={
+                "marina": {
+                    "workspace": "workspace-marina",
+                    "api_key": "marina-secret",
+                    "observed_peer": "marina-person",
+                }
+            },
+        ),
+        tmp_path / "family",
+        tenant_id="marina",
+    )
 
     assert isinstance(owner_backend, ShadowMemoryBackend)
     assert isinstance(non_owner_backend, ShadowMemoryBackend)
     assert isinstance(partial_backend, ShadowMemoryBackend)
-    assert created == [("https://honcho.test", "secret", "workspace-one")]
+    assert isinstance(family_backend, ShadowMemoryBackend)
+    assert created == [
+        ("https://honcho.test", "secret", "workspace-one"),
+        ("https://honcho.test", "marina-secret", "workspace-marina"),
+    ]
     assert isinstance(owner_backend._honcho_client, StubHonchoClient)
     assert non_owner_backend._honcho_client is None
     assert partial_backend._honcho_client is None
+    assert isinstance(family_backend._honcho_client, StubHonchoClient)
+    assert family_backend._base._tenant_id == "marina"
+    assert family_backend._observed == "marina-person"
 
 
 async def test_non_owner_disables_configured_shadow_client(tmp_path: Path):

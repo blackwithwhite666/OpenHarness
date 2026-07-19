@@ -11,7 +11,7 @@ from typing import Any
 import pytest
 
 from ohmo.memory_catalog import MemoryCatalog
-from ohmo.memory_service.outbox import DrainReport, drain_once
+from ohmo.memory_service.outbox import DrainReport, TenantHonchoTarget, drain_once
 
 
 class FakeHoncho:
@@ -135,6 +135,34 @@ async def test_drain_add_uses_curated_peer_pair_records_ack_and_marks_done(tmp_p
     assert record is not None
     assert json.loads(record.honcho_conclusion_ids) == ["conclusion-1"]
     assert _outbox_rows(catalog)[0]["state"] == "done"
+
+
+async def test_drain_routes_family_row_to_its_tenant_client_and_peer(tmp_path: Path):
+    catalog = MemoryCatalog(db_path=tmp_path / "catalog.sqlite3")
+    catalog.ensure_tenant("marina", "private")
+    owner_honcho = FakeHoncho()
+    marina_honcho = FakeHoncho()
+    assert catalog.add("marina", "Timezone", "Marina lives in Paris.").ok
+
+    report = await drain_once(
+        catalog,
+        owner_honcho,
+        tenant_honcho={
+            "marina": TenantHonchoTarget(marina_honcho, "marina"),  # type: ignore[arg-type]
+        },
+    )
+
+    assert report == DrainReport(mirrored=1)
+    assert owner_honcho.created == []
+    assert marina_honcho.created == [
+        [
+            {
+                "content": "Marina lives in Paris.",
+                "observer_id": "ohmo-curated",
+                "observed_id": "marina",
+            }
+        ]
+    ]
 
 
 async def test_ack_followed_by_local_failure_is_replayed_at_least_once(

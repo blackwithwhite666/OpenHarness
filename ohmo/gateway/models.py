@@ -48,6 +48,7 @@ class GatewayConfig(BaseModel):
     honcho_base_url: str | None = None
     honcho_api_key: str | None = None
     honcho_workspace: str | None = None
+    tenant_honcho: dict[str, dict[str, str]] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def validate_memory_tenant_config(self) -> GatewayConfig:
@@ -63,6 +64,21 @@ class GatewayConfig(BaseModel):
         for tenant_id in (*self.shared_tenants, *self.enabled_memory_tenants):
             if _TENANT_ID_RE.fullmatch(tenant_id) is None:
                 raise ValueError("memory tenant ids must match [a-z0-9_-]+")
+
+        for tenant_id, binding in self.tenant_honcho.items():
+            if _TENANT_ID_RE.fullmatch(tenant_id) is None:
+                raise ValueError("tenant_honcho keys must match [a-z0-9_-]+")
+            for field_name in ("workspace", "api_key"):
+                value = binding.get(field_name)
+                if not isinstance(value, str) or not value.strip():
+                    raise ValueError(
+                        f"tenant_honcho[{tenant_id!r}].{field_name} is required"
+                    )
+            observed_peer = binding.get("observed_peer", tenant_id)
+            if not isinstance(observed_peer, str) or not observed_peer.strip():
+                raise ValueError(
+                    f"tenant_honcho[{tenant_id!r}].observed_peer must not be empty"
+                )
 
         if "owner" in self.shared_tenants:
             raise ValueError("the owner tenant cannot be a shared tenant")

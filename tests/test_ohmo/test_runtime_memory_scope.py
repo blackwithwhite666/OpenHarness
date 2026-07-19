@@ -11,6 +11,7 @@ import pytest
 from openharness.engine.messages import ConversationMessage
 from openharness.tools.base import ToolExecutionContext, ToolRegistry
 
+from ohmo.gateway.config import save_gateway_config
 from ohmo.gateway.memory_gate import MemoryScope
 from ohmo.gateway.models import GatewayConfig
 from ohmo.gateway.runtime import OhmoSessionRuntimePool
@@ -39,6 +40,30 @@ class _FakeHoncho:
     ) -> list[object]:
         del session
         self.messages.append(messages)
+        return []
+
+
+class _BoundFakeHoncho:
+    instances: dict[str, _BoundFakeHoncho] = {}
+
+    def __init__(self, base_url: str, jwt: str, workspace: str) -> None:
+        self.base_url = base_url
+        self.jwt = jwt
+        self.workspace = workspace
+        self.queries: list[tuple[str, dict[str, object]]] = []
+        self.messages: list[tuple[str, list[dict[str, object]]]] = []
+        self.instances[workspace] = self
+
+    async def query_conclusions(self, query: str, **kwargs: object) -> list[object]:
+        self.queries.append((query, kwargs))
+        return [SimpleNamespace(content=f"{self.workspace} derived fact")]
+
+    async def create_messages(
+        self,
+        session: str,
+        messages: list[dict[str, object]],
+    ) -> list[object]:
+        self.messages.append((session, messages))
         return []
 
 
@@ -282,6 +307,151 @@ async def test_family_turn_never_uses_owner_honcho_recall_or_ingest(
     assert "honcho, derived" in owner_prompt
     assert honcho.queries == ["recall owner history"]
     assert len(honcho.messages) == 2
+
+
+async def test_owner_and_marina_honcho_recall_and_ingest_are_isolated(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from ohmo.memory_service import honcho_client as honcho_client_module
+
+    _BoundFakeHoncho.instances = {}
+    monkeypatch.setattr(honcho_client_module, "HonchoClient", _BoundFakeHoncho)
+    workspace = tmp_path / ".ohmo-home"
+    initialize_workspace(workspace)
+    _seed_catalog(workspace)
+    save_gateway_config(
+        _family_config(
+            memory_backend="shadow",
+            visible_recall=True,
+            conversation_learning=True,
+            honcho_base_url="https://honcho.test",
+            honcho_api_key="owner-jwt",
+            honcho_workspace="owner-workspace",
+            tenant_honcho={
+                "marina": {
+                    "workspace": "marina-workspace",
+                    "api_key": "marina-jwt",
+                }
+            },
+        ),
+        workspace,
+    )
+    pool = OhmoSessionRuntimePool(
+        cwd=tmp_path,
+        workspace=workspace,
+        provider_profile="codex",
+    )
+
+    owner_ctx = _context("100", owner=True)
+    marina_ctx = _context("200", owner=False)
+    for turn_ctx in (owner_ctx, marina_ctx):
+        pool._session_owner_principals[turn_ctx.session_id] = turn_ctx.principal
+    owner_scope = pool._resolve_turn_memory_scope(owner_ctx)
+    marina_scope = pool._resolve_turn_memory_scope(marina_ctx)
+    assert owner_scope is not None
+    assert marina_scope is not None
+
+    owner_prompt = await pool._runtime_system_prompt(
+        SimpleNamespace(cwd=str(tmp_path)),
+        "owner recall",
+        turn_ctx=owner_ctx,
+        memory_scope=owner_scope,
+    )
+    marina_prompt = await pool._runtime_system_prompt(
+        SimpleNamespace(cwd=str(tmp_path)),
+        "marina recall",
+        turn_ctx=marina_ctx,
+        memory_scope=marina_scope,
+    )
+    await pool._append_conversation_turn(
+        turn_ctx=owner_ctx,
+        memory_scope=owner_scope,
+        user_text="owner user turn",
+        assistant_text="owner assistant turn",
+    )
+    await pool._append_conversation_turn(
+        turn_ctx=marina_ctx,
+        memory_scope=marina_scope,
+        user_text="marina user turn",
+        assistant_text="marina assistant turn",
+    )
+    owner_shadow = pool._shadow_backend_for_scope(owner_scope)
+    marina_shadow = pool._shadow_backend_for_scope(marina_scope)
+    assert owner_shadow is not None
+    assert marina_shadow is not None
+    await asyncio.gather(owner_shadow.await_pending(), marina_shadow.await_pending())
+
+    owner_honcho = _BoundFakeHoncho.instances["owner-workspace"]
+    marina_honcho = _BoundFakeHoncho.instances["marina-workspace"]
+    assert (owner_honcho.base_url, owner_honcho.jwt) == (
+        "https://honcho.test",
+        "owner-jwt",
+    )
+    assert (marina_honcho.base_url, marina_honcho.jwt) == (
+        "https://honcho.test",
+        "marina-jwt",
+    )
+    assert owner_honcho.queries == [
+        (
+            "owner recall",
+            {"observer": "ohmo", "observed": "owner", "top_k": 10},
+        )
+    ]
+    assert marina_honcho.queries == [
+        (
+            "marina recall",
+            {"observer": "ohmo", "observed": "marina", "top_k": 10},
+        )
+    ]
+    assert "owner-workspace derived fact" in owner_prompt
+    assert "marina-workspace derived fact" not in owner_prompt
+    assert "marina-workspace derived fact" in marina_prompt
+    assert "owner-workspace derived fact" not in marina_prompt
+    assert owner_honcho.messages == [
+        (
+            "ohmo",
+            [
+                {
+                    "content": "owner user turn",
+                    "peer_id": "owner",
+                    "metadata": {"role": "user"},
+                }
+            ],
+        ),
+        (
+            "ohmo",
+            [
+                {
+                    "content": "owner assistant turn",
+                    "peer_id": "ohmo",
+                    "metadata": {"role": "assistant"},
+                }
+            ],
+        ),
+    ]
+    assert marina_honcho.messages == [
+        (
+            "ohmo",
+            [
+                {
+                    "content": "marina user turn",
+                    "peer_id": "marina",
+                    "metadata": {"role": "user"},
+                }
+            ],
+        ),
+        (
+            "ohmo",
+            [
+                {
+                    "content": "marina assistant turn",
+                    "peer_id": "ohmo",
+                    "metadata": {"role": "assistant"},
+                }
+            ],
+        ),
+    ]
 
 
 @pytest.mark.parametrize(

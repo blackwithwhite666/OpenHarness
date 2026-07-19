@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from collections.abc import Mapping
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -199,11 +200,20 @@ class DrainReport:
     failed: int = 0
 
 
+@dataclass(frozen=True, slots=True)
+class TenantHonchoTarget:
+    """Resolved outbox destination for exactly one catalog tenant."""
+
+    client: HonchoClient
+    observed_peer: str
+
+
 async def drain_once(
     catalog: _OutboxCatalog,
-    honcho_client: HonchoClient,
+    honcho_client: HonchoClient | None = None,
     *,
     batch: int = 100,
+    tenant_honcho: Mapping[str, TenantHonchoTarget] | None = None,
 ) -> DrainReport:
     """Lease and deliver one batch without putting Honcho on the write path."""
     mirrored = retried = failed = 0
@@ -213,17 +223,24 @@ async def drain_once(
         op_type = cast(str, operation["op_type"])
         slug = cast(str, operation["slug"])
         try:
+            target = _tenant_target(
+                tenant_id,
+                owner_client=honcho_client,
+                tenant_honcho=tenant_honcho,
+            )
+            if target is None:
+                raise RuntimeError(f"no Honcho binding for tenant {tenant_id!r}")
             new_id = None
             if op_type in {"add", "update"}:
                 content = operation["content"]
                 if not isinstance(content, str):
                     raise ValueError(f"outbox operation {outbox_id} has no content")
-                acknowledgements = await honcho_client.create_conclusions(
+                acknowledgements = await target.client.create_conclusions(
                     [
                         {
                             "content": content,
                             "observer_id": "ohmo-curated",
-                            "observed_id": tenant_id,
+                            "observed_id": target.observed_peer,
                         }
                     ]
                 )
@@ -246,10 +263,10 @@ async def drain_once(
                 catalog.append_conclusion_id(tenant_id, slug, new_id)
             elif op_type == "update":
                 assert new_id is not None
-                await _delete_best_effort(honcho_client, old_ids)
+                await _delete_best_effort(target.client, old_ids)
                 catalog.set_conclusion_ids(tenant_id, slug, [new_id])
             elif op_type == "remove":
-                await _delete_best_effort(honcho_client, old_ids)
+                await _delete_best_effort(target.client, old_ids)
             else:
                 raise ValueError(f"unknown outbox operation {op_type!r}")
             catalog.mark_outbox_done(outbox_id)
@@ -260,6 +277,21 @@ async def drain_once(
         else:
             mirrored += 1
     return DrainReport(mirrored=mirrored, retried=retried, failed=failed)
+
+
+def _tenant_target(
+    tenant_id: str,
+    *,
+    owner_client: HonchoClient | None,
+    tenant_honcho: Mapping[str, TenantHonchoTarget] | None,
+) -> TenantHonchoTarget | None:
+    if tenant_honcho is not None:
+        target = tenant_honcho.get(tenant_id)
+        if target is not None:
+            return target
+    if tenant_id == "owner" and owner_client is not None:
+        return TenantHonchoTarget(owner_client, "owner")
+    return None
 
 
 def reconcile_outbox(catalog: _OutboxCatalog) -> dict[str, int]:
@@ -293,4 +325,4 @@ def _timestamp(offset: timedelta = timedelta()) -> str:
     return (datetime.now(timezone.utc) + offset).isoformat().replace("+00:00", "Z")
 
 
-__all__ = ["DrainReport", "drain_once", "reconcile_outbox"]
+__all__ = ["DrainReport", "TenantHonchoTarget", "drain_once", "reconcile_outbox"]
