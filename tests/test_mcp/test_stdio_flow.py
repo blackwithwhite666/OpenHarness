@@ -11,6 +11,7 @@ from openharness.mcp.client import McpClientManager
 from openharness.mcp.types import McpStdioServerConfig
 from openharness.tools import create_default_tool_registry
 from openharness.tools.base import ToolExecutionContext
+from openharness.untrusted import UNTRUSTED_BANNER
 
 
 @pytest.mark.asyncio
@@ -39,7 +40,7 @@ async def test_stdio_mcp_manager_connects_and_executes_real_server():
             hello_tool.input_model.model_validate({"name": "world"}),
             ToolExecutionContext(cwd=Path(".")),
         )
-        assert hello_result.output == "fixture-hello:world"
+        assert hello_result.output == f"{UNTRUSTED_BANNER}\n\nfixture-hello:world"
 
         resource_tool = registry.get("read_mcp_resource")
         assert resource_tool is not None

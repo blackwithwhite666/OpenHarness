@@ -23,6 +23,7 @@ from openharness.mcp.types import McpConnectionStatus, McpStdioServerConfig, Mcp
 from openharness.tools.base import ToolExecutionContext
 from openharness.tools.mcp_tool import McpToolAdapter
 from openharness.tools.read_mcp_resource_tool import ReadMcpResourceTool
+from openharness.untrusted import UNTRUSTED_BANNER
 
 
 class _AsyncContextManager:
@@ -302,6 +303,7 @@ async def test_mcp_tool_adapter_returns_error_result_on_disconnected_server():
         ToolExecutionContext(cwd=Path(".")),
     )
     assert result.is_error is True
+    assert UNTRUSTED_BANNER not in result.output
     assert "not connected" in result.output
 
 
@@ -317,4 +319,5 @@ async def test_read_mcp_resource_tool_returns_error_result_on_disconnected_serve
         ToolExecutionContext(cwd=Path(".")),
     )
     assert result.is_error is True
+    assert UNTRUSTED_BANNER not in result.output
     assert "not connected" in result.output

@@ -34,6 +34,7 @@ from openharness.channels.bus.queue import MessageBus
 from openharness.channels.impl.base import BaseChannel, resolve_channel_state_dir
 from openharness.channels.last_location import LastLocationStore
 from openharness.config.schema import TelegramConfig
+from openharness.untrusted import UNTRUSTED_BANNER
 from openharness.utils.helpers import split_message
 
 logger = logging.getLogger(__name__)
@@ -104,7 +105,7 @@ def _reply_context(reply) -> tuple[str, dict]:
         quoted = "[no text]"
     if len(quoted) > _REPLY_QUOTE_MAX:
         quoted = quoted[:_REPLY_QUOTE_MAX] + "…"
-    prefix = f'[In reply to {author}: "{quoted}"]'
+    prefix = f'[In reply to {author} — {UNTRUSTED_BANNER}: "{quoted}"]'
     meta = {
         "reply_to_message_id": getattr(reply, "message_id", None),
         "reply_to_text": quoted,

@@ -31,25 +31,22 @@ def _owner_private_context() -> TurnContext:
 
 
 @pytest.mark.parametrize(
-    ("context_changes", "principal_isolated", "tools_confined", "reason"),
+    ("context_changes", "principal_isolated", "reason"),
     (
-        ({"is_owner": False}, True, True, "is_canonical_owner"),
-        ({"is_private": False}, True, True, "is_trusted_private_chat"),
-        ({}, False, True, "principal_isolated_session"),
-        ({}, True, False, "tools_confined"),
+        ({"is_owner": False}, True, "is_canonical_owner"),
+        ({"is_private": False}, True, "is_trusted_private_chat"),
+        ({}, False, "principal_isolated_session"),
     ),
 )
 def test_memory_gate_denies_each_single_false_conjunct(
     context_changes: dict[str, bool],
     principal_isolated: bool,
-    tools_confined: bool,
     reason: str,
 ) -> None:
     turn_ctx = replace(_owner_private_context(), **context_changes)
 
     decision = evaluate_memory_gate(
         turn_ctx,
-        tools_confined=tools_confined,
         principal_isolated=principal_isolated,
     )
 
@@ -57,10 +54,9 @@ def test_memory_gate_denies_each_single_false_conjunct(
     assert decision.reasons == (reason,)
 
 
-def test_memory_gate_allows_only_when_all_four_conjuncts_are_true() -> None:
+def test_memory_gate_allows_only_when_all_three_conjuncts_are_true() -> None:
     decision = evaluate_memory_gate(
         _owner_private_context(),
-        tools_confined=True,
         principal_isolated=True,
     )
 
@@ -71,7 +67,6 @@ def test_memory_gate_allows_only_when_all_four_conjuncts_are_true() -> None:
 def test_memory_gate_treats_missing_inputs_as_false() -> None:
     decision = evaluate_memory_gate(
         None,
-        tools_confined=None,
         principal_isolated=None,
     )
 
@@ -80,11 +75,10 @@ def test_memory_gate_treats_missing_inputs_as_false() -> None:
         "is_canonical_owner",
         "is_trusted_private_chat",
         "principal_isolated_session",
-        "tools_confined",
     )
 
 
-async def test_gateway_config_default_keeps_prepared_turn_gate_closed(
+async def test_owner_private_isolated_turn_opens_gate_without_visible_recall(
     tmp_path: Path,
 ) -> None:
     config = GatewayConfig()
@@ -93,13 +87,13 @@ async def test_gateway_config_default_keeps_prepared_turn_gate_closed(
     snapshot = await prepare_turn(
         backend,
         turn_ctx=_owner_private_context(),
-        tools_confined=config.tools_confined,
         principal_isolated=True,
+        visible_recall=config.visible_recall,
     )
 
-    assert config.tools_confined is False
-    assert snapshot.gate_decision.allowed is False
-    assert snapshot.gate_decision.reasons == ("tools_confined",)
+    assert config.visible_recall is False
+    assert snapshot.gate_decision.allowed is True
+    assert snapshot.gate_decision.reasons == ()
 
 
 def test_principal_isolated_session_requires_exact_known_owner() -> None:
@@ -134,9 +128,8 @@ async def test_prepare_turn_gate_metadata_does_not_change_memory_injection(
     snapshot = await prepare_turn(
         backend,
         turn_ctx=_owner_private_context(),
-        tools_confined=False,
         principal_isolated=True,
     )
 
-    assert snapshot.gate_decision.allowed is False
+    assert snapshot.gate_decision.allowed is True
     assert compose_runtime_prompt(memory_free, snapshot) == legacy

@@ -6,6 +6,7 @@ from pydantic import BaseModel
 
 from openharness.mcp.client import McpClientManager
 from openharness.tools.base import BaseTool, ToolExecutionContext, ToolResult
+from openharness.untrusted import UNTRUSTED_BANNER
 
 
 class ListMcpResourcesToolInput(BaseModel):
@@ -31,6 +32,9 @@ class ListMcpResourcesTool(BaseTool):
         resources = self._manager.list_resources()
         if not resources:
             return ToolResult(output="(no MCP resources)")
+        output = "\n".join(
+            f"{item.server_name}:{item.uri} {item.description}".strip() for item in resources
+        )
         return ToolResult(
-            output="\n".join(f"{item.server_name}:{item.uri} {item.description}".strip() for item in resources)
+            output=f"{UNTRUSTED_BANNER}\n\n{output}"
         )

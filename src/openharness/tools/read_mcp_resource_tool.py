@@ -6,6 +6,7 @@ from pydantic import BaseModel, Field
 
 from openharness.mcp.client import McpClientManager, McpServerNotConnectedError
 from openharness.tools.base import BaseTool, ToolExecutionContext, ToolResult
+from openharness.untrusted import UNTRUSTED_BANNER
 
 
 class ReadMcpResourceToolInput(BaseModel):
@@ -35,4 +36,4 @@ class ReadMcpResourceTool(BaseTool):
             output = await self._manager.read_resource(arguments.server, arguments.uri)
         except McpServerNotConnectedError as exc:
             return ToolResult(output=str(exc), is_error=True)
-        return ToolResult(output=output)
+        return ToolResult(output=f"{UNTRUSTED_BANNER}\n\n{output}")

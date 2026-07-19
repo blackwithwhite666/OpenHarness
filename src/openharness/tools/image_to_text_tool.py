@@ -17,6 +17,7 @@ from pydantic import BaseModel, Field
 
 from openharness.api.openai_client import OpenAICompatibleClient
 from openharness.tools.base import BaseTool, ToolExecutionContext, ToolResult
+from openharness.untrusted import UNTRUSTED_BANNER
 
 log = logging.getLogger(__name__)
 
@@ -125,6 +126,7 @@ class ImageToTextTool(BaseTool):
 
         return ToolResult(
             output=(
+                f"{UNTRUSTED_BANNER}\n\n"
                 f"[Image description via {model}]\n\n{description}"
             )
         )

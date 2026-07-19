@@ -1,4 +1,4 @@
-"""Tests for opt-in, gate-confined Honcho derived recall."""
+"""Tests for opt-in, confidentiality-gated Honcho derived recall."""
 
 from __future__ import annotations
 
@@ -7,6 +7,8 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 import pytest
+
+from openharness.untrusted import UNTRUSTED_BANNER
 
 from ohmo.gateway.models import GatewayConfig
 from ohmo.gateway.turn_context import TurnContext
@@ -76,19 +78,10 @@ def _backend(
     return base, shadow
 
 
-@pytest.mark.parametrize(
-    ("visible_recall", "tools_confined"),
-    ((False, True), (True, False)),
-)
 async def test_visible_recall_is_dormant_unless_opted_in_and_gate_allowed(
-    visible_recall: bool,
-    tools_confined: bool,
     tmp_path: Path,
 ) -> None:
-    config = GatewayConfig(
-        visible_recall=visible_recall,
-        tools_confined=tools_confined,
-    )
+    config = GatewayConfig()
     fake = FakeHoncho([FakeConclusion("Honcho-only secret preference.")])
     base, shadow = _backend(tmp_path, fake)
     catalog_only = await base.render_prompt()
@@ -96,7 +89,6 @@ async def test_visible_recall_is_dormant_unless_opted_in_and_gate_allowed(
     snapshot = await prepare_turn(
         shadow,
         turn_ctx=_owner_private_context(),
-        tools_confined=config.tools_confined,
         principal_isolated=True,
         visible_recall=config.visible_recall,
         latest_user_prompt="What do I prefer?",
@@ -127,18 +119,48 @@ async def test_visible_recall_surfaces_labelled_derived_hits_under_composite_bud
         shadow,
         budget=budget,
         turn_ctx=_owner_private_context(),
-        tools_confined=True,
         principal_isolated=True,
         visible_recall=True,
         latest_user_prompt="How should you update me?",
     )
 
     assert snapshot.gate_decision.allowed is True
-    assert "## Recalled (honcho, derived — may be imperfect)" in snapshot
-    assert "catalog memory above is curated" in snapshot
-    assert "- User likes concise status updates." in snapshot
+    heading = "## Recalled (honcho, derived — may be imperfect)"
+    provenance = "catalog memory above is curated"
+    first_hit = "- User likes concise status updates."
+    assert heading in snapshot
+    assert provenance in snapshot
+    assert UNTRUSTED_BANNER in snapshot
+    assert first_hit in snapshot
+    assert snapshot.index(heading) < snapshot.index(provenance)
+    assert snapshot.index(provenance) < snapshot.index(UNTRUSTED_BANNER)
+    assert snapshot.index(UNTRUSTED_BANNER) < snapshot.index(first_hit)
     assert len(snapshot) <= budget
     assert fake.queries == [("How should you update me?", "ohmo", "owner", 10)]
+
+
+async def test_derived_recall_banner_counts_toward_budget(tmp_path: Path) -> None:
+    fake = FakeHoncho([FakeConclusion("x")])
+    _, shadow = _backend(tmp_path, fake)
+
+    block = await shadow.derived_recall_block("Recall x.", budget=1_000, timeout=1.0)
+
+    assert block is not None
+    assert block.splitlines() == [
+        "## Recalled (honcho, derived — may be imperfect)",
+        "_The catalog memory above is curated; these additive hits are derived from conversations._",
+        UNTRUSTED_BANNER,
+        "- x",
+    ]
+    assert await shadow.derived_recall_block(
+        "Recall x.", budget=len(block), timeout=1.0
+    ) == block
+    assert (
+        await shadow.derived_recall_block(
+            "Recall x.", budget=len(block) - 1, timeout=1.0
+        )
+        is None
+    )
 
 
 @pytest.mark.parametrize("failure", ["timeout", "error"])
@@ -153,7 +175,6 @@ async def test_visible_recall_failure_falls_open_to_catalog_only(
     snapshot = await prepare_turn(
         shadow,
         turn_ctx=_owner_private_context(),
-        tools_confined=True,
         principal_isolated=True,
         visible_recall=True,
         latest_user_prompt="Recall something useful.",
@@ -166,18 +187,16 @@ async def test_visible_recall_failure_falls_open_to_catalog_only(
 
 
 @pytest.mark.parametrize(
-    ("context_changes", "principal_isolated", "tools_confined"),
+    ("context_changes", "principal_isolated"),
     (
-        ({"is_owner": False}, True, True),
-        ({"is_private": False}, True, True),
-        ({}, False, True),
-        ({}, True, False),
+        ({"is_owner": False}, True),
+        ({"is_private": False}, True),
+        ({}, False),
     ),
 )
 async def test_visible_recall_gate_denies_each_single_false_conjunct(
     context_changes: dict[str, bool],
     principal_isolated: bool,
-    tools_confined: bool,
     tmp_path: Path,
 ) -> None:
     fake = FakeHoncho([FakeConclusion("This must stay out of the prompt.")])
@@ -187,7 +206,6 @@ async def test_visible_recall_gate_denies_each_single_false_conjunct(
     snapshot = await prepare_turn(
         shadow,
         turn_ctx=replace(_owner_private_context(), **context_changes),
-        tools_confined=tools_confined,
         principal_isolated=principal_isolated,
         visible_recall=True,
         latest_user_prompt="What do you recall?",

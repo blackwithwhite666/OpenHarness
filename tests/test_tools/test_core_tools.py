@@ -28,6 +28,7 @@ from openharness.tools.skill_tool import SkillTool, SkillToolInput
 from openharness.tools.todo_write_tool import TodoWriteTool, TodoWriteToolInput
 from openharness.tools.tool_search_tool import ToolSearchTool, ToolSearchToolInput
 from openharness.tools import create_default_tool_registry
+from openharness.untrusted import UNTRUSTED_BANNER
 
 
 @pytest.mark.asyncio
@@ -400,6 +401,51 @@ async def test_cron_and_remote_trigger_tools(tmp_path: Path, monkeypatch):
         context,
     )
     assert delete_result.is_error is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("returncode", "expect_banner"), [(0, True), (1, False)])
+async def test_remote_trigger_fences_only_success_output(
+    tmp_path: Path,
+    monkeypatch,
+    returncode: int,
+    expect_banner: bool,
+):
+    class FakeProcess:
+        async def communicate(self):
+            return b"remote stdout", b"remote stderr"
+
+    process = FakeProcess()
+    process.returncode = returncode
+
+    async def fake_create_shell_subprocess(*_args, **_kwargs):
+        return process
+
+    monkeypatch.setitem(
+        RemoteTriggerTool.execute.__globals__,
+        "get_cron_job",
+        lambda _name: {"cwd": str(tmp_path), "command": "ignored"},
+    )
+    monkeypatch.setitem(
+        RemoteTriggerTool.execute.__globals__,
+        "_command_for_job",
+        lambda _job: "ignored",
+    )
+    monkeypatch.setitem(
+        RemoteTriggerTool.execute.__globals__,
+        "create_shell_subprocess",
+        fake_create_shell_subprocess,
+    )
+
+    result = await RemoteTriggerTool().execute(
+        RemoteTriggerToolInput(name="nightly"),
+        ToolExecutionContext(cwd=tmp_path),
+    )
+
+    assert result.is_error is (returncode != 0)
+    assert (UNTRUSTED_BANNER in result.output) is expect_banner
+    assert "remote stdout" in result.output
+    assert "remote stderr" in result.output
 
 
 @pytest.mark.asyncio

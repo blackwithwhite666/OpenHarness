@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field, create_model
 from openharness.mcp.client import McpClientManager, McpServerNotConnectedError
 from openharness.mcp.types import McpToolInfo
 from openharness.tools.base import BaseTool, ToolExecutionContext, ToolResult
+from openharness.untrusted import UNTRUSTED_BANNER
 
 
 class McpToolAdapter(BaseTool):
@@ -33,7 +34,9 @@ class McpToolAdapter(BaseTool):
             )
         except McpServerNotConnectedError as exc:
             return ToolResult(output=str(exc), is_error=True)
-        return ToolResult(output=output)
+        if not isinstance(output, str) or not output.strip():
+            return ToolResult(output=output)
+        return ToolResult(output=f"{UNTRUSTED_BANNER}\n\n{output}")
 
 
 _JSON_TYPE_MAP: dict[str, type] = {

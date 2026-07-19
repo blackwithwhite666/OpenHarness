@@ -9,7 +9,6 @@ from ohmo.gateway.turn_context import TurnContext
 _OWNER_CONJUNCT = "is_canonical_owner"
 _PRIVATE_CONJUNCT = "is_trusted_private_chat"
 _ISOLATED_CONJUNCT = "principal_isolated_session"
-_CONFINED_CONJUNCT = "tools_confined"
 
 
 @dataclass(frozen=True)
@@ -23,7 +22,6 @@ class GateDecision:
 def evaluate_memory_gate(
     turn_ctx: TurnContext | None,
     *,
-    tools_confined: bool | None,
     principal_isolated: bool | None,
 ) -> GateDecision:
     """Allow recall only when every positively attested conjunct is true.
@@ -35,7 +33,6 @@ def evaluate_memory_gate(
         (_OWNER_CONJUNCT, getattr(turn_ctx, "is_owner", False) is True),
         (_PRIVATE_CONJUNCT, getattr(turn_ctx, "is_private", False) is True),
         (_ISOLATED_CONJUNCT, principal_isolated is True),
-        (_CONFINED_CONJUNCT, tools_confined is True),
     )
     reasons = tuple(name for name, passed in conjuncts if not passed)
     return GateDecision(allowed=not reasons, reasons=reasons)

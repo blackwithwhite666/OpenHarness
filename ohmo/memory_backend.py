@@ -11,6 +11,8 @@ from pathlib import Path
 from time import perf_counter
 from typing import TYPE_CHECKING, Protocol, cast
 
+from openharness.untrusted import UNTRUSTED_BANNER
+
 from ohmo.memory import (
     DEFAULT_MEMORY_INJECT_CHARS,
     _MEMORY_ENTRY_RENDER_CHARS,
@@ -407,7 +409,11 @@ class ShadowMemoryBackend(MemoryBackend):
             logger.warning("ohmo visible Honcho recall failed", exc_info=True)
             return None
 
-        prefix = f"{_DERIVED_RECALL_HEADING}\n{_DERIVED_RECALL_PROVENANCE}"
+        prefix = (
+            f"{_DERIVED_RECALL_HEADING}\n"
+            f"{_DERIVED_RECALL_PROVENANCE}\n"
+            f"{UNTRUSTED_BANNER}"
+        )
         if len(prefix) >= budget:
             return None
 

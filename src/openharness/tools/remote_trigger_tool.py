@@ -11,6 +11,7 @@ from openharness.services.cron import get_cron_job
 from openharness.services.cron_scheduler import _command_for_job
 from openharness.sandbox import SandboxUnavailableError
 from openharness.tools.base import BaseTool, ToolExecutionContext, ToolResult
+from openharness.untrusted import UNTRUSTED_BANNER
 from openharness.utils.shell import create_shell_subprocess
 
 
@@ -67,8 +68,12 @@ class RemoteTriggerTool(BaseTool):
         if stderr:
             parts.append(stderr.decode("utf-8", errors="replace").rstrip())
         body = "\n".join(part for part in parts if part).strip() or "(no output)"
+        is_error = process.returncode != 0
+        output = f"Triggered {arguments.name}\n{body}"
+        if not is_error:
+            output = f"{UNTRUSTED_BANNER}\n\n{output}"
         return ToolResult(
-            output=f"Triggered {arguments.name}\n{body}",
-            is_error=process.returncode != 0,
+            output=output,
+            is_error=is_error,
             metadata={"returncode": process.returncode},
         )

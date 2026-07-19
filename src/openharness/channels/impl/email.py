@@ -20,6 +20,7 @@ from openharness.channels.bus.events import OutboundMessage
 from openharness.channels.bus.queue import MessageBus
 from openharness.channels.impl.base import BaseChannel
 from openharness.config.schema import EmailConfig
+from openharness.untrusted import UNTRUSTED_BANNER
 
 logger = logging.getLogger(__name__)
 
@@ -282,6 +283,7 @@ class EmailChannel(BaseChannel):
 
                 body = body[: self.config.max_body_chars]
                 content = (
+                    f"{UNTRUSTED_BANNER}\n"
                     f"Email received.\n"
                     f"From: {sender}\n"
                     f"Subject: {subject}\n"

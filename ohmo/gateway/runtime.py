@@ -1158,7 +1158,6 @@ class OhmoSessionRuntimePool:
         snapshot = await prepare_turn(
             self._prompt_memory_backend,
             turn_ctx=turn_ctx,
-            tools_confined=self._gateway_config.tools_confined,
             principal_isolated=principal_isolated_session(
                 turn_ctx,
                 session_owner_principal,

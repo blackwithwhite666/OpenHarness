@@ -49,7 +49,6 @@ async def prepare_turn(
     *,
     budget: int | None = None,
     turn_ctx: TurnContext | None = None,
-    tools_confined: bool | None = None,
     principal_isolated: bool | None = None,
     visible_recall: bool = False,
     latest_user_prompt: str | None = None,
@@ -64,7 +63,6 @@ async def prepare_turn(
     """
     gate_decision = evaluate_memory_gate(
         turn_ctx,
-        tools_confined=tools_confined,
         principal_isolated=principal_isolated,
     )
     memory_block = await backend.render_prompt(budget)

@@ -11,6 +11,7 @@ import httpx
 from pydantic import BaseModel, Field
 
 from openharness.tools.base import BaseTool, ToolExecutionContext, ToolResult
+from openharness.untrusted import UNTRUSTED_BANNER
 from openharness.utils.network_guard import NetworkGuardError, fetch_public_http_response
 
 
@@ -65,7 +66,8 @@ class WebSearchTool(BaseTool):
             lines.append(f"   URL: {result['url']}")
             if result["snippet"]:
                 lines.append(f"   {result['snippet']}")
-        return ToolResult(output="\n".join(lines))
+        output = "\n".join(lines)
+        return ToolResult(output=f"{UNTRUSTED_BANNER}\n\n{output}")
 
 
 def _parse_search_results(body: str, *, limit: int) -> list[dict[str, str]]:

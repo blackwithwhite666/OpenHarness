@@ -12,6 +12,7 @@ from openharness.plugins.types import LoadedPlugin
 from openharness.plugins.schemas import PluginManifest
 from openharness.tools import create_default_tool_registry
 from openharness.tools.base import ToolExecutionContext
+from openharness.untrusted import UNTRUSTED_BANNER
 
 
 @dataclass
@@ -71,7 +72,7 @@ async def test_mcp_tools_are_registered():
     assert tool is not None
     parsed = tool.input_model.model_validate({"name": "world"})
     result = await tool.execute(parsed, ToolExecutionContext(cwd=Path(".")))
-    assert result.output == "demo:hello:world"
+    assert result.output == f"{UNTRUSTED_BANNER}\n\ndemo:hello:world"
 
     list_tool = registry.get("list_mcp_resources")
     assert list_tool is not None

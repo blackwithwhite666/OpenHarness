@@ -15,6 +15,7 @@ from openharness.plugins import load_plugins
 from openharness.plugins.installer import install_plugin_from_path, uninstall_plugin
 from openharness.tools import create_default_tool_registry
 from openharness.tools.base import ToolExecutionContext
+from openharness.untrusted import UNTRUSTED_BANNER
 
 
 def _write_plugin(source_root: Path, server_script: Path) -> Path:
@@ -86,7 +87,7 @@ async def test_plugin_install_load_and_uninstall_flow(tmp_path: Path, monkeypatc
             mcp_tool.input_model.model_validate({"name": "plugin"}),
             ToolExecutionContext(cwd=project),
         )
-        assert mcp_result.output == "fixture-hello:plugin"
+        assert mcp_result.output == f"{UNTRUSTED_BANNER}\n\nfixture-hello:plugin"
     finally:
         await manager.close()
 

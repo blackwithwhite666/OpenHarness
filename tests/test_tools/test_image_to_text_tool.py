@@ -10,6 +10,7 @@ from openharness.api.provider import is_model_multimodal
 from openharness.config.settings import VisionModelConfig
 from openharness.tools.base import ToolExecutionContext
 from openharness.tools.image_to_text_tool import ImageToTextTool, ImageToTextToolInput
+from openharness.untrusted import UNTRUSTED_BANNER
 
 
 # ---------------------------------------------------------------------------
@@ -127,6 +128,39 @@ class TestImageToTextToolInput:
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
+async def test_execute_success_is_fenced(tmp_path: Path, monkeypatch) -> None:
+    """Tool fences a vision model's description while preserving its label."""
+
+    async def fake_call_vision_model(**_: object) -> str:
+        return "Text supplied by the image."
+
+    monkeypatch.setattr(
+        ImageToTextTool,
+        "_call_vision_model",
+        staticmethod(fake_call_vision_model),
+    )
+    result = await ImageToTextTool().execute(
+        ImageToTextToolInput(image_data="iVBORw0KGgo="),
+        ToolExecutionContext(
+            cwd=tmp_path,
+            metadata={
+                "vision_model_config": {
+                    "model": "test-vision-model",
+                    "api_key": "test-key",
+                }
+            },
+        ),
+    )
+
+    assert result.is_error is False
+    assert result.output == (
+        f"{UNTRUSTED_BANNER}\n\n"
+        "[Image description via test-vision-model]\n\n"
+        "Text supplied by the image."
+    )
+
+
+@pytest.mark.asyncio
 async def test_execute_no_input(tmp_path: Path) -> None:
     """Tool returns error when neither image_data nor image_path is provided."""
     tool = ImageToTextTool()
@@ -165,6 +199,7 @@ async def test_execute_no_vision_config(tmp_path: Path) -> None:
         context,
     )
     assert result.is_error
+    assert UNTRUSTED_BANNER not in result.output
     assert "vision model is not configured" in result.output
 
 
