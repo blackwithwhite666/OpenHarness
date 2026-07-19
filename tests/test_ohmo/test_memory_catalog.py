@@ -212,7 +212,7 @@ def test_schema_migration_and_env_limits(monkeypatch, tmp_path: Path):
     assert catalog.add("owner", "Too long", "1234").ok is False
     assert catalog.add("owner", "Overflow", "xy").ok is False
     with sqlite3.connect(db_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
         assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
         assert connection.execute(
             "SELECT name FROM sqlite_master WHERE name = 'memory_embeddings'"
@@ -274,13 +274,19 @@ def test_v3_catalog_migration_preserves_rows_fts_and_embeddings(tmp_path: Path):
     reopened = MemoryCatalog(db_path=db_path)
     assert reopened.list("owner", include_archived=True) == [migrated]
     with sqlite3.connect(db_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
         assert connection.execute(
             "SELECT tenant_id, kind FROM tenants ORDER BY tenant_id"
         ).fetchall() == [("owner", "private")]
         assert connection.execute("SELECT COUNT(*) FROM memories").fetchone()[0] == 1
         assert connection.execute("SELECT COUNT(*) FROM memories_fts").fetchone()[0] == 1
         assert connection.execute("SELECT COUNT(*) FROM memory_embeddings").fetchone()[0] == 1
+        assert connection.execute(
+            "SELECT provenance_kind FROM memories WHERE tenant_id = 'owner'"
+        ).fetchone() == ("legacy_curated",)
+        assert connection.execute(
+            "SELECT name FROM sqlite_master WHERE name = 'share_ledger'"
+        ).fetchone() == ("share_ledger",)
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
 
 

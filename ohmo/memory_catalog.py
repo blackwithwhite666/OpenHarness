@@ -23,12 +23,21 @@ from ohmo.memory_store import (
 from ohmo.threat_patterns import first_threat_message
 from ohmo.workspace import get_memory_dir
 
-_SCHEMA_VERSION = 4
+_SCHEMA_VERSION = 5
 _MAX_TITLE_CHARS = 256
 _BUSY_TIMEOUT_MS = 5_000
 _RESERVED_NAMES = {"memory.md"}
 _SOURCES = {"curated", "derived"}
 _ARCHIVE_STATUSES = {"active", "archived"}
+_PROVENANCE_KINDS = {
+    "legacy_curated",
+    "legacy_owner_migration",
+    "direct_statement",
+    "reported_about_other",
+    "confirmed_derived",
+    "explicit_shared",
+    "maintenance_import",
+}
 
 
 @dataclass(frozen=True)
@@ -45,6 +54,13 @@ class CatalogRecord:
     generation: int
     source: str
     archive_status: str
+    provenance_kind: str
+    source_principal: str | None
+    subject_tenant_id: str | None
+    source_ref: str | None
+    shared_from_tenant_id: str | None
+    shared_by_principal: str | None
+    shared_at: str | None
     honcho_conclusion_ids: str
     outbox_state: str | None
     created_at: str
@@ -140,6 +156,9 @@ class MemoryCatalog:
             if version < 4:
                 self._migrate_to_v4(connection)
                 version = 4
+            if version < 5:
+                self._migrate_to_v5(connection)
+                version = 5
             connection.execute(f"PRAGMA user_version = {version}")
 
     @staticmethod
@@ -364,6 +383,34 @@ class MemoryCatalog:
             "ALTER TABLE outbox ADD COLUMN tenant_id TEXT NOT NULL DEFAULT 'owner'"
         )
 
+    @staticmethod
+    def _migrate_to_v5(connection: sqlite3.Connection) -> None:
+        """Add provenance metadata and the idempotent sharing ledger."""
+        for statement in (
+            "ALTER TABLE memories ADD COLUMN provenance_kind "
+            "TEXT NOT NULL DEFAULT 'legacy_curated'",
+            "ALTER TABLE memories ADD COLUMN source_principal TEXT",
+            "ALTER TABLE memories ADD COLUMN subject_tenant_id TEXT",
+            "ALTER TABLE memories ADD COLUMN source_ref TEXT",
+            "ALTER TABLE memories ADD COLUMN shared_from_tenant_id TEXT",
+            "ALTER TABLE memories ADD COLUMN shared_by_principal TEXT",
+            "ALTER TABLE memories ADD COLUMN shared_at TEXT",
+        ):
+            connection.execute(statement)
+        connection.execute(
+            """
+            CREATE TABLE share_ledger (
+                op_id TEXT PRIMARY KEY,
+                source_tenant_id TEXT NOT NULL REFERENCES tenants(tenant_id),
+                source_slug TEXT,
+                source_digest TEXT NOT NULL,
+                actor_principal TEXT NOT NULL,
+                target_slug TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+
     def ensure_tenant(self, tenant_id: str, kind: str) -> None:
         """Create a tenant, rejecting empty ids and incompatible redefinitions."""
         clean_tenant_id = _tenant_reference(tenant_id)
@@ -513,6 +560,13 @@ class MemoryCatalog:
         archive_status: str = "active",
         created_at: str | None = None,
         updated_at: str | None = None,
+        provenance_kind: str = "legacy_curated",
+        source_principal: str | None = None,
+        subject_tenant_id: str | None = None,
+        source_ref: str | None = None,
+        shared_from_tenant_id: str | None = None,
+        shared_by_principal: str | None = None,
+        shared_at: str | None = None,
     ) -> MemoryOpResult:
         """Import trusted legacy content without enqueueing or model-write limits."""
         clean_tenant_id = _tenant_reference(tenant_id)
@@ -527,6 +581,23 @@ class MemoryCatalog:
                 return MemoryOpResult(
                     False,
                     f"Invalid memory archive status {archive_status!r}.",
+                )
+            if provenance_kind not in _PROVENANCE_KINDS:
+                return MemoryOpResult(
+                    False,
+                    f"Invalid memory provenance kind {provenance_kind!r}.",
+                )
+            sharing_values = (
+                shared_from_tenant_id,
+                shared_by_principal,
+                shared_at,
+            )
+            if provenance_kind == "explicit_shared" and any(
+                value is None or not value.strip() for value in sharing_values
+            ):
+                return MemoryOpResult(
+                    False,
+                    "Explicitly shared memory requires sharing provenance.",
                 )
 
             existing = connection.execute(
@@ -552,8 +623,10 @@ class MemoryCatalog:
                 """
                 INSERT INTO memories (
                     tenant_id, slug, title, content, size, source, archive_status,
+                    provenance_kind, source_principal, subject_tenant_id, source_ref,
+                    shared_from_tenant_id, shared_by_principal, shared_at,
                     created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     clean_tenant_id,
@@ -563,11 +636,66 @@ class MemoryCatalog:
                     len(content),
                     source,
                     archive_status,
+                    provenance_kind,
+                    source_principal,
+                    subject_tenant_id,
+                    source_ref,
+                    shared_from_tenant_id,
+                    shared_by_principal,
+                    shared_at,
                     effective_created_at,
                     effective_updated_at,
                 ),
             )
             return MemoryOpResult(True, f"Imported memory {clean_slug}.md.")
+
+    def record_share(
+        self,
+        *,
+        op_id: str,
+        source_tenant_id: str,
+        source_slug: str,
+        source_digest: str,
+        actor_principal: str,
+        target_slug: str,
+        created_at: str | None = None,
+    ) -> bool:
+        """Record one completed share operation, returning false for a duplicate op id."""
+        clean_op_id = (op_id or "").strip()
+        clean_source_tenant_id = _tenant_reference(source_tenant_id)
+        clean_source_slug = _slug_reference(source_slug)
+        clean_source_digest = (source_digest or "").strip()
+        clean_actor_principal = (actor_principal or "").strip()
+        clean_target_slug = _slug_reference(target_slug)
+        if not all(
+            (
+                clean_op_id,
+                clean_source_slug,
+                clean_source_digest,
+                clean_actor_principal,
+                clean_target_slug,
+            )
+        ):
+            raise ValueError("share ledger values must not be empty")
+        with self._write_connection() as connection:
+            cursor = connection.execute(
+                """
+                INSERT OR IGNORE INTO share_ledger (
+                    op_id, source_tenant_id, source_slug, source_digest,
+                    actor_principal, target_slug, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    clean_op_id,
+                    clean_source_tenant_id,
+                    clean_source_slug,
+                    clean_source_digest,
+                    clean_actor_principal,
+                    clean_target_slug,
+                    created_at or _utc_timestamp(),
+                ),
+            )
+        return cursor.rowcount == 1
 
     def update(
         self,
@@ -965,6 +1093,13 @@ def _record_from_row(row: sqlite3.Row) -> CatalogRecord:
         generation=cast(int, row["generation"]),
         source=cast(str, row["source"]),
         archive_status=cast(str, row["archive_status"]),
+        provenance_kind=cast(str, row["provenance_kind"]),
+        source_principal=cast(str | None, row["source_principal"]),
+        subject_tenant_id=cast(str | None, row["subject_tenant_id"]),
+        source_ref=cast(str | None, row["source_ref"]),
+        shared_from_tenant_id=cast(str | None, row["shared_from_tenant_id"]),
+        shared_by_principal=cast(str | None, row["shared_by_principal"]),
+        shared_at=cast(str | None, row["shared_at"]),
         honcho_conclusion_ids=cast(str, row["honcho_conclusion_ids"]),
         outbox_state=cast(str | None, row["outbox_state"]),
         created_at=cast(str, row["created_at"]),
