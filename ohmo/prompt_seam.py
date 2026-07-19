@@ -58,6 +58,8 @@ async def prepare_turn(
     latest_user_prompt: str | None = None,
     derived_recall_timeout: float = _DERIVED_RECALL_TIMEOUT_SECONDS,
     owner_principals: tuple[str, ...] = (),
+    memory_engaged_override: bool | None = None,
+    derived_backend: ShadowMemoryBackend | None = None,
 ) -> TurnSnapshot:
     """Read a fresh backend-rendered memory snapshot for one submitted turn.
 
@@ -71,18 +73,25 @@ async def prepare_turn(
         turn_ctx,
         principal_isolated=principal_isolated,
     )
-    engaged = memory_engaged(owner_principals, gate_decision)
+    engaged = (
+        memory_engaged(owner_principals, gate_decision)
+        if memory_engaged_override is None
+        else memory_engaged_override
+    )
     memory_block = await backend.render_prompt(budget) if engaged else ""
+    recall_backend = derived_backend
+    if recall_backend is None and isinstance(backend, ShadowMemoryBackend):
+        recall_backend = backend
     if (
         visible_recall is True
         and gate_decision.allowed
-        and isinstance(backend, ShadowMemoryBackend)
+        and recall_backend is not None
         and isinstance(latest_user_prompt, str)
     ):
         separator = "\n\n" if memory_block.strip() else ""
         composite_budget = budget if budget is not None else _inject_char_budget()
         derived_budget = composite_budget - len(memory_block) - len(separator)
-        derived_block = await backend.derived_recall_block(
+        derived_block = await recall_backend.derived_recall_block(
             latest_user_prompt,
             budget=derived_budget,
             timeout=derived_recall_timeout,

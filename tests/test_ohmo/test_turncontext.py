@@ -109,6 +109,8 @@ async def test_runtime_prompt_threads_turn_context_into_prepare_turn(
         latest_user_prompt=None,
         derived_recall_timeout=0.5,
         owner_principals=(),
+        memory_engaged_override=None,
+        derived_backend=None,
     ):
         captured["backend"] = backend
         captured["budget"] = budget
@@ -117,6 +119,8 @@ async def test_runtime_prompt_threads_turn_context_into_prepare_turn(
         captured["visible_recall"] = visible_recall
         captured["latest_user_prompt"] = latest_user_prompt
         captured["owner_principals"] = owner_principals
+        captured["memory_engaged_override"] = memory_engaged_override
+        captured["derived_backend"] = derived_backend
         return ""
 
     monkeypatch.setattr("ohmo.gateway.runtime.prepare_turn", fake_prepare_turn)
@@ -132,3 +136,5 @@ async def test_runtime_prompt_threads_turn_context_into_prepare_turn(
     assert captured["visible_recall"] is False
     assert captured["latest_user_prompt"] == "hello"
     assert captured["owner_principals"] == ()
+    assert captured["memory_engaged_override"] is True
+    assert captured["derived_backend"] is None

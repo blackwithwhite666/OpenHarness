@@ -40,9 +40,10 @@ from ohmo.gateway.config import load_gateway_config
 from ohmo.gateway.group_tool import CreateFeishuGroup, OhmoCreateFeishuGroupTool, PublishGroupWelcome
 from ohmo.gateway.memory_gate import (
     GateDecision,
+    MemoryScope,
     evaluate_memory_gate,
-    memory_engaged,
     principal_isolated_session,
+    resolve_memory_scope,
 )
 from ohmo.gateway.provider_commands import handle_gateway_model_command, handle_gateway_provider_command
 from ohmo.gateway.router import session_key_for_message
@@ -50,8 +51,14 @@ from ohmo.gateway.send_message_tool import SendTelegramMessageTool
 from ohmo.gateway.turn_context import TurnContext, build_turn_context
 from ohmo.group_registry import load_managed_group_record, normalize_cwd
 from ohmo.contact_registry import ContactStore
-from ohmo.memory import create_memory_command_backend
-from ohmo.memory_backend import make_memory_backend
+from ohmo.memory import create_memory_command_backend, ensure_catalog_migrated
+from ohmo.memory_backend import (
+    CatalogMemoryBackend,
+    FileMemoryBackend,
+    MemoryBackend,
+    ShadowMemoryBackend,
+    make_memory_backend,
+)
 from ohmo.memory_store import MemoryStore
 from ohmo.memory_judge import judge_enabled, judge_interval, run_memory_judge
 from ohmo.memory_tool import OhmoMemoryTool
@@ -105,6 +112,7 @@ _IMAGE_FALLBACK_NOTE = (
     "Use the attachment paths and summaries above if needed.]"
 )
 _NO_GROUP_REQUEST = object()
+_UNRESOLVED_MEMORY_SCOPE = object()
 _GROUP_TOOL_NAME = "ohmo_create_feishu_group"
 _GROUP_AGENT_PROMPT_PREFIX = "The user invoked `/group` from a Feishu private chat."
 _GROUP_AGENT_PROMPT_REQUEST_MARKER = "User /group request:"
@@ -208,6 +216,7 @@ class OhmoSessionRuntimePool:
         self._todo_store = TodoStore(self._workspace)
         self._memory_store = MemoryStore(self._workspace)
         self._prompt_memory_backend = make_memory_backend(self._gateway_config, self._workspace)
+        self._catalog_memory_backends: dict[tuple[str, str | None], CatalogMemoryBackend] = {}
         self._judge_turn_counts: dict[str, int] = {}
         self._judge_tasks: dict[str, asyncio.Task] = {}
         self._reminder_store = ReminderStore(workspace=self._workspace)
@@ -264,6 +273,7 @@ class OhmoSessionRuntimePool:
         cwd: str | Path | None = None,
     ) -> RuntimeBundle:
         """Return an existing bundle or create a new one."""
+        initial_memory_scope = self._resolve_turn_memory_scope(None)
         session_cwd = str(Path(cwd or self._cwd).expanduser().resolve())
         bundle = self._bundles.get(session_key)
         if bundle is not None:
@@ -317,7 +327,7 @@ class OhmoSessionRuntimePool:
             include_project_memory=False,
             autodream_context=(
                 self._autodream_context()
-                if not self._gateway_config.owner_principals
+                if initial_memory_scope is not None
                 else None
             ),
         )
@@ -325,12 +335,20 @@ class OhmoSessionRuntimePool:
             bundle.session_id = str(snapshot["session_id"])
         self._register_gateway_tools(
             bundle,
-            memory_engaged=not self._gateway_config.owner_principals,
+            memory_engaged=initial_memory_scope is not None,
         )
-        self._configure_turn_memory_surfaces(bundle, None)
+        self._configure_turn_memory_surfaces(
+            bundle,
+            None,
+            memory_scope=initial_memory_scope,
+        )
         await start_runtime(bundle)
         bundle.engine.set_system_prompt(
-            await self._runtime_system_prompt(bundle, latest_user_prompt)
+            await self._runtime_system_prompt(
+                bundle,
+                latest_user_prompt,
+                memory_scope=initial_memory_scope,
+            )
         )
         logger.info(
             "ohmo runtime started session_key=%s session_id=%s restored_messages=%s",
@@ -429,7 +447,12 @@ class OhmoSessionRuntimePool:
             owner_principals=self._gateway_config.owner_principals,
         )
         self._bind_session_owner(message, session_key, turn_ctx)
-        self._configure_turn_memory_surfaces(bundle, turn_ctx)
+        memory_scope = self._resolve_turn_memory_scope(turn_ctx)
+        self._configure_turn_memory_surfaces(
+            bundle,
+            turn_ctx,
+            memory_scope=memory_scope,
+        )
         logger.debug(
             "ohmo turn identity principal=%s owner=%s private=%s channel=%s chat_id=%s session_id=%s",
             turn_ctx.principal,
@@ -548,6 +571,7 @@ class OhmoSessionRuntimePool:
                             user_prompt=user_prompt,
                             result=result,
                             turn_ctx=turn_ctx,
+                            memory_scope=memory_scope,
                             recorder=recorder,
                         )
                     ):
@@ -575,6 +599,7 @@ class OhmoSessionRuntimePool:
                             user_prompt=user_prompt,
                             result=result,
                             turn_ctx=turn_ctx,
+                            memory_scope=memory_scope,
                             recorder=recorder,
                         )
                     ):
@@ -592,6 +617,7 @@ class OhmoSessionRuntimePool:
                         user_prompt=user_prompt,
                         result=result,
                         turn_ctx=turn_ctx,
+                        memory_scope=memory_scope,
                         recorder=recorder,
                     )
                 ):
@@ -606,6 +632,7 @@ class OhmoSessionRuntimePool:
                     user_prompt=user_prompt,
                     user_message=user_message,
                     turn_ctx=turn_ctx,
+                    memory_scope=memory_scope,
                     recorder=recorder,
                 )
             ):
@@ -635,6 +662,7 @@ class OhmoSessionRuntimePool:
         user_prompt: str,
         result,
         turn_ctx: TurnContext,
+        memory_scope: MemoryScope | None,
         recorder: GatewayEvalRecorder | None = None,
     ):
         if result.refresh_runtime:
@@ -643,6 +671,7 @@ class OhmoSessionRuntimePool:
                 bundle,
                 user_prompt,
                 turn_ctx=turn_ctx,
+                memory_scope=memory_scope,
             )
 
         if result.message:
@@ -664,6 +693,7 @@ class OhmoSessionRuntimePool:
                     user_prompt=result.submit_prompt,
                     user_message=result.submit_prompt,
                     turn_ctx=turn_ctx,
+                    memory_scope=memory_scope,
                     recorder=recorder,
                 ):
                     yield update
@@ -681,6 +711,7 @@ class OhmoSessionRuntimePool:
                     bundle,
                     _last_user_text(bundle.engine.messages),
                     turn_ctx=turn_ctx,
+                    memory_scope=memory_scope,
                 )
             )
             turns = result.continue_turns if result.continue_turns is not None else bundle.engine.max_turns
@@ -731,10 +762,16 @@ class OhmoSessionRuntimePool:
         user_prompt: str,
         user_message: ConversationMessage | str,
         turn_ctx: TurnContext,
+        memory_scope: MemoryScope | None,
         recorder: GatewayEvalRecorder | None = None,
     ):
         bundle.engine.set_system_prompt(
-            await self._runtime_system_prompt(bundle, user_prompt, turn_ctx=turn_ctx)
+            await self._runtime_system_prompt(
+                bundle,
+                user_prompt,
+                turn_ctx=turn_ctx,
+                memory_scope=memory_scope,
+            )
         )
         reply_parts: list[str] = []
         emitted_media: set[str] = set()
@@ -827,11 +864,13 @@ class OhmoSessionRuntimePool:
             bundle,
             session_key,
             turn_ctx=turn_ctx,
+            memory_scope=memory_scope,
         )
         reply = "".join(reply_parts).strip()
         if reply:
             await self._append_conversation_turn(
                 turn_ctx=turn_ctx,
+                memory_scope=memory_scope,
                 user_text=message.content or user_prompt,
                 assistant_text=reply,
             )
@@ -856,12 +895,21 @@ class OhmoSessionRuntimePool:
         self,
         *,
         turn_ctx: TurnContext,
+        memory_scope: MemoryScope | None | object = _UNRESOLVED_MEMORY_SCOPE,
         user_text: str,
         assistant_text: str,
     ) -> None:
         if self._gateway_config.conversation_learning is not True:
             return
-        if not self._memory_gate_decision(turn_ctx).allowed:
+        scope = self._coerce_memory_scope(turn_ctx, memory_scope)
+        # TODO(family-memory): create per-tenant Honcho workspaces and ingest
+        # non-owner conversations in the next step. The current Honcho/shadow
+        # workspace remains strictly owner-bound.
+        if (
+            scope is None
+            or scope.private_tenant != "owner"
+            or not self._memory_gate_decision(turn_ctx).allowed
+        ):
             return
         await self._prompt_memory_backend.append_turn("user", user_text)
         await self._prompt_memory_backend.append_turn("assistant", assistant_text)
@@ -1103,11 +1151,13 @@ class OhmoSessionRuntimePool:
         latest_user_prompt: str | None,
         *,
         turn_ctx: TurnContext | None = None,
+        memory_scope: MemoryScope | None | object = _UNRESOLVED_MEMORY_SCOPE,
     ) -> RuntimeBundle:
         snapshot = sanitize_conversation_messages(list(bundle.engine.messages))
         prior_session_id = bundle.session_id
         bundle_cwd = str(Path(getattr(bundle, "cwd", self._cwd)).resolve())
-        engaged = self._memory_engaged(turn_ctx)
+        scope = self._coerce_memory_scope(turn_ctx, memory_scope)
+        engaged = scope is not None
         await close_runtime(bundle)
         refreshed = await build_runtime(
             cwd=bundle_cwd,
@@ -1135,13 +1185,18 @@ class OhmoSessionRuntimePool:
         )
         refreshed.session_id = prior_session_id
         self._register_gateway_tools(refreshed, memory_engaged=engaged)
-        self._configure_turn_memory_surfaces(refreshed, turn_ctx)
+        self._configure_turn_memory_surfaces(
+            refreshed,
+            turn_ctx,
+            memory_scope=scope,
+        )
         await start_runtime(refreshed)
         refreshed.engine.set_system_prompt(
             await self._runtime_system_prompt(
                 refreshed,
                 latest_user_prompt,
                 turn_ctx=turn_ctx,
+                memory_scope=scope,
             )
         )
         self._bundles[session_key] = refreshed
@@ -1159,9 +1214,11 @@ class OhmoSessionRuntimePool:
         latest_user_prompt: str | None,
         *,
         turn_ctx: TurnContext | None = None,
+        memory_scope: MemoryScope | None | object = _UNRESOLVED_MEMORY_SCOPE,
     ) -> str:
         bundle_cwd = str(Path(getattr(bundle, "cwd", self._cwd)).resolve())
-        engaged = self._memory_engaged(turn_ctx)
+        scope = self._coerce_memory_scope(turn_ctx, memory_scope)
+        engaged = scope is not None
         memory_free_base = build_ohmo_system_prompt(
             bundle_cwd,
             workspace=self._workspace,
@@ -1174,8 +1231,22 @@ class OhmoSessionRuntimePool:
             if turn_ctx is not None
             else None
         )
+        backend = (
+            self._memory_backend_for_scope(scope)
+            if scope is not None
+            else self._prompt_memory_backend
+        )
+        derived_backend = (
+            self._prompt_memory_backend
+            if (
+                scope is not None
+                and scope.private_tenant == "owner"
+                and isinstance(self._prompt_memory_backend, ShadowMemoryBackend)
+            )
+            else None
+        )
         snapshot = await prepare_turn(
-            self._prompt_memory_backend,
+            backend,
             turn_ctx=turn_ctx,
             principal_isolated=principal_isolated_session(
                 turn_ctx,
@@ -1184,6 +1255,8 @@ class OhmoSessionRuntimePool:
             visible_recall=self._gateway_config.visible_recall,
             latest_user_prompt=latest_user_prompt,
             owner_principals=self._gateway_config.owner_principals,
+            memory_engaged_override=engaged,
+            derived_backend=derived_backend,
         )
         gate_decision = getattr(snapshot, "gate_decision", None)
         if gate_decision is not None:
@@ -1269,11 +1342,95 @@ class OhmoSessionRuntimePool:
             ),
         )
 
-    def _memory_engaged(self, turn_ctx: TurnContext | None) -> bool:
-        return memory_engaged(
-            self._gateway_config.owner_principals,
-            self._memory_gate_decision(turn_ctx),
+    def _resolve_turn_memory_scope(
+        self,
+        turn_ctx: TurnContext | None,
+    ) -> MemoryScope | None:
+        """Resolve one turn's catalog audience, preserving single-user legacy."""
+        if (
+            not self._gateway_config.owner_principals
+            and not self._gateway_config.family_principals
+        ):
+            return MemoryScope(private_tenant="owner", shared_tenants=())
+        if turn_ctx is None:
+            return None
+        session_owner_principal = self._session_owner_principals.get(turn_ctx.session_id)
+        scope = resolve_memory_scope(
+            self._gateway_config,
+            turn_ctx,
+            principal_isolated=principal_isolated_session(
+                turn_ctx,
+                session_owner_principal,
+            ),
         )
+        if (
+            scope is not None
+            and scope.private_tenant == "owner"
+            and turn_ctx.is_owner is not True
+        ):
+            return None
+        return scope
+
+    def _coerce_memory_scope(
+        self,
+        turn_ctx: TurnContext | None,
+        memory_scope: MemoryScope | None | object,
+    ) -> MemoryScope | None:
+        if memory_scope is _UNRESOLVED_MEMORY_SCOPE:
+            return self._resolve_turn_memory_scope(turn_ctx)
+        return memory_scope if isinstance(memory_scope, MemoryScope) else None
+
+    def _catalog_backend_for_scope(self, scope: MemoryScope) -> CatalogMemoryBackend:
+        """Bind the shared catalog/embedder to one private+shared audience."""
+        shared_tenant_id = scope.shared_tenants[0] if scope.shared_tenants else None
+        key = (scope.private_tenant, shared_tenant_id)
+        cache = getattr(self, "_catalog_memory_backends", None)
+        if cache is None:
+            cache = {}
+            self._catalog_memory_backends = cache
+        cached = cache.get(key)
+        if cached is not None:
+            return cached
+
+        source: MemoryBackend = self._prompt_memory_backend
+        if isinstance(source, ShadowMemoryBackend):
+            source = source._base
+        if isinstance(source, CatalogMemoryBackend):
+            catalog = source._catalog
+            embedder = source._embedder
+            model = source._embedding_model
+            embedding_timeout = source._embedding_timeout
+        else:
+            catalog = ensure_catalog_migrated(self._workspace)
+            embedder = None
+            model = "BAAI/bge-m3"
+            embedding_timeout = 2.0
+
+        backend = CatalogMemoryBackend(
+            catalog,
+            self._workspace,
+            tenant_id=scope.private_tenant,
+            shared_tenant_id=shared_tenant_id,
+            embedder=embedder,
+            owns_embedder=False,
+            model=model,
+            embedding_timeout=embedding_timeout,
+        )
+        cache[key] = backend
+        return backend
+
+    def _memory_backend_for_scope(self, scope: MemoryScope) -> MemoryBackend:
+        # Empty identity registries are the pre-authz single-user deployment:
+        # preserve its exact backend and file/catalog behavior.
+        if (
+            not self._gateway_config.owner_principals
+            and not self._gateway_config.family_principals
+        ):
+            return self._prompt_memory_backend
+        return self._catalog_backend_for_scope(scope)
+
+    def _memory_engaged(self, turn_ctx: TurnContext | None) -> bool:
+        return self._resolve_turn_memory_scope(turn_ctx) is not None
 
     def _autodream_context(self) -> dict[str, object]:
         return {
@@ -1287,9 +1444,17 @@ class OhmoSessionRuntimePool:
         self,
         bundle: RuntimeBundle,
         turn_ctx: TurnContext | None,
+        *,
+        memory_scope: MemoryScope | None | object = _UNRESOLVED_MEMORY_SCOPE,
     ) -> bool:
-        engaged = self._memory_engaged(turn_ctx)
-        self._register_memory_tool(bundle, memory_engaged=engaged)
+        scope = self._coerce_memory_scope(turn_ctx, memory_scope)
+        engaged = scope is not None
+        backend = self._memory_backend_for_scope(scope) if scope is not None else None
+        self._register_memory_tool(
+            bundle,
+            memory_engaged=engaged,
+            backend=backend,
+        )
         autodream_context = self._autodream_context() if engaged else None
         bundle.autodream_context = autodream_context
         metadata = getattr(getattr(bundle, "engine", None), "tool_metadata", None)
@@ -1317,6 +1482,7 @@ class OhmoSessionRuntimePool:
         bundle: RuntimeBundle,
         *,
         memory_engaged: bool = True,
+        backend: MemoryBackend | None = None,
     ) -> None:
         """Register the model-callable ``memory`` tool — disciplined curation
         (unicode-safe slugs, dedup, per-entry + store char bounds with
@@ -1330,7 +1496,7 @@ class OhmoSessionRuntimePool:
             if isinstance(tools, dict):
                 tools.pop(OhmoMemoryTool.name, None)
             return
-        registry.register(OhmoMemoryTool(self._prompt_memory_backend))
+        registry.register(OhmoMemoryTool(backend or self._prompt_memory_backend))
 
     def _maybe_schedule_memory_judge(
         self,
@@ -1338,13 +1504,22 @@ class OhmoSessionRuntimePool:
         session_key: str,
         *,
         turn_ctx: TurnContext | None = None,
+        memory_scope: MemoryScope | None | object = _UNRESOLVED_MEMORY_SCOPE,
     ) -> None:
         """Schedule the background memory judge off the hot path, on a per-session
         turn cadence. Opt-in via OHMO_MEMORY_JUDGE; never blocks the reply (the
         snapshot of inputs is taken now, the LLM call runs in a tracked task)."""
-        if not self._memory_engaged(turn_ctx):
+        scope = self._coerce_memory_scope(turn_ctx, memory_scope)
+        if scope is None:
             return
-        if self._gateway_config.memory_backend != "file" or not judge_enabled():
+        if not judge_enabled():
+            return
+        backend = self._memory_backend_for_scope(scope)
+        if (
+            not self._gateway_config.owner_principals
+            and not self._gateway_config.family_principals
+            and not isinstance(backend, FileMemoryBackend)
+        ):
             return
         count = self._judge_turn_counts.get(session_key, 0) + 1
         self._judge_turn_counts[session_key] = count
@@ -1366,7 +1541,14 @@ class OhmoSessionRuntimePool:
             logger.warning("ohmo memory judge schedule failed session_key=%s", session_key, exc_info=True)
             return
         task = asyncio.create_task(
-            self._run_memory_judge_task(session_key, api_client, model, messages, timeout),
+            self._run_memory_judge_task(
+                session_key,
+                api_client,
+                model,
+                messages,
+                timeout,
+                backend=backend,
+            ),
             name=f"ohmo-memory-judge:{session_key}",
         )
         self._judge_tasks[session_key] = task
@@ -1378,15 +1560,26 @@ class OhmoSessionRuntimePool:
 
         task.add_done_callback(_pop)
 
-    async def _run_memory_judge_task(self, session_key, api_client, model, messages, timeout) -> None:
-        if self._gateway_config.memory_backend != "file":
-            return
+    async def _run_memory_judge_task(
+        self,
+        session_key,
+        api_client,
+        model,
+        messages,
+        timeout,
+        *,
+        backend: MemoryBackend | None = None,
+    ) -> None:
         try:
+            if isinstance(backend, CatalogMemoryBackend):
+                store = backend.judge_store()
+            else:
+                store = self._memory_store
             outcome = await run_memory_judge(
                 api_client=api_client,
                 model=model,
                 messages=messages,
-                store=self._memory_store,
+                store=store,
                 timeout=timeout,
             )
             # Always log a fired run — even a no-op ("nothing to save") — so the

@@ -538,6 +538,102 @@ class CatalogMemoryBackend(MemoryBackend):
     async def append_turn(self, role: str, text: str) -> None:
         del role, text
 
+    def judge_store(self) -> CatalogJudgeStore:
+        """Return a synchronous, tenant-bound view for the legacy judge seam."""
+        return CatalogJudgeStore(self)
+
+
+class CatalogJudgeStore:
+    """MemoryStore-compatible view used by the synchronous judge helpers.
+
+    The judge predates the async backend seam. Keeping this small adapter at the
+    catalog boundary lets it read the private+shared union while every mutation
+    remains bound to the private tenant.
+    """
+
+    def __init__(self, backend: CatalogMemoryBackend) -> None:
+        self._backend = backend
+        self._catalog = backend._catalog
+        self._tenant_id = backend._tenant_id
+        self._shared_tenant_id = backend._shared_tenant_id
+        self._store_char_budget = backend._catalog._store_char_budget
+
+    def _dir(self) -> Path:
+        return self._backend._memory_dir / ".judge" / self._tenant_id
+
+    def _entry(self, record: CatalogRecord, *, shared: bool = False) -> MemoryEntry:
+        entry = self._backend._entry(record, shared=shared)
+        return MemoryEntry(
+            name=entry.name,
+            slug=entry.slug,
+            title=entry.title,
+            content=entry.content,
+            path=self._dir() / entry.name,
+        )
+
+    def list(self) -> builtins.list[MemoryEntry]:
+        private_records = self._catalog.list(self._tenant_id, include_archived=False)
+        entries = [self._entry(record) for record in private_records]
+        if self._shared_tenant_id is not None:
+            shared_records = self._catalog.list(
+                self._shared_tenant_id,
+                include_archived=False,
+            )
+            entries.extend(self._entry(record, shared=True) for record in shared_records)
+        return entries
+
+    def get(self, name: str) -> MemoryEntry | None:
+        record = self._catalog.get(self._tenant_id, name)
+        return self._entry(record) if record is not None else None
+
+    def add(self, title: str, content: str) -> MemoryOpResult:
+        return self._result(
+            self._catalog.add(
+                self._tenant_id,
+                title,
+                content,
+                source="curated",
+            )
+        )
+
+    def update(
+        self,
+        name: str,
+        content: str,
+        *,
+        title: str | None = None,
+    ) -> MemoryOpResult:
+        return self._result(
+            self._catalog.update(
+                self._tenant_id,
+                name,
+                content,
+                title=title,
+            )
+        )
+
+    def remove(self, name: str) -> MemoryOpResult:
+        return self._catalog.remove(self._tenant_id, name)
+
+    def total_chars(self) -> int:
+        return sum(
+            len(record.content)
+            for record in self._catalog.list(
+                self._tenant_id,
+                include_archived=False,
+            )
+        )
+
+    def _result(self, result: MemoryOpResult) -> MemoryOpResult:
+        if result.entries is None:
+            return result
+        records = cast(tuple[CatalogRecord, ...], result.entries)
+        return MemoryOpResult(
+            ok=result.ok,
+            message=result.message,
+            entries=tuple(self._entry(record) for record in records),
+        )
+
 
 from ohmo.memory_service.shadow import (  # noqa: E402 - avoids package import cycle
     SHADOW_COMPARISON_LOG_FILENAME,
