@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from ohmo.gateway.memory_gate import GateDecision, evaluate_memory_gate
 from ohmo.memory_backend import MemoryBackend
 from ohmo.prompts import _build_ohmo_workspace_sections
 
@@ -16,19 +17,54 @@ _MEMORY_DIRECTORY_PREFIX = "- Personal memory directory: "
 _REMINDERS_SECTION = "# Reminders"
 
 
+class TurnSnapshot(str):
+    """Rendered memory block plus the decision governing future recall.
+
+    This remains a ``str`` so the current prompt-injection path stays byte-for-
+    byte compatible. The later visible-recall step can inspect
+    ``gate_decision`` without changing today's rendering behavior.
+    """
+
+    gate_decision: GateDecision
+
+    def __new__(
+        cls,
+        memory_block: str,
+        *,
+        gate_decision: GateDecision,
+    ) -> TurnSnapshot:
+        snapshot = super().__new__(cls, memory_block)
+        snapshot.gate_decision = gate_decision
+        return snapshot
+
+    @property
+    def memory_block(self) -> str:
+        """Return the unchanged backend-rendered prompt text."""
+        return str(self)
+
+
 async def prepare_turn(
     backend: MemoryBackend,
     *,
     budget: int | None = None,
     turn_ctx: TurnContext | None = None,
-) -> str:
+    tools_confined: bool | None = None,
+    principal_isolated: bool | None = None,
+) -> TurnSnapshot:
     """Read a fresh backend-rendered memory snapshot for one submitted turn.
 
-    ``turn_ctx`` is identity plumbing for future backends and confidentiality
-    enforcement. The Phase-0 file backend intentionally ignores it.
+    The gate decision is deliberately metadata only in this step: the backend
+    block is still rendered and injected exactly as before.
     """
-    del turn_ctx
-    return await backend.render_prompt(budget)
+    gate_decision = evaluate_memory_gate(
+        turn_ctx,
+        tools_confined=tools_confined,
+        principal_isolated=principal_isolated,
+    )
+    return TurnSnapshot(
+        await backend.render_prompt(budget),
+        gate_decision=gate_decision,
+    )
 
 
 def compose_runtime_prompt(memory_free_base: str, snapshot: str) -> str:

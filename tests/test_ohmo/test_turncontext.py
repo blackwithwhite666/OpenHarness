@@ -99,10 +99,19 @@ async def test_runtime_prompt_threads_turn_context_into_prepare_turn(
     )
     captured: dict[str, object] = {}
 
-    async def fake_prepare_turn(backend, *, budget=None, turn_ctx=None):
+    async def fake_prepare_turn(
+        backend,
+        *,
+        budget=None,
+        turn_ctx=None,
+        tools_confined=None,
+        principal_isolated=None,
+    ):
         captured["backend"] = backend
         captured["budget"] = budget
         captured["turn_ctx"] = turn_ctx
+        captured["tools_confined"] = tools_confined
+        captured["principal_isolated"] = principal_isolated
         return ""
 
     monkeypatch.setattr("ohmo.gateway.runtime.prepare_turn", fake_prepare_turn)
@@ -114,3 +123,5 @@ async def test_runtime_prompt_threads_turn_context_into_prepare_turn(
     )
 
     assert captured["turn_ctx"] is turn_ctx
+    assert captured["tools_confined"] is False
+    assert captured["principal_isolated"] is False

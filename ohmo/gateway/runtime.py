@@ -38,7 +38,9 @@ from openharness.ui.runtime import RuntimeBundle, _last_user_text, build_runtime
 from ohmo.evals import GatewayEvalRecorder
 from ohmo.gateway.config import load_gateway_config
 from ohmo.gateway.group_tool import CreateFeishuGroup, OhmoCreateFeishuGroupTool, PublishGroupWelcome
+from ohmo.gateway.memory_gate import principal_isolated_session
 from ohmo.gateway.provider_commands import handle_gateway_model_command, handle_gateway_provider_command
+from ohmo.gateway.router import session_key_for_message
 from ohmo.gateway.send_message_tool import SendTelegramMessageTool
 from ohmo.gateway.turn_context import TurnContext, build_turn_context
 from ohmo.group_registry import load_managed_group_record, normalize_cwd
@@ -206,6 +208,7 @@ class OhmoSessionRuntimePool:
         self._reminder_store = ReminderStore(workspace=self._workspace)
         self._reminder_lock = asyncio.Lock()
         self._bundles: dict[str, RuntimeBundle] = {}
+        self._session_owner_principals: dict[str, str | None] = {}
         reaped = reap_stale_work_dirs(self._workspace)
         if reaped:
             logger.info("ohmo runtime reaped %d stale per-chat work dir(s) at startup", reaped)
@@ -327,6 +330,9 @@ class OhmoSessionRuntimePool:
         there was a live bundle to drop."""
         bundle = self._bundles.pop(session_key, None)
         had_bundle = bundle is not None
+        session_id = getattr(bundle, "session_id", None)
+        if isinstance(session_id, str):
+            self._session_owner_principals.pop(session_id, None)
         # Reset the judge cadence + cancel any in-flight judge for this session.
         self._judge_turn_counts.pop(session_key, None)
         judge_task = self._judge_tasks.pop(session_key, None)
@@ -366,6 +372,32 @@ class OhmoSessionRuntimePool:
         logger.info("ohmo runtime session reset session_key=%s had_bundle=%s", session_key, had_bundle)
         return had_bundle
 
+    def _bind_session_owner(
+        self,
+        message: InboundMessage,
+        session_key: str,
+        turn_ctx: TurnContext,
+    ) -> str | None:
+        """Record a principal only when normal gateway routing proves the binding."""
+        candidate = None
+        if (
+            message.session_key_override is None
+            and session_key_for_message(message) == session_key
+            and turn_ctx.principal
+        ):
+            candidate = turn_ctx.principal
+
+        session_id = turn_ctx.session_id
+        if session_id not in self._session_owner_principals:
+            self._session_owner_principals[session_id] = candidate
+        elif candidate is not None:
+            current = self._session_owner_principals[session_id]
+            if current is None:
+                self._session_owner_principals[session_id] = candidate
+            elif current != candidate:
+                self._session_owner_principals[session_id] = None
+        return self._session_owner_principals[session_id]
+
     async def stream_message(self, message: InboundMessage, session_key: str):
         """Submit an inbound channel message and yield progress + final reply updates."""
         user_message = _build_inbound_user_message(message)
@@ -378,6 +410,7 @@ class OhmoSessionRuntimePool:
             session_id=bundle.session_id,
             owner_principals=self._gateway_config.owner_principals,
         )
+        self._bind_session_owner(message, session_key, turn_ctx)
         logger.debug(
             "ohmo turn identity principal=%s owner=%s private=%s channel=%s chat_id=%s session_id=%s",
             turn_ctx.principal,
@@ -1095,7 +1128,28 @@ class OhmoSessionRuntimePool:
             extra_prompt=None,
             include_ohmo_memory=False,
         )
-        snapshot = await prepare_turn(self._prompt_memory_backend, turn_ctx=turn_ctx)
+        session_owner_principal = (
+            self._session_owner_principals.get(turn_ctx.session_id)
+            if turn_ctx is not None
+            else None
+        )
+        snapshot = await prepare_turn(
+            self._prompt_memory_backend,
+            turn_ctx=turn_ctx,
+            tools_confined=self._gateway_config.tools_confined,
+            principal_isolated=principal_isolated_session(
+                turn_ctx,
+                session_owner_principal,
+            ),
+        )
+        gate_decision = getattr(snapshot, "gate_decision", None)
+        if gate_decision is not None:
+            logger.debug(
+                "ohmo memory gate allowed=%s reasons=%s session_id=%s",
+                gate_decision.allowed,
+                gate_decision.reasons,
+                turn_ctx.session_id if turn_ctx is not None else "",
+            )
         if not hasattr(bundle, "current_settings"):
             return compose_runtime_prompt(memory_free_base, snapshot)
         settings = bundle.current_settings()
