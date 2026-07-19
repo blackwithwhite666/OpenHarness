@@ -117,10 +117,10 @@ async def test_round_trip_every_operation_matches_catalog_semantics(
     )
     assert await client.get("first_note") == await service.backend.get("first_note")
 
-    service_before_turn = MemoryCatalog(tmp_path / "service-workspace").list(include_archived=True)
+    service_before_turn = MemoryCatalog(tmp_path / "service-workspace").list("owner", include_archived=True)
     assert await client.append_turn("user", "Do not persist this transient turn.") is None
     assert (
-        MemoryCatalog(tmp_path / "service-workspace").list(include_archived=True)
+        MemoryCatalog(tmp_path / "service-workspace").list("owner", include_archived=True)
         == service_before_turn
     )
 
@@ -129,7 +129,7 @@ async def test_round_trip_every_operation_matches_catalog_semantics(
         await reference.remove("first_note.md"),
     )
     assert await client.list() == await service.backend.list() == []
-    archived = MemoryCatalog(tmp_path / "service-workspace").list(include_archived=True)
+    archived = MemoryCatalog(tmp_path / "service-workspace").list("owner", include_archived=True)
     assert len(archived) == 1
     assert archived[0].archive_status == "archived"
 

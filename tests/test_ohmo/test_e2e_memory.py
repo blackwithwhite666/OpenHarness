@@ -47,7 +47,7 @@ def _usage_count(kind: str, workspace: Path, name: str) -> int:
     if kind == "file":
         usage = MemoryStore(workspace).usage(name)
         return int(usage["use_count"]) if usage is not None else 0
-    record = MemoryCatalog(workspace).get(name)
+    record = MemoryCatalog(workspace).get("owner", name)
     return record.usage if record is not None else 0
 
 

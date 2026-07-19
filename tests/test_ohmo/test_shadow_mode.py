@@ -72,8 +72,8 @@ class FakeHoncho:
 
 def _catalog_backend(workspace: Path) -> CatalogMemoryBackend:
     catalog = MemoryCatalog(workspace)
-    assert catalog.add("Timezone", "User prefers Europe/Moscow.").ok
-    assert catalog.add("Editor", "User prefers Vim for quick edits.").ok
+    assert catalog.add("owner", "Timezone", "User prefers Europe/Moscow.").ok
+    assert catalog.add("owner", "Editor", "User prefers Vim for quick edits.").ok
     return CatalogMemoryBackend(catalog, workspace)
 
 

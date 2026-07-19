@@ -63,7 +63,7 @@ async def test_catalog_memory_commands_curate_catalog_without_markdown(
 
     assert add_result.message == "Added memory entry notes.md"
     catalog = MemoryCatalog(workspace)
-    note = catalog.get("notes")
+    note = catalog.get("owner", "notes")
     assert note is not None
     assert note.content == "remember this"
 
@@ -84,14 +84,14 @@ async def test_catalog_memory_commands_curate_catalog_without_markdown(
     edit_command, edit_args = registry.lookup("/memory edit notes")
     edit_result = await edit_command.handler(edit_args, context)
     assert edit_result.message == "Edited catalog memory entry: notes"
-    edited = catalog.get("notes")
+    edited = catalog.get("owner", "notes")
     assert edited is not None
     assert edited.content == "edited in catalog"
 
     remove_command, remove_args = registry.lookup("/memory remove notes")
     remove_result = await remove_command.handler(remove_args, context)
     assert remove_result.message == "Removed memory entry notes"
-    archived = catalog.get("notes")
+    archived = catalog.get("owner", "notes")
     assert archived is not None
     assert archived.archive_status == "archived"
 
@@ -177,7 +177,7 @@ def test_ensure_catalog_migrated_is_copy_only_and_noops_when_populated(
 
     assert {
         record.slug: (record.title, record.content)
-        for record in catalog.list(include_archived=True)
+        for record in catalog.list("owner", include_archived=True)
     } == {
         "editor_preference": ("Editor preference", "User prefers Neovim."),
         "home_timezone": ("Home timezone", "User lives in Moscow."),
@@ -190,7 +190,7 @@ def test_ensure_catalog_migrated_is_copy_only_and_noops_when_populated(
     monkeypatch.setattr(memory_module, "migrate", fail_migrate)
     second = ensure_catalog_migrated(workspace)
 
-    assert second.list(include_archived=True) == catalog.list(include_archived=True)
+    assert second.list("owner", include_archived=True) == catalog.list("owner", include_archived=True)
     assert {
         path.relative_to(memory_dir): path.read_bytes() for path in memory_dir.rglob("*.md")
     } == markdown_before

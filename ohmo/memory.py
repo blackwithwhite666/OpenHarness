@@ -68,7 +68,7 @@ def ensure_catalog_migrated(
 ) -> MemoryCatalog:
     """Copy legacy Markdown memory into an empty workspace catalog once."""
     catalog = MemoryCatalog(workspace)
-    if catalog.list(include_archived=True):
+    if catalog.list("owner", include_archived=True):
         return catalog
 
     active, archived = inventory(workspace)
@@ -189,16 +189,16 @@ def create_memory_command_backend(
         memory_dir = get_memory_dir(workspace)
 
         def add_catalog_entry(title: str, content: str) -> Path:
-            result = catalog.add(title, content, source="curated")
+            result = catalog.add("owner", title, content, source="curated")
             if not result.ok:
                 raise ValueError(result.message)
-            record = catalog.get(slugify(title))
+            record = catalog.get("owner", slugify(title))
             if record is None:
                 clean_content = content.strip()
                 record = next(
                     (
                         item
-                        for item in catalog.list(include_archived=False)
+                        for item in catalog.list("owner", include_archived=False)
                         if item.content == clean_content
                     ),
                     None,
@@ -208,13 +208,13 @@ def create_memory_command_backend(
             return memory_dir / f"{record.slug}.md"
 
         def read_catalog_entry(name: str) -> str | None:
-            record = catalog.get(name)
+            record = catalog.get("owner", name)
             if record is None or record.archive_status != "active":
                 return None
             return record.content
 
         def update_catalog_entry(name: str, content: str) -> bool:
-            result = catalog.update(name, content)
+            result = catalog.update("owner", name, content)
             if not result.ok:
                 raise ValueError(result.message)
             return True
@@ -226,10 +226,11 @@ def create_memory_command_backend(
             get_memory_dir=lambda: memory_dir,
             get_entrypoint=lambda: catalog.db_path,
             list_files=lambda: [
-                memory_dir / f"{record.slug}.md" for record in catalog.list(include_archived=False)
+                memory_dir / f"{record.slug}.md"
+                for record in catalog.list("owner", include_archived=False)
             ],
             add_entry=add_catalog_entry,
-            remove_entry=lambda name: catalog.remove(name).ok,
+            remove_entry=lambda name: catalog.remove("owner", name).ok,
             backend_kind=backend_kind,
             read_entry=read_catalog_entry,
             update_entry=update_catalog_entry,

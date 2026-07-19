@@ -68,7 +68,7 @@ def _backend(
     fake: FakeHoncho,
 ) -> tuple[CatalogMemoryBackend, ShadowMemoryBackend]:
     catalog = MemoryCatalog(workspace)
-    assert catalog.add("Timezone", "User prefers Europe/Moscow.").ok
+    assert catalog.add("owner", "Timezone", "User prefers Europe/Moscow.").ok
     base = CatalogMemoryBackend(catalog, workspace)
     shadow = ShadowMemoryBackend(
         base,

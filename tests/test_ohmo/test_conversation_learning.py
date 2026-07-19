@@ -309,7 +309,7 @@ def test_shadow_factory_passes_learning_flag_and_preserves_defaults(
 async def test_curated_mirror_uses_direct_conclusions_not_messages(tmp_path: Path) -> None:
     catalog = MemoryCatalog(db_path=tmp_path / "catalog.sqlite3")
     honcho = FakeHoncho()
-    assert catalog.add("Timezone", "User lives in Moscow.").ok
+    assert catalog.add("owner", "Timezone", "User lives in Moscow.").ok
 
     report = await drain_once(catalog, honcho)  # type: ignore[arg-type]
 

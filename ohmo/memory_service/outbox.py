@@ -43,6 +43,7 @@ class _OutboxCatalogMixin:
     @staticmethod
     def _enqueue_outbox(
         connection: sqlite3.Connection,
+        tenant_id: str,
         op_type: str,
         slug: str,
         content: str | None,
@@ -54,10 +55,10 @@ class _OutboxCatalogMixin:
         connection.execute(
             """
             INSERT INTO outbox (
-                op_type, slug, content, old_conclusion_ids, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?)
+                tenant_id, op_type, slug, content, old_conclusion_ids, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
-            (op_type, slug, content, old_conclusion_ids or "[]", now, now),
+            (tenant_id, op_type, slug, content, old_conclusion_ids or "[]", now, now),
         )
 
     def lease_outbox(self, limit: int, lease_seconds: float) -> list[sqlite3.Row]:
@@ -116,20 +117,32 @@ class _OutboxCatalogMixin:
             if cursor.rowcount != 1:
                 raise RuntimeError(f"outbox operation {outbox_id} is not leased")
 
-    def set_conclusion_ids(self, slug: str, conclusion_ids: Sequence[str]) -> None:
+    def set_conclusion_ids(
+        self,
+        tenant_id: str,
+        slug: str,
+        conclusion_ids: Sequence[str],
+    ) -> None:
         with self._write_connection() as connection:
             cursor = connection.execute(
-                "UPDATE memories SET honcho_conclusion_ids = ? WHERE slug = ?",
-                (json.dumps(list(conclusion_ids)), _slug_reference(slug)),
+                """
+                UPDATE memories SET honcho_conclusion_ids = ?
+                WHERE tenant_id = ? AND slug = ?
+                """,
+                (json.dumps(list(conclusion_ids)), tenant_id, _slug_reference(slug)),
             )
             if cursor.rowcount != 1:
                 raise KeyError(f"unknown memory {_slug_reference(slug)!r}")
 
-    def append_conclusion_id(self, slug: str, conclusion_id: str) -> None:
+    def append_conclusion_id(self, tenant_id: str, slug: str, conclusion_id: str) -> None:
         clean_slug = _slug_reference(slug)
         with self._write_connection() as connection:
             row = connection.execute(
-                "SELECT honcho_conclusion_ids FROM memories WHERE slug = ?", (clean_slug,)
+                """
+                SELECT honcho_conclusion_ids FROM memories
+                WHERE tenant_id = ? AND slug = ?
+                """,
+                (tenant_id, clean_slug),
             ).fetchone()
             if row is None:
                 raise KeyError(f"unknown memory {clean_slug!r}")
@@ -137,8 +150,11 @@ class _OutboxCatalogMixin:
             if conclusion_id not in conclusion_ids:
                 conclusion_ids.append(conclusion_id)
             connection.execute(
-                "UPDATE memories SET honcho_conclusion_ids = ? WHERE slug = ?",
-                (json.dumps(conclusion_ids), clean_slug),
+                """
+                UPDATE memories SET honcho_conclusion_ids = ?
+                WHERE tenant_id = ? AND slug = ?
+                """,
+                (json.dumps(conclusion_ids), tenant_id, clean_slug),
             )
 
     def reconcile_outbox(self) -> dict[str, int]:
@@ -162,9 +178,14 @@ class _OutboxCatalog(Protocol):
 
     def mark_outbox_retry(self, outbox_id: int) -> None: ...
 
-    def set_conclusion_ids(self, slug: str, conclusion_ids: Sequence[str]) -> None: ...
+    def set_conclusion_ids(
+        self,
+        tenant_id: str,
+        slug: str,
+        conclusion_ids: Sequence[str],
+    ) -> None: ...
 
-    def append_conclusion_id(self, slug: str, conclusion_id: str) -> None: ...
+    def append_conclusion_id(self, tenant_id: str, slug: str, conclusion_id: str) -> None: ...
 
     def reconcile_outbox(self) -> dict[str, int]: ...
 
@@ -188,6 +209,7 @@ async def drain_once(
     mirrored = retried = failed = 0
     for operation in catalog.lease_outbox(batch, _LEASE_SECONDS):
         outbox_id = cast(int, operation["id"])
+        tenant_id = cast(str, operation["tenant_id"])
         op_type = cast(str, operation["op_type"])
         slug = cast(str, operation["slug"])
         try:
@@ -201,7 +223,7 @@ async def drain_once(
                         {
                             "content": content,
                             "observer_id": "ohmo-curated",
-                            "observed_id": "owner",
+                            "observed_id": tenant_id,
                         }
                     ]
                 )
@@ -221,11 +243,11 @@ async def drain_once(
             old_ids = _decode_ids(operation["old_conclusion_ids"])
             if op_type == "add":
                 assert new_id is not None
-                catalog.append_conclusion_id(slug, new_id)
+                catalog.append_conclusion_id(tenant_id, slug, new_id)
             elif op_type == "update":
                 assert new_id is not None
                 await _delete_best_effort(honcho_client, old_ids)
-                catalog.set_conclusion_ids(slug, [new_id])
+                catalog.set_conclusion_ids(tenant_id, slug, [new_id])
             elif op_type == "remove":
                 await _delete_best_effort(honcho_client, old_ids)
             else:

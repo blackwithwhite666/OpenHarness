@@ -141,6 +141,7 @@ def _migrate_entry(
 
     assert catalog is not None
     result = catalog.import_entry(
+        "owner",
         slug,
         title,
         content,
@@ -171,7 +172,7 @@ def export_catalog_to_files(catalog: MemoryCatalog, dest_dir: str | Path) -> Non
         raise ValueError("Export archive directory must not be a symlink.")
     archive_dir.mkdir(parents=True, exist_ok=True)
 
-    records = catalog.list(include_archived=True)
+    records = catalog.list("owner", include_archived=True)
     active_records = [record for record in records if record.archive_status == "active"]
     archived_records = [record for record in records if record.archive_status == "archived"]
 

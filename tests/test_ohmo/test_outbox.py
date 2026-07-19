@@ -56,7 +56,7 @@ def test_schema_v1_migrates_to_latest_idempotently(tmp_path: Path):
     MemoryCatalog(db_path=db_path)
 
     with sqlite3.connect(db_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
         columns = {
             row[1] for row in connection.execute("PRAGMA table_info(outbox)").fetchall()
         }
@@ -65,6 +65,7 @@ def test_schema_v1_migrates_to_latest_idempotently(tmp_path: Path):
         }
     assert columns == {
         "id",
+        "tenant_id",
         "op_type",
         "slug",
         "content",
@@ -76,6 +77,7 @@ def test_schema_v1_migrates_to_latest_idempotently(tmp_path: Path):
         "updated_at",
     }
     assert embedding_columns == {
+        "tenant_id",
         "slug",
         "model",
         "dim",
@@ -92,7 +94,7 @@ def test_curated_add_and_enqueue_are_atomic_and_do_not_call_honcho(
     catalog = MemoryCatalog(db_path=tmp_path / "catalog.sqlite3")
     honcho = FakeHoncho(unreachable=True)
 
-    assert catalog.add("Timezone", "User lives in Moscow.").ok
+    assert catalog.add("owner", "Timezone", "User lives in Moscow.").ok
 
     [operation] = _outbox_rows(catalog)
     assert (operation["op_type"], operation["slug"], operation["content"]) == (
@@ -108,14 +110,14 @@ def test_curated_add_and_enqueue_are_atomic_and_do_not_call_honcho(
 
     monkeypatch.setattr(catalog, "_enqueue_outbox", fail_enqueue)
     with pytest.raises(sqlite3.OperationalError, match="outbox unavailable"):
-        catalog.add("Rolled back", "This row must roll back.")
-    assert catalog.get("rolled_back") is None
+        catalog.add("owner", "Rolled back", "This row must roll back.")
+    assert catalog.get("owner", "rolled_back") is None
 
 
 async def test_drain_add_uses_curated_peer_pair_records_ack_and_marks_done(tmp_path: Path):
     catalog = MemoryCatalog(db_path=tmp_path / "catalog.sqlite3")
     honcho = FakeHoncho()
-    assert catalog.add("Timezone", "User lives in Moscow.").ok
+    assert catalog.add("owner", "Timezone", "User lives in Moscow.").ok
 
     report = await drain_once(catalog, honcho)
 
@@ -129,7 +131,7 @@ async def test_drain_add_uses_curated_peer_pair_records_ack_and_marks_done(tmp_p
             }
         ]
     ]
-    record = catalog.get("timezone")
+    record = catalog.get("owner", "timezone")
     assert record is not None
     assert json.loads(record.honcho_conclusion_ids) == ["conclusion-1"]
     assert _outbox_rows(catalog)[0]["state"] == "done"
@@ -141,7 +143,7 @@ async def test_ack_followed_by_local_failure_is_replayed_at_least_once(
 ):
     catalog = MemoryCatalog(db_path=tmp_path / "catalog.sqlite3")
     honcho = FakeHoncho()
-    assert catalog.add("Editor", "User prefers Neovim.").ok
+    assert catalog.add("owner", "Editor", "User prefers Neovim.").ok
     original_append = catalog.append_conclusion_id
 
     def fail_local_record(slug: str, conclusion_id: str) -> None:
@@ -155,7 +157,7 @@ async def test_ack_followed_by_local_failure_is_replayed_at_least_once(
 
     assert await drain_once(catalog, honcho) == DrainReport(mirrored=1)
     assert len(honcho.created) == 2
-    record = catalog.get("editor")
+    record = catalog.get("owner", "editor")
     assert record is not None
     assert json.loads(record.honcho_conclusion_ids) == ["conclusion-2"]
     assert _outbox_rows(catalog)[0]["state"] == "done"
@@ -164,19 +166,19 @@ async def test_ack_followed_by_local_failure_is_replayed_at_least_once(
 async def test_update_replaces_conclusion_and_remove_deletes_current_id(tmp_path: Path):
     catalog = MemoryCatalog(db_path=tmp_path / "catalog.sqlite3")
     honcho = FakeHoncho()
-    assert catalog.add("Editor", "User prefers Vim.").ok
+    assert catalog.add("owner", "Editor", "User prefers Vim.").ok
     assert await drain_once(catalog, honcho) == DrainReport(mirrored=1)
 
-    assert catalog.update("editor", "User prefers Neovim.").ok
+    assert catalog.update("owner", "editor", "User prefers Neovim.").ok
     update_operation = _outbox_rows(catalog)[1]
     assert json.loads(update_operation["old_conclusion_ids"]) == ["conclusion-1"]
     assert await drain_once(catalog, honcho) == DrainReport(mirrored=1)
     assert honcho.deleted == ["conclusion-1"]
-    record = catalog.get("editor")
+    record = catalog.get("owner", "editor")
     assert record is not None
     assert json.loads(record.honcho_conclusion_ids) == ["conclusion-2"]
 
-    assert catalog.remove("editor").ok
+    assert catalog.remove("owner", "editor").ok
     remove_operation = _outbox_rows(catalog)[2]
     assert json.loads(remove_operation["old_conclusion_ids"]) == ["conclusion-2"]
     assert await drain_once(catalog, honcho) == DrainReport(mirrored=1)
@@ -186,7 +188,7 @@ async def test_update_replaces_conclusion_and_remove_deletes_current_id(tmp_path
 
 def test_reconcile_requeues_an_expired_lease(tmp_path: Path):
     catalog = MemoryCatalog(db_path=tmp_path / "catalog.sqlite3")
-    assert catalog.add("Shell", "User prefers zsh.").ok
+    assert catalog.add("owner", "Shell", "User prefers zsh.").ok
     assert len(catalog.lease_outbox(1, 60)) == 1
     _expire_leases(catalog)
 
@@ -199,22 +201,22 @@ def test_reconcile_requeues_an_expired_lease(tmp_path: Path):
 async def test_honcho_error_retries_without_affecting_committed_catalog_write(tmp_path: Path):
     catalog = MemoryCatalog(db_path=tmp_path / "catalog.sqlite3")
     honcho = FakeHoncho(unreachable=True)
-    assert catalog.add("Shell", "User prefers zsh.").ok
-    assert catalog.get("shell") is not None
+    assert catalog.add("owner", "Shell", "User prefers zsh.").ok
+    assert catalog.get("owner", "shell") is not None
 
     assert await drain_once(catalog, honcho) == DrainReport(retried=1)
 
     operation = _outbox_rows(catalog)[0]
     assert (operation["state"], operation["attempts"]) == ("pending", 1)
-    assert catalog.get("shell") is not None
+    assert catalog.get("owner", "shell") is not None
 
 
 def test_imported_and_derived_writes_do_not_enqueue(tmp_path: Path):
     catalog = MemoryCatalog(db_path=tmp_path / "catalog.sqlite3")
 
-    assert catalog.import_entry("legacy", "Legacy", "Imported curated memory.").ok
-    assert catalog.add("Derived", "Synthesized memory.", source="derived").ok
-    assert catalog.update("derived", "Updated synthesized memory.").ok
-    assert catalog.remove("derived").ok
+    assert catalog.import_entry("owner", "legacy", "Legacy", "Imported curated memory.").ok
+    assert catalog.add("owner", "Derived", "Synthesized memory.", source="derived").ok
+    assert catalog.update("owner", "derived", "Updated synthesized memory.").ok
+    assert catalog.remove("owner", "derived").ok
 
     assert _outbox_rows(catalog) == []

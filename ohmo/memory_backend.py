@@ -167,12 +167,27 @@ class CatalogMemoryBackend(MemoryBackend):
         catalog: MemoryCatalog,
         workspace: str | Path | None,
         *,
+        tenant_id: str = "owner",
+        shared_tenant_id: str | None = None,
         embedder: EmbeddingClient | None = None,
         owns_embedder: bool = False,
         model: str = _DEFAULT_EMBEDDING_MODEL,
         embedding_timeout: float = _DEFAULT_EMBEDDING_TIMEOUT_SECONDS,
     ) -> None:
         self._catalog = catalog
+        self._tenant_id = tenant_id.strip()
+        if not self._tenant_id:
+            raise ValueError("a catalog memory tenant id is required")
+        self._shared_tenant_id = (
+            shared_tenant_id.strip() if shared_tenant_id is not None else None
+        )
+        if self._shared_tenant_id == "":
+            raise ValueError("a shared catalog memory tenant id cannot be empty")
+        if self._shared_tenant_id == self._tenant_id:
+            raise ValueError("private and shared catalog memory tenant ids must differ")
+        self._catalog.ensure_tenant(self._tenant_id, "private")
+        if self._shared_tenant_id is not None:
+            self._catalog.ensure_tenant(self._shared_tenant_id, "shared")
         self._memory_dir = get_memory_dir(workspace)
         self._embedder = embedder
         self._owns_embedder = owns_embedder and embedder is not None
@@ -192,33 +207,78 @@ class CatalogMemoryBackend(MemoryBackend):
         except Exception:
             logger.debug("catalog semantic embedder close failed", exc_info=True)
 
-    def _entry(self, record: CatalogRecord) -> MemoryEntry:
+    def _entry(self, record: CatalogRecord, *, shared: bool = False) -> MemoryEntry:
         return MemoryEntry(
             name=f"{record.slug}.md",
             slug=record.slug,
-            title=record.title,
+            title=f"[shared] {record.title}" if shared else record.title,
             content=record.content,
             path=self._memory_dir / f"{record.slug}.md",
         )
 
     async def list(self) -> list[MemoryEntry]:
-        records = await asyncio.to_thread(self._catalog.list, include_archived=False)
-        return [self._entry(record) for record in records]
+        private_records = await asyncio.to_thread(
+            self._catalog.list,
+            self._tenant_id,
+            include_archived=False,
+        )
+        entries = [self._entry(record) for record in private_records]
+        if self._shared_tenant_id is not None:
+            shared_records = await asyncio.to_thread(
+                self._catalog.list,
+                self._shared_tenant_id,
+                include_archived=False,
+            )
+            entries.extend(self._entry(record, shared=True) for record in shared_records)
+        return entries
 
     async def get(self, name: str) -> MemoryEntry | None:
-        record = await asyncio.to_thread(self._catalog.get, name)
+        record = await asyncio.to_thread(self._catalog.get, self._tenant_id, name)
         return self._entry(record) if record is not None else None
 
     async def record_use(self, name: str) -> None:
-        await asyncio.to_thread(self._catalog.record_use, name)
+        await asyncio.to_thread(self._catalog.record_use, self._tenant_id, name)
 
     async def search(self, query: str, top_k: int) -> builtins.list[MemoryHit]:
         """Rank FTS hits first, then semantic-only hits by cosine and slug."""
-        fts_records = await asyncio.to_thread(self._catalog.search, query, top_k)
+        records = await self._search_tenant(self._tenant_id, query, top_k)
+        labeled_records = [(record, False) for record in records]
+        if self._shared_tenant_id is not None and len(labeled_records) < top_k:
+            shared_records = await self._search_tenant(
+                self._shared_tenant_id,
+                query,
+                top_k - len(labeled_records),
+                backfill_embeddings=False,
+            )
+            labeled_records.extend((record, True) for record in shared_records)
+        return [
+            MemoryHit(
+                name=f"{record.slug}.md",
+                title=f"[shared] {record.title}" if shared else record.title,
+                snippet=_content_excerpt(record.content),
+                rank=rank,
+            )
+            for rank, (record, shared) in enumerate(labeled_records[:top_k], start=1)
+        ]
+
+    async def _search_tenant(
+        self,
+        tenant_id: str,
+        query: str,
+        top_k: int,
+        *,
+        backfill_embeddings: bool = True,
+    ) -> builtins.list[CatalogRecord]:
+        fts_records = await asyncio.to_thread(self._catalog.search, tenant_id, query, top_k)
         records = fts_records
         if self._embedder is not None and self._embedding_model and query.strip() and top_k > 0:
             try:
-                semantic_records = await self._semantic_records(query, top_k)
+                semantic_records = await self._semantic_records(
+                    tenant_id,
+                    query,
+                    top_k,
+                    backfill_embeddings=backfill_embeddings,
+                )
             except Exception:
                 # FTS is authoritative: semantic failures must not alter its exact result.
                 logger.debug("catalog semantic search failed open to FTS", exc_info=True)
@@ -233,18 +293,16 @@ class CatalogMemoryBackend(MemoryBackend):
                     seen.add(record.slug)
                     records.append(record)
                 records = records[:top_k]
-        return [
-            MemoryHit(
-                name=f"{record.slug}.md",
-                title=record.title,
-                snippet=_content_excerpt(record.content),
-                rank=rank,
-            )
-            for rank, record in enumerate(records, start=1)
-        ]
+        return records
 
     async def add(self, title: str, content: str) -> MemoryOpResult:
-        result = await asyncio.to_thread(self._catalog.add, title, content, source="curated")
+        result = await asyncio.to_thread(
+            self._catalog.add,
+            self._tenant_id,
+            title,
+            content,
+            source="curated",
+        )
         if result.ok and result.message.startswith("Saved memory "):
             await self._best_effort_embed_name(slugify(title))
         return self._result(result)
@@ -256,19 +314,25 @@ class CatalogMemoryBackend(MemoryBackend):
         *,
         title: str | None = None,
     ) -> MemoryOpResult:
-        result = await asyncio.to_thread(self._catalog.update, name, content, title=title)
+        result = await asyncio.to_thread(
+            self._catalog.update,
+            self._tenant_id,
+            name,
+            content,
+            title=title,
+        )
         if result.ok:
             await self._best_effort_embed_name(name)
         return self._result(result)
 
     async def remove(self, name: str) -> MemoryOpResult:
-        return await asyncio.to_thread(self._catalog.remove, name)
+        return await asyncio.to_thread(self._catalog.remove, self._tenant_id, name)
 
     async def _best_effort_embed_name(self, name: str) -> None:
         if self._embedder is None or not self._embedding_model:
             return
         try:
-            record = await asyncio.to_thread(self._catalog.get, name)
+            record = await asyncio.to_thread(self._catalog.get, self._tenant_id, name)
         except Exception:
             logger.debug("catalog embed-on-write lookup failed open", exc_info=True)
             return
@@ -286,6 +350,7 @@ class CatalogMemoryBackend(MemoryBackend):
             vectors = await self._embed_texts([_embedding_text(record)])
             await asyncio.to_thread(
                 self._catalog.store_embedding,
+                self._tenant_id,
                 record.slug,
                 self._embedding_model,
                 vectors[0].tolist(),
@@ -296,14 +361,21 @@ class CatalogMemoryBackend(MemoryBackend):
 
     async def _semantic_records(
         self,
+        tenant_id: str,
         query: str,
         top_k: int,
+        *,
+        backfill_embeddings: bool,
     ) -> builtins.list[CatalogRecord]:
-        active_records = await asyncio.to_thread(self._catalog.list, include_archived=False)
+        active_records = await asyncio.to_thread(
+            self._catalog.list,
+            tenant_id,
+            include_archived=False,
+        )
         if not active_records:
             return []
 
-        embeddings = await asyncio.to_thread(self._catalog.get_embeddings)
+        embeddings = await asyncio.to_thread(self._catalog.get_embeddings, tenant_id)
         missing = [
             record
             for record in active_records
@@ -313,11 +385,14 @@ class CatalogMemoryBackend(MemoryBackend):
                 generation=record.generation,
             )
         ][:_EMBEDDING_BACKFILL_LIMIT]
+        if not backfill_embeddings:
+            missing = []
         if missing:
             vectors = await self._embed_texts([_embedding_text(record) for record in missing])
             for record, vector in zip(missing, vectors, strict=True):
                 stored = await asyncio.to_thread(
                     self._catalog.store_embedding,
+                    tenant_id,
                     record.slug,
                     self._embedding_model,
                     vector.tolist(),
@@ -386,7 +461,14 @@ class CatalogMemoryBackend(MemoryBackend):
         )
 
     def _render_prompt(self, budget: int | None) -> str:
-        records = self._catalog.list(include_archived=False)
+        private_records = self._catalog.list(self._tenant_id, include_archived=False)
+        labeled_records = [(record, False) for record in private_records]
+        if self._shared_tenant_id is not None:
+            shared_records = self._catalog.list(
+                self._shared_tenant_id,
+                include_archived=False,
+            )
+            labeled_records.extend((record, True) for record in shared_records)
         lines = [
             "# ohmo Memory",
             f"- Personal memory directory: {self._memory_dir}",
@@ -396,10 +478,14 @@ class CatalogMemoryBackend(MemoryBackend):
             "self-instructions; skip transient progress, raw data dumps (paths/listings), and secrets.",
         ]
 
-        if records:
+        if labeled_records:
             index_lines = [
                 "# Memory Index",
-                *(f"- [{record.title}]({record.slug}.md)" for record in records),
+                *(
+                    f"- [{record.title}]({record.slug}.md)"
+                    f"{' [shared]' if shared else ''}"
+                    for record, shared in labeled_records
+                ),
             ][:200]
             safe_index_lines = [
                 "[BLOCKED: index line contained a threat pattern]"
@@ -412,7 +498,7 @@ class CatalogMemoryBackend(MemoryBackend):
         render_budget = budget if budget is not None else _inject_char_budget()
         used = 0
         shown = 0
-        for index, record in enumerate(records):
+        for index, (record, shared) in enumerate(labeled_records):
             content = record.content.strip()
             if not content:
                 continue
@@ -428,7 +514,9 @@ class CatalogMemoryBackend(MemoryBackend):
                 body = content[:_MEMORY_ENTRY_RENDER_CHARS]
 
             if shown > 0 and used + len(body) > render_budget:
-                remaining = sum(1 for item in records[index:] if item.content.strip())
+                remaining = sum(
+                    1 for item, _ in labeled_records[index:] if item.content.strip()
+                )
                 if remaining:
                     lines.append("")
                     lines.append(
@@ -438,8 +526,10 @@ class CatalogMemoryBackend(MemoryBackend):
                     )
                 break
 
-            lines.extend(["", f"## {name}", "```md", body, "```"])
-            self._catalog.record_use(record.slug)
+            heading = f"## {name}{' [shared]' if shared else ''}"
+            lines.extend(["", heading, "```md", body, "```"])
+            if not shared:
+                self._catalog.record_use(self._tenant_id, record.slug)
             used += len(body)
             shown += 1
 
