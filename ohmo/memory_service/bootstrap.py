@@ -50,8 +50,19 @@ async def bootstrap_workspace(
 
     workspace_result = await client.get_or_create_workspace()
     peer_results = tuple([await client.get_or_create_peer(peer) for peer in peer_names])
+    # Only the assistant peer observes others (forms facts about the owner). The
+    # assistant + curated peers are NOT observed-about: honcho attributes each
+    # observation to the message SENDER, so leaving observe_me on the assistant
+    # makes the deriver mint "ohmo said X" self-observations from the assistant's
+    # own verbose turns (pollution). observe_me stays on for human subjects (owner
+    # / family), whose turns are the legitimate source of facts about them.
+    _NON_SUBJECT_PEERS = frozenset({"ohmo", "ohmo-curated"})
     peer_configuration = {
-        peer: {"observe_others": observe_others if peer == "ohmo" else False} for peer in peer_names
+        peer: {
+            "observe_others": observe_others if peer == "ohmo" else False,
+            "observe_me": peer not in _NON_SUBJECT_PEERS,
+        }
+        for peer in peer_names
     }
     session_result = await client.get_or_create_session(
         session,

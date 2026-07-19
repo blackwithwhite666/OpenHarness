@@ -397,9 +397,9 @@ async def test_bootstrap_is_idempotent_and_configures_only_derived_observer(
     assert [peer.id for peer in first.peers] == ["ohmo", "ohmo-curated", "owner"]
     assert first.session.id == "ohmo"
     assert fake_honcho.sessions[("workspace-one", "ohmo")] == {
-        "ohmo": {"observe_others": True},
-        "ohmo-curated": {"observe_others": False},
-        "owner": {"observe_others": False},
+        "ohmo": {"observe_others": True, "observe_me": False},
+        "ohmo-curated": {"observe_others": False, "observe_me": False},
+        "owner": {"observe_others": False, "observe_me": True},
     }
     assert fake_honcho.side_effects == Counter({"peer": 3, "workspace": 1, "session": 1})
     assert sum(request.url.path == "/v3/workspaces" for request in fake_honcho.requests) == 2
