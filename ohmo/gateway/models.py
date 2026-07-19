@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
+import re
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
+
+
+_TENANT_ID_RE = re.compile(r"[a-z0-9_-]+")
+_NUMERIC_PRINCIPAL_RE = re.compile(r"[0-9]+")
 
 
 class GatewayConfig(BaseModel):
@@ -37,9 +42,42 @@ class GatewayConfig(BaseModel):
     memory_service_socket: str | None = None
     memory_service_secret_file: str | None = None
     owner_principals: tuple[str, ...] = ()
+    family_principals: dict[str, str] = Field(default_factory=dict)
+    shared_tenants: tuple[str, ...] = ()
+    enabled_memory_tenants: tuple[str, ...] = ()
     honcho_base_url: str | None = None
     honcho_api_key: str | None = None
     honcho_workspace: str | None = None
+
+    @model_validator(mode="after")
+    def validate_memory_tenant_config(self) -> GatewayConfig:
+        """Validate canonical principals and memory tenant identifiers."""
+        for principal, tenant_id in self.family_principals.items():
+            if _NUMERIC_PRINCIPAL_RE.fullmatch(principal) is None:
+                raise ValueError("family_principals keys must be canonical numeric ids")
+            if _TENANT_ID_RE.fullmatch(tenant_id) is None:
+                raise ValueError("memory tenant ids must match [a-z0-9_-]+")
+            if tenant_id == "owner":
+                raise ValueError("the owner tenant is reserved for owner_principals")
+
+        for tenant_id in (*self.shared_tenants, *self.enabled_memory_tenants):
+            if _TENANT_ID_RE.fullmatch(tenant_id) is None:
+                raise ValueError("memory tenant ids must match [a-z0-9_-]+")
+
+        if "owner" in self.shared_tenants:
+            raise ValueError("the owner tenant cannot be a shared tenant")
+
+        owner_numeric_ids = {
+            canonical
+            for owner in self.owner_principals
+            if (canonical := str(owner).strip().split("|", 1)[0].strip())
+            and _NUMERIC_PRINCIPAL_RE.fullmatch(canonical) is not None
+        }
+        overlap = owner_numeric_ids.intersection(self.family_principals)
+        if overlap:
+            raise ValueError("numeric principals cannot map to both owner and family tenants")
+
+        return self
 
 
 class GatewayState(BaseModel):

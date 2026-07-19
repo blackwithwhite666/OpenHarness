@@ -5,7 +5,8 @@ from __future__ import annotations
 from collections.abc import Collection
 from dataclasses import dataclass
 
-from ohmo.gateway.turn_context import TurnContext
+from ohmo.gateway.models import GatewayConfig
+from ohmo.gateway.turn_context import TurnContext, canonical_principal
 
 _OWNER_CONJUNCT = "is_canonical_owner"
 _PRIVATE_CONJUNCT = "is_trusted_private_chat"
@@ -18,6 +19,55 @@ class GateDecision:
 
     allowed: bool
     reasons: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class MemoryScope:
+    """Private and shared memory tenants authorized for one turn."""
+
+    private_tenant: str
+    shared_tenants: tuple[str, ...]
+
+
+def resolve_memory_scope(
+    cfg: GatewayConfig,
+    turn_ctx: TurnContext | None,
+    *,
+    principal_isolated: bool | None,
+) -> MemoryScope | None:
+    """Resolve the turn's authorized memory audience, denying by default."""
+    if turn_ctx is None:
+        return None
+
+    principal = canonical_principal(turn_ctx.channel, turn_ctx.principal)
+    if not principal:
+        return None
+    owner_principals = {
+        canonical_principal(turn_ctx.channel, owner) for owner in cfg.owner_principals
+    }
+    tenant: str | None
+    if principal in owner_principals:
+        tenant = "owner"
+    else:
+        tenant = cfg.family_principals.get(principal)
+
+    if tenant is None:
+        return None
+    if turn_ctx.is_private is not True or principal_isolated is not True:
+        return None
+
+    legacy_owner_mode = not cfg.family_principals and not cfg.enabled_memory_tenants
+    if legacy_owner_mode:
+        if tenant != "owner":
+            return None
+        return MemoryScope(private_tenant="owner", shared_tenants=())
+
+    if tenant not in cfg.enabled_memory_tenants:
+        return None
+    return MemoryScope(
+        private_tenant=tenant,
+        shared_tenants=cfg.shared_tenants,
+    )
 
 
 def memory_engaged(
