@@ -43,6 +43,25 @@ FREEZING_JUDGE_SYSTEM_PROMPT = (
     "Be decisive and consistent: identical answers must get the same verdict. "
     "Reply with the first word PASS or FAIL, then one short sentence explaining why."
 )
+
+# A side-effecting tool can only be simulated (or can fail for user-namespace
+# reasons) in the faithful fs-sandbox. Keep these authoritative trajectory
+# markers explicit and easy to extend; ordinary mentions of "mock" do not count.
+SANDBOX_SIDE_EFFECT_CREDIT_SENTINELS: frozenset[str] = frozenset(
+    {
+        '"mock": true',
+        "No user exists for uid",
+    }
+)
+SANDBOX_SIDE_EFFECT_CREDIT_METADATA_TOKENS: frozenset[str] = frozenset({"mock"})
+SANDBOX_SIDE_EFFECT_CREDIT_RULE = (
+    "When the observed trajectory shows the assistant correctly invoked a "
+    "side-effecting tool or skill but the result is a sandbox mock (marked "
+    '`"mock": true` or metadata token `mock`) or a sandbox-environment failure '
+    "(for example, `No user exists for uid ...`), treat that action as COMPLETED "
+    "for both intent_met and constraints_held; judge the assistant's DECISION and "
+    "tool-invocation correctness, NOT whether the real external side effect occurred."
+)
 GROUNDING_FREEZING_JUDGE_SYSTEM_PROMPT = (
     "You are an evaluation judge for a TIME-SENSITIVE / live task whose facts "
     "change over time, so the reference answer may be STALE. Judge METHOD and "
@@ -567,6 +586,21 @@ def _format_checklist(items: Sequence[str]) -> str:
     return "\n".join(f"- {item}" for item in items if item.strip())
 
 
+def detect_sandbox_side_effect_credit_signals(trajectory: str) -> tuple[str, ...]:
+    """Return recognized sandbox-only side-effect markers from a tool trajectory."""
+
+    lowered = trajectory.lower()
+    sentinels = SANDBOX_SIDE_EFFECT_CREDIT_SENTINELS | frozenset(
+        f'"{token}": true'
+        for token in SANDBOX_SIDE_EFFECT_CREDIT_METADATA_TOKENS
+    )
+    return tuple(
+        sentinel
+        for sentinel in sorted(sentinels)
+        if sentinel.lower() in lowered
+    )
+
+
 def _coerce_bool(value: object) -> bool:
     if isinstance(value, bool):
         return value
@@ -586,15 +620,31 @@ async def judge_intent_met(
     intent: str,
     constraints: Sequence[str],
     transcript: Sequence[tuple[str, str]],
+    trajectory: str = "",
     votes: int = 1,
     max_tokens: int = 600,
 ) -> dict[str, object]:
+    tool_trajectory = trajectory.strip() or "No observed tool calls."
+    credit_signals = detect_sandbox_side_effect_credit_signals(tool_trajectory)
+    credit_signal_block = (
+        ", ".join(credit_signals) if credit_signals else "(none)"
+    )
     prompt = (
         "You are a strict outcome judge for a task execution transcript.\n\n"
         f"Intent: {intent or '(unspecified)'}\n"
         f"Constraints: {_format_checklist(constraints) or '- (none)'}\n\n"
         "Transcript (role: text per line):\n"
         f"{_format_transcript_for_intent_judge(transcript)}\n\n"
+        "Observed tool trajectory (authoritative tool calls and results):\n"
+        f"{tool_trajectory}\n\n"
+        "SANDBOX SIDE-EFFECT CREDIT RULE: "
+        f"{SANDBOX_SIDE_EFFECT_CREDIT_RULE}\n"
+        "Do NOT use this rule to excuse genuinely skipping the action, producing "
+        "only a draft or placeholder without invoking the tool, or inventing or "
+        "fabricating a result. When applying this credit, explicitly mention it "
+        "in evidence.\n"
+        "Detected sandbox-only side-effect signals in the observed tool trajectory: "
+        f"{credit_signal_block}\n\n"
         'Return only ONE JSON object with keys:\n'
         '{"intent_met": true|false, "constraints_held": true|false, '
         '"evidence": "brief evidence snippets"}\n'
@@ -625,10 +675,20 @@ async def judge_intent_met(
             if e:
                 evidences.append(e)
 
+    intent_met = sum(intent_votes) > run_count / 2
+    constraints_held = sum(constraints_votes) > run_count / 2
+    evidence = evidences[0] if evidences else ""
+    if credit_signals and (intent_met or constraints_held):
+        credit_evidence = (
+            "Sandbox side-effect credit applied based on observed signal(s): "
+            + ", ".join(credit_signals)
+        )
+        evidence = f"{evidence}; {credit_evidence}" if evidence else credit_evidence
+
     return {
-        "intent_met": sum(intent_votes) > run_count / 2,
-        "constraints_held": sum(constraints_votes) > run_count / 2,
-        "evidence": evidences[0] if evidences else "",
+        "intent_met": intent_met,
+        "constraints_held": constraints_held,
+        "evidence": evidence,
         "votes": run_count,
     }
 

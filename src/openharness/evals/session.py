@@ -121,12 +121,19 @@ async def score_faithful_session(
     transcript_tuple = tuple(
         (str(role), str(text)) for role, text in transcript if role is not None
     )
+    tool_trajectory = _serialize_tool_calls_for_grounding(
+        tool_calls,
+        max_calls=40,
+        max_output_chars=240,
+        max_arg_chars=160,
+    )
     intent = await judge_intent_met(
         api_client,
         model,
         intent=spec.intent,
         constraints=spec.constraints,
         transcript=transcript_tuple,
+        trajectory=tool_trajectory,
         votes=judge_votes,
         max_tokens=max_tokens,
     )
@@ -230,10 +237,13 @@ def _serialize_tool_calls_for_grounding(
         if output is None:
             output = _tool_call_field(call, "result", "")
         is_error = bool(_tool_call_field(call, "is_error", False))
+        metadata = _tool_call_field(call, "metadata", {})
+        metadata_text = _format_tool_metadata(metadata, max_chars=max_arg_chars)
         rows.append(
             f"{index}. tool={tool_name or '<unknown>'} "
             f"args={_format_tool_arguments(arguments, max_arg_chars=max_arg_chars)} "
             f"is_error={str(is_error).lower()} "
+            f"metadata={metadata_text} "
             f"output={_truncate_for_grounding(output, max_output_chars)}"
         )
 
@@ -263,6 +273,13 @@ def _format_tool_arguments(arguments: Any, *, max_arg_chars: int) -> str:
             text = text[:-1] + ', "...": "arguments omitted"}'
         return text
     return _truncate_for_grounding(arguments, max_arg_chars)
+
+
+def _format_tool_metadata(metadata: Any, *, max_chars: int) -> str:
+    if not isinstance(metadata, Mapping):
+        return "{}"
+    text = json.dumps(dict(metadata), ensure_ascii=True, sort_keys=True, default=str)
+    return text if len(text) <= max_chars else text[:max_chars] + "..."
 
 
 def _truncate_for_grounding(value: Any, max_chars: int) -> str:

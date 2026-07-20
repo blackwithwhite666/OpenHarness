@@ -463,6 +463,96 @@ async def test_score_faithful_session_uses_and_checks_intent_and_grounding(monke
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("output", "is_error", "metadata", "detected_signal"),
+    [
+        (
+            '{"url": "https://example.invalid/report", "mock": true}',
+            False,
+            {},
+            '"mock": true',
+        ),
+        (
+            "No user exists for uid 1000",
+            True,
+            {},
+            "No user exists for uid",
+        ),
+        (
+            "Message queued for Marina.",
+            False,
+            {"mock": True},
+            '"mock": true',
+        ),
+    ],
+)
+async def test_score_faithful_session_threads_sandbox_credit_trajectory(
+    monkeypatch,
+    output: str,
+    is_error: bool,
+    metadata: dict[str, bool],
+    detected_signal: str,
+) -> None:
+    async def fake_derive_ironuser_spec(*_args, **_kwargs):
+        return IronUserSpec(
+            intent="Publish the completed report.",
+            known_info=(),
+            constraints=("Use the publisher tool.",),
+        )
+
+    async def fake_verify_grounding(*_args, **_kwargs):
+        return {
+            "score": 1.0,
+            "status": "scored",
+            "verified": 1,
+            "refuted": 0,
+            "claims": [],
+            "votes": 1,
+        }
+
+    monkeypatch.setattr(
+        "openharness.evals.session.derive_ironuser_spec",
+        fake_derive_ironuser_spec,
+    )
+    monkeypatch.setattr(
+        "openharness.evals.session._verify_grounding_voted",
+        fake_verify_grounding,
+    )
+    client = _RecordingTextApiClient(
+        '{"intent_met": true, "constraints_held": true, '
+        '"evidence": "action completed"}'
+    )
+
+    result = await score_faithful_session(
+        client,
+        "judge-model",
+        captured_prompts=("Publish the completed report.",),
+        transcript=(
+            ("user", "Publish the completed report."),
+            ("assistant", "The publisher action completed."),
+        ),
+        final_text="The publisher action completed.",
+        tool_calls=(
+            EvalObservedCall(
+                tool_name="static_publisher",
+                arguments={"path": "report"},
+                output=output,
+                is_error=is_error,
+                metadata=metadata,
+            ),
+        ),
+        search=lambda query: query,
+    )
+
+    prompt = client.requests[0].messages[0].text
+    assert f"metadata={json.dumps(metadata).lower()}" in prompt
+    assert detected_signal in prompt
+    assert result["checks"]["intent_met"] is True
+    assert result["checks"]["constraints_held"] is True
+    assert "Sandbox side-effect credit applied" in result["intent_evidence"]
+
+
+@pytest.mark.asyncio
 async def test_score_faithful_session_action_supported_by_tool_call_log(monkeypatch):
     _patch_faithful_session_goal_judges(monkeypatch)
     client = _GatewayActionGroundingApiClient()

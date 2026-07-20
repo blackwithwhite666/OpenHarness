@@ -107,6 +107,7 @@ class EvalObservedCall:
     output: str = ""
     started_ms: int | None = None
     ended_ms: int | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -653,6 +654,7 @@ async def _run_query_engine_replay(
                     "is_error": False,
                     "started_ms": event_time_ms,
                     "ended_ms": None,
+                    "metadata": {},
                 }
                 observed_calls.append(entry)
                 if event.tool_call_id:
@@ -664,6 +666,7 @@ async def _run_query_engine_replay(
                     entry["is_error"] = event.is_error
                     entry["output"] = event.output
                     entry["ended_ms"] = event_time_ms
+                    entry["metadata"] = dict(event.metadata or {})
                 event_kind_path.append(
                     "tool_completed_error" if event.is_error else "tool_completed"
                 )

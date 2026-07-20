@@ -20,10 +20,15 @@ from openharness.evals import (
     derive_case_rubric,
 )
 from openharness.evals.judge import (
+    SANDBOX_SIDE_EFFECT_CREDIT_METADATA_TOKENS,
+    SANDBOX_SIDE_EFFECT_CREDIT_RULE,
+    SANDBOX_SIDE_EFFECT_CREDIT_SENTINELS,
     _aggregate_v2,
     _parse_v2_scores,
     _v2_trajectory,
     _verify_grounding,
+    detect_sandbox_side_effect_credit_signals,
+    judge_intent_met,
 )
 
 
@@ -44,6 +49,101 @@ class _StaticJudgeApiClient:
 
 def _wrap(scores_json: dict) -> str:
     return "Reasoning about the run.\n```json\n" + json.dumps(scores_json) + "\n```"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("trajectory", "detected_signal"),
+    [
+        (
+            '1. tool=static_publisher args={"path": "report"} is_error=false '
+            'metadata={} output={"url": "https://example.invalid/report", '
+            '"mock": true}',
+            '"mock": true',
+        ),
+        (
+            '1. tool=bash:ssh args={"command": "ssh host publish report"} '
+            "is_error=true metadata={} output=No user exists for uid 1000",
+            "No user exists for uid",
+        ),
+    ],
+)
+async def test_intent_judge_credits_detected_sandbox_side_effect(
+    trajectory: str,
+    detected_signal: str,
+) -> None:
+    api_client = _StaticJudgeApiClient(
+        '{"intent_met": true, "constraints_held": true, '
+        '"evidence": "action completed"}'
+    )
+
+    result = await judge_intent_met(
+        api_client,
+        "judge-model",
+        intent="Publish the completed report.",
+        constraints=("Use the publisher tool.",),
+        transcript=(
+            ("user", "Publish the completed report."),
+            ("assistant", "I invoked the publisher with the report."),
+        ),
+        trajectory=trajectory,
+    )
+
+    prompt = api_client.requests[0].messages[0].text
+    assert SANDBOX_SIDE_EFFECT_CREDIT_RULE in prompt
+    assert (
+        "Detected sandbox-only side-effect signals in the observed tool trajectory: "
+        f"{detected_signal}"
+    ) in prompt
+    assert result["intent_met"] is True
+    assert result["constraints_held"] is True
+    assert "Sandbox side-effect credit applied" in result["evidence"]
+    assert detected_signal in result["evidence"]
+
+
+@pytest.mark.asyncio
+async def test_intent_judge_does_not_credit_skipped_side_effect() -> None:
+    api_client = _StaticJudgeApiClient(
+        '{"intent_met": false, "constraints_held": false, '
+        '"evidence": "only a draft was produced; publisher was not invoked"}'
+    )
+
+    result = await judge_intent_met(
+        api_client,
+        "judge-model",
+        intent="Publish the completed report.",
+        constraints=("Use the publisher tool.",),
+        transcript=(
+            ("user", "Publish the completed report."),
+            ("assistant", "Here is a draft; you can publish it later."),
+        ),
+        trajectory="No observed tool calls.",
+    )
+
+    prompt = api_client.requests[0].messages[0].text
+    assert SANDBOX_SIDE_EFFECT_CREDIT_RULE in prompt
+    assert (
+        "Detected sandbox-only side-effect signals in the observed tool trajectory: "
+        "(none)"
+    ) in prompt
+    assert result["intent_met"] is False
+    assert result["constraints_held"] is False
+    assert "Sandbox side-effect credit applied" not in result["evidence"]
+
+
+def test_sandbox_side_effect_credit_detection_is_narrow() -> None:
+    assert '"mock": true' in SANDBOX_SIDE_EFFECT_CREDIT_SENTINELS
+    assert "No user exists for uid" in SANDBOX_SIDE_EFFECT_CREDIT_SENTINELS
+    assert "mock" in SANDBOX_SIDE_EFFECT_CREDIT_METADATA_TOKENS
+    assert detect_sandbox_side_effect_credit_signals(
+        'metadata={"mock": true}'
+    ) == ('"mock": true',)
+    assert detect_sandbox_side_effect_credit_signals(
+        "output=No user exists for uid 1000"
+    ) == ("No user exists for uid",)
+    assert detect_sandbox_side_effect_credit_signals(
+        "ordinary mock output and an unrelated ssh failure"
+    ) == ()
 
 
 _ALL_GOOD = _wrap(
