@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import re
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -394,6 +397,10 @@ def test_fs_sandbox_agent_runner_threads_netns_proxy_browser_to_bash_tool(
         lambda settings, cli_configs: {},
     )
     api_client = _WriteReadApiClient()
+    mock_cli = tmp_path / "mock-cli"
+    real_cli = tmp_path / "real-cli"
+    mock_cli.write_text("mock\n", encoding="utf-8")
+    real_cli.write_text("real\n", encoding="utf-8")
     runner = FsSandboxAgentRunner(
         api_client=api_client,
         model="eval-model",
@@ -404,6 +411,7 @@ def test_fs_sandbox_agent_runner_threads_netns_proxy_browser_to_bash_tool(
         browser_socket="/tmp/browser-cli-ohmo.sock",
         browser_cli_name="ohmo",
         live_mcp_server_names=("google_search",),
+        sandbox_bind_overrides=((mock_cli, real_cli),),
     )
     registry = build_replay_tool_registry(())
 
@@ -427,6 +435,7 @@ def test_fs_sandbox_agent_runner_threads_netns_proxy_browser_to_bash_tool(
         proxy_url=bash_tool._proxy_url,
         browser_socket=bash_tool._browser_socket,
         browser_cli_name=bash_tool._browser_cli_name,
+        bind_overrides=bash_tool._bind_overrides,
         uid=123,
         gid=456,
     ) + ["bash", "-lc", "echo ok"]
@@ -445,7 +454,33 @@ def test_fs_sandbox_agent_runner_threads_netns_proxy_browser_to_bash_tool(
         ["--bind", "/tmp/browser-cli-ohmo.sock", "/tmp/browser-cli-ohmo.sock"],
     )
     assert _contains_subsequence(argv, ["--setenv", "BROWSER_CLI_NAME", "ohmo"])
+    assert _contains_subsequence(
+        argv,
+        ["--ro-bind", str(mock_cli), str(real_cli)],
+    )
     assert argv[-3:] == ["bash", "-lc", "echo ok"]
+
+    calls: list[tuple[object, ...]] = []
+
+    async def fake_exec(*args, **kwargs):
+        del kwargs
+        calls.append(args)
+        return _FakeProcess(stdout=b"ok\n")
+
+    monkeypatch.setattr(
+        "openharness.evals.fs_sandbox.asyncio.create_subprocess_exec",
+        fake_exec,
+    )
+    asyncio.run(
+        bash_tool.execute(
+            ReplayToolInput.model_validate({"command": "echo ok"}),
+            ToolExecutionContext(cwd=tmp_path),
+        )
+    )
+    assert _contains_subsequence(
+        list(calls[0]),
+        ["--ro-bind", str(mock_cli), str(real_cli)],
+    )
 
 
 def _contains_subsequence(items: list[str], expected: list[str]) -> bool:
@@ -604,18 +639,69 @@ def test_build_sandbox_skill_bin_mocks_publisher(tmp_path):
     from ohmo.evals.runner import _build_sandbox_skill_bin
     from ohmo.workspace import get_skills_dir
 
-    assert _build_sandbox_skill_bin(None, live_skill=False) == ()
+    empty = _build_sandbox_skill_bin(None, live_skill=False)
+    assert empty.bin_dirs == ()
+    assert empty.bind_overrides == ()
     ws = tmp_path / "ws"
     skills = get_skills_dir(ws)
     (skills / "static_publisher").mkdir(parents=True)
     (skills / "maps").mkdir(parents=True)
     (skills / "static_publisher" / "static_publisher-cli").write_text("real")
     (skills / "maps" / "maps-cli").write_text("real")
-    dirs = _build_sandbox_skill_bin(ws, live_skill=True)
+    skill_bin = _build_sandbox_skill_bin(ws, live_skill=True)
+    dirs = skill_bin.bin_dirs
     mock_pub = dirs[0] / "static_publisher-cli"
     assert mock_pub.exists() and (mock_pub.stat().st_mode & 0o111)
     assert "mock" in mock_pub.read_text()
     assert (dirs[1] / "maps-cli").exists()  # flat symlink to the real nested CLI
+    assert (
+        mock_pub,
+        skills / "static_publisher" / "static_publisher-cli",
+    ) in skill_bin.bind_overrides
+
+
+def test_static_publisher_mock_accepts_global_json_flag(tmp_path):
+    from ohmo.evals.runner import (
+        _MOCK_STATIC_PUBLISHER_SH,
+        _build_sandbox_skill_bin,
+    )
+    from ohmo.workspace import get_skills_dir
+
+    ws = tmp_path / "ws"
+    get_skills_dir(ws).mkdir(parents=True)
+    published_dir = tmp_path / "published"
+    published_dir.mkdir()
+    (published_dir / "index.html").write_text("hello\n", encoding="utf-8")
+    skill_bin = _build_sandbox_skill_bin(ws, live_skill=True)
+    mock_pub = skill_bin.bin_dirs[0] / "static_publisher-cli"
+
+    outputs: list[str] = []
+    for args in (
+        ("publish", str(published_dir)),
+        ("--json", "publish", str(published_dir)),
+        ("publish", str(published_dir), "--json"),
+    ):
+        completed = subprocess.run(
+            ["bash", "-c", 'exec "$@"', "mock-static-publisher", mock_pub, *args],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        outputs.append(completed.stdout.strip())
+
+    assert re.fullmatch(
+        r"Published: https://worfalomey\.top/static/[0-9a-f]{16}/",
+        outputs[0],
+    )
+    for output in outputs[1:]:
+        payload = json.loads(output)
+        assert payload["mock"] is True
+        assert re.fullmatch(
+            r"https://worfalomey\.top/static/[0-9a-f]{16}/",
+            payload["url"],
+        )
+    for forbidden in ("ssh", "scp", "rsync"):
+        assert forbidden not in _MOCK_STATIC_PUBLISHER_SH
 
 
 def test_build_bwrap_argv_bin_dirs_bound_after_tmp(tmp_path):
@@ -629,6 +715,11 @@ def test_build_bwrap_argv_bin_dirs_bound_after_tmp(tmp_path):
     tmp_bind.mkdir()
     bindir = tmp_path / "skillbin"
     bindir.mkdir()
+    mock_cli = bindir / "static_publisher-cli"
+    mock_cli.write_text("mock\n", encoding="utf-8")
+    real_cli = tmp_path / "skills" / "static_publisher" / "static_publisher-cli"
+    real_cli.parent.mkdir(parents=True)
+    real_cli.write_text("real\n", encoding="utf-8")
     argv = build_bwrap_argv(
         sandbox_root=tmp_path,
         cwd=tmp_path,
@@ -637,24 +728,43 @@ def test_build_bwrap_argv_bin_dirs_bound_after_tmp(tmp_path):
         rw_binds=((tmp_bind, Path("/tmp")),),
         net_mode="host",
         bin_dirs=[bindir],
+        bind_overrides=[(mock_cli, real_cli)],
     )
     resolved = str(bindir.resolve())
     tmp_idx = _subsequence_index(argv, ["--bind", str(tmp_bind), "/tmp"])
     bin_idx = _subsequence_index(argv, ["--ro-bind", resolved, resolved])
+    override_idx = _subsequence_index(
+        argv,
+        ["--ro-bind", str(mock_cli), str(real_cli)],
+    )
     assert bin_idx > tmp_idx  # bin dir bound after /tmp -> not shadowed
+    assert override_idx > bin_idx  # file override is the final bind and wins
 
 
-def test_build_sandbox_skill_bin_mocks_dropbox(tmp_path):
+def test_build_sandbox_skill_bin_mocks_home_clis(tmp_path, monkeypatch):
     from ohmo.evals.runner import _build_sandbox_skill_bin
     from ohmo.workspace import get_skills_dir
 
     ws = tmp_path / "ws"
     get_skills_dir(ws).mkdir(parents=True)
-    dirs = _build_sandbox_skill_bin(ws, live_skill=True)
+    home = tmp_path / "home"
+    home_bin = home / "bin"
+    home_bin.mkdir(parents=True)
+    home_publisher = home_bin / "static_publisher-cli"
+    home_dropbox = home_bin / "dropbox"
+    home_publisher.write_text("real publisher\n", encoding="utf-8")
+    home_dropbox.write_text("real dropbox\n", encoding="utf-8")
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+
+    skill_bin = _build_sandbox_skill_bin(ws, live_skill=True)
+    dirs = skill_bin.bin_dirs
     mock_dropbox = dirs[0] / "dropbox"  # shadows the real ~/bin/dropbox on PATH
     assert mock_dropbox.exists() and (mock_dropbox.stat().st_mode & 0o111)
     body = mock_dropbox.read_text()
     assert "sharelink" in body and "dropbox.com/s/" in body
+    mock_publisher = dirs[0] / "static_publisher-cli"
+    assert (mock_publisher, home_publisher) in skill_bin.bind_overrides
+    assert (mock_dropbox, home_dropbox) in skill_bin.bind_overrides
 
 
 def test_fs_sandbox_default_ro_source_dirs_include_attachments():

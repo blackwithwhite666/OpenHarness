@@ -81,13 +81,15 @@ def build_bwrap_argv(
     browser_socket: str | None = None,
     browser_cli_name: str | None = None,
     bin_dirs: Iterable[str | Path] = (),
+    bind_overrides: Iterable[tuple[str | Path, str | Path]] = (),
 ) -> list[str]:
     """Build the bubblewrap argv used for real bash execution.
 
     ``bin_dirs`` are ro-bound AND prepended to PATH, so skill CLIs (which live
     nested under ``skills/<name>/<name>-cli`` and would otherwise be present-but-
     unreachable — bare invocations resolve as "command not found") become
-    runnable in the jail.
+    runnable in the jail. ``bind_overrides`` are file-level ro-binds emitted
+    after all directory binds so a mock can authoritatively shadow a real CLI.
     """
     del sandbox_root
     bwrap_argv = [
@@ -155,6 +157,15 @@ def build_bwrap_argv(
             if text not in sandbox_bin_paths:
                 bwrap_argv.extend(["--ro-bind", text, text])
                 sandbox_bin_paths.append(text)
+
+    # File-level overrides must be the final binds. In particular, a mock under
+    # the host /tmp would disappear if the disposable /tmp rw-bind were emitted
+    # after it, and a destination inside a ro-bound skill/home bin directory must
+    # be mounted over that directory's original contents.
+    for raw_src, raw_dest in bind_overrides:
+        src = Path(raw_src).expanduser()
+        dest = Path(raw_dest).expanduser()
+        bwrap_argv.extend(["--ro-bind", str(src), str(dest)])
 
     bwrap_argv.extend(
         [
@@ -307,6 +318,7 @@ class FsSandboxBashTool(BaseTool):
         browser_socket: str | None = None,
         browser_cli_name: str | None = None,
         bin_dirs: Iterable[str | Path] = (),
+        bind_overrides: Iterable[tuple[str | Path, str | Path]] = (),
         timeout: float = 120.0,
     ) -> None:
         self._mock_tool = mock_tool
@@ -323,6 +335,10 @@ class FsSandboxBashTool(BaseTool):
         self._browser_socket = browser_socket
         self._browser_cli_name = browser_cli_name
         self._bin_dirs = tuple(bin_dirs)
+        self._bind_overrides = tuple(
+            (Path(src).expanduser(), Path(dest).expanduser())
+            for src, dest in bind_overrides
+        )
         self._timeout = timeout
 
     async def execute(
@@ -353,6 +369,7 @@ class FsSandboxBashTool(BaseTool):
             browser_socket=self._browser_socket,
             browser_cli_name=self._browser_cli_name,
             bin_dirs=self._bin_dirs,
+            bind_overrides=self._bind_overrides,
         ) + ["bash", "-c", command]
         metadata = {"lane": "fs-sandbox", "net_mode": self._net_mode}
         try:
@@ -537,6 +554,9 @@ class FsSandboxAgentRunner:
         ro_source_dirs: Iterable[str | Path] | None = None,
         extra_ro_source_dirs: Iterable[str | Path] = (),
         sandbox_bin_dirs: Iterable[str | Path] = (),
+        sandbox_bind_overrides: Iterable[
+            tuple[str | Path, str | Path]
+        ] = (),
     ) -> None:
         self._api_client = api_client
         self._model = model
@@ -573,6 +593,10 @@ class FsSandboxAgentRunner:
             Path(p).expanduser() for p in extra_ro_source_dirs
         )
         self._sandbox_bin_dirs = tuple(sandbox_bin_dirs)
+        self._sandbox_bind_overrides = tuple(
+            (Path(src).expanduser(), Path(dest).expanduser())
+            for src, dest in sandbox_bind_overrides
+        )
         self._home = Path.home().resolve()
 
     def run(
@@ -660,6 +684,7 @@ class FsSandboxAgentRunner:
                         browser_socket=self._browser_socket,
                         browser_cli_name=self._browser_cli_name,
                         bin_dirs=self._sandbox_bin_dirs,
+                        bind_overrides=self._sandbox_bind_overrides,
                         timeout=self._timeout,
                     )
                 )

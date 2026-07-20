@@ -590,6 +590,9 @@ def run_ohmo_session_eval(
                     ro_source_dirs=base_faithful_runner._ro_source_dirs,
                     extra_ro_source_dirs=(),
                     sandbox_bin_dirs=base_faithful_runner._sandbox_bin_dirs,
+                    sandbox_bind_overrides=(
+                        base_faithful_runner._sandbox_bind_overrides
+                    ),
                     persist_cwd=True,
                 )
             return base_faithful_runner
@@ -862,12 +865,22 @@ _MOCK_STATIC_PUBLISHER_SH = """#!/bin/bash
 # ACL/upload is tested elsewhere; in fs-sandbox eval we only need the publish
 # step to yield a stable, groundable URL.
 cmd="${1:-}"
-if [ "$cmd" = "publish" ]; then
-  shift || true
+publish=0
+json=0
+for a in "$@"; do
+  [ "$a" = "publish" ] && publish=1
+  [ "$a" = "--json" ] && json=1
+done
+if [ "$publish" = "1" ]; then
   dir="."
-  if [ $# -ge 1 ]; then case "$1" in -*) ;; *) dir="$1";; esac; fi
-  json=0
-  for a in "$@"; do [ "$a" = "--json" ] && json=1; done
+  after_publish=0
+  for a in "$@"; do
+    if [ "$after_publish" = "0" ]; then
+      [ "$a" = "publish" ] && after_publish=1
+      continue
+    fi
+    case "$a" in -*) ;; *) dir="$a"; break;; esac
+  done
   slug=$( { find "$dir" -type f -exec cat {} + 2>&-; printf '%s' "$dir"; } | sha256sum | cut -c1-16 )
   url="https://worfalomey.top/static/$slug/"
   if [ "$json" = "1" ]; then
@@ -905,9 +918,17 @@ esac
 """
 
 
+@dataclass(frozen=True)
+class SandboxSkillBin:
+    """Skill-bin directories and authoritative mock file bind-overrides."""
+
+    bin_dirs: tuple[Path, ...]
+    bind_overrides: tuple[tuple[Path, Path], ...]
+
+
 def _build_sandbox_skill_bin(
     workspace: Path | None, *, live_skill: bool
-) -> tuple[Path, ...]:
+) -> SandboxSkillBin:
     """Expose skill CLIs on the fs-sandbox PATH, with a mocked publisher.
 
     Skill CLIs live nested (``skills/<name>/<name>-cli``), so a bare invocation
@@ -916,19 +937,23 @@ def _build_sandbox_skill_bin(
     side-effecting ``static_publisher-cli`` with a deterministic mock (a
     content-addressed ``worfalomey.top/static/<hash>/`` URL, no upload) so the
     faithful lane's publish step yields a groundable URL without a real side
-    effect. Returns bin dirs to prepend to PATH (mock dir first, so it wins).
+    effect. Returns bin dirs to prepend to PATH (mock dir first, so it wins),
+    plus file bind-overrides for absolute invocations of side-effecting CLIs.
     No-op unless ``live_skill`` (the faithful lane).
     """
     if not live_skill or workspace is None:
-        return ()
+        return SandboxSkillBin(bin_dirs=(), bind_overrides=())
     skills_dir = get_skills_dir(workspace)
     bin_root = Path(tempfile.mkdtemp(prefix="openharness-eval-skillbin-"))
     mock_dir = bin_root / "mock"
     flat_dir = bin_root / "skills"
     mock_dir.mkdir()
     flat_dir.mkdir()
+    static_publisher_targets: set[Path] = set()
     if skills_dir.is_dir():
-        for cli in skills_dir.glob("*/*-cli"):
+        for cli in sorted(skills_dir.glob("*/*-cli")):
+            if cli == skills_dir / "static_publisher" / "static_publisher-cli":
+                static_publisher_targets.add(cli)
             link = flat_dir / cli.name
             if not link.exists():
                 try:
@@ -948,7 +973,19 @@ def _build_sandbox_skill_bin(
     home_bin = Path.home() / "bin"
     if home_bin.is_dir():
         dirs.append(home_bin)
-    return tuple(dirs)
+    home_publisher = home_bin / "static_publisher-cli"
+    if home_publisher.exists():
+        static_publisher_targets.add(home_publisher)
+    bind_overrides = [
+        (mock_publisher, target) for target in sorted(static_publisher_targets)
+    ]
+    home_dropbox = home_bin / "dropbox"
+    if home_dropbox.exists():
+        bind_overrides.append((mock_dropbox, home_dropbox))
+    return SandboxSkillBin(
+        bin_dirs=tuple(dirs),
+        bind_overrides=tuple(bind_overrides),
+    )
 
 
 def _build_agent_runner_config(
@@ -1031,6 +1068,9 @@ def _build_agent_runner_config(
             replay_tools_only=False,
         )
     if normalized == "fs-sandbox":
+        sandbox_skill_bin = _build_sandbox_skill_bin(
+            workspace, live_skill=live_skill
+        )
         return _AgentRunnerConfig(
             agent_runner=FsSandboxAgentRunner(
                 api_client=api_client,
@@ -1043,9 +1083,8 @@ def _build_agent_runner_config(
                 browser_socket=sandbox_browser_socket,
                 browser_cli_name=sandbox_browser_name,
                 extra_ro_source_dirs=sandbox_ro_dirs,
-                sandbox_bin_dirs=_build_sandbox_skill_bin(
-                    workspace, live_skill=live_skill
-                ),
+                sandbox_bin_dirs=sandbox_skill_bin.bin_dirs,
+                sandbox_bind_overrides=sandbox_skill_bin.bind_overrides,
                 live_mcp_server_names=(
                     ("google_search",) if sandbox_net_mode.startswith("netns:") else ()
                 ),
