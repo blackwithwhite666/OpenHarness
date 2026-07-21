@@ -32,6 +32,60 @@ log = logging.getLogger(__name__)
 _DEFAULT_MCP_TOOL_TIMEOUT = 120.0
 
 
+def _describe_mcp_exc(exc: BaseException) -> str:
+    """Human-readable failure detail that is never empty.
+
+    Prefer an HTTP status code when the exception carries an HTTP response;
+    otherwise fall back to its message and finally its type name.
+    """
+    try:
+        type_name = type(exc).__name__ or "BaseException"
+    except BaseException:
+        type_name = "BaseException"
+
+    try:
+        response = getattr(exc, "response", None)
+        status = getattr(response, "status_code", None)
+    except BaseException:
+        status = None
+
+    try:
+        text = (str(exc) or "").strip()
+    except BaseException:
+        text = ""
+
+    if status is not None:
+        try:
+            status_text = str(status).strip() or type(status).__name__
+        except BaseException:
+            status_text = "unknown"
+        return f"HTTP {status_text}: {text or type_name}"
+
+    try:
+        inner_exceptions = getattr(exc, "exceptions", ())
+    except BaseException:
+        inner_exceptions = ()
+    if isinstance(inner_exceptions, tuple) and inner_exceptions:
+        # ExceptionGroup.__str__ adds only a count when its message is empty;
+        # that summary is no more useful than an empty exception message.
+        try:
+            group_message = getattr(exc, "message", None)
+            group_message_is_empty = group_message is not None and not str(
+                group_message
+            ).strip()
+        except BaseException:
+            group_message_is_empty = False
+        if not text or text == type_name or group_message_is_empty:
+            try:
+                inner = inner_exceptions[0]
+                if isinstance(inner, BaseException) and inner is not exc:
+                    return _describe_mcp_exc(inner)
+            except BaseException:
+                pass
+
+    return text or type_name
+
+
 def _mcp_tool_timeout() -> float | None:
     raw = os.environ.get("OPENHARNESS_MCP_TOOL_TIMEOUT")
     if raw is None or raw.strip() == "":
@@ -65,8 +119,9 @@ class _OAuthBearerAuth(httpx.Auth):
     bearer set once at connect time goes stale when the (often short-lived)
     access token expires — every later request then 401s until the process
     restarts. Refreshing per request (a cheap file read while the token is still
-    valid; a lock-serialized refresh only near expiry) keeps the connection
-    usable across token rotations without reconnecting.
+    valid; a lock-serialized refresh near expiry) keeps the connection usable
+    across token rotations without reconnecting. A 401 also force-refreshes the
+    bearer and retries the request once.
     """
 
     def __init__(self, oauth) -> None:
@@ -75,15 +130,26 @@ class _OAuthBearerAuth(httpx.Auth):
     def sync_auth_flow(self, request):
         from openharness.mcp.oauth import ensure_bearer
 
-        request.headers[self._oauth.header] = f"Bearer {ensure_bearer(self._oauth)}"
-        yield request
+        token = ensure_bearer(self._oauth)
+        request.headers[self._oauth.header] = f"Bearer {token}"
+        response = yield request
+        if response.status_code == 401:
+            token = ensure_bearer(self._oauth, force=True, stale_token=token)
+            request.headers[self._oauth.header] = f"Bearer {token}"
+            yield request
 
     async def async_auth_flow(self, request):
         from openharness.mcp.oauth import ensure_bearer
 
         token = await asyncio.to_thread(ensure_bearer, self._oauth)
         request.headers[self._oauth.header] = f"Bearer {token}"
-        yield request
+        response = yield request
+        if response.status_code == 401:
+            token = await asyncio.to_thread(
+                lambda: ensure_bearer(self._oauth, force=True, stale_token=token)
+            )
+            request.headers[self._oauth.header] = f"Bearer {token}"
+            yield request
 
 
 class McpClientManager:
@@ -245,7 +311,7 @@ class McpClientManager:
             ) from exc
         except Exception as exc:
             raise McpServerNotConnectedError(
-                f"MCP server '{server_name}' call failed: {exc}"
+                f"MCP server '{server_name}' call failed: {_describe_mcp_exc(exc)}"
             ) from exc
         parts: list[str] = []
         for item in result.content:
@@ -272,7 +338,8 @@ class McpClientManager:
             result: ReadResourceResult = await session.read_resource(uri)
         except Exception as exc:
             raise McpServerNotConnectedError(
-                f"MCP server '{server_name}' resource read failed: {exc}"
+                f"MCP server '{server_name}' resource read failed: "
+                f"{_describe_mcp_exc(exc)}"
             ) from exc
         parts: list[str] = []
         for item in result.contents:

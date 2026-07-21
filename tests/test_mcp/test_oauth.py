@@ -56,6 +56,39 @@ def test_near_expiry_triggers_refresh(tmp_path, monkeypatch):
     assert oauth_mod.ensure_bearer(_cfg(tf)) == "NEW"
 
 
+def test_ensure_bearer_force_refreshes_even_when_token_valid(tmp_path, monkeypatch):
+    tf = tmp_path / "tok.json"
+    tf.write_text(
+        json.dumps(
+            {"access_token": "OLD", "expires_at": time.time() + 3600, "refresh_token": "R1"}
+        )
+    )
+    calls = []
+
+    def fake_refresh(oauth, refresh_token):
+        calls.append(refresh_token)
+        return {"access_token": "NEW", "expires_in": 3600}
+
+    monkeypatch.setattr(oauth_mod, "_refresh", fake_refresh)
+    assert oauth_mod.ensure_bearer(_cfg(tf), force=True) == "NEW"
+    assert calls == ["R1"]
+
+
+def test_ensure_bearer_force_dedups_via_stale_token(tmp_path, monkeypatch):
+    tf = tmp_path / "tok.json"
+    tf.write_text(
+        json.dumps(
+            {"access_token": "NEW", "expires_at": time.time() + 3600, "refresh_token": "R2"}
+        )
+    )
+
+    def _boom(*a, **k):
+        raise AssertionError("refresh should not run after another caller rotated the token")
+
+    monkeypatch.setattr(oauth_mod, "_refresh", _boom)
+    assert oauth_mod.ensure_bearer(_cfg(tf), force=True, stale_token="OLD") == "NEW"
+
+
 def test_refresh_omits_scope_but_keeps_resource(tmp_path, monkeypatch):
     """`scope` must NOT be sent on the refresh grant (RFC 6749 §6 optional; strict
     servers 400 on it, silently killing the rotating chain). `resource` is kept."""
@@ -124,6 +157,47 @@ def test_concurrent_refresh_runs_once(tmp_path, monkeypatch):
 
     assert results[0] == results[1] == "NEW"
     assert len(calls) == 1  # lock + double-check collapses the duplicate refresh
+
+
+def test_oauth_bearer_auth_retries_once_on_401(tmp_path, monkeypatch):
+    from openharness.mcp.client import _OAuthBearerAuth
+
+    cfg = _cfg(tmp_path / "tok.json")
+    auth = _OAuthBearerAuth(cfg)
+    calls = []
+
+    def fake_ensure_bearer(oauth, **kwargs):
+        calls.append(kwargs)
+        return "NEW" if kwargs.get("force") else "OLD"
+
+    monkeypatch.setattr(oauth_mod, "ensure_bearer", fake_ensure_bearer)
+
+    class _Request:
+        def __init__(self):
+            self.headers = {}
+
+    class _Response:
+        def __init__(self, status_code):
+            self.status_code = status_code
+
+    request = _Request()
+    flow = auth.sync_auth_flow(request)
+    first = next(flow)
+    assert first.headers[cfg.header] == "Bearer OLD"
+    second = flow.send(_Response(401))
+    assert second is request
+    assert second.headers[cfg.header] == "Bearer NEW"
+    assert calls == [{}, {"force": True, "stale_token": "OLD"}]
+    with pytest.raises(StopIteration):
+        flow.send(_Response(401))
+
+    calls.clear()
+    request = _Request()
+    flow = auth.sync_auth_flow(request)
+    next(flow)
+    with pytest.raises(StopIteration):
+        flow.send(_Response(200))
+    assert calls == [{}]
 
 
 @pytest.mark.asyncio
