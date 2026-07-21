@@ -944,6 +944,89 @@ esac
 """
 
 
+_MOCK_FALAI_SH = """#!/bin/bash
+# Eval-only mock of falai-cli: returns deterministic fal.media URLs without
+# contacting fal.ai. Generating results carry a mock sentinel so the faithful
+# eval judge can ground them without mistaking them for real generated media.
+cmd=""
+json=0
+for a in "$@"; do
+  [ "$a" = "--json" ] && json=1
+  if [ -z "$cmd" ]; then
+    case "$a" in
+      image|video|run|submit|models|params|upload|status|result|cancel) cmd="$a";;
+    esac
+  fi
+done
+if [ -z "$cmd" ]; then
+  for a in "$@"; do
+    case "$a" in -*) ;; *) cmd="$a"; break;; esac
+  done
+fi
+
+hash=$(printf '%s' "$*" | sha256sum | cut -c1-16)
+
+case "$cmd" in
+  image|video|run)
+    if [ "$cmd" = "image" ]; then ext="png"; else ext="mp4"; fi
+    url="https://fal.media/files/$hash/output.$ext"
+    save_dir=""
+    want_save=0
+    for a in "$@"; do
+      if [ "$want_save" = "1" ]; then save_dir="$a"; want_save=0; continue; fi
+      case "$a" in
+        --save) want_save=1;;
+        --save=*) save_dir="${a#--save=}";;
+      esac
+    done
+    saved_path=""
+    if [ -n "$save_dir" ]; then
+      mkdir -p "$save_dir"
+      saved_path="$save_dir/output.$ext"
+      printf 'mock\\n' > "$saved_path"
+    fi
+    if [ "$json" = "1" ]; then
+      if [ "$cmd" = "image" ]; then
+        if [ -n "$saved_path" ]; then
+          printf '{"images":[{"url":"%s"}],"saved_path":"%s","mock":true}\\n' "$url" "$saved_path"
+        else
+          printf '{"images":[{"url":"%s"}],"mock":true}\\n' "$url"
+        fi
+      elif [ -n "$saved_path" ]; then
+        printf '{"video":{"url":"%s"},"saved_path":"%s","mock":true}\\n' "$url" "$saved_path"
+      else
+        printf '{"video":{"url":"%s"},"mock":true}\\n' "$url"
+      fi
+    else
+      printf '%s (mock)\\n' "$url"
+      [ -n "$saved_path" ] && printf 'Saved: %s (mock)\\n' "$saved_path"
+    fi
+    ;;
+  submit)
+    if [ "$json" = "1" ]; then
+      printf '{"request_id":"%s","status":"COMPLETED","mock":true}\\n' "$hash"
+    else
+      printf 'request_id: %s (mock)\\n' "$hash"
+    fi
+    ;;
+  models)
+    if [ "$json" = "1" ]; then
+      printf '{"models":[],"mock":true}\\n'
+    else
+      printf 'fal-ai/flux/dev\\nfal-ai/bytedance/seedance/v1/lite/text-to-video (mock)\\n'
+    fi
+    ;;
+  *)
+    if [ "$json" = "1" ]; then
+      printf '{"command":"%s","mock":true}\\n' "${cmd:-unknown}"
+    else
+      printf 'mock falai-cli: %s\\n' "$*"
+    fi
+    ;;
+esac
+"""
+
+
 @dataclass(frozen=True)
 class SandboxSkillBin:
     """Skill-bin directories and authoritative mock file bind-overrides."""
@@ -955,17 +1038,16 @@ class SandboxSkillBin:
 def _build_sandbox_skill_bin(
     workspace: Path | None, *, live_skill: bool
 ) -> SandboxSkillBin:
-    """Expose skill CLIs on the fs-sandbox PATH, with a mocked publisher.
+    """Expose skill CLIs on the fs-sandbox PATH, with side effects mocked.
 
     Skill CLIs live nested (``skills/<name>/<name>-cli``), so a bare invocation
     resolves as "command not found" inside the jail even though the dir is
     ro-bound (PATH is only ``/usr/bin:/bin``). Symlink them flat, and shadow the
-    side-effecting ``static_publisher-cli`` with a deterministic mock (a
-    content-addressed ``worfalomey.top/static/<hash>/`` URL, no upload) so the
-    faithful lane's publish step yields a groundable URL without a real side
-    effect. Returns bin dirs to prepend to PATH (mock dir first, so it wins),
-    plus file bind-overrides for absolute invocations of side-effecting CLIs.
-    No-op unless ``live_skill`` (the faithful lane).
+    side-effecting publisher and fal.ai CLIs with deterministic mocks so the
+    faithful lane yields groundable URLs without real side effects. Returns bin
+    dirs to prepend to PATH (mock dir first, so it wins), plus file
+    bind-overrides for absolute invocations of side-effecting CLIs. No-op unless
+    ``live_skill`` (the faithful lane).
     """
     if not live_skill or workspace is None:
         return SandboxSkillBin(bin_dirs=(), bind_overrides=())
@@ -976,10 +1058,13 @@ def _build_sandbox_skill_bin(
     mock_dir.mkdir()
     flat_dir.mkdir()
     static_publisher_targets: set[Path] = set()
+    falai_targets: set[Path] = set()
     if skills_dir.is_dir():
         for cli in sorted(skills_dir.glob("*/*-cli")):
             if cli == skills_dir / "static_publisher" / "static_publisher-cli":
                 static_publisher_targets.add(cli)
+            if cli == skills_dir / "falai" / "falai-cli":
+                falai_targets.add(cli)
             link = flat_dir / cli.name
             if not link.exists():
                 try:
@@ -989,6 +1074,9 @@ def _build_sandbox_skill_bin(
     mock_publisher = mock_dir / "static_publisher-cli"
     mock_publisher.write_text(_MOCK_STATIC_PUBLISHER_SH, encoding="utf-8")
     mock_publisher.chmod(0o755)
+    mock_falai = mock_dir / "falai-cli"
+    mock_falai.write_text(_MOCK_FALAI_SH, encoding="utf-8")
+    mock_falai.chmod(0o755)
     # Shadow the real ~/bin/dropbox (nautilus daemon controller, needs a running
     # daemon + creds) with a deterministic share-link mock; mock_dir is first on
     # PATH so it wins.
@@ -1002,9 +1090,13 @@ def _build_sandbox_skill_bin(
     home_publisher = home_bin / "static_publisher-cli"
     if home_publisher.exists():
         static_publisher_targets.add(home_publisher)
+    home_falai = home_bin / "falai-cli"
+    if home_falai.exists():
+        falai_targets.add(home_falai)
     bind_overrides = [
         (mock_publisher, target) for target in sorted(static_publisher_targets)
     ]
+    bind_overrides.extend((mock_falai, target) for target in sorted(falai_targets))
     home_dropbox = home_bin / "dropbox"
     if home_dropbox.exists():
         bind_overrides.append((mock_dropbox, home_dropbox))

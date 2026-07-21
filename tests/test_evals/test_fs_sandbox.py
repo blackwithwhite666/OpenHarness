@@ -704,6 +704,82 @@ def test_static_publisher_mock_accepts_global_json_flag(tmp_path):
         assert forbidden not in _MOCK_STATIC_PUBLISHER_SH
 
 
+def test_build_sandbox_skill_bin_mocks_falai(tmp_path):
+    from ohmo.evals.runner import _build_sandbox_skill_bin
+    from ohmo.workspace import get_skills_dir
+
+    ws = tmp_path / "ws"
+    skills = get_skills_dir(ws)
+    (skills / "falai").mkdir(parents=True)
+    real_falai = skills / "falai" / "falai-cli"
+    real_falai.write_text("real", encoding="utf-8")
+
+    skill_bin = _build_sandbox_skill_bin(ws, live_skill=True)
+
+    mock_falai = skill_bin.bin_dirs[0] / "falai-cli"
+    assert mock_falai.exists() and (mock_falai.stat().st_mode & 0o111)
+    assert (mock_falai, real_falai) in skill_bin.bind_overrides
+
+
+def test_falai_mock_generates_groundable_media_without_network(tmp_path):
+    from ohmo.evals.runner import _MOCK_FALAI_SH, _build_sandbox_skill_bin
+    from ohmo.workspace import get_skills_dir
+
+    ws = tmp_path / "ws"
+    get_skills_dir(ws).mkdir(parents=True)
+    skill_bin = _build_sandbox_skill_bin(ws, live_skill=True)
+    mock_falai = skill_bin.bin_dirs[0] / "falai-cli"
+    save_dir = tmp_path / "saved"
+
+    cases = (
+        (("video", "a cat", "--json"), "video", "mp4"),
+        (("image", "a dog", "--json"), "image", "png"),
+        (("--json", "video", "x"), "video", "mp4"),
+        (("video", "saved", "--save", str(save_dir), "--json"), "video", "mp4"),
+    )
+    outputs: list[str] = []
+    for args, kind, extension in cases:
+        completed = subprocess.run(
+            ["bash", "-c", 'exec "$@"', "mock-falai", mock_falai, *args],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        outputs.append(completed.stdout.strip())
+        payload = json.loads(completed.stdout)
+        assert payload["mock"] is True
+        url = (
+            payload["images"][0]["url"]
+            if kind == "image"
+            else payload["video"]["url"]
+        )
+        assert re.fullmatch(
+            rf"https://fal\.media/files/[0-9a-f]{{16}}/output\.{extension}",
+            url,
+        )
+
+    repeated = subprocess.run(
+        [
+            "bash",
+            "-c",
+            'exec "$@"',
+            "mock-falai",
+            mock_falai,
+            "video",
+            "a cat",
+            "--json",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert repeated.stdout.strip() == outputs[0]
+    assert (save_dir / "output.mp4").read_bytes() == b"mock\n"
+    assert json.loads(outputs[-1])["saved_path"] == str(save_dir / "output.mp4")
+    for forbidden in ("curl", "wget"):
+        assert forbidden not in _MOCK_FALAI_SH
+
+
 def test_build_bwrap_argv_bin_dirs_bound_after_tmp(tmp_path):
     # Regression: a skill-bin dir lives under /tmp (mkdtemp), and /tmp is itself an
     # rw-bind to the disposable sandbox tmp. The bin dir must be ro-bound AFTER the
@@ -752,8 +828,10 @@ def test_build_sandbox_skill_bin_mocks_home_clis(tmp_path, monkeypatch):
     home_bin.mkdir(parents=True)
     home_publisher = home_bin / "static_publisher-cli"
     home_dropbox = home_bin / "dropbox"
+    home_falai = home_bin / "falai-cli"
     home_publisher.write_text("real publisher\n", encoding="utf-8")
     home_dropbox.write_text("real dropbox\n", encoding="utf-8")
+    home_falai.write_text("real falai\n", encoding="utf-8")
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
 
     skill_bin = _build_sandbox_skill_bin(ws, live_skill=True)
@@ -763,8 +841,10 @@ def test_build_sandbox_skill_bin_mocks_home_clis(tmp_path, monkeypatch):
     body = mock_dropbox.read_text()
     assert "sharelink" in body and "dropbox.com/s/" in body
     mock_publisher = dirs[0] / "static_publisher-cli"
+    mock_falai = dirs[0] / "falai-cli"
     assert (mock_publisher, home_publisher) in skill_bin.bind_overrides
     assert (mock_dropbox, home_dropbox) in skill_bin.bind_overrides
+    assert (mock_falai, home_falai) in skill_bin.bind_overrides
 
 
 def test_fs_sandbox_default_ro_source_dirs_include_attachments():
