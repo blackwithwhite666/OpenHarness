@@ -8,7 +8,7 @@ import os
 import shutil
 import sys
 import tempfile
-from collections.abc import Iterable, Mapping
+from collections.abc import Coroutine, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -392,6 +392,11 @@ class FsSandboxBashTool(BaseTool):
                     is_error=True,
                     metadata={**metadata, "timeout": self._timeout},
                 )
+            except asyncio.CancelledError:
+                if process.returncode is None:
+                    process.kill()
+                await process.wait()
+                raise
         except OSError:
             result = await self._mock_tool.execute(arguments, context)
             return ToolResult(
@@ -606,6 +611,34 @@ class FsSandboxAgentRunner:
         tool_registry: ToolRegistry,
         context: EvalExecutionContext,
     ) -> EvalExecutorResult:
+        return _run_eval_coroutine(
+            self._run_coroutine(
+                prompt=prompt,
+                tool_registry=tool_registry,
+                context=context,
+            )
+        )
+
+    async def run_async(
+        self,
+        *,
+        prompt: str,
+        tool_registry: ToolRegistry,
+        context: EvalExecutionContext,
+    ) -> EvalExecutorResult:
+        return await self._run_coroutine(
+            prompt=prompt,
+            tool_registry=tool_registry,
+            context=context,
+        )
+
+    def _run_coroutine(
+        self,
+        *,
+        prompt: str,
+        tool_registry: ToolRegistry,
+        context: EvalExecutionContext,
+    ) -> Coroutine[object, object, EvalExecutorResult]:
         async def _run_async() -> EvalExecutorResult:
             sandbox_root = Path(
                 tempfile.mkdtemp(prefix="openharness-eval-fs-sandbox-")
@@ -727,7 +760,7 @@ class FsSandboxAgentRunner:
                         )
                 shutil.rmtree(sandbox_root, ignore_errors=True)
 
-        return _run_eval_coroutine(_run_async())
+        return _run_async()
 
 
 def _rebind_local_state_tools(tool_registry: ToolRegistry, state_root: Path) -> tuple[str, ...]:

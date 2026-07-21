@@ -455,6 +455,7 @@ def run_ohmo_session_eval(
     sandbox_browser_socket: str | None = None,
     sandbox_browser_name: str | None = None,
     sandbox_ro_dirs: tuple[str, ...] = (),
+    session_timeout: float | None = 900.0,
 ) -> OhmoSessionEvalRunResult:
     """Run P0 session replay checks over captured Ohmo eval episodes.
 
@@ -482,6 +483,8 @@ def run_ohmo_session_eval(
         raise ValueError("judge_votes must be positive")
     if grounding_votes < 1:
         raise ValueError("grounding_votes must be positive")
+    if session_timeout is not None and session_timeout < 0:
+        raise ValueError("session_timeout must be non-negative")
     fixture_match = _validate_fixture_match(fixture_match)
     preset = preset.strip().lower()
     if preset not in {"inner", "faithful"}:
@@ -631,17 +634,37 @@ def run_ohmo_session_eval(
     cases = []
     total = len(groups)
     for index, group in enumerate(groups, start=1):
-        case = _run_session_report_case_sampled(
-            store=store,
-            group=group,
-            runner=runner,
-            samples=samples,
-            gold_capabilities_by_session=gold_capabilities_by_session,
-            user_simulator_factory=user_simulator_factory,
-            clarification_allowed_by_session=clarification_allowed_by_session,
-            judge_votes=judge_votes,
-            grounding_votes=grounding_votes,
-        )
+        try:
+            case = _run_session_report_case_sampled(
+                store=store,
+                group=group,
+                runner=runner,
+                samples=samples,
+                gold_capabilities_by_session=gold_capabilities_by_session,
+                user_simulator_factory=user_simulator_factory,
+                clarification_allowed_by_session=clarification_allowed_by_session,
+                judge_votes=judge_votes,
+                grounding_votes=grounding_votes,
+                session_timeout=session_timeout,
+            )
+        except asyncio.TimeoutError:
+            timeout_s = float(session_timeout or 0.0)
+            case = EvalSessionReportCase(
+                session_id=group.session_id,
+                status="errored",
+                score=0.0,
+                checks={},
+                metadata={
+                    "errored": True,
+                    "error": "session-timeout",
+                    "timeout_s": timeout_s,
+                    "session_id": group.session_id,
+                },
+            )
+            print(
+                f"session {group.session_id} ERRORED after "
+                f"{timeout_s:g}s (timeout)"
+            )
         cases.append(case)
         _append_session_progress(
             progress_path,
@@ -650,7 +673,8 @@ def run_ohmo_session_eval(
             case=case,
         )
     passed_count = sum(1 for case in cases if case.status == "passed")
-    failed_count = len(cases) - passed_count
+    failed_count = sum(1 for case in cases if case.status == "failed")
+    errored_count = sum(1 for case in cases if case.status == "errored")
     mean_replay_hit_rate = (
         sum(float(case.metadata.get("replay_hit_rate", 0.0)) for case in cases)
         / len(cases)
@@ -665,6 +689,7 @@ def run_ohmo_session_eval(
         session_count=len(cases),
         passed_count=passed_count,
         failed_count=failed_count,
+        errored_count=errored_count,
         cases=cases,
         metadata={
             "privacy": "metadata_only",
@@ -689,6 +714,7 @@ def run_ohmo_session_eval(
             "samples": samples,
             "judge_votes": judge_votes,
             "grounding_votes": grounding_votes,
+            "session_timeout": session_timeout or 0.0,
         },
     )
     atomic_write_text(path, report.model_dump_json(indent=2) + "\n")
@@ -1434,8 +1460,37 @@ def _run_session_report_case_sampled(
     clarification_allowed_by_session: Mapping[str, bool] | None,
     judge_votes: int,
     grounding_votes: int,
+    session_timeout: float | None = None,
 ) -> EvalSessionReportCase:
-    first = _run_session_report_case(
+    coroutine = _run_session_report_case_sampled_async(
+        store=store,
+        group=group,
+        runner=runner,
+        samples=samples,
+        gold_capabilities_by_session=gold_capabilities_by_session,
+        user_simulator_factory=user_simulator_factory,
+        clarification_allowed_by_session=clarification_allowed_by_session,
+        judge_votes=judge_votes,
+        grounding_votes=grounding_votes,
+    )
+    if session_timeout is not None and session_timeout > 0:
+        coroutine = asyncio.wait_for(coroutine, timeout=session_timeout)
+    return _run_eval_coroutine(coroutine)
+
+
+async def _run_session_report_case_sampled_async(
+    *,
+    store,
+    group,
+    runner: SessionReplayRunner | FaithfulSessionRunner,
+    samples: int,
+    gold_capabilities_by_session: Mapping[str, Sequence[str]] | None,
+    user_simulator_factory: Callable[[], UserSimulator] | None,
+    clarification_allowed_by_session: Mapping[str, bool] | None,
+    judge_votes: int,
+    grounding_votes: int,
+) -> EvalSessionReportCase:
+    first = await _run_session_report_case_async(
         store=store,
         group=group,
         runner=runner,
@@ -1451,7 +1506,7 @@ def _run_session_report_case_sampled(
     sample_cases = [first]
     for _ in range(samples - 1):
         sample_cases.append(
-            _run_session_report_case(
+            await _run_session_report_case_async(
                 store=store,
                 group=group,
                 runner=runner,
@@ -1498,6 +1553,31 @@ def _run_session_report_case(
     judge_votes: int,
     grounding_votes: int,
 ) -> EvalSessionReportCase:
+    return _run_eval_coroutine(
+        _run_session_report_case_async(
+            store=store,
+            group=group,
+            runner=runner,
+            gold_capabilities_by_session=gold_capabilities_by_session,
+            user_simulator_factory=user_simulator_factory,
+            clarification_allowed_by_session=clarification_allowed_by_session,
+            judge_votes=judge_votes,
+            grounding_votes=grounding_votes,
+        )
+    )
+
+
+async def _run_session_report_case_async(
+    *,
+    store,
+    group,
+    runner: SessionReplayRunner | FaithfulSessionRunner,
+    gold_capabilities_by_session: Mapping[str, Sequence[str]] | None,
+    user_simulator_factory: Callable[[], UserSimulator] | None,
+    clarification_allowed_by_session: Mapping[str, bool] | None,
+    judge_votes: int,
+    grounding_votes: int,
+) -> EvalSessionReportCase:
     gold_source = (
         "provided"
         if gold_capabilities_by_session
@@ -1516,20 +1596,10 @@ def _run_session_report_case(
     user_simulator = (
         user_simulator_factory() if user_simulator_factory is not None else None
     )
-    result = (
-        runner.run(
-            group=group,
-            store=store,
-            user_simulator=user_simulator,
-        )
-        if not isinstance(runner, FaithfulSessionRunner)
-        else _run_eval_coroutine(
-            runner.run_session(
-                group=group,
-                store=store,
-                user_simulator=user_simulator,
-            )
-        )
+    result = await runner.run_session(
+        group=group,
+        store=store,
+        user_simulator=user_simulator,
     )
     captured_prompts_list: list[str] = []
     for episode_id in group.episode_ids:
@@ -1546,18 +1616,16 @@ def _run_session_report_case(
     score_payload: dict
     if isinstance(runner, FaithfulSessionRunner):
         transcript = result.metadata.get("transcript", ())
-        score_payload = _run_eval_coroutine(
-            score_faithful_session(
-                runner._api_client,
-                runner._model,
-                captured_prompts=captured_prompts,
-                transcript=transcript,
-                final_text=result.final_text,
-                tool_calls=result.tool_calls,
-                search=_default_grounding_search,
-                judge_votes=judge_votes,
-                grounding_votes=grounding_votes,
-            )
+        score_payload = await score_faithful_session(
+            runner._api_client,
+            runner._model,
+            captured_prompts=captured_prompts,
+            transcript=transcript,
+            final_text=result.final_text,
+            tool_calls=result.tool_calls,
+            search=_default_grounding_search,
+            judge_votes=judge_votes,
+            grounding_votes=grounding_votes,
         )
     else:
         score_payload = score_session(

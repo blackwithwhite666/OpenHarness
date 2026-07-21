@@ -656,6 +656,7 @@ class EvalSessionReport(BaseModel):
     session_count: int
     passed_count: int
     failed_count: int
+    errored_count: int = 0
     cases: list[EvalSessionReportCase] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)
 

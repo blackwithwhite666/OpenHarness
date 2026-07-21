@@ -245,6 +245,7 @@ def _eval_session_run_summary(result: object) -> dict[str, object]:
         "session_count": getattr(report, "session_count"),
         "passed_count": getattr(report, "passed_count"),
         "failed_count": getattr(report, "failed_count"),
+        "errored_count": getattr(report, "errored_count", 0),
     }
 
 
@@ -2884,6 +2885,12 @@ def evals_run_session_cmd(
         min=1,
         help="Drop conversations shorter than this many turns when --segment",
     ),
+    session_timeout: float = typer.Option(
+        900.0,
+        "--session-timeout",
+        min=0.0,
+        help="Per-session wall-clock timeout in seconds (0 disables)",
+    ),
     json_output: bool = typer.Option(False, "--json", help="Print a JSON summary"),
 ) -> None:
     """Run session-level replay checks over captured Ohmo eval episodes."""
@@ -2912,6 +2919,7 @@ def evals_run_session_cmd(
             sandbox_browser_socket=sandbox_browser_socket,
             sandbox_browser_name=sandbox_browser_name,
             sandbox_ro_dirs=tuple(sandbox_ro_dir),
+            session_timeout=session_timeout,
         )
     except (FileNotFoundError, ValueError) as exc:
         print(str(exc), file=sys.stderr)
@@ -2920,17 +2928,18 @@ def evals_run_session_cmd(
     report = result.write.report
     if json_output:
         _print_json_summary(_eval_session_run_summary(result))
-        if report.failed_count:
+        if report.failed_count or getattr(report, "errored_count", 0):
             raise typer.Exit(1)
         return
 
     print(f"Wrote session eval report: {result.write.path}")
     print(
-        "Session eval evaluated "
-        f"{report.session_count} sessions: "
-        f"passed={report.passed_count} failed={report.failed_count}"
+        "Session eval evaluated: "
+        f"passed={report.passed_count} failed={report.failed_count} "
+        f"errored={getattr(report, 'errored_count', 0)} "
+        f"of {report.session_count}"
     )
-    if report.failed_count:
+    if report.failed_count or getattr(report, "errored_count", 0):
         raise typer.Exit(1)
 
 

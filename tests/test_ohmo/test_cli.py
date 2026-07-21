@@ -1875,6 +1875,7 @@ def test_ohmo_evals_run_session_command_runs_session_eval(tmp_path: Path, monkey
         sandbox_browser_socket: str | None = None,
         sandbox_browser_name: str | None = None,
         sandbox_ro_dirs: tuple[str, ...] = (),
+        session_timeout: float | None = 900.0,
     ):
         calls.append(
             {
@@ -1902,6 +1903,7 @@ def test_ohmo_evals_run_session_command_runs_session_eval(tmp_path: Path, monkey
                 "sandbox_browser_socket": sandbox_browser_socket,
                 "sandbox_browser_name": sandbox_browser_name,
                 "sandbox_ro_dirs": sandbox_ro_dirs,
+                "session_timeout": session_timeout,
             }
         )
         return SimpleNamespace(
@@ -1914,6 +1916,7 @@ def test_ohmo_evals_run_session_command_runs_session_eval(tmp_path: Path, monkey
                     session_count=2,
                     passed_count=2,
                     failed_count=0,
+                    errored_count=0,
                 ),
             ),
         )
@@ -1969,12 +1972,14 @@ def test_ohmo_evals_run_session_command_runs_session_eval(tmp_path: Path, monkey
             "45",
             "--min-turns",
             "3",
+            "--session-timeout",
+            "12.5",
         ],
     )
 
     assert result.exit_code == 0
     assert "Wrote session eval report:" in result.output
-    assert "Session eval evaluated 2 sessions: passed=2 failed=0" in result.output
+    assert "passed=2 failed=0 errored=0 of 2" in result.output
     assert calls == [
         {
             "workspace": workspace.resolve(),
@@ -2001,6 +2006,7 @@ def test_ohmo_evals_run_session_command_runs_session_eval(tmp_path: Path, monkey
             "sandbox_browser_socket": "/tmp/b.sock",
             "sandbox_browser_name": "ohmo",
             "sandbox_ro_dirs": ("/a", "/b"),
+            "session_timeout": 12.5,
         }
     ]
 

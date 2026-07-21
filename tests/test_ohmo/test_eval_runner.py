@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 
@@ -340,6 +341,202 @@ class _FaithfulSessionEvalFsRunner:
         )
 
 
+class _TimeoutSessionEvalRunner:
+    def __init__(self, *, hanging_prompts: tuple[str, ...] = ()) -> None:
+        self._cwd = Path.cwd()
+        self._hanging_prompts = hanging_prompts
+        self._never_set = asyncio.Event()
+        self.started_prompts: list[str] = []
+        self.cleaned_prompts: list[str] = []
+        self.workspaces: list[Path] = []
+
+    async def run_async(
+        self,
+        *,
+        prompt: str,
+        tool_registry: object,
+        context: object,
+    ) -> EvalExecutorResult:
+        del tool_registry, context
+        self.started_prompts.append(prompt)
+        self.workspaces.append(self._cwd)
+        try:
+            if any(marker in prompt for marker in self._hanging_prompts):
+                await self._never_set.wait()
+            return EvalExecutorResult(final_text=f"completed {prompt}")
+        finally:
+            self.cleaned_prompts.append(prompt)
+
+
+def _install_timeout_session_fakes(
+    monkeypatch,
+    *,
+    workspace: Path,
+    hanging_prompts: tuple[str, ...] = (),
+) -> _TimeoutSessionEvalRunner:
+    fake_runner = _TimeoutSessionEvalRunner(hanging_prompts=hanging_prompts)
+
+    def fake_build_agent_runner_config(agent_runner_name, **_kwargs):
+        assert agent_runner_name == "fs-sandbox"
+        return runner_module._AgentRunnerConfig(
+            agent_runner=fake_runner,
+            agent_runner_name="fs-sandbox",
+            model="fake-model",
+            provider_profile="fake-profile",
+            api_client=object(),
+            system_prompt="FAKE_PROMPT",
+            cwd=workspace,
+        )
+
+    async def fake_score_faithful_session(
+        *_args,
+        captured_prompts,
+        **_kwargs,
+    ):
+        passed = not any("session-3" in prompt for prompt in captured_prompts)
+        checks = {
+            "intent_met": passed,
+            "constraints_held": True,
+            "grounding_ok": True,
+        }
+        return {
+            "passed": passed,
+            "score": sum(checks.values()) / len(checks),
+            "checks": checks,
+            "missing_capabilities": [],
+            "observed_capabilities": [],
+            "constraints": [],
+            "intent_evidence": "",
+            "grounding": {},
+        }
+
+    monkeypatch.setattr(
+        runner_module,
+        "_build_agent_runner_config",
+        fake_build_agent_runner_config,
+    )
+    monkeypatch.setattr(runner_module, "_ohmo_sandbox_state", lambda _path: {})
+    monkeypatch.setattr(
+        runner_module,
+        "score_faithful_session",
+        fake_score_faithful_session,
+    )
+    return fake_runner
+
+
+async def test_run_ohmo_session_eval_timeout_isolates_wedged_middle_session(
+    tmp_path: Path,
+    monkeypatch,
+):
+    workspace = tmp_path / "workspace"
+    store = get_eval_store(workspace)
+    for number in (1, 2, 3):
+        _append_session_episode(
+            store,
+            episode_id=f"ep-{number}",
+            session_id=f"session-{number}",
+            user_text=f"request for session-{number}",
+            tool_call_id=f"tool-{number}",
+        )
+    fake_runner = _install_timeout_session_fakes(
+        monkeypatch,
+        workspace=workspace,
+        hanging_prompts=("session-2",),
+    )
+
+    result = await asyncio.wait_for(
+        asyncio.to_thread(
+            run_ohmo_session_eval,
+            workspace=workspace,
+            preset="faithful",
+            session_timeout=0.2,
+        ),
+        timeout=2.0,
+    )
+
+    report = result.write.report
+    assert report.session_count == 3
+    assert report.passed_count == 1
+    assert report.failed_count == 1
+    assert report.errored_count == 1
+    assert [case.status for case in report.cases] == ["passed", "errored", "failed"]
+    timed_out = report.cases[1]
+    assert timed_out.score == 0.0
+    assert timed_out.checks == {}
+    assert timed_out.metadata == {
+        "errored": True,
+        "error": "session-timeout",
+        "timeout_s": 0.2,
+        "session_id": "session-2",
+    }
+    assert any("session-3" in prompt for prompt in fake_runner.started_prompts)
+
+
+@pytest.mark.parametrize("session_timeout", [None, 0])
+def test_run_ohmo_session_eval_can_disable_session_timeout(
+    tmp_path: Path,
+    monkeypatch,
+    session_timeout: float | None,
+):
+    workspace = tmp_path / "workspace"
+    store = get_eval_store(workspace)
+    for number in (1, 2, 3):
+        _append_session_episode(
+            store,
+            episode_id=f"ep-{number}",
+            session_id=f"session-{number}",
+            user_text=f"request for session-{number}",
+            tool_call_id=f"tool-{number}",
+        )
+    _install_timeout_session_fakes(monkeypatch, workspace=workspace)
+
+    report = run_ohmo_session_eval(
+        workspace=workspace,
+        preset="faithful",
+        session_timeout=session_timeout,
+    ).write.report
+
+    assert [case.status for case in report.cases] == ["passed", "passed", "failed"]
+    assert report.passed_count == 2
+    assert report.failed_count == 1
+    assert report.errored_count == 0
+
+
+async def test_run_ohmo_session_eval_timeout_cleans_up_session_runner(
+    tmp_path: Path,
+    monkeypatch,
+):
+    workspace = tmp_path / "workspace"
+    store = get_eval_store(workspace)
+    _append_session_episode(
+        store,
+        episode_id="ep-timeout",
+        session_id="session-timeout",
+        user_text="request that hangs",
+        tool_call_id="tool-timeout",
+    )
+    fake_runner = _install_timeout_session_fakes(
+        monkeypatch,
+        workspace=workspace,
+        hanging_prompts=("request that hangs",),
+    )
+
+    result = await asyncio.wait_for(
+        asyncio.to_thread(
+            run_ohmo_session_eval,
+            workspace=workspace,
+            preset="faithful",
+            session_timeout=0.1,
+        ),
+        timeout=2.0,
+    )
+
+    assert result.write.report.errored_count == 1
+    assert len(fake_runner.cleaned_prompts) == 1
+    assert len(set(fake_runner.workspaces)) == 1
+    assert all(not path.exists() for path in fake_runner.workspaces)
+
+
 def test_run_ohmo_session_eval_faithful_preset_records_sandbox_state_delta(
     tmp_path: Path,
     monkeypatch,
@@ -503,11 +700,12 @@ def test_run_session_report_case_sampled_includes_check_rates(monkeypatch):
     )
     iterator = iter(cases)
 
-    def fake_run_session_report_case(*args, **kwargs):
+    async def fake_run_session_report_case(*args, **kwargs):
         return next(iterator)
 
     monkeypatch.setattr(
-        "ohmo.evals.runner._run_session_report_case", fake_run_session_report_case
+        "ohmo.evals.runner._run_session_report_case_async",
+        fake_run_session_report_case,
     )
 
     case = runner_module._run_session_report_case_sampled(

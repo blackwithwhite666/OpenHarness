@@ -804,13 +804,21 @@ class FaithfulSessionRunner:
                     else ""
                 )
                 transcript.append(("user", user_turn.text))
-                executor_result = agent_runner.run(
-                    prompt=_serialize_transcript_for_turn(
-                        transcript=transcript,
-                    ),
-                    tool_registry=ToolRegistry(),
-                    context=context,
-                )
+                run_async = getattr(agent_runner, "run_async", None)
+                prompt = _serialize_transcript_for_turn(transcript=transcript)
+                tool_registry = ToolRegistry()
+                if callable(run_async):
+                    executor_result = await run_async(
+                        prompt=prompt,
+                        tool_registry=tool_registry,
+                        context=context,
+                    )
+                else:
+                    executor_result = agent_runner.run(
+                        prompt=prompt,
+                        tool_registry=tool_registry,
+                        context=context,
+                    )
                 turn = _executor_result_to_turn_result(
                     episode_id=episode_id,
                     result=executor_result,
@@ -828,9 +836,11 @@ class FaithfulSessionRunner:
                     max_session_turns,
                 )
         finally:
-            after_state = self._sandbox_state_fn(session_workspace)
-            state_delta = compute_state_delta(before_state, after_state)
-            shutil.rmtree(session_workspace, ignore_errors=True)
+            try:
+                after_state = self._sandbox_state_fn(session_workspace)
+                state_delta = compute_state_delta(before_state, after_state)
+            finally:
+                shutil.rmtree(session_workspace, ignore_errors=True)
 
         union_capabilities = sorted(
             {capability for turn in turns for capability in turn.capabilities}
