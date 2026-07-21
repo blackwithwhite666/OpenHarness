@@ -273,6 +273,7 @@ class QueryContext:
     system_prompt: str
     max_tokens: int
     effort: str | None = None
+    cache_key: str | None = None
     context_window_tokens: int | None = None
     auto_compact_threshold_tokens: int | None = None
     permission_prompt: PermissionPrompt | None = None
@@ -741,6 +742,7 @@ async def _attempt_decision_trace_repair(
                 system_prompt=context.system_prompt,
                 max_tokens=min(effective_max_tokens, 1024),
                 tools=[trace_tool.to_api_schema()],
+                cache_key=context.cache_key,
             )
         ):
             if isinstance(event, ApiMessageCompleteEvent):
@@ -1397,6 +1399,7 @@ async def run_query(
                     max_tokens=effective_max_tokens,
                     tools=context.tool_registry.to_api_schema(),
                     effort=context.effort,
+                    cache_key=context.cache_key,
                 )
             ):
                 if isinstance(event, ApiTextDeltaEvent):

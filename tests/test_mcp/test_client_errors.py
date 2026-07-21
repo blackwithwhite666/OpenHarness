@@ -70,6 +70,59 @@ async def test_call_tool_raises_when_session_errors():
 
 
 @pytest.mark.asyncio
+async def test_call_tool_surfaces_http_status():
+    class _HttpFailure(Exception):
+        response = MagicMock(status_code=401)
+
+    manager = McpClientManager({})
+    mock_session = AsyncMock()
+    mock_session.call_tool.side_effect = _HttpFailure()
+    manager._sessions["auth"] = mock_session
+
+    with pytest.raises(McpServerNotConnectedError) as exc_info:
+        await manager.call_tool("auth", "tool", {})
+
+    assert "HTTP 401" in str(exc_info.value)
+    assert not str(exc_info.value).endswith("call failed:")
+
+
+@pytest.mark.asyncio
+async def test_call_tool_empty_exc_uses_type_name():
+    class _Blank(Exception):
+        def __str__(self):
+            return ""
+
+    manager = McpClientManager({})
+    mock_session = AsyncMock()
+    mock_session.call_tool.side_effect = _Blank()
+    manager._sessions["blank"] = mock_session
+
+    with pytest.raises(McpServerNotConnectedError) as exc_info:
+        await manager.call_tool("blank", "tool", {})
+
+    assert "_Blank" in str(exc_info.value)
+    assert not str(exc_info.value).endswith("call failed:")
+
+
+@pytest.mark.asyncio
+async def test_call_tool_empty_exception_group_uses_first_inner():
+    class _Blank(Exception):
+        def __str__(self):
+            return ""
+
+    manager = McpClientManager({})
+    mock_session = AsyncMock()
+    mock_session.call_tool.side_effect = BaseExceptionGroup("", [_Blank()])
+    manager._sessions["blank-group"] = mock_session
+
+    with pytest.raises(McpServerNotConnectedError) as exc_info:
+        await manager.call_tool("blank-group", "tool", {})
+
+    assert "_Blank" in str(exc_info.value)
+    assert not str(exc_info.value).endswith("call failed:")
+
+
+@pytest.mark.asyncio
 async def test_call_tool_times_out_when_session_hangs(monkeypatch):
     """A hung MCP backend must raise (not hang forever) so the turn gets a result."""
     monkeypatch.setenv("OPENHARNESS_MCP_TOOL_TIMEOUT", "0.05")
@@ -160,6 +213,23 @@ async def test_read_resource_raises_when_session_errors():
 
     with pytest.raises(McpServerNotConnectedError, match="broken pipe"):
         await manager.read_resource("flaky", "res://data")
+
+
+@pytest.mark.asyncio
+async def test_read_resource_surfaces_http_status():
+    class _HttpFailure(Exception):
+        response = MagicMock(status_code=401)
+
+    manager = McpClientManager({})
+    mock_session = AsyncMock()
+    mock_session.read_resource.side_effect = _HttpFailure()
+    manager._sessions["auth"] = mock_session
+
+    with pytest.raises(McpServerNotConnectedError) as exc_info:
+        await manager.read_resource("auth", "res://data")
+
+    assert "HTTP 401" in str(exc_info.value)
+    assert not str(exc_info.value).endswith("resource read failed:")
 
 
 @pytest.mark.asyncio

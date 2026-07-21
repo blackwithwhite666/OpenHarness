@@ -790,6 +790,7 @@ class ShadowMemoryBackend(MemoryBackend):
             return None
 
         try:
+            started = perf_counter()
             hits = await asyncio.wait_for(
                 honcho_client.query_conclusions(
                     query,
@@ -799,12 +800,25 @@ class ShadowMemoryBackend(MemoryBackend):
                 ),
                 timeout=timeout,
             )
+            honcho_latency_ms = (perf_counter() - started) * 1_000
         except TimeoutError:
             logger.warning("ohmo visible Honcho recall timed out")
             return None
         except Exception:  # noqa: BLE001 - derived recall is additive only
             logger.warning("ohmo visible Honcho recall failed", exc_info=True)
             return None
+
+        if hits:
+            task = asyncio.create_task(
+                self._shadow_compare_derived(
+                    query=query,
+                    honcho_hits=hits,
+                    honcho_latency_ms=honcho_latency_ms,
+                ),
+                name="ohmo-derived-shadow",
+            )
+            self._pending.add(task)
+            task.add_done_callback(self._pending.discard)
 
         prefix = (
             f"{_DERIVED_RECALL_HEADING}\n"
@@ -898,6 +912,43 @@ class ShadowMemoryBackend(MemoryBackend):
                 )
         except Exception:  # noqa: BLE001 - shadow failures never reach the model path
             logger.warning("ohmo shadow recall comparison failed", exc_info=True)
+
+    async def _shadow_compare_derived(
+        self,
+        *,
+        query: str,
+        honcho_hits: Sequence[object],
+        honcho_latency_ms: float,
+    ) -> None:
+        """Log a catalog-vs-Honcho shadow record for the per-turn derived path.
+
+        Reuses the Honcho hits already fetched by ``derived_recall_block`` (so no
+        second Honcho query) and only adds a local catalog search off the reply
+        path.
+        """
+        if self._honcho_client is None:
+            return
+        try:
+            started = perf_counter()
+            catalog_hits = await self._base.search(query, _DERIVED_RECALL_TOP_K)
+            catalog_latency_ms = (perf_counter() - started) * 1_000
+            record = build_shadow_record(
+                query=query,
+                catalog_hits=[
+                    (hit.name, hit.rank, hit.snippet) for hit in catalog_hits
+                ],
+                honcho_hits=honcho_hits,  # type: ignore[arg-type]
+                catalog_latency_ms=catalog_latency_ms,
+                honcho_latency_ms=honcho_latency_ms,
+            )
+            async with self._log_lock:
+                await asyncio.to_thread(
+                    append_shadow_record,
+                    self._comparison_log_path,
+                    record,
+                )
+        except Exception:  # noqa: BLE001 - shadow failures never reach the model path
+            logger.warning("ohmo derived shadow comparison failed", exc_info=True)
 
     async def _ingest_turn(self, *, role: str, text: str, peer_id: str) -> None:
         honcho_client = self._honcho_client

@@ -18,6 +18,7 @@ from openharness.channels.bus.queue import MessageBus
 
 from ohmo.contact_registry import ContactStore
 from ohmo.group_registry import load_managed_group_record
+from ohmo.gateway.config import load_gateway_config, save_gateway_config
 from ohmo.gateway.router import session_key_for_message
 from ohmo.gateway.runtime import OhmoSessionRuntimePool
 from ohmo.workspace import get_gateway_interrupted_requests_path
@@ -141,6 +142,7 @@ class OhmoGatewayBridge:
         message_coalesce_media_window: float = 0.0,
         message_coalesce_max: int = 20,
         contact_store: ContactStore | None = None,
+        compact_progress_chats: list[str] | None = None,
     ) -> None:
         self._bus = bus
         self._runtime_pool = runtime_pool
@@ -158,6 +160,10 @@ class OhmoGatewayBridge:
         # In-flight dispatched turns, so a shutdown can record what it interrupts.
         self._inflight: dict[str, InboundMessage] = {}
         self._contact_store = contact_store
+        # Chats (by str chat_id) whose turn progress collapses into a single
+        # spinner-animated status message instead of one message per tool/step.
+        # Mutated live by /quiet and /verbose and persisted to gateway.json.
+        self._compact_chats: set[str] = {str(c) for c in (compact_progress_chats or [])}
 
     async def run(self) -> None:
         self._running = True
@@ -199,13 +205,13 @@ class OhmoGatewayBridge:
             group_args = _parse_group_command(message.content)
             is_synthetic = bool(message.metadata.get("_synthetic")) or message.sender_id == "__scheduler__"
             is_special = (
-                stripped in ("/stop", "/restart", "/new", "/clear")
+                stripped in ("/stop", "/restart", "/new", "/clear", "/quiet", "/verbose")
                 or group_args is not None
                 or is_synthetic
             )
 
             if is_special:
-                is_control = stripped in ("/stop", "/restart", "/new", "/clear")
+                is_control = stripped in ("/stop", "/restart", "/new", "/clear", "/quiet", "/verbose")
                 # Dispatch any buffered plain messages first (arrival order, no
                 # loss), THEN handle the special message verbatim. Control
                 # commands stop/reset the session, so cancelling the just-flushed
@@ -222,6 +228,9 @@ class OhmoGatewayBridge:
                     continue
                 if stripped in ("/new", "/clear"):
                     await self._handle_new(message, session_key)
+                    continue
+                if stripped in ("/quiet", "/verbose"):
+                    await self._handle_compact_toggle(message, session_key, enable=stripped == "/quiet")
                     continue
                 if group_args is not None:
                     prepared = await self._prepare_group_prompt_message(message, session_key, group_args)
@@ -430,6 +439,31 @@ class OhmoGatewayBridge:
             message, session_key, "🧹 Контекст сброшен — начинаю новую сессию."
         )
 
+    async def _handle_compact_toggle(self, message, session_key: str, *, enable: bool) -> None:
+        """/quiet (enable) or /verbose (disable): flip this chat's compact-progress
+        mode. Mutates the in-memory set (read per-turn to tag ``_collapse``) and
+        persists to gateway.json so the choice survives a restart. Does NOT touch
+        the running session — it takes effect on the next turn.
+        """
+        chat_id = str(message.chat_id)
+        if enable:
+            self._compact_chats.add(chat_id)
+            reply = "🔇 Компактный прогресс включён для этого чата — покажу один статус со спиннером."
+        else:
+            self._compact_chats.discard(chat_id)
+            reply = "🔊 Показываю все шаги."
+        try:
+            self._persist_compact_chats()
+        except Exception:  # noqa: BLE001 — the in-memory flip already took effect
+            logger.exception("ohmo failed to persist compact_progress_chats chat_id=%s", chat_id)
+        await self._publish_command_reply(message, session_key, reply)
+
+    def _persist_compact_chats(self) -> None:
+        """Round-trip gateway.json, updating only ``compact_progress_chats``."""
+        config = load_gateway_config(self._workspace)
+        config.compact_progress_chats = sorted(self._compact_chats)
+        save_gateway_config(config, self._workspace)
+
     async def _handle_restart(self, message, session_key: str) -> None:
         await self._interrupt_session(
             session_key,
@@ -530,6 +564,9 @@ class OhmoGatewayBridge:
         if chat_type == "group" or inbound_meta.get("thread_id"):
             if "message_id" in message.metadata:
                 inbound_meta["message_id"] = message.metadata["message_id"]
+        # Collapse this turn's progress into one live status message? Read the set
+        # per-turn so a /quiet or /verbose in a prior turn is already in effect.
+        collapse = message.channel == "telegram" and str(message.chat_id) in self._compact_chats
         try:
             reply = ""
             final_media: list[str] = []
@@ -550,13 +587,18 @@ class OhmoGatewayBridge:
                     update.kind,
                     _content_snippet(update.text),
                 )
+                update_meta = {**inbound_meta, **(update.metadata or {})}
+                if collapse:
+                    # Tag every non-final progress/tool_hint so the Telegram
+                    # channel folds it into the chat's single live status message.
+                    update_meta["_collapse"] = True
                 await self._bus.publish_outbound(
                     OutboundMessage(
                         channel=message.channel,
                         chat_id=message.chat_id,
                         content=update.text,
                         media=list(getattr(update, "media", None) or (update.metadata or {}).get("_media") or []),
-                        metadata={**inbound_meta, **(update.metadata or {})},
+                        metadata=update_meta,
                     )
                 )
         except asyncio.CancelledError:

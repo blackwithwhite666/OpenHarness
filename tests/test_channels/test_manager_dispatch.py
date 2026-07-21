@@ -99,3 +99,41 @@ async def test_successful_send_does_not_invoke_hook() -> None:
 
     assert failures == []
     assert len(channel.sent) == 1
+
+
+def _manager_flags(channel: _FakeChannel, *, send_progress: bool, send_tool_hints: bool) -> ChannelManager:
+    manager = ChannelManager.__new__(ChannelManager)
+    manager.bus = MessageBus()
+    manager.channels = {"telegram": channel}
+    manager._on_send_failure = None
+
+    class _Channels:
+        pass
+
+    _Channels.send_tool_hints = send_tool_hints
+    _Channels.send_progress = send_progress
+
+    class _Config:
+        channels = _Channels()
+
+    manager.config = _Config()
+    return manager
+
+
+@pytest.mark.asyncio
+async def test_collapse_progress_bypasses_progress_and_tool_hint_drop() -> None:
+    """With both global switches OFF, a normal progress/tool_hint is dropped, but a
+    ``_collapse`` one still reaches the channel so the compact status can animate."""
+    channel = _FakeChannel(raise_on_send=False)
+    manager = _manager_flags(channel, send_progress=False, send_tool_hints=False)
+
+    dropped = OutboundMessage(channel="telegram", chat_id="1", content="hint",
+                              metadata={"_progress": True, "_tool_hint": True})
+    kept = OutboundMessage(channel="telegram", chat_id="1", content="status",
+                           metadata={"_progress": True, "_tool_hint": True, "_collapse": True})
+
+    await _dispatch_one(manager, dropped)
+    await _dispatch_one(manager, kept)
+
+    assert len(channel.sent) == 1
+    assert channel.sent[0].metadata.get("_collapse") is True

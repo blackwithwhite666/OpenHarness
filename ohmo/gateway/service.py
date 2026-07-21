@@ -92,6 +92,7 @@ class OhmoGatewayService:
             message_coalesce_media_window=self._config.message_coalesce_media_window,
             message_coalesce_max=self._config.message_coalesce_max,
             contact_store=self._contact_store,
+            compact_progress_chats=self._config.compact_progress_chats,
         )
 
     @property

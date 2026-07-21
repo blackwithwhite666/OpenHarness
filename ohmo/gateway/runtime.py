@@ -352,6 +352,8 @@ class OhmoSessionRuntimePool:
                 memory_scope=initial_memory_scope,
             )
         )
+        if hasattr(bundle.engine, "set_cache_key"):
+            bundle.engine.set_cache_key(bundle.session_id)
         logger.info(
             "ohmo runtime started session_key=%s session_id=%s restored_messages=%s",
             session_key,
@@ -1197,6 +1199,8 @@ class OhmoSessionRuntimePool:
                 memory_scope=scope,
             )
         )
+        if hasattr(refreshed.engine, "set_cache_key"):
+            refreshed.engine.set_cache_key(refreshed.session_id)
         self._bundles[session_key] = refreshed
         logger.info(
             "ohmo runtime refreshed session_key=%s session_id=%s message_count=%s",

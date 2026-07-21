@@ -67,25 +67,29 @@ def _refresh(oauth: McpOAuthConfig, refresh_token: str) -> dict:
         return json.loads(resp.read().decode())
 
 
-def ensure_bearer(oauth: McpOAuthConfig, *, now: float | None = None) -> str:
+def ensure_bearer(oauth, *, now=None, force=False, stale_token=None) -> str:
     """Return a valid access token, refreshing (and persisting rotation) if needed.
 
     Safe to call on every request (see ``_OAuthBearerAuth`` in ``client.py``):
-    when the cached token is still valid it is a cheap file read; only a token
-    within ``_EXPIRY_SKEW_S`` of expiry triggers a (lock-serialized) refresh.
+    when the cached token is still valid it is a cheap file read. Tokens near
+    expiry and forced refreshes trigger a lock-serialized refresh.
     """
     now = time.time() if now is None else now
-    store = _read_store(oauth.token_file)
-    access = store.get("access_token")
-    expires_at = store.get("expires_at") or 0
-    if access and expires_at - now > _EXPIRY_SKEW_S:
-        return access
+    if not force:
+        store = _read_store(oauth.token_file)
+        access = store.get("access_token")
+        expires_at = store.get("expires_at") or 0
+        if access and expires_at - now > _EXPIRY_SKEW_S:
+            return access
     with _refresh_lock:
         # Re-read inside the lock: another caller may have refreshed while we waited.
         store = _read_store(oauth.token_file)
         access = store.get("access_token")
         expires_at = store.get("expires_at") or 0
-        if access and expires_at - now > _EXPIRY_SKEW_S:
+        valid = access and expires_at - now > _EXPIRY_SKEW_S
+        if (not force and valid) or (
+            force and stale_token is not None and access != stale_token and valid
+        ):
             return access
         refresh_token = store.get("refresh_token")
         if not refresh_token:

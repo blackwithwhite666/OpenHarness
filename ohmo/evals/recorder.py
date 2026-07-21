@@ -169,6 +169,8 @@ class GatewayEvalRecorder:
                 "model": model,
                 "input_tokens": event.usage.input_tokens,
                 "output_tokens": event.usage.output_tokens,
+                "cached_input_tokens": event.usage.cached_input_tokens,
+                "cache_write_input_tokens": event.usage.cache_write_input_tokens,
             },
         )
 

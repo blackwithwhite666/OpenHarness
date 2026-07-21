@@ -27,7 +27,10 @@ def build_shadow_record(
 ) -> ShadowRecord:
     """Build one compact, source-neutral comparison record."""
     catalog_rows = [{"name": name, "rank": rank} for name, rank, _ in catalog_hits]
-    honcho_rows = [{"id": hit.id, "snippet": _snippet(hit.content)} for hit in honcho_hits]
+    honcho_rows = [
+        {"id": getattr(hit, "id", None), "snippet": _snippet(hit.content)}
+        for hit in honcho_hits
+    ]
     rank_pairs = _match_rank_pairs(catalog_hits, honcho_hits)
     overlap = len(rank_pairs)
     return {

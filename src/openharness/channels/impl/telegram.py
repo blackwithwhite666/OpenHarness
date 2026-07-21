@@ -7,6 +7,8 @@ import contextlib
 import logging
 import re
 import time
+from collections import deque
+from dataclasses import dataclass, field
 
 from telegram import (
     BotCommand,
@@ -27,6 +29,7 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
+from telegram.error import BadRequest, RetryAfter
 from telegram.request import HTTPXRequest
 
 from openharness.channels.bus.events import OutboundMessage
@@ -41,6 +44,36 @@ logger = logging.getLogger(__name__)
 
 TELEGRAM_MAX_MESSAGE_LEN = 4000  # Telegram message character limit
 _TELEGRAM_URL_LOGGERS = ("httpx", "httpcore", "telegram.ext")
+
+# --- Compact progress (one live spinner-animated status message per turn) ------
+_SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+_COMPACT_TICK = 1.5  # seconds between spinner edits (≈0.67 edits/s — well under flood limits)
+_COMPACT_TICK_BACKOFF = 3.0  # slower tick after a RetryAfter
+_COMPACT_IDLE_S = 90.0  # no new event for this long → the turn likely died; stop spinning
+_COMPACT_TAIL = 3  # rolling number of recent step lines shown under the spinner
+_COMPACT_LINE_MAX = 160  # per-step line truncation
+
+
+def _compact_step_line(text: str) -> str:
+    """The first non-empty line of a progress update, trimmed for the status body."""
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        if line:
+            return line[:_COMPACT_LINE_MAX]
+    return ""
+
+
+@dataclass
+class _CompactStatus:
+    """Live per-chat status message that collapses a turn's progress events."""
+
+    message_id: int
+    lines: deque[str] = field(default_factory=lambda: deque(maxlen=_COMPACT_TAIL))
+    spinner_idx: int = 0
+    dirty: bool = True
+    tick: float = _COMPACT_TICK
+    last_event: float = 0.0
+    anim: asyncio.Task | None = None
 
 
 def silence_telegram_token_url_loggers() -> None:
@@ -361,6 +394,7 @@ class TelegramChannel(BaseChannel):
         self.polling_started = False
         self._chat_ids: dict[str, int] = {}  # Map sender_id to chat_id for replies
         self._typing_tasks: dict[str, asyncio.Task] = {}  # chat_id -> typing loop task
+        self._status: dict[str, _CompactStatus] = {}  # chat_id -> live compact status
         self._media_group_buffers: dict[str, dict] = {}
         self._media_group_tasks: dict[str, asyncio.Task] = {}
         # Last known location per chat. ANY inbound location (pin / venue / live
@@ -454,6 +488,12 @@ class TelegramChannel(BaseChannel):
         # Cancel all typing indicators
         for chat_id in list(self._typing_tasks):
             self._stop_typing(chat_id)
+
+        # Cancel any live compact-status spinner loops.
+        for status in list(self._status.values()):
+            if status.anim is not None and not status.anim.done():
+                status.anim.cancel()
+        self._status.clear()
 
         for task in self._media_group_tasks.values():
             task.cancel()
@@ -619,15 +659,28 @@ class TelegramChannel(BaseChannel):
             logger.warning("Telegram bot not running")
             return
 
-        # Only stop typing indicator for final responses
-        if not msg.metadata.get("_progress", False):
-            self._stop_typing(msg.chat_id)
-
         try:
             chat_id = int(msg.chat_id)
         except ValueError:
             logger.error("Invalid chat_id: %s", msg.chat_id)
             return
+
+        chat_key = str(msg.chat_id)
+
+        # Compact progress: fold this event into the chat's single live status
+        # message (spinner-animated, edited in place) instead of a fresh message.
+        if msg.metadata.get("_collapse") and msg.content and msg.content != "[empty message]":
+            await self._compact_progress(chat_key, chat_id, msg.content)
+            return
+
+        # Any non-collapse send (final answer, error, command reply, /stop notify)
+        # ends the collapsed run: tear the status message down before sending, so
+        # the chat is left with just the user's message + the real answer.
+        await self._clear_compact_status(chat_key)
+
+        # Only stop typing indicator for final responses
+        if not msg.metadata.get("_progress", False):
+            self._stop_typing(msg.chat_id)
 
         reply_params = None
         if getattr(self.config, "reply_to_message", False):
@@ -709,6 +762,101 @@ class TelegramChannel(BaseChannel):
                             reply_params_for_next_send = None
                     except Exception as e2:
                         logger.error("Error sending Telegram message: %s", e2)
+
+    def _render_status(self, status: _CompactStatus) -> str:
+        """Spinner header + the rolling tail of recent step lines."""
+        head = f"{_SPINNER_FRAMES[status.spinner_idx]} Работаю…"
+        body = "\n".join(status.lines)
+        return f"{head}\n{body}" if body else head
+
+    async def _compact_progress(self, chat_key: str, chat_id: int, content: str) -> None:
+        """Fold one progress event into the chat's single live status message.
+
+        First event → send the status message once and start the spinner loop.
+        Subsequent events → append the step and mark dirty; the loop (the single
+        writer) performs the throttled ``edit_message_text``.
+        """
+        line = _compact_step_line(content)
+        status = self._status.get(chat_key)
+        if status is None:
+            status = _CompactStatus(message_id=0, last_event=time.monotonic())
+            if line:
+                status.lines.append(line)
+            text = self._render_status(status)
+            try:
+                sent = await self._app.bot.send_message(
+                    chat_id=chat_id, text=text, parse_mode=None
+                )
+            except Exception as e:  # noqa: BLE001 — never let progress break a turn
+                logger.warning("compact status create failed chat=%s: %s", chat_key, e)
+                return
+            status.message_id = sent.message_id
+            self._status[chat_key] = status
+            self._stop_typing(chat_key)  # the spinner replaces the typing indicator
+            status.anim = asyncio.create_task(self._compact_anim(chat_key, chat_id))
+            return
+        if line:
+            status.lines.append(line)
+        status.dirty = True
+        status.last_event = time.monotonic()
+
+    async def _compact_anim(self, chat_key: str, chat_id: int) -> None:
+        """Single-writer spinner loop: advance the frame and edit the status once
+        per tick. Coalesces bursts, backs off on RetryAfter, self-expires if the
+        turn goes idle (cancelled with no final)."""
+        try:
+            while self._app:
+                status = self._status.get(chat_key)
+                if status is None:
+                    break
+                await asyncio.sleep(status.tick)
+                status = self._status.get(chat_key)
+                if status is None:
+                    break
+                if time.monotonic() - status.last_event > _COMPACT_IDLE_S:
+                    # No new event for a while — the turn most likely died without a
+                    # final. Leave a terminal marker instead of spinning forever.
+                    await self._edit_status(chat_id, status, "⏹️ остановлено")
+                    self._status.pop(chat_key, None)
+                    break
+                status.spinner_idx = (status.spinner_idx + 1) % len(_SPINNER_FRAMES)
+                await self._edit_status(chat_id, status, self._render_status(status))
+                status.dirty = False
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:  # noqa: BLE001
+            logger.debug("compact anim stopped chat=%s: %s", chat_key, e)
+
+    async def _edit_status(self, chat_id: int, status: _CompactStatus, text: str) -> None:
+        """One throttled edit of the status message. Swallows 'not modified',
+        backs the tick off on RetryAfter (429)."""
+        try:
+            await self._app.bot.edit_message_text(
+                chat_id=chat_id, message_id=status.message_id, text=text, parse_mode=None
+            )
+        except RetryAfter as e:
+            status.tick = max(status.tick, _COMPACT_TICK_BACKOFF, e.retry_after + 0.5)
+            await asyncio.sleep(e.retry_after + 0.5)
+        except BadRequest as e:
+            if "not modified" not in str(e).lower():
+                logger.debug("compact status edit failed chat=%s: %s", chat_id, e)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("compact status edit failed chat=%s: %s", chat_id, e)
+
+    async def _clear_compact_status(self, chat_key: str) -> None:
+        """Cancel the spinner and delete the status message (best-effort). No-op
+        when the chat has no live status (verbose chats, or already cleared)."""
+        status = self._status.pop(chat_key, None)
+        if status is None:
+            return
+        if status.anim is not None and not status.anim.done():
+            status.anim.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await status.anim
+        try:
+            await self._app.bot.delete_message(chat_id=int(chat_key), message_id=status.message_id)
+        except Exception as e:  # noqa: BLE001 — the message may already be gone
+            logger.debug("compact status delete failed chat=%s: %s", chat_key, e)
 
     async def _on_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle /start command."""
