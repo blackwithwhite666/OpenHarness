@@ -57,6 +57,17 @@ def _token_limit_param_for_model(model: str, max_tokens: int) -> dict[str, int]:
     return {"max_tokens": max_tokens}
 
 
+def _cached_input_tokens_from_usage(usage: Any) -> int:
+    prompt_tokens_details = getattr(usage, "prompt_tokens_details", None)
+    if prompt_tokens_details is None and isinstance(usage, dict):
+        prompt_tokens_details = usage.get("prompt_tokens_details")
+    if isinstance(prompt_tokens_details, dict):
+        cached_tokens = prompt_tokens_details.get("cached_tokens", 0)
+    else:
+        cached_tokens = getattr(prompt_tokens_details, "cached_tokens", 0)
+    return int(cached_tokens or 0)
+
+
 def _convert_tools_to_openai(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Convert Anthropic tool schemas to OpenAI function-calling format.
 
@@ -124,6 +135,29 @@ def _convert_messages_to_openai(
                 openai_messages.append({"role": "user", "content": ""})
 
     return openai_messages
+
+
+def _build_openai_body(request: ApiMessageRequest) -> dict[str, Any]:
+    openai_messages = _convert_messages_to_openai(request.messages, request.system_prompt)
+    openai_tools = _convert_tools_to_openai(request.tools) if request.tools else None
+
+    body: dict[str, Any] = {
+        "model": request.model,
+        "messages": openai_messages,
+        "stream": True,
+        "stream_options": {"include_usage": True},
+    }
+    body.update(_token_limit_param_for_model(request.model, request.max_tokens))
+    if request.cache_key:
+        body["prompt_cache_key"] = request.cache_key
+    if openai_tools:
+        body["tools"] = openai_tools
+        # Some providers (Kimi) error on empty reasoning_content in
+        # tool-call follow-ups.  Omit the entire stream_options key if
+        # tools are present – avoids triggering model-side thinking mode
+        # that requires reasoning_content on every assistant message.
+        body.pop("stream_options", None)
+    return body
 
 
 def _convert_user_content_to_openai(blocks: list[ContentBlock]) -> str | list[dict[str, Any]]:
@@ -314,23 +348,7 @@ class OpenAICompatibleClient:
 
     async def _stream_once(self, request: ApiMessageRequest) -> AsyncIterator[ApiStreamEvent]:
         """Single attempt: stream an OpenAI chat completion."""
-        openai_messages = _convert_messages_to_openai(request.messages, request.system_prompt)
-        openai_tools = _convert_tools_to_openai(request.tools) if request.tools else None
-
-        params: dict[str, Any] = {
-            "model": request.model,
-            "messages": openai_messages,
-            "stream": True,
-            "stream_options": {"include_usage": True},
-        }
-        params.update(_token_limit_param_for_model(request.model, request.max_tokens))
-        if openai_tools:
-            params["tools"] = openai_tools
-            # Some providers (Kimi) error on empty reasoning_content in
-            # tool-call follow-ups.  Omit the entire stream_options key if
-            # tools are present – avoids triggering model-side thinking mode
-            # that requires reasoning_content on every assistant message.
-            params.pop("stream_options", None)
+        params = _build_openai_body(request)
 
         # Collect full response while streaming text deltas
         collected_content = ""
@@ -349,6 +367,7 @@ class OpenAICompatibleClient:
                     usage_data = {
                         "input_tokens": chunk.usage.prompt_tokens or 0,
                         "output_tokens": chunk.usage.completion_tokens or 0,
+                        "cached_input_tokens": _cached_input_tokens_from_usage(chunk.usage),
                     }
                 continue
 
@@ -395,6 +414,7 @@ class OpenAICompatibleClient:
                 usage_data = {
                     "input_tokens": chunk.usage.prompt_tokens or 0,
                     "output_tokens": chunk.usage.completion_tokens or 0,
+                    "cached_input_tokens": _cached_input_tokens_from_usage(chunk.usage),
                 }
 
         # Build the final ConversationMessage
@@ -429,6 +449,7 @@ class OpenAICompatibleClient:
             usage=UsageSnapshot(
                 input_tokens=usage_data.get("input_tokens", 0),
                 output_tokens=usage_data.get("output_tokens", 0),
+                cached_input_tokens=usage_data.get("cached_input_tokens", 0),
             ),
             stop_reason=finish_reason,
         )

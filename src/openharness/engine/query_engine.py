@@ -64,6 +64,7 @@ class QueryEngine:
         self._cwd = Path(cwd).resolve()
         self._model = model
         self._system_prompt = system_prompt
+        self._cache_key: str | None = None
         self._max_tokens = max_tokens
         self._effort = settings.effort if settings is not None else None
         self._context_window_tokens = context_window_tokens
@@ -126,6 +127,10 @@ class QueryEngine:
     def set_system_prompt(self, prompt: str) -> None:
         """Update the active system prompt for future turns."""
         self._system_prompt = prompt
+
+    def set_cache_key(self, key: str | None) -> None:
+        """Update the prompt cache key for future turns."""
+        self._cache_key = key
 
     def set_model(self, model: str) -> None:
         """Update the active model for future turns."""
@@ -289,6 +294,7 @@ class QueryEngine:
             system_prompt=self._system_prompt,
             max_tokens=self._max_tokens,
             effort=self._effort,
+            cache_key=self._cache_key,
             context_window_tokens=self._context_window_tokens,
             auto_compact_threshold_tokens=self._auto_compact_threshold_tokens,
             max_turns=self._max_turns,
@@ -336,6 +342,7 @@ class QueryEngine:
             system_prompt=self._system_prompt,
             max_tokens=self._max_tokens,
             effort=self._effort,
+            cache_key=self._cache_key,
             context_window_tokens=self._context_window_tokens,
             auto_compact_threshold_tokens=self._auto_compact_threshold_tokens,
             max_turns=max_turns if max_turns is not None else self._max_turns,

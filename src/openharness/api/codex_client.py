@@ -138,6 +138,28 @@ def _convert_tools_to_codex(tools: list[dict[str, Any]]) -> list[dict[str, Any]]
     ]
 
 
+def _build_codex_body(request: ApiMessageRequest) -> dict[str, Any]:
+    body: dict[str, Any] = {
+        "model": request.model,
+        "store": False,
+        "stream": True,
+        "instructions": request.system_prompt or "You are OpenHarness.",
+        "input": _convert_messages_to_codex(request.messages),
+        "text": {"verbosity": "medium"},
+        "include": ["reasoning.encrypted_content"],
+        "tool_choice": "auto",
+        "parallel_tool_calls": True,
+    }
+    if request.cache_key:
+        body["prompt_cache_key"] = request.cache_key
+    if request.tools:
+        body["tools"] = _convert_tools_to_codex(request.tools)
+    effort = _normalize_reasoning_effort(request.effort)
+    if effort:
+        body["reasoning"] = {"effort": effort}
+    return body
+
+
 def _normalize_reasoning_effort(effort: str | None) -> str | None:
     normalized = (effort or "").strip().lower()
     if normalized == "max":
@@ -151,9 +173,16 @@ def _usage_from_response(response: dict[str, Any]) -> UsageSnapshot:
     usage = response.get("usage")
     if not isinstance(usage, dict):
         return UsageSnapshot()
+    input_tokens_details = usage.get("input_tokens_details")
+    cached_input_tokens = (
+        input_tokens_details.get("cached_tokens", 0)
+        if isinstance(input_tokens_details, dict)
+        else 0
+    )
     return UsageSnapshot(
         input_tokens=int(usage.get("input_tokens") or 0),
         output_tokens=int(usage.get("output_tokens") or 0),
+        cached_input_tokens=int(cached_input_tokens or 0),
     )
 
 
@@ -282,22 +311,7 @@ class CodexApiClient:
             raise self._translate_error(last_error) from last_error
 
     async def _stream_once(self, request: ApiMessageRequest) -> AsyncIterator[ApiStreamEvent]:
-        body: dict[str, Any] = {
-            "model": request.model,
-            "store": False,
-            "stream": True,
-            "instructions": request.system_prompt or "You are OpenHarness.",
-            "input": _convert_messages_to_codex(request.messages),
-            "text": {"verbosity": "medium"},
-            "include": ["reasoning.encrypted_content"],
-            "tool_choice": "auto",
-            "parallel_tool_calls": True,
-        }
-        if request.tools:
-            body["tools"] = _convert_tools_to_codex(request.tools)
-        effort = _normalize_reasoning_effort(request.effort)
-        if effort:
-            body["reasoning"] = {"effort": effort}
+        body = _build_codex_body(request)
 
         content: list[TextBlock | ToolUseBlock] = []
         current_text_parts: list[str] = []

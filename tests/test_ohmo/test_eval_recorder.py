@@ -240,6 +240,8 @@ def test_gateway_eval_recorder_record_model_call_writes_tokens(tmp_path: Path) -
         "model": "gpt-prod",
         "input_tokens": 12,
         "output_tokens": 5,
+        "cached_input_tokens": 0,
+        "cache_write_input_tokens": 0,
     }
 
 
