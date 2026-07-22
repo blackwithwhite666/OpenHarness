@@ -7,6 +7,7 @@ import base64
 import json
 import logging
 import platform
+import random
 from collections.abc import Callable
 from typing import Any, AsyncIterator
 
@@ -30,6 +31,10 @@ JWT_CLAIM_PATH = "https://api.openai.com/auth"
 MAX_RETRIES = 5
 BASE_DELAY_SECONDS = 1.0
 MAX_DELAY_SECONDS = 30.0
+
+
+class StreamStalled(RequestFailure):
+    """Raised when a Codex SSE stream stops producing events."""
 
 
 def _extract_account_id(token: str) -> str:
@@ -261,11 +266,13 @@ class CodexApiClient:
         *,
         base_url: str | None = None,
         auth_token_resolver: Callable[[], str] | None = None,
+        stall_timeout_seconds: float | None = 30.0,
     ) -> None:
         self._auth_token = auth_token
         self._base_url = base_url
         self._url = _resolve_codex_url(base_url)
         self._auth_token_resolver = auth_token_resolver
+        self._stall_timeout_seconds = stall_timeout_seconds
 
     def _refresh_client_auth(self) -> None:
         """Re-resolve the access token before a request so a long-running client
@@ -288,18 +295,27 @@ class CodexApiClient:
 
     async def stream_message(self, request: ApiMessageRequest) -> AsyncIterator[ApiStreamEvent]:
         last_error: Exception | None = None
+        stream_event_yielded = False
         for attempt in range(MAX_RETRIES + 1):
             try:
                 # Off the event loop: the resolver may do a blocking HTTPS refresh.
                 await asyncio.to_thread(self._refresh_client_auth)
                 async for event in self._stream_once(request):
+                    stream_event_yielded = True
                     yield event
                 return
             except Exception as exc:
                 last_error = exc
-                if attempt >= MAX_RETRIES or not self._is_retryable(exc):
+                if stream_event_yielded or not self._is_retryable(exc):
                     raise self._translate_error(exc) from exc
-                delay = min(BASE_DELAY_SECONDS * (2 ** attempt), MAX_DELAY_SECONDS)
+                if attempt >= MAX_RETRIES:
+                    if isinstance(exc, StreamStalled):
+                        raise StreamStalled(
+                            f"Codex stream stalled; gave up after {attempt + 1} attempts: {exc}"
+                        ) from exc
+                    raise self._translate_error(exc) from exc
+                base_delay = min(BASE_DELAY_SECONDS * (2 ** attempt), MAX_DELAY_SECONDS)
+                delay = base_delay + random.uniform(0, base_delay * 0.25)
                 yield ApiRetryEvent(
                     message=str(exc),
                     attempt=attempt + 1,
@@ -325,7 +341,25 @@ class CodexApiClient:
                     message = _format_error_message(response.status_code, payload.decode("utf-8", "replace"))
                     raise httpx.HTTPStatusError(message, request=response.request, response=response)
 
-                async for event in self._iter_sse_events(response):
+                event_iterator = self._iter_sse_events(response).__aiter__()
+                while True:
+                    try:
+                        if self._stall_timeout_seconds and self._stall_timeout_seconds > 0:
+                            event = await asyncio.wait_for(
+                                event_iterator.__anext__(),
+                                timeout=self._stall_timeout_seconds,
+                            )
+                        else:
+                            event = await event_iterator.__anext__()
+                    except StopAsyncIteration:
+                        break
+                    except TimeoutError as exc:
+                        raise StreamStalled(
+                            "Codex stream stalled after "
+                            f"{self._stall_timeout_seconds:g}s without an SSE event "
+                            "(inactivity timeout)"
+                        ) from exc
+
                     event_type = event.get("type")
                     if event_type == "response.output_text.delta":
                         delta = event.get("delta")
@@ -429,6 +463,8 @@ class CodexApiClient:
 
     @staticmethod
     def _is_retryable(exc: Exception) -> bool:
+        if isinstance(exc, StreamStalled):
+            return True
         if isinstance(exc, httpx.HTTPStatusError):
             return exc.response.status_code in {429, 500, 502, 503, 504}
         if isinstance(exc, RateLimitFailure):
