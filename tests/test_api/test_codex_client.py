@@ -30,6 +30,7 @@ class _FakeStreamResponse:
         pause_after_line: int | None = None,
         pause_gate: asyncio.Event | None = None,
         line_delays: dict[int, float] | None = None,
+        hang_on_enter: bool = False,
     ) -> None:
         self.status_code = status_code
         self._lines = lines or []
@@ -38,8 +39,11 @@ class _FakeStreamResponse:
         self._pause_after_line = pause_after_line
         self._pause_gate = pause_gate
         self._line_delays = line_delays or {}
+        self._hang_on_enter = hang_on_enter
 
     async def __aenter__(self) -> "_FakeStreamResponse":
+        if self._hang_on_enter:
+            await asyncio.Event().wait()
         return self
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
@@ -58,6 +62,21 @@ class _FakeStreamResponse:
                 await self._pause_gate.wait()
         if self._hang_after_lines:
             await asyncio.Event().wait()
+
+
+class _SlowDripStreamResponse(_FakeStreamResponse):
+    def __init__(self, *, interval: float, initial_lines: list[str] | None = None) -> None:
+        super().__init__()
+        self._interval = interval
+        self._initial_lines = initial_lines or []
+
+    async def aiter_lines(self):
+        for line in self._initial_lines:
+            yield line
+        while True:
+            await asyncio.sleep(self._interval)
+            yield 'data: {"type":"response.in_progress","response":{"status":"in_progress"}}'
+            yield ""
 
 
 class _FakeAsyncClient:
@@ -284,32 +303,30 @@ async def test_codex_client_streams_text(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_codex_client_retries_pre_output_stall_then_succeeds(monkeypatch):
+async def test_codex_client_retries_response_start_hang_then_succeeds(monkeypatch):
     sink: dict[str, Any] = {}
-    stalled = _FakeStreamResponse(
-        lines=[
-            'data: {"type":"response.created","response":{"status":"in_progress"}}',
-            "",
-            'data: {"type":"response.in_progress","response":{"status":"in_progress"}}',
-            "",
-        ],
-        hang_after_lines=True,
-    )
+    stalled = _FakeStreamResponse(hang_after_lines=True)
     succeeded = _FakeStreamResponse(lines=_successful_text_lines("clean ", "answer"))
     client_factory = _FakeAsyncClientSequence([stalled, succeeded], sink)
     monkeypatch.setattr("openharness.api.codex_client.httpx.AsyncClient", client_factory)
     _disable_retry_delays(monkeypatch)
 
-    client = CodexApiClient(_fake_codex_token(), stall_timeout_seconds=0.02)
+    client = CodexApiClient(
+        _fake_codex_token(),
+        stall_timeout_seconds=0.02,
+        attempt_timeout_seconds=0.2,
+    )
     started = time.monotonic()
     events = await asyncio.wait_for(
         _collect_stream(client, _codex_request()),
         timeout=0.5,
     )
 
-    assert time.monotonic() - started < 0.5
+    assert time.monotonic() - started < 0.15
     assert client_factory.attempts == 2
-    assert len([event for event in events if isinstance(event, ApiRetryEvent)]) == 1
+    retry_events = [event for event in events if isinstance(event, ApiRetryEvent)]
+    assert len(retry_events) == 1
+    assert "inactivity timeout" in retry_events[0].message
     assert [event.text for event in events if isinstance(event, ApiTextDeltaEvent)] == [
         "clean ",
         "answer",
@@ -317,6 +334,62 @@ async def test_codex_client_retries_pre_output_stall_then_succeeds(monkeypatch):
     complete_events = [event for event in events if isinstance(event, ApiMessageCompleteEvent)]
     assert len(complete_events) == 1
     assert complete_events[0].message.text == "clean answer"
+
+
+@pytest.mark.asyncio
+async def test_codex_client_total_timeout_stops_slow_drip(monkeypatch):
+    sink: dict[str, Any] = {}
+    response = _SlowDripStreamResponse(interval=0.01)
+    succeeded = _FakeStreamResponse(lines=_successful_text_lines("recovered"))
+    client_factory = _FakeAsyncClientSequence([response, succeeded], sink)
+    monkeypatch.setattr("openharness.api.codex_client.httpx.AsyncClient", client_factory)
+    _disable_retry_delays(monkeypatch)
+
+    client = CodexApiClient(
+        _fake_codex_token(),
+        stall_timeout_seconds=0.03,
+        attempt_timeout_seconds=0.06,
+    )
+    started = time.monotonic()
+    events = await asyncio.wait_for(
+        _collect_stream(client, _codex_request()),
+        timeout=0.3,
+    )
+
+    assert time.monotonic() - started < 0.2
+    assert client_factory.attempts == 2
+    retry_events = [event for event in events if isinstance(event, ApiRetryEvent)]
+    assert len(retry_events) == 1
+    assert "attempt timeout" in retry_events[0].message
+    assert [event.text for event in events if isinstance(event, ApiTextDeltaEvent)] == ["recovered"]
+
+
+@pytest.mark.asyncio
+async def test_codex_client_total_timeout_stops_connect_headers_hang(monkeypatch):
+    sink: dict[str, Any] = {}
+    response = _FakeStreamResponse(hang_on_enter=True)
+    succeeded = _FakeStreamResponse(lines=_successful_text_lines("connected"))
+    client_factory = _FakeAsyncClientSequence([response, succeeded], sink)
+    monkeypatch.setattr("openharness.api.codex_client.httpx.AsyncClient", client_factory)
+    _disable_retry_delays(monkeypatch)
+
+    client = CodexApiClient(
+        _fake_codex_token(),
+        stall_timeout_seconds=0.01,
+        attempt_timeout_seconds=0.04,
+    )
+    started = time.monotonic()
+    events = await asyncio.wait_for(
+        _collect_stream(client, _codex_request()),
+        timeout=0.2,
+    )
+
+    assert time.monotonic() - started < 0.15
+    assert client_factory.attempts == 2
+    retry_events = [event for event in events if isinstance(event, ApiRetryEvent)]
+    assert len(retry_events) == 1
+    assert "attempt timeout" in retry_events[0].message
+    assert [event.text for event in events if isinstance(event, ApiTextDeltaEvent)] == ["connected"]
 
 
 @pytest.mark.asyncio
@@ -380,6 +453,37 @@ async def test_codex_client_does_not_retry_stall_after_text_delta(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_codex_client_does_not_retry_total_timeout_after_text_delta(monkeypatch):
+    sink: dict[str, Any] = {}
+    partial = _SlowDripStreamResponse(
+        interval=0.01,
+        initial_lines=['data: {"type":"response.output_text.delta","delta":"partial"}', ""],
+    )
+    unused_retry = _FakeStreamResponse(lines=_successful_text_lines("duplicate"))
+    client_factory = _FakeAsyncClientSequence([partial, unused_retry], sink)
+    monkeypatch.setattr("openharness.api.codex_client.httpx.AsyncClient", client_factory)
+    _disable_retry_delays(monkeypatch)
+
+    client = CodexApiClient(
+        _fake_codex_token(),
+        stall_timeout_seconds=0.03,
+        attempt_timeout_seconds=0.06,
+    )
+    events: list[Any] = []
+
+    async def consume() -> None:
+        async for event in client.stream_message(_codex_request()):
+            events.append(event)
+
+    with pytest.raises(StreamStalled, match="attempt timeout"):
+        await asyncio.wait_for(consume(), timeout=0.3)
+
+    assert client_factory.attempts == 1
+    assert [event.text for event in events if isinstance(event, ApiTextDeltaEvent)] == ["partial"]
+    assert not any(isinstance(event, ApiRetryEvent) for event in events)
+
+
+@pytest.mark.asyncio
 async def test_codex_client_happy_path_deltas_remain_live_and_ordered(monkeypatch):
     sink: dict[str, Any] = {}
     release_rest = asyncio.Event()
@@ -391,7 +495,11 @@ async def test_codex_client_happy_path_deltas_remain_live_and_ordered(monkeypatc
     client_factory = _FakeAsyncClientSequence([response], sink)
     monkeypatch.setattr("openharness.api.codex_client.httpx.AsyncClient", client_factory)
 
-    client = CodexApiClient(_fake_codex_token(), stall_timeout_seconds=0.2)
+    client = CodexApiClient(
+        _fake_codex_token(),
+        stall_timeout_seconds=0.2,
+        attempt_timeout_seconds=0.5,
+    )
     stream = client.stream_message(_codex_request()).__aiter__()
     first_event = await asyncio.wait_for(stream.__anext__(), timeout=0.1)
 
@@ -411,7 +519,7 @@ async def test_codex_client_happy_path_deltas_remain_live_and_ordered(monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_codex_client_disabled_stall_timeout_allows_slow_stream(monkeypatch):
+async def test_codex_client_disabled_timeouts_allow_slow_stream(monkeypatch):
     sink: dict[str, Any] = {}
     lines = [
         'data: {"type":"response.in_progress"}',
@@ -422,7 +530,11 @@ async def test_codex_client_disabled_stall_timeout_allows_slow_stream(monkeypatc
     client_factory = _FakeAsyncClientSequence([response], sink)
     monkeypatch.setattr("openharness.api.codex_client.httpx.AsyncClient", client_factory)
 
-    client = CodexApiClient(_fake_codex_token(), stall_timeout_seconds=None)
+    client = CodexApiClient(
+        _fake_codex_token(),
+        stall_timeout_seconds=None,
+        attempt_timeout_seconds=None,
+    )
     events = await asyncio.wait_for(
         _collect_stream(client, _codex_request()),
         timeout=0.2,

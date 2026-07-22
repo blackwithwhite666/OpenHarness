@@ -8,8 +8,9 @@ import json
 import logging
 import platform
 import random
-from collections.abc import Callable
-from typing import Any, AsyncIterator
+from collections.abc import Awaitable, Callable
+from contextlib import AsyncExitStack
+from typing import Any, AsyncIterator, TypeVar
 
 import httpx
 
@@ -31,6 +32,8 @@ JWT_CLAIM_PATH = "https://api.openai.com/auth"
 MAX_RETRIES = 5
 BASE_DELAY_SECONDS = 1.0
 MAX_DELAY_SECONDS = 30.0
+
+_T = TypeVar("_T")
 
 
 class StreamStalled(RequestFailure):
@@ -267,12 +270,14 @@ class CodexApiClient:
         base_url: str | None = None,
         auth_token_resolver: Callable[[], str] | None = None,
         stall_timeout_seconds: float | None = 30.0,
+        attempt_timeout_seconds: float | None = 120.0,
     ) -> None:
         self._auth_token = auth_token
         self._base_url = base_url
         self._url = _resolve_codex_url(base_url)
         self._auth_token_resolver = auth_token_resolver
         self._stall_timeout_seconds = stall_timeout_seconds
+        self._attempt_timeout_seconds = attempt_timeout_seconds
 
     def _refresh_client_auth(self) -> None:
         """Re-resolve the access token before a request so a long-running client
@@ -327,6 +332,12 @@ class CodexApiClient:
             raise self._translate_error(last_error) from last_error
 
     async def _stream_once(self, request: ApiMessageRequest) -> AsyncIterator[ApiStreamEvent]:
+        loop = asyncio.get_running_loop()
+        deadline = (
+            loop.time() + self._attempt_timeout_seconds
+            if self._attempt_timeout_seconds and self._attempt_timeout_seconds > 0
+            else None
+        )
         body = _build_codex_body(request)
 
         content: list[TextBlock | ToolUseBlock] = []
@@ -334,31 +345,34 @@ class CodexApiClient:
         completed_response: dict[str, Any] | None = None
 
         headers = _build_codex_headers(self._auth_token)
-        async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
-            async with client.stream("POST", self._url, headers=headers, json=body) as response:
+        async with AsyncExitStack() as client_stack:
+            client = await self._await_before_attempt_deadline(
+                client_stack.enter_async_context(
+                    httpx.AsyncClient(timeout=60.0, follow_redirects=True)
+                ),
+                deadline=deadline,
+            )
+            async with AsyncExitStack() as stack:
+                response = await self._await_before_attempt_deadline(
+                    stack.enter_async_context(
+                        client.stream("POST", self._url, headers=headers, json=body)
+                    ),
+                    deadline=deadline,
+                )
                 if response.status_code >= 400:
-                    payload = await response.aread()
+                    payload = await self._await_before_attempt_deadline(
+                        response.aread(),
+                        deadline=deadline,
+                    )
                     message = _format_error_message(response.status_code, payload.decode("utf-8", "replace"))
                     raise httpx.HTTPStatusError(message, request=response.request, response=response)
 
                 event_iterator = self._iter_sse_events(response).__aiter__()
                 while True:
                     try:
-                        if self._stall_timeout_seconds and self._stall_timeout_seconds > 0:
-                            event = await asyncio.wait_for(
-                                event_iterator.__anext__(),
-                                timeout=self._stall_timeout_seconds,
-                            )
-                        else:
-                            event = await event_iterator.__anext__()
+                        event = await self._next_sse_event(event_iterator, deadline=deadline)
                     except StopAsyncIteration:
                         break
-                    except TimeoutError as exc:
-                        raise StreamStalled(
-                            "Codex stream stalled after "
-                            f"{self._stall_timeout_seconds:g}s without an SSE event "
-                            "(inactivity timeout)"
-                        ) from exc
 
                     event_type = event.get("type")
                     if event_type == "response.output_text.delta":
@@ -432,6 +446,59 @@ class CodexApiClient:
             message=final_message,
             usage=usage,
             stop_reason=stop_reason,
+        )
+
+    async def _await_before_attempt_deadline(
+        self,
+        awaitable: Awaitable[_T],
+        *,
+        deadline: float | None,
+    ) -> _T:
+        if deadline is None:
+            return await awaitable
+
+        remaining = max(0.0, deadline - asyncio.get_running_loop().time())
+        try:
+            return await asyncio.wait_for(awaitable, timeout=remaining)
+        except asyncio.TimeoutError as exc:
+            raise self._attempt_timeout_error() from exc
+
+    async def _next_sse_event(
+        self,
+        event_iterator: AsyncIterator[dict[str, Any]],
+        *,
+        deadline: float | None,
+    ) -> dict[str, Any]:
+        wait_timeout: float | None = None
+        deadline_is_limit = False
+        if self._stall_timeout_seconds and self._stall_timeout_seconds > 0:
+            wait_timeout = self._stall_timeout_seconds
+
+        if deadline is not None:
+            remaining = max(0.0, deadline - asyncio.get_running_loop().time())
+            if wait_timeout is None or remaining <= wait_timeout:
+                wait_timeout = remaining
+                deadline_is_limit = True
+
+        try:
+            if wait_timeout is None:
+                return await event_iterator.__anext__()
+            return await asyncio.wait_for(event_iterator.__anext__(), timeout=wait_timeout)
+        except asyncio.TimeoutError as exc:
+            if deadline_is_limit:
+                raise self._attempt_timeout_error() from exc
+            raise StreamStalled(
+                "Codex stream stalled after "
+                f"{self._stall_timeout_seconds:g}s without an SSE event "
+                "(inactivity timeout)"
+            ) from exc
+
+    def _attempt_timeout_error(self) -> StreamStalled:
+        timeout_seconds = self._attempt_timeout_seconds
+        assert timeout_seconds is not None and timeout_seconds > 0
+        return StreamStalled(
+            "Codex attempt timeout after "
+            f"{timeout_seconds:g}s total wall-clock time"
         )
 
     async def _iter_sse_events(self, response: httpx.Response) -> AsyncIterator[dict[str, Any]]:
