@@ -9,6 +9,7 @@ is persisted across runs without rewriting settings.
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import threading
@@ -23,6 +24,24 @@ _EXPIRY_SKEW_S = 60
 # Refresh tokens rotate: two concurrent refreshes would consume the same token
 # and break the chain (the loser's rotated token is lost). Serialize refreshes.
 _refresh_lock = threading.Lock()
+
+
+def _acquire_cross_process_lock(token_file: str) -> int:
+    """Advisory cross-process lock so multiple OpenHarness processes (gateway,
+    cron_scheduler, per-turn tasks) sharing this token_file cannot refresh — and
+    thus consume the same single-use rotating refresh token — concurrently. The
+    threading.Lock above only serializes threads within ONE process."""
+    lock_path = os.path.expanduser(token_file) + ".lock"
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    return fd
+
+
+def _release_cross_process_lock(fd: int) -> None:
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
 
 
 def _read_store(path: str) -> dict:
@@ -82,25 +101,35 @@ def ensure_bearer(oauth, *, now=None, force=False, stale_token=None) -> str:
         if access and expires_at - now > _EXPIRY_SKEW_S:
             return access
     with _refresh_lock:
-        # Re-read inside the lock: another caller may have refreshed while we waited.
-        store = _read_store(oauth.token_file)
-        access = store.get("access_token")
-        expires_at = store.get("expires_at") or 0
-        valid = access and expires_at - now > _EXPIRY_SKEW_S
-        if (not force and valid) or (
-            force and stale_token is not None and access != stale_token and valid
-        ):
+        # Serialize refreshes ACROSS PROCESSES: acquire the file lock and only
+        # THEN re-read, so "another caller may have refreshed while we waited"
+        # actually holds across processes, not just threads. The second racer
+        # then sees the already-rotated token and returns it instead of
+        # re-consuming the old (now single-use-spent) refresh token — which is
+        # what split the rotation chain and forced periodic re-auth.
+        lock_fd = _acquire_cross_process_lock(oauth.token_file)
+        try:
+            now2 = time.time()
+            store = _read_store(oauth.token_file)
+            access = store.get("access_token")
+            expires_at = store.get("expires_at") or 0
+            valid = access and expires_at - now2 > _EXPIRY_SKEW_S
+            if (not force and valid) or (
+                force and stale_token is not None and access != stale_token and valid
+            ):
+                return access
+            refresh_token = store.get("refresh_token")
+            if not refresh_token:
+                raise ValueError(
+                    f"No refresh_token in {oauth.token_file}; re-authenticate the MCP server."
+                )
+            tok = _refresh(oauth, refresh_token)
+            access = tok["access_token"]
+            store["access_token"] = access
+            store["expires_at"] = now2 + int(tok.get("expires_in", 3600))
+            if tok.get("refresh_token"):  # rotation
+                store["refresh_token"] = tok["refresh_token"]
+            _write_store(oauth.token_file, store)
             return access
-        refresh_token = store.get("refresh_token")
-        if not refresh_token:
-            raise ValueError(
-                f"No refresh_token in {oauth.token_file}; re-authenticate the MCP server."
-            )
-        tok = _refresh(oauth, refresh_token)
-        access = tok["access_token"]
-        store["access_token"] = access
-        store["expires_at"] = now + int(tok.get("expires_in", 3600))
-        if tok.get("refresh_token"):  # rotation
-            store["refresh_token"] = tok["refresh_token"]
-        _write_store(oauth.token_file, store)
-        return access
+        finally:
+            _release_cross_process_lock(lock_fd)

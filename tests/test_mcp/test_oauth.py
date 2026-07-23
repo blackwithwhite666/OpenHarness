@@ -220,3 +220,97 @@ async def test_oauth_bearer_auth_injects_token_per_request(tmp_path):
     sent = await flow.__anext__()
     assert sent.headers[cfg.header] == "Bearer TKN"
     await flow.aclose()
+
+
+def test_flock_serializes_refresh_across_processes(tmp_path):
+    """Cross-process file lock: concurrent OpenHarness processes (gateway,
+    cron_scheduler, per-turn tasks) sharing one token_file must not consume the
+    same single-use rotating refresh token twice. Regression for the worfalomey
+    forced-re-auth: a single-use token was observed exchanged twice ~19s apart
+    (two processes racing past the in-process threading.Lock), which split the
+    rotation chain. Uses real subprocesses against a real single-use rotating
+    endpoint with NO grace, so it exercises the flock, not just the thread lock.
+    """
+    import http.server
+    import secrets
+    import socketserver
+    import subprocess
+    import sys
+    import threading
+    import urllib.parse
+    from concurrent.futures import ThreadPoolExecutor
+
+    n = 6
+    state = {"valid": {"R0"}, "consumed": {}}
+    lock = threading.Lock()
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", 0))
+            form = dict(urllib.parse.parse_qsl(self.rfile.read(length).decode()))
+            rt = form.get("refresh_token")
+            with lock:
+                if rt in state["valid"]:
+                    state["valid"].discard(rt)
+                    state["consumed"][rt] = state["consumed"].get(rt, 0) + 1
+                    new = "R" + secrets.token_hex(6)
+                    state["valid"].add(new)
+                    code, resp = 200, {
+                        "access_token": "A" + secrets.token_hex(4),
+                        "expires_in": 3600,
+                        "refresh_token": new,
+                    }
+                else:
+                    code, resp = 400, {"error": "invalid_grant"}
+            payload = json.dumps(resp).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, *a):
+            pass
+
+    srv = socketserver.ThreadingTCPServer(("127.0.0.1", 0), Handler)
+    srv.daemon_threads = True
+    port = srv.server_address[1]
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        tf = tmp_path / "tok.json"
+        tf.write_text(json.dumps(
+            {"access_token": "OLD", "expires_at": 0, "refresh_token": "R0"}
+        ))
+        cfg = {
+            "token_url": f"http://127.0.0.1:{port}/token",
+            "client_id": "cid",
+            "client_secret": "sec",
+            "token_file": str(tf),
+            "resource": "https://mcp.example/mcp",
+            "scope": "user",
+        }
+        child = (
+            "import json,sys;"
+            "from openharness.mcp import oauth;"
+            "from openharness.mcp.types import McpOAuthConfig;"
+            "cfg=McpOAuthConfig(**json.loads(sys.argv[1]));"
+            "print(oauth.ensure_bearer(cfg, force=True))"
+        )
+
+        def run(_i):
+            return subprocess.run(
+                [sys.executable, "-c", child, json.dumps(cfg)],
+                capture_output=True, text=True, timeout=30,
+            )
+
+        with ThreadPoolExecutor(max_workers=n) as ex:
+            results = list(ex.map(run, range(n)))
+    finally:
+        srv.shutdown()
+
+    failures = [r for r in results if r.returncode != 0]
+    assert not failures, failures[0].stderr
+    # The old token R0 was consumed exactly once despite n concurrent forced
+    # refreshes — the losers re-read the file under the lock and saw the
+    # already-rotated token instead of re-spending R0.
+    assert state["consumed"].get("R0") == 1, state["consumed"]
