@@ -455,7 +455,7 @@ def run_ohmo_session_eval(
     sandbox_browser_socket: str | None = None,
     sandbox_browser_name: str | None = None,
     sandbox_ro_dirs: tuple[str, ...] = (),
-    session_timeout: float | None = 900.0,
+    session_timeout: float | None = 2400.0,
 ) -> OhmoSessionEvalRunResult:
     """Run P0 session replay checks over captured Ohmo eval episodes.
 

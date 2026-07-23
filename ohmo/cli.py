@@ -2886,7 +2886,7 @@ def evals_run_session_cmd(
         help="Drop conversations shorter than this many turns when --segment",
     ),
     session_timeout: float = typer.Option(
-        900.0,
+        2400.0,
         "--session-timeout",
         min=0.0,
         help="Per-session wall-clock timeout in seconds (0 disables)",

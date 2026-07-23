@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 from pathlib import Path
 
@@ -47,6 +48,12 @@ from ohmo.evals import (
 from openharness.config.settings import Settings
 from ohmo.evals.runner import _build_agent_runner, _resolve_eval_system_prompt
 from ohmo.workspace import get_reminders_path, get_skills_dir, initialize_workspace
+
+
+def test_run_ohmo_session_eval_default_timeout_allows_heavy_sessions():
+    default = inspect.signature(run_ohmo_session_eval).parameters["session_timeout"].default
+
+    assert default == 2400.0
 
 
 def test_run_ohmo_eval_report_writes_metadata_replay_report(tmp_path: Path):

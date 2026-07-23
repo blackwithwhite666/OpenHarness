@@ -5,6 +5,7 @@ import json
 import time
 from typing import Any
 
+import httpx
 import pytest
 
 from openharness.api.client import ApiMessageRequest, ApiMessageCompleteEvent, ApiRetryEvent, ApiTextDeltaEvent
@@ -254,6 +255,21 @@ def test_format_codex_stream_error_includes_code_and_request_id():
     assert message == "Upstream overloaded (code=overloaded) [request_id=req_123]"
 
 
+def test_codex_client_defaults_match_codex_stream_timeouts():
+    client = CodexApiClient(_fake_codex_token())
+
+    assert client._stall_timeout_seconds == 300.0
+    assert client._attempt_timeout_seconds is None
+
+
+def test_codex_client_uses_server_requested_retry_delay():
+    request = httpx.Request("POST", "https://chatgpt.com/backend-api/codex/responses")
+    response = httpx.Response(429, headers={"Retry-After": "2.5"}, request=request)
+    error = httpx.HTTPStatusError("rate limited", request=request, response=response)
+
+    assert CodexApiClient._server_requested_retry_delay(error) == 2.5
+
+
 @pytest.mark.asyncio
 async def test_codex_client_streams_text(monkeypatch):
     sink: dict[str, Any] = {}
@@ -314,7 +330,7 @@ async def test_codex_client_retries_response_start_hang_then_succeeds(monkeypatc
     client = CodexApiClient(
         _fake_codex_token(),
         stall_timeout_seconds=0.02,
-        attempt_timeout_seconds=0.2,
+        attempt_timeout_seconds=None,
     )
     started = time.monotonic()
     events = await asyncio.wait_for(
@@ -334,6 +350,37 @@ async def test_codex_client_retries_response_start_hang_then_succeeds(monkeypatc
     complete_events = [event for event in events if isinstance(event, ApiMessageCompleteEvent)]
     assert len(complete_events) == 1
     assert complete_events[0].message.text == "clean answer"
+
+
+@pytest.mark.asyncio
+async def test_codex_client_allows_long_stream_that_keeps_making_progress(monkeypatch):
+    sink: dict[str, Any] = {}
+    response = _FakeStreamResponse(
+        lines=_successful_text_lines("still ", "working"),
+        line_delays={0: 0.02, 2: 0.02, 6: 0.02},
+    )
+    client_factory = _FakeAsyncClientSequence([response], sink)
+    monkeypatch.setattr("openharness.api.codex_client.httpx.AsyncClient", client_factory)
+
+    client = CodexApiClient(
+        _fake_codex_token(),
+        stall_timeout_seconds=0.03,
+        attempt_timeout_seconds=None,
+    )
+    started = time.monotonic()
+    events = await asyncio.wait_for(
+        _collect_stream(client, _codex_request()),
+        timeout=0.2,
+    )
+
+    assert time.monotonic() - started > 0.05
+    assert client_factory.attempts == 1
+    assert not any(isinstance(event, ApiRetryEvent) for event in events)
+    assert [event.text for event in events if isinstance(event, ApiTextDeltaEvent)] == [
+        "still ",
+        "working",
+    ]
+    assert len([event for event in events if isinstance(event, ApiMessageCompleteEvent)]) == 1
 
 
 @pytest.mark.asyncio
@@ -365,7 +412,7 @@ async def test_codex_client_total_timeout_stops_slow_drip(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_codex_client_total_timeout_stops_connect_headers_hang(monkeypatch):
+async def test_codex_client_idle_timeout_stops_connect_headers_hang(monkeypatch):
     sink: dict[str, Any] = {}
     response = _FakeStreamResponse(hang_on_enter=True)
     succeeded = _FakeStreamResponse(lines=_successful_text_lines("connected"))
@@ -376,7 +423,7 @@ async def test_codex_client_total_timeout_stops_connect_headers_hang(monkeypatch
     client = CodexApiClient(
         _fake_codex_token(),
         stall_timeout_seconds=0.01,
-        attempt_timeout_seconds=0.04,
+        attempt_timeout_seconds=None,
     )
     started = time.monotonic()
     events = await asyncio.wait_for(
@@ -388,7 +435,7 @@ async def test_codex_client_total_timeout_stops_connect_headers_hang(monkeypatch
     assert client_factory.attempts == 2
     retry_events = [event for event in events if isinstance(event, ApiRetryEvent)]
     assert len(retry_events) == 1
-    assert "attempt timeout" in retry_events[0].message
+    assert "inactivity timeout" in retry_events[0].message
     assert [event.text for event in events if isinstance(event, ApiTextDeltaEvent)] == ["connected"]
 
 

@@ -1875,7 +1875,7 @@ def test_ohmo_evals_run_session_command_runs_session_eval(tmp_path: Path, monkey
         sandbox_browser_socket: str | None = None,
         sandbox_browser_name: str | None = None,
         sandbox_ro_dirs: tuple[str, ...] = (),
-        session_timeout: float | None = 900.0,
+        session_timeout: float | None = 2400.0,
     ):
         calls.append(
             {
@@ -2024,6 +2024,7 @@ def test_ohmo_evals_run_session_command_runs_session_eval(tmp_path: Path, monkey
 
     assert explicit_true.exit_code == 0
     assert calls[0]["user_sim_goal_anchored"] is True
+    assert calls[0]["session_timeout"] == 2400.0
 
 
 def test_ohmo_evals_fixture_match_rejects_invalid_value(tmp_path: Path):

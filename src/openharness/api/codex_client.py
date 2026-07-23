@@ -6,6 +6,7 @@ import asyncio
 import base64
 import json
 import logging
+import math
 import platform
 import random
 from collections.abc import Awaitable, Callable
@@ -269,8 +270,8 @@ class CodexApiClient:
         *,
         base_url: str | None = None,
         auth_token_resolver: Callable[[], str] | None = None,
-        stall_timeout_seconds: float | None = 30.0,
-        attempt_timeout_seconds: float | None = 120.0,
+        stall_timeout_seconds: float | None = 300.0,
+        attempt_timeout_seconds: float | None = None,
     ) -> None:
         self._auth_token = auth_token
         self._base_url = base_url
@@ -311,6 +312,8 @@ class CodexApiClient:
                 return
             except Exception as exc:
                 last_error = exc
+                # Unlike codex-rs, never retry after progress: yielded deltas are
+                # already downstream, so re-streaming would duplicate partial output.
                 if stream_event_yielded or not self._is_retryable(exc):
                     raise self._translate_error(exc) from exc
                 if attempt >= MAX_RETRIES:
@@ -319,8 +322,10 @@ class CodexApiClient:
                             f"Codex stream stalled; gave up after {attempt + 1} attempts: {exc}"
                         ) from exc
                     raise self._translate_error(exc) from exc
-                base_delay = min(BASE_DELAY_SECONDS * (2 ** attempt), MAX_DELAY_SECONDS)
-                delay = base_delay + random.uniform(0, base_delay * 0.25)
+                delay = self._server_requested_retry_delay(exc)
+                if delay is None:
+                    base_delay = min(BASE_DELAY_SECONDS * (2 ** attempt), MAX_DELAY_SECONDS)
+                    delay = base_delay + random.uniform(0, base_delay * 0.25)
                 yield ApiRetryEvent(
                     message=str(exc),
                     attempt=attempt + 1,
@@ -346,9 +351,10 @@ class CodexApiClient:
 
         headers = _build_codex_headers(self._auth_token)
         async with AsyncExitStack() as client_stack:
+            # The explicit idle wrapper below is the sole stream timeout.
             client = await self._await_before_attempt_deadline(
                 client_stack.enter_async_context(
-                    httpx.AsyncClient(timeout=60.0, follow_redirects=True)
+                    httpx.AsyncClient(timeout=None, follow_redirects=True)
                 ),
                 deadline=deadline,
             )
@@ -454,21 +460,6 @@ class CodexApiClient:
         *,
         deadline: float | None,
     ) -> _T:
-        if deadline is None:
-            return await awaitable
-
-        remaining = max(0.0, deadline - asyncio.get_running_loop().time())
-        try:
-            return await asyncio.wait_for(awaitable, timeout=remaining)
-        except asyncio.TimeoutError as exc:
-            raise self._attempt_timeout_error() from exc
-
-    async def _next_sse_event(
-        self,
-        event_iterator: AsyncIterator[dict[str, Any]],
-        *,
-        deadline: float | None,
-    ) -> dict[str, Any]:
         wait_timeout: float | None = None
         deadline_is_limit = False
         if self._stall_timeout_seconds and self._stall_timeout_seconds > 0:
@@ -482,16 +473,32 @@ class CodexApiClient:
 
         try:
             if wait_timeout is None:
-                return await event_iterator.__anext__()
-            return await asyncio.wait_for(event_iterator.__anext__(), timeout=wait_timeout)
+                return await awaitable
+            return await asyncio.wait_for(awaitable, timeout=wait_timeout)
         except asyncio.TimeoutError as exc:
             if deadline_is_limit:
                 raise self._attempt_timeout_error() from exc
-            raise StreamStalled(
-                "Codex stream stalled after "
-                f"{self._stall_timeout_seconds:g}s without an SSE event "
-                "(inactivity timeout)"
-            ) from exc
+            raise self._stall_timeout_error() from exc
+
+    async def _next_sse_event(
+        self,
+        event_iterator: AsyncIterator[dict[str, Any]],
+        *,
+        deadline: float | None,
+    ) -> dict[str, Any]:
+        return await self._await_before_attempt_deadline(
+            event_iterator.__anext__(),
+            deadline=deadline,
+        )
+
+    def _stall_timeout_error(self) -> StreamStalled:
+        timeout_seconds = self._stall_timeout_seconds
+        assert timeout_seconds is not None and timeout_seconds > 0
+        return StreamStalled(
+            "Codex stream stalled after "
+            f"{timeout_seconds:g}s without response or SSE progress "
+            "(inactivity timeout)"
+        )
 
     def _attempt_timeout_error(self) -> StreamStalled:
         timeout_seconds = self._attempt_timeout_seconds
@@ -500,6 +507,20 @@ class CodexApiClient:
             "Codex attempt timeout after "
             f"{timeout_seconds:g}s total wall-clock time"
         )
+
+    @staticmethod
+    def _server_requested_retry_delay(exc: Exception) -> float | None:
+        if not isinstance(exc, httpx.HTTPStatusError):
+            return None
+        retry_after = exc.response.headers.get("Retry-After")
+        if retry_after is None:
+            return None
+        try:
+            delay = float(retry_after)
+        except ValueError:
+            # TODO: Support HTTP-date Retry-After values if Codex starts sending them.
+            return None
+        return delay if math.isfinite(delay) and delay >= 0 else None
 
     async def _iter_sse_events(self, response: httpx.Response) -> AsyncIterator[dict[str, Any]]:
         data_lines: list[str] = []
