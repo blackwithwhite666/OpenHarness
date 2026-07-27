@@ -1628,6 +1628,48 @@ async def test_gateway_bridge_publishes_progress_updates():
 
 
 @pytest.mark.asyncio
+async def test_gateway_bridge_dedupes_absolute_attach_image(tmp_path):
+    """An absolute-path image attached with ``[[attach: /abs/img.jpg]]`` is
+    matched by BOTH the runtime final-reply fallback (surfaced here via the
+    final update's ``media``) and the bridge's ``_extract_attachments`` marker
+    parser. The two must be deduped so Telegram sends the photo once, not twice.
+    Regression for the duplicate-photo bug.
+    """
+    image = tmp_path / "photo.jpg"
+    image.write_bytes(b"\xff\xd8\xff\xd9")  # minimal JPEG marker bytes
+    image_path = str(image)
+
+    class FakeRuntimePool:
+        async def stream_message(self, message, session_key):
+            # Runtime's _extract_final_reply_media surfaces the bare absolute
+            # image path (in .media); the reply text still carries the
+            # [[attach: ...]] marker the bridge parses independently.
+            yield SimpleNamespace(
+                kind="final",
+                text=f"Вот фото: [[attach: {image_path}]]",
+                media=[image_path],
+                metadata={"_media": [image_path]},
+            )
+
+    bus = MessageBus()
+    bridge = OhmoGatewayBridge(bus=bus, runtime_pool=FakeRuntimePool())
+    task = asyncio.create_task(bridge.run())
+    try:
+        await bus.publish_inbound(
+            InboundMessage(channel="telegram", sender_id="u1", chat_id="c1", content="фото")
+        )
+        final = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
+    finally:
+        bridge.stop()
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    assert final.media == [image_path]  # deduped: the file is attached exactly once
+    assert "[[attach" not in final.content  # marker stripped from visible text
+
+
+@pytest.mark.asyncio
 async def test_gateway_bridge_does_not_thread_private_feishu_replies():
     bus = MessageBus()
 

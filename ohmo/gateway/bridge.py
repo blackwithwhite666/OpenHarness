@@ -639,12 +639,19 @@ class OhmoGatewayBridge:
             # Show the question above the buttons (the visible text may already
             # carry context; append the question so the choices read clearly).
             content = (content + ("\n\n" if content else "") + question).strip()
+        # Attachments can surface twice for the same file: the runtime final-reply
+        # fallback (_extract_final_reply_media) matches a bare absolute image path,
+        # while _extract_attachments matches that same path inside its
+        # [[attach: ...]] marker. Concatenating both would attach — and Telegram
+        # would send — the file twice. Dedup (order-preserving) so an image
+        # referenced by an absolute [[attach:]] path is delivered exactly once.
+        final_media_paths = list(dict.fromkeys([*final_media, *media]))
         logger.info(
             "ohmo outbound final channel=%s chat_id=%s session_key=%s media=%d buttons=%d content=%r",
             message.channel,
             message.chat_id,
             session_key,
-            len(media),
+            len(final_media_paths),
             len(options),
             _content_snippet(content),
         )
@@ -661,7 +668,7 @@ class OhmoGatewayBridge:
                 channel=message.channel,
                 chat_id=message.chat_id,
                 content=content,
-                media=[*final_media, *media],
+                media=final_media_paths,
                 buttons=options,
                 metadata=final_meta,
             )
