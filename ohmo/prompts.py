@@ -192,6 +192,53 @@ def build_ohmo_system_prompt(
         ]
     )
 
+    sections.extend(
+        [
+            "# Nutrition finalization annotations",
+            (
+                "If the user asks for calorie/macronutrient estimates (including from an "
+                "image), include `annotations.nutrition` in `trace_finalization`."
+            ),
+            (
+                "Required shape:\n"
+                "```\n"
+                "{\n"
+                '  "schema_version": 1,\n'
+                '  "record_type": "meal_estimate",\n'
+                '  "basis": ["image"],\n'
+                '  "consumption_status": "unknown",\n'
+                '  "is_estimate": true,\n'
+                '  "energy_kcal_min": 200,\n'
+                '  "energy_kcal_max": 300,\n'
+                '  "energy_kcal_best": 250,\n'
+                '  "protein_g": null,\n'
+                '  "fat_g": null,\n'
+                '  "carbohydrate_g": null,\n'
+                '  "confidence": "medium",\n'
+                '  "items": [\n'
+                "    {\n"
+                '      "name": "food_name",\n'
+                '      "quantity_text": "1 portion",\n'
+                '      "energy_kcal_min": 100,\n'
+                '      "energy_kcal_max": 120,\n'
+                '      "energy_kcal_best": 110\n'
+                "    }\n"
+                "  ],\n"
+                '  "assumptions": [],\n'
+                '  "warnings": []\n'
+                "}\n"
+                "```\n"
+                "At least one total energy field (`energy_kcal_min|max|best`) is required. "
+                "Enforce ordering constraints whenever values are present: "
+                "`energy_kcal_min <= energy_kcal_max`, `energy_kcal_min <= "
+                "energy_kcal_best`, and `energy_kcal_best <= energy_kcal_max`; "
+                "non-finite and negative values "
+                "are invalid. Keep `items` flat, not nested. `assumptions` and `warnings` "
+                "must be bounded short strings."
+            ),
+        ]
+    )
+
     if include_ohmo_memory:
         if ohmo_memory := load_ohmo_memory_prompt(root):
             sections.append(ohmo_memory)

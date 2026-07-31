@@ -3,18 +3,27 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+from openharness.channels.bus.events import InboundMessage
 from openharness.engine.messages import ConversationMessage
+from openharness.evals import DecisionTraceValidationError, TRACE_FINALIZATION
 from openharness.tools.base import ToolExecutionContext, ToolRegistry
+from ohmo.evals import GatewayEvalRecorder
 
 from ohmo.gateway.config import save_gateway_config
 from ohmo.gateway.memory_gate import MemoryScope
 from ohmo.gateway.models import GatewayConfig
-from ohmo.gateway.runtime import OhmoSessionRuntimePool
+from ohmo.gateway.runtime import (
+    OhmoSessionRuntimePool,
+    _build_conversation_turn_metadata,
+    _logical_turn_id_for_conversation,
+    _message_identity_for_turn,
+)
 from ohmo.gateway.turn_context import TurnContext
 from ohmo.memory_backend import CatalogMemoryBackend, ShadowMemoryBackend
 from ohmo.memory_catalog import MemoryCatalog
@@ -111,6 +120,107 @@ def _seed_catalog(workspace: Path) -> MemoryCatalog:
     assert catalog.add("marina", "Marina note", "marina-only row").ok
     assert catalog.add("family-shared", "Family note", "shared-family row").ok
     return catalog
+
+
+def _message() -> InboundMessage:
+    return InboundMessage(
+        channel="telegram",
+        sender_id="100",
+        chat_id="100",
+        content="What did I eat today?",
+        metadata={"message_id": 0, "chat_type": "p2p"},
+        timestamp=datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc),
+    )
+
+
+def _metadata(
+    *,
+    turn_ctx: TurnContext,
+    scope: MemoryScope,
+    message: InboundMessage,
+    recorder: GatewayEvalRecorder | None,
+) -> tuple[str, dict[str, object], dict[str, object]]:
+    return _build_conversation_turn_metadata(
+        turn_ctx=turn_ctx,
+        message=message,
+        scope=scope,
+        recorder=recorder,
+    )
+
+
+def _assert_expected_metadata_keys(metadata: dict[str, object], *, recorder: bool = False) -> None:
+    expected = {
+        "tenant_id",
+        "source_principal",
+        "gateway_session_id",
+        "logical_turn_id",
+        "client_op_id",
+        "decision_trace_status",
+        "nutrition_annotation_status",
+        "decision_trace_episode_id",
+    }
+    if recorder:
+        assert set(metadata.keys()) == expected | {"decision_trace"}
+    else:
+        assert set(metadata.keys()) == expected
+
+
+def _assert_metadata_fields(
+    metadata: dict[str, object],
+    *,
+    turn_ctx: TurnContext,
+    scope: MemoryScope,
+    recorder: GatewayEvalRecorder | None,
+) -> None:
+    _assert_expected_metadata_keys(
+        metadata,
+        recorder="decision_trace" in metadata,
+    )
+    assert metadata["tenant_id"] == scope.private_tenant
+    assert metadata["source_principal"] == f"{turn_ctx.channel}:{turn_ctx.principal}"
+    assert metadata["gateway_session_id"] == turn_ctx.session_id
+    expected_decision_trace_episode_id = None if recorder is None else recorder.episode_id
+    assert metadata["decision_trace_episode_id"] == expected_decision_trace_episode_id
+    assert metadata["client_op_id"].startswith(metadata["logical_turn_id"] + ":")
+
+    if "decision_trace" in metadata:
+        assert metadata["client_op_id"].endswith(":assistant")
+
+
+def _build_recorder(tmp_path: Path, message: InboundMessage) -> GatewayEvalRecorder:
+    bundle = SimpleNamespace(
+        session_id="session-100",
+        current_settings=lambda: SimpleNamespace(model="test-model"),
+        cwd=str(tmp_path),
+    )
+    return GatewayEvalRecorder.start(
+        workspace=tmp_path,
+        bundle=bundle,
+        message=message,
+        session_key="telegram:100",
+        user_text=message.content or "",
+        user_goal="track nutrition",
+    )
+
+
+def _assert_honcho_metadata_depth(value: object, depth: int = 1) -> int:
+    max_depth = depth
+    if isinstance(value, dict):
+        for nested in value.values():
+            if isinstance(nested, dict):
+                max_depth = max(max_depth, _assert_honcho_metadata_depth(nested, depth + 1))
+            elif isinstance(nested, list):
+                for item in nested:
+                    if isinstance(item, dict):
+                        max_depth = max(
+                            max_depth,
+                            _assert_honcho_metadata_depth(item, depth + 1),
+                        )
+    elif isinstance(value, list):
+        for item in value:
+            if isinstance(item, dict):
+                max_depth = max(max_depth, _assert_honcho_metadata_depth(item, depth + 1))
+    return max_depth
 
 
 async def _assert_scoped_surfaces(
@@ -275,6 +385,7 @@ async def test_family_turn_never_uses_owner_honcho_recall_or_ingest(
     await pool._append_conversation_turn(
         turn_ctx=turn_ctx,
         memory_scope=scope,
+        message=_message(),
         user_text="family user turn",
         assistant_text="family assistant turn",
     )
@@ -298,6 +409,7 @@ async def test_family_turn_never_uses_owner_honcho_recall_or_ingest(
     await pool._append_conversation_turn(
         turn_ctx=owner_ctx,
         memory_scope=owner_scope,
+        message=_message(),
         user_text="owner user turn",
         assistant_text="owner assistant turn",
     )
@@ -306,7 +418,16 @@ async def test_family_turn_never_uses_owner_honcho_recall_or_ingest(
     assert "owner-derived fact" in owner_prompt
     assert "honcho, derived" in owner_prompt
     assert honcho.queries == ["recall owner history"]
-    assert len(honcho.messages) == 2
+    assert len(honcho.messages) == 1
+    owner_exchange = honcho.messages[0]
+    assert isinstance(owner_exchange, list)
+    assert len(owner_exchange) == 2
+    assert owner_exchange[0]["content"] == "owner user turn"
+    assert owner_exchange[0]["peer_id"] == "owner"
+    assert owner_exchange[0]["metadata"]["role"] == "user"
+    assert owner_exchange[1]["content"] == "owner assistant turn"
+    assert owner_exchange[1]["peer_id"] == "ohmo"
+    assert owner_exchange[1]["metadata"]["role"] == "assistant"
 
 
 async def test_owner_and_marina_honcho_recall_and_ingest_are_isolated(
@@ -367,12 +488,14 @@ async def test_owner_and_marina_honcho_recall_and_ingest_are_isolated(
     await pool._append_conversation_turn(
         turn_ctx=owner_ctx,
         memory_scope=owner_scope,
+        message=_message(),
         user_text="owner user turn",
         assistant_text="owner assistant turn",
     )
     await pool._append_conversation_turn(
         turn_ctx=marina_ctx,
         memory_scope=marina_scope,
+        message=_message(),
         user_text="marina user turn",
         assistant_text="marina assistant turn",
     )
@@ -408,50 +531,27 @@ async def test_owner_and_marina_honcho_recall_and_ingest_are_isolated(
     assert "marina-workspace derived fact" not in owner_prompt
     assert "marina-workspace derived fact" in marina_prompt
     assert "owner-workspace derived fact" not in marina_prompt
-    assert owner_honcho.messages == [
-        (
-            "ohmo",
-            [
-                {
-                    "content": "owner user turn",
-                    "peer_id": "owner",
-                    "metadata": {"role": "user"},
-                }
-            ],
-        ),
-        (
-            "ohmo",
-            [
-                {
-                    "content": "owner assistant turn",
-                    "peer_id": "ohmo",
-                    "metadata": {"role": "assistant"},
-                }
-            ],
-        ),
-    ]
-    assert marina_honcho.messages == [
-        (
-            "ohmo",
-            [
-                {
-                    "content": "marina user turn",
-                    "peer_id": "marina",
-                    "metadata": {"role": "user"},
-                }
-            ],
-        ),
-        (
-            "ohmo",
-            [
-                {
-                    "content": "marina assistant turn",
-                    "peer_id": "ohmo",
-                    "metadata": {"role": "assistant"},
-                }
-            ],
-        ),
-    ]
+    assert len(owner_honcho.messages) == 1
+    owner_session, owner_exchange = owner_honcho.messages[0]
+    assert owner_session == "ohmo"
+    assert len(owner_exchange) == 2
+    assert owner_exchange[0]["content"] == "owner user turn"
+    assert owner_exchange[0]["peer_id"] == "owner"
+    assert owner_exchange[0]["metadata"]["role"] == "user"
+    assert owner_exchange[1]["content"] == "owner assistant turn"
+    assert owner_exchange[1]["peer_id"] == "ohmo"
+    assert owner_exchange[1]["metadata"]["role"] == "assistant"
+
+    assert len(marina_honcho.messages) == 1
+    marina_session, marina_exchange = marina_honcho.messages[0]
+    assert marina_session == "ohmo"
+    assert len(marina_exchange) == 2
+    assert marina_exchange[0]["content"] == "marina user turn"
+    assert marina_exchange[0]["peer_id"] == "marina"
+    assert marina_exchange[0]["metadata"]["role"] == "user"
+    assert marina_exchange[1]["content"] == "marina assistant turn"
+    assert marina_exchange[1]["peer_id"] == "ohmo"
+    assert marina_exchange[1]["metadata"]["role"] == "assistant"
 
 
 @pytest.mark.parametrize(
@@ -556,3 +656,241 @@ async def test_empty_identity_registries_preserve_the_single_backend_for_every_t
     assert owner_prompt == non_owner_prompt
     assert owner_bundle.tool_registry.get("memory")._store is pool._prompt_memory_backend
     assert non_owner_bundle.tool_registry.get("memory")._store is pool._prompt_memory_backend
+
+
+def test_runtime_memory_turn_metadata_statuses_cover_every_recorder_state(tmp_path: Path) -> None:
+    scope = MemoryScope("owner", ("family-shared",))
+    turn_ctx = _context("100", owner=True)
+    message_with_id = _message()
+    expected_turn_id = _logical_turn_id_for_conversation(
+        turn_ctx=turn_ctx,
+        message=message_with_id,
+    )
+    logical_turn_id, user_metadata, assistant_metadata = _metadata(
+        turn_ctx=turn_ctx,
+        scope=scope,
+        message=message_with_id,
+        recorder=None,
+    )
+    assert _metadata(turn_ctx=turn_ctx, scope=scope, message=message_with_id, recorder=None)[
+        0
+    ] == expected_turn_id
+    assert logical_turn_id == expected_turn_id == assistant_metadata["logical_turn_id"] == user_metadata[
+        "logical_turn_id"
+    ]
+    assert _assert_honcho_metadata_depth(user_metadata) == 1
+    assert _assert_honcho_metadata_depth(assistant_metadata) == 1
+    assert user_metadata["client_op_id"] == f"{expected_turn_id}:user"
+    assert assistant_metadata["client_op_id"] == f"{expected_turn_id}:assistant"
+    assert user_metadata["decision_trace_status"] == "disabled"
+    assert user_metadata["nutrition_annotation_status"] == "disabled"
+    assert assistant_metadata["decision_trace_status"] == "disabled"
+    assert assistant_metadata["nutrition_annotation_status"] == "disabled"
+    assert user_metadata["decision_trace_episode_id"] is None
+    assert assistant_metadata["decision_trace_episode_id"] is None
+    assert _message_identity_for_turn(message_with_id) == "0"
+    _assert_metadata_fields(
+        user_metadata,
+        turn_ctx=turn_ctx,
+        scope=scope,
+        recorder=None,
+    )
+    _assert_metadata_fields(
+        assistant_metadata,
+        turn_ctx=turn_ctx,
+        scope=scope,
+        recorder=None,
+    )
+    _assert_expected_metadata_keys(user_metadata)
+    _assert_expected_metadata_keys(assistant_metadata)
+    assert not isinstance(logical_turn_id, dict)
+    assert user_metadata["client_op_id"] != assistant_metadata["client_op_id"]
+
+
+def test_runtime_memory_turn_metadata_status_recorded_with_nutrition(tmp_path: Path) -> None:
+    scope = MemoryScope("owner", ("family-shared",))
+    turn_ctx = _context("100", owner=True)
+    message_with_id = _message()
+    recorder = _build_recorder(tmp_path / ".ohmo-home", message_with_id)
+    recorder.decision_trace_recorder.trace_requirement_signals("сколько калорий в супе")
+    recorder.decision_trace_recorder.record(
+        TRACE_FINALIZATION,
+        {
+            "schema_version": 1,
+            "trace_event_id": "trace-1",
+            "annotations": {
+                "nutrition": {
+                    "energy_kcal_min": 10.0,
+                    "energy_kcal_max": 12.5,
+                    "items": [
+                        {
+                            "name": "apple",
+                            "quantity_text": "1",
+                            "energy_kcal_min": 5,
+                            "energy_kcal_max": 10,
+                        }
+                    ],
+                }
+            },
+        },
+    )
+    _, user_metadata, assistant_metadata = _metadata(
+        turn_ctx=turn_ctx,
+        scope=scope,
+        message=message_with_id,
+        recorder=recorder,
+    )
+
+    assert user_metadata["decision_trace_status"] == "recorded"
+    assert user_metadata["nutrition_annotation_status"] == "recorded"
+    assert "decision_trace" not in user_metadata
+    assert assistant_metadata["decision_trace_status"] == "recorded"
+    assert assistant_metadata["nutrition_annotation_status"] == "recorded"
+    assert "decision_trace" in assistant_metadata
+    decision_trace = assistant_metadata["decision_trace"]
+    assert isinstance(decision_trace, dict)
+    assert decision_trace["kind"] == "trace_finalization"
+    assert decision_trace["episode_id"] == recorder.episode_id
+    assert decision_trace["schema_version"] == 1
+    assert decision_trace["trace_event_id"] == "trace-1"
+    assert decision_trace["annotations"]["nutrition"]["energy_kcal_min"] == 10.0
+    assert decision_trace["annotations"]["nutrition"]["record_type"] == "meal_estimate"
+    assert "payload" not in decision_trace
+    assert isinstance(decision_trace["timestamp"], str)
+    _assert_expected_metadata_keys(assistant_metadata, recorder=True)
+    _assert_expected_metadata_keys(user_metadata)
+    assert _assert_honcho_metadata_depth(assistant_metadata) <= 5
+    assert _assert_honcho_metadata_depth(user_metadata) <= 1
+
+
+def test_runtime_memory_turn_metadata_status_applicable_but_missing_finalization(tmp_path: Path) -> None:
+    scope = MemoryScope("owner", ("family-shared",))
+    turn_ctx = _context("100", owner=True)
+    message_with_id = _message()
+    recorder = _build_recorder(tmp_path / ".ohmo-home", message_with_id)
+    recorder.decision_trace_recorder.trace_requirement_signals("сколько калорий в ужине?")
+    _, user_metadata, assistant_metadata = _metadata(
+        turn_ctx=turn_ctx,
+        scope=scope,
+        message=message_with_id,
+        recorder=recorder,
+    )
+
+    assert user_metadata["decision_trace_status"] == "missing"
+    assert user_metadata["nutrition_annotation_status"] == "missing"
+    assert assistant_metadata["decision_trace_status"] == "missing"
+    assert assistant_metadata["nutrition_annotation_status"] == "missing"
+    assert "decision_trace" not in assistant_metadata
+    _assert_expected_metadata_keys(user_metadata)
+    _assert_expected_metadata_keys(assistant_metadata)
+
+
+def test_runtime_memory_turn_metadata_status_generic_finalization_without_nutrition(tmp_path: Path) -> None:
+    scope = MemoryScope("owner", ("family-shared",))
+    turn_ctx = _context("100", owner=True)
+    message_with_id = _message()
+    recorder = _build_recorder(tmp_path / ".ohmo-home", message_with_id)
+    recorder.decision_trace_recorder.record(
+        TRACE_FINALIZATION,
+        {
+            "schema_version": 1,
+            "trace_event_id": "trace-2",
+            "outcome": "assistant responded",
+        },
+    )
+    _, user_metadata, assistant_metadata = _metadata(
+        turn_ctx=turn_ctx,
+        scope=scope,
+        message=message_with_id,
+        recorder=recorder,
+    )
+    assert user_metadata["decision_trace_status"] == "recorded"
+    assert user_metadata["nutrition_annotation_status"] == "missing"
+    assert assistant_metadata["decision_trace_status"] == "recorded"
+    assert assistant_metadata["nutrition_annotation_status"] == "missing"
+    assert "decision_trace" in assistant_metadata
+    _assert_expected_metadata_keys(user_metadata)
+    _assert_expected_metadata_keys(assistant_metadata, recorder=True)
+
+
+def test_runtime_memory_turn_metadata_status_invalid_nutrition_finalization(tmp_path: Path) -> None:
+    scope = MemoryScope("owner", ("family-shared",))
+    turn_ctx = _context("100", owner=True)
+    message_with_id = _message()
+    recorder = _build_recorder(tmp_path / ".ohmo-home", message_with_id)
+    recorder.decision_trace_recorder.trace_requirement_signals("сколько калорий в салате")
+    with pytest.raises(DecisionTraceValidationError):
+        recorder.decision_trace_recorder.record(
+            TRACE_FINALIZATION,
+            {
+                "schema_version": 1,
+                "trace_event_id": "trace-3",
+                "annotations": {
+                    "nutrition": {
+                        "energy_kcal_min": -1,
+                    }
+                },
+            },
+        )
+    _, user_metadata, assistant_metadata = _metadata(
+        turn_ctx=turn_ctx,
+        scope=scope,
+        message=message_with_id,
+        recorder=recorder,
+    )
+    assert user_metadata["decision_trace_status"] == "invalid"
+    assert user_metadata["nutrition_annotation_status"] == "invalid"
+    assert assistant_metadata["decision_trace_status"] == "invalid"
+    assert assistant_metadata["nutrition_annotation_status"] == "invalid"
+    assert "decision_trace" not in assistant_metadata
+    _assert_expected_metadata_keys(user_metadata)
+    _assert_expected_metadata_keys(assistant_metadata)
+
+
+def test_runtime_memory_turn_metadata_status_not_applicable(tmp_path: Path) -> None:
+    scope = MemoryScope("owner", ("family-shared",))
+    turn_ctx = _context("100", owner=True)
+    message_with_id = _message()
+    recorder = _build_recorder(tmp_path / ".ohmo-home", message_with_id)
+    _, user_metadata, assistant_metadata = _metadata(
+        turn_ctx=turn_ctx,
+        scope=scope,
+        message=message_with_id,
+        recorder=recorder,
+    )
+    assert user_metadata["decision_trace_status"] == "missing"
+    assert user_metadata["nutrition_annotation_status"] == "not_applicable"
+    assert assistant_metadata["decision_trace_status"] == "missing"
+    assert assistant_metadata["nutrition_annotation_status"] == "not_applicable"
+    assert "decision_trace" not in assistant_metadata
+    _assert_expected_metadata_keys(user_metadata)
+    _assert_expected_metadata_keys(assistant_metadata)
+
+
+def test_runtime_memory_turn_metadata_timestamp_fallback_is_isoformat(tmp_path: Path) -> None:
+    scope = MemoryScope("owner", ("family-shared",))
+    turn_ctx = _context("100", owner=True)
+    message = InboundMessage(
+        channel="telegram",
+        sender_id="100",
+        chat_id="100",
+        content="What did I eat today?",
+        metadata={"chat_type": "p2p"},
+        timestamp=datetime(2026, 2, 1, 2, 3, 4, tzinfo=timezone.utc),
+    )
+    assert _message_identity_for_turn(message) == "2026-02-01T02:03:04+00:00"
+
+    recorder = _build_recorder(tmp_path / ".ohmo-home", message)
+    logical_turn_id_first, _, _ = _metadata(
+        turn_ctx=turn_ctx,
+        scope=scope,
+        message=message,
+        recorder=recorder,
+    )
+    logical_turn_id_second, _, _ = _metadata(
+        turn_ctx=turn_ctx,
+        scope=scope,
+        message=message,
+        recorder=recorder,
+    )
+    assert logical_turn_id_first == logical_turn_id_second

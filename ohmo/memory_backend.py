@@ -9,7 +9,7 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 from time import perf_counter
-from typing import TYPE_CHECKING, Protocol, Sequence, cast
+from typing import TYPE_CHECKING, Mapping, Protocol, Sequence, cast
 
 import numpy as np
 from numpy.typing import NDArray
@@ -866,6 +866,36 @@ class ShadowMemoryBackend(MemoryBackend):
         self._pending.add(task)
         task.add_done_callback(self._pending.discard)
 
+    async def append_exchange(
+        self,
+        user_text: str,
+        assistant_text: str,
+        *,
+        user_metadata: Mapping[str, object],
+        assistant_metadata: Mapping[str, object],
+    ) -> None:
+        honcho_client = self._honcho_client
+        if not self._conversation_learning or honcho_client is None:
+            await self._base.append_turn("user", user_text)
+            await self._base.append_turn("assistant", assistant_text)
+            return
+
+        user_metadata_mapping = dict(user_metadata)
+        assistant_metadata_mapping = dict(assistant_metadata)
+        user_metadata_mapping["role"] = "user"
+        assistant_metadata_mapping["role"] = "assistant"
+        task = asyncio.create_task(
+            self._ingest_exchange(
+                user_text=user_text,
+                assistant_text=assistant_text,
+                user_metadata=user_metadata_mapping,
+                assistant_metadata=assistant_metadata_mapping,
+            ),
+            name="ohmo-conversation-learning-exchange",
+        )
+        self._pending.add(task)
+        task.add_done_callback(self._pending.discard)
+
     async def await_pending(self) -> None:
         """Drain all shadow work scheduled before or while this call runs."""
         while self._pending:
@@ -968,6 +998,41 @@ class ShadowMemoryBackend(MemoryBackend):
                 )
         except Exception:  # noqa: BLE001 - learning failures never reach the turn path
             logger.warning("ohmo conversation learning ingestion failed", exc_info=True)
+
+    async def _ingest_exchange(
+        self,
+        *,
+        user_text: str,
+        assistant_text: str,
+        user_metadata: Mapping[str, object],
+        assistant_metadata: Mapping[str, object],
+    ) -> None:
+        honcho_client = self._honcho_client
+        if honcho_client is None:
+            return
+        try:
+            messages = [
+                {
+                    "content": user_text,
+                    "peer_id": self._observed,
+                    "metadata": user_metadata,
+                },
+                {
+                    "content": assistant_text,
+                    "peer_id": self._assistant_peer,
+                    "metadata": assistant_metadata,
+                },
+            ]
+            async with self._ingest_lock:
+                await honcho_client.create_messages(
+                    self._session,
+                    messages,
+                )
+        except Exception:  # noqa: BLE001 - learning failures never reach the turn path
+            logger.warning(
+                "ohmo conversation learning exchange ingestion failed",
+                exc_info=True,
+            )
 
 
 def _embedding_text(record: CatalogRecord) -> str:

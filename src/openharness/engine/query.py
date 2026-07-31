@@ -558,12 +558,39 @@ def _classify_trace_requirement(
     *,
     run_state: _DecisionTraceRunState,
     prior_tool_results_seen: bool,
+    decision_trace_recorder: DecisionTraceRecorderLike | None = None,
 ) -> _TraceRequirement:
     text = _normalized_trace_final_text(final_message.text)
-    if _is_trivial_trace_final_text(text):
+    signals: list[str] = []
+
+    trace_signal_provider = getattr(
+        decision_trace_recorder,
+        "trace_requirement_signals",
+        None,
+    )
+    if callable(trace_signal_provider):
+        try:
+            external_signals = trace_signal_provider(text)
+        except Exception:
+            log.exception("failed to read decision-trace requirement signals from recorder")
+        else:
+            if external_signals is None:
+                external_signals = ()
+            elif isinstance(external_signals, str):
+                external_signals = (external_signals,)
+            try:
+                iterable_signals = iter(external_signals)
+            except TypeError:
+                iterable_signals = ()
+            for signal in iterable_signals:
+                if isinstance(signal, str):
+                    normalized = signal.strip()
+                    if normalized:
+                        signals.append(normalized)
+
+    if _is_trivial_trace_final_text(text) and not signals:
         return _TraceRequirement(False, "trivial_final_answer")
 
-    signals: list[str] = []
     if len(text) >= _TRACE_REQUIRED_MIN_TEXT_CHARS:
         signals.append("substantive_final_answer")
     if run_state.tool_call_count > 0 or run_state.tool_result_count > 0:
@@ -657,6 +684,10 @@ def _decision_trace_repair_instruction(
         "Each user-visible claim in the final answer MUST map to the tool_call_id(s) "
         "of the observation(s) below that support it. Add an `uncertainties` list "
         "(empty if none) for claims you could not ground in an observation."
+    )
+    parts.append(
+        "If system-defined finalization annotations apply, include all applicable "
+        "`annotations` fields in the same `trace_finalization` payload."
     )
 
     if has_obs:
@@ -1525,6 +1556,7 @@ async def run_query(
                 final_message,
                 run_state=trace_run_state,
                 prior_tool_results_seen=prior_tool_results_seen,
+                decision_trace_recorder=context.decision_trace_recorder,
             )
             if trace_requirement.required and not trace_run_state.successful_finalization:
                 repaired_finalization = await _attempt_decision_trace_repair(

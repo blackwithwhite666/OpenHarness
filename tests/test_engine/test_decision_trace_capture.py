@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from collections.abc import Mapping
+from typing import Any
 
 import pytest
 from pydantic import BaseModel
@@ -34,6 +36,8 @@ from openharness.evals import (
     EvalStore,
 )
 from openharness.permissions import PermissionChecker, PermissionMode
+from openharness.hooks import HookEvent
+from openharness.hooks.types import AggregatedHookResult
 from openharness.tools import TraceTool
 from openharness.tools.base import BaseTool, ToolExecutionContext, ToolRegistry, ToolResult
 
@@ -84,6 +88,64 @@ class _TraceAwareTool(BaseTool):
         )
 
 
+class _AlwaysSignalDecisionTraceRecorder:
+    def __init__(
+        self,
+        recorder: DecisionTraceRecorder,
+        *,
+        signals: tuple[str, ...] = ("ohmo_nutrition_request",),
+    ) -> None:
+        self._recorder = recorder
+        self._signals = signals
+
+    def trace_requirement_signals(self, final_text: str) -> tuple[str, ...]:
+        del final_text
+        return self._signals
+
+    def record(
+        self,
+        kind: str,
+        payload: Mapping[str, Any],
+        *,
+        tool_name: str | None = None,
+        tool_call_id: str | None = None,
+        is_error: bool = False,
+    ) -> object | None:
+        return self._recorder.record(
+            kind,
+            payload,
+            tool_name=tool_name,
+            tool_call_id=tool_call_id,
+            is_error=is_error,
+        )
+
+    def record_structural(
+        self,
+        kind: str,
+        payload: Mapping[str, Any],
+        *,
+        tool_name: str | None = None,
+        tool_call_id: str | None = None,
+        is_error: bool = False,
+    ) -> object | None:
+        return self._recorder.record_structural(
+            kind,
+            payload,
+            tool_name=tool_name,
+            tool_call_id=tool_call_id,
+            is_error=is_error,
+        )
+
+
+class _EmptyHookExecutor:
+    def __init__(self) -> None:
+        self.calls: list[tuple[HookEvent, dict[str, object]]] = []
+
+    async def execute(self, event: HookEvent, payload: dict[str, object]) -> AggregatedHookResult:
+        self.calls.append((event, payload))
+        return AggregatedHookResult([])
+
+
 def _store_and_recorder(
     tmp_path: Path,
     *,
@@ -118,6 +180,7 @@ def _engine(
     api_client: _ScriptedApiClient,
     recorder: DecisionTraceRecorder,
     tool_registry: ToolRegistry | None = None,
+    hook_executor: Any | None = None,
 ) -> QueryEngine:
     return QueryEngine(
         api_client=api_client,
@@ -129,6 +192,7 @@ def _engine(
         model="trace-model",
         system_prompt="system",
         decision_trace_recorder=recorder,
+        hook_executor=hook_executor,
     )
 
 
@@ -535,6 +599,112 @@ async def test_trace_required_repair_records_trace_without_yielding_extra_turn(
     recorded_events = list(store.iter_events("ep-trace"))
     assert any(event.kind == TRACE_FINALIZATION for event in recorded_events)
     assert not any(event.kind == TRACE_MISSING_REQUIRED for event in recorded_events)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("with_empty_hook", [False, True])
+async def test_short_answer_trace_repair_is_triggered_by_recorder_signal(
+    tmp_path: Path,
+    with_empty_hook: bool,
+) -> None:
+    store, recorder = _store_and_recorder(tmp_path)
+    registry = ToolRegistry()
+    registry.register(TraceTool())
+    hook_executor = _EmptyHookExecutor() if with_empty_hook else None
+
+    api_client = _ScriptedApiClient(
+        [
+            _FakeResponse(
+                message=ConversationMessage(
+                    role="assistant",
+                    content=[TextBlock(text="OK.")],
+                ),
+                usage=UsageSnapshot(input_tokens=3, output_tokens=1),
+            ),
+            _FakeResponse(
+                message=ConversationMessage(
+                    role="assistant",
+                    content=[
+                        ToolUseBlock(
+                            id="repair-trace-1",
+                            name="trace",
+                            input={
+                                "kind": TRACE_FINALIZATION,
+                                "payload": _trace_payload(
+                                    "repair-trace-1",
+                                    reason="ohmo_nutrition_request",
+                                    answer_claims=[],
+                                ),
+                            },
+                        )
+                    ],
+                ),
+                usage=UsageSnapshot(input_tokens=4, output_tokens=2),
+            ),
+        ]
+    )
+    engine = _engine(
+        tmp_path=tmp_path,
+        api_client=api_client,
+        recorder=_AlwaysSignalDecisionTraceRecorder(recorder),
+        tool_registry=registry,
+        hook_executor=hook_executor,
+    )
+
+    stream_events = [event async for event in engine.submit_message("нежно короткий ответ")]
+
+    assert len(api_client.requests) == 2
+    assert [tool["name"] for tool in api_client.requests[1].tools] == ["trace"]
+    assert "Signals: ohmo_nutrition_request" in api_client.requests[1].messages[-1].text
+
+    assistant_turns = [
+        event for event in stream_events if isinstance(event, AssistantTurnComplete)
+    ]
+    assert [event.message.text for event in assistant_turns] == ["OK."]
+
+    recorded_events = list(store.iter_events("ep-trace"))
+    assert any(event.kind == TRACE_FINALIZATION for event in recorded_events)
+
+    if with_empty_hook:
+        assert hook_executor is not None
+        assert len(hook_executor.calls) >= 1
+        event, payload = next(
+            (event_payload for event_payload in hook_executor.calls if event_payload[0] == HookEvent.STOP),
+            (None, {}),
+        )
+        assert event == HookEvent.STOP
+        assert payload["stop_reason"] == "tool_uses_empty"
+
+
+@pytest.mark.asyncio
+async def test_short_answer_trace_repair_is_not_triggered_by_empty_recorder_signal(
+    tmp_path: Path,
+) -> None:
+    store, recorder = _store_and_recorder(tmp_path)
+    api_client = _ScriptedApiClient(
+        [
+            _FakeResponse(
+                message=ConversationMessage(
+                    role="assistant",
+                    content=[TextBlock(text="OK.")],
+                ),
+                usage=UsageSnapshot(input_tokens=3, output_tokens=1),
+            )
+        ]
+    )
+    engine = _engine(
+        tmp_path=tmp_path,
+        api_client=api_client,
+        recorder=_AlwaysSignalDecisionTraceRecorder(recorder, signals=()),
+        tool_registry=ToolRegistry(),
+    )
+
+    _ = [event async for event in engine.submit_message("нужен короткий ответ")]
+
+    assert len(api_client.requests) == 1
+    assert not any(
+        event.kind == TRACE_MISSING_REQUIRED for event in store.iter_events("ep-trace")
+    )
 
 
 @pytest.mark.asyncio

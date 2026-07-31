@@ -1,12 +1,12 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import pytest
-
 from openharness.api.usage import UsageSnapshot
 from openharness.engine.messages import ConversationMessage, TextBlock
 from openharness.engine.stream_events import (
@@ -16,6 +16,7 @@ from openharness.engine.stream_events import (
     ToolExecutionStarted,
 )
 from openharness.evals import (
+    DecisionTraceValidationError,
     DECISION_TRACE_ENV_VAR,
     DECISION_TRACE_MAX_PAYLOAD_BYTES,
     STRUCTURAL_ASSISTANT_FINAL,
@@ -25,6 +26,7 @@ from openharness.evals import (
     STRUCTURAL_TOOL_STARTED,
     STRUCTURAL_TURN_STARTED,
     TRACE_DECISION,
+    TRACE_FINALIZATION,
     DecisionTraceRecorder,
     EvalEpisode,
     EvalEvent,
@@ -35,7 +37,10 @@ from ohmo.evals import GatewayEvalRecorder, get_eval_store
 
 
 def _new_recorder(
-    tmp_path: Path, episode_id: str = "ep-recorder"
+    tmp_path: Path,
+    *,
+    episode_id: str = "ep-recorder",
+    user_goal: str = "",
 ) -> tuple[GatewayEvalRecorder, EvalStore]:
     store = get_eval_store(tmp_path)
     store.append_episode(
@@ -47,7 +52,15 @@ def _new_recorder(
             user_text="hello",
         )
     )
-    return GatewayEvalRecorder(store=store, episode_id=episode_id), store
+    return GatewayEvalRecorder(store=store, episode_id=episode_id, user_goal=user_goal), store
+
+
+def _finalization_payload(annotations: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "trace_event_id": "trace-final-1",
+        "annotations": annotations,
+    }
 
 
 def test_gateway_eval_recorder_record_event_delegates_to_legacy_structural_recorder(
@@ -223,7 +236,7 @@ def test_gateway_eval_recorder_runtime_adapter_records_completed_duration_but_sk
 
 def test_gateway_eval_recorder_record_model_call_writes_tokens(tmp_path: Path) -> None:
     episode_id = "ep-recorder"
-    recorder, store = _new_recorder(tmp_path, episode_id)
+    recorder, store = _new_recorder(tmp_path, episode_id=episode_id)
     event = AssistantTurnComplete(
         message=ConversationMessage(
             role="assistant",
@@ -383,3 +396,175 @@ def test_gateway_eval_recorder_payloads_are_json_safe(tmp_path: Path) -> None:
             "negative_inf": "-inf",
         },
     }
+
+
+def test_gateway_eval_recorder_finalization_status_records_invalid_then_later_valid_recovery(
+    tmp_path: Path,
+) -> None:
+    recorder, store = _new_recorder(tmp_path)
+    runtime_recorder = recorder.decision_trace_recorder
+
+    assert recorder.decision_trace_status == "missing"
+    assert recorder.nutrition_annotation_status == "not_applicable"
+    assert recorder.decision_trace_envelope is None
+
+    with pytest.raises(DecisionTraceValidationError, match="energy_kcal_min"):
+        runtime_recorder.record(
+            TRACE_FINALIZATION,
+            _finalization_payload({"nutrition": {"energy_kcal_min": -1}}),
+        )
+
+    assert recorder.decision_trace_status == "invalid"
+    assert recorder.nutrition_annotation_status == "invalid"
+    assert recorder.decision_trace_envelope is None
+    assert store.count_events("ep-recorder") == 0
+
+    runtime_recorder.record(
+        TRACE_FINALIZATION,
+        _finalization_payload(
+            {
+                "nutrition": {
+                    "energy_kcal_min": 10,
+                    "items": [{"name": "egg", "quantity_text": "1", "energy_kcal_min": 80}],
+                }
+            }
+        ),
+    )
+
+    assert recorder.decision_trace_status == "recorded"
+    assert recorder.nutrition_annotation_status == "recorded"
+    [recorded] = list(store.iter_events("ep-recorder"))
+    assert recorded.kind == TRACE_FINALIZATION
+    assert recorded.payload["annotations"]["nutrition"]["energy_kcal_min"] == 10.0
+
+
+def test_gateway_eval_recorder_nutrition_status_is_missing_when_applicable_without_nutrition(
+    tmp_path: Path,
+) -> None:
+    recorder, store = _new_recorder(tmp_path)
+    runtime_recorder = recorder.decision_trace_recorder
+
+    runtime_recorder.trace_requirement_signals("сколько калорий в ужине?")
+
+    runtime_recorder.record(
+        TRACE_FINALIZATION,
+        {"schema_version": 1, "trace_event_id": "trace-final-2"},
+    )
+
+    assert recorder.decision_trace_status == "recorded"
+    assert recorder.nutrition_annotation_status == "missing"
+    [recorded] = list(store.iter_events("ep-recorder"))
+    assert recorded.kind == TRACE_FINALIZATION
+    assert "annotations" not in recorded.payload
+
+
+@pytest.mark.parametrize(
+    "text, expected_signal",
+    [
+        ("посчитай калорийность", True),
+        ("сколько калорий", True),
+        ("Сколько ккал в этом супе", True),
+        ("Сколько белков и жиров в блюде", True),
+        ("Мне важно знать БЖУ этого блюда", True),
+        ("Мне нужен белок и жиры, пожалуйста", True),
+        ("Я сейчас посмотрю фильм", False),
+        ("Сколько белая рубашка стоит?", False),
+    ],
+)
+def test_gateway_eval_recorder_trace_requirement_signals_is_marker_driven(
+    tmp_path: Path,
+    text: str,
+    expected_signal: bool,
+) -> None:
+    recorder, _ = _new_recorder(tmp_path, episode_id="ep-markers")
+    signals = recorder.decision_trace_recorder.trace_requirement_signals(text)
+
+    if expected_signal:
+        assert signals == ("ohmo_nutrition_request",)
+    else:
+        assert signals == ()
+
+
+def test_gateway_eval_recorder_trace_requirement_signals_prefers_user_goal_when_final_text_is_neutral(
+    tmp_path: Path,
+) -> None:
+    recorder, _ = _new_recorder(tmp_path, user_goal="Сколько калорий в обеде сегодня?")
+    signals = recorder.decision_trace_recorder.trace_requirement_signals("можно краткий апдейт?")
+
+    assert signals == ("ohmo_nutrition_request",)
+    assert recorder.nutrition_annotation_status == "missing"
+
+
+def test_gateway_eval_recorder_nutrition_applicability_is_monotonic_within_turn(
+    tmp_path: Path,
+) -> None:
+    recorder, _ = _new_recorder(tmp_path, episode_id="ep-monotonic")
+    runtime_recorder = recorder.decision_trace_recorder
+
+    assert recorder.nutrition_annotation_status == "not_applicable"
+
+    runtime_recorder.trace_requirement_signals("сколько калорий в ужине?")
+    assert recorder.nutrition_annotation_status == "missing"
+
+    runtime_recorder.trace_requirement_signals("я сейчас посмотрю фильм")
+    assert recorder.nutrition_annotation_status == "missing"
+
+
+def test_gateway_eval_recorder_nutrition_applicability_can_be_marked_without_finalization(
+    tmp_path: Path,
+) -> None:
+    recorder, _ = _new_recorder(tmp_path, episode_id="ep-applicability")
+    runtime_recorder = recorder.decision_trace_recorder
+
+    assert recorder.nutrition_annotation_status == "not_applicable"
+    assert runtime_recorder.trace_requirement_signals("подскажи, какой обед был, пожалуйста") == ()
+
+    runtime_recorder.trace_requirement_signals("посчитай калорийность обеда")
+    assert recorder.nutrition_annotation_status == "missing"
+
+
+def test_gateway_eval_recorder_decision_trace_envelope_is_json_safe_and_immutable(
+    tmp_path: Path,
+) -> None:
+    recorder, _ = _new_recorder(tmp_path)
+    runtime_recorder = recorder.decision_trace_recorder
+
+    runtime_recorder.record(
+        TRACE_FINALIZATION,
+        _finalization_payload(
+            {
+                "nutrition": {
+                    "energy_kcal_min": 100,
+                    "energy_kcal_max": 120,
+                    "items": [
+                        {
+                            "name": "egg",
+                            "quantity_text": "1",
+                            "energy_kcal_min": 100,
+                            "energy_kcal_max": 120,
+                        }
+                    ],
+                }
+            }
+        ),
+    )
+
+    envelope = recorder.decision_trace_envelope
+    assert envelope is not None
+    assert envelope["kind"] == TRACE_FINALIZATION
+    assert envelope["episode_id"] == "ep-recorder"
+    assert envelope["schema_version"] == 1
+    assert envelope["trace_event_id"] == "trace-final-1"
+    assert envelope["timestamp"] is not None
+    assert "annotations" in envelope
+    assert "payload" not in envelope
+    json.dumps(envelope)
+
+    with pytest.raises(TypeError):
+        envelope["kind"] = "mutated"
+
+    envelope["annotations"]["nutrition"]["assumptions"].append("example")
+    assert (
+        recorder.decision_trace_envelope["annotations"]["nutrition"]["assumptions"]
+        == []
+    )

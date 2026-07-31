@@ -8,6 +8,7 @@ from dataclasses import dataclass
 import hashlib
 import logging
 import mimetypes
+from datetime import date, datetime
 from pathlib import Path
 import json
 import os
@@ -48,7 +49,7 @@ from ohmo.gateway.memory_gate import (
 from ohmo.gateway.provider_commands import handle_gateway_model_command, handle_gateway_provider_command
 from ohmo.gateway.router import session_key_for_message
 from ohmo.gateway.send_message_tool import SendTelegramMessageTool
-from ohmo.gateway.turn_context import TurnContext, build_turn_context
+from ohmo.gateway.turn_context import TurnContext, build_turn_context, canonical_principal
 from ohmo.group_registry import load_managed_group_record, normalize_cwd
 from ohmo.contact_registry import ContactStore
 from ohmo.memory import create_memory_command_backend, ensure_catalog_migrated
@@ -126,6 +127,7 @@ _GROUP_METADATA_KEYS = (
 )
 DEFAULT_REMINDER_TZ = "Europe/Moscow"
 DEFAULT_REMINDER_MAX_PER_CHAT = 50
+_CONVERSATION_TRACE_DISABLED_STATUS = "disabled"
 
 
 @dataclass(frozen=True)
@@ -180,6 +182,86 @@ def _restore_gateway_decision_trace_recorder(
     set_recorder = getattr(restore.engine, "set_decision_trace_recorder", None)
     if callable(set_recorder):
         set_recorder(restore.previous)
+
+
+def _message_identity_for_turn(message: InboundMessage) -> str:
+    metadata = message.metadata or {}
+
+    for key in ("message_id", "messageId", "message-id"):
+        if key not in metadata:
+            continue
+        message_id = metadata[key]
+        if message_id is not None:
+            rendered_id = str(message_id).strip()
+            if rendered_id:
+                return rendered_id
+
+    timestamp = getattr(message, "timestamp", None)
+    if isinstance(timestamp, datetime):
+        return timestamp.isoformat()
+    if isinstance(timestamp, date):
+        return timestamp.isoformat()
+    if timestamp is not None:
+        rendered_timestamp = str(timestamp).strip()
+        if rendered_timestamp:
+            return rendered_timestamp
+    return "unknown"
+
+
+def _logical_turn_id_for_conversation(
+    *,
+    turn_ctx: TurnContext,
+    message: InboundMessage,
+) -> str:
+    seed = "\x00".join(
+        (
+            str(turn_ctx.channel),
+            str(turn_ctx.chat_id),
+            canonical_principal(turn_ctx.channel, turn_ctx.principal),
+            str(turn_ctx.session_id),
+            _message_identity_for_turn(message),
+        )
+    ).encode("utf-8")
+    return f"ohmo-turn-{hashlib.sha256(seed).hexdigest()}"
+
+
+def _build_conversation_turn_metadata(
+    *,
+    turn_ctx: TurnContext,
+    message: InboundMessage,
+    scope: MemoryScope,
+    recorder: GatewayEvalRecorder | None = None,
+) -> tuple[str, dict[str, object], dict[str, object]]:
+    logical_turn_id = _logical_turn_id_for_conversation(
+        turn_ctx=turn_ctx,
+        message=message,
+    )
+    source_principal = f"{turn_ctx.channel}:{canonical_principal(turn_ctx.channel, turn_ctx.principal)}"
+    decision_trace_status = (
+        recorder.decision_trace_status if recorder is not None else _CONVERSATION_TRACE_DISABLED_STATUS
+    )
+    nutrition_annotation_status = (
+        recorder.nutrition_annotation_status
+        if recorder is not None
+        else _CONVERSATION_TRACE_DISABLED_STATUS
+    )
+    base_metadata: dict[str, object] = {
+        "tenant_id": scope.private_tenant,
+        "source_principal": source_principal,
+        "gateway_session_id": turn_ctx.session_id,
+        "logical_turn_id": logical_turn_id,
+        "client_op_id": f"{logical_turn_id}:user",
+        "decision_trace_status": decision_trace_status,
+        "nutrition_annotation_status": nutrition_annotation_status,
+        "decision_trace_episode_id": recorder.episode_id if recorder is not None else None,
+    }
+    user_metadata = dict(base_metadata)
+    assistant_metadata = dict(base_metadata)
+    assistant_metadata["client_op_id"] = f"{logical_turn_id}:assistant"
+    decision_trace = recorder.decision_trace_envelope if recorder is not None else None
+    if decision_trace is not None:
+        assistant_metadata["decision_trace"] = dict(decision_trace)
+    return logical_turn_id, user_metadata, assistant_metadata
 
 
 class OhmoSessionRuntimePool:
@@ -875,6 +957,8 @@ class OhmoSessionRuntimePool:
             await self._append_conversation_turn(
                 turn_ctx=turn_ctx,
                 memory_scope=memory_scope,
+                message=message,
+                recorder=recorder,
                 user_text=message.content or user_prompt,
                 assistant_text=reply,
             )
@@ -900,6 +984,8 @@ class OhmoSessionRuntimePool:
         *,
         turn_ctx: TurnContext,
         memory_scope: MemoryScope | None | object = _UNRESOLVED_MEMORY_SCOPE,
+        message: InboundMessage,
+        recorder: GatewayEvalRecorder | None = None,
         user_text: str,
         assistant_text: str,
     ) -> None:
@@ -911,8 +997,18 @@ class OhmoSessionRuntimePool:
         shadow_backend = self._shadow_backend_for_scope(scope)
         if shadow_backend is None:
             return
-        await shadow_backend.append_turn("user", user_text)
-        await shadow_backend.append_turn("assistant", assistant_text)
+        _, user_metadata, assistant_metadata = _build_conversation_turn_metadata(
+            turn_ctx=turn_ctx,
+            message=message,
+            scope=scope,
+            recorder=recorder,
+        )
+        await shadow_backend.append_exchange(
+            user_text,
+            assistant_text,
+            user_metadata=user_metadata,
+            assistant_metadata=assistant_metadata,
+        )
 
     async def _convert_stream_event(
         self,

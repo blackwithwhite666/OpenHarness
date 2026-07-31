@@ -251,6 +251,69 @@ Comparison reports are also metadata-only. They compare case ids, statuses,
 scores, and aggregate counts. They do not read or persist raw prompts, tool
 inputs, tool outputs, or final answers.
 
+## Nutrition trace annotations in ohmo conversation learning
+
+For the ohmo gateway, applicable nutrition turns extend the existing
+`trace_finalization` contract with an optional, strictly validated
+`annotations.nutrition` object.
+
+- `annotations` stays optional and only adds to the normal `trace_finalization`
+  envelope at the domain boundary.
+- The nutrition annotation schema is domain-local and versioned as
+  `schema_version=1`, `record_type="meal_estimate"`.
+- Fields are validated in `ohmo/evals/nutrition_trace.py` with:
+  - bounded strings/lists,
+  - finite non-negative nutrient and energy values,
+  - optional strict ranges (`min <= best <= max` when all values are present),
+  - at least one total energy field present,
+  - `extra="forbid"` on both top-level and nested nutrition objects.
+
+Decision-trace status fields are now attached to each conversation-learning turn:
+
+- `decision_trace_status`:
+  - `disabled` — recorder or learning path is disabled,
+  - `missing` — no valid finalization was captured,
+  - `invalid` — capture was attempted but failed validation,
+  - `recorded` — valid `trace_finalization` captured.
+- `nutrition_annotation_status`:
+  - `disabled` — capture is disabled,
+  - `not_applicable` — no nutrition marker was detected,
+  - `missing` — trace finalization captured, but no nutrition annotation present,
+  - `invalid` — finalization included invalid nutrition annotation,
+  - `recorded` — finalization includes valid `annotations.nutrition`.
+
+Conversation-learning writes one ordered pair of Messages per turn through
+Honcho:
+
+- user message first, assistant message second,
+- both in one call via `honcho_client.create_messages`,
+- both with trusted root metadata (`tenant_id`, `source_principal`,
+  `gateway_session_id`, `logical_turn_id`, `client_op_id`, both status fields,
+  `decision_trace_episode_id`).
+
+Only the assistant Message gets the complete flattened `decision_trace` envelope.
+The stored `decision_trace` is assistant-only and metadata-only:
+
+- includes envelope fields directly (`kind`, `episode_id`, `timestamp`,
+  `schema_version`, `trace_event_id`, `reason`, `final_answer_summary`, etc.),
+  not a nested `payload`,
+- includes the validated `annotations.nutrition` object when present,
+- excludes structural events (`inbound_message`, `resource_snapshot`,
+  tool event records, `gateway_final`) and raw episode/event paths.
+
+The paired write preserves stable identifiers:
+
+- `logical_turn_id` is derived from trusted channel/chat/principal/session and
+  inbound message identity,
+- `client_op_id` is `<logical_turn_id>:user` for the user role message and
+  `<logical_turn_id>:assistant` for assistant.
+
+Explicit non-goals:
+
+- no separate nutrition ledger or collection,
+- no extra model call for nutrition extraction,
+- no dedicated nutrition logging tool.
+
 ## Trace viewer (web UI)
 
 A read-only web viewer for **all** captured traces — prod episodes and прокачки

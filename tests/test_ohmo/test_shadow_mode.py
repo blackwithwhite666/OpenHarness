@@ -70,6 +70,25 @@ class FakeHoncho:
         raise AssertionError("shadow mode must never call a dream/deriver route")
 
 
+class FakeHonchoExchange(FakeHoncho):
+    def __init__(
+        self,
+        *args: object,
+        fail_exchange: bool = False,
+        **kwargs: object,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self.fail_exchange = fail_exchange
+        self.exchange_calls: list[tuple[str, list[dict[str, object]]]] = []
+
+    async def create_messages(self, session: str, messages: object) -> list[object]:
+        self.create_messages_calls += 1
+        self.exchange_calls.append((session, [dict(message) for message in messages]))
+        if self.fail_exchange:
+            raise OSError("fake Honcho exchange ingestion failed")
+        return []
+
+
 def _catalog_backend(workspace: Path) -> CatalogMemoryBackend:
     catalog = MemoryCatalog(workspace)
     assert catalog.add("owner", "Timezone", "User prefers Europe/Moscow.").ok
@@ -195,6 +214,118 @@ async def test_shadow_turn_is_read_only_and_never_ingests_or_dreams(tmp_path: Pa
     assert fake.queries == [("timezone", "ohmo-curated", "owner", 2)]
     assert fake.create_messages_calls == 0
     assert fake.dream_calls == 0
+
+
+async def test_shadow_append_exchange_creates_ordered_batch_with_forced_roles(tmp_path: Path):
+    base = _catalog_backend(tmp_path)
+    fake = FakeHonchoExchange()
+    shadow = ShadowMemoryBackend(
+        base,
+        honcho_client=fake,  # type: ignore[arg-type]
+        observed="friend",
+        assistant_peer="ohmo-friend",
+        conversation_learning=True,
+        comparison_log_path=tmp_path / "exchange.jsonl",
+    )
+
+    await shadow.append_exchange(
+        "User says hi.",
+        "Assistant answers.",
+        user_metadata={"role": "not-user", "logical_turn_id": "turn-1"},
+        assistant_metadata={"role": "not-asst", "logical_turn_id": "turn-1", "client_op_id": "op-assistant"},
+    )
+    await shadow.await_pending()
+
+    assert fake.create_messages_calls == 1
+    assert fake.exchange_calls
+    session, messages = fake.exchange_calls[0]
+    assert session == "ohmo"
+    assert len(messages) == 2
+    assert messages[0]["content"] == "User says hi."
+    assert messages[0]["peer_id"] == "friend"
+    assert messages[0]["metadata"]["role"] == "user"
+    assert messages[0]["metadata"]["logical_turn_id"] == "turn-1"
+    assert messages[1]["content"] == "Assistant answers."
+    assert messages[1]["peer_id"] == "ohmo-friend"
+    assert messages[1]["metadata"]["role"] == "assistant"
+    assert messages[1]["metadata"]["client_op_id"] == "op-assistant"
+
+
+async def test_shadow_append_exchange_delegates_when_learning_disabled(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    base = _catalog_backend(tmp_path)
+    calls: list[tuple[str, str]] = []
+
+    async def append_turn(role: str, text: str) -> None:
+        calls.append((role, text))
+
+    monkeypatch.setattr(base, "append_turn", append_turn)
+    fake = FakeHonchoExchange()
+    shadow = ShadowMemoryBackend(
+        base,
+        honcho_client=fake,  # type: ignore[arg-type]
+        conversation_learning=False,
+        comparison_log_path=tmp_path / "exchange-disabled.jsonl",
+    )
+
+    await shadow.append_exchange(
+        "User turns off.",
+        "Assistant turns off.",
+        user_metadata={"role": "override"},
+        assistant_metadata={"role": "override"},
+    )
+
+    assert calls == [("user", "User turns off."), ("assistant", "Assistant turns off.")]
+    assert fake.create_messages_calls == 0
+
+
+async def test_shadow_append_exchange_failure_isolated_from_runtime(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+):
+    base = _catalog_backend(tmp_path)
+    fake = FakeHonchoExchange(fail_exchange=True)
+    shadow = ShadowMemoryBackend(
+        base,
+        honcho_client=fake,  # type: ignore[arg-type]
+        conversation_learning=True,
+        comparison_log_path=tmp_path / "exchange-failed.jsonl",
+    )
+
+    await shadow.append_exchange(
+        "User fails.",
+        "Assistant fails.",
+        user_metadata={},
+        assistant_metadata={},
+    )
+    await shadow.await_pending()
+
+    assert fake.create_messages_calls == 1
+    assert "ohmo conversation learning exchange ingestion failed" in caplog.text
+
+
+async def test_shadow_append_turn_remains_single_message_ingest_batch(tmp_path: Path):
+    base = _catalog_backend(tmp_path)
+    fake = FakeHonchoExchange()
+    shadow = ShadowMemoryBackend(
+        base,
+        honcho_client=fake,  # type: ignore[arg-type]
+        comparison_log_path=tmp_path / "turn-regression.jsonl",
+        conversation_learning=True,
+    )
+
+    await shadow.append_turn("assistant", "Assistant follow-up.")
+    await shadow.await_pending()
+
+    assert fake.create_messages_calls == 1
+    assert fake.exchange_calls
+    session, messages = fake.exchange_calls[0]
+    assert session == "ohmo"
+    assert len(messages) == 1
+    assert messages[0]["peer_id"] == "ohmo"
+    assert messages[0]["metadata"]["role"] == "assistant"
 
 
 @pytest.mark.parametrize("is_owner", [True, False])

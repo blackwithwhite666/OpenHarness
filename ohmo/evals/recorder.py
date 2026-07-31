@@ -6,12 +6,20 @@ from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field, is_dataclass
 from datetime import date, datetime
 import math
+import re
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
 from openharness.channels.bus.events import InboundMessage
-from openharness.evals import DecisionTraceRecorder, EvalEpisode, EvalEvent, EvalStore
+from openharness.evals import (
+    DecisionTraceRecorder,
+    DecisionTraceValidationError,
+    EvalEpisode,
+    EvalEvent,
+    EvalStore,
+    TRACE_FINALIZATION,
+)
 from openharness.evals.tool_labels import effective_tool_label, tool_call_binaries
 from openharness.engine.stream_events import (
     AssistantTurnComplete,
@@ -21,6 +29,7 @@ from openharness.engine.stream_events import (
 )
 
 from ohmo.evals.adapter import get_eval_store
+from ohmo.evals.nutrition_trace import validate_trace_finalization_annotations
 from ohmo.evals.resources import ResourceSnapshotWrite, write_ohmo_resource_snapshot
 
 
@@ -30,6 +39,7 @@ class GatewayEvalRecorder:
 
     store: EvalStore
     episode_id: str
+    user_goal: str = ""
     _finished: bool = False
     _structural_recorder: DecisionTraceRecorder = field(init=False, repr=False)
     _runtime_recorder: _GatewayDecisionTraceRecorderAdapter = field(
@@ -44,7 +54,8 @@ class GatewayEvalRecorder:
             enabled=True,
         )
         self._runtime_recorder = _GatewayDecisionTraceRecorderAdapter(
-            self._structural_recorder
+            self._structural_recorder,
+            user_goal=self.user_goal,
         )
 
     @property
@@ -61,11 +72,13 @@ class GatewayEvalRecorder:
         message: InboundMessage,
         session_key: str,
         user_text: str,
-        user_goal: str,
+        user_goal: str | None = None,
     ) -> "GatewayEvalRecorder":
+        normalized_user_goal = user_goal or ""
         recorder = cls(
             store=get_eval_store(workspace),
             episode_id=f"ohmo-gateway-{uuid4().hex}",
+            user_goal=normalized_user_goal,
         )
         metadata = {
             "workspace": str(Path(workspace).expanduser().resolve()),
@@ -81,7 +94,7 @@ class GatewayEvalRecorder:
                 source="gateway",
                 app="ohmo",
                 session_id=str(getattr(bundle, "session_id", "") or ""),
-                user_goal=user_goal,
+                user_goal=normalized_user_goal,
                 user_text=user_text,
                 tags=["gateway", str(message.channel)],
                 privacy=str((message.metadata or {}).get("privacy") or "private"),
@@ -89,13 +102,18 @@ class GatewayEvalRecorder:
                 metadata=_json_safe_mapping(metadata),
             )
         )
-        recorder.record_inbound_message(message, user_text=user_text, user_goal=user_goal)
+        recorder.record_inbound_message(
+            message,
+            user_text=user_text,
+            user_goal=normalized_user_goal,
+        )
         recorder.record_resource_snapshot(workspace=workspace, bundle=bundle)
         return recorder
 
     def record_inbound_message(
-        self, message: InboundMessage, *, user_text: str, user_goal: str
+        self, message: InboundMessage, *, user_text: str, user_goal: str | None = None
     ) -> None:
+        user_goal = user_goal or self.user_goal
         self.record_event(
             "inbound_message",
             payload={
@@ -230,6 +248,24 @@ class GatewayEvalRecorder:
             is_error=is_error,
         )
 
+    @property
+    def decision_trace_status(self) -> str:
+        """Return the latest trace-finalization status for this turn."""
+        return self._runtime_recorder.decision_trace_status
+
+    @property
+    def nutrition_annotation_status(self) -> str:
+        """Return the latest nutrition annotation status for this turn."""
+        return self._runtime_recorder.nutrition_annotation_status
+
+    @property
+    def decision_trace_envelope(self) -> Mapping[str, Any] | None:
+        """Return a JSON-safe snapshot of the latest finalization event."""
+        envelope = self._runtime_recorder.decision_trace_envelope
+        if envelope is None:
+            return None
+        return envelope
+
 
 _RUNTIME_STRUCTURAL_SKIP_KINDS = frozenset(
     {
@@ -238,12 +274,56 @@ _RUNTIME_STRUCTURAL_SKIP_KINDS = frozenset(
     }
 )
 
+_NUTRITION_REQUIREMENT_SIGNAL = "ohmo_nutrition_request"
+_NUTRITION_REQUIREMENT_MARKERS = (
+    re.compile(r"\bcalorie(?:s)?\b", re.IGNORECASE),
+    re.compile(r"\bkcal\b", re.IGNORECASE),
+    re.compile(r"\bnutrition(?:s)?\b", re.IGNORECASE),
+    re.compile(r"\bmacronutrient(?:s)?\b", re.IGNORECASE),
+    re.compile(r"\bmacro(?:s)?\b", re.IGNORECASE),
+    re.compile(r"\bprotein(?:s)?\b", re.IGNORECASE),
+    re.compile(r"\bcarb(?:ohydrate|o?hydrates)?(?:s)?\b", re.IGNORECASE),
+    re.compile(r"\bfat(?:s)?\b", re.IGNORECASE),
+    re.compile(r"\bкалори[йя]\b", re.IGNORECASE),
+    re.compile(r"\bкалорийность\b", re.IGNORECASE),
+    re.compile(r"\bккал\b", re.IGNORECASE),
+    re.compile(r"\bбжу\b", re.IGNORECASE),
+    re.compile(r"\bбелк[а-я]*\b", re.IGNORECASE),
+    re.compile(r"\bжир[а-я]*\b", re.IGNORECASE),
+    re.compile(r"\bуглевод[а-я]*\b", re.IGNORECASE),
+)
+
+_DECISION_TRACE_STATUS_DISABLED = "disabled"
+_DECISION_TRACE_STATUS_INVALID = "invalid"
+_DECISION_TRACE_STATUS_MISSING = "missing"
+_DECISION_TRACE_STATUS_RECORDED = "recorded"
+
+_NUTRITION_ANNOTATION_STATUS_DISABLED = "disabled"
+_NUTRITION_ANNOTATION_STATUS_INVALID = "invalid"
+_NUTRITION_ANNOTATION_STATUS_MISSING = "missing"
+_NUTRITION_ANNOTATION_STATUS_NOT_APPLICABLE = "not_applicable"
+_NUTRITION_ANNOTATION_STATUS_RECORDED = "recorded"
+
+
+def _contains_nutrition_marker(*texts: str | None) -> bool:
+    haystack = " ".join(text or "" for text in texts).lower()
+    return any(marker.search(haystack) for marker in _NUTRITION_REQUIREMENT_MARKERS)
+
 
 class _GatewayDecisionTraceRecorderAdapter:
     """Runtime recorder bridge for gateway-owned eval episodes."""
 
-    def __init__(self, recorder: DecisionTraceRecorder) -> None:
+    def __init__(
+        self,
+        recorder: DecisionTraceRecorder,
+        *,
+        user_goal: str = "",
+    ) -> None:
         self._recorder = recorder
+        self._user_goal = user_goal
+        self._latest_finalization: EvalEvent | None = None
+        self._saw_invalid_finalization = False
+        self._nutrition_applicable = False
 
     def record(
         self,
@@ -254,6 +334,22 @@ class _GatewayDecisionTraceRecorderAdapter:
         tool_call_id: str | None = None,
         is_error: bool = False,
     ) -> EvalEvent | None:
+        if kind == TRACE_FINALIZATION:
+            try:
+                payload = validate_trace_finalization_annotations(payload)
+                event = self._recorder.record(
+                    kind,
+                    payload,
+                    tool_name=tool_name,
+                    tool_call_id=tool_call_id,
+                    is_error=is_error,
+                )
+            except DecisionTraceValidationError:
+                self._saw_invalid_finalization = True
+                raise
+            if event is not None:
+                self._latest_finalization = event
+            return event
         return self._recorder.record(
             kind,
             payload,
@@ -261,6 +357,51 @@ class _GatewayDecisionTraceRecorderAdapter:
             tool_call_id=tool_call_id,
             is_error=is_error,
         )
+
+    def trace_requirement_signals(self, final_text: str) -> tuple[str, ...]:
+        if _contains_nutrition_marker(final_text, self._user_goal):
+            self._nutrition_applicable = True
+            return (_NUTRITION_REQUIREMENT_SIGNAL,)
+        return ()
+
+    @property
+    def decision_trace_status(self) -> str:
+        if not self._recorder.enabled:
+            return _DECISION_TRACE_STATUS_DISABLED
+        if self._latest_finalization is not None:
+            return _DECISION_TRACE_STATUS_RECORDED
+        if self._saw_invalid_finalization:
+            return _DECISION_TRACE_STATUS_INVALID
+        return _DECISION_TRACE_STATUS_MISSING
+
+    @property
+    def nutrition_annotation_status(self) -> str:
+        if not self._recorder.enabled:
+            return _NUTRITION_ANNOTATION_STATUS_DISABLED
+        finalization = self._latest_finalization
+        if finalization is None:
+            if self._saw_invalid_finalization:
+                return _NUTRITION_ANNOTATION_STATUS_INVALID
+            if self._nutrition_applicable:
+                return _NUTRITION_ANNOTATION_STATUS_MISSING
+            return _NUTRITION_ANNOTATION_STATUS_NOT_APPLICABLE
+
+        annotations = finalization.payload.get("annotations")
+        if isinstance(annotations, Mapping) and "nutrition" in annotations:
+            return _NUTRITION_ANNOTATION_STATUS_RECORDED
+        return _NUTRITION_ANNOTATION_STATUS_MISSING
+
+    @property
+    def decision_trace_envelope(self) -> Mapping[str, Any] | None:
+        if self._latest_finalization is None:
+            return None
+        envelope = {
+            "kind": self._latest_finalization.kind,
+            "episode_id": self._latest_finalization.episode_id,
+            "timestamp": self._latest_finalization.timestamp,
+            **self._latest_finalization.payload,
+        }
+        return _freeze_json_mapping(_json_safe(envelope))
 
     def record_structural(
         self,
@@ -280,6 +421,30 @@ class _GatewayDecisionTraceRecorderAdapter:
             tool_call_id=tool_call_id,
             is_error=is_error,
         )
+
+
+class _FrozenMapping(dict[str, Any]):
+    """Simple immutable mapping used for returning read-only tracing envelopes."""
+
+    def __setitem__(self, key: str, value: Any) -> None:
+        raise TypeError("Frozen mapping is read-only")
+
+    def __delitem__(self, key: str) -> None:
+        raise TypeError("Frozen mapping is read-only")
+
+
+def _freeze_json_mapping(value: Mapping[str, Any]) -> Mapping[str, Any]:
+    return _FrozenMapping({str(key): _freeze_json_value(item) for key, item in value.items()})
+
+
+def _freeze_json_value(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return _freeze_json_mapping(value)
+    if isinstance(value, list):
+        return [_freeze_json_value(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_freeze_json_value(item) for item in value)
+    return value
 
 
 def _inbound_metadata(message: InboundMessage) -> dict[str, Any]:

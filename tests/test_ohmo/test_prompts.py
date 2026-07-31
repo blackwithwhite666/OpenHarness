@@ -110,3 +110,20 @@ def test_ohmo_prompt_explains_file_attachment(tmp_path: Path):
     assert "Attaching files" in prompt
     assert "[[attach:" in prompt  # exact marker the bridge regex strips
     assert "Dropbox" in prompt  # explicitly steers away from the wrong fallback
+
+
+def test_ohmo_prompt_nutrition_contract_contains_versioned_annotation_rules(tmp_path: Path) -> None:
+    workspace = tmp_path / ".ohmo-home"
+    initialize_workspace(workspace)
+    prompt = build_ohmo_system_prompt(tmp_path, workspace=workspace)
+
+    assert "annotations.nutrition" in prompt
+    assert '"schema_version": 1' in prompt
+    assert '"record_type": "meal_estimate"' in prompt
+    assert '"is_estimate": true' in prompt
+    assert '"consumption_status": "unknown"' in prompt
+    assert "At least one total energy field (`energy_kcal_min|max|best`) is required." in prompt
+    assert (
+        "Enforce ordering constraints whenever values are present: "
+        "`energy_kcal_min <= energy_kcal_max`" in prompt
+    )
