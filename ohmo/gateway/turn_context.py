@@ -27,6 +27,7 @@ class TurnContext:
     channel: str
     chat_id: str
     session_id: str
+    is_forwarded: bool = False
 
 
 def canonical_principal(channel: str, sender_id: str) -> str:
@@ -46,12 +47,11 @@ def canonical_principal(channel: str, sender_id: str) -> str:
 def is_private_message(message: InboundMessage) -> bool:
     """Return whether the channel positively identifies a direct private chat.
 
-    Unknown or absent metadata is deliberately not treated as private. A
-    forwarded payload is also not a private turn even when it arrived through
-    a direct chat, because its original audience/sender context is different.
+    Unknown or absent metadata is deliberately not treated as private. Forward
+    provenance does not change the authenticated destination chat's scope.
     """
     metadata = message.metadata
-    if not metadata or _is_forwarded(metadata):
+    if not metadata:
         return False
 
     chat_type = str(metadata.get("chat_type") or "").strip().lower()
@@ -80,6 +80,7 @@ def build_turn_context(
         channel=str(message.channel),
         chat_id=str(message.chat_id),
         session_id=str(session_id),
+        is_forwarded=_is_forwarded(message.metadata or {}),
     )
 
 

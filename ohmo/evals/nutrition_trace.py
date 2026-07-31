@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping
+from datetime import datetime
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
@@ -84,6 +85,7 @@ class NutritionAnnotationV1(BaseModel):
     record_type: str = Field(default="meal_estimate", min_length=1, max_length=32)
     basis: list[str] = Field(default_factory=list, max_length=_ITEM_BASIS_MAX)
     consumption_status: str = Field(default="unknown", min_length=1, max_length=32)
+    meal_at: datetime | None = None
     is_estimate: bool = True
     energy_kcal_min: float | None = None
     energy_kcal_max: float | None = None
@@ -165,6 +167,22 @@ class NutritionAnnotationV1(BaseModel):
         allowed = {"low", "medium", "high"}
         if value not in allowed:
             raise ValueError("confidence must be one of: low, medium, high")
+        return value
+
+    @field_validator("meal_at")
+    @classmethod
+    def _validate_meal_at(cls, value: datetime | None) -> datetime | None:
+        if value is None:
+            return None
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("meal_at must be a timezone-aware ISO-8601 datetime")
+        return value
+
+    @field_validator("meal_at", mode="before")
+    @classmethod
+    def _validate_meal_at_input(cls, value: Any) -> Any:
+        if value is not None and not isinstance(value, (str, datetime)):
+            raise ValueError("meal_at must be a timezone-aware ISO-8601 datetime")
         return value
 
     @model_validator(mode="after")

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from math import inf, nan
 from typing import Any
 
@@ -50,6 +51,7 @@ def test_validate_trace_finalization_annotations_round_trips_with_defaults_and_n
     assert nutrition["record_type"] == "meal_estimate"
     assert nutrition["basis"] == ["image"]
     assert nutrition["consumption_status"] == "unknown"
+    assert nutrition["meal_at"] is None
     assert nutrition["is_estimate"] is True
     assert nutrition["protein_g"] == 12.5
     assert nutrition["fat_g"] is None
@@ -66,6 +68,44 @@ def test_validate_trace_finalization_annotations_round_trips_with_defaults_and_n
             "energy_kcal_best": None,
         }
     ]
+
+
+@pytest.mark.parametrize(
+    ("meal_at", "expected"),
+    (
+        (None, None),
+        ("2026-07-31T19:30:00+03:00", "2026-07-31T19:30:00+03:00"),
+        (
+            datetime(2026, 7, 31, 16, 30, tzinfo=timezone.utc),
+            "2026-07-31T16:30:00Z",
+        ),
+    ),
+)
+def test_nutrition_meal_at_round_trips_as_nullable_aware_iso_datetime(
+    meal_at,
+    expected,
+) -> None:
+    validated = validate_trace_finalization_annotations(
+        _payload_with_nutrition(energy_kcal_min=100, meal_at=meal_at)
+    )
+
+    assert validated["annotations"]["nutrition"]["meal_at"] == expected
+
+
+@pytest.mark.parametrize(
+    "meal_at",
+    (
+        "2026-07-31T19:30:00",
+        datetime(2026, 7, 31, 19, 30),
+        "not-a-date",
+        1_785_526_200,
+    ),
+)
+def test_nutrition_meal_at_rejects_naive_and_invalid_timestamps(meal_at) -> None:
+    with pytest.raises(DecisionTraceValidationError, match="meal_at"):
+        validate_trace_finalization_annotations(
+            _payload_with_nutrition(energy_kcal_min=100, meal_at=meal_at)
+        )
 
 
 def test_validate_trace_finalization_annotations_rejects_non_mapping_annotations_and_nutrition() -> None:

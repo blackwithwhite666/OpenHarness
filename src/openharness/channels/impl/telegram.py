@@ -5,10 +5,12 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import math
 import re
 import time
 from collections import deque
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 
 from telegram import (
     BotCommand,
@@ -90,6 +92,86 @@ _REPLY_QUOTE_MAX = 500  # cap the quoted antecedent inlined into the agent promp
 # LIVE location: movement arrives as message *edits*, so dropping it silently
 # disables live-location tracking even with the right handler/filters in place.
 _ALLOWED_UPDATES = ["message", "edited_message", "callback_query"]
+_LAST_LOCATION_MAX_AGE_SECONDS = 7 * 24 * 60 * 60
+
+
+def _aware_utc_datetime(value: object) -> datetime | None:
+    """Return an aware datetime normalized to UTC, or ``None`` when invalid."""
+    if not isinstance(value, datetime):
+        return None
+    try:
+        if value.tzinfo is None or value.utcoffset() is None:
+            return None
+        return value.astimezone(timezone.utc)
+    except (OverflowError, ValueError):
+        return None
+
+
+def _utc_iso(value: object) -> str | None:
+    normalized = _aware_utc_datetime(value)
+    return normalized.isoformat() if normalized is not None else None
+
+
+def _telegram_message_provenance(message) -> dict[str, object]:
+    """Extract only trusted chronology/forward markers from a Telegram message."""
+    forward_origin = getattr(message, "forward_origin", None)
+    return {
+        "received_at": _utc_iso(getattr(message, "date", None)),
+        "is_forwarded": forward_origin is not None,
+        "source_message_at": (
+            _utc_iso(getattr(forward_origin, "date", None))
+            if forward_origin is not None
+            else None
+        ),
+    }
+
+
+def _earliest_datetime(current: object, candidate: object) -> object:
+    """Keep the original datetime object representing the earliest valid instant."""
+    current_utc = _aware_utc_datetime(current)
+    candidate_utc = _aware_utc_datetime(candidate)
+    if candidate_utc is None:
+        return current
+    if current_utc is None or candidate_utc < current_utc:
+        return candidate
+    return current
+
+
+def _earliest_utc_iso(current: object, candidate: object) -> str | None:
+    parsed: list[datetime] = []
+    for value in (current, candidate):
+        if not isinstance(value, str):
+            continue
+        try:
+            timestamp = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        normalized = _aware_utc_datetime(timestamp)
+        if normalized is not None:
+            parsed.append(normalized)
+    return min(parsed).isoformat() if parsed else None
+
+
+def _merge_media_group_provenance(
+    buffer: dict,
+    *,
+    timestamp: object,
+    provenance: dict[str, object],
+) -> None:
+    """Merge chronology while leaving the first part's message identity intact."""
+    buffer["timestamp"] = _earliest_datetime(buffer.get("timestamp"), timestamp)
+    metadata = buffer["metadata"]
+    metadata["received_at"] = _earliest_utc_iso(
+        metadata.get("received_at"),
+        provenance.get("received_at"),
+    )
+    metadata["is_forwarded"] = bool(
+        metadata.get("is_forwarded") or provenance.get("is_forwarded")
+    )
+    metadata["source_message_at"] = _earliest_utc_iso(
+        metadata.get("source_message_at"),
+        provenance.get("source_message_at"),
+    )
 
 
 def _reply_context(reply) -> tuple[str, dict]:
@@ -217,7 +299,7 @@ def _live_expires_at(message, loc) -> float | None:
 def _format_last_location(record: dict, now: float) -> str:
     """The chat's last known location, injected into a turn as context.
 
-    Always shown if present (per "add it if there is one"); the live-share expiry
+    Callers first enforce the seven-day injection age limit. The live-share expiry
     is surfaced so the agent knows whether the user is still actively there or the
     share has ended."""
     lat, lon = record["latitude"], record["longitude"]
@@ -233,6 +315,19 @@ def _format_last_location(record: dict, now: float) -> str:
             parts.append(f"; live share ended ~{_humanize_age(now - expires_at)} ago")
     parts.append(f"; {_maps_link(lat, lon)}]")
     return "".join(parts)
+
+
+def _last_location_is_recent(record: dict, now: float) -> bool:
+    """Whether a stored location is safe to inject under the exact seven-day limit."""
+    updated_at = record.get("updated_at")
+    if (
+        isinstance(updated_at, bool)
+        or not isinstance(updated_at, (int, float))
+        or not math.isfinite(float(updated_at))
+    ):
+        return False
+    age = now - float(updated_at)
+    return math.isfinite(age) and 0 <= age <= _LAST_LOCATION_MAX_AGE_SECONDS
 
 
 def _split_table_row(line: str) -> list[str]:
@@ -398,8 +493,9 @@ class TelegramChannel(BaseChannel):
         self._media_group_buffers: dict[str, dict] = {}
         self._media_group_tasks: dict[str, asyncio.Task] = {}
         # Last known location per chat. ANY inbound location (pin / venue / live
-        # share + its edits) silently overwrites it; it is injected into the next
-        # real user turn as context. No turn is ever spawned by a location itself.
+        # share + its edits) silently overwrites it; records stay on disk, while
+        # only updates no more than seven days old are injected into a real turn.
+        # No turn is ever spawned by a location itself.
         self._last_location = LastLocationStore(
             resolve_channel_state_dir(self.name, "last_location")
         )
@@ -1009,6 +1105,7 @@ class TelegramChannel(BaseChannel):
         user = update.effective_user
         chat_id = message.chat_id
         sender_id = self._sender_id(user)
+        provenance = _telegram_message_provenance(message)
 
         # Store chat_id for replies
         self._chat_ids[sender_id] = chat_id
@@ -1087,8 +1184,9 @@ class TelegramChannel(BaseChannel):
         # "what's nearby?" has coordinates. Location messages returned earlier, so
         # this only ever augments a real text/media turn. Absent → nothing added.
         last = self._last_location.get(str(chat_id))
-        if last:
-            content_parts.append(_format_last_location(last, time.time()))
+        now = time.time()
+        if last and _last_location_is_recent(last, now):
+            content_parts.append(_format_last_location(last, now))
 
         content = "\n".join(content_parts) if content_parts else "[empty message]"
 
@@ -1109,15 +1207,22 @@ class TelegramChannel(BaseChannel):
                 self._media_group_buffers[key] = {
                     "sender_id": sender_id, "chat_id": str_chat_id,
                     "contents": [], "media": [],
+                    "timestamp": getattr(message, "date", None),
                     "metadata": {
                         "message_id": message.message_id, "user_id": user.id,
                         "username": user.username, "first_name": user.first_name,
                         "is_group": message.chat.type != "private",
+                        **provenance,
                         **reply_meta,
                     },
                 }
                 self._start_typing(str_chat_id)
             buf = self._media_group_buffers[key]
+            _merge_media_group_provenance(
+                buf,
+                timestamp=getattr(message, "date", None),
+                provenance=provenance,
+            )
             if content and content != "[empty message]":
                 buf["contents"].append(content)
             buf["media"].extend(media_paths)
@@ -1140,8 +1245,10 @@ class TelegramChannel(BaseChannel):
                 "username": user.username,
                 "first_name": user.first_name,
                 "is_group": message.chat.type != "private",
+                **provenance,
                 **reply_meta,
-            }
+            },
+            timestamp=getattr(message, "date", None),
         )
 
     async def _flush_media_group(self, key: str) -> None:
@@ -1155,6 +1262,7 @@ class TelegramChannel(BaseChannel):
                 sender_id=buf["sender_id"], chat_id=buf["chat_id"],
                 content=content, media=list(dict.fromkeys(buf["media"])),
                 metadata=buf["metadata"],
+                timestamp=buf.get("timestamp"),
             )
         finally:
             self._media_group_tasks.pop(key, None)

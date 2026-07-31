@@ -265,8 +265,15 @@ For the ohmo gateway, applicable nutrition turns extend the existing
   - bounded strings/lists,
   - finite non-negative nutrient and energy values,
   - optional strict ranges (`min <= best <= max` when all values are present),
+  - optional timezone-aware ISO-8601 `meal_at`, normalized through Pydantic JSON
+    dumping and rejected when naive or invalid,
   - at least one total energy field present,
   - `extra="forbid"` on both top-level and nested nutrition objects.
+
+`meal_at` may be emitted only when the user explicitly states the meal or
+consumption time. It must never be populated from a forwarded source timestamp,
+receive timestamp, image metadata, or a model guess. An image without explicit
+consumption language keeps `meal_at=null` and `consumption_status=unknown`.
 
 Decision-trace status fields are now attached to each conversation-learning turn:
 
@@ -289,7 +296,14 @@ Honcho:
 - both in one call via `honcho_client.create_messages`,
 - both with trusted root metadata (`tenant_id`, `source_principal`,
   `gateway_session_id`, `logical_turn_id`, `client_op_id`, both status fields,
-  `decision_trace_episode_id`).
+  `decision_trace_episode_id`, `received_at`, `is_forwarded`,
+  `source_message_at`).
+
+The three transport-provenance fields are adapter-trusted: `received_at` is the
+inbound transport timestamp normalized to UTC ISO-8601, `is_forwarded` records
+native forwarding without changing the authenticated destination chat scope, and
+`source_message_at` is the validated origin timestamp normalized to UTC or null.
+Original forward author/user/chat identifiers and names are not copied.
 
 Only the assistant Message gets the complete flattened `decision_trace` envelope.
 The stored `decision_trace` is assistant-only and metadata-only:

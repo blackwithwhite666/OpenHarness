@@ -3,10 +3,12 @@
 Contract: ANY inbound location (static pin, venue, live start, live edit) just
 overwrites the chat's last-known location SILENTLY — it never becomes an agent
 turn. A later real user turn gets that location injected as context (only if one
-exists). Live-share expiry is retained and surfaced in the injected text, but
-never drops the record.
+exists and was updated no more than seven days ago). Live-share expiry is retained
+on disk and surfaced in eligible injected text, but never deletes the record.
 """
 
+import json
+import time
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
@@ -20,6 +22,7 @@ from openharness.channels.impl.telegram import (
     _format_location,
     _format_venue,
     _humanize_age,
+    _last_location_is_recent,
     _live_expires_at,
     _reply_context,
 )
@@ -78,6 +81,30 @@ def test_format_last_location_live_active_and_ended():
 def test_format_last_location_with_label():
     rec = {"latitude": 1.0, "longitude": 2.0, "updated_at": 100.0, "label": "Эрмитаж"}
     assert "«Эрмитаж»" in _format_last_location(rec, now=100.0)
+
+
+@pytest.mark.parametrize(
+    ("updated_at", "expected"),
+    (
+        (1_000_000.0 - 604_799.999, True),
+        (1_000_000.0 - 604_800, True),
+        (1_000_000.0 - 604_800.001, False),
+        (None, False),
+        ("not-a-timestamp", False),
+        (float("nan"), False),
+        (float("inf"), False),
+        (1_000_000.001, False),
+    ),
+)
+def test_last_location_recency_requires_valid_age_at_most_seven_days(
+    updated_at,
+    expected,
+):
+    record = {"latitude": 1.0, "longitude": 2.0}
+    if updated_at is not None:
+        record["updated_at"] = updated_at
+
+    assert _last_location_is_recent(record, now=1_000_000.0) is expected
 
 
 def test_reply_to_location_is_labelled_not_no_text():
@@ -204,6 +231,55 @@ async def test_text_with_stored_location_injects_it(tmp_path, monkeypatch):
     assert "last known location" in sent[0]["content"]
     assert "60.00000, 30.50000" in sent[0]["content"]
     assert "live, expires in ~" in sent[0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_stale_location_stays_on_disk_but_is_not_injected(tmp_path, monkeypatch):
+    ch, sent = _channel(tmp_path, monkeypatch)
+    now = time.time()
+    ch._last_location.update(
+        "116870365",
+        latitude=60.0,
+        longitude=30.5,
+        source="pin",
+        updated_at=now - 604_800.001,
+    )
+
+    txt = _msg(text="что рядом?")
+    await ch._on_message(
+        SimpleNamespace(effective_user=_user(), message=txt, edited_message=None, effective_message=txt),
+        None,
+    )
+
+    assert sent[0]["content"] == "что рядом?"
+    path = ch._last_location._path("116870365")
+    assert path.exists()
+    assert json.loads(path.read_text())["updated_at"] == pytest.approx(now - 604_800.001)
+
+
+@pytest.mark.asyncio
+async def test_new_location_update_makes_stale_record_eligible_again(tmp_path, monkeypatch):
+    ch, sent = _channel(tmp_path, monkeypatch)
+    ch._last_location.update(
+        "116870365",
+        latitude=1.0,
+        longitude=2.0,
+        updated_at=time.time() - 604_801,
+    )
+
+    pin = _msg(location=_loc(lat=60.0, lon=30.5))
+    await ch._on_message(
+        SimpleNamespace(effective_user=_user(), message=pin, edited_message=None, effective_message=pin),
+        None,
+    )
+    txt = _msg(text="что рядом?")
+    await ch._on_message(
+        SimpleNamespace(effective_user=_user(), message=txt, edited_message=None, effective_message=txt),
+        None,
+    )
+
+    assert "last known location" in sent[0]["content"]
+    assert "60.00000, 30.50000" in sent[0]["content"]
 
 
 @pytest.mark.asyncio

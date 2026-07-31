@@ -3,6 +3,7 @@
 import os
 import logging
 from abc import ABC, abstractmethod
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -131,6 +132,7 @@ class BaseChannel(ABC):
         media: list[str] | None = None,
         metadata: dict[str, Any] | None = None,
         session_key: str | None = None,
+        timestamp: datetime | None = None,
     ) -> None:
         """
         Handle an incoming message from the chat platform.
@@ -144,6 +146,7 @@ class BaseChannel(ABC):
             media: Optional list of media URLs.
             metadata: Optional channel-specific metadata.
             session_key: Optional session key override (e.g. thread-scoped sessions).
+            timestamp: Optional trusted transport receive timestamp.
         """
         if not self.is_allowed(sender_id):
             logger.warning(
@@ -153,6 +156,9 @@ class BaseChannel(ABC):
             )
             return
 
+        message_kwargs: dict[str, Any] = {}
+        if timestamp is not None:
+            message_kwargs["timestamp"] = timestamp
         msg = InboundMessage(
             channel=self.name,
             sender_id=str(sender_id),
@@ -161,6 +167,7 @@ class BaseChannel(ABC):
             media=media or [],
             metadata=metadata or {},
             session_key_override=session_key,
+            **message_kwargs,
         )
 
         await self.bus.publish_inbound(msg)

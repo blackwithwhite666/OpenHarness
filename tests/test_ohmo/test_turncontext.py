@@ -66,16 +66,26 @@ def test_load_gateway_config_parses_owner_principals(tmp_path: Path) -> None:
     assert load_gateway_config(workspace).owner_principals == ("12345", "ou_owner")
 
 
-def test_private_status_requires_genuine_non_forwarded_private_signal() -> None:
+def test_private_status_uses_destination_scope_and_tracks_forward_provenance() -> None:
     group = _message(metadata={"is_group": True})
     forwarded = _message(metadata={"is_group": False, "is_forwarded": True})
+    forwarded_group = _message(metadata={"is_group": True, "is_forwarded": True})
     unknown = _message(metadata={})
     private = _message(metadata={"is_group": False})
 
     assert is_private_message(group) is False
-    assert is_private_message(forwarded) is False
+    assert is_private_message(forwarded) is True
+    assert is_private_message(forwarded_group) is False
     assert is_private_message(unknown) is False
     assert is_private_message(private) is True
+
+    private_forward_context = build_turn_context(forwarded, session_id="forward-private")
+    group_forward_context = build_turn_context(forwarded_group, session_id="forward-group")
+    assert private_forward_context.is_private is True
+    assert private_forward_context.is_forwarded is True
+    assert group_forward_context.is_private is False
+    assert group_forward_context.is_forwarded is True
+    assert build_turn_context(private, session_id="plain").is_forwarded is False
 
 
 async def test_runtime_prompt_threads_turn_context_into_prepare_turn(

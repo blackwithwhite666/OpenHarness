@@ -5,8 +5,8 @@ share that streams ``edited_message`` movement updates. We don't want any of
 these to spawn an agent turn (an hour of live edits would be dozens of model
 calls); instead every inbound location silently overwrites the chat's last known
 location here, and it is injected into the next real user turn as context — only
-if one exists. There is no expiry: the last location persists until replaced, and
-its age is surfaced so the agent can judge staleness.
+if one exists and its update is no more than seven days old. Records persist until
+replaced even after they become too old for prompt injection.
 
 The store is tiny and file-based: one JSON record per chat, written atomically.
 """
@@ -48,8 +48,9 @@ class LastLocationStore:
         """Overwrite the last known location for *chat_id* (atomic replace).
 
         ``expires_at`` (epoch seconds) is the live-share expiry when known; it is
-        retained and surfaced in the prompt, but never used to drop the record —
-        an expired share still counts as the last known location."""
+        retained and may be surfaced in an eligible prompt, but never used to drop
+        the record. The transport separately limits prompt injection by
+        ``updated_at`` age without deleting stored data."""
         record: dict[str, Any] = {
             "chat_id": str(chat_id),
             "latitude": latitude,

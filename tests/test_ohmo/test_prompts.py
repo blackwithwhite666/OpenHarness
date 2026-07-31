@@ -122,6 +122,13 @@ def test_ohmo_prompt_nutrition_contract_contains_versioned_annotation_rules(tmp_
     assert '"record_type": "meal_estimate"' in prompt
     assert '"is_estimate": true' in prompt
     assert '"consumption_status": "unknown"' in prompt
+    assert '"meal_at": null' in prompt
+    assert "only when the user explicitly states" in prompt
+    assert "forwarded source timestamp" in prompt
+    assert "receive timestamp" in prompt
+    assert "image metadata" in prompt
+    assert "model guess" in prompt
+    assert "without explicit consumption language" in prompt
     assert "At least one total energy field (`energy_kcal_min|max|best`) is required." in prompt
     assert (
         "Enforce ordering constraints whenever values are present: "

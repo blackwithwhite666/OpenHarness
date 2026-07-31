@@ -207,6 +207,7 @@ def build_ohmo_system_prompt(
                 '  "record_type": "meal_estimate",\n'
                 '  "basis": ["image"],\n'
                 '  "consumption_status": "unknown",\n'
+                '  "meal_at": null,\n'
                 '  "is_estimate": true,\n'
                 '  "energy_kcal_min": 200,\n'
                 '  "energy_kcal_max": 300,\n'
@@ -235,6 +236,13 @@ def build_ohmo_system_prompt(
                 "non-finite and negative values "
                 "are invalid. Keep `items` flat, not nested. `assumptions` and `warnings` "
                 "must be bounded short strings."
+            ),
+            (
+                "`meal_at` is optional and may be emitted only when the user explicitly states "
+                "the meal or consumption time. Never infer or copy it from a forwarded source "
+                "timestamp, receive timestamp, image metadata, or a model guess. For an image "
+                "without explicit consumption language, keep `meal_at=null` and "
+                "`consumption_status=unknown`."
             ),
         ]
     )

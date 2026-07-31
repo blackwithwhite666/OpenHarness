@@ -228,6 +228,88 @@ async def test_owner_private_isolated_turn_ingests_without_delaying_reply(
     assert messages[1]["metadata"]["role"] == "assistant"
 
 
+async def test_private_forward_writes_ordered_pair_with_provenance_but_forwarded_group_does_not(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / ".ohmo-home"
+    initialize_workspace(workspace)
+    save_gateway_config(
+        GatewayConfig(
+            evals_capture=False,
+            memory_backend="shadow",
+            conversation_learning=True,
+            owner_principals=("owner",),
+        ),
+        workspace,
+    )
+    _install_fake_runtime(monkeypatch, tmp_path)
+    honcho = FakeHoncho()
+    backend = _shadow_backend(workspace, honcho, conversation_learning=True)
+    pool = OhmoSessionRuntimePool(cwd=tmp_path, workspace=workspace, provider_profile="codex")
+    pool._prompt_memory_backend = backend
+    received_at = datetime(2026, 7, 31, 19, 30, tzinfo=timezone.utc)
+    source_message_at = "2026-07-30T20:15:00+03:00"
+    private_forward = InboundMessage(
+        channel="telegram",
+        sender_id="owner|current_sender",
+        chat_id="owner",
+        content="Forwarded private request.",
+        timestamp=received_at,
+        metadata={
+            "message_id": 101,
+            "is_group": False,
+            "is_forwarded": True,
+            "received_at": received_at.isoformat(),
+            "source_message_at": source_message_at,
+        },
+    )
+
+    private_updates = [
+        update async for update in pool.stream_message(private_forward, "telegram:owner")
+    ]
+    await backend.await_pending()
+
+    assert private_updates[-1].kind == "final"
+    assert len(honcho.messages) == 1
+    session, messages = honcho.messages[0]
+    assert session == "ohmo"
+    assert [message["content"] for message in messages] == [
+        "Forwarded private request.",
+        "Assistant response.",
+    ]
+    assert [message["peer_id"] for message in messages] == ["owner", "ohmo"]
+    for message in messages:
+        metadata = message["metadata"]
+        assert metadata["tenant_id"] == "owner"
+        assert metadata["received_at"] == "2026-07-31T19:30:00+00:00"
+        assert metadata["is_forwarded"] is True
+        assert metadata["source_message_at"] == "2026-07-30T17:15:00+00:00"
+
+    forwarded_group = InboundMessage(
+        channel="telegram",
+        sender_id="owner|current_sender",
+        chat_id="family-group",
+        content="Forwarded group request.",
+        timestamp=received_at,
+        metadata={
+            "message_id": 102,
+            "is_group": True,
+            "is_forwarded": True,
+            "received_at": received_at.isoformat(),
+            "source_message_at": source_message_at,
+        },
+    )
+    group_updates = [
+        update
+        async for update in pool.stream_message(forwarded_group, "telegram:family-group")
+    ]
+    await backend.await_pending()
+
+    assert group_updates[-1].kind == "final"
+    assert len(honcho.messages) == 1
+
+
 async def test_learning_off_never_calls_create_messages(tmp_path: Path) -> None:
     honcho = FakeHoncho()
     backend = _shadow_backend(tmp_path, honcho, conversation_learning=True)

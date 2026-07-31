@@ -8,7 +8,7 @@ from dataclasses import dataclass
 import hashlib
 import logging
 import mimetypes
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from pathlib import Path
 import json
 import os
@@ -128,6 +128,26 @@ _GROUP_METADATA_KEYS = (
 DEFAULT_REMINDER_TZ = "Europe/Moscow"
 DEFAULT_REMINDER_MAX_PER_CHAT = 50
 _CONVERSATION_TRACE_DISABLED_STATUS = "disabled"
+
+
+def _trusted_utc_iso(value: object) -> str | None:
+    """Normalize a trusted aware datetime/ISO value to UTC, rejecting ambiguity."""
+    timestamp: datetime
+    if isinstance(value, datetime):
+        timestamp = value
+    elif isinstance(value, str):
+        try:
+            timestamp = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    else:
+        return None
+    try:
+        if timestamp.tzinfo is None or timestamp.utcoffset() is None:
+            return None
+        return timestamp.astimezone(timezone.utc).isoformat()
+    except (OverflowError, ValueError):
+        return None
 
 
 @dataclass(frozen=True)
@@ -254,6 +274,11 @@ def _build_conversation_turn_metadata(
         "decision_trace_status": decision_trace_status,
         "nutrition_annotation_status": nutrition_annotation_status,
         "decision_trace_episode_id": recorder.episode_id if recorder is not None else None,
+        "received_at": _trusted_utc_iso(message.timestamp),
+        "is_forwarded": turn_ctx.is_forwarded,
+        "source_message_at": _trusted_utc_iso(
+            (message.metadata or {}).get("source_message_at")
+        ),
     }
     user_metadata = dict(base_metadata)
     assistant_metadata = dict(base_metadata)

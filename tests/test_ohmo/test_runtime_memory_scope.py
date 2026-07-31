@@ -158,6 +158,9 @@ def _assert_expected_metadata_keys(metadata: dict[str, object], *, recorder: boo
         "decision_trace_status",
         "nutrition_annotation_status",
         "decision_trace_episode_id",
+        "received_at",
+        "is_forwarded",
+        "source_message_at",
     }
     if recorder:
         assert set(metadata.keys()) == expected | {"decision_trace"}
@@ -181,6 +184,9 @@ def _assert_metadata_fields(
     assert metadata["gateway_session_id"] == turn_ctx.session_id
     expected_decision_trace_episode_id = None if recorder is None else recorder.episode_id
     assert metadata["decision_trace_episode_id"] == expected_decision_trace_episode_id
+    assert metadata["received_at"] == "2026-01-02T03:04:05+00:00"
+    assert metadata["is_forwarded"] is turn_ctx.is_forwarded
+    assert metadata["source_message_at"] is None
     assert metadata["client_op_id"].startswith(metadata["logical_turn_id"] + ":")
 
     if "decision_trace" in metadata:
@@ -688,6 +694,9 @@ def test_runtime_memory_turn_metadata_statuses_cover_every_recorder_state(tmp_pa
     assert assistant_metadata["nutrition_annotation_status"] == "disabled"
     assert user_metadata["decision_trace_episode_id"] is None
     assert assistant_metadata["decision_trace_episode_id"] is None
+    assert user_metadata["received_at"] == assistant_metadata["received_at"]
+    assert user_metadata["is_forwarded"] is False
+    assert assistant_metadata["source_message_at"] is None
     assert _message_identity_for_turn(message_with_id) == "0"
     _assert_metadata_fields(
         user_metadata,
@@ -705,6 +714,54 @@ def test_runtime_memory_turn_metadata_statuses_cover_every_recorder_state(tmp_pa
     _assert_expected_metadata_keys(assistant_metadata)
     assert not isinstance(logical_turn_id, dict)
     assert user_metadata["client_op_id"] != assistant_metadata["client_op_id"]
+
+
+def test_runtime_memory_turn_metadata_normalizes_forward_provenance() -> None:
+    scope = MemoryScope("owner", ())
+    turn_ctx = TurnContext(
+        principal="100",
+        is_owner=True,
+        is_private=True,
+        channel="telegram",
+        chat_id="100",
+        session_id="session-100",
+        is_forwarded=True,
+    )
+    message = InboundMessage(
+        channel="telegram",
+        sender_id="100|owner",
+        chat_id="100",
+        content="forwarded",
+        timestamp=datetime(2026, 7, 31, 19, 30, tzinfo=timezone.utc),
+        metadata={
+            "is_group": False,
+            "is_forwarded": True,
+            "source_message_at": "2026-07-30T20:15:00+03:00",
+        },
+    )
+
+    _, user_metadata, assistant_metadata = _metadata(
+        turn_ctx=turn_ctx,
+        scope=scope,
+        message=message,
+        recorder=None,
+    )
+
+    for metadata in (user_metadata, assistant_metadata):
+        assert metadata["received_at"] == "2026-07-31T19:30:00+00:00"
+        assert metadata["is_forwarded"] is True
+        assert metadata["source_message_at"] == "2026-07-30T17:15:00+00:00"
+
+    invalid = message.metadata | {"source_message_at": "2026-07-30T20:15:00"}
+    message.metadata = invalid
+    _, invalid_user_metadata, invalid_assistant_metadata = _metadata(
+        turn_ctx=turn_ctx,
+        scope=scope,
+        message=message,
+        recorder=None,
+    )
+    assert invalid_user_metadata["source_message_at"] is None
+    assert invalid_assistant_metadata["source_message_at"] is None
 
 
 def test_runtime_memory_turn_metadata_status_recorded_with_nutrition(tmp_path: Path) -> None:
