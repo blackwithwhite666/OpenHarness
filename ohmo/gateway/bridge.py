@@ -71,6 +71,26 @@ def _extract_attachments(
     return clean, paths
 
 
+def _is_trusted_suppressed_reminder_turn(message: InboundMessage) -> bool:
+    """True only for a scheduler-originated synthetic turn of a recipient-bound
+    reminder whose bridge output must be suppressed.
+
+    The suppression marker is honored ONLY together with the scheduler sender
+    sentinel, the synthetic flag and the recipient binding stamped at fire
+    time — arbitrary live user metadata can never suppress output (channel
+    adapters don't accept these keys, and the sentinel is only set by the
+    in-process scheduler).
+    """
+    metadata = message.metadata or {}
+    return (
+        message.sender_id == "__scheduler__"
+        and bool(metadata.get("_synthetic"))
+        and bool(metadata.get("_suppress_bridge_output"))
+        and bool(metadata.get("_reminder_id"))
+        and bool(metadata.get("_reminder_recipient_chat_id"))
+    )
+
+
 _ASK_RE = re.compile(r"\[\[\s*ask\s*:\s*([^\]]+?)\s*\]\]", re.IGNORECASE)
 
 
@@ -300,10 +320,16 @@ class OhmoGatewayBridge:
             )
 
     async def _dispatch(self, message: InboundMessage, session_key: str) -> None:
+        # A suppressed recipient-bound reminder turn never emits to the chat —
+        # including the "stopped previous task" notice when a recurring fire
+        # replaces its own still-running previous turn.
+        suppress = _is_trusted_suppressed_reminder_turn(message)
         await self._interrupt_session(
             session_key,
             reason="replaced by a newer user message",
-            notify=OutboundMessage(
+            notify=None
+            if suppress
+            else OutboundMessage(
                 channel=message.channel,
                 chat_id=message.chat_id,
                 content="⏹️ Остановил предыдущую задачу, перехожу к новому сообщению.",
@@ -567,6 +593,11 @@ class OhmoGatewayBridge:
         # Collapse this turn's progress into one live status message? Read the set
         # per-turn so a /quiet or /verbose in a prior turn is already in effect.
         collapse = message.channel == "telegram" and str(message.chat_id) in self._compact_chats
+        # Trusted recipient-bound reminder turn: still run the turn (tool-made
+        # outbound sends are unaffected), but publish NO progress/tool hints and
+        # NO final reply to message.chat_id — recipient data must not reach the
+        # creator's chat.
+        suppress_output = _is_trusted_suppressed_reminder_turn(message)
         try:
             reply = ""
             final_media: list[str] = []
@@ -578,6 +609,8 @@ class OhmoGatewayBridge:
                     final_metadata = dict(update.metadata or {})
                     continue
                 if not update.text:
+                    continue
+                if suppress_output:
                     continue
                 logger.info(
                     "ohmo outbound update channel=%s chat_id=%s session_key=%s kind=%s content=%r",
@@ -626,6 +659,15 @@ class OhmoGatewayBridge:
                 message.channel,
                 message.chat_id,
                 session_key,
+            )
+            return
+        if suppress_output:
+            logger.info(
+                "ohmo suppressed final reply for recipient-bound reminder turn channel=%s chat_id=%s session_key=%s reminder_id=%s",
+                message.channel,
+                message.chat_id,
+                session_key,
+                message.metadata.get("_reminder_id"),
             )
             return
         # Resolve a relative [[attach:]] path against the session's cwd (its

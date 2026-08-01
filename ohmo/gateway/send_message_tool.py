@@ -76,19 +76,40 @@ class SendTelegramMessageTool(BaseTool):
                 output="Refusing to send an empty message.",
                 is_error=True,
             )
+        # Trusted fixed scheduled recipient (surfaced by the runtime only for a
+        # scheduler-stamped recipient-bound reminder turn). When present, the
+        # delivery target is pinned: any resolved recipient whose chat_id
+        # differs is rejected — the model cannot widen the audience.
+        fixed_chat_id = str(send_ctx.get("fixed_recipient_chat_id") or "").strip()
+        fixed_label = str(send_ctx.get("fixed_recipient_label") or "").strip()
+        reminder_id = str(send_ctx.get("reminder_id") or "").strip()
 
         matches = self._contact_store.resolve(arguments.recipient, channel="telegram")
         if len(matches) == 1:
             contact = matches[0]
+            if fixed_chat_id and str(contact.chat_id) != fixed_chat_id:
+                return ToolResult(
+                    output=(
+                        "Refusing to send: this scheduled reminder is bound to "
+                        f"{fixed_label or 'a fixed recipient'} "
+                        f"(chat_id={fixed_chat_id}) and cannot message anyone else."
+                    ),
+                    is_error=True,
+                )
+            metadata = {
+                "_session_key": f"telegram:{contact.chat_id}",
+                "_origin": "send_telegram_message",
+            }
+            if reminder_id:
+                # Lets the channel dispatcher pause the reminder when the actual
+                # Telegram delivery fails (e.g. the recipient blocked the bot).
+                metadata["_reminder_id"] = reminder_id
             await self._send_outbound(
                 OutboundMessage(
                     channel="telegram",
                     chat_id=contact.chat_id,
                     content=_signed_text(arguments.text, sender_label),
-                    metadata={
-                        "_session_key": f"telegram:{contact.chat_id}",
-                        "_origin": "send_telegram_message",
-                    },
+                    metadata=metadata,
                 )
             )
             return ToolResult(

@@ -18,6 +18,7 @@ from openharness.tools.base import ToolExecutionContext, ToolRegistry
 from openharness.tools.mcp_tool import McpToolAdapter, WellnessUserIdInjectingAdapter
 from ohmo.evals import GatewayEvalRecorder
 
+from ohmo.contact_registry import ContactStore
 from ohmo.gateway.config import save_gateway_config
 from ohmo.gateway.memory_gate import MemoryScope
 from ohmo.gateway.models import GatewayConfig
@@ -26,12 +27,14 @@ from ohmo.gateway.runtime import (
     _build_conversation_turn_metadata,
     _logical_turn_id_for_conversation,
     _message_identity_for_turn,
+    _trusted_bound_reminder,
 )
 from ohmo.gateway.turn_context import TurnContext
 from ohmo.memory_backend import CatalogMemoryBackend, ShadowMemoryBackend
 from ohmo.memory_catalog import MemoryCatalog
 from ohmo.memory_judge import JudgeOutcome
 from ohmo.memory_tool import OhmoMemoryTool, OhmoMemoryToolInput
+from ohmo.reminders.tool import RemindCreateTool
 from ohmo.workspace import initialize_workspace
 
 
@@ -1050,3 +1053,168 @@ def test_runtime_memory_turn_metadata_timestamp_fallback_is_isoformat(tmp_path: 
         recorder=recorder,
     )
     assert logical_turn_id_first == logical_turn_id_second
+
+
+def test_reminder_create_tool_gets_contact_store_and_wellness_resolver(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / ".ohmo-home"
+    initialize_workspace(workspace)
+    contact_store = ContactStore(workspace)
+    pool = OhmoSessionRuntimePool(
+        cwd=tmp_path,
+        workspace=workspace,
+        provider_profile="codex",
+        contact_store=contact_store,
+    )
+    pool._gateway_config = _family_config(owner_principals=("100|dmitry",))
+    bundle = _surface_bundle()
+    pool._register_reminder_tools(bundle)
+    tool = bundle.tool_registry.get(RemindCreateTool.name)
+    assert isinstance(tool, RemindCreateTool)
+    assert tool._contact_store is contact_store
+    resolver = tool._wellness_tenants
+    assert resolver is not None
+    # Owner principals are canonicalized to their numeric prefix.
+    assert resolver.resolve("100") == "owner"
+    assert resolver.resolve("200") == "marina"
+    assert resolver.resolve("999") is None
+
+    # A family tenant that is not enabled fails closed.
+    pool._gateway_config = _family_config(enabled_memory_tenants=("owner",))
+    pool._register_reminder_tools(bundle)
+    tool = bundle.tool_registry.get(RemindCreateTool.name)
+    assert isinstance(tool, RemindCreateTool)
+    assert tool._wellness_tenants is not None
+    assert tool._wellness_tenants.resolve("200") is None
+    assert tool._wellness_tenants.resolve("100") == "owner"
+
+
+def _bound_reminder_message(**meta_overrides: object) -> InboundMessage:
+    metadata: dict[str, object] = {
+        "_synthetic": True,
+        "_reminder_id": "r1",
+        "_reminder_created_by": "100|dmitry",
+        "_reminder_recipient_chat_id": "200",
+        "_reminder_recipient_principal": "200",
+        "_reminder_recipient_label": "Marina @marina",
+        "_reminder_wellness_tenant": "marina",
+        "_suppress_bridge_output": True,
+    }
+    metadata.update(meta_overrides)
+    return InboundMessage(
+        channel="telegram",
+        sender_id="__scheduler__",
+        chat_id="100",
+        content="send Marina her morning wellness digest",
+        session_key_override="telegram:reminder:r1",
+        metadata=metadata,
+    )
+
+
+def test_trusted_bound_reminder_rejects_live_user_spoof() -> None:
+    # Only the scheduler sentinel + synthetic flag mint a trusted binding; a
+    # live user's metadata (even fully forged) is never trusted.
+    message = _bound_reminder_message()
+    bound = _trusted_bound_reminder(message)
+    assert bound is not None
+    assert bound["reminder_id"] == "r1"
+    assert bound["recipient_chat_id"] == "200"
+    assert bound["recipient_principal"] == "200"
+    assert bound["wellness_tenant"] == "marina"
+
+    spoofed_sender = InboundMessage(
+        channel="telegram",
+        sender_id="200|mallory",
+        chat_id="200",
+        content="hi",
+        metadata=dict(message.metadata),
+    )
+    assert _trusted_bound_reminder(spoofed_sender) is None
+
+    nonsynthetic = _bound_reminder_message()
+    nonsynthetic.metadata.pop("_synthetic")
+    assert _trusted_bound_reminder(nonsynthetic) is None
+
+    legacy = InboundMessage(
+        channel="telegram",
+        sender_id="__scheduler__",
+        chat_id="100",
+        content="ping",
+        session_key_override="telegram:100",
+        metadata={"_synthetic": True, "_reminder_id": "r1"},
+    )
+    assert _trusted_bound_reminder(legacy) is None
+
+
+async def test_bound_synthetic_reminder_binds_marina_wellness_with_memory_disabled(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / ".ohmo-home"
+    initialize_workspace(workspace)
+    _seed_catalog(workspace)
+    pool = OhmoSessionRuntimePool(
+        cwd=tmp_path,
+        workspace=workspace,
+        provider_profile="codex",
+    )
+    pool._gateway_config = _family_config()
+    bundle, manager = _wellness_bundle()
+    bound = _trusted_bound_reminder(_bound_reminder_message())
+    assert bound is not None
+
+    # The synthetic turn's private/shared memory scope stays disabled — no
+    # MemoryScope is manufactured for the recipient.
+    engaged = pool._configure_turn_memory_surfaces(bundle, None, memory_scope=None)
+    assert engaged is False
+    assert bundle.tool_registry.get("memory") is None
+    assert bundle.autodream_context is None
+
+    pool._apply_bound_reminder_turn(bundle, bound)
+    tool = bundle.tool_registry.get(_WELLNESS_TOOL_NAME)
+    assert isinstance(tool, WellnessUserIdInjectingAdapter)
+    result = await tool.execute(
+        tool.input_model(params={"interval": "7d"}),
+        ToolExecutionContext(cwd=tmp_path),
+    )
+    assert result.is_error is False
+    assert manager.calls[-1][2]["params"] == {"interval": "7d", "user_id": "marina"}
+
+
+@pytest.mark.parametrize(
+    ("overrides", "config_changes"),
+    (
+        ({"_reminder_wellness_tenant": "owner"}, {}),
+        ({"_reminder_recipient_principal": "999"}, {}),
+        ({}, {"enabled_memory_tenants": ("owner",)}),
+        ({"_reminder_wellness_tenant": None}, {}),
+    ),
+    ids=("mismatched", "unmapped", "disabled", "missing"),
+)
+async def test_bound_synthetic_reminder_invalid_wellness_fails_closed(
+    overrides: dict[str, object],
+    config_changes: dict[str, object],
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / ".ohmo-home"
+    initialize_workspace(workspace)
+    _seed_catalog(workspace)
+    pool = OhmoSessionRuntimePool(
+        cwd=tmp_path,
+        workspace=workspace,
+        provider_profile="codex",
+    )
+    pool._gateway_config = _family_config(**config_changes)
+    bundle, manager = _wellness_bundle()
+    bound = _trusted_bound_reminder(_bound_reminder_message(**overrides))
+    assert bound is not None
+
+    pool._configure_turn_memory_surfaces(bundle, None, memory_scope=None)
+    pool._apply_bound_reminder_turn(bundle, bound)
+    tool = bundle.tool_registry.get(_WELLNESS_TOOL_NAME)
+    result = await tool.execute(
+        tool.input_model(params={"interval": "7d"}),
+        ToolExecutionContext(cwd=tmp_path),
+    )
+    assert result.is_error is True
+    assert manager.calls == []  # no MCP call was made

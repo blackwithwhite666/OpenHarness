@@ -196,23 +196,46 @@ class ReminderScheduler:
         )
 
     async def _deliver_agentic(self, reminder: Reminder) -> None:
+        if reminder.recipient_chat_id is not None:
+            # Recipient-bound reminder: run the turn in a reminder-specific
+            # isolated session (NEVER the creator's or the recipient's chat
+            # session) and stamp the trusted binding + the bridge-output
+            # suppression marker. Delivery then happens ONLY via
+            # send_telegram_message to the fixed recipient; progress/final
+            # replies are suppressed by the bridge so recipient wellness/tool
+            # results can never leak into the creator's interactive session.
+            session_key = f"{reminder.channel}:reminder:{reminder.id}"
+            metadata = {
+                "_synthetic": True,
+                "_reminder_id": reminder.id,
+                "_reminder_created_by": reminder.created_by,
+                "_reminder_recipient_chat_id": reminder.recipient_chat_id,
+                "_reminder_recipient_principal": reminder.recipient_principal,
+                "_reminder_recipient_label": reminder.recipient_label,
+                "_reminder_wellness_tenant": reminder.wellness_tenant,
+                "_suppress_bridge_output": True,
+            }
+        else:
+            # Legacy this-chat reminder: unchanged session + output behavior.
+            session_key = reminder.session_key
+            metadata = {
+                "_synthetic": True,
+                "_reminder_id": reminder.id,
+                "_reminder_created_by": reminder.created_by,
+            }
         await self._bus.publish_inbound(
             InboundMessage(
                 channel=reminder.channel,
                 sender_id=_SCHEDULER_SENDER,
                 chat_id=reminder.chat_id,
                 content=reminder.summary,
-                session_key_override=reminder.session_key,
+                session_key_override=session_key,
                 # ``_reminder_created_by`` carries the human who scheduled this
                 # reminder (the creator's channel sender_id, e.g. Telegram
                 # "<id>|<username>"). The turn itself is synthetic
                 # (sender_id=__scheduler__), but a tool like send_telegram_message
                 # can sign on the creator's behalf — see runtime ohmo_send_ctx.
-                metadata={
-                    "_synthetic": True,
-                    "_reminder_id": reminder.id,
-                    "_reminder_created_by": reminder.created_by,
-                },
+                metadata=metadata,
             )
         )
 

@@ -246,6 +246,90 @@ async def test_send_telegram_message_signs_from_reminder_creator(tmp_path: Path)
     assert "через бота" in content
 
 
+def _bound_reminder_ctx(tmp_path: Path, **overrides) -> ToolExecutionContext:
+    """ohmo_send_ctx as the runtime builds it for a recipient-bound synthetic
+    reminder turn: creator as signer + the fixed recipient + reminder id."""
+    ctx = {
+        "sender_id": "42|valeria",
+        "username": "",
+        "first_name": "",
+        "display_name": "",
+        "fixed_recipient_chat_id": "200",
+        "fixed_recipient_label": "Marina @marina",
+        "reminder_id": "r1",
+    }
+    ctx.update(overrides)
+    return ToolExecutionContext(cwd=tmp_path, metadata={"ohmo_send_ctx": ctx})
+
+
+@pytest.mark.asyncio
+async def test_scheduled_send_goes_to_fixed_recipient_signed_with_reminder_id(tmp_path: Path):
+    published: list[OutboundMessage] = []
+
+    async def send_outbound(message: OutboundMessage) -> None:
+        published.append(message)
+
+    store = ContactStore(tmp_path)
+    store.record_inbound(
+        channel="telegram",
+        chat_id="200",
+        user_id="200",
+        username="marina",
+        first_name="Marina",
+    )
+    tool = SendTelegramMessageTool(store, send_outbound)
+
+    result = await tool.execute(
+        SendTelegramMessageInput(recipient="@marina", text="Your morning digest"),
+        _bound_reminder_ctx(tmp_path),
+    )
+
+    assert not result.is_error
+    assert len(published) == 1
+    message = published[0]
+    assert message.chat_id == "200"
+    # Signed as the reminder's creator.
+    assert "@valeria" in message.content
+    assert "через бота" in message.content
+    # Carries the reminder id so a real Telegram delivery failure can pause it.
+    assert message.metadata["_reminder_id"] == "r1"
+    assert message.metadata["_origin"] == "send_telegram_message"
+
+
+@pytest.mark.asyncio
+async def test_scheduled_send_to_another_known_contact_is_rejected(tmp_path: Path):
+    published: list[OutboundMessage] = []
+
+    async def send_outbound(message: OutboundMessage) -> None:
+        published.append(message)
+
+    store = ContactStore(tmp_path)
+    store.record_inbound(
+        channel="telegram",
+        chat_id="200",
+        user_id="200",
+        username="marina",
+        first_name="Marina",
+    )
+    store.record_inbound(
+        channel="telegram",
+        chat_id="123",
+        user_id="456",
+        username="alice",
+        first_name="Alice",
+    )
+    tool = SendTelegramMessageTool(store, send_outbound)
+
+    result = await tool.execute(
+        SendTelegramMessageInput(recipient="@alice", text="hi Alice"),
+        _bound_reminder_ctx(tmp_path),
+    )
+
+    assert result.is_error
+    assert "bound" in result.output
+    assert published == []
+
+
 @pytest.mark.asyncio
 async def test_send_telegram_message_fuzzy_match_suggests_without_sending(tmp_path: Path):
     published: list[OutboundMessage] = []

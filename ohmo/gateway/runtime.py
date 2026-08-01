@@ -68,7 +68,12 @@ from ohmo.memory_tool import OhmoMemoryTool
 from ohmo.prompt_seam import compose_runtime_prompt, prepare_turn
 from ohmo.prompts import build_ohmo_system_prompt
 from ohmo.reminders.store import ReminderStore
-from ohmo.reminders.tool import RemindCancelTool, RemindCreateTool, RemindListTool
+from ohmo.reminders.tool import (
+    RemindCancelTool,
+    RemindCreateTool,
+    RemindListTool,
+    WellnessTenantResolver,
+)
 from ohmo.session_storage import (
     OhmoSessionBackend,
     clear_session_work_dir,
@@ -289,6 +294,82 @@ def _build_conversation_turn_metadata(
     if decision_trace is not None:
         assistant_metadata["decision_trace"] = dict(decision_trace)
     return logical_turn_id, user_metadata, assistant_metadata
+
+
+def _reminder_wellness_tenants(config) -> WellnessTenantResolver:
+    """Build the reminders' server-side principal -> wellness tenant mapping.
+
+    Owner principals may carry ``id|username``; only the canonical numeric
+    prefix is trusted (same canonicalization GatewayConfig validates against).
+    """
+    owners = tuple(
+        canonical
+        for owner in config.owner_principals
+        if (canonical := str(owner).strip().split("|", 1)[0].strip())
+    )
+    return WellnessTenantResolver(
+        owner_principals=owners,
+        family_principals=dict(config.family_principals),
+        enabled_tenants=tuple(config.enabled_memory_tenants),
+    )
+
+
+_SCHEDULER_SENDER = "__scheduler__"
+
+
+def _trusted_bound_reminder(message: InboundMessage) -> dict[str, str | None] | None:
+    """Return the trusted recipient binding of a scheduler-originated synthetic
+    reminder turn, or ``None`` for any other message.
+
+    Trusted means: the scheduler sender sentinel + the synthetic flag + the
+    binding the scheduler stamped at fire time. A live user's metadata can
+    never mint this binding — channel adapters don't accept these keys and the
+    sentinel is only set by the in-process scheduler.
+    """
+    metadata = message.metadata or {}
+    if message.sender_id != _SCHEDULER_SENDER or not metadata.get("_synthetic"):
+        return None
+    recipient_chat_id = str(metadata.get("_reminder_recipient_chat_id") or "").strip()
+    reminder_id = str(metadata.get("_reminder_id") or "").strip()
+    if not recipient_chat_id or not reminder_id:
+        return None
+    return {
+        "reminder_id": reminder_id,
+        "recipient_chat_id": recipient_chat_id,
+        "recipient_principal": str(metadata.get("_reminder_recipient_principal") or "").strip(),
+        "recipient_label": str(metadata.get("_reminder_recipient_label") or "").strip(),
+        "wellness_tenant": str(metadata.get("_reminder_wellness_tenant") or "").strip() or None,
+    }
+
+
+def _augment_bound_reminder_message(
+    user_message: ConversationMessage,
+    bound: dict[str, str | None],
+) -> ConversationMessage:
+    """Prepend a trusted scheduling instruction to a recipient-bound synthetic
+    reminder turn so the model reliably delivers ONLY via send_telegram_message
+    to the fixed recipient. The recipient label is informational context; the
+    actual chat_id boundary is enforced server-side in the send tool — neither
+    it nor the wellness tenant is a model-selectable authorization boundary.
+    """
+    label = bound.get("recipient_label") or "the fixed recipient"
+    note = (
+        "[Scheduled reminder — trusted gateway instruction]\n"
+        f"This turn was fired automatically by reminder {bound['reminder_id']}. "
+        f"Deliver the result ONLY to {label} with the send_telegram_message "
+        "tool: the recipient was fixed when the reminder was created and "
+        "cannot be changed — any other recipient is rejected. Your chat "
+        "progress and final reply are NOT delivered to anyone, so the tool "
+        "call is the only delivery path."
+    )
+    if bound.get("wellness_tenant"):
+        note += (
+            " Wellness access in this turn reads only the fixed recipient's "
+            "own wellness data."
+        )
+    return user_message.model_copy(
+        update={"content": [TextBlock(text=note), *user_message.content]}
+    )
 
 
 class OhmoSessionRuntimePool:
@@ -549,7 +630,10 @@ class OhmoSessionRuntimePool:
 
     async def stream_message(self, message: InboundMessage, session_key: str):
         """Submit an inbound channel message and yield progress + final reply updates."""
+        bound_reminder = _trusted_bound_reminder(message)
         user_message = _build_inbound_user_message(message)
+        if bound_reminder is not None:
+            user_message = _augment_bound_reminder_message(user_message, bound_reminder)
         user_prompt = user_message.text
         command_prompt = (message.content or "").strip()
         session_cwd = self._cwd_for_message(message, session_key)
@@ -560,12 +644,19 @@ class OhmoSessionRuntimePool:
             owner_principals=self._gateway_config.owner_principals,
         )
         self._bind_session_owner(message, session_key, turn_ctx)
-        memory_scope = self._resolve_turn_memory_scope(turn_ctx)
+        # A recipient-bound synthetic reminder turn keeps its private/shared
+        # memory scope disabled — never manufacture a MemoryScope for the
+        # recipient. Wellness, if any, is bound separately below.
+        memory_scope = (
+            None if bound_reminder is not None else self._resolve_turn_memory_scope(turn_ctx)
+        )
         self._configure_turn_memory_surfaces(
             bundle,
             turn_ctx,
             memory_scope=memory_scope,
         )
+        if bound_reminder is not None:
+            self._apply_bound_reminder_turn(bundle, bound_reminder)
         logger.debug(
             "ohmo turn identity principal=%s owner=%s private=%s channel=%s chat_id=%s session_id=%s",
             turn_ctx.principal,
@@ -595,12 +686,21 @@ class OhmoSessionRuntimePool:
             # instead of refusing the whole turn (the creator's id is the same
             # "<id>|<username>" shape _sender_label already parses).
             reminder_created_by = str(message.metadata.get("_reminder_created_by") or "").strip()
-            engine_metadata["ohmo_send_ctx"] = {
+            send_ctx: dict[str, str] = {
                 "sender_id": reminder_created_by or str(message.sender_id),
                 "username": str(message.metadata.get("username") or "").strip(),
                 "first_name": str(message.metadata.get("first_name") or "").strip(),
                 "display_name": str(message.metadata.get("sender_display_name") or "").strip(),
             }
+            if bound_reminder is not None:
+                # Surface the fixed scheduled recipient + reminder id so the
+                # send tool can pin delivery to that recipient and tag the
+                # OutboundMessage for delivery-failure pausing. Trusted only
+                # because it comes from a scheduler-stamped synthetic turn.
+                send_ctx["fixed_recipient_chat_id"] = bound_reminder["recipient_chat_id"] or ""
+                send_ctx["fixed_recipient_label"] = bound_reminder["recipient_label"] or ""
+                send_ctx["reminder_id"] = bound_reminder["reminder_id"] or ""
+            engine_metadata["ohmo_send_ctx"] = send_ctx
         logger.info(
             "ohmo runtime processing start channel=%s chat_id=%s session_key=%s session_id=%s content=%r",
             message.channel,
@@ -1628,10 +1728,55 @@ class OhmoSessionRuntimePool:
         self._bind_wellness_tool_tenant(bundle, scope)
         return engaged
 
+    def _apply_bound_reminder_turn(
+        self,
+        bundle: RuntimeBundle,
+        bound: dict[str, str | None],
+    ) -> None:
+        """Bind wellness for a recipient-bound synthetic reminder turn.
+
+        Memory surfaces stay disabled for the synthetic turn (no MemoryScope is
+        manufactured for the recipient); ONLY the wellness adapter is bound,
+        and only after re-validating the scheduler-stamped tenant against the
+        CURRENT GatewayConfig and the fixed recipient principal. A missing,
+        mismatched, unmapped or disabled subject clears the tenant — fail
+        closed, the adapter then refuses every call and no MCP call is made.
+        """
+        tenant = self._validated_bound_wellness_tenant(bound)
+        self._bind_wellness_tenant(bundle, tenant)
+
+    def _validated_bound_wellness_tenant(self, bound: dict[str, str | None]) -> str | None:
+        tenant = bound.get("wellness_tenant")
+        principal = bound.get("recipient_principal")
+        if not tenant or not principal:
+            return None
+        canonical = canonical_principal("telegram", principal)
+        resolved = _reminder_wellness_tenants(self._gateway_config).resolve(canonical)
+        if resolved is None or resolved != tenant:
+            logger.warning(
+                "ohmo bound reminder wellness rejected tenant=%r principal=%s resolved=%r reminder_id=%s",
+                tenant,
+                canonical,
+                resolved,
+                bound.get("reminder_id"),
+            )
+            return None
+        return tenant
+
     @staticmethod
     def _bind_wellness_tool_tenant(
         bundle: RuntimeBundle,
         scope: MemoryScope | None,
+    ) -> None:
+        OhmoSessionRuntimePool._bind_wellness_tenant(
+            bundle,
+            scope.private_tenant if scope is not None else None,
+        )
+
+    @staticmethod
+    def _bind_wellness_tenant(
+        bundle: RuntimeBundle,
+        tenant: str | None,
     ) -> None:
         """Bind the OHMO-scoped wellness MCP tool to this turn's trusted tenant.
 
@@ -1654,7 +1799,7 @@ class OhmoSessionRuntimePool:
             registry.register(tool)
         if not isinstance(tool, WellnessUserIdInjectingAdapter):
             return
-        tool.set_tenant(scope.private_tenant if scope is not None else None)
+        tool.set_tenant(tenant)
 
     def _register_gateway_tools(
         self,
@@ -1812,6 +1957,8 @@ class OhmoSessionRuntimePool:
                 self._reminder_lock,
                 default_tz=self._default_tz,
                 max_per_chat=self._reminder_max_per_chat,
+                contact_store=self._contact_store,
+                wellness_tenants=_reminder_wellness_tenants(self._gateway_config),
             )
         )
         registry.register(

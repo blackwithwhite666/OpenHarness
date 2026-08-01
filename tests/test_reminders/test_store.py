@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import time
 from pathlib import Path
 
@@ -136,3 +137,45 @@ def test_atomic_write_leaves_no_temp(store: ReminderStore, tmp_path: Path) -> No
     assert not any(n.endswith(".tmp") for n in names)
     # Only the registry + optional lock file may remain.
     assert names <= {"reminders.json", "reminders.json.lock"}
+
+
+def test_recipient_fields_persist(store: ReminderStore) -> None:
+    store.add(
+        _reminder(
+            "r1",
+            mode="agentic",
+            recipient_chat_id="200",
+            recipient_principal="200",
+            recipient_label="Marina @marina",
+            wellness_tenant="marina",
+        )
+    )
+    loaded = store.get("r1")
+    assert loaded is not None
+    assert loaded.recipient_chat_id == "200"
+    assert loaded.recipient_principal == "200"
+    assert loaded.recipient_label == "Marina @marina"
+    assert loaded.wellness_tenant == "marina"
+
+
+def test_legacy_record_without_recipient_fields_loads(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    path = tmp_path / "reminders.json"
+    legacy = _reminder("r1").model_dump()
+    for key in (
+        "recipient_chat_id",
+        "recipient_principal",
+        "recipient_label",
+        "wellness_tenant",
+    ):
+        legacy.pop(key)
+    path.write_text(json.dumps([legacy]), encoding="utf-8")
+    monkeypatch.setattr("ohmo.reminders.store.get_reminders_path", lambda workspace=None: path)
+    loaded = ReminderStore().get("r1")
+    assert loaded is not None
+    assert loaded.recipient_chat_id is None
+    assert loaded.recipient_principal is None
+    assert loaded.recipient_label is None
+    assert loaded.wellness_tenant is None
+    assert loaded.summary == "ping-r1"

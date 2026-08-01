@@ -37,6 +37,16 @@ class Reminder(BaseModel):
     last_fired_at: float | None = None
     status: str = "active"
     fire_count: int = 0
+    # Fixed delivery recipient bound at creation (None = deliver to the
+    # originating chat, the legacy behavior). ``recipient_principal`` is the
+    # contact's canonical numeric Telegram principal; ``recipient_label`` is a
+    # stable human-readable label for confirmations/listings.
+    recipient_chat_id: str | None = None
+    recipient_principal: str | None = None
+    recipient_label: str | None = None
+    # Wellness subject derived server-side at creation from the recipient's
+    # canonical principal (never model-supplied). None = no wellness access.
+    wellness_tenant: str | None = None
 
     @field_validator("mode")
     @classmethod

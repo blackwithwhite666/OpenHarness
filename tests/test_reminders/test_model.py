@@ -187,3 +187,36 @@ class TestValidation:
     def test_bad_status_rejected(self) -> None:
         with pytest.raises(ValueError):
             _reminder(status="frozen")
+
+
+class TestRecipientFields:
+    def test_legacy_record_without_new_fields_loads(self) -> None:
+        reminder = _reminder()
+        payload = reminder.model_dump()
+        for key in (
+            "recipient_chat_id",
+            "recipient_principal",
+            "recipient_label",
+            "wellness_tenant",
+        ):
+            payload.pop(key)
+        loaded = Reminder.model_validate(payload)
+        assert loaded.recipient_chat_id is None
+        assert loaded.recipient_principal is None
+        assert loaded.recipient_label is None
+        assert loaded.wellness_tenant is None
+        assert loaded == reminder
+
+    def test_recipient_fields_round_trip(self) -> None:
+        reminder = _reminder(
+            mode="agentic",
+            recipient_chat_id="200",
+            recipient_principal="200",
+            recipient_label="Marina @marina",
+            wellness_tenant="marina",
+        )
+        loaded = Reminder.model_validate(reminder.model_dump())
+        assert loaded.recipient_chat_id == "200"
+        assert loaded.recipient_principal == "200"
+        assert loaded.recipient_label == "Marina @marina"
+        assert loaded.wellness_tenant == "marina"

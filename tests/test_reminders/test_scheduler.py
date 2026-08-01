@@ -194,6 +194,68 @@ async def test_agentic_publishes_inbound() -> None:
     assert msg.metadata["_reminder_created_by"] == "42|valeria"
 
 
+async def test_bound_agentic_uses_isolated_session_and_trusted_metadata() -> None:
+    # A recipient-bound agentic reminder runs in a reminder-specific isolated
+    # session (never the creator's or the recipient's chat session) and stamps
+    # the trusted binding + the bridge suppression marker.
+    store = ReminderStore()
+    store.add(
+        _reminder(
+            "r1",
+            mode="agentic",
+            created_by="42|valeria",
+            recipient_chat_id="200",
+            recipient_principal="200",
+            recipient_label="Marina @marina",
+            wellness_tenant="marina",
+        )
+    )
+    bus = FakeBus()
+    sched = _make_scheduler(bus, store)
+
+    await sched.fire_due()
+
+    assert len(bus.outbound) == 0
+    assert len(bus.inbound) == 1
+    msg = bus.inbound[0]
+    assert msg.sender_id == "__scheduler__"
+    assert msg.session_key_override == "telegram:reminder:r1"
+    assert msg.session_key_override != "telegram:100"  # creator's chat session
+    assert msg.session_key_override != "telegram:200"  # recipient's chat session
+    md = msg.metadata
+    assert md["_synthetic"] is True
+    assert md["_reminder_id"] == "r1"
+    assert md["_reminder_created_by"] == "42|valeria"
+    assert md["_reminder_recipient_chat_id"] == "200"
+    assert md["_reminder_recipient_principal"] == "200"
+    assert md["_reminder_recipient_label"] == "Marina @marina"
+    assert md["_reminder_wellness_tenant"] == "marina"
+    assert md["_suppress_bridge_output"] is True
+
+
+async def test_bound_agentic_without_wellness_carries_no_tenant() -> None:
+    store = ReminderStore()
+    store.add(
+        _reminder(
+            "r1",
+            mode="agentic",
+            recipient_chat_id="200",
+            recipient_principal="200",
+            recipient_label="Marina @marina",
+            wellness_tenant=None,
+        )
+    )
+    bus = FakeBus()
+    sched = _make_scheduler(bus, store)
+
+    await sched.fire_due()
+
+    assert len(bus.inbound) == 1
+    md = bus.inbound[0].metadata
+    assert md["_reminder_wellness_tenant"] is None
+    assert md["_suppress_bridge_output"] is True
+
+
 async def test_catchup_once_fires_one_then_advances() -> None:
     store = ReminderStore()
     # Recurring reminder several periods in the past.

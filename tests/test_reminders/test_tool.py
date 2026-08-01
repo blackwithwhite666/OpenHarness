@@ -9,6 +9,7 @@ from pathlib import Path
 
 from openharness.tools.base import ToolExecutionContext
 
+from ohmo.contact_registry import ContactStore
 from ohmo.reminders.store import ReminderStore
 from ohmo.reminders.tool import (
     RemindCancelInput,
@@ -17,6 +18,7 @@ from ohmo.reminders.tool import (
     RemindCreateTool,
     RemindListInput,
     RemindListTool,
+    WellnessTenantResolver,
 )
 
 MSK = timezone(timedelta(hours=3))
@@ -196,3 +198,287 @@ async def test_cancel_wrong_chat_errors(tmp_path: Path) -> None:
         _ctx(_reminder_ctx(chat_id="999"), tmp_path),
     )
     assert result.is_error
+
+
+def _contacts(tmp_path: Path) -> ContactStore:
+    contacts = ContactStore(tmp_path)
+    contacts.record_inbound(
+        channel="telegram",
+        chat_id="200",
+        user_id="200",
+        username="marina",
+        first_name="Marina",
+    )
+    return contacts
+
+
+def _wellness(**overrides) -> WellnessTenantResolver:
+    values = {
+        "owner_principals": ("100",),
+        "family_principals": {"200": "marina"},
+        "enabled_tenants": ("owner", "marina"),
+    }
+    values.update(overrides)
+    return WellnessTenantResolver(**values)
+
+
+def _create_tool(
+    tmp_path: Path,
+    *,
+    contacts: ContactStore | None = None,
+    wellness: WellnessTenantResolver | None = None,
+) -> tuple[ReminderStore, RemindCreateTool]:
+    store = ReminderStore()
+    tool = RemindCreateTool(
+        store,
+        asyncio.Lock(),
+        default_tz="Europe/Moscow",
+        max_per_chat=50,
+        contact_store=contacts,
+        wellness_tenants=wellness,
+    )
+    return store, tool
+
+
+async def test_create_with_exact_recipient_binds_and_persists(tmp_path: Path) -> None:
+    store, tool = _create_tool(tmp_path, contacts=_contacts(tmp_path))
+    result = await tool.execute(
+        RemindCreateInput(
+            summary="check on Marina",
+            dtstart=_future_iso(),
+            mode="agentic",
+            recipient="@marina",
+        ),
+        _ctx(_reminder_ctx(), tmp_path),
+    )
+    assert not result.is_error
+    assert "Recipient: Marina @marina" in result.output
+    reminder = store.list_for_chat("telegram", "100")[0]
+    assert reminder.recipient_chat_id == "200"
+    assert reminder.recipient_principal == "200"
+    assert reminder.recipient_label == "Marina @marina"
+    assert reminder.wellness_tenant is None
+    # The record stays scoped to the originating chat for list/cancel.
+    assert reminder.channel == "telegram" and reminder.chat_id == "100"
+
+
+async def test_create_unknown_recipient_refused(tmp_path: Path) -> None:
+    store, tool = _create_tool(tmp_path, contacts=_contacts(tmp_path))
+    result = await tool.execute(
+        RemindCreateInput(
+            summary="x",
+            dtstart=_future_iso(),
+            mode="agentic",
+            recipient="nobody",
+        ),
+        _ctx(_reminder_ctx(), tmp_path),
+    )
+    assert result.is_error
+    assert "Unknown recipient" in result.output
+    assert store.load() == []
+
+
+async def test_create_ambiguous_recipient_refused(tmp_path: Path) -> None:
+    contacts = ContactStore(tmp_path)
+    contacts.record_inbound(
+        channel="telegram", chat_id="200", user_id="200", first_name="Alex"
+    )
+    contacts.record_inbound(
+        channel="telegram", chat_id="300", user_id="300", first_name="Alex"
+    )
+    store, tool = _create_tool(tmp_path, contacts=contacts)
+    result = await tool.execute(
+        RemindCreateInput(
+            summary="x",
+            dtstart=_future_iso(),
+            mode="agentic",
+            recipient="Alex",
+        ),
+        _ctx(_reminder_ctx(), tmp_path),
+    )
+    assert result.is_error
+    assert "Ambiguous recipient" in result.output
+    assert store.load() == []
+
+
+async def test_create_recipient_requires_agentic_mode(tmp_path: Path) -> None:
+    store, tool = _create_tool(tmp_path, contacts=_contacts(tmp_path))
+    result = await tool.execute(
+        RemindCreateInput(
+            summary="x",
+            dtstart=_future_iso(),
+            mode="static",
+            recipient="Marina",
+        ),
+        _ctx(_reminder_ctx(), tmp_path),
+    )
+    assert result.is_error
+    assert "agentic" in result.output
+    assert store.load() == []
+
+
+async def test_create_recipient_requires_telegram_channel(tmp_path: Path) -> None:
+    store, tool = _create_tool(tmp_path, contacts=_contacts(tmp_path))
+    ctx = _reminder_ctx()
+    ctx["ohmo_reminder_ctx"]["channel"] = "feishu"
+    result = await tool.execute(
+        RemindCreateInput(
+            summary="x",
+            dtstart=_future_iso(),
+            mode="agentic",
+            recipient="Marina",
+        ),
+        _ctx(ctx, tmp_path),
+    )
+    assert result.is_error
+    assert "Telegram" in result.output
+    assert store.load() == []
+
+
+async def test_create_recipient_without_contact_store_refused(tmp_path: Path) -> None:
+    store, tool = _create_tool(tmp_path, contacts=None)
+    result = await tool.execute(
+        RemindCreateInput(
+            summary="x",
+            dtstart=_future_iso(),
+            mode="agentic",
+            recipient="Marina",
+        ),
+        _ctx(_reminder_ctx(), tmp_path),
+    )
+    assert result.is_error
+    assert store.load() == []
+
+
+async def test_wellness_opt_in_without_recipient_refused(tmp_path: Path) -> None:
+    store, tool = _create_tool(
+        tmp_path, contacts=_contacts(tmp_path), wellness=_wellness()
+    )
+    result = await tool.execute(
+        RemindCreateInput(
+            summary="x",
+            dtstart=_future_iso(),
+            mode="agentic",
+            read_recipient_wellness=True,
+        ),
+        _ctx(_reminder_ctx(), tmp_path),
+    )
+    assert result.is_error
+    assert "recipient" in result.output.lower()
+    assert store.load() == []
+
+
+async def test_wellness_unmapped_recipient_refused(tmp_path: Path) -> None:
+    contacts = _contacts(tmp_path)
+    contacts.record_inbound(
+        channel="telegram", chat_id="555", user_id="555", first_name="Stranger"
+    )
+    store, tool = _create_tool(tmp_path, contacts=contacts, wellness=_wellness())
+    result = await tool.execute(
+        RemindCreateInput(
+            summary="x",
+            dtstart=_future_iso(),
+            mode="agentic",
+            recipient="Stranger",
+            read_recipient_wellness=True,
+        ),
+        _ctx(_reminder_ctx(), tmp_path),
+    )
+    assert result.is_error
+    assert store.load() == []
+
+
+async def test_wellness_disabled_tenant_refused(tmp_path: Path) -> None:
+    store, tool = _create_tool(
+        tmp_path,
+        contacts=_contacts(tmp_path),
+        wellness=_wellness(enabled_tenants=("owner",)),
+    )
+    result = await tool.execute(
+        RemindCreateInput(
+            summary="x",
+            dtstart=_future_iso(),
+            mode="agentic",
+            recipient="Marina",
+            read_recipient_wellness=True,
+        ),
+        _ctx(_reminder_ctx(), tmp_path),
+    )
+    assert result.is_error
+    assert store.load() == []
+
+
+async def test_wellness_derives_marina_tenant(tmp_path: Path) -> None:
+    store, tool = _create_tool(
+        tmp_path, contacts=_contacts(tmp_path), wellness=_wellness()
+    )
+    result = await tool.execute(
+        RemindCreateInput(
+            summary="morning wellness check",
+            dtstart=_future_iso(),
+            mode="agentic",
+            recipient="Marina",
+            read_recipient_wellness=True,
+        ),
+        _ctx(_reminder_ctx(), tmp_path),
+    )
+    assert not result.is_error
+    assert "wellness" in result.output.lower()
+    reminder = store.list_for_chat("telegram", "100")[0]
+    assert reminder.wellness_tenant == "marina"
+    assert reminder.recipient_principal == "200"
+
+
+async def test_wellness_owner_principal_maps_to_owner(tmp_path: Path) -> None:
+    contacts = _contacts(tmp_path)
+    contacts.record_inbound(
+        channel="telegram", chat_id="100", user_id="100", first_name="Boss"
+    )
+    store, tool = _create_tool(tmp_path, contacts=contacts, wellness=_wellness())
+    result = await tool.execute(
+        RemindCreateInput(
+            summary="x",
+            dtstart=_future_iso(),
+            mode="agentic",
+            recipient="Boss",
+            read_recipient_wellness=True,
+        ),
+        _ctx(_reminder_ctx(), tmp_path),
+    )
+    assert not result.is_error
+    reminder = store.list_for_chat("telegram", "100")[0]
+    assert reminder.wellness_tenant == "owner"
+
+
+async def test_list_shows_recipient_and_wellness_presence(tmp_path: Path) -> None:
+    store, tool = _create_tool(
+        tmp_path, contacts=_contacts(tmp_path), wellness=_wellness()
+    )
+    await tool.execute(
+        RemindCreateInput(
+            summary="bound",
+            dtstart=_future_iso(),
+            mode="agentic",
+            recipient="Marina",
+            read_recipient_wellness=True,
+        ),
+        _ctx(_reminder_ctx(), tmp_path),
+    )
+    await tool.execute(
+        RemindCreateInput(summary="plain", dtstart=_future_iso()),
+        _ctx(_reminder_ctx(), tmp_path),
+    )
+    list_tool = RemindListTool(store, asyncio.Lock(), default_tz="Europe/Moscow")
+    result = await list_tool.execute(RemindListInput(), _ctx(_reminder_ctx(), tmp_path))
+    bound_line = next(line for line in result.output.splitlines() if "bound" in line)
+    plain_line = next(line for line in result.output.splitlines() if "plain" in line)
+    assert "→ Marina @marina" in bound_line
+    assert "reads wellness" in bound_line
+    assert "→" not in plain_line
+    assert "reads wellness" not in plain_line
+
+
+def test_create_input_has_no_tenant_field() -> None:
+    assert not any(
+        "tenant" in name for name in RemindCreateInput.model_fields
+    )
