@@ -87,6 +87,15 @@ def test_deep_research_prompt_has_loop_and_final_answer():
     assert "cwd" in prompt  # attachment contract
 
 
+def test_deep_research_prompt_uses_native_or_internal_image_handling():
+    agent = get_agent_definition("deep-research")
+    prompt = agent.system_prompt or ""
+    assert "provided natively" in prompt
+    assert "internally described before your model call" in prompt
+    assert "do NOT call `image_to_text`" in prompt
+    assert "Pillow/OpenCV" in prompt
+
+
 # ---------------------------------------------------------------------------
 # research-verification AgentDefinition
 # ---------------------------------------------------------------------------

@@ -12,7 +12,7 @@ from openharness.api.client import ApiMessageCompleteEvent, ApiRetryEvent, ApiTe
 from openharness.api.errors import RequestFailure
 from openharness.api.usage import UsageSnapshot
 from openharness.config.settings import PermissionSettings, Settings
-from openharness.engine.messages import ConversationMessage, TextBlock, ToolUseBlock
+from openharness.engine.messages import ConversationMessage, ImageBlock, TextBlock, ToolUseBlock
 from openharness.engine.query_engine import QueryEngine
 from openharness.prompts.context import build_runtime_system_prompt
 from openharness.engine.stream_events import (
@@ -30,6 +30,7 @@ from openharness.tools import create_default_tool_registry
 from openharness.tools.base import BaseTool, ToolExecutionContext, ToolRegistry, ToolResult
 from openharness.tools.glob_tool import GlobTool
 from openharness.tools.grep_tool import GrepTool
+from openharness.tools.image_to_text_tool import ImageToTextTool
 from pydantic import BaseModel
 from openharness.engine.messages import ToolResultBlock
 from openharness.hooks import HookExecutionContext, HookExecutor, HookEvent
@@ -243,6 +244,114 @@ async def test_query_engine_plain_text_reply(tmp_path: Path, monkeypatch):
     assert engine.total_usage.input_tokens == 10
     assert engine.total_usage.output_tokens == 5
     assert len(engine.messages) == 2
+
+
+@pytest.mark.asyncio
+async def test_query_engine_passes_native_images_without_fallback_tool_schema(
+    tmp_path: Path,
+) -> None:
+    client = RecordingApiClient()
+    engine = QueryEngine(
+        api_client=client,
+        tool_registry=create_default_tool_registry(),
+        permission_checker=PermissionChecker(PermissionSettings(mode=PermissionMode.FULL_AUTO)),
+        cwd=tmp_path,
+        model="gpt-5.5",
+        system_prompt="system",
+    )
+    prompt = ConversationMessage(
+        role="user",
+        content=[
+            TextBlock(text="Inspect this image"),
+            ImageBlock(media_type="image/png", data="YWJj"),
+        ],
+    )
+
+    events = [event async for event in engine.submit_message(prompt)]
+
+    assert isinstance(events[-1], AssistantTurnComplete)
+    request = client.requests[0]
+    assert any(isinstance(block, ImageBlock) for block in request.messages[0].content)
+    assert "image_to_text" not in {schema["name"] for schema in request.tools}
+
+
+@pytest.mark.asyncio
+async def test_query_engine_converts_images_internally_for_text_only_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake_execute(self, arguments, context):
+        del self, arguments, context
+        return ToolResult(output="internal image description")
+
+    monkeypatch.setattr(ImageToTextTool, "execute", fake_execute)
+    client = RecordingApiClient()
+    engine = QueryEngine(
+        api_client=client,
+        tool_registry=create_default_tool_registry(),
+        permission_checker=PermissionChecker(PermissionSettings(mode=PermissionMode.FULL_AUTO)),
+        cwd=tmp_path,
+        model="gpt-5.5",
+        system_prompt="system",
+        supports_native_images=False,
+        tool_metadata={
+            "vision_model_config": {
+                "model": "vision-model",
+                "api_key": "vision-key",
+            }
+        },
+    )
+    prompt = ConversationMessage(
+        role="user",
+        content=[ImageBlock(media_type="image/png", data="YWJj")],
+    )
+
+    events = [event async for event in engine.submit_message(prompt)]
+
+    assert any(isinstance(event, StatusEvent) for event in events)
+    assert isinstance(events[-1], AssistantTurnComplete)
+    request = client.requests[0]
+    assert not any(
+        isinstance(block, ImageBlock)
+        for message in request.messages
+        for block in message.content
+    )
+    assert any(
+        isinstance(block, TextBlock) and "internal image description" in block.text
+        for message in request.messages
+        for block in message.content
+    )
+    assert "image_to_text" not in {schema["name"] for schema in request.tools}
+
+
+@pytest.mark.asyncio
+async def test_query_engine_rejects_unhandled_images_before_provider_call(
+    tmp_path: Path,
+) -> None:
+    client = RecordingApiClient()
+    engine = QueryEngine(
+        api_client=client,
+        tool_registry=create_default_tool_registry(),
+        permission_checker=PermissionChecker(PermissionSettings(mode=PermissionMode.FULL_AUTO)),
+        cwd=tmp_path,
+        model="text-only-model",
+        system_prompt="system",
+        supports_native_images=False,
+        tool_metadata={"vision_model_config": {"model": "vision-model"}},
+    )
+    prompt = ConversationMessage(
+        role="user",
+        content=[ImageBlock(media_type="image/png", data="YWJj")],
+    )
+
+    events = [event async for event in engine.submit_message(prompt)]
+
+    assert client.requests == []
+    assert len(events) == 1
+    assert isinstance(events[0], ErrorEvent)
+    assert events[0].recoverable is False
+    assert "cannot process image input" in events[0].message
+    assert "vision" in events[0].message
 
 
 @pytest.mark.asyncio

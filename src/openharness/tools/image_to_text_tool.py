@@ -1,9 +1,9 @@
 """Convert images to text descriptions using a multimodal model.
 
-This tool acts as a bridge for pure-text models: when the user attaches an
-image but the active model cannot process images natively, the agent loop
-(or the model itself) can invoke this tool to obtain a text/JSON description
-of the image via a separately configured vision-capable model.
+This tool acts as an internal bridge for pure-text models: when the user
+attaches an image but the active model cannot process images natively, the
+agent loop can invoke it to obtain a description from a separately configured
+vision-capable model.
 """
 
 from __future__ import annotations
@@ -70,6 +70,7 @@ class ImageToTextTool(BaseTool):
         "model does not support image input."
     )
     input_model = ImageToTextToolInput
+    model_visible = False
 
     async def execute(
         self, arguments: ImageToTextToolInput, context: ToolExecutionContext

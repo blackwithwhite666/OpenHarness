@@ -139,6 +139,7 @@ _MULTIMODAL_MODEL_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"^claude-(?:sonnet|opus|haiku)-\d"),
     # OpenAI GPT-4o / o-series
     re.compile(r"^gpt-4o"),
+    re.compile(r"^gpt-5(?:\.|-|$)"),
     re.compile(r"^o[1349]-"),
     # Google Gemini
     re.compile(r"^gemini-(?:pro-)?vision"),
@@ -172,14 +173,20 @@ _MULTIMODAL_MODEL_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"(?:^|[-\s/])vl(?:$|[-\s])"),
 ]
 
+_MULTIMODAL_PROVIDERS = frozenset({"openai_codex", "openai-codex"})
 
-def is_model_multimodal(model: str) -> bool:
+
+def is_model_multimodal(model: str, *, provider: str | None = None) -> bool:
     """Return True when the model name indicates multimodal (vision) capability.
 
-    This is a heuristic based on known model naming conventions.  It errs on
-    the side of returning False for unknown models so that the image-to-text
-    fallback tool is used rather than silently failing.
+    Provider capability takes precedence when supplied. Otherwise this keeps
+    the model-name heuristic used by existing callers. Unknown combinations
+    return False so callers can use a configured image-to-text fallback.
     """
+    normalized_provider = (provider or "").strip().lower()
+    if normalized_provider in _MULTIMODAL_PROVIDERS:
+        return True
+
     normalized = model.strip().lower()
     # Strip provider prefix like "anthropic/" or "openai/"
     if "/" in normalized:
