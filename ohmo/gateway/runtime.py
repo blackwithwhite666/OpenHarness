@@ -34,6 +34,7 @@ from openharness.engine.stream_events import (
     ToolExecutionStarted,
 )
 from openharness.prompts import build_runtime_system_prompt
+from openharness.tools.mcp_tool import McpToolAdapter, WellnessUserIdInjectingAdapter
 from openharness.ui.runtime import RuntimeBundle, _last_user_text, build_runtime, close_runtime, start_runtime
 
 from ohmo.evals import GatewayEvalRecorder
@@ -116,6 +117,7 @@ _IMAGE_FALLBACK_NOTE = (
 _NO_GROUP_REQUEST = object()
 _UNRESOLVED_MEMORY_SCOPE = object()
 _GROUP_TOOL_NAME = "ohmo_create_feishu_group"
+_WELLNESS_TOOL_NAME = "mcp__worfalomey__get_wellness_data"
 _GROUP_AGENT_PROMPT_PREFIX = "The user invoked `/group` from a Feishu private chat."
 _GROUP_AGENT_PROMPT_REQUEST_MARKER = "User /group request:"
 _GROUP_METADATA_KEYS = (
@@ -1623,7 +1625,36 @@ class OhmoSessionRuntimePool:
                 metadata.pop("autodream_context", None)
             else:
                 metadata["autodream_context"] = autodream_context
+        self._bind_wellness_tool_tenant(bundle, scope)
         return engaged
+
+    @staticmethod
+    def _bind_wellness_tool_tenant(
+        bundle: RuntimeBundle,
+        scope: MemoryScope | None,
+    ) -> None:
+        """Bind the OHMO-scoped wellness MCP tool to this turn's trusted tenant.
+
+        The worfalomey ``get_wellness_data`` selector is never model-controlled:
+        the plain adapter is wrapped once per bundle so ``params.user_id`` is
+        hidden from the model schema and force-injected at execution time from
+        the resolved ``MemoryScope.private_tenant`` (itself derived only from
+        the immutable Telegram principal). Every turn re-binds — or clears —
+        the tenant, so a bundle refresh or a later turn without a resolved
+        scope fails closed instead of reusing a previous turn's identity.
+        """
+        registry = getattr(bundle, "tool_registry", None)
+        if registry is None:
+            return
+        tool = registry.get(_WELLNESS_TOOL_NAME)
+        if tool is None:
+            return
+        if isinstance(tool, McpToolAdapter):
+            tool = WellnessUserIdInjectingAdapter(tool)
+            registry.register(tool)
+        if not isinstance(tool, WellnessUserIdInjectingAdapter):
+            return
+        tool.set_tenant(scope.private_tenant if scope is not None else None)
 
     def _register_gateway_tools(
         self,

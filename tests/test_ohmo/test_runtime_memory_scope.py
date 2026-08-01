@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,7 +13,9 @@ import pytest
 from openharness.channels.bus.events import InboundMessage
 from openharness.engine.messages import ConversationMessage
 from openharness.evals import DecisionTraceValidationError, TRACE_FINALIZATION
+from openharness.mcp.types import McpToolInfo
 from openharness.tools.base import ToolExecutionContext, ToolRegistry
+from openharness.tools.mcp_tool import McpToolAdapter, WellnessUserIdInjectingAdapter
 from ohmo.evals import GatewayEvalRecorder
 
 from ohmo.gateway.config import save_gateway_config
@@ -627,6 +630,102 @@ async def test_denied_family_turn_has_no_authoritative_memory_surface(
     assert bundle.autodream_context is None
     assert pool._judge_turn_counts == {}
     assert pool._judge_tasks == {}
+
+
+class _RecordingMcpManager:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str, dict]] = []
+
+    async def call_tool(self, server_name: str, tool_name: str, arguments: dict) -> str:
+        self.calls.append((server_name, tool_name, arguments))
+        return "wellness payload"
+
+
+_WELLNESS_TOOL_NAME = "mcp__worfalomey__get_wellness_data"
+
+
+def _wellness_bundle() -> tuple[SimpleNamespace, _RecordingMcpManager]:
+    bundle = _surface_bundle()
+    manager = _RecordingMcpManager()
+    bundle.tool_registry.register(
+        McpToolAdapter(
+            manager,
+            McpToolInfo(
+                server_name="worfalomey",
+                name="get_wellness_data",
+                description="wellness",
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "params": {
+                            "type": "object",
+                            "properties": {
+                                "user_id": {"type": "string"},
+                                "interval": {"type": "string"},
+                            },
+                        }
+                    },
+                },
+            ),
+        )
+    )
+    return bundle, manager
+
+
+async def test_wellness_tool_injects_resolved_tenant_and_never_leaks_across_turns(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / ".ohmo-home"
+    initialize_workspace(workspace)
+    _seed_catalog(workspace)
+    pool = OhmoSessionRuntimePool(
+        cwd=tmp_path,
+        workspace=workspace,
+        provider_profile="codex",
+    )
+    pool._gateway_config = _family_config()
+    bundle, manager = _wellness_bundle()
+    owner_ctx = _context("100", owner=True)
+    marina_ctx = _context("200", owner=False)
+    unknown_ctx = _context("999", owner=False)
+    for turn_ctx in (owner_ctx, marina_ctx, unknown_ctx):
+        pool._session_owner_principals[turn_ctx.session_id] = turn_ctx.principal
+
+    owner_scope = pool._resolve_turn_memory_scope(owner_ctx)
+    assert owner_scope is not None
+    pool._configure_turn_memory_surfaces(bundle, owner_ctx, memory_scope=owner_scope)
+    tool = bundle.tool_registry.get(_WELLNESS_TOOL_NAME)
+    assert isinstance(tool, WellnessUserIdInjectingAdapter)
+    assert "user_id" not in json.dumps(tool.input_model.model_json_schema())
+
+    owner_result = await tool.execute(
+        tool.input_model(params={"interval": "7d", "user_id": "mallory"}),
+        ToolExecutionContext(cwd=tmp_path),
+    )
+    assert owner_result.is_error is False
+    assert manager.calls[-1][2]["params"] == {"interval": "7d", "user_id": "owner"}
+
+    marina_scope = pool._resolve_turn_memory_scope(marina_ctx)
+    assert marina_scope is not None
+    pool._configure_turn_memory_surfaces(bundle, marina_ctx, memory_scope=marina_scope)
+    tool = bundle.tool_registry.get(_WELLNESS_TOOL_NAME)
+    marina_result = await tool.execute(
+        tool.input_model(params={"interval": "7d"}),
+        ToolExecutionContext(cwd=tmp_path),
+    )
+    assert marina_result.is_error is False
+    assert manager.calls[-1][2]["params"] == {"interval": "7d", "user_id": "marina"}
+
+    assert pool._resolve_turn_memory_scope(unknown_ctx) is None
+    pool._configure_turn_memory_surfaces(bundle, unknown_ctx, memory_scope=None)
+    tool = bundle.tool_registry.get(_WELLNESS_TOOL_NAME)
+    calls_before = len(manager.calls)
+    denied_result = await tool.execute(
+        tool.input_model(params={"interval": "7d"}),
+        ToolExecutionContext(cwd=tmp_path),
+    )
+    assert denied_result.is_error is True
+    assert len(manager.calls) == calls_before
 
 
 async def test_empty_identity_registries_preserve_the_single_backend_for_every_turn(
