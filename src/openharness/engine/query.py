@@ -272,6 +272,8 @@ class QueryContext:
     model: str
     system_prompt: str
     max_tokens: int
+    supports_native_images: bool | None = None
+    image_provider: str | None = None
     effort: str | None = None
     cache_key: str | None = None
     context_window_tokens: int | None = None
@@ -1259,19 +1261,12 @@ async def _preprocess_images_in_messages(
     messages: list[ConversationMessage],
     context: QueryContext,
 ) -> AsyncIterator[StreamEvent]:
-    """Scan messages for ImageBlocks and convert them to text if the active
-    model does not support multimodal input.
+    """Resolve ImageBlocks for the active runtime before its provider call.
 
-    Yields status events during conversion so the UI stays responsive.
+    Native-image runtimes keep images unchanged. Text-only runtimes either
+    replace every image through the configured internal fallback or yield one
+    non-recoverable error without allowing the provider request to proceed.
     """
-    if is_model_multimodal(context.model):
-        return
-
-    vision_config = context.tool_metadata.get("vision_model_config")
-    if not vision_config:
-        # No vision model configured — skip preprocessing.
-        return
-
     # Collect all ImageBlocks with their parent message index and block index
     pending: list[tuple[int, int, ImageBlock]] = []
     for msg_idx, msg in enumerate(messages):
@@ -1284,26 +1279,67 @@ async def _preprocess_images_in_messages(
     if not pending:
         return
 
+    supports_native_images = context.supports_native_images
+    if supports_native_images is None:
+        supports_native_images = is_model_multimodal(
+            context.model,
+            provider=context.image_provider,
+        )
+    if supports_native_images:
+        return
+
+    tool_metadata = context.tool_metadata or {}
+    vision_config = tool_metadata.get("vision_model_config")
+    if not (
+        isinstance(vision_config, dict)
+        and isinstance(vision_config.get("model"), str)
+        and vision_config["model"].strip()
+        and isinstance(vision_config.get("api_key"), str)
+        and vision_config["api_key"].strip()
+    ):
+        yield ErrorEvent(
+            message=(
+                f"Model '{context.model}' cannot process image input, and no complete "
+                "vision fallback is configured. Configure vision.model and vision.api_key "
+                "or use a native-image-capable model."
+            ),
+            recoverable=False,
+        )
+        return
+
+    tool = context.tool_registry.get("image_to_text")
+    if tool is None:
+        yield ErrorEvent(
+            message=(
+                f"Model '{context.model}' cannot process image input, and the internal "
+                "image_to_text fallback is unavailable."
+            ),
+            recoverable=False,
+        )
+        return
+
     yield StatusEvent(message=_IMAGE_PREPROCESS_STATUS)
 
     # Process images in parallel
-    async def _describe(msg_idx: int, blk_idx: int, block: ImageBlock) -> tuple[int, int, str]:
-        tool = context.tool_registry.get("image_to_text")
-        if tool is None:
-            return msg_idx, blk_idx, "[Image: could not describe — image_to_text tool not available]"
-
+    async def _describe(
+        msg_idx: int,
+        blk_idx: int,
+        block: ImageBlock,
+    ) -> tuple[int, int, str, str | None]:
         # Build tool input
         tool_input_data: dict[str, object] = {
             "image_data": block.data,
             "media_type": block.media_type,
-            "prompt": "Describe this image in detail, including any text, "
-                      "UI elements, code, diagrams, or visual information present.",
+            "prompt": (
+                "Describe this image in detail, including any text, "
+                "UI elements, code, diagrams, or visual information present."
+            ),
         }
 
         try:
             parsed = tool.input_model.model_validate(tool_input_data)
-        except Exception:
-            return msg_idx, blk_idx, "[Image: could not parse image data]"
+        except Exception as exc:  # noqa: BLE001 - internal tool schemas are extensible
+            return msg_idx, blk_idx, "", f"could not parse image data: {exc}"
 
         exec_context = ToolExecutionContext(
             cwd=context.cwd,
@@ -1312,15 +1348,26 @@ async def _preprocess_images_in_messages(
                 {"vision_model_config": vision_config},
             ),
         )
-        result = await tool.execute(parsed, exec_context)
+        try:
+            result = await tool.execute(parsed, exec_context)
+        except Exception as exc:  # noqa: BLE001 - tool adapters may raise provider-specific errors
+            return msg_idx, blk_idx, "", f"vision fallback failed: {exc}"
         if result.is_error:
-            return msg_idx, blk_idx, f"[Image description failed: {result.output}]"
-        return msg_idx, blk_idx, result.output
+            return msg_idx, blk_idx, "", result.output
+        return msg_idx, blk_idx, result.output, None
 
     results = await asyncio.gather(*[_describe(mi, bi, blk) for mi, bi, blk in pending])
 
+    failures = [error for _, _, _, error in results if error is not None]
+    if failures:
+        yield ErrorEvent(
+            message=f"Image preprocessing failed: {failures[0]}",
+            recoverable=False,
+        )
+        return
+
     # Replace ImageBlocks with TextBlocks in-place
-    for msg_idx, blk_idx, description in results:
+    for msg_idx, blk_idx, description, _ in results:
         msg = messages[msg_idx]
         msg.content[blk_idx] = TextBlock(text=description)
 
@@ -1341,6 +1388,14 @@ async def run_query(
         AutoCompactState,
         auto_compact_if_needed,
     )
+
+    image_preprocessing_failed = False
+    async for event in _preprocess_images_in_messages(messages, context):
+        if isinstance(event, ErrorEvent):
+            image_preprocessing_failed = True
+        yield event, None
+    if image_preprocessing_failed:
+        return
 
     compact_state = AutoCompactState()
     reactive_compact_attempted = False
@@ -1412,11 +1467,6 @@ async def run_query(
         if compacted_messages is not messages:
             messages[:] = compacted_messages
         # ---------------------------------------------------------------
-
-        # --- image preprocessing: convert ImageBlocks to text for non-vision models ---
-        async for event in _preprocess_images_in_messages(messages, context):
-            yield event, None
-        # -----------------------------------------------------------------------------
 
         final_message: ConversationMessage | None = None
         usage = UsageSnapshot()

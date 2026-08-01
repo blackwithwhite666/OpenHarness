@@ -38,6 +38,7 @@ class BaseTool(ABC):
     name: str
     description: str
     input_model: type[BaseModel]
+    model_visible: bool = True
 
     @abstractmethod
     async def execute(self, arguments: BaseModel, context: ToolExecutionContext) -> ToolResult:
@@ -108,5 +109,5 @@ class ToolRegistry:
             }
 
     def to_api_schema(self) -> list[dict[str, Any]]:
-        """Return all tool schemas in API format."""
-        return [tool.to_api_schema() for tool in self._tools.values()]
+        """Return model-visible tool schemas in API format."""
+        return [tool.to_api_schema() for tool in self._tools.values() if tool.model_visible]

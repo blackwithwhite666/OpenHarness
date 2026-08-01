@@ -47,6 +47,8 @@ class QueryEngine:
         cwd: str | Path,
         model: str,
         system_prompt: str,
+        supports_native_images: bool | None = None,
+        image_provider: str | None = None,
         max_tokens: int = 4096,
         context_window_tokens: int | None = None,
         auto_compact_threshold_tokens: int | None = None,
@@ -64,6 +66,8 @@ class QueryEngine:
         self._cwd = Path(cwd).resolve()
         self._model = model
         self._system_prompt = system_prompt
+        self._supports_native_images = supports_native_images
+        self._image_provider = image_provider
         self._cache_key: str | None = None
         self._max_tokens = max_tokens
         self._effort = settings.effort if settings is not None else None
@@ -143,6 +147,10 @@ class QueryEngine:
     def set_api_client(self, api_client: SupportsStreamingMessages) -> None:
         """Update the active API client for future turns."""
         self._api_client = api_client
+
+    def set_image_provider(self, provider: str | None) -> None:
+        """Update the provider hint used for native-image capability resolution."""
+        self._image_provider = provider
 
     def set_max_turns(self, max_turns: int | None) -> None:
         """Update the maximum number of agentic turns per user input."""
@@ -293,6 +301,8 @@ class QueryEngine:
             model=self._model,
             system_prompt=self._system_prompt,
             max_tokens=self._max_tokens,
+            supports_native_images=self._supports_native_images,
+            image_provider=self._image_provider,
             effort=self._effort,
             cache_key=self._cache_key,
             context_window_tokens=self._context_window_tokens,
@@ -341,6 +351,8 @@ class QueryEngine:
             model=self._model,
             system_prompt=self._system_prompt,
             max_tokens=self._max_tokens,
+            supports_native_images=self._supports_native_images,
+            image_provider=self._image_provider,
             effort=self._effort,
             cache_key=self._cache_key,
             context_window_tokens=self._context_window_tokens,

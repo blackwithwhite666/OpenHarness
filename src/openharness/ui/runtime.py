@@ -376,6 +376,7 @@ async def build_runtime(
         cwd=cwd,
         model=settings.model,
         system_prompt=system_prompt_text,
+        image_provider=settings.provider,
         max_tokens=settings.max_tokens,
         context_window_tokens=settings.context_window_tokens or settings.memory.context_window_tokens,
         auto_compact_threshold_tokens=(
@@ -576,6 +577,7 @@ def refresh_runtime_client(bundle: RuntimeBundle) -> None:
             default_model=settings.model,
         )
     bundle.engine.set_model(settings.model)
+    bundle.engine.set_image_provider(settings.provider)
     bundle.engine.set_effort(settings.effort)
     bundle.engine.set_permission_checker(PermissionChecker(settings.permission))
     system_prompt = build_runtime_system_prompt(

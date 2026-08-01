@@ -30,6 +30,9 @@ from openharness.untrusted import UNTRUSTED_BANNER
         # OpenAI multimodal
         ("gpt-4o", True),
         ("gpt-4o-mini", True),
+        ("gpt-5", True),
+        ("gpt-5.5", True),
+        ("openai/gpt-5.4-codex", True),
         ("o1-mini", True),
         ("o3-mini", True),
         ("o4-mini", True),
@@ -71,6 +74,11 @@ from openharness.untrusted import UNTRUSTED_BANNER
 )
 def test_is_model_multimodal(model: str, expected: bool) -> None:
     assert is_model_multimodal(model) == expected
+
+
+def test_is_model_multimodal_honors_provider_capability() -> None:
+    assert is_model_multimodal("custom-model", provider="openai_codex")
+    assert is_model_multimodal("custom-model", provider="openai-codex")
 
 
 # ---------------------------------------------------------------------------
@@ -301,7 +309,7 @@ class TestVisionModelConfig:
 # ---------------------------------------------------------------------------
 
 def test_tool_registered() -> None:
-    """image_to_text tool is registered in the default registry."""
+    """image_to_text remains registered but is hidden from the model schema."""
     from openharness.tools import create_default_tool_registry
 
     registry = create_default_tool_registry()
@@ -311,3 +319,6 @@ def test_tool_registered() -> None:
     assert "vision" in tool.description.lower()
     assert tool.input_model.__name__ == "ImageToTextToolInput"
     assert tool.input_model.__module__ == "openharness.tools.image_to_text_tool"
+    assert "image_to_text" not in {
+        schema["name"] for schema in registry.to_api_schema()
+    }
