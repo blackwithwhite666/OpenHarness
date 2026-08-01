@@ -8,6 +8,7 @@ from contextlib import AsyncExitStack
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from mcp.types import CallToolResult, TextContent
 
 try:
     BaseExceptionGroup
@@ -192,6 +193,90 @@ async def test_call_tool_includes_unknown_server_detail_for_unconfigured():
     manager = McpClientManager({})
     with pytest.raises(McpServerNotConnectedError, match="unknown server"):
         await manager.call_tool("ghost", "tool", {})
+
+
+# --- McpClientManager.call_tool_result: tool-declared isError preservation ---
+
+
+def _manager_with_result(result: CallToolResult) -> McpClientManager:
+    manager = McpClientManager({})
+    mock_session = AsyncMock()
+    mock_session.call_tool.return_value = result
+    manager._sessions["srv"] = mock_session
+    return manager
+
+
+@pytest.mark.asyncio
+async def test_call_tool_result_success_is_not_error():
+    manager = _manager_with_result(
+        CallToolResult(content=[TextContent(type="text", text="payload")], isError=False)
+    )
+
+    outcome = await manager.call_tool_result("srv", "tool", {})
+
+    assert outcome.is_error is False
+    assert outcome.output == "payload"
+
+
+@pytest.mark.asyncio
+async def test_call_tool_result_preserves_tool_declared_error_body():
+    manager = _manager_with_result(
+        CallToolResult(
+            content=[TextContent(type="text", text="interval must not exceed 31 days")],
+            isError=True,
+        )
+    )
+
+    outcome = await manager.call_tool_result("srv", "tool", {})
+
+    assert outcome.is_error is True
+    assert outcome.output == "interval must not exceed 31 days"
+
+
+@pytest.mark.asyncio
+async def test_call_tool_still_returns_body_string_for_direct_callers():
+    manager = _manager_with_result(
+        CallToolResult(
+            content=[TextContent(type="text", text="interval must not exceed 31 days")],
+            isError=True,
+        )
+    )
+
+    assert await manager.call_tool("srv", "tool", {}) == "interval must not exceed 31 days"
+
+
+@pytest.mark.asyncio
+async def test_call_tool_result_raises_on_disconnected_server():
+    manager = McpClientManager({})
+    with pytest.raises(McpServerNotConnectedError, match="not connected"):
+        await manager.call_tool_result("missing", "some_tool", {})
+
+
+@pytest.mark.asyncio
+async def test_call_tool_result_times_out_when_session_hangs(monkeypatch):
+    monkeypatch.setenv("OPENHARNESS_MCP_TOOL_TIMEOUT", "0.05")
+    manager = McpClientManager({})
+    mock_session = AsyncMock()
+
+    async def _hang(*_args, **_kwargs):
+        await asyncio.sleep(30)
+
+    mock_session.call_tool.side_effect = _hang
+    manager._sessions["slow"] = mock_session
+
+    with pytest.raises(McpToolTimeoutError, match="timed out"):
+        await manager.call_tool_result("slow", "tool", {})
+
+
+@pytest.mark.asyncio
+async def test_call_tool_result_raises_on_transport_error_not_misclassified():
+    manager = McpClientManager({})
+    mock_session = AsyncMock()
+    mock_session.call_tool.side_effect = RuntimeError("transport closed")
+    manager._sessions["flaky"] = mock_session
+
+    with pytest.raises(McpServerNotConnectedError, match="transport closed"):
+        await manager.call_tool_result("flaky", "tool", {})
 
 
 # --- McpClientManager.read_resource ---

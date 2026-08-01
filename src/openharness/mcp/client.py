@@ -6,6 +6,7 @@ import asyncio
 import logging
 import os
 from contextlib import AsyncExitStack
+from dataclasses import dataclass
 from typing import Any
 
 import httpx
@@ -106,6 +107,19 @@ def _auth_configured_for(config: object) -> bool:
 
 class McpServerNotConnectedError(Exception):
     """Raised when an MCP server is not connected or its session has been lost."""
+
+
+@dataclass(frozen=True)
+class McpToolCallResult:
+    """Stringified MCP tool output plus the tool-declared error flag.
+
+    ``is_error`` mirrors ``CallToolResult.isError``: the call succeeded at the
+    transport level but the tool itself declared failure (e.g. argument
+    validation). Transport failures still raise ``McpServerNotConnectedError``.
+    """
+
+    output: str
+    is_error: bool = False
 
 
 class McpToolTimeoutError(McpServerNotConnectedError):
@@ -288,7 +302,17 @@ class McpClientManager:
         return resources
 
     async def call_tool(self, server_name: str, tool_name: str, arguments: dict[str, Any]) -> str:
-        """Invoke one MCP tool and stringify the result."""
+        """Invoke one MCP tool and stringify the result.
+
+        Returns the textual body whether or not the tool declared an error;
+        use ``call_tool_result`` when the ``isError`` flag matters.
+        """
+        return (await self.call_tool_result(server_name, tool_name, arguments)).output
+
+    async def call_tool_result(
+        self, server_name: str, tool_name: str, arguments: dict[str, Any]
+    ) -> McpToolCallResult:
+        """Invoke one MCP tool, preserving the tool-level ``isError`` flag."""
         session = self._sessions.get(server_name)
         if session is None:
             status = self._statuses.get(server_name)
@@ -323,7 +347,12 @@ class McpClientManager:
             parts.append(str(result.structuredContent))
         if not parts:
             parts.append("(no output)")
-        return "\n".join(parts).strip()
+        # `is True` (not bool()): mocked sessions return a truthy MagicMock for
+        # unset isError, while the real CallToolResult field is always a bool.
+        return McpToolCallResult(
+            output="\n".join(parts).strip(),
+            is_error=getattr(result, "isError", False) is True,
+        )
 
     async def read_resource(self, server_name: str, uri: str) -> str:
         """Read one MCP resource and stringify the response."""

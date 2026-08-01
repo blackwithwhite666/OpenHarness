@@ -6,6 +6,11 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
+from openharness.mcp.client import (
+    McpServerNotConnectedError,
+    McpToolCallResult,
+    McpToolTimeoutError,
+)
 from openharness.mcp.types import McpResourceInfo, McpToolInfo
 from openharness.tools.base import ToolExecutionContext
 from openharness.tools.list_mcp_resources_tool import ListMcpResourcesTool
@@ -13,7 +18,7 @@ from openharness.tools.mcp_tool import (
     McpToolAdapter,
     WellnessUserIdInjectingAdapter,
     _input_model_from_schema,
-    _schema_without_params_user_id,
+    _schema_without_nested_params,
 )
 from openharness.tools.read_mcp_resource_tool import ReadMcpResourceTool
 from openharness.untrusted import UNTRUSTED_BANNER
@@ -41,6 +46,119 @@ class _FakeMcpManager:
 
     def list_resources(self) -> list[McpResourceInfo]:
         return self.resources
+
+
+class _TypedFakeMcpManager:
+    """Manager double exposing the typed call_tool_result path."""
+
+    def __init__(
+        self,
+        *,
+        outcome: McpToolCallResult | None = None,
+        error: Exception | None = None,
+    ) -> None:
+        self.outcome = outcome
+        self.error = error
+
+    async def call_tool_result(
+        self, server_name: str, tool_name: str, arguments: dict
+    ) -> McpToolCallResult:
+        del server_name, tool_name, arguments
+        if self.error is not None:
+            raise self.error
+        assert self.outcome is not None
+        return self.outcome
+
+
+def _demo_adapter(manager) -> McpToolAdapter:
+    return McpToolAdapter(
+        manager,
+        McpToolInfo(
+            server_name="demo",
+            name="hello",
+            description="test",
+            input_schema={"type": "object", "properties": {}},
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_mcp_tool_adapter_typed_success_is_fenced_and_not_error():
+    manager = _TypedFakeMcpManager(outcome=McpToolCallResult(output="server supplied output"))
+    adapter = _demo_adapter(manager)
+
+    result = await adapter.execute(
+        adapter.input_model(),
+        ToolExecutionContext(cwd=Path(".")),
+    )
+
+    assert result.is_error is False
+    assert result.output == f"{UNTRUSTED_BANNER}\n\nserver supplied output"
+
+
+@pytest.mark.asyncio
+async def test_mcp_tool_adapter_tool_declared_error_preserves_body():
+    manager = _TypedFakeMcpManager(
+        outcome=McpToolCallResult(
+            output="interval must not exceed 31 days",
+            is_error=True,
+        )
+    )
+    adapter = _demo_adapter(manager)
+
+    result = await adapter.execute(
+        adapter.input_model(),
+        ToolExecutionContext(cwd=Path(".")),
+    )
+
+    assert result.is_error is True
+    assert "interval must not exceed 31 days" in result.output
+
+
+@pytest.mark.asyncio
+async def test_mcp_tool_adapter_tool_declared_error_with_empty_body_stays_error():
+    manager = _TypedFakeMcpManager(outcome=McpToolCallResult(output="", is_error=True))
+    adapter = _demo_adapter(manager)
+
+    result = await adapter.execute(
+        adapter.input_model(),
+        ToolExecutionContext(cwd=Path(".")),
+    )
+
+    assert result.is_error is True
+    assert result.output == ""
+
+
+@pytest.mark.asyncio
+async def test_mcp_tool_adapter_timeout_remains_error_on_typed_path():
+    manager = _TypedFakeMcpManager(
+        error=McpToolTimeoutError("MCP server 'demo' tool 'hello' timed out after 1s")
+    )
+    adapter = _demo_adapter(manager)
+
+    result = await adapter.execute(
+        adapter.input_model(),
+        ToolExecutionContext(cwd=Path(".")),
+    )
+
+    assert result.is_error is True
+    assert "timed out" in result.output
+
+
+@pytest.mark.asyncio
+async def test_mcp_tool_adapter_disconnection_remains_error_on_typed_path():
+    manager = _TypedFakeMcpManager(
+        error=McpServerNotConnectedError("MCP server 'demo' is not connected: boom")
+    )
+    adapter = _demo_adapter(manager)
+
+    result = await adapter.execute(
+        adapter.input_model(),
+        ToolExecutionContext(cwd=Path(".")),
+    )
+
+    assert result.is_error is True
+    assert "not connected" in result.output
 
 
 @pytest.mark.asyncio
@@ -147,7 +265,10 @@ def _wellness_delegate(manager: _RecordingMcpManager) -> McpToolAdapter:
                         "type": "object",
                         "properties": {
                             "user_id": {"type": "string"},
+                            "health_types": {"type": "array"},
                             "interval": {"type": "string"},
+                            "start": {"type": "string"},
+                            "end": {"type": "string"},
                             "include_health": {"type": "boolean"},
                         },
                     }
@@ -164,13 +285,29 @@ class TestWellnessUserIdInjectingAdapter:
         delegate = _wellness_delegate(_RecordingMcpManager())
         adapter = WellnessUserIdInjectingAdapter(delegate)
 
-        scrubbed = _schema_without_params_user_id(delegate._tool_info.input_schema)
+        scrubbed = _schema_without_nested_params(
+            delegate._tool_info.input_schema, adapter._HIDDEN_PARAMS
+        )
         params_properties = scrubbed["properties"]["params"]["properties"]
         assert "user_id" not in params_properties
-        assert set(params_properties) == {"interval", "include_health"}
+        assert set(params_properties) == {"interval", "start", "end", "include_health"}
         assert "user_id" in delegate._tool_info.input_schema["properties"]["params"]["properties"]
         assert "user_id" not in json.dumps(adapter.input_model.model_json_schema())
         assert "user_id" not in json.dumps(adapter.to_api_schema())
+
+    def test_health_types_hidden_from_model_schema(self):
+        delegate = _wellness_delegate(_RecordingMcpManager())
+        adapter = WellnessUserIdInjectingAdapter(delegate)
+
+        scrubbed = _schema_without_nested_params(
+            delegate._tool_info.input_schema, adapter._HIDDEN_PARAMS
+        )
+        params_properties = scrubbed["properties"]["params"]["properties"]
+        assert "health_types" not in params_properties
+        original_properties = delegate._tool_info.input_schema["properties"]["params"]["properties"]
+        assert "health_types" in original_properties
+        assert "health_types" not in json.dumps(adapter.input_model.model_json_schema())
+        assert "health_types" not in json.dumps(adapter.to_api_schema())
 
     async def test_injects_bound_tenant(self):
         manager = _RecordingMcpManager()
@@ -200,6 +337,51 @@ class TestWellnessUserIdInjectingAdapter:
 
         assert result.is_error is False
         assert manager.calls[0][2]["params"]["user_id"] == "marina"
+
+    async def test_strips_model_supplied_health_types(self):
+        manager = _RecordingMcpManager()
+        adapter = WellnessUserIdInjectingAdapter(_wellness_delegate(manager))
+        adapter.set_tenant("owner")
+
+        result = await adapter.execute(
+            adapter.input_model(
+                params={
+                    "interval": "7d",
+                    "health_types": ["weight", "HKQuantityTypeIdentifierBodyMass"],
+                }
+            ),
+            ToolExecutionContext(cwd=Path(".")),
+        )
+
+        assert result.is_error is False
+        assert len(manager.calls) == 1
+        params = manager.calls[0][2]["params"]
+        assert "health_types" not in params
+        assert params == {"interval": "7d", "user_id": "owner"}
+
+    async def test_forwards_interval_bounds_and_other_params_unchanged(self):
+        manager = _RecordingMcpManager()
+        adapter = WellnessUserIdInjectingAdapter(_wellness_delegate(manager))
+        adapter.set_tenant("owner")
+
+        result = await adapter.execute(
+            adapter.input_model(
+                params={
+                    "start": "2026-07-01",
+                    "end": "2026-07-31",
+                    "include_health": True,
+                }
+            ),
+            ToolExecutionContext(cwd=Path(".")),
+        )
+
+        assert result.is_error is False
+        assert manager.calls[0][2]["params"] == {
+            "start": "2026-07-01",
+            "end": "2026-07-31",
+            "include_health": True,
+            "user_id": "owner",
+        }
 
     async def test_missing_tenant_fails_closed_without_mcp_call(self):
         manager = _RecordingMcpManager()
