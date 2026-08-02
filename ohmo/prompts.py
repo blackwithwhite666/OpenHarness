@@ -200,13 +200,14 @@ def build_ohmo_system_prompt(
                 "image), include `annotations.nutrition` in `trace_finalization`."
             ),
             (
-                "Required shape:\n"
+                "Required shape (schema v2):\n"
                 "```\n"
                 "{\n"
-                '  "schema_version": 1,\n'
-                '  "record_type": "meal_estimate",\n'
+                '  "schema_version": 2,\n'
+                '  "record_type": "meal_observation",\n'
                 '  "basis": ["image"],\n'
                 '  "consumption_status": "unknown",\n'
+                '  "meal_date": null,\n'
                 '  "meal_at": null,\n'
                 '  "is_estimate": true,\n'
                 '  "energy_kcal_min": 200,\n'
@@ -225,11 +226,14 @@ def build_ohmo_system_prompt(
                 '      "energy_kcal_best": 110\n'
                 "    }\n"
                 "  ],\n"
+                '  "changed_fields": [],\n'
+                '  "summary_date": null,\n'
                 '  "assumptions": [],\n'
                 '  "warnings": []\n'
                 "}\n"
                 "```\n"
-                "At least one total energy field (`energy_kcal_min|max|best`) is required. "
+                "At least one total energy field (`energy_kcal_min|max|best`) is required "
+                "only for `meal_observation`. "
                 "Enforce ordering constraints whenever values are present: "
                 "`energy_kcal_min <= energy_kcal_max`, `energy_kcal_min <= "
                 "energy_kcal_best`, and `energy_kcal_best <= energy_kcal_max`; "
@@ -238,11 +242,39 @@ def build_ohmo_system_prompt(
                 "must be bounded short strings."
             ),
             (
-                "`meal_at` is optional and may be emitted only when the user explicitly states "
-                "the meal or consumption time. Never infer or copy it from a forwarded source "
-                "timestamp, receive timestamp, image metadata, or a model guess. For an image "
-                "without explicit consumption language, keep `meal_at=null` and "
+                "`record_type` is one of `meal_observation`, `meal_correction`, "
+                "`meal_deletion`, `day_summary`. Use `meal_observation` for a new possible "
+                'consumption event. When the user CORRECTS an earlier meal ("that was '
+                'breakfast on 1 August", "it was 300 kcal, not 500"), emit '
+                "`meal_correction`: list ONLY the fields being changed in `changed_fields` "
+                "and provide replacement values just for those fields — a correction is "
+                "never another meal, and a date-only correction does not repeat the calorie "
+                "estimate. When the user says a logged meal must not count, emit "
+                "`meal_deletion` with no nutrient values. A daily report you calculate "
+                "from already-recorded meals is `day_summary` with totals plus "
+                "`summary_date` — it is a non-countable summary, NEVER a new meal."
+            ),
+            (
+                "`meal_date` is an ISO calendar date (`YYYY-MM-DD`) for date-only language: "
+                '"breakfast on 1 August" sets `meal_date=2026-08-01` and keeps '
+                "`meal_at=null`. `meal_at` is optional and may be emitted only when the "
+                "user explicitly states the meal or consumption time precisely enough. "
+                "Never infer or copy either field from a forwarded source timestamp, "
+                "receive timestamp, image metadata, or a model guess. For an image without "
+                "explicit consumption language, keep `meal_date=null`, `meal_at=null` and "
                 "`consumption_status=unknown`."
+            ),
+            (
+                "Set `explicit_new_consumption` to true ONLY when the user explicitly "
+                "states that the same food or an already-sent photo is a new, separate "
+                'consumption ("I ate the same thing again today"). In every other case '
+                "keep it false: a resent or reused photo without that explicit statement "
+                "is a duplicate, not another meal."
+            ),
+            (
+                "Never emit identity or provenance fields (`meal_id`, `source_message_id`, "
+                "`reply_to_source_message_id`, `attachment_fingerprints`, tenant or session "
+                "ids) — the trusted gateway attaches them and rejects model-authored values."
             ),
         ]
     )

@@ -167,6 +167,9 @@ def _assert_expected_metadata_keys(metadata: dict[str, object], *, recorder: boo
         "received_at",
         "is_forwarded",
         "source_message_at",
+        "source_message_id",
+        "reply_to_source_message_id",
+        "attachment_fingerprints",
     }
     if recorder:
         assert set(metadata.keys()) == expected | {"decision_trace"}
@@ -780,12 +783,16 @@ def test_runtime_memory_turn_metadata_statuses_cover_every_recorder_state(tmp_pa
         message=message_with_id,
         recorder=None,
     )
-    assert _metadata(turn_ctx=turn_ctx, scope=scope, message=message_with_id, recorder=None)[
-        0
-    ] == expected_turn_id
-    assert logical_turn_id == expected_turn_id == assistant_metadata["logical_turn_id"] == user_metadata[
-        "logical_turn_id"
-    ]
+    assert (
+        _metadata(turn_ctx=turn_ctx, scope=scope, message=message_with_id, recorder=None)[0]
+        == expected_turn_id
+    )
+    assert (
+        logical_turn_id
+        == expected_turn_id
+        == assistant_metadata["logical_turn_id"]
+        == user_metadata["logical_turn_id"]
+    )
     assert _assert_honcho_metadata_depth(user_metadata) == 1
     assert _assert_honcho_metadata_depth(assistant_metadata) == 1
     assert user_metadata["client_op_id"] == f"{expected_turn_id}:user"
@@ -922,7 +929,9 @@ def test_runtime_memory_turn_metadata_status_recorded_with_nutrition(tmp_path: P
     assert _assert_honcho_metadata_depth(user_metadata) <= 1
 
 
-def test_runtime_memory_turn_metadata_status_applicable_but_missing_finalization(tmp_path: Path) -> None:
+def test_runtime_memory_turn_metadata_status_applicable_but_missing_finalization(
+    tmp_path: Path,
+) -> None:
     scope = MemoryScope("owner", ("family-shared",))
     turn_ctx = _context("100", owner=True)
     message_with_id = _message()
@@ -944,7 +953,9 @@ def test_runtime_memory_turn_metadata_status_applicable_but_missing_finalization
     _assert_expected_metadata_keys(assistant_metadata)
 
 
-def test_runtime_memory_turn_metadata_status_generic_finalization_without_nutrition(tmp_path: Path) -> None:
+def test_runtime_memory_turn_metadata_status_generic_finalization_without_nutrition(
+    tmp_path: Path,
+) -> None:
     scope = MemoryScope("owner", ("family-shared",))
     turn_ctx = _context("100", owner=True)
     message_with_id = _message()

@@ -35,11 +35,22 @@ from openharness.engine.stream_events import (
 )
 from openharness.prompts import build_runtime_system_prompt
 from openharness.tools.mcp_tool import McpToolAdapter, WellnessUserIdInjectingAdapter
-from openharness.ui.runtime import RuntimeBundle, _last_user_text, build_runtime, close_runtime, start_runtime
+from openharness.ui.runtime import (
+    RuntimeBundle,
+    _last_user_text,
+    build_runtime,
+    close_runtime,
+    start_runtime,
+)
 
 from ohmo.evals import GatewayEvalRecorder
+from ohmo.gateway.attachment_fingerprints import compute_attachment_fingerprints
 from ohmo.gateway.config import load_gateway_config
-from ohmo.gateway.group_tool import CreateFeishuGroup, OhmoCreateFeishuGroupTool, PublishGroupWelcome
+from ohmo.gateway.group_tool import (
+    CreateFeishuGroup,
+    OhmoCreateFeishuGroupTool,
+    PublishGroupWelcome,
+)
 from ohmo.gateway.memory_gate import (
     GateDecision,
     MemoryScope,
@@ -47,7 +58,10 @@ from ohmo.gateway.memory_gate import (
     principal_isolated_session,
     resolve_memory_scope,
 )
-from ohmo.gateway.provider_commands import handle_gateway_model_command, handle_gateway_provider_command
+from ohmo.gateway.provider_commands import (
+    handle_gateway_model_command,
+    handle_gateway_provider_command,
+)
 from ohmo.gateway.router import session_key_for_message
 from ohmo.gateway.send_message_tool import SendTelegramMessageTool
 from ohmo.gateway.turn_context import TurnContext, build_turn_context, canonical_principal
@@ -252,6 +266,19 @@ def _logical_turn_id_for_conversation(
     return f"ohmo-turn-{hashlib.sha256(seed).hexdigest()}"
 
 
+def _normalize_source_message_ref(value: object) -> str | None:
+    """Normalize a channel-owned message reference into a plain string id.
+
+    The raw channel name (Telegram ``message_id`` / ``reply_to_message_id``)
+    never crosses the gateway boundary: it is normalized here so another
+    channel can implement the same contract. The model never authors these.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    rendered = str(value).strip()
+    return rendered or None
+
+
 def _build_conversation_turn_metadata(
     *,
     turn_ctx: TurnContext,
@@ -263,9 +290,14 @@ def _build_conversation_turn_metadata(
         turn_ctx=turn_ctx,
         message=message,
     )
-    source_principal = f"{turn_ctx.channel}:{canonical_principal(turn_ctx.channel, turn_ctx.principal)}"
+    source_principal = (
+        f"{turn_ctx.channel}:{canonical_principal(turn_ctx.channel, turn_ctx.principal)}"
+    )
+    message_metadata = message.metadata or {}
     decision_trace_status = (
-        recorder.decision_trace_status if recorder is not None else _CONVERSATION_TRACE_DISABLED_STATUS
+        recorder.decision_trace_status
+        if recorder is not None
+        else _CONVERSATION_TRACE_DISABLED_STATUS
     )
     nutrition_annotation_status = (
         recorder.nutrition_annotation_status
@@ -283,9 +315,12 @@ def _build_conversation_turn_metadata(
         "decision_trace_episode_id": recorder.episode_id if recorder is not None else None,
         "received_at": _trusted_utc_iso(message.timestamp),
         "is_forwarded": turn_ctx.is_forwarded,
-        "source_message_at": _trusted_utc_iso(
-            (message.metadata or {}).get("source_message_at")
+        "source_message_at": _trusted_utc_iso(message_metadata.get("source_message_at")),
+        "source_message_id": _normalize_source_message_ref(message_metadata.get("message_id")),
+        "reply_to_source_message_id": _normalize_source_message_ref(
+            message_metadata.get("reply_to_message_id")
         ),
+        "attachment_fingerprints": compute_attachment_fingerprints(message.media),
     }
     user_metadata = dict(base_metadata)
     assistant_metadata = dict(base_metadata)
@@ -363,10 +398,7 @@ def _augment_bound_reminder_message(
         "call is the only delivery path."
     )
     if bound.get("wellness_tenant"):
-        note += (
-            " Wellness access in this turn reads only the fixed recipient's "
-            "own wellness data."
-        )
+        note += " Wellness access in this turn reads only the fixed recipient's own wellness data."
     return user_message.model_copy(
         update={"content": [TextBlock(text=note), *user_message.content]}
     )
@@ -445,7 +477,9 @@ class OhmoSessionRuntimePool:
         }
         return command.name.lower() in allowed
 
-    def _handle_gateway_scoped_command(self, command_name: str, args: str) -> tuple[str, bool] | None:
+    def _handle_gateway_scoped_command(
+        self, command_name: str, args: str
+    ) -> tuple[str, bool] | None:
         lowered = command_name.lower()
         if lowered == "provider":
             result = handle_gateway_provider_command(args, workspace=self._workspace)
@@ -508,8 +542,12 @@ class OhmoSessionRuntimePool:
             active_profile=self._provider_profile,
             session_backend=self._session_backend,
             enforce_max_turns=True,  # cap each prompt at settings.max_turns by default (was unlimited)
-            restore_messages=_sanitize_snapshot_messages(snapshot.get("messages") if snapshot else None),
-            restore_tool_metadata=_sanitize_group_command_metadata(snapshot.get("tool_metadata") if snapshot else None),
+            restore_messages=_sanitize_snapshot_messages(
+                snapshot.get("messages") if snapshot else None
+            ),
+            restore_tool_metadata=_sanitize_group_command_metadata(
+                snapshot.get("tool_metadata") if snapshot else None
+            ),
             extra_skill_dirs=(str(get_skills_dir(self._workspace)),),
             extra_plugin_roots=(str(get_plugins_dir(self._workspace)),),
             memory_backend=create_memory_command_backend(
@@ -518,9 +556,7 @@ class OhmoSessionRuntimePool:
             ),
             include_project_memory=False,
             autodream_context=(
-                self._autodream_context()
-                if initial_memory_scope is not None
-                else None
+                self._autodream_context() if initial_memory_scope is not None else None
             ),
         )
         if snapshot and snapshot.get("session_id"):
@@ -599,7 +635,9 @@ class OhmoSessionRuntimePool:
                 session_key,
                 exc_info=True,
             )
-        logger.info("ohmo runtime session reset session_key=%s had_bundle=%s", session_key, had_bundle)
+        logger.info(
+            "ohmo runtime session reset session_key=%s had_bundle=%s", session_key, had_bundle
+        )
         return had_bundle
 
     def _bind_session_owner(
@@ -927,7 +965,11 @@ class OhmoSessionRuntimePool:
                     memory_scope=memory_scope,
                 )
             )
-            turns = result.continue_turns if result.continue_turns is not None else bundle.engine.max_turns
+            turns = (
+                result.continue_turns
+                if result.continue_turns is not None
+                else bundle.engine.max_turns
+            )
             reply_parts: list[str] = []
             decision_trace_restore = _install_gateway_decision_trace_recorder(
                 bundle.engine,
@@ -1028,9 +1070,15 @@ class OhmoSessionRuntimePool:
                             session_key=session_key,
                             content=user_prompt,
                         ),
-                        metadata={"_progress": True, "_session_key": session_key, "_image_fallback": True},
+                        metadata={
+                            "_progress": True,
+                            "_session_key": session_key,
+                            "_image_fallback": True,
+                        },
                     )
-                    async for retry_event in bundle.engine.continue_pending(max_turns=bundle.engine.max_turns):
+                    async for retry_event in bundle.engine.continue_pending(
+                        max_turns=bundle.engine.max_turns
+                    ):
                         async for update in self._convert_stream_event(
                             event=retry_event,
                             bundle=bundle,
@@ -1271,9 +1319,7 @@ class OhmoSessionRuntimePool:
             if event.tool_name == "todo_write":
                 # Render the updated per-session list as a compact checklist
                 # (Claude-Code todo panel) instead of the per-item JSON.
-                checklist = _render_todo_checklist(
-                    self._todo_store.active_path(bundle.session_id)
-                )
+                checklist = _render_todo_checklist(self._todo_store.active_path(bundle.session_id))
                 if checklist:
                     yield GatewayStreamUpdate(
                         kind="tool_hint",
@@ -1337,9 +1383,15 @@ class OhmoSessionRuntimePool:
             if not reply_parts:
                 reply_parts.append(event.message.text.strip())
 
-    async def _save_snapshot(self, bundle: RuntimeBundle, session_key: str, user_prompt: str) -> None:
-        tool_metadata = _sanitize_group_command_metadata(getattr(bundle.engine, "tool_metadata", {}) or {})
-        if isinstance(getattr(bundle.engine, "tool_metadata", None), dict) and isinstance(tool_metadata, dict):
+    async def _save_snapshot(
+        self, bundle: RuntimeBundle, session_key: str, user_prompt: str
+    ) -> None:
+        tool_metadata = _sanitize_group_command_metadata(
+            getattr(bundle.engine, "tool_metadata", {}) or {}
+        )
+        if isinstance(getattr(bundle.engine, "tool_metadata", None), dict) and isinstance(
+            tool_metadata, dict
+        ):
             bundle.engine.tool_metadata.update(tool_metadata)
         messages = _sanitize_group_command_prompts(list(bundle.engine.messages))
         if messages != list(bundle.engine.messages):
@@ -1395,8 +1447,13 @@ class OhmoSessionRuntimePool:
             active_profile=self._provider_profile,
             session_backend=self._session_backend,
             enforce_max_turns=True,  # cap each prompt at settings.max_turns by default (was unlimited)
-            restore_messages=[message.model_dump(mode="json") for message in _sanitize_group_command_prompts(snapshot)],
-            restore_tool_metadata=_sanitize_group_command_metadata(getattr(bundle.engine, "tool_metadata", {}) or {}),
+            restore_messages=[
+                message.model_dump(mode="json")
+                for message in _sanitize_group_command_prompts(snapshot)
+            ],
+            restore_tool_metadata=_sanitize_group_command_metadata(
+                getattr(bundle.engine, "tool_metadata", {}) or {}
+            ),
             extra_skill_dirs=(str(get_skills_dir(self._workspace)),),
             extra_plugin_roots=(str(get_plugins_dir(self._workspace)),),
             memory_backend=create_memory_command_backend(
@@ -1475,9 +1532,7 @@ class OhmoSessionRuntimePool:
             memory_engaged_override=engaged,
             derived_backend=derived_backend,
             derived_recall_allowed_override=(
-                self._honcho_turn_allowed(turn_ctx, scope)
-                if scope is not None
-                else False
+                self._honcho_turn_allowed(turn_ctx, scope) if scope is not None else False
             ),
         )
         gate_decision = getattr(snapshot, "gate_decision", None)
@@ -1579,10 +1634,7 @@ class OhmoSessionRuntimePool:
         turn_ctx: TurnContext | None,
     ) -> MemoryScope | None:
         """Resolve one turn's catalog audience, preserving single-user legacy."""
-        if (
-            not self._gateway_config.owner_principals
-            and not self._gateway_config.family_principals
-        ):
+        if not self._gateway_config.owner_principals and not self._gateway_config.family_principals:
             return MemoryScope(private_tenant="owner", shared_tenants=())
         if turn_ctx is None:
             return None
@@ -1595,11 +1647,7 @@ class OhmoSessionRuntimePool:
                 session_owner_principal,
             ),
         )
-        if (
-            scope is not None
-            and scope.private_tenant == "owner"
-            and turn_ctx.is_owner is not True
-        ):
+        if scope is not None and scope.private_tenant == "owner" and turn_ctx.is_owner is not True:
             return None
         return scope
 
@@ -1654,10 +1702,7 @@ class OhmoSessionRuntimePool:
     def _memory_backend_for_scope(self, scope: MemoryScope) -> MemoryBackend:
         # Empty identity registries are the pre-authz single-user deployment:
         # preserve its exact backend and file/catalog behavior.
-        if (
-            not self._gateway_config.owner_principals
-            and not self._gateway_config.family_principals
-        ):
+        if not self._gateway_config.owner_principals and not self._gateway_config.family_principals:
             return self._prompt_memory_backend
         return self._catalog_backend_for_scope(scope)
 
@@ -1874,7 +1919,9 @@ class OhmoSessionRuntimePool:
             model = settings.model
             timeout = float(getattr(settings, "timeout", None) or 30.0)
         except Exception:  # noqa: BLE001 — never break the turn
-            logger.warning("ohmo memory judge schedule failed session_key=%s", session_key, exc_info=True)
+            logger.warning(
+                "ohmo memory judge schedule failed session_key=%s", session_key, exc_info=True
+            )
             return
         task = asyncio.create_task(
             self._run_memory_judge_task(
@@ -1940,9 +1987,7 @@ class OhmoSessionRuntimePool:
         registry = getattr(bundle, "tool_registry", None)
         if registry is None:
             return
-        registry.register(
-            OhmoTodoWriteTool(self._todo_store, lambda: bundle.session_id)
-        )
+        registry.register(OhmoTodoWriteTool(self._todo_store, lambda: bundle.session_id))
 
     def _register_reminder_tools(self, bundle: RuntimeBundle) -> None:
         """Register the per-session reminder tools (create/list/cancel). They
@@ -2074,8 +2119,12 @@ def _sanitize_snapshot_messages(raw_messages: object) -> list[dict[str, object]]
         try:
             messages.append(ConversationMessage.model_validate(raw))
         except Exception:
-            logger.warning("ohmo runtime skipped invalid restored message while sanitizing snapshot")
-    return [message.model_dump(mode="json") for message in _sanitize_group_command_prompts(messages)]
+            logger.warning(
+                "ohmo runtime skipped invalid restored message while sanitizing snapshot"
+            )
+    return [
+        message.model_dump(mode="json") for message in _sanitize_group_command_prompts(messages)
+    ]
 
 
 def _extract_tool_media(event: ToolExecutionCompleted) -> list[str]:
@@ -2157,7 +2206,9 @@ def _format_tool_media_caption(event: ToolExecutionCompleted, media: list[str]) 
     return f"已生成文件：{names}"
 
 
-def _sanitize_group_command_prompts(messages: list[ConversationMessage]) -> list[ConversationMessage]:
+def _sanitize_group_command_prompts(
+    messages: list[ConversationMessage],
+) -> list[ConversationMessage]:
     """Replace internal /group tool-driving prompts with durable user-facing history."""
     return [_sanitize_group_command_prompt(message) for message in messages]
 
@@ -2272,7 +2323,7 @@ def _format_tool_args_block(tool_input: dict[str, object]) -> str:
     if not tool_input:
         return ""
     if len(tool_input) == 1:
-        (key, value), = tuple(tool_input.items())
+        ((key, value),) = tuple(tool_input.items())
         if isinstance(value, str) and value.strip():
             body = value.strip()
             if len(body) > 600:
@@ -2406,7 +2457,9 @@ def _format_channel_progress(
             if compact_phase == "session_memory_start":
                 return "🧠 Let me quickly condense the earlier parts of this chat, then I’ll keep going."
             if compact_trigger == "reactive":
-                return "🧠 The context is too large for this turn. I’ll compact the memory and retry."
+                return (
+                    "🧠 The context is too large for this turn. I’ll compact the memory and retry."
+                )
             return "🧠 This chat is getting long. I’ll compact the memory and keep going."
         if compact_phase == "compact_retry":
             suffix = f" (attempt {attempt})" if attempt is not None else ""
@@ -2447,7 +2500,9 @@ def _build_inbound_user_message(message: InboundMessage) -> ConversationMessage:
     return ConversationMessage.from_user_content(content)
 
 
-def _should_retry_without_image_input(error_message: str, messages: list[ConversationMessage]) -> bool:
+def _should_retry_without_image_input(
+    error_message: str, messages: list[ConversationMessage]
+) -> bool:
     """Return True when a provider rejects image input and history contains images."""
     if not _history_has_image_blocks(messages):
         return False
@@ -2477,7 +2532,9 @@ def _should_retry_without_image_input(error_message: str, messages: list[Convers
 
 
 def _history_has_image_blocks(messages: list[ConversationMessage]) -> bool:
-    return any(any(isinstance(block, ImageBlock) for block in message.content) for message in messages)
+    return any(
+        any(isinstance(block, ImageBlock) for block in message.content) for message in messages
+    )
 
 
 def _strip_image_blocks_from_engine_history(engine) -> None:
@@ -2488,7 +2545,9 @@ def _strip_image_blocks_from_engine_history(engine) -> None:
         engine.messages = messages
 
 
-def _strip_image_blocks_from_messages(messages: list[ConversationMessage]) -> list[ConversationMessage]:
+def _strip_image_blocks_from_messages(
+    messages: list[ConversationMessage],
+) -> list[ConversationMessage]:
     return [_strip_image_blocks_from_message(message) for message in messages]
 
 
@@ -2528,11 +2587,7 @@ def _build_speaker_context(message: InboundMessage) -> str:
             f"This message was sent in a group chat by: {label}{handle}\n"
             f"Sender id: {message.sender_id}"
         )
-    return (
-        "[Speaker]\n"
-        f"Direct message from: {label}{handle}\n"
-        f"Sender id: {message.sender_id}"
-    )
+    return f"[Speaker]\nDirect message from: {label}{handle}\nSender id: {message.sender_id}"
 
 
 def _build_attachment_notes(media_paths: list[str]) -> str:
@@ -2612,7 +2667,9 @@ def _decode_text_preview(data: bytes) -> str | None:
         decoded = data.decode("utf-8")
     except UnicodeDecodeError:
         return None
-    printable = sum(1 for char in decoded if char in string.printable or char.isprintable() or char in "\n\r\t")
+    printable = sum(
+        1 for char in decoded if char in string.printable or char.isprintable() or char in "\n\r\t"
+    )
     if printable / max(len(decoded), 1) < 0.9:
         return None
     normalized = " ".join(decoded.split())

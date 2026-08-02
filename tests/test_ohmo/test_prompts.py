@@ -21,7 +21,9 @@ def test_ohmo_prompt_includes_persona_and_memory(tmp_path: Path):
     get_soul_path(workspace).write_text("# soul\nSpeak like a calm operator.\n", encoding="utf-8")
     get_identity_path(workspace).write_text("# identity\nName: ohmo\n", encoding="utf-8")
     get_user_path(workspace).write_text("# user\nPrefers terse answers.\n", encoding="utf-8")
-    get_bootstrap_path(workspace).write_text("# bootstrap\nAsk a few high-value questions.\n", encoding="utf-8")
+    get_bootstrap_path(workspace).write_text(
+        "# bootstrap\nAsk a few high-value questions.\n", encoding="utf-8"
+    )
     add_ohmo_memory_entry(workspace, "timezone", "The user prefers UTC timestamps.")
 
     prompt = build_ohmo_system_prompt(tmp_path, workspace=workspace)
@@ -51,7 +53,9 @@ def test_poisoned_soul_is_blocked_in_prompt(tmp_path: Path):
 def test_clean_soul_renders_unblocked(tmp_path: Path):
     workspace = tmp_path / ".ohmo-home"
     initialize_workspace(workspace)
-    get_soul_path(workspace).write_text("You are ohmo, a calm helpful operator.\n", encoding="utf-8")
+    get_soul_path(workspace).write_text(
+        "You are ohmo, a calm helpful operator.\n", encoding="utf-8"
+    )
     prompt = build_ohmo_system_prompt(tmp_path, workspace=workspace)
     assert "You are ohmo, a calm helpful operator." in prompt
     assert "[BLOCKED" not in prompt
@@ -118,10 +122,11 @@ def test_ohmo_prompt_nutrition_contract_contains_versioned_annotation_rules(tmp_
     prompt = build_ohmo_system_prompt(tmp_path, workspace=workspace)
 
     assert "annotations.nutrition" in prompt
-    assert '"schema_version": 1' in prompt
-    assert '"record_type": "meal_estimate"' in prompt
+    assert '"schema_version": 2' in prompt
+    assert '"record_type": "meal_observation"' in prompt
     assert '"is_estimate": true' in prompt
     assert '"consumption_status": "unknown"' in prompt
+    assert '"meal_date": null' in prompt
     assert '"meal_at": null' in prompt
     assert "only when the user explicitly states" in prompt
     assert "forwarded source timestamp" in prompt
@@ -129,8 +134,46 @@ def test_ohmo_prompt_nutrition_contract_contains_versioned_annotation_rules(tmp_
     assert "image metadata" in prompt
     assert "model guess" in prompt
     assert "without explicit consumption language" in prompt
-    assert "At least one total energy field (`energy_kcal_min|max|best`) is required." in prompt
+    assert (
+        "At least one total energy field (`energy_kcal_min|max|best`) is required "
+        "only for `meal_observation`." in prompt
+    )
     assert (
         "Enforce ordering constraints whenever values are present: "
         "`energy_kcal_min <= energy_kcal_max`" in prompt
     )
+
+
+def test_ohmo_prompt_nutrition_contract_distinguishes_corrections_and_summaries(
+    tmp_path: Path,
+) -> None:
+    """A daily report is a non-countable summary and a user correction is not a new meal."""
+    workspace = tmp_path / ".ohmo-home"
+    initialize_workspace(workspace)
+    prompt = build_ohmo_system_prompt(tmp_path, workspace=workspace)
+
+    assert "`meal_observation`, `meal_correction`" in prompt
+    assert "`meal_deletion`, `day_summary`" in prompt
+    assert "changed_fields" in prompt
+    assert "a correction is never another meal" in prompt
+    assert "a date-only correction does not repeat the calorie estimate" in prompt
+    assert "non-countable summary, NEVER a new meal" in prompt
+    assert "meal_date=2026-08-01" in prompt
+    assert "source_message_id" in prompt
+    assert "attachment_fingerprints" in prompt
+    assert "the trusted gateway attaches them" in prompt
+
+
+def test_ohmo_prompt_nutrition_contract_explicit_new_consumption_rule(
+    tmp_path: Path,
+) -> None:
+    """The structured same-photo-but-new-consumption signal is conservative."""
+    workspace = tmp_path / ".ohmo-home"
+    initialize_workspace(workspace)
+    prompt = build_ohmo_system_prompt(tmp_path, workspace=workspace)
+
+    assert "`explicit_new_consumption`" in prompt
+    assert "ONLY when the user explicitly states" in prompt
+    assert "new, separate consumption" in prompt
+    assert "keep it false" in prompt
+    assert "is a duplicate, not another meal" in prompt

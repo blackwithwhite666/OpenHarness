@@ -25,7 +25,9 @@ def _payload_with_nutrition(**nutrition: Any) -> dict[str, Any]:
     }
 
 
-def test_validate_trace_finalization_annotations_round_trips_with_defaults_and_nullable_fields() -> None:
+def test_validate_trace_finalization_annotations_round_trips_with_defaults_and_nullable_fields() -> (
+    None
+):
     payload = _payload_with_nutrition(
         energy_kcal_min=320,
         basis=["image"],
@@ -108,7 +110,9 @@ def test_nutrition_meal_at_rejects_naive_and_invalid_timestamps(meal_at) -> None
         )
 
 
-def test_validate_trace_finalization_annotations_rejects_non_mapping_annotations_and_nutrition() -> None:
+def test_validate_trace_finalization_annotations_rejects_non_mapping_annotations_and_nutrition() -> (
+    None
+):
     with pytest.raises(
         DecisionTraceValidationError,
         match="annotations must be a mapping",
@@ -184,10 +188,10 @@ def test_validate_trace_finalization_annotations_rejects_non_mapping_annotations
         ),
         (
             {
-                "schema_version": 2,
+                "schema_version": 3,
                 "energy_kcal_min": 300,
             },
-            r"schema_version must be 1",
+            r"schema_version must be 1 or 2",
         ),
         (
             {
