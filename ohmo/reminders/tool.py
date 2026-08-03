@@ -101,16 +101,23 @@ class RemindCreateInput(BaseModel):
         description=(
             "Deliver to ONE specific known Telegram contact instead of this chat: "
             "their exact @username, exact name, or numeric chat_id. Set ONLY when "
-            "the user explicitly named a recipient. Requires mode='agentic'. "
-            "Unknown or ambiguous names are refused — never guess."
+            "the user explicitly named a DIFFERENT person as the recipient. "
+            "Requires mode='agentic'. Unknown or ambiguous names are refused — "
+            "never guess. Omit `recipient` (and set read_recipient_wellness=true) "
+            "ONLY to read the current private Telegram sender's OWN wellness; "
+            "named other-person wellness always requires an explicit `recipient`."
         ),
     )
     read_recipient_wellness: bool = Field(
         default=False,
         description=(
             "Set true ONLY when the user explicitly asked this reminder to read "
-            "the RECIPIENT's own wellness data. Requires `recipient`; refused "
-            "when the recipient's identity maps to no enabled wellness subject."
+            "wellness data. With an explicit `recipient`, reads THAT named "
+            "person's wellness. WITHOUT `recipient`, reads the current private "
+            "Telegram sender's OWN wellness (self-recipient opt-in: requires "
+            "mode='agentic', a Telegram private chat, and a sender whose numeric "
+            "principal equals the current chat_id and maps to an enabled tenant). "
+            "Refused for every mismatch or unmapped case."
         ),
     )
 
@@ -181,7 +188,10 @@ class RemindCreateTool(BaseTool):
         "`recipient` (exact @username / exact name / numeric chat_id of a known "
         "Telegram contact) with mode='agentic'; set `read_recipient_wellness=true` "
         "only when the user explicitly asked to include that person's own wellness "
-        "data."
+        "data. To read the CURRENT private Telegram sender's own wellness instead, "
+        "omit `recipient` and set `read_recipient_wellness=true` with mode='agentic' "
+        "— this is an explicit opt-in, not a default, and is refused outside a "
+        "private Telegram chat whose numeric sender matches the current chat_id."
     )
     input_model = RemindCreateInput
 
@@ -310,17 +320,17 @@ class RemindCreateTool(BaseTool):
         ambiguous contacts and every unmapped/disabled wellness subject fail
         closed. Returns ``None`` for a legacy this-chat reminder, a binding on
         success, or a ToolResult error.
+
+        When ``read_recipient_wellness`` is true and no explicit ``recipient``
+        is given, the current private Telegram sender is resolved as a
+        self-recipient (see :meth:`_resolve_self_recipient_binding`); this
+        reuses the same bound-reminder path as an explicit recipient so the
+        scheduler, runtime, and MCP tenant injection are unchanged.
         """
-        if arguments.read_recipient_wellness and not (arguments.recipient or "").strip():
-            return ToolResult(
-                output=(
-                    "read_recipient_wellness requires `recipient`: wellness data is "
-                    "read for the named recipient, so name one explicitly."
-                ),
-                is_error=True,
-            )
         query = (arguments.recipient or "").strip()
         if not query:
+            if arguments.read_recipient_wellness:
+                return self._resolve_self_recipient_binding(arguments, ctx)
             return None
         if arguments.mode != "agentic":
             return ToolResult(
@@ -373,6 +383,93 @@ class RemindCreateTool(BaseTool):
             chat_id=contact.chat_id,
             principal=principal,
             label=_contact_label(contact),
+            wellness_tenant=wellness_tenant,
+        )
+
+    def _resolve_self_recipient_binding(
+        self,
+        arguments: RemindCreateInput,
+        ctx: dict,
+    ) -> _RecipientBinding | ToolResult:
+        """Resolve the current private Telegram sender as the wellness recipient.
+
+        Explicit opt-in path: ``read_recipient_wellness=true`` with no explicit
+        ``recipient``. The current private Telegram sender is bound as the
+        recipient so the existing scheduler/runtime/MCP recipient-bound path is
+        reused unchanged. Every requirement below must hold or the call fails
+        closed with a clear tool error:
+
+        * ``mode == 'agentic'``;
+        * Telegram channel;
+        * private chat (reject ``is_group`` or ``chat_type == 'group'``);
+        * canonical numeric sender principal from ``sender_id``
+          (``<numeric>|<username>`` is allowed — only the numeric prefix is
+          trusted);
+        * current ``chat_id`` exactly equals that numeric principal;
+        * configured wellness resolver maps it to an enabled tenant.
+        """
+        if arguments.mode != "agentic":
+            return ToolResult(
+                output=(
+                    "A self-recipient wellness reminder must run a full agent turn: "
+                    "pass mode='agentic' together with read_recipient_wellness."
+                ),
+                is_error=True,
+            )
+        if str(ctx.get("channel") or "").strip().lower() != "telegram":
+            return ToolResult(
+                output=(
+                    "read_recipient_wellness without a named recipient is only "
+                    "supported for private Telegram chats."
+                ),
+                is_error=True,
+            )
+        if bool(ctx.get("is_group")) or (
+            str(ctx.get("chat_type") or "").strip().lower() == "group"
+        ):
+            return ToolResult(
+                output=(
+                    "read_recipient_wellness without a named recipient requires a "
+                    "private Telegram chat; group chats cannot self-bind wellness."
+                ),
+                is_error=True,
+            )
+        sender_id = str(ctx.get("sender_id") or "").strip()
+        # Telegram sender IDs may append a mutable username after '|'; only the
+        # immutable numeric prefix is trusted (same rule as canonical_principal).
+        principal = sender_id.split("|", 1)[0].strip()
+        if not principal or not principal.isdigit():
+            return ToolResult(
+                output=(
+                    "read_recipient_wellness without a named recipient requires a "
+                    "canonical numeric Telegram sender; the current sender is "
+                    "non-numeric or a scheduler sentinel."
+                ),
+                is_error=True,
+            )
+        chat_id = str(ctx.get("chat_id") or "").strip()
+        if chat_id != principal:
+            return ToolResult(
+                output=(
+                    "read_recipient_wellness without a named recipient requires the "
+                    f"current chat to be the sender's own private chat (chat_id "
+                    f"{chat_id!r} does not match sender principal {principal!r})."
+                ),
+                is_error=True,
+            )
+        if self._wellness_tenants is None:
+            return ToolResult(output=_WELLNESS_REFUSAL, is_error=True)
+        wellness_tenant = self._wellness_tenants.resolve(principal)
+        if wellness_tenant is None:
+            return ToolResult(output=_WELLNESS_REFUSAL, is_error=True)
+        label = principal
+        username_part = sender_id.partition("|")[2].strip() if "|" in sender_id else ""
+        if username_part:
+            label = f"@{username_part}"
+        return _RecipientBinding(
+            chat_id=chat_id,
+            principal=principal,
+            label=label,
             wellness_tenant=wellness_tenant,
         )
 

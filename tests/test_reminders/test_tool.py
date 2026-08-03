@@ -6,6 +6,8 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import pytest
+
 
 from openharness.tools.base import ToolExecutionContext
 
@@ -350,22 +352,104 @@ async def test_create_recipient_without_contact_store_refused(tmp_path: Path) ->
     assert store.load() == []
 
 
-async def test_wellness_opt_in_without_recipient_refused(tmp_path: Path) -> None:
+async def test_wellness_self_recipient_succeeds(tmp_path: Path) -> None:
+    # read_recipient_wellness=true with no explicit recipient resolves the
+    # current private Telegram sender as the wellness subject. The scheduler,
+    # runtime, and MCP tenant path all reuse the normal bound-reminder flow.
     store, tool = _create_tool(
         tmp_path, contacts=_contacts(tmp_path), wellness=_wellness()
     )
     result = await tool.execute(
         RemindCreateInput(
-            summary="x",
+            summary="morning wellness self-check",
             dtstart=_future_iso(),
             mode="agentic",
             read_recipient_wellness=True,
         ),
-        _ctx(_reminder_ctx(), tmp_path),
+        _ctx(_reminder_ctx(chat_id="100", sender_id="100|dmitry"), tmp_path),
+    )
+    assert not result.is_error
+    assert "Recipient:" in result.output
+    assert "wellness" in result.output.lower()
+    reminder = store.list_for_chat("telegram", "100")[0]
+    assert reminder.recipient_chat_id == "100"
+    assert reminder.recipient_principal == "100"
+    assert reminder.wellness_tenant == "owner"
+    assert reminder.recipient_label is not None
+
+
+# Base context for self-recipient cases: private Telegram chat whose numeric
+# sender (100) maps to the "owner" wellness tenant. Each refusal parametrizes
+# one deviation from this base.
+_SELF_OK = {"chat_id": "100", "sender_id": "100|dmitry"}
+
+
+@pytest.mark.parametrize(
+    ("ctx_overrides", "opts"),
+    [
+        pytest.param({"is_group": True}, {}, id="is_group"),
+        pytest.param({"chat_type": "group"}, {}, id="chat_type_group"),
+        pytest.param({"chat_id": "999"}, {}, id="sender_chat_mismatch"),
+        pytest.param(
+            {"chat_id": "dmitry", "sender_id": "dmitry"}, {}, id="nonnumeric_sender"
+        ),
+        pytest.param(
+            {"chat_id": "__scheduler__", "sender_id": "__scheduler__"},
+            {},
+            id="scheduler_sender",
+        ),
+        pytest.param(
+            {"chat_id": "777", "sender_id": "777|stranger"}, {}, id="unmapped_tenant"
+        ),
+        pytest.param(
+            {"chat_id": "200", "sender_id": "200|marina"},
+            {"wellness_overrides": {"enabled_tenants": ("owner",)}},
+            id="disabled_tenant",
+        ),
+        pytest.param({}, {"wellness": None}, id="no_resolver"),
+        pytest.param({}, {"channel": "feishu"}, id="non_telegram"),
+        pytest.param({}, {"mode": "static"}, id="static_mode"),
+    ],
+)
+async def test_wellness_self_recipient_refused(
+    tmp_path: Path, ctx_overrides: dict, opts: dict
+) -> None:
+    wellness = opts.get("wellness", _wellness(**opts.get("wellness_overrides", {})))
+    store, tool = _create_tool(
+        tmp_path, contacts=_contacts(tmp_path), wellness=wellness
+    )
+    ctx = _reminder_ctx(**{**_SELF_OK, **ctx_overrides})
+    if "channel" in opts:
+        ctx["ohmo_reminder_ctx"]["channel"] = opts["channel"]
+    result = await tool.execute(
+        RemindCreateInput(
+            summary="x",
+            dtstart=_future_iso(),
+            mode=opts.get("mode", "agentic"),
+            read_recipient_wellness=True,
+        ),
+        _ctx(ctx, tmp_path),
     )
     assert result.is_error
-    assert "recipient" in result.output.lower()
     assert store.load() == []
+
+
+async def test_plain_reminder_without_opt_in_stays_unbound(tmp_path: Path) -> None:
+    # Without read_recipient_wellness, a plain reminder (no recipient) stays
+    # unbound — no recipient, no wellness tenant. This legacy path must continue
+    # to fail closed for wellness at fire time.
+    store, tool = _create_tool(
+        tmp_path, contacts=_contacts(tmp_path), wellness=_wellness()
+    )
+    result = await tool.execute(
+        RemindCreateInput(summary="plain legacy reminder", dtstart=_future_iso()),
+        _ctx(_reminder_ctx(chat_id="100", sender_id="100|dmitry"), tmp_path),
+    )
+    assert not result.is_error
+    reminder = store.list_for_chat("telegram", "100")[0]
+    assert reminder.recipient_chat_id is None
+    assert reminder.recipient_principal is None
+    assert reminder.wellness_tenant is None
 
 
 async def test_wellness_unmapped_recipient_refused(tmp_path: Path) -> None:
