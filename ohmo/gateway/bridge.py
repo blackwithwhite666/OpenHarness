@@ -162,7 +162,9 @@ class OhmoGatewayBridge:
         message_coalesce_media_window: float = 0.0,
         message_coalesce_max: int = 20,
         contact_store: ContactStore | None = None,
+        compact_progress_default: bool = False,
         compact_progress_chats: list[str] | None = None,
+        verbose_progress_chats: list[str] | None = None,
     ) -> None:
         self._bus = bus
         self._runtime_pool = runtime_pool
@@ -180,10 +182,13 @@ class OhmoGatewayBridge:
         # In-flight dispatched turns, so a shutdown can record what it interrupts.
         self._inflight: dict[str, InboundMessage] = {}
         self._contact_store = contact_store
-        # Chats (by str chat_id) whose turn progress collapses into a single
-        # spinner-animated status message instead of one message per tool/step.
-        # Mutated live by /quiet and /verbose and persisted to gateway.json.
-        self._compact_chats: set[str] = {str(c) for c in (compact_progress_chats or [])}
+        # Telegram progress defaults and per-chat overrides. Mutated live by
+        # /quiet and /verbose and persisted to gateway.json.
+        self._compact_progress_default = bool(compact_progress_default)
+        self._verbose_chats: set[str] = {str(c) for c in (verbose_progress_chats or [])}
+        self._compact_chats: set[str] = {
+            str(c) for c in (compact_progress_chats or [])
+        } - self._verbose_chats
 
     async def run(self) -> None:
         self._running = True
@@ -466,28 +471,32 @@ class OhmoGatewayBridge:
         )
 
     async def _handle_compact_toggle(self, message, session_key: str, *, enable: bool) -> None:
-        """/quiet (enable) or /verbose (disable): flip this chat's compact-progress
-        mode. Mutates the in-memory set (read per-turn to tag ``_collapse``) and
-        persists to gateway.json so the choice survives a restart. Does NOT touch
-        the running session — it takes effect on the next turn.
+        """/quiet (enable) or /verbose (disable): set this chat's progress override.
+
+        Mutates the in-memory sets (read per-turn to tag ``_collapse``) and
+        persists both to gateway.json so the choice survives a restart. Does
+        NOT touch the running session — it takes effect on the next turn.
         """
         chat_id = str(message.chat_id)
         if enable:
+            self._verbose_chats.discard(chat_id)
             self._compact_chats.add(chat_id)
             reply = "🔇 Компактный прогресс включён для этого чата — покажу один статус со спиннером."
         else:
             self._compact_chats.discard(chat_id)
+            self._verbose_chats.add(chat_id)
             reply = "🔊 Показываю все шаги."
         try:
-            self._persist_compact_chats()
+            self._persist_progress_overrides()
         except Exception:  # noqa: BLE001 — the in-memory flip already took effect
-            logger.exception("ohmo failed to persist compact_progress_chats chat_id=%s", chat_id)
+            logger.exception("ohmo failed to persist progress overrides chat_id=%s", chat_id)
         await self._publish_command_reply(message, session_key, reply)
 
-    def _persist_compact_chats(self) -> None:
-        """Round-trip gateway.json, updating only ``compact_progress_chats``."""
+    def _persist_progress_overrides(self) -> None:
+        """Round-trip gateway.json, updating both progress override lists."""
         config = load_gateway_config(self._workspace)
         config.compact_progress_chats = sorted(self._compact_chats)
+        config.verbose_progress_chats = sorted(self._verbose_chats)
         save_gateway_config(config, self._workspace)
 
     async def _handle_restart(self, message, session_key: str) -> None:
@@ -590,9 +599,14 @@ class OhmoGatewayBridge:
         if chat_type == "group" or inbound_meta.get("thread_id"):
             if "message_id" in message.metadata:
                 inbound_meta["message_id"] = message.metadata["message_id"]
-        # Collapse this turn's progress into one live status message? Read the set
-        # per-turn so a /quiet or /verbose in a prior turn is already in effect.
-        collapse = message.channel == "telegram" and str(message.chat_id) in self._compact_chats
+        # Collapse this turn's progress into one live status message? Read the
+        # overrides per-turn so a prior /quiet or /verbose is already in effect.
+        chat_id = str(message.chat_id)
+        collapse = (
+            message.channel == "telegram"
+            and chat_id not in self._verbose_chats
+            and (self._compact_progress_default or chat_id in self._compact_chats)
+        )
         # Trusted recipient-bound reminder turn: still run the turn (tool-made
         # outbound sends are unaffected), but publish NO progress/tool hints and
         # NO final reply to message.chat_id — recipient data must not reach the
@@ -607,6 +621,7 @@ class OhmoGatewayBridge:
                     reply = update.text
                     final_media = list(getattr(update, "media", None) or (update.metadata or {}).get("_media") or [])
                     final_metadata = dict(update.metadata or {})
+                    final_metadata.pop("_collapse", None)
                     continue
                 if not update.text:
                     continue

@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 from ohmo.workspace import (
@@ -30,9 +31,13 @@ def test_initialize_workspace_creates_expected_files(tmp_path: Path):
     user_text = get_user_path(workspace).read_text(encoding="utf-8")
     identity_text = get_identity_path(workspace).read_text(encoding="utf-8")
     bootstrap_text = get_bootstrap_path(workspace).read_text(encoding="utf-8")
+    gateway_config = json.loads(get_gateway_config_path(workspace).read_text(encoding="utf-8"))
     assert "Be genuinely helpful, not performatively helpful." in soul_text
     assert "Remember that access is intimacy." in soul_text
     assert "Relationship notes" in user_text
     assert "learn enough to help well, not to build a dossier" in user_text
     assert "Name: ohmo" in identity_text
     assert "first conversation" in bootstrap_text
+    assert gateway_config["compact_progress_default"] is False
+    assert gateway_config["compact_progress_chats"] == []
+    assert gateway_config["verbose_progress_chats"] == []
