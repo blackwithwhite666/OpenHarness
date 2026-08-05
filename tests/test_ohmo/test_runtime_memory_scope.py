@@ -29,6 +29,7 @@ from ohmo.gateway.runtime import (
     _logical_turn_id_for_conversation,
     _message_identity_for_turn,
     _trusted_bound_reminder,
+    _trusted_reminder_wellness,
 )
 from ohmo.gateway.turn_context import TurnContext
 from ohmo.memory_backend import CatalogMemoryBackend, ShadowMemoryBackend
@@ -1157,6 +1158,118 @@ def test_trusted_bound_reminder_rejects_live_user_spoof() -> None:
         metadata={"_synthetic": True, "_reminder_id": "r1"},
     )
     assert _trusted_bound_reminder(legacy) is None
+
+
+def test_trusted_auto_reminder_wellness_keeps_current_chat_scope() -> None:
+    message = InboundMessage(
+        channel="telegram",
+        sender_id="__scheduler__",
+        chat_id="100",
+        content="self-check",
+        session_key_override="telegram:100",
+        metadata={
+            "_synthetic": True,
+            "_reminder_id": "r1",
+            "_reminder_created_by": "100|dmitry",
+            "_reminder_wellness_principal": "100|dmitry",
+            "_reminder_wellness_tenant": "owner",
+        },
+    )
+    trusted = _trusted_reminder_wellness(message)
+    assert trusted == {
+        "reminder_id": "r1",
+        "wellness_tenant": "owner",
+        "wellness_principal": "100|dmitry",
+    }
+
+
+async def test_auto_reminder_wellness_is_revalidated_and_injected(tmp_path: Path) -> None:
+    workspace = tmp_path / ".ohmo-home"
+    initialize_workspace(workspace)
+    _seed_catalog(workspace)
+    pool = OhmoSessionRuntimePool(
+        cwd=tmp_path,
+        workspace=workspace,
+        provider_profile="codex",
+    )
+    pool._gateway_config = _family_config()
+    bundle, manager = _wellness_bundle()
+    reminder = _trusted_reminder_wellness(
+        InboundMessage(
+            channel="telegram",
+            sender_id="__scheduler__",
+            chat_id="100",
+            content="self-check",
+            metadata={
+                "_synthetic": True,
+                "_reminder_id": "r1",
+                "_reminder_created_by": "100|dmitry",
+                "_reminder_wellness_principal": "100|dmitry",
+                "_reminder_wellness_tenant": "owner",
+            },
+        )
+    )
+    assert reminder is not None
+
+    pool._configure_turn_memory_surfaces(bundle, None, memory_scope=None)
+    pool._apply_reminder_wellness_turn(bundle, reminder)
+    tool = bundle.tool_registry.get(_WELLNESS_TOOL_NAME)
+    assert isinstance(tool, WellnessUserIdInjectingAdapter)
+    result = await tool.execute(
+        tool.input_model(params={"interval": "7d"}),
+        ToolExecutionContext(cwd=tmp_path),
+    )
+    assert result.is_error is False
+    assert manager.calls[-1][2]["params"] == {"interval": "7d", "user_id": "owner"}
+
+
+@pytest.mark.parametrize(
+    ("case", "message_changes", "metadata_changes"),
+    (
+        ("live_user", {"sender_id": "100|dmitry"}, {},),
+        ("non_synthetic", {}, {"_synthetic": False}),
+        ("missing_metadata", {}, {"_reminder_created_by": None}),
+        (
+            "recipient_bound",
+            {},
+            {"_reminder_recipient_chat_id": "200"},
+        ),
+        ("principal_chat_mismatch", {"chat_id": "200"}, {}),
+        (
+            "nonnumeric_creator",
+            {},
+            {"_reminder_created_by": "dmitry"},
+        ),
+        (
+            "nonnumeric_wellness_principal",
+            {},
+            {"_reminder_wellness_principal": "dmitry"},
+        ),
+        ("non_telegram_channel", {"channel": "feishu"}, {}),
+    ),
+)
+def test_trusted_auto_reminder_wellness_rejects_unsafe_metadata(
+    case: str,
+    message_changes: dict[str, str],
+    metadata_changes: dict[str, object],
+) -> None:
+    del case
+    message_kwargs = {
+        "channel": "telegram",
+        "sender_id": "__scheduler__",
+        "chat_id": "100",
+        "content": "self-check",
+        "metadata": {
+            "_synthetic": True,
+            "_reminder_id": "r1",
+            "_reminder_created_by": "100|dmitry",
+            "_reminder_wellness_principal": "100|dmitry",
+            "_reminder_wellness_tenant": "owner",
+        },
+    }
+    message_kwargs.update(message_changes)
+    message_kwargs["metadata"].update(metadata_changes)
+    assert _trusted_reminder_wellness(InboundMessage(**message_kwargs)) is None
 
 
 def test_bound_conditional_reminder_instruction_covers_silence_and_cancellation() -> None:

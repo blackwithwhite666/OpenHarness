@@ -377,6 +377,51 @@ def _trusted_bound_reminder(message: InboundMessage) -> dict[str, str | None] | 
     }
 
 
+def _trusted_reminder_wellness(message: InboundMessage) -> dict[str, str | None] | None:
+    """Return a scheduler-stamped wellness-only reminder scope.
+
+    Unlike a recipient-bound reminder, this path preserves the originating
+    chat/session delivery semantics. The scheduler supplies the authenticated
+    creator principal and the runtime revalidates its tenant mapping.
+    """
+    if str(message.channel).strip().lower() != "telegram":
+        return None
+    metadata = message.metadata or {}
+    if message.sender_id != _SCHEDULER_SENDER or not metadata.get("_synthetic"):
+        return None
+    if any(
+        key in metadata
+        for key in (
+            "_reminder_recipient_chat_id",
+            "_reminder_recipient_principal",
+            "_reminder_recipient_label",
+            "_suppress_bridge_output",
+        )
+    ):
+        return None
+    reminder_id = str(metadata.get("_reminder_id") or "").strip()
+    created_by = str(metadata.get("_reminder_created_by") or "").strip()
+    principal = str(metadata.get("_reminder_wellness_principal") or "").strip()
+    tenant = str(metadata.get("_reminder_wellness_tenant") or "").strip()
+    if not reminder_id or not created_by or not principal or not tenant:
+        return None
+    chat_id = str(message.chat_id).strip()
+    canonical_created_by = canonical_principal("telegram", created_by)
+    canonical_principal_id = canonical_principal("telegram", principal)
+    if (
+        not canonical_created_by.isdigit()
+        or canonical_created_by != chat_id
+        or not canonical_principal_id.isdigit()
+        or canonical_principal_id != canonical_created_by
+    ):
+        return None
+    return {
+        "reminder_id": reminder_id,
+        "wellness_tenant": tenant,
+        "wellness_principal": principal,
+    }
+
+
 def _augment_bound_reminder_message(
     user_message: ConversationMessage,
     bound: dict[str, str | None],
@@ -676,6 +721,7 @@ class OhmoSessionRuntimePool:
     async def stream_message(self, message: InboundMessage, session_key: str):
         """Submit an inbound channel message and yield progress + final reply updates."""
         bound_reminder = _trusted_bound_reminder(message)
+        wellness_reminder = _trusted_reminder_wellness(message)
         user_message = _build_inbound_user_message(message)
         if bound_reminder is not None:
             user_message = _augment_bound_reminder_message(user_message, bound_reminder)
@@ -702,6 +748,8 @@ class OhmoSessionRuntimePool:
         )
         if bound_reminder is not None:
             self._apply_bound_reminder_turn(bundle, bound_reminder)
+        elif wellness_reminder is not None:
+            self._apply_reminder_wellness_turn(bundle, wellness_reminder)
         logger.debug(
             "ohmo turn identity principal=%s owner=%s private=%s channel=%s chat_id=%s session_id=%s",
             turn_ctx.principal,
@@ -1803,9 +1851,31 @@ class OhmoSessionRuntimePool:
         tenant = self._validated_bound_wellness_tenant(bound)
         self._bind_wellness_tenant(bundle, tenant)
 
+    def _apply_reminder_wellness_turn(
+        self,
+        bundle: RuntimeBundle,
+        reminder: dict[str, str | None],
+    ) -> None:
+        """Bind wellness for an auto-delivered current-chat reminder."""
+        tenant = self._validated_reminder_wellness_tenant(reminder)
+        self._bind_wellness_tenant(bundle, tenant)
+
     def _validated_bound_wellness_tenant(self, bound: dict[str, str | None]) -> str | None:
         tenant = bound.get("wellness_tenant")
         principal = bound.get("recipient_principal")
+        return self._validated_reminder_wellness_tenant(
+            {
+                "reminder_id": bound.get("reminder_id"),
+                "wellness_tenant": tenant,
+                "wellness_principal": principal,
+            },
+        )
+
+    def _validated_reminder_wellness_tenant(
+        self, reminder: dict[str, str | None]
+    ) -> str | None:
+        tenant = reminder.get("wellness_tenant")
+        principal = reminder.get("wellness_principal")
         if not tenant or not principal:
             return None
         canonical = canonical_principal("telegram", principal)
@@ -1816,7 +1886,7 @@ class OhmoSessionRuntimePool:
                 tenant,
                 canonical,
                 resolved,
-                bound.get("reminder_id"),
+                reminder.get("reminder_id"),
             )
             return None
         return tenant

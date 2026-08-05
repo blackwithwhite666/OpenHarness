@@ -194,6 +194,30 @@ async def test_agentic_publishes_inbound() -> None:
     assert msg.metadata["_reminder_created_by"] == "42|valeria"
 
 
+async def test_auto_wellness_agentic_keeps_current_chat_delivery() -> None:
+    store = ReminderStore()
+    store.add(
+        _reminder(
+            "r1",
+            mode="agentic",
+            created_by="100|dmitry",
+            wellness_tenant="owner",
+        )
+    )
+    bus = FakeBus()
+    sched = _make_scheduler(bus, store)
+
+    await sched.fire_due()
+
+    assert len(bus.inbound) == 1
+    msg = bus.inbound[0]
+    assert msg.session_key_override == "telegram:100"
+    assert msg.metadata["_reminder_wellness_principal"] == "100|dmitry"
+    assert msg.metadata["_reminder_wellness_tenant"] == "owner"
+    assert "_reminder_recipient_chat_id" not in msg.metadata
+    assert "_suppress_bridge_output" not in msg.metadata
+
+
 async def test_bound_agentic_uses_isolated_session_and_trusted_metadata() -> None:
     # A recipient-bound agentic reminder runs in a reminder-specific isolated
     # session (never the creator's or the recipient's chat session) and stamps

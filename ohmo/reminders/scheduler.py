@@ -223,6 +223,12 @@ class ReminderScheduler:
                 "_reminder_id": reminder.id,
                 "_reminder_created_by": reminder.created_by,
             }
+            if reminder.wellness_tenant:
+                # Auto-delivery keeps the original chat/session semantics. The
+                # runtime validates this creator principal against current
+                # gateway configuration before binding the tenant.
+                metadata["_reminder_wellness_principal"] = reminder.created_by
+                metadata["_reminder_wellness_tenant"] = reminder.wellness_tenant
         await self._bus.publish_inbound(
             InboundMessage(
                 channel=reminder.channel,
