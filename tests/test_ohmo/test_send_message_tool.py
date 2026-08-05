@@ -255,6 +255,7 @@ def _bound_reminder_ctx(tmp_path: Path, **overrides) -> ToolExecutionContext:
         "first_name": "",
         "display_name": "",
         "fixed_recipient_chat_id": "200",
+        "fixed_recipient_principal": "200",
         "fixed_recipient_label": "Marina @marina",
         "reminder_id": "r1",
     }
@@ -294,6 +295,155 @@ async def test_scheduled_send_goes_to_fixed_recipient_signed_with_reminder_id(tm
     # Carries the reminder id so a real Telegram delivery failure can pause it.
     assert message.metadata["_reminder_id"] == "r1"
     assert message.metadata["_origin"] == "send_telegram_message"
+
+
+@pytest.mark.asyncio
+async def test_scheduled_send_accepts_exact_fixed_recipient_label(tmp_path: Path):
+    published: list[OutboundMessage] = []
+
+    async def send_outbound(message: OutboundMessage) -> None:
+        published.append(message)
+
+    store = ContactStore(tmp_path)
+    store.record_inbound(
+        channel="telegram",
+        chat_id="200",
+        user_id="200",
+        username="marina",
+        first_name="Marina",
+    )
+    tool = SendTelegramMessageTool(store, send_outbound)
+
+    result = await tool.execute(
+        SendTelegramMessageInput(recipient="Marina @marina", text="Condition met"),
+        _bound_reminder_ctx(tmp_path),
+    )
+
+    assert not result.is_error
+    assert result.metadata == {"recipient_chat_id": "200"}
+    assert [message.chat_id for message in published] == ["200"]
+
+
+@pytest.mark.asyncio
+async def test_scheduled_send_fixed_recipient_label_mismatch_does_not_bypass_resolution(
+    tmp_path: Path,
+):
+    published: list[OutboundMessage] = []
+
+    async def send_outbound(message: OutboundMessage) -> None:
+        published.append(message)
+
+    store = ContactStore(tmp_path)
+    store.record_inbound(
+        channel="telegram",
+        chat_id="200",
+        user_id="200",
+        username="marina",
+        first_name="Marina",
+    )
+    tool = SendTelegramMessageTool(store, send_outbound)
+
+    result = await tool.execute(
+        SendTelegramMessageInput(recipient="Marina (@marina)", text="Condition met"),
+        _bound_reminder_ctx(tmp_path),
+    )
+
+    assert result.is_error
+    assert "Unknown recipient" in result.output
+    assert published == []
+
+
+@pytest.mark.asyncio
+async def test_scheduled_send_rejects_stale_fixed_contact(tmp_path: Path):
+    published: list[OutboundMessage] = []
+
+    async def send_outbound(message: OutboundMessage) -> None:
+        published.append(message)
+
+    store = ContactStore(tmp_path)
+    store.record_inbound(
+        channel="telegram",
+        chat_id="200",
+        user_id="200",
+        username="marina",
+        first_name="Maria",
+    )
+    tool = SendTelegramMessageTool(store, send_outbound)
+
+    result = await tool.execute(
+        SendTelegramMessageInput(recipient="Marina @marina", text="Condition met"),
+        _bound_reminder_ctx(tmp_path),
+    )
+
+    assert result.is_error
+    assert "label" in result.output
+    assert published == []
+
+
+@pytest.mark.asyncio
+async def test_scheduled_send_rejects_changed_fixed_principal(tmp_path: Path):
+    published: list[OutboundMessage] = []
+
+    async def send_outbound(message: OutboundMessage) -> None:
+        published.append(message)
+
+    store = ContactStore(tmp_path)
+    store.record_inbound(
+        channel="telegram",
+        chat_id="200",
+        user_id="999",
+        username="marina",
+        first_name="Marina",
+    )
+    tool = SendTelegramMessageTool(store, send_outbound)
+
+    result = await tool.execute(
+        SendTelegramMessageInput(recipient="Marina @marina", text="Condition met"),
+        _bound_reminder_ctx(tmp_path),
+    )
+
+    assert result.is_error
+    assert "principal" in result.output
+    assert published == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("recipient", "first_name", "expected_error"),
+    [
+        pytest.param("@marina", "Maria", "label", id="changed_label_alias"),
+        pytest.param("999", "Marina", "principal", id="changed_principal_alias"),
+    ],
+)
+async def test_scheduled_send_rejects_changed_fixed_identity_via_alias(
+    tmp_path: Path,
+    recipient: str,
+    first_name: str,
+    expected_error: str,
+):
+    published: list[OutboundMessage] = []
+
+    async def send_outbound(message: OutboundMessage) -> None:
+        published.append(message)
+
+    store = ContactStore(tmp_path)
+    store.record_inbound(
+        channel="telegram",
+        chat_id="200",
+        user_id="999" if expected_error == "principal" else "200",
+        username="marina",
+        first_name=first_name,
+    )
+    tool = SendTelegramMessageTool(store, send_outbound)
+
+    result = await tool.execute(
+        SendTelegramMessageInput(recipient=recipient, text="Condition met"),
+        _bound_reminder_ctx(tmp_path),
+    )
+
+    assert result.is_error
+    assert expected_error in result.output
+    assert published == []
 
 
 @pytest.mark.asyncio

@@ -24,6 +24,7 @@ from ohmo.gateway.memory_gate import MemoryScope
 from ohmo.gateway.models import GatewayConfig
 from ohmo.gateway.runtime import (
     OhmoSessionRuntimePool,
+    _augment_bound_reminder_message,
     _build_conversation_turn_metadata,
     _logical_turn_id_for_conversation,
     _message_identity_for_turn,
@@ -1156,6 +1157,28 @@ def test_trusted_bound_reminder_rejects_live_user_spoof() -> None:
         metadata={"_synthetic": True, "_reminder_id": "r1"},
     )
     assert _trusted_bound_reminder(legacy) is None
+
+
+def test_bound_conditional_reminder_instruction_covers_silence_and_cancellation() -> None:
+    augmented = _augment_bound_reminder_message(
+        ConversationMessage.from_user_text("check whether the condition is true"),
+        {
+            "reminder_id": "r1",
+            "recipient_chat_id": "200",
+            "recipient_principal": "200",
+            "recipient_label": "Marina @marina",
+            "wellness_tenant": None,
+        },
+    )
+
+    text = augmented.text
+    assert "ONLY to Marina @marina with the send_telegram_message" in text
+    assert "Pass 'Marina @marina' exactly as the `recipient` argument" in text
+    assert "condition is false, do NOT call send_telegram_message" in text
+    assert "non-empty internal acknowledgement such as `Done`" in text
+    assert "bridge output is suppressed" in text
+    assert "until-condition recurrence" in text
+    assert "remind_cancel with id='r1'" in text
 
 
 async def test_bound_synthetic_reminder_binds_marina_wellness_with_memory_disabled(

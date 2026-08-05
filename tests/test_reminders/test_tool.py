@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 
 from openharness.tools.base import ToolExecutionContext
@@ -36,6 +37,9 @@ def _reminder_ctx(
     sender_id: str = "42",
     chat_type: str = "private",
     is_group: bool = False,
+    username: str = "",
+    first_name: str = "",
+    display_name: str = "",
 ) -> dict:
     return {
         "ohmo_reminder_ctx": {
@@ -45,6 +49,9 @@ def _reminder_ctx(
             "sender_id": sender_id,
             "chat_type": chat_type,
             "is_group": is_group,
+            "username": username,
+            "first_name": first_name,
+            "display_name": display_name,
             "tz": "Europe/Moscow",
         }
     }
@@ -240,6 +247,111 @@ def _create_tool(
         wellness_tenants=wellness,
     )
     return store, tool
+
+
+def test_create_delivery_defaults_to_auto_and_rejects_other_values() -> None:
+    reminder = RemindCreateInput(summary="x", dtstart=_future_iso())
+    assert reminder.delivery == "auto"
+    with pytest.raises(ValidationError):
+        RemindCreateInput(summary="x", dtstart=_future_iso(), delivery="silent")
+
+
+async def test_create_explicit_delivery_binds_current_private_sender(
+    tmp_path: Path,
+) -> None:
+    # A configured wellness resolver is present, but explicit delivery neither
+    # requires nor enables it. The fixed recipient comes only from current
+    # authenticated gateway context; no contact lookup is needed.
+    store, tool = _create_tool(tmp_path, wellness=_wellness())
+    result = await tool.execute(
+        RemindCreateInput(
+            summary="notify only when the condition becomes true",
+            dtstart=_future_iso(),
+            mode="agentic",
+            delivery="explicit",
+        ),
+        _ctx(
+            _reminder_ctx(
+                chat_id="100",
+                sender_id="100|dmitry",
+                username="dmitry",
+                first_name="Dmitry",
+            ),
+            tmp_path,
+        ),
+    )
+
+    assert not result.is_error
+    assert "Recipient: Dmitry @dmitry" in result.output
+    reminder = store.list_for_chat("telegram", "100")[0]
+    assert reminder.mode == "agentic"
+    assert reminder.recipient_chat_id == "100"
+    assert reminder.recipient_principal == "100"
+    assert reminder.recipient_label == "Dmitry @dmitry"
+    assert reminder.wellness_tenant is None
+
+
+@pytest.mark.parametrize(
+    ("input_overrides", "ctx_overrides", "channel"),
+    [
+        pytest.param({"mode": "static"}, {}, "telegram", id="agentic_required"),
+        pytest.param({}, {"is_group": True}, "telegram", id="telegram_group_flag"),
+        pytest.param(
+            {}, {"is_group": None}, "telegram", id="missing_private_chat_signal"
+        ),
+        pytest.param(
+            {}, {"chat_type": "supergroup"}, "telegram", id="telegram_group_type"
+        ),
+        pytest.param({}, {}, "feishu", id="telegram_required"),
+        pytest.param(
+            {}, {"chat_id": "999"}, "telegram", id="sender_chat_mismatch"
+        ),
+        pytest.param(
+            {},
+            {"chat_id": "dmitry", "sender_id": "dmitry"},
+            "telegram",
+            id="numeric_sender_required",
+        ),
+        pytest.param(
+            {"recipient": "Marina"}, {}, "telegram", id="recipient_rejected"
+        ),
+        pytest.param(
+            {"recipient": None}, {}, "telegram", id="explicit_null_recipient_rejected"
+        ),
+        pytest.param(
+            {"read_recipient_wellness": True},
+            {},
+            "telegram",
+            id="wellness_rejected",
+        ),
+    ],
+)
+async def test_create_explicit_delivery_validation_boundaries(
+    tmp_path: Path,
+    input_overrides: dict,
+    ctx_overrides: dict,
+    channel: str,
+) -> None:
+    store, tool = _create_tool(
+        tmp_path,
+        contacts=_contacts(tmp_path),
+        wellness=_wellness(),
+    )
+    values = {
+        "summary": "conditional check",
+        "dtstart": _future_iso(),
+        "mode": "agentic",
+        "delivery": "explicit",
+        **input_overrides,
+    }
+    ctx_values = {"chat_id": "100", "sender_id": "100|dmitry", **ctx_overrides}
+    ctx = _reminder_ctx(**ctx_values)
+    ctx["ohmo_reminder_ctx"]["channel"] = channel
+
+    result = await tool.execute(RemindCreateInput(**values), _ctx(ctx, tmp_path))
+
+    assert result.is_error
+    assert store.load() == []
 
 
 async def test_create_with_exact_recipient_binds_and_persists(tmp_path: Path) -> None:

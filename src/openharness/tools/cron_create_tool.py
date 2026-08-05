@@ -20,15 +20,27 @@ class CronCreateToolInput(BaseModel):
             "'0 9 * * 1-5' for weekdays at 9am)"
         ),
     )
-    command: str | None = Field(default=None, description="Shell command to run when triggered")
-    message: str | None = Field(default=None, description="Instruction for an agent_turn cron job")
+    command: str | None = Field(
+        default=None,
+        description="Machine/background shell command to run when triggered.",
+    )
+    message: str | None = Field(
+        default=None,
+        description=(
+            "Instruction for a headless agent_turn cron job. This runs in the "
+            "background and is not a user-facing chat reply; in an ohmo gateway "
+            "chat use remind_create instead."
+        ),
+    )
     timezone: str | None = Field(default=None, description="IANA timezone for interpreting cron schedule")
     cwd: str | None = Field(default=None, description="Optional working directory override")
     enabled: bool = Field(default=True, description="Whether the job is active")
     payload: dict[str, Any] | None = Field(
         default=None,
         description=(
-            "Optional nanobot-style payload. Example: "
+            "Optional headless nanobot-style payload for background work; it is "
+            "not a user-facing chat delivery. In an ohmo gateway chat use "
+            "remind_create instead. Example: "
             "{'kind': 'agent_turn', 'message': 'check GitHub', 'deliver': True, 'channel': 'feishu', 'to': 'ou_xxx'}."
         ),
     )
@@ -46,8 +58,11 @@ class CronCreateTool(BaseTool):
 
     name = "cron_create"
     description = (
-        "Create or replace a local cron job with a standard cron expression. "
-        "Use 'oh cron start' to run the scheduler daemon."
+        "Create or replace a background cron job with a standard cron expression. "
+        "Use 'command' for machine work or 'message'/'payload' for a headless "
+        "agent_turn; neither produces a user-facing chat reply. In an ohmo gateway "
+        "chat use remind_create for reminders. Use 'oh cron start' to run the "
+        "scheduler daemon."
     )
     input_model = CronCreateToolInput
 
@@ -67,6 +82,30 @@ class CronCreateTool(BaseTool):
             )
         if not validate_timezone(arguments.timezone):
             return ToolResult(output=f"Invalid timezone: {arguments.timezone!r}", is_error=True)
+
+        # The scheduler gives an explicit command precedence over any payload.
+        # Classify the effective job using that same precedence, while accepting
+        # harmless case/whitespace variations in gateway input.
+        requests_agent_turn = False
+        if not arguments.command:
+            if arguments.message is not None:
+                requests_agent_turn = True
+            elif arguments.payload is not None:
+                requested_payload_kind = str(
+                    arguments.payload.get("kind", "agent_turn")
+                ).strip().casefold()
+                requests_agent_turn = requested_payload_kind == "agent_turn"
+        if "ohmo_reminder_ctx" in context.metadata and requests_agent_turn:
+            return ToolResult(
+                output=(
+                    "Agent-turn cron jobs are not available in an ohmo gateway "
+                    "chat because cron output is not delivered as a chat reply. "
+                    "Use remind_create instead (delivery='explicit' for a "
+                    "conditionally silent current-chat reminder). Machine command "
+                    "cron jobs remain available through cron_create."
+                ),
+                is_error=True,
+            )
 
         payload = dict(arguments.payload or {})
         if arguments.message:

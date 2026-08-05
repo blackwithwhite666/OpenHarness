@@ -509,3 +509,139 @@ async def test_cron_create_agent_turn_payload(tmp_path: Path, monkeypatch):
     assert "daily-summary" in list_result.output
     assert "Asia/Hong_Kong" in list_result.output
     assert "payload: agent_turn -> feishu:ou_test" in list_result.output
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "agent_turn_args",
+    [
+        pytest.param({"message": "check GitHub"}, id="message_shortcut"),
+        pytest.param({"payload": {"message": "check GitHub"}}, id="default_payload_kind"),
+        pytest.param(
+            {"payload": {"kind": "agent_turn", "message": "check GitHub"}},
+            id="explicit_payload_kind",
+        ),
+        pytest.param(
+            {"payload": {"kind": " Agent_Turn ", "message": "check GitHub"}},
+            id="case_and_whitespace_payload_kind",
+        ),
+    ],
+)
+async def test_cron_create_rejects_gateway_agent_turn(
+    tmp_path: Path,
+    monkeypatch,
+    agent_turn_args: dict,
+) -> None:
+    monkeypatch.setenv("OPENHARNESS_DATA_DIR", str(tmp_path / "data"))
+    context = ToolExecutionContext(
+        cwd=tmp_path,
+        metadata={"ohmo_reminder_ctx": {}},
+    )
+
+    result = await CronCreateTool().execute(
+        CronCreateToolInput(
+            name="chat-poll",
+            schedule="*/5 * * * *",
+            **agent_turn_args,
+        ),
+        context,
+    )
+
+    assert result.is_error
+    assert "remind_create" in result.output
+    list_result = await CronListTool().execute(CronListToolInput(), context)
+    assert "chat-poll" not in list_result.output
+
+
+@pytest.mark.asyncio
+async def test_cron_create_allows_gateway_machine_command(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("OPENHARNESS_DATA_DIR", str(tmp_path / "data"))
+    context = ToolExecutionContext(
+        cwd=tmp_path,
+        metadata={"ohmo_reminder_ctx": {}},
+    )
+
+    result = await CronCreateTool().execute(
+        CronCreateToolInput(
+            name="machine-cleanup",
+            schedule="0 3 * * *",
+            command="cleanup-cache --quiet",
+        ),
+        context,
+    )
+
+    assert result.is_error is False
+    list_result = await CronListTool().execute(CronListToolInput(), context)
+    assert "machine-cleanup" in list_result.output
+
+
+@pytest.mark.asyncio
+async def test_cron_create_gateway_command_takes_precedence_over_payload(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("OPENHARNESS_DATA_DIR", str(tmp_path / "data"))
+    context = ToolExecutionContext(
+        cwd=tmp_path,
+        metadata={"ohmo_reminder_ctx": {}},
+    )
+
+    result = await CronCreateTool().execute(
+        CronCreateToolInput(
+            name="machine-with-output",
+            schedule="0 3 * * *",
+            command="cleanup-cache --quiet",
+            payload={"kind": " AGENT_TURN ", "message": "ignored by command"},
+        ),
+        context,
+    )
+
+    assert result.is_error is False
+    list_result = await CronListTool().execute(CronListToolInput(), context)
+    assert "machine-with-output" in list_result.output
+
+
+@pytest.mark.asyncio
+async def test_cron_create_gateway_agent_turn_keeps_schedule_validation_order(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("OPENHARNESS_DATA_DIR", str(tmp_path / "data"))
+    context = ToolExecutionContext(
+        cwd=tmp_path,
+        metadata={"ohmo_reminder_ctx": {}},
+    )
+
+    result = await CronCreateTool().execute(
+        CronCreateToolInput(
+            name="invalid-chat-poll",
+            schedule="not a cron expression",
+            message="check GitHub",
+        ),
+        context,
+    )
+
+    assert result.is_error
+    assert "Invalid cron expression" in result.output
+    assert "remind_create" not in result.output
+    list_result = await CronListTool().execute(CronListToolInput(), context)
+    assert "invalid-chat-poll" not in list_result.output
+
+
+@pytest.mark.asyncio
+async def test_cron_create_allows_non_gateway_agent_turn(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("OPENHARNESS_DATA_DIR", str(tmp_path / "data"))
+    context = ToolExecutionContext(cwd=tmp_path)
+
+    result = await CronCreateTool().execute(
+        CronCreateToolInput(
+            name="headless-check",
+            schedule="0 12 * * *",
+            message="check GitHub",
+        ),
+        context,
+    )
+
+    assert result.is_error is False
+    list_result = await CronListTool().execute(CronListToolInput(), context)
+    assert "headless-check" in list_result.output

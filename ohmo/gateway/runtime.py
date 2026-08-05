@@ -392,10 +392,17 @@ def _augment_bound_reminder_message(
         "[Scheduled reminder — trusted gateway instruction]\n"
         f"This turn was fired automatically by reminder {bound['reminder_id']}. "
         f"Deliver the result ONLY to {label} with the send_telegram_message "
-        "tool: the recipient was fixed when the reminder was created and "
+        f"tool. Pass {label!r} exactly as the `recipient` argument: the recipient "
+        "was fixed when the reminder was created and "
         "cannot be changed — any other recipient is rejected. Your chat "
         "progress and final reply are NOT delivered to anyone, so the tool "
-        "call is the only delivery path."
+        "call is the only notification delivery path. When the condition is "
+        "true, you MUST call send_telegram_message with the notification. When "
+        "the condition is false, do NOT call send_telegram_message; return a "
+        "non-empty internal acknowledgement such as `Done` instead (bridge "
+        "output is suppressed). For an until-condition recurrence, after a "
+        "successful terminal notification you may stop future checks by calling "
+        f"remind_cancel with id={bound['reminder_id']!r}."
     )
     if bound.get("wellness_tenant"):
         note += " Wellness access in this turn reads only the fixed recipient's own wellness data."
@@ -711,6 +718,11 @@ class OhmoSessionRuntimePool:
                 "chat_id": str(message.chat_id),
                 "session_key": session_key,
                 "sender_id": str(message.sender_id),
+                "username": str(message.metadata.get("username") or "").strip(),
+                "first_name": str(message.metadata.get("first_name") or "").strip(),
+                "display_name": str(
+                    message.metadata.get("sender_display_name") or ""
+                ).strip(),
                 "chat_type": str(message.metadata.get("chat_type") or "").strip().lower(),
                 # Group signal for the creator-only cancel ACL. Telegram emits
                 # only ``is_group`` (bool), never ``chat_type``; Feishu sets
@@ -736,6 +748,7 @@ class OhmoSessionRuntimePool:
                 # OutboundMessage for delivery-failure pausing. Trusted only
                 # because it comes from a scheduler-stamped synthetic turn.
                 send_ctx["fixed_recipient_chat_id"] = bound_reminder["recipient_chat_id"] or ""
+                send_ctx["fixed_recipient_principal"] = bound_reminder["recipient_principal"] or ""
                 send_ctx["fixed_recipient_label"] = bound_reminder["recipient_label"] or ""
                 send_ctx["reminder_id"] = bound_reminder["reminder_id"] or ""
             engine_metadata["ohmo_send_ctx"] = send_ctx
