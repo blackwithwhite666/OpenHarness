@@ -565,22 +565,10 @@ class NutritionIngestCoordinator:
                         message_id=self._safe_message_id(message.id),
                         kind="sha256",
                     )
-                candidate_phash = candidate.get("phash")
-                candidate_algorithm = candidate.get("phash_algorithm")
-                phash = fingerprint.get("phash")
-                algorithm = fingerprint.get("phash_algorithm")
-                if (
-                    candidate_phash is not None
-                    and isinstance(phash, str)
-                    and phash == candidate_phash
-                    and isinstance(algorithm, str)
-                    and algorithm == candidate_algorithm
-                ):
-                    return _DuplicateMatch(
-                        message_id=self._safe_message_id(message.id),
-                        kind="phash",
-                        phash_algorithm=algorithm,
-                    )
+                # The offline image corpus did not establish a zero-FP
+                # perceptual threshold at the required real recall. Keep
+                # perceptual metadata for compatibility/audit, but fail
+                # closed to exact SHA-256 until a reviewed threshold exists.
         return None
 
     def _trusted_message_fingerprints(

@@ -1369,7 +1369,7 @@ async def test_exact_sha_duplicate_becomes_seen_and_writes_owner_only_tombstone(
 
 
 @pytest.mark.asyncio
-async def test_same_algorithm_phash_matches_but_different_algorithm_does_not(
+async def test_phash_metadata_does_not_match_without_safe_threshold(
     tmp_path: Path,
 ) -> None:
     data = _png((50, 100, 150))
@@ -1401,25 +1401,6 @@ async def test_same_algorithm_phash_matches_but_different_algorithm_does_not(
         chat_id="123",
         session_key="telegram:123",
     )
-    coordinator = NutritionIngestCoordinator(config, honcho_client=source, now=_Clock())
-    await coordinator.poll_once()
-    tombstone_path = tmp_path / "_seen" / f"{first}.json"
-    assert not (tmp_path / first).exists()
-    tombstone = json.loads(tombstone_path.read_text())
-    assert tombstone["terminal_reason"] == "duplicate_honcho"
-    assert tombstone["matching_fingerprint_kind"] == "phash"
-    assert tombstone["phash_algorithm"] == PHASH_ALGORITHM
-
-    second = _candidate(
-        tmp_path,
-        file_id="id:phash-other",
-        rev="rev:phash-other",
-        data=data,
-        filename="photo.png",
-    )
-    source.messages = [
-        _recent_message([{"phash": descriptor["phash"], "phash_algorithm": "other-v1"}])
-    ]
     outbound = []
     coordinator = NutritionIngestCoordinator(
         config,
@@ -1428,8 +1409,9 @@ async def test_same_algorithm_phash_matches_but_different_algorithm_does_not(
         now=_Clock(),
     )
     await coordinator.poll_once()
+    assert (tmp_path / first).is_dir()
     assert len(outbound) == 1
-    assert outbound[0].metadata["_nutrition_candidate_id"] == second
+    assert outbound[0].metadata["_nutrition_candidate_id"] == first
 
 
 @pytest.mark.asyncio
