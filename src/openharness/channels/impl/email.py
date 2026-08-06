@@ -16,7 +16,7 @@ from email.utils import parseaddr
 from typing import Any
 
 
-from openharness.channels.bus.events import OutboundMessage
+from openharness.channels.bus.events import OutboundDeliveryReceipt, OutboundMessage
 from openharness.channels.bus.queue import MessageBus
 from openharness.channels.impl.base import BaseChannel
 from openharness.config.schema import EmailConfig
@@ -105,7 +105,7 @@ class EmailChannel(BaseChannel):
         """Stop polling loop."""
         self._running = False
 
-    async def send(self, msg: OutboundMessage) -> None:
+    async def send(self, msg: OutboundMessage) -> "OutboundDeliveryReceipt | None":
         """Send email via SMTP."""
         if not self.config.consent_granted:
             logger.warning("Skip email send: consent_granted is false")

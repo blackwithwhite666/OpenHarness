@@ -1,0 +1,44 @@
+{
+  "provider_profile": "codex",
+  "enabled_channels": ["telegram"],
+  "session_routing": "chat-thread",
+  "send_progress": true,
+  "send_tool_hints": true,
+  "permission_mode": "default",
+  "sandbox_enabled": false,
+  "log_level": "INFO",
+  "channel_configs": {
+    "telegram": {
+      "enabled": true
+    }
+  },
+  "default_tz": "Europe/Moscow",
+  "memory_backend": "file",
+  "conversation_learning": true,
+  "owner_principals": [],
+  "family_principals": {
+    "999999999": "marina"
+  },
+  "enabled_memory_tenants": ["marina"],
+  "tenant_honcho": {
+    "marina": {
+      "workspace": "${MARINA_HONCHO_WORKSPACE}",
+      "api_key": "${MARINA_HONCHO_API_KEY}",
+      "observed_peer": "${MARINA_HONCHO_OBSERVED_PEER}"
+    }
+  },
+  "nutrition_ingest": {
+    "enabled": false,
+    "synchronized_root": "${NUTRITION_ASSETS_ROOT}",
+    "principal": "${MARINA_TELEGRAM_PRINCIPAL}",
+    "chat_id": "${MARINA_TELEGRAM_PRIVATE_CHAT_ID}",
+    "session_key": "telegram:${MARINA_TELEGRAM_PRINCIPAL}",
+    "tenant_id": "marina",
+    "locale": "ru",
+    "poll_interval_seconds": 10.0,
+    "max_prompt_attempts": 3,
+    "max_estimation_attempts": 5,
+    "retry_backoff_seconds": 5.0,
+    "require_owner_only_filesystem": true
+  }
+}

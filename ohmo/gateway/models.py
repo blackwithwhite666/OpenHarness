@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import re
+import stat
+from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 _TENANT_ID_RE = re.compile(r"[a-z0-9_-]+")
-_NUMERIC_PRINCIPAL_RE = re.compile(r"[0-9]+")
+_NUMERIC_PRINCIPAL_RE = re.compile(r"[1-9][0-9]*")
 
 
 class GatewayConfig(BaseModel):
@@ -52,6 +54,7 @@ class GatewayConfig(BaseModel):
     honcho_api_key: str | None = None
     honcho_workspace: str | None = None
     tenant_honcho: dict[str, dict[str, str]] = Field(default_factory=dict)
+    nutrition_ingest: "NutritionIngestConfig" = Field(default_factory=lambda: NutritionIngestConfig())
 
     @model_validator(mode="after")
     def validate_memory_tenant_config(self) -> GatewayConfig:
@@ -96,7 +99,88 @@ class GatewayConfig(BaseModel):
         if overlap:
             raise ValueError("numeric principals cannot map to both owner and family tenants")
 
+        self.nutrition_ingest.validate_runtime(self)
         return self
+
+
+class NutritionIngestConfig(BaseModel):
+    """Fail-closed, Marina-only Dropbox confirmation configuration."""
+
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
+
+    enabled: bool = False
+    synchronized_root: Path | None = None
+    principal: str = ""
+    chat_id: str = ""
+    session_key: str = ""
+    tenant_id: Literal["marina"] = "marina"
+    locale: Literal["ru"] = "ru"
+    poll_interval_seconds: float = Field(default=10.0, gt=0, le=3600)
+    max_prompt_attempts: int = Field(default=3, ge=1, le=20)
+    max_estimation_attempts: int = Field(default=5, ge=1, le=20)
+    retry_backoff_seconds: float = Field(default=5.0, ge=0, le=3600)
+    require_owner_only_filesystem: bool = True
+
+    @property
+    def canonical_principal(self) -> str:
+        return self.principal
+
+    @property
+    def private_chat_id(self) -> str:
+        return self.chat_id
+
+    @property
+    def exact_session_key(self) -> str:
+        return self.session_key
+
+    @property
+    def root(self) -> Path | None:
+        return self.synchronized_root
+
+    @model_validator(mode="after")
+    def validate_enabled_binding(self) -> "NutritionIngestConfig":
+        if not self.enabled:
+            return self
+        if not re.fullmatch(r"[1-9][0-9]*", self.principal):
+            raise ValueError("nutrition_ingest principal must be canonical numeric")
+        if not re.fullmatch(r"[1-9][0-9]*", self.chat_id):
+            raise ValueError("nutrition_ingest private chat id must be a positive numeric id")
+        if self.chat_id != self.principal:
+            raise ValueError("nutrition_ingest chat_id must equal the principal")
+        if self.session_key != f"telegram:{self.principal}":
+            raise ValueError("nutrition_ingest session_key must match the private Telegram chat")
+        if self.synchronized_root is None:
+            raise ValueError("nutrition_ingest synchronized_root is required")
+        return self
+
+    def validate_runtime(self, gateway: GatewayConfig) -> None:
+        """Validate cross-config and filesystem invariants at service startup."""
+        if not self.enabled:
+            return
+        if gateway.conversation_learning is not True:
+            raise ValueError("nutrition ingest requires conversation learning")
+        if gateway.family_principals.get(self.principal) != "marina":
+            raise ValueError("nutrition ingest principal is not bound to marina")
+        if self.tenant_id not in gateway.enabled_memory_tenants:
+            raise ValueError("nutrition ingest Marina tenant is not enabled")
+        binding = gateway.tenant_honcho.get("marina")
+        if not binding or not all(
+            isinstance(binding.get(key), str) and binding.get(key, "").strip()
+            for key in ("workspace", "api_key", "observed_peer")
+        ):
+            raise ValueError("tenant_honcho marina binding is incomplete")
+        root = self.synchronized_root.expanduser().resolve()
+        if not root.is_dir():
+            raise ValueError("nutrition ingest synchronized_root must be a directory")
+        if self.require_owner_only_filesystem:
+            paths = [root, *root.rglob("*")]
+            for path in paths:
+                try:
+                    mode = path.stat().st_mode
+                except OSError as exc:
+                    raise ValueError("nutrition ingest filesystem is not readable") from exc
+                if stat.S_IMODE(mode) & 0o077:
+                    raise ValueError("nutrition ingest filesystem must be owner-only")
 
 
 class GatewayState(BaseModel):

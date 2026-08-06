@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from typing import Any
 
 
-from openharness.channels.bus.events import OutboundMessage
+from openharness.channels.bus.events import OutboundDeliveryReceipt, OutboundMessage
 from openharness.channels.bus.queue import MessageBus
 from openharness.channels.impl.base import BaseChannel
 from openharness.channels.impl.base import resolve_channel_media_dir
@@ -1061,7 +1061,7 @@ class FeishuChannel(BaseChannel):
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, self._rename_group_sync, chat_id, name)
 
-    async def send(self, msg: OutboundMessage) -> None:
+    async def send(self, msg: OutboundMessage) -> "OutboundDeliveryReceipt | None":
         """Send a message through Feishu, including media (images/files) if present."""
         if not self._ensure_rest_client():
             logger.warning("Feishu client not initialized")

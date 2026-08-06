@@ -7,7 +7,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from openharness.channels.bus.events import InboundMessage, OutboundMessage
+from openharness.channels.bus.events import InboundMessage, OutboundDeliveryReceipt, OutboundMessage
 from openharness.channels.bus.queue import MessageBus
 from openharness.config.paths import get_data_dir
 
@@ -95,7 +95,7 @@ class BaseChannel(ABC):
         pass
 
     @abstractmethod
-    async def send(self, msg: OutboundMessage) -> None:
+    async def send(self, msg: OutboundMessage) -> OutboundDeliveryReceipt | None:
         """
         Send a message through this channel.
 

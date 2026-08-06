@@ -12,6 +12,7 @@ from time import perf_counter
 from typing import TYPE_CHECKING, Mapping, Protocol, Sequence, cast
 
 import numpy as np
+import httpx
 from numpy.typing import NDArray
 
 from openharness.untrusted import UNTRUSTED_BANNER
@@ -67,6 +68,28 @@ class TenantHonchoBinding:
     api_key: str
     workspace: str
     observed_peer: str
+
+
+@dataclass(frozen=True, slots=True)
+class ConversationAppendReceipt:
+    """Durable ids for one ordered user/assistant Honcho exchange."""
+
+    user_message_id: str
+    assistant_message_id: str
+    user_client_op_id: str
+    assistant_client_op_id: str
+
+    @property
+    def user_id(self) -> str:
+        return self.user_message_id
+
+    @property
+    def assistant_id(self) -> str:
+        return self.assistant_message_id
+
+
+class NutritionReconciliationError(RuntimeError):
+    """Honcho contained no unambiguous trusted result for a retry."""
 
 
 def resolve_tenant_honcho_binding(
@@ -873,17 +896,40 @@ class ShadowMemoryBackend(MemoryBackend):
         *,
         user_metadata: Mapping[str, object],
         assistant_metadata: Mapping[str, object],
-    ) -> None:
+        durable: bool = False,
+        trusted_nutrition: bool = False,
+        nutrition: bool | None = None,
+    ) -> ConversationAppendReceipt | None:
+        if nutrition is not None:
+            trusted_nutrition = trusted_nutrition or nutrition
         honcho_client = self._honcho_client
         if not self._conversation_learning or honcho_client is None:
             await self._base.append_turn("user", user_text)
             await self._base.append_turn("assistant", assistant_text)
-            return
+            if durable or trusted_nutrition:
+                raise NutritionReconciliationError("durable nutrition ingestion is unavailable")
+            return None
 
         user_metadata_mapping = dict(user_metadata)
         assistant_metadata_mapping = dict(assistant_metadata)
         user_metadata_mapping["role"] = "user"
         assistant_metadata_mapping["role"] = "assistant"
+        is_trusted_nutrition = trusted_nutrition or bool(
+            assistant_metadata_mapping.get("_nutrition_trusted")
+        )
+        if is_trusted_nutrition:
+            _validate_trusted_nutrition_metadata(
+                user_metadata_mapping,
+                assistant_metadata_mapping,
+            )
+        if durable or is_trusted_nutrition:
+            return await self._append_exchange_durable(
+                honcho_client,
+                user_text=user_text,
+                assistant_text=assistant_text,
+                user_metadata=user_metadata_mapping,
+                assistant_metadata=assistant_metadata_mapping,
+            )
         task = asyncio.create_task(
             self._ingest_exchange(
                 user_text=user_text,
@@ -895,6 +941,111 @@ class ShadowMemoryBackend(MemoryBackend):
         )
         self._pending.add(task)
         task.add_done_callback(self._pending.discard)
+        return None
+
+    async def _append_exchange_durable(
+        self,
+        honcho_client: HonchoClient,
+        *,
+        user_text: str,
+        assistant_text: str,
+        user_metadata: Mapping[str, object],
+        assistant_metadata: Mapping[str, object],
+    ) -> ConversationAppendReceipt:
+        user_op = _required_client_op_id(user_metadata, "user")
+        assistant_op = _required_client_op_id(assistant_metadata, "assistant")
+        async with self._ingest_lock:
+            existing_assistant = await self._find_unique_operation(
+                honcho_client, assistant_op, expected_role="assistant"
+            )
+            existing_user = await self._find_unique_operation(
+                honcho_client, user_op, expected_role="user"
+            )
+            if existing_assistant is not None:
+                if existing_user is None:
+                    raise NutritionReconciliationError(
+                        "assistant operation exists without its paired user message"
+                    )
+                return ConversationAppendReceipt(
+                    user_message_id=existing_user.id,
+                    assistant_message_id=existing_assistant.id,
+                    user_client_op_id=user_op,
+                    assistant_client_op_id=assistant_op,
+                )
+
+            messages: list[dict[str, object]] = []
+            if existing_user is None:
+                messages.append(
+                    {"content": user_text, "peer_id": self._observed, "metadata": dict(user_metadata)}
+                )
+            messages.append(
+                {
+                    "content": assistant_text,
+                    "peer_id": self._assistant_peer,
+                    "metadata": dict(assistant_metadata),
+                }
+            )
+            try:
+                created = await honcho_client.create_messages(self._session, messages)
+            except (TimeoutError, asyncio.TimeoutError, httpx.TimeoutException):
+                # The server may have committed the batch before the client
+                # timed out. Reconcile the stable assistant operation before
+                # allowing a retry to append anything.
+                created_assistant = await self._find_unique_operation(
+                    honcho_client, assistant_op, expected_role="assistant"
+                )
+                created_user = await self._find_unique_operation(
+                    honcho_client, user_op, expected_role="user"
+                )
+                if created_assistant is None or created_user is None:
+                    raise
+                return ConversationAppendReceipt(
+                    user_message_id=created_user.id,
+                    assistant_message_id=created_assistant.id,
+                    user_client_op_id=user_op,
+                    assistant_client_op_id=assistant_op,
+                )
+
+            expected_count = len(messages)
+            if len(created) != expected_count:
+                raise NutritionReconciliationError("Honcho returned an incomplete message batch")
+            by_role = {str(item.metadata.get("role")): item for item in created}
+            user_message = existing_user or by_role.get("user")
+            assistant_message = by_role.get("assistant")
+            if user_message is None or assistant_message is None:
+                raise NutritionReconciliationError("Honcho response omitted a paired message")
+            return ConversationAppendReceipt(
+                user_message_id=user_message.id,
+                assistant_message_id=assistant_message.id,
+                user_client_op_id=user_op,
+                assistant_client_op_id=assistant_op,
+            )
+
+    async def _find_unique_operation(
+        self,
+        honcho_client: HonchoClient,
+        client_op_id: str,
+        *,
+        expected_role: str,
+    ):
+        matches = await honcho_client.find_messages_by_client_op_id(
+            self._session, client_op_id
+        )
+        if len(matches) > 1:
+            raise NutritionReconciliationError(
+                f"ambiguous Honcho operation {client_op_id!r}"
+            )
+        if not matches:
+            return None
+        message = matches[0]
+        if (
+            message.metadata.get("client_op_id") != client_op_id
+            or message.metadata.get("role") != expected_role
+        ):
+            raise NutritionReconciliationError(
+                f"malformed Honcho operation {client_op_id!r}"
+            )
+        return message
 
     async def await_pending(self) -> None:
         """Drain all shadow work scheduled before or while this call runs."""
@@ -1037,6 +1188,58 @@ class ShadowMemoryBackend(MemoryBackend):
 
 def _embedding_text(record: CatalogRecord) -> str:
     return f"{record.title}\n{record.content}"
+
+
+_TRUSTED_NUTRITION_KEYS = frozenset(
+    {
+        "_nutrition_trusted",
+        "ingest_source",
+        "confirmation_required",
+        "candidate_id",
+        "nutrition_phase",
+        "client_op_id",
+    }
+)
+
+
+def _required_client_op_id(metadata: Mapping[str, object], role: str) -> str:
+    value = metadata.get("client_op_id")
+    if not isinstance(value, str) or not value.strip():
+        raise NutritionReconciliationError(f"{role} client_op_id is required")
+    return value.strip()
+
+
+def _validate_trusted_nutrition_metadata(
+    user_metadata: Mapping[str, object],
+    assistant_metadata: Mapping[str, object],
+) -> None:
+    if user_metadata.get("_nutrition_trusted") is not True:
+        raise NutritionReconciliationError("nutrition provenance is not coordinator-trusted")
+    if assistant_metadata.get("_nutrition_trusted") is not True:
+        raise NutritionReconciliationError("nutrition assistant provenance is not coordinator-trusted")
+    if user_metadata.get("ingest_source") != "dropbox_camera" or assistant_metadata.get(
+        "ingest_source"
+    ) != "dropbox_camera":
+        raise NutritionReconciliationError("unsupported nutrition ingest source")
+    if user_metadata.get("tenant_id") != "marina" or assistant_metadata.get("tenant_id") != "marina":
+        raise NutritionReconciliationError("nutrition provenance is not Marina-bound")
+    principal = user_metadata.get("source_principal")
+    if not isinstance(principal, str) or not principal.startswith("telegram:"):
+        raise NutritionReconciliationError("nutrition provenance has no Telegram principal")
+    if user_metadata.get("confirmation_required") is not True or assistant_metadata.get(
+        "confirmation_required"
+    ) is not True:
+        raise NutritionReconciliationError("nutrition confirmation is required")
+    candidate = user_metadata.get("candidate_id")
+    if not isinstance(candidate, str) or candidate != assistant_metadata.get("candidate_id"):
+        raise NutritionReconciliationError("nutrition candidate identity mismatch")
+    phase = user_metadata.get("nutrition_phase")
+    if phase != "estimation" or assistant_metadata.get("nutrition_phase") != phase:
+        raise NutritionReconciliationError("nutrition phase must be estimation")
+    if assistant_metadata.get("client_op_id") != f"{candidate}:meal-observation:v1":
+        raise NutritionReconciliationError("nutrition assistant operation is not candidate-bound")
+    if user_metadata.get("client_op_id") == assistant_metadata.get("client_op_id"):
+        raise NutritionReconciliationError("paired nutrition operation ids must differ")
 
 
 def _embedding_is_current(

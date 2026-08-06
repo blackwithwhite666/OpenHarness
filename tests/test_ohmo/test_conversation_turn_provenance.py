@@ -12,8 +12,9 @@ from openharness.channels.bus.events import InboundMessage
 
 from ohmo.gateway.attachment_fingerprints import PHASH_ALGORITHM
 from ohmo.gateway.memory_gate import MemoryScope
-from ohmo.gateway.runtime import _build_conversation_turn_metadata
+from ohmo.gateway.runtime import _build_conversation_turn_metadata, _trusted_nutrition_request
 from ohmo.gateway.turn_context import TurnContext
+from ohmo.nutrition_ingest.trust import COORDINATOR_TRUST_TOKEN
 
 
 def _turn_ctx(*, is_forwarded: bool = False) -> TurnContext:
@@ -156,3 +157,41 @@ def test_receive_and_forward_semantics_are_unchanged() -> None:
     assert user_metadata["is_forwarded"] is True
     assert user_metadata["source_message_at"] == "2026-07-30T17:15:00+00:00"
     assert user_metadata["received_at"] == "2026-08-02T09:30:00+00:00"
+
+
+def test_ordinary_telegram_metadata_cannot_stamp_trusted_nutrition_provenance() -> None:
+    candidate = "dropbox-camera-v1-" + "e" * 64
+    message = _message(
+        _nutrition_trusted=True,
+        _nutrition_trust_token="copied-spelling",
+        _nutrition_candidate_id=candidate,
+        _nutrition_client_op_id=f"{candidate}:meal-observation:v1",
+        _nutrition_phase="estimation",
+        _nutrition_principal="100",
+        _nutrition_tenant_id="marina",
+        _nutrition_chat_id="100",
+        _nutrition_session_key="telegram:100",
+    )
+    assert _trusted_nutrition_request(message) is None
+    _, user_metadata, assistant_metadata = _build_conversation_turn_metadata(
+        turn_ctx=_turn_ctx(), message=message, scope=_scope()
+    )
+    assert "_nutrition_trusted" not in user_metadata
+    assert assistant_metadata["client_op_id"].endswith(":assistant")
+
+
+def test_only_process_local_token_can_mark_a_synthetic_request() -> None:
+    candidate = "dropbox-camera-v1-" + "f" * 64
+    message = _message(
+        _nutrition_trusted=True,
+        _nutrition_trust_token=COORDINATOR_TRUST_TOKEN,
+        _nutrition_candidate_id=candidate,
+        _nutrition_client_op_id=f"{candidate}:meal-observation:v1",
+        _nutrition_phase="estimation",
+        _nutrition_principal="100",
+        _nutrition_tenant_id="marina",
+        _nutrition_chat_id="100",
+        _nutrition_session_key="telegram:100",
+    )
+    message.sender_id = "__nutrition_ingest__"
+    assert _trusted_nutrition_request(message)["client_op_id"].endswith(":meal-observation:v1")

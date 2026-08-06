@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from openharness.channels.bus.events import OutboundDeliveryReceipt
 from openharness.channels.impl.base import BaseChannel
 
 
@@ -16,7 +17,7 @@ class _FakeChannel(BaseChannel):
 
     async def start(self) -> None: ...
     async def stop(self) -> None: ...
-    async def send(self, *args, **kwargs) -> None: ...
+    async def send(self, *args, **kwargs) -> OutboundDeliveryReceipt | None: ...
 
 
 def test_allow_from_at_prefixed_username_matches():

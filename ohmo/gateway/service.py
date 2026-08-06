@@ -25,6 +25,7 @@ from ohmo.gateway.bridge import OhmoGatewayBridge
 from ohmo.gateway.config import build_channel_manager_config, load_gateway_config
 from ohmo.gateway.models import GatewayState
 from ohmo.gateway.runtime import OhmoSessionRuntimePool
+from ohmo.nutrition_ingest.coordinator import NutritionIngestCoordinator
 from ohmo.reminders.scheduler import ReminderScheduler
 from ohmo.workspace import (
     get_gateway_interrupted_requests_path,
@@ -60,6 +61,7 @@ class OhmoGatewayService:
             build_channel_manager_config(self._config),
             self._bus,
             on_send_failure=self._on_outbound_send_failure,
+            on_send_success=self._on_outbound_send_success,
         )
         self._runtime_pool = OhmoSessionRuntimePool(
             cwd=self._cwd,
@@ -80,6 +82,11 @@ class OhmoGatewayService:
             lock=self._runtime_pool._reminder_lock,
             catchup=self._config.reminder_catchup,
         )
+        self._nutrition_coordinator = NutritionIngestCoordinator(
+            self._config.nutrition_ingest,
+            publish_outbound=self._bus.publish_outbound,
+            runtime_pool=self._runtime_pool,
+        )
         self._bridge = OhmoGatewayBridge(
             bus=self._bus,
             runtime_pool=self._runtime_pool,
@@ -95,6 +102,7 @@ class OhmoGatewayService:
             compact_progress_default=self._config.compact_progress_default,
             compact_progress_chats=self._config.compact_progress_chats,
             verbose_progress_chats=self._config.verbose_progress_chats,
+            nutrition_coordinator=self._nutrition_coordinator,
         )
 
     @property
@@ -184,8 +192,13 @@ class OhmoGatewayService:
         (per the locked design) instead of re-firing every occurrence forever."""
         reminder_id = (msg.metadata or {}).get("_reminder_id")
         if not reminder_id:
+            await self._nutrition_coordinator.on_send_failure(msg, error)
             return
         await self._reminder_scheduler.handle_delivery_failure(str(reminder_id), error)
+        await self._nutrition_coordinator.on_send_failure(msg, error)
+
+    async def _on_outbound_send_success(self, msg, receipt) -> None:
+        await self._nutrition_coordinator.on_send_success(msg, receipt)
 
     def _exec_restart(self) -> None:
         root = str(get_workspace_root(self._workspace))
@@ -302,6 +315,10 @@ class OhmoGatewayService:
             self._reminder_scheduler.run(),
             name="ohmo-gateway-reminder-scheduler",
         )
+        nutrition_task = asyncio.create_task(
+            self._nutrition_coordinator.run(),
+            name="ohmo-gateway-nutrition-ingest",
+        )
         stop_event = asyncio.Event()
         self._stop_event = stop_event
         self._restart_requested = False
@@ -350,6 +367,11 @@ class OhmoGatewayService:
                 scheduler_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await scheduler_task
+            self._nutrition_coordinator.stop()
+            if not nutrition_task.done():
+                nutrition_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await nutrition_task
             await self._runtime_pool.aclose()
             await self._manager.stop_all()
             self.write_state(running=False)

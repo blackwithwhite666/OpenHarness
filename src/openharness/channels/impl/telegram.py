@@ -34,7 +34,7 @@ from telegram.ext import (
 from telegram.error import BadRequest, RetryAfter
 from telegram.request import HTTPXRequest
 
-from openharness.channels.bus.events import OutboundMessage
+from openharness.channels.bus.events import OutboundDeliveryReceipt, OutboundMessage
 from openharness.channels.bus.queue import MessageBus
 from openharness.channels.impl.base import BaseChannel, resolve_channel_state_dir
 from openharness.channels.last_location import LastLocationStore
@@ -45,6 +45,7 @@ from openharness.utils.helpers import split_message
 logger = logging.getLogger(__name__)
 
 TELEGRAM_MAX_MESSAGE_LEN = 4000  # Telegram message character limit
+TELEGRAM_MAX_CAPTION_LEN = 1024  # Telegram photo/video caption character limit
 _TELEGRAM_URL_LOGGERS = ("httpx", "httpcore", "telegram.ext")
 
 # --- Compact progress (one live spinner-animated status message per turn) ------
@@ -388,6 +389,22 @@ def _convert_md_tables(text: str, save_block) -> str:
     return "\n".join(out)
 
 
+def _is_caption_formatting_bad_request(error: BadRequest) -> bool:
+    """Return whether Telegram rejected the caption's format or caption size."""
+    message = str(error).lower()
+    return any(
+        marker in message
+        for marker in (
+            "can't parse entities",
+            "cannot parse entities",
+            "can't find end of the entity",
+            "unsupported start tag",
+            "caption is too long",
+            "message caption is too long",
+        )
+    )
+
+
 def _markdown_to_telegram_html(text: str) -> str:
     """
     Convert markdown to Telegram-safe HTML.
@@ -677,6 +694,7 @@ class TelegramChannel(BaseChannel):
         chat_id: int,
         media_path: str,
         reply_parameters: ReplyParameters | None,
+        native_message_ids: list[int | str] | None = None,
     ) -> ReplyParameters | None:
         try:
             media_type = self._get_media_type(media_path)
@@ -692,25 +710,33 @@ class TelegramChannel(BaseChannel):
                 sender = self._app.bot.send_document
             param = media_type if media_type in ("photo", "video", "voice", "audio") else "document"
             with open(media_path, "rb") as f:
-                await sender(
+                sent = await sender(
                     chat_id=chat_id,
                     **{param: f},
                     reply_parameters=reply_parameters,
                 )
+            if native_message_ids is not None:
+                message_id = getattr(sent, "message_id", None)
+                if message_id is not None:
+                    native_message_ids.append(message_id)
             return None
         except Exception as e:
             filename = media_path.rsplit("/", 1)[-1]
             logger.error("Failed to send media %s: %s", media_path, e)
             try:
-                await self._app.bot.send_message(
+                fallback = await self._app.bot.send_message(
                     chat_id=chat_id,
                     text=f"[Failed to send: {filename}]",
                     reply_parameters=reply_parameters,
                 )
+                if native_message_ids is not None:
+                    message_id = getattr(fallback, "message_id", None)
+                    if message_id is not None:
+                        native_message_ids.append(message_id)
                 return None
             except Exception as fallback_error:
                 logger.error("Failed to send media failure notice for %s: %s", media_path, fallback_error)
-                return reply_parameters
+                raise fallback_error from e
 
     async def _send_media_group_batch(
         self,
@@ -719,12 +745,14 @@ class TelegramChannel(BaseChannel):
         bucket: str,
         media_paths: list[str],
         reply_parameters: ReplyParameters | None,
+        native_message_ids: list[int | str] | None = None,
     ) -> ReplyParameters | None:
         if len(media_paths) == 1:
             return await self._send_single_media(
                 chat_id=chat_id,
                 media_path=media_paths[0],
                 reply_parameters=reply_parameters,
+                native_message_ids=native_message_ids,
             )
         try:
             with contextlib.ExitStack() as stack:
@@ -732,11 +760,16 @@ class TelegramChannel(BaseChannel):
                     self._build_input_media(bucket, path, stack.enter_context(open(path, "rb")))
                     for path in media_paths
                 ]
-                await self._app.bot.send_media_group(
+                sent = await self._app.bot.send_media_group(
                     chat_id=chat_id,
                     media=media,
                     reply_parameters=reply_parameters,
                 )
+            if native_message_ids is not None:
+                for message in sent or []:
+                    message_id = getattr(message, "message_id", None)
+                    if message_id is not None:
+                        native_message_ids.append(message_id)
             return None
         except Exception as e:
             filenames = ", ".join(path.rsplit("/", 1)[-1] for path in media_paths)
@@ -746,20 +779,79 @@ class TelegramChannel(BaseChannel):
                     chat_id=chat_id,
                     media_path=media_path,
                     reply_parameters=reply_parameters,
+                    native_message_ids=native_message_ids,
                 )
             return reply_parameters
 
-    async def send(self, msg: OutboundMessage) -> None:
-        """Send a message through Telegram."""
+    @staticmethod
+    def _outbound_operation_id(msg: OutboundMessage) -> str | None:
+        """Read only coordinator-stamped operation metadata.
+
+        Public/model-authored ``operation_id`` keys are deliberately ignored.
+        """
+        for key in ("_trusted_outbound_operation_id", "_outbound_operation_id"):
+            value = msg.metadata.get(key)
+            if isinstance(value, str) and value:
+                return value
+        return None
+
+    def _receipt(
+        self, msg: OutboundMessage, native_message_ids: list[int | str]
+    ) -> OutboundDeliveryReceipt:
+        return OutboundDeliveryReceipt(
+            channel=self.name,
+            chat_id=str(msg.chat_id),
+            native_message_ids=tuple(native_message_ids),
+            outbound_operation_id=self._outbound_operation_id(msg),
+        )
+
+    async def _send_photo_prompt(
+        self,
+        *,
+        chat_id: int,
+        media_path: str,
+        content: str,
+        keyboard: InlineKeyboardMarkup,
+        reply_parameters: ReplyParameters | None,
+    ) -> object:
+        """Send the nutrition-shaped one-photo prompt as one native message."""
+        html = _markdown_to_telegram_html(content)
+        try:
+            with open(media_path, "rb") as photo:
+                return await self._app.bot.send_photo(
+                    chat_id=chat_id,
+                    photo=photo,
+                    caption=html,
+                    parse_mode="HTML",
+                    reply_parameters=reply_parameters,
+                    reply_markup=keyboard,
+                )
+        except BadRequest as primary_error:
+            if not _is_caption_formatting_bad_request(primary_error):
+                raise
+            logger.warning("HTML caption rejected, falling back to plain text: %s", primary_error)
+            with open(media_path, "rb") as photo:
+                return await self._app.bot.send_photo(
+                    chat_id=chat_id,
+                    photo=photo,
+                    caption=content,
+                    reply_parameters=reply_parameters,
+                    reply_markup=keyboard,
+                )
+
+    async def send(self, msg: OutboundMessage) -> OutboundDeliveryReceipt | None:
+        """Send a message through Telegram and return trusted native ids."""
         if not self._app:
             logger.warning("Telegram bot not running")
-            return
+            return None
 
         try:
             chat_id = int(msg.chat_id)
         except ValueError:
             logger.error("Invalid chat_id: %s", msg.chat_id)
-            return
+            return None
+
+        native_message_ids: list[int | str] = []
 
         chat_key = str(msg.chat_id)
 
@@ -767,7 +859,7 @@ class TelegramChannel(BaseChannel):
         # message (spinner-animated, edited in place) instead of a fresh message.
         if msg.metadata.get("_collapse") and msg.content and msg.content != "[empty message]":
             await self._compact_progress(chat_key, chat_id, msg.content)
-            return
+            return self._receipt(msg, native_message_ids)
 
         # Any non-collapse send (final answer, error, command reply, /stop notify)
         # ends the collapsed run: tear the status message down before sending, so
@@ -791,6 +883,28 @@ class TelegramChannel(BaseChannel):
 
         # Send media files
         media_paths = list(msg.media or [])
+        keyboard = self._build_keyboard(msg.buttons)
+        if (
+            len(media_paths) == 1
+            and self._get_media_type(media_paths[0]) == "photo"
+            and msg.content
+            and msg.content != "[empty message]"
+            and len(msg.content) <= TELEGRAM_MAX_CAPTION_LEN
+            and keyboard is not None
+            and not msg.metadata.get("_progress", False)
+        ):
+            sent = await self._send_photo_prompt(
+                chat_id=chat_id,
+                media_path=media_paths[0],
+                content=msg.content,
+                keyboard=keyboard,
+                reply_parameters=reply_params_for_next_send,
+            )
+            message_id = getattr(sent, "message_id", None)
+            if message_id is not None:
+                native_message_ids.append(message_id)
+            return self._receipt(msg, native_message_ids)
+
         if media_paths:
             buckets, bucket_order = self._partition_media(media_paths)
             for bucket in bucket_order:
@@ -800,6 +914,7 @@ class TelegramChannel(BaseChannel):
                             chat_id=chat_id,
                             media_path=media_path,
                             reply_parameters=reply_params_for_next_send,
+                            native_message_ids=native_message_ids,
                         )
                     continue
                 for batch in self._chunked(buckets[bucket], 10):
@@ -808,13 +923,13 @@ class TelegramChannel(BaseChannel):
                         bucket=bucket,
                         media_paths=batch,
                         reply_parameters=reply_params_for_next_send,
+                        native_message_ids=native_message_ids,
                     )
 
         # Send text content
         if msg.content and msg.content != "[empty message]":
             is_progress = msg.metadata.get("_progress", False)
             draft_id = msg.metadata.get("message_id")
-            keyboard = self._build_keyboard(msg.buttons)  # [[ask: …]] quick-reply buttons
             chunks = split_message(msg.content, TELEGRAM_MAX_MESSAGE_LEN)
 
             for ci, chunk in enumerate(chunks):
@@ -831,13 +946,16 @@ class TelegramChannel(BaseChannel):
                             parse_mode="HTML"
                         )
                     else:
-                        await self._app.bot.send_message(
+                        sent = await self._app.bot.send_message(
                             chat_id=chat_id,
                             text=html,
                             parse_mode="HTML",
                             reply_parameters=reply_params_for_next_send,
                             reply_markup=markup,
                         )
+                        message_id = getattr(sent, "message_id", None)
+                        if message_id is not None:
+                            native_message_ids.append(message_id)
                         reply_params_for_next_send = None
                 except Exception as e:
                     logger.warning("HTML parse failed, falling back to plain text: %s", e)
@@ -849,15 +967,20 @@ class TelegramChannel(BaseChannel):
                                 text=chunk
                             )
                         else:
-                            await self._app.bot.send_message(
+                            sent = await self._app.bot.send_message(
                                 chat_id=chat_id,
                                 text=chunk,
                                 reply_parameters=reply_params_for_next_send,
                                 reply_markup=markup,
                             )
+                            message_id = getattr(sent, "message_id", None)
+                            if message_id is not None:
+                                native_message_ids.append(message_id)
                             reply_params_for_next_send = None
                     except Exception as e2:
-                        logger.error("Error sending Telegram message: %s", e2)
+                        raise e2 from e
+
+        return self._receipt(msg, native_message_ids)
 
     def _render_status(self, status: _CompactStatus) -> str:
         """Spinner header + the rolling tail of recent step lines."""
@@ -1029,10 +1152,20 @@ class TelegramChannel(BaseChannel):
         chat_id = message.chat_id
         # Reflect the pick + remove the keyboard so it can't be tapped twice.
         try:
-            base = message.text_html if message.text else ""
+            is_caption = bool(getattr(message, "caption", None)) and not bool(
+                getattr(message, "text", None)
+            )
+            base = (
+                getattr(message, "caption_html", None) or message.caption
+                if is_caption
+                else (message.text_html if message.text else "")
+            )
             picked = option.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
             new_text = (base + f"\n\n✅ {picked}").strip() if base else f"✅ {picked}"
-            await query.edit_message_text(text=new_text, parse_mode="HTML")
+            if is_caption:
+                await query.edit_message_caption(caption=new_text, parse_mode="HTML")
+            else:
+                await query.edit_message_text(text=new_text, parse_mode="HTML")
         except Exception as e:  # noqa: BLE001 — best-effort; at least drop the keyboard
             logger.debug("callback edit failed: %s", e)
             try:
@@ -1049,6 +1182,9 @@ class TelegramChannel(BaseChannel):
             content=option,
             metadata={
                 "message_id": message.message_id,
+                "native_message_id": message.message_id,
+                "callback_query": True,
+                "callback_data": data,
                 "user_id": user.id,
                 "username": user.username,
                 "first_name": user.first_name,

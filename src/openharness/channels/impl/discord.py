@@ -8,7 +8,7 @@ import httpx
 import websockets
 import logging
 
-from openharness.channels.bus.events import OutboundMessage
+from openharness.channels.bus.events import OutboundDeliveryReceipt, OutboundMessage
 from openharness.channels.bus.queue import MessageBus
 from openharness.channels.impl.base import BaseChannel, resolve_channel_media_dir
 from openharness.config.schema import DiscordConfig
@@ -75,7 +75,7 @@ class DiscordChannel(BaseChannel):
             await self._http.aclose()
             self._http = None
 
-    async def send(self, msg: OutboundMessage) -> None:
+    async def send(self, msg: OutboundMessage) -> "OutboundDeliveryReceipt | None":
         """Send a message through Discord REST API."""
         if not self._http:
             logger.warning("Discord HTTP client not initialized")

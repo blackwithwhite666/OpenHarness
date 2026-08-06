@@ -6,7 +6,7 @@ from collections import deque
 from typing import TYPE_CHECKING
 
 
-from openharness.channels.bus.events import OutboundMessage
+from openharness.channels.bus.events import OutboundDeliveryReceipt, OutboundMessage
 from openharness.channels.bus.queue import MessageBus
 from openharness.channels.impl.base import BaseChannel
 from openharness.config.schema import QQConfig
@@ -98,7 +98,7 @@ class QQChannel(BaseChannel):
                 pass
         logger.info("QQ bot stopped")
 
-    async def send(self, msg: OutboundMessage) -> None:
+    async def send(self, msg: OutboundMessage) -> "OutboundDeliveryReceipt | None":
         """Send a message through QQ."""
         if not self._client:
             logger.warning("QQ client not initialized")
@@ -138,4 +138,3 @@ class QQChannel(BaseChannel):
             )
         except Exception:
             logger.exception("Error handling QQ message")
-

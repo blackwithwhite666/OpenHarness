@@ -311,6 +311,74 @@ class HonchoClient:
         )
         return [Message.from_json(item) for item in _object_list(payload, "messages")]
 
+    async def find_messages_by_client_op_id(
+        self,
+        session: str,
+        client_op_id: str,
+        *,
+        page_size: int = 100,
+        max_pages: int = 100,
+    ) -> list[Message]:
+        """Find messages carrying one exact operation id.
+
+        Honcho's deployed route is a paginated ``POST`` list endpoint.  The
+        metadata filter is intentionally nested: filtering the top-level
+        ``metadata`` object with ``client_op_id`` is not equivalent to the
+        deployed JSONB containment query.
+        """
+        if not session or not client_op_id:
+            raise ValueError("session and client_op_id are required")
+        if not 1 <= page_size <= 100:
+            raise ValueError("page_size must be between 1 and 100")
+        if not 1 <= max_pages <= 1000:
+            raise ValueError("max_pages must be between 1 and 1000")
+
+        found: list[Message] = []
+        for page in range(1, max_pages + 1):
+            payload = await self._request(
+                "POST",
+                self._workspace_path(f"sessions/{_segment(session)}/messages/list"),
+                json={"filters": {"metadata": {"client_op_id": client_op_id}}},
+                params={"page": page, "size": page_size},
+            )
+            if isinstance(payload, list):
+                raw_items = payload
+                total = None
+            else:
+                page_payload = _mapping(payload, "message page")
+                raw_items = page_payload.get("items", [])
+                total = page_payload.get("total")
+                pages = page_payload.get("pages")
+                current_page = page_payload.get("page", page)
+            items = [Message.from_json(item) for item in _object_list(raw_items, "message page")]
+            found.extend(items)
+
+            if not items:
+                break
+            if isinstance(total, int) and not isinstance(total, bool) and len(found) >= total:
+                break
+            if (
+                isinstance(pages, int)
+                and not isinstance(pages, bool)
+                and isinstance(current_page, int)
+                and current_page >= pages
+            ):
+                break
+            if isinstance(payload, list) or (
+                not isinstance(total, int)
+                and not isinstance(pages, int)
+                and len(items) < page_size
+            ):
+                break
+            # Some test and proxy implementations expose a cursor instead of
+            # the standard fastapi-pagination page fields.  Stop only when it
+            # explicitly says there is no next page; otherwise page forward.
+            if isinstance(payload, dict) and payload.get("next") is None and "next" in payload:
+                break
+        else:
+            raise HonchoError("message lookup exceeded pagination limit")
+        return found
+
     async def dialectic(
         self,
         query: str,

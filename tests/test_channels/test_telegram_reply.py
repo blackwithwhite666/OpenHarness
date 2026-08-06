@@ -156,3 +156,47 @@ async def test_plain_message_remains_byte_identical_and_unbannered(tmp_path, mon
 
     assert content == own_text
     assert UNTRUSTED_BANNER not in content
+
+@pytest.mark.asyncio
+async def test_callback_propagates_native_binding_metadata() -> None:
+    channel = TelegramChannel(TelegramConfig(token="token"), MessageBus())
+    channel.config.allow_from = ["42"]
+    captured = []
+
+    async def publish(message):
+        captured.append(message)
+
+    channel.bus.publish_inbound = publish
+
+    class Query:
+        data = "ask:0"
+        message = SimpleNamespace(
+            caption="Вы это съели?",
+            caption_html="Вы это съели?",
+            text=None,
+            message_id=7,
+            chat_id=123,
+            chat=SimpleNamespace(type="private"),
+            reply_markup=SimpleNamespace(
+                inline_keyboard=[[SimpleNamespace(text="Да", callback_data="ask:0")]]
+            ),
+        )
+
+        async def answer(self):
+            pass
+
+        async def edit_message_caption(self, **kwargs):
+            pass
+
+        async def edit_message_reply_markup(self, **kwargs):
+            pass
+
+    await channel._on_callback(
+        SimpleNamespace(
+            callback_query=Query(),
+            effective_user=SimpleNamespace(id=42, username=None, first_name="M"),
+        ),
+        None,
+    )
+    assert captured[0].metadata["callback_query"] is True
+    assert captured[0].metadata["native_message_id"] == 7

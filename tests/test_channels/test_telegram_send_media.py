@@ -107,6 +107,27 @@ async def test_send_single_photo_uses_single_send(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_long_photo_prompt_uses_generic_media_plus_text_path(tmp_path):
+    bot = FakeBot()
+    channel = _channel(bot)
+    image = _paths(tmp_path, "one.jpg")
+
+    await channel.send(
+        OutboundMessage(
+            channel="telegram",
+            chat_id="123",
+            content="x" * 1025,
+            media=image,
+            buttons=["Да", "Нет"],
+        )
+    )
+
+    assert [name for name, _ in bot.calls] == ["send_photo", "send_message"]
+    assert "caption" not in bot.calls[0][1]
+    assert len(bot.calls[1][1]["text"]) == 1025
+
+
+@pytest.mark.asyncio
 async def test_send_keeps_voice_individual_and_groups_photos(tmp_path):
     bot = FakeBot()
     channel = _channel(bot)

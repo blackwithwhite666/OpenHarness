@@ -266,6 +266,18 @@ class GatewayEvalRecorder:
             return None
         return envelope
 
+    @property
+    def validated_nutrition_envelope(self) -> Mapping[str, Any] | None:
+        """Return the recorder-owned, schema-validated nutrition annotation."""
+        envelope = self.decision_trace_envelope
+        if envelope is None:
+            return None
+        annotations = envelope.get("annotations")
+        if not isinstance(annotations, Mapping):
+            return None
+        nutrition = annotations.get("nutrition")
+        return nutrition if isinstance(nutrition, Mapping) else None
+
 
 _RUNTIME_STRUCTURAL_SKIP_KINDS = frozenset(
     {

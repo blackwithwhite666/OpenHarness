@@ -12,7 +12,7 @@ from urllib.parse import unquote, urlparse
 import httpx
 import logging
 
-from openharness.channels.bus.events import OutboundMessage
+from openharness.channels.bus.events import OutboundDeliveryReceipt, OutboundMessage
 from openharness.channels.bus.queue import MessageBus
 from openharness.channels.impl.base import BaseChannel
 from openharness.config.schema import DingTalkConfig
@@ -402,7 +402,7 @@ class DingTalkChannel(BaseChannel):
             {"mediaId": media_id, "fileName": filename, "fileType": file_type},
         )
 
-    async def send(self, msg: OutboundMessage) -> None:
+    async def send(self, msg: OutboundMessage) -> "OutboundDeliveryReceipt | None":
         """Send a message through DingTalk."""
         token = await self._get_access_token()
         if not token:

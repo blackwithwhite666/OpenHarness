@@ -12,7 +12,7 @@ from typing import Any
 import httpx
 import logging
 
-from openharness.channels.bus.events import OutboundMessage
+from openharness.channels.bus.events import OutboundDeliveryReceipt, OutboundMessage
 from openharness.channels.bus.queue import MessageBus
 from openharness.channels.impl.base import BaseChannel
 from openharness.config.schema import MochatConfig
@@ -297,7 +297,7 @@ class MochatChannel(BaseChannel):
             self._http = None
         self._ws_connected = self._ws_ready = False
 
-    async def send(self, msg: OutboundMessage) -> None:
+    async def send(self, msg: OutboundMessage) -> "OutboundDeliveryReceipt | None":
         """Send outbound message to session or panel."""
         if not self.config.claw_token:
             logger.warning("Mochat claw_token missing, skip send")

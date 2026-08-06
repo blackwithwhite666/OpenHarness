@@ -1,0 +1,219 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.yandex-team.ru/dropbox_camera_manifest_v1.schema.json",
+  "title": "Dropbox camera manifest v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "candidate_id",
+    "event_id",
+    "producer_source",
+    "file_id",
+    "rev",
+    "source_path",
+    "server_modified",
+    "discovery_time",
+    "original_filename",
+    "mime_type",
+    "original_size_bytes",
+    "original_sha256",
+    "width",
+    "height",
+    "exif",
+    "classifier_model",
+    "classifier_prompt_version",
+    "classifier_policy_version",
+    "classifier_dataset_version",
+    "classifier_output",
+    "food_candidate",
+    "ingest_source",
+    "confirmation_required",
+    "consumption_status"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "candidate_id": {
+      "type": "string",
+      "pattern": "^dropbox-camera-v1-[0-9a-f]{64}$"
+    },
+    "event_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "producer_source": {
+      "type": "string",
+      "const": "dropbox_camera"
+    },
+    "file_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "rev": {
+      "type": "string",
+      "minLength": 1
+    },
+    "source_path": {
+      "type": "string",
+      "minLength": 1
+    },
+    "server_modified": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "client_modified": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "discovery_time": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "original_filename": {
+      "type": "string",
+      "minLength": 1
+    },
+    "mime_type": {
+      "type": "string",
+      "minLength": 1
+    },
+    "original_size_bytes": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "original_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "width": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "height": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "exif": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "timezone_status"
+      ],
+      "properties": {
+        "timezone_status": {
+          "type": "string",
+          "enum": [
+            "known",
+            "missing",
+            "ambiguous"
+          ]
+        },
+        "raw_datetime_original": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "offset_time_original": {
+          "type": "string",
+          "maxLength": 32
+        },
+        "raw_datetime_digitized": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "offset_time_digitized": {
+          "type": "string",
+          "maxLength": 32
+        },
+        "raw_capture_time": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "capture_timezone_offset": {
+          "type": "string",
+          "maxLength": 32
+        },
+        "normalized_capture_time": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "orientation": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 8
+        },
+        "width": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "height": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "classifier_model": {
+      "type": "string",
+      "minLength": 1
+    },
+    "classifier_prompt_version": {
+      "type": "string",
+      "minLength": 1
+    },
+    "classifier_policy_version": {
+      "type": "string",
+      "minLength": 1
+    },
+    "classifier_dataset_version": {
+      "type": "string",
+      "minLength": 1
+    },
+    "classifier_output": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "decision"
+      ],
+      "properties": {
+        "schema_version": {
+          "type": "integer",
+          "const": 1
+        },
+        "decision": {
+          "type": "string",
+          "enum": [
+            "food",
+            "ambiguous"
+          ]
+        },
+        "score": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "explanation": {
+          "type": "string"
+        }
+      }
+    },
+    "food_candidate": {
+      "type": "boolean",
+      "const": true
+    },
+    "ingest_source": {
+      "type": "string",
+      "const": "dropbox_camera"
+    },
+    "confirmation_required": {
+      "type": "boolean",
+      "const": true
+    },
+    "consumption_status": {
+      "type": "string",
+      "const": "unknown"
+    }
+  }
+}

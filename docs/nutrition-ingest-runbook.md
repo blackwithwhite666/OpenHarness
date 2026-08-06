@@ -1,0 +1,135 @@
+# Nutrition ingest runbook
+
+This runbook operates the OpenHarness consumer of Telegent's synchronized
+`nutrition-assets` artifacts. The consumer is a Marina-only confirmation
+adapter. It verifies artifacts and records the answer; it never reclassifies
+images. Producer CLIP remains shadow until the separate recall/shadow gate is
+accepted, and the consumer never runs Qwen or CLIP.
+
+## Configuration validation
+
+1. Copy the non-secret shape from `deploy/server/gateway.example.json` into
+   the service workspace. Replace every `${...}` placeholder through the
+   deployment secret/config mechanism. Do not put tokens, private identifiers,
+   usernames, replies, or paths in logs or documentation.
+2. Keep `nutrition_ingest.enabled=false` until all values are replaced and the
+   synchronized root exists, is owner-only, and contains only the expected
+   protocol tree. The principal, private chat id, and `telegram:<principal>`
+   session key must be the same positive numeric Marina binding. The tenant is
+   exactly `marina`; usernames are not authorization. The numeric
+   `family_principals` key in the example is a synthetic shape-only placeholder,
+   not an authorized account; replace it together with the `${...}` binding
+   values before enabling the feature.
+3. Validate the exact runtime model before restart:
+
+   ```bash
+   .venv/bin/python -c \
+     'from ohmo.gateway.config import load_gateway_config; load_gateway_config()'
+   systemctl --user is-active ohmo-gateway.service
+   systemctl --user show ohmo-gateway.service -p ActiveState -p SubState
+   ```
+
+   If the local CLI exposes a different config-validate spelling, use that
+   existing command, not a new configuration key. A failed validation is a
+   hard stop.
+
+## Deploy and Dropbox preflight
+
+Use the existing deploy-branch workflow and approved restart path. Review the
+dirty worktree before any update; preserve unrelated implementation changes.
+Before an operator deploys, inspect the dirty state without resetting or
+rewriting concurrent work:
+
+```bash
+git status --short
+git diff --check
+git log -1 --oneline
+```
+
+Only the reviewed deploy-branch change may be installed.
+After deployment, verify the Dropbox selective sync for the synchronized
+`nutrition-assets` root, owner-only permissions, free space, and service
+readiness. Do not recursively print the tree. The scanner ignores temporary
+objects and accepts only a manifest whose named image has the exact declared
+size and SHA-256.
+
+Inspect aggregate status with the privacy-safe command:
+
+```bash
+.venv/bin/python -m ohmo nutrition-ingest status --workspace "$OHMO_WORKSPACE"
+```
+
+The output may contain bounded states and counts only. Select an operator-known
+candidate locally for replay; never copy its id into logs, chat, or metrics.
+
+## Rollout order
+
+1. **Disabled:** producer discovery and consumer notifications are disabled.
+   Validate config, sync, schema parity, service health, and no outbound
+   messages.
+2. **Shadow:** run the producer with both `--dropbox-camera-mode=shadow` and
+   `--dropbox-camera-clip-mode=shadow`. Qwen remains authoritative; CLIP is
+   diagnostic and the consumer does not classify. Compare aggregate shadow
+   counts, privacy checks, and idempotency evidence.
+3. **Publish canary:** after shadow acceptance, enable the consumer for the
+   fixed Marina binding only. One ready positive artifact produces one native
+   Telegram photo with caption `Вы это съели?` and buttons `Да` and `Нет`.
+4. **Normal publish:** expand only after the canary proves exact routing,
+   confirmation-before-estimation, durable observation reconciliation, and
+   restart idempotency. Keep CLIP shadow until its recorded recall/shadow gate
+   is accepted; never make the consumer a second classifier.
+
+## Confirmation state machine
+
+- A verified candidate is queued in deterministic discovery order. There is at
+  most one pending Marina confirmation.
+- `Нет` records `not_consumed`, emits no meal observation, and advances the
+  queue. `Да` records `consumed` and only then invokes the existing nutrition
+  estimator, producing exactly one consumed observation under its stable
+  operation id.
+- An unrelated, ambiguous, or unknown reply remains pending and is clarified;
+  it never becomes an acceptance or decline. Callback handling must match the
+  exact native prompt id and Marina binding.
+- Pending latency, confirmation outcome, retry/dead-letter, delivery-unknown,
+  duplicate suppression, and end-to-end latency are aggregate metrics with
+  bounded stage/error labels only.
+
+## Delivery-unknown and recovery
+
+If a prompt send has no unambiguous single-message receipt, the result sidecar
+enters `delivery_unknown`. Do not resend automatically. Reconcile the channel
+receipt and sidecar locally, then either acknowledge the existing prompt or
+use the operator replay command. A retryable error may use capped exponential
+backoff; exhausted prompt or estimation attempts become a dead letter.
+
+```bash
+.venv/bin/python -m ohmo nutrition-ingest replay --workspace "$OHMO_WORKSPACE" \
+  "$OPERATOR_SELECTED_CANDIDATE"
+```
+
+The command must be invoked with an operator-selected value and prints only a
+bounded JSON result (`{"replayed": true|false}`). Never include that value in
+captured evidence.
+
+On restart, a persisted `prompt_sending` is reconciled as
+`delivery_unknown`, not resent. A persisted consumed result is reconciled by
+stable Honcho/observation operation id, so a crash after remote commit cannot
+create a second observation. A partial or mismatched image remains invisible
+to the consumer; repair sync or dead-letter it after bounded retries without
+mutating the manifest.
+
+## Evidence and rollback
+
+Retain aggregate counts for verified candidates, pending/confirmation
+outcomes, retries, dead letters, delivery-unknown states, duplicate
+suppression, and latency. Evidence must not contain candidate ids, paths,
+filenames, EXIF, image or reply content, usernames, owner labels, or
+principal/chat/tenant/session identifiers. Reconcile detailed sidecars only on
+the owner host and store them under the existing audit boundary.
+
+To roll back, disable consumer notifications and producer discovery, stop the
+service only through the approved systemd/deploy workflow, and restore direct
+Qwen (`--dropbox-camera-clip-mode=disabled`) if producer classification must
+continue. Do not delete synchronized images, manifests, result/error sidecars,
+or audit events. Leave pending work replayable and require a fresh shadow and
+Marina-only canary acceptance before re-enabling publish.

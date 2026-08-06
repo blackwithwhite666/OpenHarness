@@ -22,6 +22,7 @@ from ohmo.gateway.config import load_gateway_config, save_gateway_config
 from ohmo.gateway.router import session_key_for_message
 from ohmo.gateway.runtime import OhmoSessionRuntimePool
 from ohmo.workspace import get_gateway_interrupted_requests_path
+from ohmo.nutrition_ingest.coordinator import NutritionIngestCoordinator
 
 logger = logging.getLogger(__name__)
 
@@ -165,6 +166,7 @@ class OhmoGatewayBridge:
         compact_progress_default: bool = False,
         compact_progress_chats: list[str] | None = None,
         verbose_progress_chats: list[str] | None = None,
+        nutrition_coordinator: NutritionIngestCoordinator | None = None,
     ) -> None:
         self._bus = bus
         self._runtime_pool = runtime_pool
@@ -189,6 +191,7 @@ class OhmoGatewayBridge:
         self._compact_chats: set[str] = {
             str(c) for c in (compact_progress_chats or [])
         } - self._verbose_chats
+        self._nutrition_coordinator = nutrition_coordinator
 
     async def run(self) -> None:
         self._running = True
@@ -213,6 +216,9 @@ class OhmoGatewayBridge:
                     self._feishu_group_policy,
                     _content_snippet(message.content),
                 )
+                continue
+
+            if self._nutrition_coordinator is not None and await self._nutrition_coordinator.handle_inbound(message):
                 continue
 
             session_key = session_key_for_message(message)

@@ -8,7 +8,7 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 
-from openharness.channels.bus.events import OutboundMessage
+from openharness.channels.bus.events import OutboundDeliveryReceipt, OutboundMessage
 from openharness.channels.bus.queue import MessageBus
 from openharness.channels.impl.base import BaseChannel
 from openharness.config.schema import Config
@@ -16,6 +16,9 @@ from openharness.config.schema import Config
 logger = logging.getLogger(__name__)
 
 SendFailureHook = Callable[[OutboundMessage, BaseException], Awaitable[None] | None]
+SendSuccessHook = Callable[
+    [OutboundMessage, OutboundDeliveryReceipt | None], Awaitable[None] | None
+]
 
 
 class ChannelManager:
@@ -33,6 +36,7 @@ class ChannelManager:
         config: Config,
         bus: MessageBus,
         on_send_failure: SendFailureHook | None = None,
+        on_send_success: SendSuccessHook | None = None,
     ):
         self.config = config
         self.bus = bus
@@ -43,6 +47,7 @@ class ChannelManager:
         # Telegram Forbidden/blocked — surfaces ONLY here. Lets a producer
         # (e.g. the reminder scheduler) react to a failed delivery it queued.
         self._on_send_failure = on_send_failure
+        self._on_send_success = on_send_success
 
         self._init_channels()
 
@@ -240,7 +245,22 @@ class ChannelManager:
                 channel = self.channels.get(msg.channel)
                 if channel:
                     try:
-                        await channel.send(msg)
+                        receipt = await channel.send(msg)
+                        nutrition_receipt_invalid = msg.metadata.get("_nutrition_confirmation") and (
+                            receipt is None
+                            or receipt.channel != msg.channel
+                            or str(receipt.chat_id) != str(msg.chat_id)
+                            or receipt.outbound_operation_id
+                            != msg.metadata.get("_trusted_outbound_operation_id")
+                            or len(receipt.native_message_ids) != 1
+                        )
+                        if nutrition_receipt_invalid:
+                            await self._notify_send_failure(
+                                msg,
+                                RuntimeError("nutrition confirmation delivery returned no receipt"),
+                            )
+                        else:
+                            await self._notify_send_success(msg, receipt)
                     except Exception as e:
                         logger.error("Error sending to %s: %s", msg.channel, e)
                         await self._notify_send_failure(msg, e)
@@ -263,6 +283,20 @@ class ChannelManager:
                 await result
         except Exception as hook_error:  # noqa: BLE001 — never break dispatch
             logger.error("Send-failure hook raised: %s", hook_error)
+
+    async def _notify_send_success(
+        self, msg: OutboundMessage, receipt: OutboundDeliveryReceipt | None
+    ) -> None:
+        """Invoke the success hook in isolation from dispatch and send errors."""
+        hook = getattr(self, "_on_send_success", None)
+        if hook is None:
+            return
+        try:
+            result = hook(msg, receipt)
+            if asyncio.iscoroutine(result):
+                await result
+        except Exception as hook_error:  # noqa: BLE001 — never break dispatch
+            logger.error("Send-success hook raised: %s", hook_error)
 
     def get_channel(self, name: str) -> BaseChannel | None:
         """Get a channel by name."""

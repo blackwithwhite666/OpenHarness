@@ -13,20 +13,22 @@ import asyncio
 
 import pytest
 
-from openharness.channels.bus.events import OutboundMessage
+from openharness.channels.bus.events import OutboundDeliveryReceipt, OutboundMessage
 from openharness.channels.bus.queue import MessageBus
 from openharness.channels.impl.manager import ChannelManager
 
 
 class _FakeChannel:
-    def __init__(self, *, raise_on_send: bool) -> None:
+    def __init__(self, *, raise_on_send: bool, receipt=None) -> None:
         self.raise_on_send = raise_on_send
+        self.receipt = receipt
         self.sent: list[OutboundMessage] = []
 
-    async def send(self, msg: OutboundMessage) -> None:
+    async def send(self, msg: OutboundMessage):
         if self.raise_on_send:
             raise RuntimeError("Forbidden: bot was blocked by the user")
         self.sent.append(msg)
+        return self.receipt
 
 
 def _manager(channel: _FakeChannel, *, on_send_failure) -> ChannelManager:
@@ -35,6 +37,7 @@ def _manager(channel: _FakeChannel, *, on_send_failure) -> ChannelManager:
     manager.bus = MessageBus()
     manager.channels = {"telegram": channel}
     manager._on_send_failure = on_send_failure
+    manager._on_send_success = None
 
     class _Channels:
         send_tool_hints = True
@@ -106,6 +109,7 @@ def _manager_flags(channel: _FakeChannel, *, send_progress: bool, send_tool_hint
     manager.bus = MessageBus()
     manager.channels = {"telegram": channel}
     manager._on_send_failure = None
+    manager._on_send_success = None
 
     class _Channels:
         pass
@@ -137,3 +141,42 @@ async def test_collapse_progress_bypasses_progress_and_tool_hint_drop() -> None:
 
     assert len(channel.sent) == 1
     assert channel.sent[0].metadata.get("_collapse") is True
+
+
+@pytest.mark.asyncio
+async def test_success_hook_receives_optional_receipt() -> None:
+    receipts = []
+
+    async def hook(msg, receipt):
+        receipts.append((msg, receipt))
+
+    receipt = OutboundDeliveryReceipt(
+        channel="telegram", chat_id="100", native_message_ids=(42,), outbound_operation_id="op-1"
+    )
+    channel = _FakeChannel(raise_on_send=False, receipt=receipt)
+    manager = _manager(channel, on_send_failure=None)
+    manager._on_send_success = hook
+
+    await _dispatch_one(manager, OutboundMessage(channel="telegram", chat_id="100", content="hi"))
+
+    assert len(receipts) == 1
+    assert receipts[0][1] == receipt
+
+
+@pytest.mark.asyncio
+async def test_success_hook_failure_does_not_stop_dispatch() -> None:
+    calls = []
+
+    async def hook(msg, receipt):
+        calls.append(msg.content)
+        raise RuntimeError("hook failure")
+
+    channel = _FakeChannel(raise_on_send=False)
+    manager = _manager(channel, on_send_failure=None)
+    manager._on_send_success = hook
+
+    await _dispatch_one(manager, OutboundMessage(channel="telegram", chat_id="100", content="first"))
+    await _dispatch_one(manager, OutboundMessage(channel="telegram", chat_id="100", content="second"))
+
+    assert calls == ["first", "second"]
+    assert [message.content for message in channel.sent] == ["first", "second"]

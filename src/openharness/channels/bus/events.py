@@ -36,3 +36,17 @@ class OutboundMessage:
     metadata: dict[str, Any] = field(default_factory=dict)
     buttons: list[str] = field(default_factory=list)  # inline quick-reply options; a tap sends the label back as a user message
 
+
+@dataclass(frozen=True)
+class OutboundDeliveryReceipt:
+    """Trusted acknowledgement returned by a channel after native delivery."""
+
+    channel: str
+    chat_id: str
+    native_message_ids: tuple[int | str, ...] = ()
+    outbound_operation_id: str | None = None
+
+    @property
+    def operation_id(self) -> str | None:
+        """Compatibility spelling for callers that call the stable id an operation id."""
+        return self.outbound_operation_id

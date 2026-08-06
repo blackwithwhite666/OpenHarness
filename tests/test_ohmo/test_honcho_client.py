@@ -366,6 +366,84 @@ async def test_client_matches_conclusion_message_and_recall_contracts(
     )
 
 
+def _message_payload(identifier: str, operation: str, *, role: str = "assistant") -> dict[str, object]:
+    return {
+        "id": identifier,
+        "content": "content",
+        "peer_id": "ohmo" if role == "assistant" else "owner",
+        "session_id": "session-one",
+        "metadata": {"client_op_id": operation, "role": role},
+        "created_at": _NOW,
+        "workspace_id": "workspace-one",
+        "token_count": 1,
+    }
+
+
+@pytest.mark.asyncio
+async def test_find_messages_uses_exact_nested_filter_and_paginates() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        assert request.url.path.endswith("/sessions/session-one/messages/list")
+        assert _request_json(request) == {"filters": {"metadata": {"client_op_id": "op-1"}}}
+        page = int(request.url.params["page"])
+        if page == 1:
+            return httpx.Response(
+                200,
+                json={
+                    "items": [_message_payload("m1", "op-1")],
+                    "total": 2,
+                    "page": 1,
+                    "size": 1,
+                    "pages": 2,
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "items": [_message_payload("m2", "op-1")],
+                "total": 2,
+                "page": 2,
+                "size": 1,
+                "pages": 2,
+            },
+        )
+
+    async with HonchoClient(
+        "https://honcho.test", "workspace-jwt", "workspace-one", transport=httpx.MockTransport(handler)
+    ) as client:
+        found = await client.find_messages_by_client_op_id("session-one", "op-1", page_size=1)
+    assert [item.id for item in found] == ["m1", "m2"]
+    assert [request.url.params["page"] for request in requests] == ["1", "2"]
+
+
+@pytest.mark.asyncio
+async def test_find_messages_stops_on_empty_final_page_and_guards_max_pages() -> None:
+    def empty_final(request: httpx.Request) -> httpx.Response:
+        page = int(request.url.params["page"])
+        items = [_message_payload("m1", "op-1")] if page == 1 else []
+        return httpx.Response(200, json={"items": items, "size": 1})
+
+    async with HonchoClient(
+        "https://honcho.test", "workspace-jwt", "workspace-one", transport=httpx.MockTransport(empty_final)
+    ) as client:
+        found = await client.find_messages_by_client_op_id("session-one", "op-1", page_size=1)
+    assert [item.id for item in found] == ["m1"]
+
+    def endless(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"items": [_message_payload(str(request.url.params["page"]), "op-1")]},
+        )
+
+    async with HonchoClient(
+        "https://honcho.test", "workspace-jwt", "workspace-one", transport=httpx.MockTransport(endless)
+    ) as client:
+        with pytest.raises(HonchoError, match="pagination limit"):
+            await client.find_messages_by_client_op_id("session-one", "op-1", page_size=1, max_pages=2)
+
+
 @pytest.mark.parametrize(
     ("status_code", "detail"),
     [(401, "Invalid JWT"), (500, "database unavailable")],

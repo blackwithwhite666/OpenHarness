@@ -40,7 +40,7 @@ from ohmo.evals import get_eval_store
 from ohmo.gateway.bridge import OhmoGatewayBridge, _format_gateway_error
 from ohmo.gateway.config import load_gateway_config, save_gateway_config
 from ohmo.gateway.group_tool import OhmoCreateFeishuGroupInput, OhmoCreateFeishuGroupTool
-from ohmo.gateway.models import GatewayConfig, GatewayState
+from ohmo.gateway.models import GatewayConfig, GatewayState, NutritionIngestConfig
 from ohmo.gateway.provider_commands import handle_gateway_model_command, handle_gateway_provider_command
 from ohmo.gateway.runtime import (
     OhmoSessionRuntimePool,
@@ -55,6 +55,7 @@ from ohmo.group_registry import load_managed_group_record, save_managed_group_re
 from ohmo.memory import add_memory_entry as add_ohmo_memory_entry
 from ohmo.memory import list_memory_files as list_ohmo_memory_files
 from ohmo.gateway.router import session_key_for_message
+from ohmo.nutrition_ingest.coordinator import NutritionIngestCoordinator
 from ohmo.session_storage import save_session_snapshot
 from ohmo.workspace import (
     get_gateway_interrupted_requests_path,
@@ -62,6 +63,70 @@ from ohmo.workspace import (
     get_skills_dir,
     initialize_workspace,
 )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("nutrition_enabled", [False, True])
+async def test_gateway_foreground_starts_and_cancels_nutrition_coordinator(
+    tmp_path: Path, nutrition_enabled: bool, monkeypatch
+) -> None:
+    """The service lifecycle runs the coordinator in both real configuration modes."""
+
+    service = object.__new__(OhmoGatewayService)
+    service._restart_requested = False
+    service._stop_event = None
+    coordinator = NutritionIngestCoordinator(
+        NutritionIngestConfig(
+            enabled=nutrition_enabled,
+            synchronized_root=tmp_path,
+            principal="123" if nutrition_enabled else "",
+            chat_id="123" if nutrition_enabled else "",
+            session_key="telegram:123" if nutrition_enabled else "",
+        )
+    )
+    service._nutrition_coordinator = coordinator
+    original_stop = coordinator.stop
+    coordinator_started: list[bool] = []
+    coordinator_stopped: list[bool] = []
+
+    async def coordinator_run() -> None:
+        coordinator_started.append(coordinator.enabled)
+        assert coordinator.enabled is nutrition_enabled
+        assert await coordinator.poll_once() == []
+        await asyncio.Event().wait()
+
+    service._nutrition_coordinator.run = coordinator_run
+    service._nutrition_coordinator.stop = lambda: (
+        coordinator_stopped.append(coordinator.enabled),
+        original_stop(),
+    )[0]
+    monkeypatch.setattr(
+        OhmoGatewayService,
+        "pid_file",
+        property(lambda _service: tmp_path / "gateway.pid"),
+    )
+    service.write_state = lambda **_: None
+    service._bridge = SimpleNamespace(
+        run=lambda: _wait_and_stop(service),
+        stop=lambda: None,
+    )
+    service._manager = SimpleNamespace(
+        start_all=lambda: asyncio.sleep(0),
+        stop_all=lambda: asyncio.sleep(0),
+    )
+    service._reminder_scheduler = SimpleNamespace(run=lambda: asyncio.Event().wait())
+    service._runtime_pool = SimpleNamespace(aclose=lambda: asyncio.sleep(0))
+    service._publish_pending_restart_notice = lambda: asyncio.sleep(0)
+    service._publish_interrupted_requests_notice = lambda: asyncio.sleep(0)
+
+    async def _wait_and_stop(current_service) -> None:
+        while current_service._stop_event is None:
+            await asyncio.sleep(0)
+        current_service._stop_event.set()
+
+    await service.run_foreground()
+    assert coordinator_started == [nutrition_enabled]
+    assert coordinator_stopped == [nutrition_enabled]
 
 
 def _single_eval_episode(workspace: Path):

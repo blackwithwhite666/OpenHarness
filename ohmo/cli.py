@@ -43,6 +43,7 @@ from ohmo.gateway.service import (
     start_gateway_process,
     stop_gateway_process,
 )
+from ohmo.nutrition_ingest.coordinator import NutritionIngestCoordinator
 from ohmo.evals import (
     SUPPORTED_EVAL_AGENT_RUNNER_NAMES,
     SUPPORTED_EVAL_EXECUTOR_NAMES,
@@ -104,6 +105,7 @@ memory_app = typer.Typer(name="memory", help="Manage .ohmo memory")
 soul_app = typer.Typer(name="soul", help="Inspect or edit soul.md")
 user_app = typer.Typer(name="user", help="Inspect or edit user.md")
 gateway_app = typer.Typer(name="gateway", help="Run the ohmo gateway")
+nutrition_app = typer.Typer(name="nutrition-ingest", help="Inspect Dropbox nutrition ingestion")
 evals_app = typer.Typer(name="evals", help="Build ohmo eval/data-flywheel artifacts")
 evals_cases_app = typer.Typer(name="cases", help="Inspect metadata-only eval cases")
 evals_baseline_app = typer.Typer(name="baseline", help="Manage ohmo eval baselines")
@@ -112,6 +114,7 @@ app.add_typer(memory_app)
 app.add_typer(soul_app)
 app.add_typer(user_app)
 app.add_typer(gateway_app)
+app.add_typer(nutrition_app)
 app.add_typer(evals_app)
 evals_app.add_typer(evals_cases_app)
 evals_app.add_typer(evals_baseline_app)
@@ -1193,6 +1196,29 @@ def gateway_status_cmd(
 ) -> None:
     state = gateway_status(cwd, workspace)
     print(state.model_dump_json(indent=2))
+
+
+@nutrition_app.command("status")
+def nutrition_status_cmd(
+    workspace: str | None = typer.Option(None, "--workspace", help=_WORKSPACE_HELP),
+) -> None:
+    """Print privacy-safe nutrition ingest state."""
+    config = load_gateway_config(workspace)
+    coordinator = NutritionIngestCoordinator(config.nutrition_ingest)
+    status = coordinator.status()
+    print(json.dumps({"enabled": status["enabled"], "pending": status["pending"], "states": [item["state"] for item in status["items"]]}, sort_keys=True))
+
+
+@nutrition_app.command("replay")
+def nutrition_replay_cmd(
+    candidate: str = typer.Argument(..., help="Candidate id to replay"),
+    workspace: str | None = typer.Option(None, "--workspace", help=_WORKSPACE_HELP),
+) -> None:
+    """Explicitly replay an operator-selected ambiguous delivery."""
+    config = load_gateway_config(workspace)
+    coordinator = NutritionIngestCoordinator(config.nutrition_ingest)
+    result = coordinator.request_replay(candidate)
+    print(json.dumps({"replayed": result}, sort_keys=True))
 
 
 @evals_app.command("embed")

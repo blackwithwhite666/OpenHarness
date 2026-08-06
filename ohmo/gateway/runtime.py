@@ -44,6 +44,7 @@ from openharness.ui.runtime import (
 )
 
 from ohmo.evals import GatewayEvalRecorder
+from ohmo.evals.nutrition_trace import NutritionAnnotationV2
 from ohmo.gateway.attachment_fingerprints import compute_attachment_fingerprints
 from ohmo.gateway.config import load_gateway_config
 from ohmo.gateway.group_tool import (
@@ -70,6 +71,7 @@ from ohmo.contact_registry import ContactStore
 from ohmo.memory import create_memory_command_backend, ensure_catalog_migrated
 from ohmo.memory_backend import (
     CatalogMemoryBackend,
+    ConversationAppendReceipt,
     FileMemoryBackend,
     MemoryBackend,
     ShadowMemoryBackend,
@@ -77,6 +79,7 @@ from ohmo.memory_backend import (
     make_tenant_shadow_backend,
 )
 from ohmo.memory_store import MemoryStore
+from ohmo.nutrition_ingest.trust import COORDINATOR_TRUST_TOKEN
 from ohmo.memory_judge import judge_enabled, judge_interval, run_memory_judge
 from ohmo.memory_tool import OhmoMemoryTool
 from ohmo.prompt_seam import compose_runtime_prompt, prepare_turn
@@ -149,6 +152,49 @@ _GROUP_METADATA_KEYS = (
 DEFAULT_REMINDER_TZ = "Europe/Moscow"
 DEFAULT_REMINDER_MAX_PER_CHAT = 50
 _CONVERSATION_TRACE_DISABLED_STATUS = "disabled"
+_NUTRITION_SENDER = "__nutrition_ingest__"
+_NUTRITION_CANDIDATE_RE = re.compile(r"^dropbox-camera-v1-[0-9a-f]{64}$")
+
+
+def _trusted_nutrition_request(message: InboundMessage) -> dict[str, str] | None:
+    """Validate the coordinator-owned synthetic estimation marker."""
+    metadata = message.metadata or {}
+    if (
+        message.sender_id != _NUTRITION_SENDER
+        or metadata.get("_nutrition_trusted") is not True
+        or metadata.get("_nutrition_trust_token") is not COORDINATOR_TRUST_TOKEN
+    ):
+        return None
+    if message.channel != "telegram":
+        return None
+    candidate = metadata.get("_nutrition_candidate_id")
+    operation = metadata.get("_nutrition_client_op_id")
+    phase = metadata.get("_nutrition_phase")
+    principal = metadata.get("_nutrition_principal")
+    tenant = metadata.get("_nutrition_tenant_id")
+    chat_id = metadata.get("_nutrition_chat_id")
+    session_key = metadata.get("_nutrition_session_key")
+    if not all(isinstance(value, str) and value.strip() for value in (candidate, operation, phase, principal, tenant, chat_id, session_key)):
+        return None
+    if not _NUTRITION_CANDIDATE_RE.fullmatch(candidate) or phase != "estimation":
+        return None
+    if (
+        re.fullmatch(r"[1-9][0-9]*", principal) is None
+        or tenant != "marina"
+        or chat_id != str(message.chat_id)
+        or session_key != message.session_key
+    ):
+        return None
+    if operation != f"{candidate}:meal-observation:v1":
+        return None
+    return {
+        "candidate_id": candidate,
+        "client_op_id": operation,
+        "phase": phase,
+        "principal": principal,
+        "chat_id": chat_id,
+        "session_key": session_key,
+    }
 
 
 def _trusted_utc_iso(value: object) -> str | None:
@@ -290,10 +336,13 @@ def _build_conversation_turn_metadata(
         turn_ctx=turn_ctx,
         message=message,
     )
-    source_principal = (
-        f"{turn_ctx.channel}:{canonical_principal(turn_ctx.channel, turn_ctx.principal)}"
-    )
     message_metadata = message.metadata or {}
+    trusted_nutrition = _trusted_nutrition_request(message)
+    source_principal = (
+        f"telegram:{trusted_nutrition['principal']}"
+        if trusted_nutrition is not None
+        else f"{turn_ctx.channel}:{canonical_principal(turn_ctx.channel, turn_ctx.principal)}"
+    )
     decision_trace_status = (
         recorder.decision_trace_status
         if recorder is not None
@@ -322,9 +371,25 @@ def _build_conversation_turn_metadata(
         ),
         "attachment_fingerprints": compute_attachment_fingerprints(message.media),
     }
+    if trusted_nutrition is not None:
+        base_metadata.update(
+            {
+                "_nutrition_trusted": True,
+                "ingest_source": "dropbox_camera",
+                "confirmation_required": True,
+                "candidate_id": trusted_nutrition["candidate_id"],
+                "nutrition_phase": trusted_nutrition["phase"],
+            }
+        )
     user_metadata = dict(base_metadata)
     assistant_metadata = dict(base_metadata)
-    assistant_metadata["client_op_id"] = f"{logical_turn_id}:assistant"
+    if trusted_nutrition is not None:
+        user_metadata["client_op_id"] = f"{trusted_nutrition['candidate_id']}:meal-user:v1"
+        assistant_metadata["client_op_id"] = trusted_nutrition["client_op_id"]
+    else:
+        # Never accept operation/provenance fields from channel metadata.  The
+        # values above are gateway-owned and regenerated for ordinary turns.
+        assistant_metadata["client_op_id"] = f"{logical_turn_id}:assistant"
     decision_trace = recorder.decision_trace_envelope if recorder is not None else None
     if decision_trace is not None:
         assistant_metadata["decision_trace"] = dict(decision_trace)
@@ -718,6 +783,27 @@ class OhmoSessionRuntimePool:
                 self._session_owner_principals[session_id] = None
         return self._session_owner_principals[session_id]
 
+    def _nutrition_binding_matches_config(self, request: dict[str, str]) -> bool:
+        """Require trusted synthetic turns to match the configured Marina tenant."""
+        config = self._gateway_config
+        nutrition = config.nutrition_ingest
+        binding = config.tenant_honcho.get("marina")
+        return bool(
+            nutrition.enabled
+            and config.conversation_learning is True
+            and nutrition.tenant_id == "marina"
+            and nutrition.principal == request["principal"]
+            and nutrition.chat_id == request["chat_id"]
+            and nutrition.session_key == request["session_key"]
+            and config.family_principals.get(request["principal"]) == "marina"
+            and "marina" in config.enabled_memory_tenants
+            and binding
+            and all(
+                isinstance(binding.get(key), str) and binding.get(key, "").strip()
+                for key in ("workspace", "api_key", "observed_peer")
+            )
+        )
+
     async def stream_message(self, message: InboundMessage, session_key: str):
         """Submit an inbound channel message and yield progress + final reply updates."""
         bound_reminder = _trusted_bound_reminder(message)
@@ -738,8 +824,17 @@ class OhmoSessionRuntimePool:
         # A recipient-bound synthetic reminder turn keeps its private/shared
         # memory scope disabled — never manufacture a MemoryScope for the
         # recipient. Wellness, if any, is bound separately below.
+        nutrition_request = _trusted_nutrition_request(message)
+        if nutrition_request is not None and not self._nutrition_binding_matches_config(nutrition_request):
+            raise ValueError("trusted nutrition request is not bound to the configured Marina tenant")
         memory_scope = (
-            None if bound_reminder is not None else self._resolve_turn_memory_scope(turn_ctx)
+            None
+            if bound_reminder is not None
+            else (
+                MemoryScope(private_tenant="marina", shared_tenants=())
+                if nutrition_request is not None
+                else self._resolve_turn_memory_scope(turn_ctx)
+            )
         )
         self._configure_turn_memory_surfaces(
             bundle,
@@ -1190,7 +1285,7 @@ class OhmoSessionRuntimePool:
         )
         reply = "".join(reply_parts).strip()
         if reply:
-            await self._append_conversation_turn(
+            append_receipt = await self._append_conversation_turn(
                 turn_ctx=turn_ctx,
                 memory_scope=memory_scope,
                 message=message,
@@ -1206,6 +1301,9 @@ class OhmoSessionRuntimePool:
             )
             final_media = _extract_final_reply_media(reply, emitted_media)
             metadata: dict[str, object] = {"_session_key": session_key}
+            if append_receipt is not None:
+                metadata["_trusted_nutrition_assistant_message_id"] = append_receipt.assistant_message_id
+                metadata["_trusted_nutrition_client_op_id"] = append_receipt.assistant_client_op_id
             if final_media:
                 metadata.update({"_media": final_media, "_final_media_fallback": True})
             yield GatewayStreamUpdate(
@@ -1224,14 +1322,44 @@ class OhmoSessionRuntimePool:
         recorder: GatewayEvalRecorder | None = None,
         user_text: str,
         assistant_text: str,
-    ) -> None:
+    ) -> ConversationAppendReceipt | None:
+        trusted_nutrition = _trusted_nutrition_request(message)
+        if trusted_nutrition is not None:
+            if not self._nutrition_binding_matches_config(trusted_nutrition):
+                raise ValueError("trusted nutrition request is not bound to the configured Marina tenant")
+            annotation = recorder.validated_nutrition_envelope if recorder is not None else None
+            if annotation is None:
+                raise ValueError("trusted nutrition estimation has no validated envelope")
+            try:
+                validated = NutritionAnnotationV2.model_validate(annotation)
+            except Exception as exc:  # pydantic validation is part of the trust boundary
+                raise ValueError("trusted nutrition estimation envelope is invalid") from exc
+            if (
+                validated.record_type != "meal_observation"
+                or validated.consumption_status != "consumed"
+                or all(
+                    value is None
+                    for value in (
+                        validated.energy_kcal_min,
+                        validated.energy_kcal_max,
+                        validated.energy_kcal_best,
+                    )
+                )
+            ):
+                raise ValueError("trusted nutrition estimation must be a consumed meal observation")
         if self._gateway_config.conversation_learning is not True:
+            if trusted_nutrition is not None:
+                raise ValueError("trusted nutrition ingestion requires conversation learning")
             return
         scope = self._coerce_memory_scope(turn_ctx, memory_scope)
-        if scope is None or not self._honcho_turn_allowed(turn_ctx, scope):
+        if scope is None:
+            return
+        if trusted_nutrition is None and not self._honcho_turn_allowed(turn_ctx, scope):
             return
         shadow_backend = self._shadow_backend_for_scope(scope)
         if shadow_backend is None:
+            if trusted_nutrition is not None:
+                raise ValueError("trusted nutrition ingestion requires a Marina Honcho backend")
             return
         _, user_metadata, assistant_metadata = _build_conversation_turn_metadata(
             turn_ctx=turn_ctx,
@@ -1239,11 +1367,13 @@ class OhmoSessionRuntimePool:
             scope=scope,
             recorder=recorder,
         )
-        await shadow_backend.append_exchange(
+        return await shadow_backend.append_exchange(
             user_text,
             assistant_text,
             user_metadata=user_metadata,
             assistant_metadata=assistant_metadata,
+            durable=trusted_nutrition is not None,
+            trusted_nutrition=trusted_nutrition is not None,
         )
 
     async def _convert_stream_event(
