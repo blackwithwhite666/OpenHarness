@@ -14,7 +14,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from ohmo.gateway.attachment_fingerprints import PHASH_ALGORITHM, fingerprint_image_bytes
+from ohmo.gateway.attachment_fingerprints import (
+    PHASH_ALGORITHM,
+    PHASH_HAMMING_THRESHOLD,
+    fingerprint_image_bytes,
+)
 from ohmo.gateway.bridge import OhmoGatewayBridge
 from ohmo.gateway.models import GatewayConfig, NutritionIngestConfig
 from ohmo.gateway.runtime import OhmoSessionRuntimePool
@@ -1368,9 +1372,20 @@ async def test_exact_sha_duplicate_becomes_seen_and_writes_owner_only_tombstone(
     ]
 
 
+@pytest.mark.parametrize(
+    "bit_flips, algorithm, expected_duplicate",
+    [
+        (PHASH_HAMMING_THRESHOLD, PHASH_ALGORITHM, True),
+        (3, PHASH_ALGORITHM, False),
+        (PHASH_HAMMING_THRESHOLD, "ahash-16x16-gray-v1", False),
+    ],
+)
 @pytest.mark.asyncio
-async def test_phash_metadata_does_not_match_without_safe_threshold(
+async def test_phash_metadata_matches_at_threshold_and_rejects_above_it(
     tmp_path: Path,
+    bit_flips: int,
+    algorithm: str,
+    expected_duplicate: bool,
 ) -> None:
     data = _png((50, 100, 150))
     descriptor = fingerprint_image_bytes(data)
@@ -1387,8 +1402,8 @@ async def test_phash_metadata_does_not_match_without_safe_threshold(
             _recent_message(
                 [
                     {
-                        "phash": descriptor["phash"],
-                        "phash_algorithm": PHASH_ALGORITHM,
+                        "phash": f"{int(descriptor['phash'], 16) ^ ((1 << bit_flips) - 1):064x}",
+                        "phash_algorithm": algorithm,
                     }
                 ]
             )
@@ -1409,9 +1424,10 @@ async def test_phash_metadata_does_not_match_without_safe_threshold(
         now=_Clock(),
     )
     await coordinator.poll_once()
-    assert (tmp_path / first).is_dir()
-    assert len(outbound) == 1
-    assert outbound[0].metadata["_nutrition_candidate_id"] == first
+    assert (tmp_path / first).is_dir() is not expected_duplicate
+    assert len(outbound) == (0 if expected_duplicate else 1)
+    if not expected_duplicate:
+        assert outbound[0].metadata["_nutrition_candidate_id"] == first
 
 
 @pytest.mark.asyncio

@@ -3,13 +3,18 @@ from __future__ import annotations
 import hashlib
 import struct
 import zlib
+from io import BytesIO
+
+from PIL import Image, ImageDraw
 
 from ohmo.gateway.attachment_fingerprints import (
     ATTACHMENT_FINGERPRINT_MAX,
     PHASH_ALGORITHM,
+    PHASH_HAMMING_THRESHOLD,
     compute_attachment_fingerprints,
     fingerprint_image_bytes,
     fingerprint_image_file,
+    phash_hamming_distance,
 )
 
 
@@ -54,6 +59,19 @@ def _make_jpeg_header(width: int, height: int) -> bytes:
     )
 
 
+def _make_jpeg(*, quality: int = 95, orientation: int | None = None) -> bytes:
+    image = Image.new("RGB", (48, 64), "white")
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((4, 8, 30, 35), fill="red")
+    draw.ellipse((16, 32, 44, 60), fill="blue")
+    exif = image.getexif()
+    if orientation is not None:
+        exif[274] = orientation
+    output = BytesIO()
+    image.save(output, format="JPEG", quality=quality, exif=exif.tobytes())
+    return output.getvalue()
+
+
 def test_fingerprint_image_bytes_sha256_dimensions_and_phash() -> None:
     data = _make_rgb_png(32, 24, (200, 30, 30))
 
@@ -96,6 +114,28 @@ def test_fingerprint_jpeg_dimensions_without_decode() -> None:
     assert descriptor is not None
     assert descriptor["sha256"] == hashlib.sha256(data).hexdigest()
     assert (descriptor["width"], descriptor["height"]) == (640, 480)
+
+
+def test_fingerprint_valid_jpeg_exif_orientation_and_reencode_are_compatible() -> None:
+    original = fingerprint_image_bytes(_make_jpeg())
+    reencoded = fingerprint_image_bytes(_make_jpeg(quality=72))
+    oriented_image = Image.open(BytesIO(_make_jpeg())).transpose(Image.Transpose.ROTATE_90)
+    oriented_output = BytesIO()
+    exif = oriented_image.getexif()
+    exif[274] = 6
+    oriented_image.save(oriented_output, format="JPEG", quality=95, exif=exif.tobytes())
+    oriented = fingerprint_image_bytes(oriented_output.getvalue())
+
+    assert original is not None and reencoded is not None and oriented is not None
+    assert original["phash_algorithm"] == PHASH_ALGORITHM
+    assert phash_hamming_distance(original["phash"], reencoded["phash"]) <= PHASH_HAMMING_THRESHOLD
+    assert phash_hamming_distance(original["phash"], oriented["phash"]) <= PHASH_HAMMING_THRESHOLD
+
+
+def test_phash_hamming_distance_rejects_malformed_or_different_width_values() -> None:
+    assert phash_hamming_distance("0", "1") == 1
+    assert phash_hamming_distance("0", "00") is None
+    assert phash_hamming_distance("x", "0") is None
 
 
 def test_fingerprint_rejects_non_image_bytes() -> None:

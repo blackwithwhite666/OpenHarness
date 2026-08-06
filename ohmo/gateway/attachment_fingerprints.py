@@ -1,9 +1,9 @@
 """Bounded, privacy-safe attachment fingerprints for inbound channel media.
 
 The trusted gateway computes these descriptors; the model never authors them.
-A descriptor contains only a SHA-256 digest, image dimensions, and (when
-decoding succeeds) a fixed-version perceptual hash. Paths, filenames, download
-tokens, and image bytes are never included.
+A descriptor contains only a SHA-256 digest, image dimensions, and a fixed,
+EXIF-normalized DCT perceptual hash.  Paths, filenames, download tokens, and
+image bytes are never included.
 """
 
 from __future__ import annotations
@@ -13,21 +13,36 @@ import io
 import logging
 import os
 import struct
-import zlib
 from pathlib import Path
+
+import numpy as np
+from PIL import Image, ImageOps
 
 logger = logging.getLogger(__name__)
 
 ATTACHMENT_FINGERPRINT_MAX = 8
 ATTACHMENT_FINGERPRINT_MAX_BYTES = 64 * 1024 * 1024
-PHASH_ALGORITHM = "ahash-16x16-gray-v1"
+PHASH_ALGORITHM = "dct-phash-16x16-v1"
+PHASH_HAMMING_THRESHOLD = 2
 
 _PHASH_SIZE = 16
+_DCT_INPUT_SIZE = 32
 _MAX_DECODE_PIXELS = 40_000_000
 _PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 _JPEG_SOF_MARKERS = frozenset(
     {0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF}
 )
+
+
+def _dct_matrix(size: int) -> np.ndarray:
+    positions = np.arange(size, dtype=np.float64)
+    frequencies = np.arange(size, dtype=np.float64)[:, None]
+    matrix = np.cos(np.pi * (2 * positions + 1) * frequencies / (2 * size))
+    matrix[0] *= 1 / np.sqrt(2)
+    return matrix * np.sqrt(2 / size)
+
+
+_DCT = _dct_matrix(_DCT_INPUT_SIZE)
 
 
 def fingerprint_image_bytes(data: bytes) -> dict[str, object] | None:
@@ -41,12 +56,10 @@ def fingerprint_image_bytes(data: bytes) -> dict[str, object] | None:
         "width": width,
         "height": height,
     }
-    gray = _decode_grayscale(data, width, height)
-    if gray is not None:
-        phash = _ahash(gray, width, height)
-        if phash is not None:
-            descriptor["phash"] = phash
-            descriptor["phash_algorithm"] = PHASH_ALGORITHM
+    phash = _dct_phash(data)
+    if phash is not None:
+        descriptor["phash"] = phash
+        descriptor["phash_algorithm"] = PHASH_ALGORITHM
     return descriptor
 
 
@@ -54,9 +67,7 @@ def fingerprint_image_file(media_path: str | os.PathLike[str]) -> dict[str, obje
     """Fingerprint one downloaded image; never leaks the path into the result."""
     try:
         path = Path(media_path)
-        if not path.is_file():
-            return None
-        if path.stat().st_size > ATTACHMENT_FINGERPRINT_MAX_BYTES:
+        if not path.is_file() or path.stat().st_size > ATTACHMENT_FINGERPRINT_MAX_BYTES:
             return None
         data = path.read_bytes()
     except OSError:
@@ -72,12 +83,22 @@ def compute_attachment_fingerprints(media_paths: list[str] | None) -> list[dict[
             break
         try:
             descriptor = fingerprint_image_file(media_path)
-        except Exception:  # noqa: BLE001 — fingerprinting is best-effort provenance
+        except Exception:
             logger.exception("ohmo attachment fingerprint failed")
             continue
         if descriptor is not None:
             fingerprints.append(descriptor)
     return fingerprints
+
+
+def phash_hamming_distance(left: str, right: str) -> int | None:
+    """Return the Hamming distance for two fixed-version hexadecimal pHashes."""
+    if len(left) != len(right) or not left or not right:
+        return None
+    try:
+        return (int(left, 16) ^ int(right, 16)).bit_count()
+    except ValueError:
+        return None
 
 
 def _image_dimensions(data: bytes) -> tuple[int, int] | None:
@@ -118,146 +139,27 @@ def _jpeg_dimensions(data: bytes) -> tuple[int, int] | None:
     return None
 
 
-def _decode_grayscale(data: bytes, width: int, height: int) -> list[int] | None:
-    """Decode to 8-bit grayscale samples, or None when decoding fails."""
-    if width <= 0 or height <= 0 or width * height > _MAX_DECODE_PIXELS:
-        return None
-    decoded = _decode_grayscale_pil(data)
-    if decoded is not None:
-        pixels, decoded_width, decoded_height = decoded
-        if decoded_width == width and decoded_height == height:
-            return pixels
-        return None
-    if data.startswith(_PNG_SIGNATURE):
-        return _decode_png_grayscale(data, width, height)
-    return None
-
-
-def _decode_grayscale_pil(data: bytes) -> tuple[list[int], int, int] | None:
+def _dct_phash(data: bytes) -> str | None:
     try:
-        from PIL import Image
-    except ImportError:
-        return None
-    try:
-        with Image.open(io.BytesIO(data)) as image:
-            grayscale = image.convert("L")
-            width, height = grayscale.size
-            if width * height > _MAX_DECODE_PIXELS:
+        with Image.open(io.BytesIO(data)) as source:
+            image = ImageOps.exif_transpose(source)
+            width, height = image.size
+            if width <= 0 or height <= 0 or width * height > _MAX_DECODE_PIXELS:
                 return None
-            return list(grayscale.tobytes()), width, height
-    except Exception:  # noqa: BLE001 — any decode failure just drops the phash
+            grayscale = np.asarray(
+                image.convert("L").resize(
+                    (_DCT_INPUT_SIZE, _DCT_INPUT_SIZE), Image.Resampling.BILINEAR
+                ),
+                dtype=np.float64,
+            )
+    except Exception:  # noqa: BLE001 - any decode failure just drops the pHash
         return None
 
-
-def _decode_png_grayscale(data: bytes, width: int, height: int) -> list[int] | None:
-    """Stdlib decoder for 8-bit non-interlaced PNG (gray/RGB/gray+alpha/RGBA)."""
-    pos = len(_PNG_SIGNATURE)
-    bit_depth = color_type = interlace = None
-    idat = bytearray()
-    while pos + 8 <= len(data):
-        chunk_length = struct.unpack(">I", data[pos : pos + 4])[0]
-        chunk_type = data[pos + 4 : pos + 8]
-        chunk = data[pos + 8 : pos + 8 + chunk_length]
-        if len(chunk) != chunk_length:
-            return None
-        if chunk_type == b"IHDR":
-            if chunk_length != 13:
-                return None
-            (
-                ihdr_width,
-                ihdr_height,
-                bit_depth,
-                color_type,
-                _compression,
-                _filter_method,
-                interlace,
-            ) = struct.unpack(">IIBBBBB", chunk)
-            if (ihdr_width, ihdr_height) != (width, height):
-                return None
-        elif chunk_type == b"IDAT":
-            idat += chunk
-        elif chunk_type == b"IEND":
-            break
-        pos += 12 + chunk_length
-    channels_by_type = {0: 1, 2: 3, 4: 2, 6: 4}
-    if bit_depth != 8 or interlace != 0 or color_type not in channels_by_type or not idat:
-        return None
-    channels = channels_by_type[color_type]
-    try:
-        raw = zlib.decompress(bytes(idat))
-    except zlib.error:
-        return None
-    stride = width * channels
-    if len(raw) != (stride + 1) * height:
-        return None
-    grayscale: list[int] = []
-    previous = bytearray(stride)
-    offset = 0
-    for _row in range(height):
-        filter_type = raw[offset]
-        offset += 1
-        line = bytearray(raw[offset : offset + stride])
-        offset += stride
-        if filter_type == 1:
-            for i in range(channels, stride):
-                line[i] = (line[i] + line[i - channels]) & 0xFF
-        elif filter_type == 2:
-            for i in range(stride):
-                line[i] = (line[i] + previous[i]) & 0xFF
-        elif filter_type == 3:
-            for i in range(stride):
-                left = line[i - channels] if i >= channels else 0
-                line[i] = (line[i] + ((left + previous[i]) >> 1)) & 0xFF
-        elif filter_type == 4:
-            for i in range(stride):
-                left = line[i - channels] if i >= channels else 0
-                up = previous[i]
-                up_left = previous[i - channels] if i >= channels else 0
-                line[i] = (line[i] + _paeth(left, up, up_left)) & 0xFF
-        elif filter_type != 0:
-            return None
-        previous = line
-        if color_type in (0, 4):
-            grayscale.extend(line[::channels])
-        else:
-            for i in range(0, stride, channels):
-                grayscale.append((line[i] * 299 + line[i + 1] * 587 + line[i + 2] * 114) // 1000)
-    return grayscale
-
-
-def _paeth(left: int, up: int, up_left: int) -> int:
-    estimate = left + up - up_left
-    dist_left = abs(estimate - left)
-    dist_up = abs(estimate - up)
-    dist_up_left = abs(estimate - up_left)
-    if dist_left <= dist_up and dist_left <= dist_up_left:
-        return left
-    if dist_up <= dist_up_left:
-        return up
-    return up_left
-
-
-def _ahash(grayscale: list[int], width: int, height: int) -> str | None:
-    """16x16 average hash (PHASH_ALGORITHM); deterministic box downsample."""
-    if len(grayscale) != width * height:
-        return None
-    cells: list[float] = []
-    for cell_y in range(_PHASH_SIZE):
-        y0 = cell_y * height // _PHASH_SIZE
-        y1 = max((cell_y + 1) * height // _PHASH_SIZE, y0 + 1)
-        for cell_x in range(_PHASH_SIZE):
-            x0 = cell_x * width // _PHASH_SIZE
-            x1 = max((cell_x + 1) * width // _PHASH_SIZE, x0 + 1)
-            total = 0
-            count = 0
-            for y in range(y0, min(y1, height)):
-                row_base = y * width
-                for x in range(x0, min(x1, width)):
-                    total += grayscale[row_base + x]
-                    count += 1
-            cells.append(total / count)
-    mean = sum(cells) / len(cells)
+    coefficients = _DCT @ grayscale @ _DCT.T
+    low_frequency = coefficients[:_PHASH_SIZE, :_PHASH_SIZE].copy()
+    low_frequency[0, 0] = 0
+    median = float(np.median(low_frequency))
     bits = 0
-    for cell in cells:
-        bits = (bits << 1) | (1 if cell >= mean else 0)
+    for coefficient in low_frequency.reshape(-1):
+        bits = (bits << 1) | int(coefficient >= median)
     return f"{bits:0{_PHASH_SIZE * _PHASH_SIZE // 4}x}"

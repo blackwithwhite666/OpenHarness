@@ -17,7 +17,10 @@ from typing import Any, Protocol
 
 from ohmo.gateway.attachment_fingerprints import (
     ATTACHMENT_FINGERPRINT_MAX,
+    PHASH_ALGORITHM,
+    PHASH_HAMMING_THRESHOLD,
     fingerprint_image_file,
+    phash_hamming_distance,
 )
 from ohmo.memory_service.honcho_client import RecentMessageMetadata
 from openharness.channels.bus.events import (
@@ -565,10 +568,28 @@ class NutritionIngestCoordinator:
                         message_id=self._safe_message_id(message.id),
                         kind="sha256",
                     )
-                # The offline image corpus did not establish a zero-FP
-                # perceptual threshold at the required real recall. Keep
-                # perceptual metadata for compatibility/audit, but fail
-                # closed to exact SHA-256 until a reviewed threshold exists.
+                phash = fingerprint.get("phash")
+                algorithm = fingerprint.get("phash_algorithm")
+                candidate_phash = candidate.get("phash")
+                candidate_algorithm = candidate.get("phash_algorithm")
+                distance = (
+                    phash_hamming_distance(phash, candidate_phash)
+                    if isinstance(phash, str) and isinstance(candidate_phash, str)
+                    else None
+                )
+                if (
+                    isinstance(candidate_phash, str)
+                    and candidate_algorithm == PHASH_ALGORITHM
+                    and algorithm == PHASH_ALGORITHM
+                    and isinstance(phash, str)
+                    and distance is not None
+                    and distance <= PHASH_HAMMING_THRESHOLD
+                ):
+                    return _DuplicateMatch(
+                        message_id=self._safe_message_id(message.id),
+                        kind="phash",
+                        phash_algorithm=algorithm,
+                    )
         return None
 
     def _trusted_message_fingerprints(

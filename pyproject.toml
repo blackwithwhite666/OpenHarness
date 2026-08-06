@@ -35,6 +35,7 @@ dependencies = [
     "discord.py>=2.0.0",
     "lark-oapi>=1.5.0",
     "numpy>=2.0.0,<2.5.0",
+    "Pillow>=10.0.0",
 ]
 
 [project.optional-dependencies]
