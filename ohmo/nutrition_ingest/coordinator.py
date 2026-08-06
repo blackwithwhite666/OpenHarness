@@ -6,7 +6,7 @@ import asyncio
 import logging
 import re
 from collections.abc import Awaitable, Callable
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -16,13 +16,19 @@ from openharness.channels.bus.events import (
     OutboundMessage,
 )
 
-from .models import NutritionResultSidecar, RecipientBinding, ResultState, StageAttempt, StateHistoryEntry
+from .freshness import exif_freshness_reason
 from .metrics import NutritionMetrics
+from .models import (
+    NutritionResultSidecar,
+    RecipientBinding,
+    ResultState,
+    StageAttempt,
+    StateHistoryEntry,
+)
 from .prompts import build_post_confirmation_prompt
 from .sidecars import NutritionResultStore
 from .trust import COORDINATOR_TRUST_TOKEN
 from .watcher import NutritionArtifactScanner, ReadyNutritionArtifact
-
 
 _PRINCIPAL_RE = re.compile(r"^[1-9][0-9]*$")
 _YES = {"да"}
@@ -63,7 +69,8 @@ class NutritionIngestCoordinator:
         self._runtime_pool = runtime_pool
         self._estimate = estimate
         self._metrics = metrics or NutritionMetrics()
-        self._now = now or (lambda: datetime.now(timezone.utc))
+        self._now = now or (lambda: datetime.now(UTC))
+        self._current_time()
         self._lock = asyncio.Lock()
         self._running = False
 
@@ -90,7 +97,7 @@ class NutritionIngestCoordinator:
         return NutritionResultStore(artifact.directory / "result.json")
 
     def _new_sidecar(self, artifact: ReadyNutritionArtifact) -> NutritionResultSidecar:
-        at = self._now()
+        at = self._current_time()
         return NutritionResultSidecar(
             candidate_id=artifact.candidate_id,
             revision=1,
@@ -115,7 +122,7 @@ class NutritionIngestCoordinator:
             StateHistoryEntry(
                 revision=current.revision + 1,
                 state=state,
-                at=self._now(),
+                at=self._current_time(),
                 error=error,
             )
         )
@@ -138,10 +145,13 @@ class NutritionIngestCoordinator:
             for artifact in artifacts:
                 store = self._store(artifact)
                 current = store.load()
+                is_new = current is None
                 if current is None:
                     current = store.compare_and_replace(self._new_sidecar(artifact))
+                current = self._reconcile_freshness(artifact, current)
+                if is_new and current.state != ResultState.skipped:
                     self._metrics.verified_candidate()
-                elif current.state == ResultState.prompt_sending:
+                if current.state == ResultState.prompt_sending:
                     # A restart cannot distinguish Telegram acceptance from a
                     # lost receipt.  Never resend an ambiguous prompt.
                     current = self._advance(store, current, ResultState.delivery_unknown)
@@ -196,7 +206,49 @@ class NutritionIngestCoordinator:
             float(self.config.retry_backoff_seconds) * (2**exponent),
             3600.0,
         )
-        return self._now() >= finished_at + timedelta(seconds=delay_seconds)
+        return self._current_time() >= finished_at + timedelta(seconds=delay_seconds)
+
+    def _current_time(self) -> datetime:
+        value = self._now()
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise NutritionCoordinatorError("nutrition coordinator clock must be timezone-aware")
+        return value
+
+    def _freshness_reason(self, artifact: ReadyNutritionArtifact) -> str | None:
+        return exif_freshness_reason(artifact.manifest.exif, self._current_time())
+
+    def _reconcile_freshness(
+        self, artifact: ReadyNutritionArtifact, sidecar: NutritionResultSidecar
+    ) -> NutritionResultSidecar:
+        if sidecar.state not in {
+            ResultState.published,
+            ResultState.prompt_sending,
+            ResultState.delivery_unknown,
+            ResultState.pending_confirmation,
+            ResultState.retryable_error,
+        }:
+            return sidecar
+        if sidecar.state == ResultState.retryable_error and sidecar.consumption_status == "consumed":
+            return sidecar
+        reason = self._freshness_reason(artifact)
+        if reason is None:
+            return sidecar
+        return self._skip_candidate(self._store(artifact), sidecar, reason)
+
+    def _skip_candidate(
+        self, store: NutritionResultStore, current: NutritionResultSidecar, reason: str
+    ) -> NutritionResultSidecar:
+        return self._advance(
+            store,
+            current,
+            ResultState.skipped,
+            error=f"nutrition candidate skipped: {reason}",
+            consumption_status="unknown",
+            prompt_message_id=None,
+            reply_message_id=None,
+            emitted_honcho_message_id=None,
+            skip_reason=reason,
+        )
 
     def _pending_artifact(
         self, artifacts: list[ReadyNutritionArtifact]
@@ -226,6 +278,10 @@ class NutritionIngestCoordinator:
         self, artifact: ReadyNutritionArtifact, sidecar: NutritionResultSidecar
     ) -> None:
         store = self._store(artifact)
+        reason = self._freshness_reason(artifact)
+        if reason is not None:
+            self._skip_candidate(store, store.load() or sidecar, reason)
+            return
         operation_id = sidecar.confirmation_operation_id
         sending = self._advance(store, sidecar, ResultState.prompt_sending)
         message = OutboundMessage(
@@ -250,7 +306,7 @@ class NutritionIngestCoordinator:
             result = self._publish_outbound(message)
             if asyncio.iscoroutine(result):
                 await result
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - one candidate cannot kill polling
             self._record_failure(store, sending, stage="prompt", error=exc)
 
     async def on_send_success(
@@ -307,7 +363,7 @@ class NutritionIngestCoordinator:
     ) -> NutritionResultSidecar:
         attempts = [item for item in current.attempts if item.stage == stage]
         attempt = len(attempts) + 1
-        entry = StageAttempt(stage=stage, attempt=attempt, started_at=self._now(), finished_at=self._now(), error=str(error)[:1024])
+        entry = StageAttempt(stage=stage, attempt=attempt, started_at=self._current_time(), finished_at=self._current_time(), error=str(error)[:1024])
         next_state = (
             ResultState.dead_letter
             if attempt >= (self.config.max_prompt_attempts if stage == "prompt" else self.config.max_estimation_attempts)
@@ -366,6 +422,10 @@ class NutritionIngestCoordinator:
             await self._clarify(message)
             return True
         artifact, sidecar = pending[0]
+        reason = self._freshness_reason(artifact)
+        if reason is not None:
+            self._skip_candidate(self._store(artifact), sidecar, reason)
+            return False
         native_id = message.metadata.get("native_message_id")
         callback = bool(message.metadata.get("callback_query"))
         if callback and str(native_id) != str(sidecar.prompt_message_id):
@@ -393,7 +453,7 @@ class NutritionIngestCoordinator:
         confirmed = self._advance(store, sidecar, ResultState.confirmed, consumption_status="consumed", reply_message_id=message.metadata.get("message_id"))
         try:
             await self._estimate_candidate(artifact, confirmed)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - one candidate cannot kill polling
             current = store.load() or confirmed
             if current.state == ResultState.confirmed:
                 self._record_failure(store, current, stage="estimation", error=exc)
@@ -404,7 +464,11 @@ class NutritionIngestCoordinator:
         for artifact in self._scanner.scan_ready():
             current = self._store(artifact).load()
             if current is not None and current.state == ResultState.pending_confirmation:
-                pending.append((artifact, current))
+                reason = self._freshness_reason(artifact)
+                if reason is None:
+                    pending.append((artifact, current))
+                else:
+                    self._skip_candidate(self._store(artifact), current, reason)
         return pending
 
     async def _ack(self, message: InboundMessage, content: str) -> None:
@@ -503,7 +567,7 @@ class NutritionIngestCoordinator:
     def _record_pending_latency(self, sidecar: NutritionResultSidecar) -> None:
         published = next((item for item in sidecar.state_history if item.state == ResultState.published), None)
         if published is not None:
-            self._metrics.pending_latency(max(0.0, (self._now() - published.at).total_seconds()))
+            self._metrics.pending_latency(max(0.0, (self._current_time() - published.at).total_seconds()))
 
     @staticmethod
     def _error_class(error: BaseException) -> str:
@@ -552,10 +616,10 @@ class NutritionIngestCoordinator:
                     await self.poll_once()
                 except asyncio.CancelledError:
                     raise
-                except Exception:  # noqa: BLE001 - keep the coordinator alive after one bad candidate
+                except Exception:
                     logger.exception("nutrition ingest poll failed; will retry")
                 await asyncio.sleep(self.config.poll_interval_seconds)
-        except asyncio.CancelledError:
+        except asyncio.CancelledError:  # noqa: TRY203 - preserve cancellation boundary
             raise
 
     def stop(self) -> None:

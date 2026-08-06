@@ -5,9 +5,9 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterator
 
 try:
     import fcntl
@@ -123,12 +123,13 @@ class NutritionResultStore:
         legal: dict[ResultState, set[ResultState]] = {
             ResultState.discovered: {ResultState.classified, ResultState.retryable_error},
             ResultState.classified: {ResultState.published, ResultState.completed, ResultState.retryable_error},
-            ResultState.published: {ResultState.prompt_sending, ResultState.pending_confirmation, ResultState.retryable_error},
+            ResultState.published: {ResultState.prompt_sending, ResultState.pending_confirmation, ResultState.retryable_error, ResultState.skipped},
             ResultState.prompt_sending: {
                 ResultState.pending_confirmation,
                 ResultState.retryable_error,
                 ResultState.delivery_unknown,
                 ResultState.dead_letter,
+                ResultState.skipped,
             },
             # Returning to prompt_sending is an explicit operator replay of an
             # ambiguous delivery, never an automatic retry.
@@ -136,8 +137,9 @@ class NutritionResultStore:
                 ResultState.published,
                 ResultState.prompt_sending,
                 ResultState.dead_letter,
+                ResultState.skipped,
             },
-            ResultState.pending_confirmation: {ResultState.confirmed, ResultState.declined, ResultState.retryable_error},
+            ResultState.pending_confirmation: {ResultState.confirmed, ResultState.declined, ResultState.retryable_error, ResultState.skipped},
             ResultState.confirmed: {
                 ResultState.estimated,
                 ResultState.retryable_error,
@@ -157,6 +159,7 @@ class NutritionResultStore:
                 ResultState.confirmed,
                 ResultState.estimated,
                 ResultState.retryable_error,
+                ResultState.skipped,
                 ResultState.dead_letter,
             },
             ResultState.declined: {ResultState.completed},

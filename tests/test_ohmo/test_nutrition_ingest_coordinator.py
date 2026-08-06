@@ -4,19 +4,12 @@ import asyncio
 import contextlib
 import hashlib
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from openharness.api.usage import UsageSnapshot
-from openharness.channels.bus.events import InboundMessage, OutboundDeliveryReceipt
-from openharness.channels.bus.queue import MessageBus
-from openharness.engine.messages import ConversationMessage, TextBlock
-from openharness.engine.stream_events import AssistantTextDelta, AssistantTurnComplete
-from openharness.evals import TRACE_FINALIZATION
-from openharness.tools.base import ToolRegistry
 from ohmo.gateway.bridge import OhmoGatewayBridge
 from ohmo.gateway.models import GatewayConfig, NutritionIngestConfig
 from ohmo.gateway.runtime import OhmoSessionRuntimePool
@@ -24,10 +17,18 @@ from ohmo.memory_backend import CatalogMemoryBackend, ShadowMemoryBackend
 from ohmo.memory_catalog import MemoryCatalog
 from ohmo.memory_service.honcho_client import Message
 from ohmo.nutrition_ingest.coordinator import NutritionIngestCoordinator
+from ohmo.nutrition_ingest.freshness import exif_freshness_reason
 from ohmo.nutrition_ingest.metrics import NutritionMetrics
-from ohmo.nutrition_ingest.models import ResultState, candidate_id_for
+from ohmo.nutrition_ingest.models import ExifMetadata, ResultState, candidate_id_for
 from ohmo.nutrition_ingest.sidecars import NutritionResultStore
 from ohmo.workspace import initialize_workspace
+from openharness.api.usage import UsageSnapshot
+from openharness.channels.bus.events import InboundMessage, OutboundDeliveryReceipt
+from openharness.channels.bus.queue import MessageBus
+from openharness.engine.messages import ConversationMessage, TextBlock
+from openharness.engine.stream_events import AssistantTextDelta, AssistantTurnComplete
+from openharness.evals import TRACE_FINALIZATION
+from openharness.tools.base import ToolRegistry
 
 
 def _candidate(
@@ -36,6 +37,8 @@ def _candidate(
     file_id: str = "id:test",
     rev: str = "rev:test",
     discovery_time: str = "2026-08-05T10:01:00+00:00",
+    capture_time: str | None = None,
+    exif_updates: dict[str, object] | None = None,
 ) -> str:
     fixture = json.loads(
         (Path(__file__).parents[2] / "ohmo/nutrition_ingest/manifest_v1_fixture.json").read_text()
@@ -55,13 +58,16 @@ def _candidate(
         original_size_bytes=len(data),
         original_sha256=hashlib.sha256(data).hexdigest(),
     )
+    fixture["exif"]["normalized_capture_time"] = capture_time or "2099-01-01T00:00:00+00:00"
+    if exif_updates:
+        fixture["exif"].update(exif_updates)
     (directory / "manifest.json").write_text(json.dumps(fixture))
     return candidate
 
 
 class _Clock:
     def __init__(self) -> None:
-        self.value = datetime(2026, 8, 5, 10, 0, tzinfo=timezone.utc)
+        self.value = datetime(2026, 8, 5, 10, 0, tzinfo=UTC)
 
     def __call__(self) -> datetime:
         return self.value
@@ -92,7 +98,7 @@ class _HonchoStore:
                 peer_id=str(value["peer_id"]),
                 session_id=session,
                 metadata=dict(value["metadata"]),
-                created_at=datetime.now(timezone.utc),
+                created_at=datetime.now(UTC),
                 workspace_id="family-marina",
                 token_count=1,
             )
@@ -991,3 +997,196 @@ async def test_estimation_backoff_doubles_caps_and_does_not_reconfirm(tmp_path: 
     assert sidecar.consumption_status == "consumed"
     assert sidecar.prompt_message_id == 42
     assert len(outbound) == 1
+
+
+@pytest.mark.asyncio
+async def test_exif_boundary_is_inclusive_and_stale_candidate_does_not_block_fresh(
+    tmp_path: Path,
+) -> None:
+    clock = _Clock()
+    clock.value = datetime(2026, 8, 12, 9, 0, tzinfo=UTC)
+    stale = _candidate(tmp_path, file_id="id:stale", rev="rev:stale",
+                       capture_time="2026-08-05T11:59:59.999999+03:00")
+    fresh = _candidate(tmp_path, file_id="id:fresh", rev="rev:fresh",
+                       capture_time="2026-08-05T12:00:00+03:00")
+    config = NutritionIngestConfig(enabled=True, synchronized_root=tmp_path,
+                                   principal="123", chat_id="123", session_key="telegram:123")
+    outbound = []
+    metrics = NutritionMetrics()
+    coordinator = NutritionIngestCoordinator(config, publish_outbound=outbound.append,
+                                              metrics=metrics, now=clock)
+
+    await coordinator.poll_once()
+
+    assert NutritionResultStore(tmp_path / stale / "result.json").load().skip_reason == "exif_stale"
+    assert len(outbound) == 1 and outbound[0].metadata["_nutrition_candidate_id"] == fresh
+    assert metrics.snapshot()["events"] == {"verified_candidate|scan|": 1}
+    await coordinator.poll_once()
+    assert len(outbound) == 1
+    restarted = NutritionIngestCoordinator(config, publish_outbound=outbound.append, now=clock)
+    await restarted.poll_once()
+    assert len(outbound) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("exif_updates", "reason"),
+    [({"normalized_capture_time": None}, "exif_missing"),
+     ({"timezone_status": "ambiguous"}, "exif_ambiguous"),
+     ({"normalized_capture_time": "not-an-iso"}, "exif_invalid")],
+)
+async def test_unusable_exif_is_terminally_skipped(tmp_path: Path, exif_updates, reason: str) -> None:
+    candidate = _candidate(tmp_path, file_id=f"id:{reason}", rev=f"rev:{reason}",
+                           exif_updates=exif_updates)
+    config = NutritionIngestConfig(enabled=True, synchronized_root=tmp_path,
+                                   principal="123", chat_id="123", session_key="telegram:123")
+    outbound = []
+    coordinator = NutritionIngestCoordinator(config, publish_outbound=outbound.append, now=_Clock())
+
+    await coordinator.poll_once()
+
+    sidecar = NutritionResultStore(tmp_path / candidate / "result.json").load()
+    assert sidecar.state == ResultState.skipped
+    assert sidecar.skip_reason == reason
+    assert sidecar.consumption_status == "unknown"
+    assert sidecar.prompt_message_id is None and sidecar.reply_message_id is None
+    assert sidecar.emitted_honcho_message_id is None and outbound == []
+
+
+@pytest.mark.asyncio
+async def test_offsetless_moscow_capture_is_checked_again_before_send(tmp_path: Path) -> None:
+    clock = _Clock()
+    clock.value = datetime(2026, 8, 12, 9, 0, tzinfo=UTC)
+    candidate = _candidate(tmp_path, file_id="id:offsetless", rev="rev:offsetless",
+                           capture_time="2026-08-05T12:00:00",
+                           exif_updates={"timezone_status": "missing", "capture_timezone_offset": None})
+    config = NutritionIngestConfig(enabled=True, synchronized_root=tmp_path,
+                                   principal="123", chat_id="123", session_key="telegram:123")
+    outbound = []
+    coordinator = NutritionIngestCoordinator(config, publish_outbound=outbound.append, now=clock)
+    original = coordinator._publish_prompt
+
+    async def advance_before_send(artifact, sidecar):
+        clock.advance(0.000001)
+        await original(artifact, sidecar)
+
+    coordinator._publish_prompt = advance_before_send
+    await coordinator.poll_once()
+    sidecar = NutritionResultStore(tmp_path / candidate / "result.json").load()
+    assert outbound == [] and sidecar.state == ResultState.skipped
+    assert sidecar.skip_reason == "exif_stale"
+
+
+@pytest.mark.asyncio
+async def test_old_pending_confirmation_cannot_consume_reply(tmp_path: Path) -> None:
+    clock = _Clock()
+    candidate = _candidate(tmp_path, file_id="id:legacy", rev="rev:legacy",
+                           capture_time="2026-08-05T12:00:00+03:00")
+    config = NutritionIngestConfig(enabled=True, synchronized_root=tmp_path,
+                                   principal="123", chat_id="123", session_key="telegram:123")
+    outbound, estimates = [], []
+    coordinator = NutritionIngestCoordinator(config, publish_outbound=outbound.append,
+                                              estimate=estimates.append, now=clock)
+    await coordinator.poll_once()
+    await coordinator.on_send_success(
+        outbound[0], OutboundDeliveryReceipt("telegram", "123", (42,),
+                                              outbound[0].metadata["_trusted_outbound_operation_id"])
+    )
+    clock.advance(7 * 24 * 60 * 60 + 0.000001)
+    handled = await coordinator.handle_inbound(InboundMessage(
+        channel="telegram", sender_id="123", chat_id="123", content="Да",
+        session_key_override="telegram:123"))
+    assert handled is False and estimates == []
+    assert NutritionResultStore(tmp_path / candidate / "result.json").load().state == ResultState.skipped
+
+
+@pytest.mark.asyncio
+async def test_consumed_estimation_retry_survives_exif_aging(tmp_path: Path) -> None:
+    clock = _Clock()
+    candidate = _candidate(tmp_path, file_id="id:aging", rev="rev:aging",
+                           capture_time="2026-08-05T12:00:00+03:00")
+    config = NutritionIngestConfig(enabled=True, synchronized_root=tmp_path,
+                                   principal="123", chat_id="123", session_key="telegram:123",
+                                   retry_backoff_seconds=0)
+    outbound, calls = [], []
+
+    def estimate(_message):
+        calls.append(True)
+        if len(calls) == 1:
+            raise RuntimeError("estimator unavailable")
+        return "honcho-aged"
+
+    coordinator = NutritionIngestCoordinator(config, publish_outbound=outbound.append,
+                                              estimate=estimate, now=clock)
+    await coordinator.poll_once()
+    await coordinator.on_send_success(
+        outbound[0], OutboundDeliveryReceipt("telegram", "123", (42,),
+                                              outbound[0].metadata["_trusted_outbound_operation_id"])
+    )
+    await coordinator.handle_inbound(InboundMessage(
+        channel="telegram", sender_id="123", chat_id="123", content="Да",
+        session_key_override="telegram:123"))
+    clock.advance(7 * 24 * 60 * 60 + 1)
+    await coordinator.poll_once()
+    sidecar = NutritionResultStore(tmp_path / candidate / "result.json").load()
+    assert len(calls) == 2 and sidecar.state == ResultState.completed
+    assert sidecar.emitted_honcho_message_id == "honcho-aged"
+
+
+def test_freshness_helper_requires_aware_clock() -> None:
+    exif = ExifMetadata(timezone_status="known",
+                        normalized_capture_time="2026-08-05T12:00:00+03:00")
+    with pytest.raises(ValueError, match="timezone-aware"):
+        exif_freshness_reason(exif, datetime.fromisoformat("2026-08-05T10:00:00"))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exif_updates", [
+    {"timezone_status": "known", "capture_timezone_offset": None},
+    {"timezone_status": "missing", "capture_timezone_offset": "+03:00"},
+])
+async def test_naive_exif_with_untruthful_provenance_is_invalid(tmp_path: Path, exif_updates) -> None:
+    candidate = _candidate(tmp_path, file_id="id:invalid", rev=str(exif_updates),
+                           capture_time="2026-08-05T12:00:00", exif_updates=exif_updates)
+    config = NutritionIngestConfig(enabled=True, synchronized_root=tmp_path,
+                                   principal="123", chat_id="123", session_key="telegram:123")
+    metrics = NutritionMetrics()
+    await NutritionIngestCoordinator(config, metrics=metrics, now=_Clock()).poll_once()
+    sidecar = NutritionResultStore(tmp_path / candidate / "result.json").load()
+    assert sidecar.state == ResultState.skipped and sidecar.skip_reason == "exif_invalid"
+    assert metrics.snapshot()["events"] == {}
+
+
+@pytest.mark.asyncio
+async def test_aware_capture_remains_valid_with_missing_offset_provenance(tmp_path: Path) -> None:
+    candidate = _candidate(tmp_path, file_id="id:aware", rev="rev:aware",
+                           capture_time="2026-08-05T12:00:00+03:00",
+                           exif_updates={"timezone_status": "missing", "capture_timezone_offset": None})
+    config = NutritionIngestConfig(enabled=True, synchronized_root=tmp_path,
+                                   principal="123", chat_id="123", session_key="telegram:123")
+    outbound = []
+    await NutritionIngestCoordinator(config, publish_outbound=outbound.append,
+                                     now=_Clock()).poll_once()
+    assert len(outbound) == 1 and outbound[0].metadata["_nutrition_candidate_id"] == candidate
+
+
+@pytest.mark.asyncio
+async def test_skipping_candidate_preserves_historical_attempts(tmp_path: Path) -> None:
+    clock = _Clock()
+    candidate = _candidate(tmp_path, file_id="id:attempts", rev="rev:attempts",
+                           capture_time="2026-08-05T12:00:00+03:00")
+    config = NutritionIngestConfig(enabled=True, synchronized_root=tmp_path,
+                                   principal="123", chat_id="123", session_key="telegram:123",
+                                   retry_backoff_seconds=0)
+
+    async def fail(_message):
+        raise RuntimeError("temporary prompt failure")
+
+    coordinator = NutritionIngestCoordinator(config, publish_outbound=fail, now=clock)
+    await coordinator.poll_once()
+    before = NutritionResultStore(tmp_path / candidate / "result.json").load()
+    clock.advance(7 * 24 * 60 * 60 + 1)
+    await coordinator.poll_once()
+    after = NutritionResultStore(tmp_path / candidate / "result.json").load()
+    assert before.state == ResultState.retryable_error
+    assert after.state == ResultState.skipped and after.attempts == before.attempts

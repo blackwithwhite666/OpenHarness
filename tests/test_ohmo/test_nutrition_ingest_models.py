@@ -11,10 +11,10 @@ from ohmo.nutrition_ingest.models import (
     NutritionResultSidecar,
     RecipientBinding,
     ResultState,
+    StageAttempt,
     StateHistoryEntry,
     candidate_id_for,
 )
-
 
 FIXTURE = Path(__file__).parents[2] / "ohmo/nutrition_ingest/manifest_v1_fixture.json"
 
@@ -119,12 +119,59 @@ def test_result_sidecar_has_stable_operation_ids_and_bounded_history() -> None:
     assert result.meal_observation_operation_id.endswith(":meal-observation:v1")
 
 
+def test_skipped_sidecar_has_terminal_invariants() -> None:
+    payload = _result(ResultState.published).model_dump(mode="json")
+    payload.update(
+        state=ResultState.skipped,
+        revision=2,
+        consumption_status="unknown",
+        prompt_message_id=None,
+        reply_message_id=None,
+        emitted_honcho_message_id=None,
+        attempts=[StageAttempt(
+            stage="prompt", attempt=1, started_at="2026-08-05T10:00:00Z",
+            finished_at="2026-08-05T10:00:01Z", error="temporary failure"
+        ).model_dump(mode="json")],
+        skip_reason="exif_stale",
+        state_history=[
+            *payload["state_history"],
+            StateHistoryEntry(revision=2, state=ResultState.skipped,
+                              at="2026-08-05T10:01:00Z").model_dump(mode="json"),
+        ],
+    )
+    result = NutritionResultSidecar.model_validate(payload)
+    assert result.state == ResultState.skipped
+    assert result.skip_reason == "exif_stale"
+
+
+@pytest.mark.parametrize("skip_reason", ["bad", "", None])
+def test_skipped_sidecar_rejects_unbounded_or_missing_reason(skip_reason) -> None:
+    payload = _result(ResultState.published).model_dump(mode="json")
+    payload.update(
+        state=ResultState.skipped,
+        revision=2,
+        skip_reason=skip_reason,
+        state_history=[
+            *payload["state_history"],
+            StateHistoryEntry(revision=2, state=ResultState.skipped,
+                              at="2026-08-05T10:01:00Z").model_dump(mode="json"),
+        ],
+    )
+    with pytest.raises(ValidationError):
+        NutritionResultSidecar.model_validate(payload)
+
+
 @pytest.mark.parametrize(
     ("previous", "current"),
     [
         (ResultState.prompt_sending, ResultState.delivery_unknown),
         (ResultState.delivery_unknown, ResultState.prompt_sending),
         (ResultState.delivery_unknown, ResultState.dead_letter),
+        (ResultState.published, ResultState.skipped),
+        (ResultState.prompt_sending, ResultState.skipped),
+        (ResultState.delivery_unknown, ResultState.skipped),
+        (ResultState.pending_confirmation, ResultState.skipped),
+        (ResultState.retryable_error, ResultState.skipped),
     ],
 )
 def test_delivery_unknown_has_explicit_reconciliation_transitions(previous, current) -> None:
@@ -141,6 +188,7 @@ def test_delivery_unknown_has_explicit_reconciliation_transitions(previous, curr
     [
         (ResultState.retryable_error, ResultState.delivery_unknown),
         (ResultState.delivery_unknown, ResultState.pending_confirmation),
+        (ResultState.skipped, ResultState.published),
     ],
 )
 def test_delivery_unknown_cannot_be_automatically_retried(previous, current) -> None:

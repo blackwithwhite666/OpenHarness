@@ -8,7 +8,7 @@ import re
 from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -23,7 +23,7 @@ def candidate_id_for(file_id: str, rev: str) -> str:
         raise ValueError("file_id must be a non-empty string")
     if not isinstance(rev, str) or not rev:
         raise ValueError("rev must be a non-empty string")
-    digest = hashlib.sha256(f"{file_id}\0{rev}".encode("utf-8")).hexdigest()
+    digest = hashlib.sha256(f"{file_id}\0{rev}".encode()).hexdigest()
     return f"dropbox-camera-v1-{digest}"
 
 
@@ -160,7 +160,7 @@ class ManifestV1(_StrictModel):
         return value
 
     @model_validator(mode="after")
-    def _identity(self) -> "ManifestV1":
+    def _identity(self) -> ManifestV1:
         if self.candidate_id != candidate_id_for(self.file_id, self.rev):
             raise ValueError("candidate_id does not match file_id and rev")
         if self.classifier_output.schema_version != 1:
@@ -168,7 +168,7 @@ class ManifestV1(_StrictModel):
         return self
 
     @classmethod
-    def from_path(cls, manifest_path: str | Path, configured_root: str | Path) -> "ManifestV1":
+    def from_path(cls, manifest_path: str | Path, configured_root: str | Path) -> ManifestV1:
         """Parse and verify a manifest and its named image under ``configured_root``."""
         return parse_manifest(manifest_path, configured_root)
 
@@ -227,6 +227,10 @@ class ResultState(StrEnum):
     completed = "completed"
     retryable_error = "retryable_error"
     dead_letter = "dead_letter"
+    skipped = "skipped"
+
+
+SkipReason = Literal["exif_missing", "exif_ambiguous", "exif_invalid", "exif_stale"]
 
 
 class RecipientBinding(_StrictModel):
@@ -269,6 +273,7 @@ class NutritionResultSidecar(_StrictModel):
     consumption_status: str = "unknown"
     attempts: list[StageAttempt] = Field(default_factory=list, max_length=32)
     emitted_honcho_message_id: str | None = None
+    skip_reason: SkipReason | None = None
 
     @field_validator("schema_version")
     @classmethod
@@ -278,7 +283,7 @@ class NutritionResultSidecar(_StrictModel):
         return value
 
     @model_validator(mode="after")
-    def _sidecar_invariants(self) -> "NutritionResultSidecar":
+    def _sidecar_invariants(self) -> NutritionResultSidecar:
         expected_history_length = min(self.revision, 32)
         if len(self.state_history) != expected_history_length:
             raise ValueError("state history must contain the bounded revision window")
@@ -297,9 +302,22 @@ class NutritionResultSidecar(_StrictModel):
             raise ValueError("meal operation id is not bound to candidate")
         if self.consumption_status not in {"unknown", "consumed", "planned", "not_consumed"}:
             raise ValueError("invalid consumption status")
-        if self.state in {ResultState.confirmed, ResultState.estimated}:
-            if self.consumption_status != "consumed":
-                raise ValueError("confirmed and estimated results require consumed status")
+        if (
+            self.state in {ResultState.confirmed, ResultState.estimated}
+            and self.consumption_status != "consumed"
+        ):
+            raise ValueError("confirmed and estimated results require consumed status")
+        if self.state == ResultState.skipped:
+            if self.skip_reason is None:
+                raise ValueError("skipped result requires a bounded EXIF skip reason")
+            if self.consumption_status != "unknown":
+                raise ValueError("skipped result requires unknown consumption status")
+            if self.prompt_message_id is not None or self.reply_message_id is not None:
+                raise ValueError("skipped result must not have prompt or reply ids")
+            if self.emitted_honcho_message_id is not None:
+                raise ValueError("skipped result must not have a Honcho message id")
+        elif self.skip_reason is not None:
+            raise ValueError("skip reason is only valid for skipped results")
         if self.state == ResultState.completed:
             if self.consumption_status == "consumed":
                 if not isinstance(self.emitted_honcho_message_id, str) or not self.emitted_honcho_message_id.strip():
