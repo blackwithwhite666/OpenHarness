@@ -15,6 +15,7 @@
   "default_tz": "Europe/Moscow",
   "memory_backend": "file",
   "conversation_learning": true,
+  "honcho_base_url": "${HONCHO_BASE_URL}",
   "owner_principals": [],
   "family_principals": {
     "999999999": "marina"
@@ -24,6 +25,7 @@
     "marina": {
       "workspace": "${MARINA_HONCHO_WORKSPACE}",
       "api_key": "${MARINA_HONCHO_API_KEY}",
+      "session": "ohmo",
       "observed_peer": "${MARINA_HONCHO_OBSERVED_PEER}"
     }
   },

@@ -16,15 +16,13 @@ from pathlib import Path
 if sys.platform == "win32":
     import ctypes
 
-from openharness.channels.bus.events import OutboundMessage
-from openharness.channels.bus.queue import MessageBus
-from openharness.channels.impl.manager import ChannelManager
-
 from ohmo.contact_registry import ContactStore
 from ohmo.gateway.bridge import OhmoGatewayBridge
 from ohmo.gateway.config import build_channel_manager_config, load_gateway_config
 from ohmo.gateway.models import GatewayState
 from ohmo.gateway.runtime import OhmoSessionRuntimePool
+from ohmo.memory_backend import resolve_tenant_honcho_binding
+from ohmo.memory_service.honcho_client import HonchoClient
 from ohmo.nutrition_ingest.coordinator import NutritionIngestCoordinator
 from ohmo.reminders.scheduler import ReminderScheduler
 from ohmo.workspace import (
@@ -35,6 +33,9 @@ from ohmo.workspace import (
     get_workspace_root,
     initialize_workspace,
 )
+from openharness.channels.bus.events import OutboundMessage
+from openharness.channels.bus.queue import MessageBus
+from openharness.channels.impl.manager import ChannelManager
 
 logger = logging.getLogger(__name__)
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -82,10 +83,27 @@ class OhmoGatewayService:
             lock=self._runtime_pool._reminder_lock,
             catchup=self._config.reminder_catchup,
         )
+        self._nutrition_honcho_client: HonchoClient | None = None
+        nutrition_honcho_session = "ohmo"
+        nutrition_observed_peer = "marina"
+        if self._config.nutrition_ingest.enabled:
+            binding = resolve_tenant_honcho_binding(self._config, "marina")
+            if binding is None:
+                raise ValueError("nutrition ingest Marina Honcho binding is unavailable")
+            self._nutrition_honcho_client = HonchoClient(
+                binding.base_url,
+                binding.api_key,
+                binding.workspace,
+            )
+            nutrition_honcho_session = binding.session
+            nutrition_observed_peer = binding.observed_peer
         self._nutrition_coordinator = NutritionIngestCoordinator(
             self._config.nutrition_ingest,
             publish_outbound=self._bus.publish_outbound,
             runtime_pool=self._runtime_pool,
+            honcho_client=self._nutrition_honcho_client,
+            honcho_session=nutrition_honcho_session,
+            observed_peer=nutrition_observed_peer,
         )
         self._bridge = OhmoGatewayBridge(
             bus=self._bus,
@@ -372,6 +390,9 @@ class OhmoGatewayService:
                 nutrition_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await nutrition_task
+            nutrition_honcho_client = getattr(self, "_nutrition_honcho_client", None)
+            if nutrition_honcho_client is not None:
+                await nutrition_honcho_client.aclose()
             await self._runtime_pool.aclose()
             await self._manager.stop_all()
             self.write_state(running=False)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 
 from ohmo.nutrition_ingest.models import candidate_id_for
@@ -54,6 +55,24 @@ def test_scanner_waits_for_complete_image_and_orders_deterministically(tmp_path:
     assert [item.candidate_id for item in ready] == [second.name, first.name]
 
 
+def test_scanner_rejects_symlinked_candidate_directory(tmp_path: Path) -> None:
+    root = tmp_path / "nutrition-assets"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    candidate = _write_candidate(
+        outside,
+        file_id="id:outside",
+        rev="rev:outside",
+        discovery="2026-08-05T10:00:00Z",
+        data=b"outside",
+    )
+    os.symlink(candidate, root / candidate.name)
+
+    assert NutritionArtifactScanner(root).scan_ready() == []
+    assert candidate.is_dir()
+
+
 def test_result_store_crash_before_replace_preserves_last_good_sidecar(tmp_path: Path) -> None:
     path = tmp_path / "candidate" / "result.json"
     store = NutritionResultStore(path)
@@ -84,8 +103,8 @@ def test_result_store_crash_before_replace_preserves_last_good_sidecar(tmp_path:
 
 
 def _write_sidecar(store: NutritionResultStore, *, revision: int, state: str):
-    from tests.test_ohmo.test_nutrition_ingest_models import _result
     from ohmo.nutrition_ingest.models import ResultState
+    from tests.test_ohmo.test_nutrition_ingest_models import _result
 
     value = _result(ResultState(state), revision)
     return store.compare_and_replace(value, expected_revision=revision - 1)

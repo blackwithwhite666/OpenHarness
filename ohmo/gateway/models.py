@@ -9,9 +9,9 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-
 _TENANT_ID_RE = re.compile(r"[a-z0-9_-]+")
 _NUMERIC_PRINCIPAL_RE = re.compile(r"[1-9][0-9]*")
+_HONCHO_SESSION_RE = re.compile(r"[A-Za-z0-9_-]{1,512}")
 
 
 class GatewayConfig(BaseModel):
@@ -84,6 +84,11 @@ class GatewayConfig(BaseModel):
             if not isinstance(observed_peer, str) or not observed_peer.strip():
                 raise ValueError(
                     f"tenant_honcho[{tenant_id!r}].observed_peer must not be empty"
+                )
+            session = binding.get("session", "ohmo")
+            if not isinstance(session, str) or _HONCHO_SESSION_RE.fullmatch(session) is None:
+                raise ValueError(
+                    f"tenant_honcho[{tenant_id!r}].session must be a bounded Honcho identifier"
                 )
 
         if "owner" in self.shared_tenants:
@@ -163,6 +168,8 @@ class NutritionIngestConfig(BaseModel):
             raise ValueError("nutrition ingest principal is not bound to marina")
         if self.tenant_id not in gateway.enabled_memory_tenants:
             raise ValueError("nutrition ingest Marina tenant is not enabled")
+        if not isinstance(gateway.honcho_base_url, str) or not gateway.honcho_base_url.strip():
+            raise ValueError("nutrition ingest requires the Honcho base URL")
         binding = gateway.tenant_honcho.get("marina")
         if not binding or not all(
             isinstance(binding.get(key), str) and binding.get(key, "").strip()

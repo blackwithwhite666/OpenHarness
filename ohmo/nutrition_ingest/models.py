@@ -8,13 +8,23 @@ import re
 from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, ClassVar, Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class _StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid", validate_assignment=True)
+
+
+_CANDIDATE_ID_PATTERN = re.compile(r"^dropbox-camera-v1-[0-9a-f]{64}$")
+
+
+def validate_candidate_id(value: str) -> str:
+    """Validate one protocol candidate id without accepting path syntax."""
+    if not isinstance(value, str) or not _CANDIDATE_ID_PATTERN.fullmatch(value):
+        raise ValueError("invalid candidate_id")
+    return value
 
 
 def candidate_id_for(file_id: str, rev: str) -> str:
@@ -99,10 +109,6 @@ class ManifestV1(_StrictModel):
     confirmation_required: bool
     consumption_status: str
 
-    _candidate_pattern: ClassVar[re.Pattern[str]] = re.compile(
-        r"^dropbox-camera-v1-[0-9a-f]{64}$"
-    )
-
     @field_validator("schema_version")
     @classmethod
     def _version(cls, value: int) -> int:
@@ -113,9 +119,7 @@ class ManifestV1(_StrictModel):
     @field_validator("candidate_id")
     @classmethod
     def _candidate_id_shape(cls, value: str) -> str:
-        if not cls._candidate_pattern.fullmatch(value):
-            raise ValueError("invalid candidate_id")
-        return value
+        return validate_candidate_id(value)
 
     @field_validator("original_sha256")
     @classmethod
@@ -228,9 +232,21 @@ class ResultState(StrEnum):
     retryable_error = "retryable_error"
     dead_letter = "dead_letter"
     skipped = "skipped"
+    seen = "seen"
 
 
 SkipReason = Literal["exif_missing", "exif_ambiguous", "exif_invalid", "exif_stale"]
+SeenReason = Literal["duplicate_honcho"]
+SeenFingerprintKind = Literal["sha256", "phash"]
+TombstoneReason = Literal["duplicate_honcho", "expired"]
+
+
+def _validate_optional_audit_id(value: str | None) -> str | None:
+    if value is not None and (
+        not value or len(value) > 256 or any(ord(character) < 32 for character in value)
+    ):
+        raise ValueError("audit message id must be a bounded printable string")
+    return value
 
 
 class RecipientBinding(_StrictModel):
@@ -274,6 +290,10 @@ class NutritionResultSidecar(_StrictModel):
     attempts: list[StageAttempt] = Field(default_factory=list, max_length=32)
     emitted_honcho_message_id: str | None = None
     skip_reason: SkipReason | None = None
+    seen_reason: SeenReason | None = None
+    matched_honcho_message_id: str | None = Field(default=None, max_length=256)
+    seen_fingerprint_kind: SeenFingerprintKind | None = None
+    seen_phash_algorithm: str | None = Field(default=None, max_length=64)
 
     @field_validator("schema_version")
     @classmethod
@@ -281,6 +301,11 @@ class NutritionResultSidecar(_StrictModel):
         if value != 1:
             raise ValueError("unsupported result sidecar version")
         return value
+
+    @field_validator("matched_honcho_message_id")
+    @classmethod
+    def _sidecar_matched_message_id(cls, value: str | None) -> str | None:
+        return _validate_optional_audit_id(value)
 
     @model_validator(mode="after")
     def _sidecar_invariants(self) -> NutritionResultSidecar:
@@ -318,9 +343,37 @@ class NutritionResultSidecar(_StrictModel):
                 raise ValueError("skipped result must not have a Honcho message id")
         elif self.skip_reason is not None:
             raise ValueError("skip reason is only valid for skipped results")
+        if self.state == ResultState.seen:
+            if self.seen_reason != "duplicate_honcho":
+                raise ValueError("seen result requires duplicate_honcho provenance")
+            if self.seen_fingerprint_kind not in {"sha256", "phash"}:
+                raise ValueError("seen result requires an exact fingerprint kind")
+            if self.seen_fingerprint_kind == "phash" and not self.seen_phash_algorithm:
+                raise ValueError("pHash duplicate requires its exact algorithm")
+            if self.seen_fingerprint_kind == "sha256" and self.seen_phash_algorithm is not None:
+                raise ValueError("SHA-256 duplicate must not carry a pHash algorithm")
+            if self.consumption_status != "unknown":
+                raise ValueError("seen result requires unknown consumption status")
+            if self.prompt_message_id is not None or self.reply_message_id is not None:
+                raise ValueError("seen result must not have prompt or reply ids")
+            if self.emitted_honcho_message_id is not None:
+                raise ValueError("seen result must not have an emitted meal id")
+        elif any(
+            value is not None
+            for value in (
+                self.seen_reason,
+                self.matched_honcho_message_id,
+                self.seen_fingerprint_kind,
+                self.seen_phash_algorithm,
+            )
+        ):
+            raise ValueError("seen provenance is only valid for seen results")
         if self.state == ResultState.completed:
             if self.consumption_status == "consumed":
-                if not isinstance(self.emitted_honcho_message_id, str) or not self.emitted_honcho_message_id.strip():
+                if (
+                    not isinstance(self.emitted_honcho_message_id, str)
+                    or not self.emitted_honcho_message_id.strip()
+                ):
                     raise ValueError("consumed completion requires a durable Honcho message id")
             elif self.consumption_status == "not_consumed":
                 if self.emitted_honcho_message_id is not None:
@@ -334,3 +387,62 @@ class NutritionResultSidecar(_StrictModel):
 
 
 NutritionResult = NutritionResultSidecar
+
+
+class SeenTombstoneV1(_StrictModel):
+    """Compact producer-facing suppression marker under ``_seen``."""
+
+    schema_version: Literal[1] = 1
+    candidate_id: str
+    original_sha256: str
+    phash: str | None = Field(default=None, max_length=256)
+    phash_algorithm: str | None = Field(default=None, max_length=64)
+    terminal_reason: TombstoneReason
+    capture_time: datetime
+    archived_at: datetime
+    state_summary: str = Field(min_length=1, max_length=64)
+    matched_honcho_message_id: str | None = Field(default=None, max_length=256)
+    matching_fingerprint_kind: SeenFingerprintKind | None = None
+
+    @field_validator("candidate_id")
+    @classmethod
+    def _tombstone_candidate_id(cls, value: str) -> str:
+        return validate_candidate_id(value)
+
+    @field_validator("original_sha256")
+    @classmethod
+    def _tombstone_sha256(cls, value: str) -> str:
+        if not re.fullmatch(r"[0-9a-f]{64}", value):
+            raise ValueError("tombstone SHA-256 must be lowercase hexadecimal")
+        return value
+
+    @field_validator("matched_honcho_message_id")
+    @classmethod
+    def _tombstone_matched_message_id(cls, value: str | None) -> str | None:
+        return _validate_optional_audit_id(value)
+
+    @field_validator("phash")
+    @classmethod
+    def _tombstone_phash(cls, value: str | None) -> str | None:
+        if value is not None and not re.fullmatch(r"[0-9a-f]{1,256}", value):
+            raise ValueError("tombstone pHash must be bounded lowercase hexadecimal")
+        return value
+
+    @field_validator("capture_time", "archived_at")
+    @classmethod
+    def _tombstone_aware(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("tombstone timestamps must be timezone-aware")
+        return value
+
+    @model_validator(mode="after")
+    def _tombstone_invariants(self) -> SeenTombstoneV1:
+        if (self.phash is None) != (self.phash_algorithm is None):
+            raise ValueError("tombstone pHash and algorithm must be paired")
+        if self.terminal_reason == "duplicate_honcho" and self.matching_fingerprint_kind is None:
+            raise ValueError("duplicate tombstone requires a matching fingerprint")
+        if self.matched_honcho_message_id is not None and self.matching_fingerprint_kind is None:
+            raise ValueError("matched Honcho id requires a matching fingerprint")
+        if self.matching_fingerprint_kind == "phash" and self.phash is None:
+            raise ValueError("pHash duplicate tombstone requires a pHash")
+        return self

@@ -122,8 +122,18 @@ class NutritionResultStore:
     def _validate_transition(previous: ResultState, current: ResultState) -> None:
         legal: dict[ResultState, set[ResultState]] = {
             ResultState.discovered: {ResultState.classified, ResultState.retryable_error},
-            ResultState.classified: {ResultState.published, ResultState.completed, ResultState.retryable_error},
-            ResultState.published: {ResultState.prompt_sending, ResultState.pending_confirmation, ResultState.retryable_error, ResultState.skipped},
+            ResultState.classified: {
+                ResultState.published,
+                ResultState.completed,
+                ResultState.retryable_error,
+            },
+            ResultState.published: {
+                ResultState.prompt_sending,
+                ResultState.pending_confirmation,
+                ResultState.retryable_error,
+                ResultState.skipped,
+                ResultState.seen,
+            },
             ResultState.prompt_sending: {
                 ResultState.pending_confirmation,
                 ResultState.retryable_error,
@@ -139,7 +149,12 @@ class NutritionResultStore:
                 ResultState.dead_letter,
                 ResultState.skipped,
             },
-            ResultState.pending_confirmation: {ResultState.confirmed, ResultState.declined, ResultState.retryable_error, ResultState.skipped},
+            ResultState.pending_confirmation: {
+                ResultState.confirmed,
+                ResultState.declined,
+                ResultState.retryable_error,
+                ResultState.skipped,
+            },
             ResultState.confirmed: {
                 ResultState.estimated,
                 ResultState.retryable_error,
@@ -161,6 +176,7 @@ class NutritionResultStore:
                 ResultState.retryable_error,
                 ResultState.skipped,
                 ResultState.dead_letter,
+                ResultState.seen,
             },
             ResultState.declined: {ResultState.completed},
             ResultState.dead_letter: {
@@ -171,6 +187,8 @@ class NutritionResultStore:
                 ResultState.confirmed,
             },
             ResultState.completed: set(),
+            ResultState.seen: set(),
+            ResultState.skipped: set(),
         }
         if current not in legal.get(previous, set()):
             raise ValueError(f"illegal nutrition state transition: {previous} -> {current}")

@@ -11,6 +11,7 @@ from __future__ import annotations
 import dataclasses
 import datetime as dt
 import json as jsonlib
+import math
 from collections.abc import Mapping, Sequence
 from typing import Literal, TypeAlias, cast
 from urllib.parse import quote
@@ -25,6 +26,9 @@ QueryValue: TypeAlias = str | int | float | bool | None
 ReasoningLevel: TypeAlias = Literal["minimal", "low", "medium", "high", "max"]
 
 _MISSING = object()
+_RECENT_MESSAGE_METADATA_MAX_BYTES = 32 * 1024
+_RECENT_MESSAGE_ID_MAX_LENGTH = 256
+_HONCHO_RESOURCE_ID_MAX_LENGTH = 512
 
 
 class HonchoError(RuntimeError):
@@ -101,6 +105,42 @@ class Message:
             created_at=_required_datetime(payload, "created_at"),
             workspace_id=_required_str(payload, "workspace_id"),
             token_count=_required_int(payload, "token_count"),
+        )
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class RecentMessageMetadata:
+    """Content-free message projection used by bounded deduplication reads."""
+
+    id: str
+    peer_id: str
+    session_id: str
+    metadata: Mapping[str, object]
+    created_at: dt.datetime
+
+    @classmethod
+    def from_json(cls, payload: Mapping[str, object]) -> "RecentMessageMetadata":
+        created_at = _required_datetime(payload, "created_at")
+        if created_at.tzinfo is None or created_at.utcoffset() is None:
+            raise HonchoError("field 'created_at' must be timezone-aware")
+        metadata = _mapping(payload.get("metadata", {}), "message metadata")
+        try:
+            encoded_metadata = jsonlib.dumps(
+                metadata,
+                allow_nan=False,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        except (RecursionError, TypeError, ValueError) as error:
+            raise HonchoError("message metadata must contain bounded JSON values") from error
+        if len(metadata) > 64 or len(encoded_metadata) > _RECENT_MESSAGE_METADATA_MAX_BYTES:
+            raise HonchoError("message metadata exceeds the deduplication bound")
+        return cls(
+            id=_required_bounded_str(payload, "id", _RECENT_MESSAGE_ID_MAX_LENGTH),
+            peer_id=_required_bounded_str(payload, "peer_id", _HONCHO_RESOURCE_ID_MAX_LENGTH),
+            session_id=_required_bounded_str(payload, "session_id", _HONCHO_RESOURCE_ID_MAX_LENGTH),
+            metadata=metadata,
+            created_at=created_at,
         )
 
 
@@ -365,9 +405,7 @@ class HonchoClient:
             ):
                 break
             if isinstance(payload, list) or (
-                not isinstance(total, int)
-                and not isinstance(pages, int)
-                and len(items) < page_size
+                not isinstance(total, int) and not isinstance(pages, int) and len(items) < page_size
             ):
                 break
             # Some test and proxy implementations expose a cursor instead of
@@ -378,6 +416,106 @@ class HonchoClient:
         else:
             raise HonchoError("message lookup exceeded pagination limit")
         return found
+
+    async def list_recent_message_metadata(
+        self,
+        session: str,
+        *,
+        expected_peer_id: str,
+        since: dt.datetime,
+        until: dt.datetime,
+        page_size: int = 50,
+        max_pages: int = 20,
+    ) -> list[RecentMessageMetadata]:
+        """List a bounded, content-free projection in ``[since, until]``.
+
+        Honcho's message-list response currently has no field-selection option,
+        so the response may contain content on the wire. This method never
+        parses, retains, returns, or logs that field. Pagination is validated
+        strictly so a partial history cannot be mistaken for a complete dedup
+        window.
+        """
+        if not session or not expected_peer_id:
+            raise ValueError("session and expected_peer_id are required")
+        for name, value in (("since", since), ("until", until)):
+            if value.tzinfo is None or value.utcoffset() is None:
+                raise ValueError(f"{name} must be timezone-aware")
+        if since > until:
+            raise ValueError("since must not be after until")
+        if not 1 <= page_size <= 100:
+            raise ValueError("page_size must be between 1 and 100")
+        if not 1 <= max_pages <= 100:
+            raise ValueError("max_pages must be between 1 and 100")
+
+        results: list[RecentMessageMetadata] = []
+        seen_ids: set[str] = set()
+        fetched = 0
+        expected_total: int | None = None
+        expected_pages: int | None = None
+        filters = {
+            "AND": [
+                {
+                    "created_at": {
+                        "gte": since.isoformat(),
+                        "lte": until.isoformat(),
+                    }
+                },
+                {"peer_id": expected_peer_id},
+            ]
+        }
+        for requested_page in range(1, max_pages + 1):
+            payload = _mapping(
+                await self._request(
+                    "POST",
+                    self._workspace_path(f"sessions/{_segment(session)}/messages/list"),
+                    json={"filters": filters},
+                    params={"page": requested_page, "size": page_size},
+                ),
+                "recent message page",
+            )
+            raw_items = _object_list(payload.get("items"), "recent message page")
+            page = _pagination_int(payload, "page", minimum=1)
+            size = _pagination_int(payload, "size", minimum=1)
+            pages = _pagination_int(payload, "pages", minimum=0)
+            total = _pagination_int(payload, "total", minimum=0)
+            if page != requested_page:
+                raise HonchoError("recent message page number did not match the request")
+            if size != page_size:
+                raise HonchoError("recent message page size did not match the request")
+            if len(raw_items) > size:
+                raise HonchoError("recent message page exceeded its declared size")
+            calculated_pages = math.ceil(total / size)
+            if pages != calculated_pages:
+                raise HonchoError("recent message pagination totals are inconsistent")
+            if pages > max_pages or total > page_size * max_pages:
+                raise HonchoError("recent message listing exceeded pagination limit")
+            if expected_total is None:
+                expected_total = total
+                expected_pages = pages
+            elif total != expected_total or pages != expected_pages:
+                raise HonchoError("recent message pagination changed during traversal")
+
+            items = [RecentMessageMetadata.from_json(item) for item in raw_items]
+            for item in items:
+                if item.session_id != session:
+                    raise HonchoError("recent message escaped the requested session")
+                if item.peer_id != expected_peer_id:
+                    raise HonchoError("recent message escaped the requested peer")
+                if not since <= item.created_at <= until:
+                    raise HonchoError("recent message escaped the requested time window")
+                if item.id in seen_ids:
+                    raise HonchoError("recent message pagination returned a duplicate id")
+                seen_ids.add(item.id)
+                results.append(item)
+            fetched += len(items)
+
+            if page >= pages:
+                if fetched != total:
+                    raise HonchoError("recent message pagination returned a partial history")
+                return results
+            if not items:
+                raise HonchoError("recent message pagination ended before the final page")
+        raise HonchoError("recent message listing exceeded pagination limit")
 
     async def dialectic(
         self,
@@ -624,6 +762,20 @@ def _required_str(payload: Mapping[str, object], key: str, *, default: str | Non
     return value
 
 
+def _required_bounded_str(payload: Mapping[str, object], key: str, maximum_length: int) -> str:
+    value = _required_str(payload, key)
+    if not value or len(value) > maximum_length or any(ord(character) < 32 for character in value):
+        raise HonchoError(f"field {key!r} must be a bounded printable string")
+    return value
+
+
+def _pagination_int(payload: Mapping[str, object], key: str, *, minimum: int) -> int:
+    value = payload.get(key)
+    if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
+        raise HonchoError(f"pagination field {key!r} must be an integer >= {minimum}")
+    return value
+
+
 def _optional_str(payload: Mapping[str, object], key: str) -> str | None:
     value = payload.get(key)
     if value is not None and not isinstance(value, str):
@@ -665,6 +817,7 @@ __all__ = [
     "Message",
     "Peer",
     "PeerContext",
+    "RecentMessageMetadata",
     "Session",
     "Workspace",
 ]

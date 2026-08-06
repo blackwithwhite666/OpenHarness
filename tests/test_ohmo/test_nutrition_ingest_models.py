@@ -128,15 +128,21 @@ def test_skipped_sidecar_has_terminal_invariants() -> None:
         prompt_message_id=None,
         reply_message_id=None,
         emitted_honcho_message_id=None,
-        attempts=[StageAttempt(
-            stage="prompt", attempt=1, started_at="2026-08-05T10:00:00Z",
-            finished_at="2026-08-05T10:00:01Z", error="temporary failure"
-        ).model_dump(mode="json")],
+        attempts=[
+            StageAttempt(
+                stage="prompt",
+                attempt=1,
+                started_at="2026-08-05T10:00:00Z",
+                finished_at="2026-08-05T10:00:01Z",
+                error="temporary failure",
+            ).model_dump(mode="json")
+        ],
         skip_reason="exif_stale",
         state_history=[
             *payload["state_history"],
-            StateHistoryEntry(revision=2, state=ResultState.skipped,
-                              at="2026-08-05T10:01:00Z").model_dump(mode="json"),
+            StateHistoryEntry(
+                revision=2, state=ResultState.skipped, at="2026-08-05T10:01:00Z"
+            ).model_dump(mode="json"),
         ],
     )
     result = NutritionResultSidecar.model_validate(payload)
@@ -153,12 +159,46 @@ def test_skipped_sidecar_rejects_unbounded_or_missing_reason(skip_reason) -> Non
         skip_reason=skip_reason,
         state_history=[
             *payload["state_history"],
-            StateHistoryEntry(revision=2, state=ResultState.skipped,
-                              at="2026-08-05T10:01:00Z").model_dump(mode="json"),
+            StateHistoryEntry(
+                revision=2, state=ResultState.skipped, at="2026-08-05T10:01:00Z"
+            ).model_dump(mode="json"),
         ],
     )
     with pytest.raises(ValidationError):
         NutritionResultSidecar.model_validate(payload)
+
+
+def test_seen_sidecar_enforces_terminal_unknown_consumption_invariants() -> None:
+    payload = _result(ResultState.published).model_dump(mode="json")
+    payload.update(
+        state=ResultState.seen,
+        revision=2,
+        seen_reason="duplicate_honcho",
+        seen_fingerprint_kind="sha256",
+        matched_honcho_message_id="honcho-message",
+        state_history=[
+            *payload["state_history"],
+            StateHistoryEntry(
+                revision=2,
+                state=ResultState.seen,
+                at="2026-08-05T10:01:00Z",
+            ).model_dump(mode="json"),
+        ],
+    )
+    result = NutritionResultSidecar.model_validate(payload)
+    assert result.consumption_status == "unknown"
+    assert result.prompt_message_id is None
+    assert result.reply_message_id is None
+    assert result.emitted_honcho_message_id is None
+
+    for mutation in (
+        {"consumption_status": "consumed"},
+        {"prompt_message_id": 42},
+        {"emitted_honcho_message_id": "meal"},
+        {"seen_fingerprint_kind": "phash", "seen_phash_algorithm": None},
+    ):
+        with pytest.raises(ValidationError):
+            NutritionResultSidecar.model_validate({**payload, **mutation})
 
 
 @pytest.mark.parametrize(
@@ -175,9 +215,7 @@ def test_skipped_sidecar_rejects_unbounded_or_missing_reason(skip_reason) -> Non
     ],
 )
 def test_delivery_unknown_has_explicit_reconciliation_transitions(previous, current) -> None:
-    NutritionResultSidecar.model_validate(
-        _result(previous).model_dump(mode="json")
-    )
+    NutritionResultSidecar.model_validate(_result(previous).model_dump(mode="json"))
     from ohmo.nutrition_ingest.sidecars import NutritionResultStore
 
     NutritionResultStore._validate_transition(previous, current)

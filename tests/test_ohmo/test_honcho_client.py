@@ -366,7 +366,9 @@ async def test_client_matches_conclusion_message_and_recall_contracts(
     )
 
 
-def _message_payload(identifier: str, operation: str, *, role: str = "assistant") -> dict[str, object]:
+def _message_payload(
+    identifier: str, operation: str, *, role: str = "assistant"
+) -> dict[str, object]:
     return {
         "id": identifier,
         "content": "content",
@@ -411,7 +413,10 @@ async def test_find_messages_uses_exact_nested_filter_and_paginates() -> None:
         )
 
     async with HonchoClient(
-        "https://honcho.test", "workspace-jwt", "workspace-one", transport=httpx.MockTransport(handler)
+        "https://honcho.test",
+        "workspace-jwt",
+        "workspace-one",
+        transport=httpx.MockTransport(handler),
     ) as client:
         found = await client.find_messages_by_client_op_id("session-one", "op-1", page_size=1)
     assert [item.id for item in found] == ["m1", "m2"]
@@ -426,7 +431,10 @@ async def test_find_messages_stops_on_empty_final_page_and_guards_max_pages() ->
         return httpx.Response(200, json={"items": items, "size": 1})
 
     async with HonchoClient(
-        "https://honcho.test", "workspace-jwt", "workspace-one", transport=httpx.MockTransport(empty_final)
+        "https://honcho.test",
+        "workspace-jwt",
+        "workspace-one",
+        transport=httpx.MockTransport(empty_final),
     ) as client:
         found = await client.find_messages_by_client_op_id("session-one", "op-1", page_size=1)
     assert [item.id for item in found] == ["m1"]
@@ -438,10 +446,184 @@ async def test_find_messages_stops_on_empty_final_page_and_guards_max_pages() ->
         )
 
     async with HonchoClient(
-        "https://honcho.test", "workspace-jwt", "workspace-one", transport=httpx.MockTransport(endless)
+        "https://honcho.test",
+        "workspace-jwt",
+        "workspace-one",
+        transport=httpx.MockTransport(endless),
     ) as client:
         with pytest.raises(HonchoError, match="pagination limit"):
-            await client.find_messages_by_client_op_id("session-one", "op-1", page_size=1, max_pages=2)
+            await client.find_messages_by_client_op_id(
+                "session-one", "op-1", page_size=1, max_pages=2
+            )
+
+
+def _recent_message(
+    identifier: str,
+    created_at: str,
+    *,
+    peer_id: str = "marina-peer",
+    session_id: str = "session-one",
+) -> dict[str, object]:
+    return {
+        "id": identifier,
+        "peer_id": peer_id,
+        "session_id": session_id,
+        "metadata": {"role": "user", "attachment_fingerprints": []},
+        "created_at": created_at,
+    }
+
+
+@pytest.mark.asyncio
+async def test_recent_message_metadata_paginates_and_keeps_inclusive_window() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        assert _request_json(request) == {
+            "filters": {
+                "AND": [
+                    {
+                        "created_at": {
+                            "gte": "2026-08-01T10:00:00+00:00",
+                            "lte": "2026-08-08T10:00:00+00:00",
+                        }
+                    },
+                    {"peer_id": "marina-peer"},
+                ]
+            }
+        }
+        page = int(request.url.params["page"])
+        items = (
+            [_recent_message("at-cutoff", "2026-08-01T10:00:00Z")]
+            if page == 1
+            else [_recent_message("at-until", "2026-08-08T10:00:00Z")]
+        )
+        return httpx.Response(
+            200,
+            json={"items": items, "total": 2, "page": page, "size": 1, "pages": 2},
+        )
+
+    async with HonchoClient(
+        "https://honcho.test",
+        "workspace-jwt",
+        "workspace-one",
+        transport=httpx.MockTransport(handler),
+    ) as client:
+        found = await client.list_recent_message_metadata(
+            "session-one",
+            expected_peer_id="marina-peer",
+            since=dt.datetime(2026, 8, 1, 10, tzinfo=dt.UTC),
+            until=dt.datetime(2026, 8, 8, 10, tzinfo=dt.UTC),
+            page_size=1,
+        )
+
+    assert [item.id for item in found] == ["at-cutoff", "at-until"]
+    assert all(not hasattr(item, "content") for item in found)
+    assert [request.url.params["page"] for request in requests] == ["1", "2"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "response",
+    [
+        {"items": [], "total": 0, "page": 2, "size": 1, "pages": 0},
+        {"items": [], "total": 0, "page": 1, "size": 2, "pages": 0},
+        {"items": [], "total": 2, "page": 1, "size": 1, "pages": 1},
+        {
+            "items": [_recent_message("naive", "2026-08-01T10:00:00")],
+            "total": 1,
+            "page": 1,
+            "size": 1,
+            "pages": 1,
+        },
+    ],
+)
+async def test_recent_message_metadata_rejects_malformed_pages_and_timestamps(
+    response: dict[str, object],
+) -> None:
+    async with HonchoClient(
+        "https://honcho.test",
+        "workspace-jwt",
+        "workspace-one",
+        transport=httpx.MockTransport(lambda _request: httpx.Response(200, json=response)),
+    ) as client:
+        with pytest.raises(HonchoError):
+            await client.list_recent_message_metadata(
+                "session-one",
+                expected_peer_id="marina-peer",
+                since=dt.datetime(2026, 8, 1, tzinfo=dt.UTC),
+                until=dt.datetime(2026, 8, 8, tzinfo=dt.UTC),
+                page_size=1,
+            )
+
+
+@pytest.mark.asyncio
+async def test_recent_message_metadata_rejects_history_over_page_cap() -> None:
+    response = {
+        "items": [_recent_message("one", "2026-08-08T00:00:00Z")],
+        "total": 3,
+        "page": 1,
+        "size": 1,
+        "pages": 3,
+    }
+    async with HonchoClient(
+        "https://honcho.test",
+        "workspace-jwt",
+        "workspace-one",
+        transport=httpx.MockTransport(lambda _request: httpx.Response(200, json=response)),
+    ) as client:
+        with pytest.raises(HonchoError, match="pagination limit"):
+            await client.list_recent_message_metadata(
+                "session-one",
+                expected_peer_id="marina-peer",
+                since=dt.datetime(2026, 8, 1, tzinfo=dt.UTC),
+                until=dt.datetime(2026, 8, 8, tzinfo=dt.UTC),
+                page_size=1,
+                max_pages=2,
+            )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("item", "message"),
+    [
+        (
+            _recent_message(
+                "wrong-peer",
+                "2026-08-05T00:00:00Z",
+                peer_id="another-peer",
+            ),
+            "requested peer",
+        ),
+        (
+            _recent_message("before-window", "2026-07-31T23:59:59.999999Z"),
+            "time window",
+        ),
+        (
+            _recent_message("after-window", "2026-08-08T00:00:00.000001Z"),
+            "time window",
+        ),
+    ],
+)
+async def test_recent_message_metadata_rejects_wrong_peer_and_out_of_window(
+    item: dict[str, object],
+    message: str,
+) -> None:
+    response = {"items": [item], "total": 1, "page": 1, "size": 1, "pages": 1}
+    async with HonchoClient(
+        "https://honcho.test",
+        "workspace-jwt",
+        "workspace-one",
+        transport=httpx.MockTransport(lambda _request: httpx.Response(200, json=response)),
+    ) as client:
+        with pytest.raises(HonchoError, match=message):
+            await client.list_recent_message_metadata(
+                "session-one",
+                expected_peer_id="marina-peer",
+                since=dt.datetime(2026, 8, 1, tzinfo=dt.UTC),
+                until=dt.datetime(2026, 8, 8, tzinfo=dt.UTC),
+                page_size=1,
+            )
 
 
 @pytest.mark.parametrize(
@@ -586,9 +768,7 @@ async def test_tenant_onboarding_is_idempotent_and_returns_runtime_binding(
         "ohmo-curated": {"observe_others": False, "observe_me": False},
         "marina": {"observe_others": False, "observe_me": True},
     }
-    assert fake_honcho.side_effects == Counter(
-        {"peer": 3, "key": 2, "workspace": 1, "session": 1}
-    )
+    assert fake_honcho.side_effects == Counter({"peer": 3, "key": 2, "workspace": 1, "session": 1})
     assert constructed == [
         {
             "base_url": "https://honcho.test",
@@ -602,11 +782,12 @@ async def test_tenant_onboarding_is_idempotent_and_returns_runtime_binding(
         },
     ]
     assert all(
-        request.headers["Authorization"] == "Bearer admin-jwt"
-        for request in fake_honcho.requests
+        request.headers["Authorization"] == "Bearer admin-jwt" for request in fake_honcho.requests
     )
     assert "admin-jwt" not in repr(first)
-    assert inspect.signature(onboard_tenant).parameters["admin_jwt"].default is inspect.Parameter.empty
+    assert (
+        inspect.signature(onboard_tenant).parameters["admin_jwt"].default is inspect.Parameter.empty
+    )
 
 
 @pytest.mark.parametrize(

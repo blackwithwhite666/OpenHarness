@@ -7,11 +7,10 @@ become metric labels.
 
 from __future__ import annotations
 
+import math
 from collections import Counter
 from dataclasses import dataclass, field
-import math
 from numbers import Real
-
 
 _EVENTS = frozenset(
     {
@@ -23,10 +22,10 @@ _EVENTS = frozenset(
         "duplicate_suppression",
     }
 )
-_STAGES = frozenset({"scan", "prompt", "estimation", "observation"})
+_STAGES = frozenset({"scan", "dedup", "prompt", "estimation", "observation"})
 _ERROR_CLASSES = frozenset({"", "runtime", "integrity", "transport", "acknowledgement"})
 _CONFIRMATION_OUTCOMES = frozenset({"accepted", "declined"})
-_DUPLICATE_OPERATIONS = frozenset({"prompt", "observation"})
+_DUPLICATE_OPERATIONS = frozenset({"dedup", "prompt", "observation"})
 
 
 @dataclass(slots=True)

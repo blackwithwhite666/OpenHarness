@@ -470,6 +470,7 @@ async def test_owner_and_marina_honcho_recall_and_ingest_are_isolated(
                 "marina": {
                     "workspace": "marina-workspace",
                     "api_key": "marina-jwt",
+                    "session": "marina-session",
                 }
             },
         ),
@@ -561,7 +562,7 @@ async def test_owner_and_marina_honcho_recall_and_ingest_are_isolated(
 
     assert len(marina_honcho.messages) == 1
     marina_session, marina_exchange = marina_honcho.messages[0]
-    assert marina_session == "ohmo"
+    assert marina_session == "marina-session"
     assert len(marina_exchange) == 2
     assert marina_exchange[0]["content"] == "marina user turn"
     assert marina_exchange[0]["peer_id"] == "marina"

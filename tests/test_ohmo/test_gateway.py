@@ -85,6 +85,12 @@ async def test_gateway_foreground_starts_and_cancels_nutrition_coordinator(
         )
     )
     service._nutrition_coordinator = coordinator
+    honcho_closed: list[bool] = []
+
+    async def close_honcho() -> None:
+        honcho_closed.append(True)
+
+    service._nutrition_honcho_client = SimpleNamespace(aclose=close_honcho)
     original_stop = coordinator.stop
     coordinator_started: list[bool] = []
     coordinator_stopped: list[bool] = []
@@ -127,6 +133,74 @@ async def test_gateway_foreground_starts_and_cancels_nutrition_coordinator(
     await service.run_foreground()
     assert coordinator_started == [nutrition_enabled]
     assert coordinator_stopped == [nutrition_enabled]
+    assert honcho_closed == [True]
+
+
+def test_gateway_lifecycle_passes_the_shared_honcho_binding_to_nutrition(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ohmo.gateway.service as service_module
+
+    assets = tmp_path / "nutrition-assets"
+    assets.mkdir(mode=0o700)
+    workspace = tmp_path / "workspace"
+    config = GatewayConfig(
+        honcho_base_url="https://honcho.test",
+        conversation_learning=True,
+        family_principals={"123": "marina"},
+        enabled_memory_tenants=("marina",),
+        tenant_honcho={
+            "marina": {
+                "workspace": "marina-workspace",
+                "api_key": "marina-key",
+                "session": "marina-session",
+                "observed_peer": "marina-peer",
+            }
+        },
+        nutrition_ingest=NutritionIngestConfig(
+            enabled=True,
+            synchronized_root=assets,
+            principal="123",
+            chat_id="123",
+            session_key="telegram:123",
+        ),
+    )
+    captured: dict[str, object] = {}
+
+    class FakeHonchoClient:
+        def __init__(self, base_url: str, api_key: str, honcho_workspace: str) -> None:
+            captured["client"] = (base_url, api_key, honcho_workspace)
+
+    class FakeRuntimePool:
+        def __init__(self, **_kwargs: object) -> None:
+            self._reminder_store = object()
+            self._reminder_lock = asyncio.Lock()
+
+    def coordinator_factory(_config, **kwargs):
+        captured["coordinator"] = kwargs
+        return SimpleNamespace()
+
+    monkeypatch.setattr(service_module, "load_gateway_config", lambda _workspace: config)
+    monkeypatch.setattr(service_module, "HonchoClient", FakeHonchoClient)
+    monkeypatch.setattr(service_module, "OhmoSessionRuntimePool", FakeRuntimePool)
+    monkeypatch.setattr(service_module, "ReminderScheduler", lambda **_kwargs: object())
+    monkeypatch.setattr(service_module, "NutritionIngestCoordinator", coordinator_factory)
+    monkeypatch.setattr(service_module, "OhmoGatewayBridge", lambda **_kwargs: object())
+    monkeypatch.setattr(service_module, "ChannelManager", lambda *_args, **_kwargs: object())
+    monkeypatch.chdir(tmp_path)
+
+    service_module.OhmoGatewayService(cwd=tmp_path, workspace=workspace)
+
+    assert captured["client"] == (
+        "https://honcho.test",
+        "marina-key",
+        "marina-workspace",
+    )
+    coordinator = captured["coordinator"]
+    assert isinstance(coordinator, dict)
+    assert coordinator["honcho_session"] == "marina-session"
+    assert coordinator["observed_peer"] == "marina-peer"
 
 
 def _single_eval_episode(workspace: Path):

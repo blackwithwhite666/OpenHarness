@@ -15,6 +15,7 @@ def _enabled_config(tmp_path, **nutrition_overrides):
         **nutrition_overrides,
     )
     return GatewayConfig(
+        honcho_base_url="https://honcho.test",
         conversation_learning=True,
         family_principals={"123": "marina"},
         enabled_memory_tenants=("marina",),
@@ -22,6 +23,7 @@ def _enabled_config(tmp_path, **nutrition_overrides):
             "marina": {
                 "workspace": "family-marina",
                 "api_key": "runtime-key",
+                "session": "marina-session",
                 "observed_peer": "marina-peer",
             }
         },
@@ -93,6 +95,7 @@ def test_enabled_nutrition_ingest_rejects_owner_overlap(tmp_path) -> None:
 
 def _enabled_config_with_owner(tmp_path):
     return GatewayConfig(
+        honcho_base_url="https://honcho.test",
         conversation_learning=True,
         owner_principals=("123",),
         family_principals={"123": "marina"},
@@ -117,6 +120,55 @@ def _enabled_config_with_owner(tmp_path):
 def test_enabled_nutrition_ingest_accepts_only_the_marina_binding(tmp_path) -> None:
     config = _enabled_config(tmp_path)
     assert config.nutrition_ingest.session_key == "telegram:123"
+    assert config.tenant_honcho["marina"]["session"] == "marina-session"
+
+
+@pytest.mark.parametrize("session", ["", "with spaces", "slash/name", "x" * 513])
+def test_tenant_honcho_session_must_be_a_bounded_identifier(session: str) -> None:
+    with pytest.raises(ValueError, match="bounded Honcho identifier"):
+        GatewayConfig(
+            tenant_honcho={
+                "marina": {
+                    "workspace": "family-marina",
+                    "api_key": "runtime-key",
+                    "observed_peer": "marina-peer",
+                    "session": session,
+                }
+            }
+        )
+
+
+def test_tenant_honcho_session_defaults_to_ohmo(tmp_path) -> None:
+    config = _enabled_config(tmp_path)
+    del config.tenant_honcho["marina"]["session"]
+    from ohmo.memory_backend import resolve_tenant_honcho_binding
+
+    binding = resolve_tenant_honcho_binding(config, "marina")
+    assert binding is not None
+    assert binding.session == "ohmo"
+
+
+def test_enabled_nutrition_ingest_requires_honcho_base_url(tmp_path) -> None:
+    with pytest.raises(ValueError, match="Honcho base URL"):
+        GatewayConfig(
+            conversation_learning=True,
+            family_principals={"123": "marina"},
+            enabled_memory_tenants=("marina",),
+            tenant_honcho={
+                "marina": {
+                    "workspace": "family-marina",
+                    "api_key": "runtime-key",
+                    "observed_peer": "marina-peer",
+                }
+            },
+            nutrition_ingest=NutritionIngestConfig(
+                enabled=True,
+                synchronized_root=tmp_path,
+                principal="123",
+                chat_id="123",
+                session_key="telegram:123",
+            ),
+        )
 
 
 def test_nutrition_status_and_replay_cli_output_is_privacy_safe(monkeypatch, capsys) -> None:

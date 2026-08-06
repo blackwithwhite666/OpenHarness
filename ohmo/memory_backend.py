@@ -68,6 +68,7 @@ class TenantHonchoBinding:
     api_key: str
     workspace: str
     observed_peer: str
+    session: str = "ohmo"
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,25 +109,29 @@ def resolve_tenant_honcho_binding(
         workspace = cfg.honcho_workspace
         api_key = cfg.honcho_api_key
         observed_peer = "owner"
+        session = "ohmo"
     else:
         workspace = raw_binding.get("workspace")
         api_key = raw_binding.get("api_key")
         observed_peer = raw_binding.get("observed_peer", tenant_id)
+        session = raw_binding.get("session", "ohmo")
 
     if not all(
         isinstance(value, str) and value.strip()
-        for value in (workspace, api_key, observed_peer)
+        for value in (workspace, api_key, observed_peer, session)
     ):
         return None
     assert isinstance(workspace, str)
     assert isinstance(api_key, str)
     assert isinstance(observed_peer, str)
+    assert isinstance(session, str)
     return TenantHonchoBinding(
         tenant_id=tenant_id,
         base_url=cfg.honcho_base_url,
         api_key=api_key,
         workspace=workspace.strip(),
         observed_peer=observed_peer.strip(),
+        session=session.strip(),
     )
 
 
@@ -1398,6 +1403,7 @@ def make_tenant_shadow_backend(
     binding = resolve_tenant_honcho_binding(cfg, tenant_id)
     honcho_client = None
     observed_peer = tenant_id
+    session = "ohmo"
     if binding is not None:
         from ohmo.memory_service.honcho_client import HonchoClient
 
@@ -1407,11 +1413,13 @@ def make_tenant_shadow_backend(
             binding.workspace,
         )
         observed_peer = binding.observed_peer
+        session = binding.session
     return ShadowMemoryBackend(
         base,
         honcho_client=honcho_client,
         observed=observed_peer,
         conversation_learning=cfg.conversation_learning,
+        session=session,
         comparison_log_path=(get_memory_dir(workspace) / SHADOW_COMPARISON_LOG_FILENAME),
         is_owner=honcho_client is not None,
     )

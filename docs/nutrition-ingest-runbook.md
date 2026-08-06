@@ -20,6 +20,9 @@ accepted, and the consumer never runs Qwen or CLIP.
    `family_principals` key in the example is a synthetic shape-only placeholder,
    not an authorized account; replace it together with the `${...}` binding
    values before enabling the feature.
+   The Marina `tenant_honcho` binding also owns the Honcho reader/writer
+   session (default `ohmo`) and observed peer. Do not derive the Honcho session
+   from the Telegram session key; reader and writer must use the same binding.
 3. Validate the exact runtime model before restart:
 
    ```bash
@@ -62,6 +65,20 @@ Inspect aggregate status with the privacy-safe command:
 The output may contain bounded states and counts only. Select an operator-known
 candidate locally for replay; never copy its id into logs, chat, or metrics.
 
+Before each confirmation attempt, the consumer fail-closed checks the inclusive
+last-seven-day window of the configured Marina Honcho session. Only
+gateway-owned Marina user metadata participates. Exact SHA-256 matches and
+exact pHash matches using the identical hash algorithm become terminal `seen`
+results; Dropbox-created synthetic meal turns are excluded. A failed or partial
+Honcho read leaves the candidate unsent and retryable.
+
+The consumer writes owner-only, atomic suppression tombstones below `_seen`.
+Once authoritative normalized EXIF is strictly older than seven days, it writes
+the tombstone before deleting a verified direct-child candidate directory. The
+exact seven-day boundary is retained. This expiry is unconditional, including
+pending or ambiguous Telegram delivery and incomplete consumed estimation;
+the compact tombstone preserves the final local state summary for audit.
+
 ## Rollout order
 
 1. **Disabled:** producer discovery and consumer notifications are disabled.
@@ -95,6 +112,11 @@ candidate locally for replay; never copy its id into logs, chat, or metrics.
   bounded stage/error labels only.
 
 ## Delivery-unknown and recovery
+
+Exactly-once processing here means stable candidate and Honcho operation ids,
+durable state transitions, and suppression of already-seen media. It does not
+make Telegram transport exactly-once. Telegram can accept a prompt while its
+receipt is lost, so prompt delivery remains inherently ambiguous.
 
 If a prompt send has no unambiguous single-message receipt, the result sidecar
 enters `delivery_unknown`. Do not resend automatically. Reconcile the channel

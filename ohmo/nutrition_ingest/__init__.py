@@ -8,10 +8,13 @@ from .models import (
     NutritionResultSidecar,
     RecipientBinding,
     ResultState,
+    SeenTombstoneV1,
     candidate_id_for,
     parse_manifest,
+    validate_candidate_id,
 )
 from .sidecars import NutritionResultStore
+from .tombstones import SeenTombstoneStore
 from .watcher import NutritionArtifactScanner, ReadyNutritionArtifact
 from .coordinator import NutritionCoordinatorError, NutritionIngestCoordinator
 from .metrics import NutritionMetrics
@@ -34,6 +37,9 @@ __all__ = [
     "ReadyNutritionArtifact",
     "RecipientBinding",
     "ResultState",
+    "SeenTombstoneStore",
+    "SeenTombstoneV1",
     "candidate_id_for",
     "parse_manifest",
+    "validate_candidate_id",
 ]
