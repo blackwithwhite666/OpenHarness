@@ -196,7 +196,15 @@ def parse_manifest(manifest_path: str | Path, configured_root: str | Path) -> Ma
     image_name = Path(manifest.original_filename)
     if image_name.name != manifest.original_filename or image_name.is_absolute():
         raise ValueError("manifest image filename escapes candidate directory")
-    image_path = (path.parent / image_name).resolve()
+    # The producer stores immutable images as ``original<suffix>`` while the
+    # manifest keeps the original Dropbox filename for provenance.  Keep the
+    # legacy named-image fallback for artifacts written by early consumers.
+    canonical_image_path = (path.parent / f"original{image_name.suffix}").resolve()
+    image_path = (
+        canonical_image_path
+        if canonical_image_path.is_file()
+        else (path.parent / image_name).resolve()
+    )
     if image_path.parent != path.parent or not image_path.is_file():
         raise ValueError("candidate image is missing or escapes candidate directory")
     if image_path.stat().st_size != manifest.original_size_bytes:

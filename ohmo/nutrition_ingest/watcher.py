@@ -64,7 +64,13 @@ class NutritionArtifactScanner:
         relative = Path(filename)
         if relative.name != filename or relative.is_absolute() or filename in {"", ".", ".."}:
             raise ValueError("manifest image filename escapes candidate directory")
-        image_path = (directory / relative).resolve()
+        canonical_image_path = (directory / f"original{relative.suffix}").resolve()
+        named_image_path = (directory / relative).resolve()
+        image_path = (
+            canonical_image_path
+            if canonical_image_path.is_file()
+            else named_image_path
+        )
         if image_path.parent != directory.resolve():
             raise ValueError("manifest image filename escapes candidate directory")
         if not image_path.is_file():
