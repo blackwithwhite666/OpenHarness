@@ -1376,7 +1376,7 @@ async def test_exact_sha_duplicate_becomes_seen_and_writes_owner_only_tombstone(
     "bit_flips, algorithm, expected_duplicate",
     [
         (PHASH_HAMMING_THRESHOLD, PHASH_ALGORITHM, True),
-        (3, PHASH_ALGORITHM, False),
+        (PHASH_HAMMING_THRESHOLD + 1, PHASH_ALGORITHM, False),
         (PHASH_HAMMING_THRESHOLD, "ahash-16x16-gray-v1", False),
     ],
 )

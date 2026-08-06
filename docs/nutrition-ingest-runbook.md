@@ -68,7 +68,7 @@ candidate locally for replay; never copy its id into logs, chat, or metrics.
 Before each confirmation attempt, the consumer fail-closed checks the inclusive
 last-seven-day window of the configured Marina Honcho session. Only
 gateway-owned Marina user metadata participates. Exact SHA-256 matches and
-same-algorithm DCT pHash matches (`dct-phash-16x16-v1`, Hamming distance <= 2)
+same-algorithm DCT pHash matches (`dct-phash-16x16-v1`, Hamming distance <= 4)
 become terminal `seen` results; Dropbox-created synthetic meal turns are
 excluded. SHA-256 is checked first, and the old aHash algorithm is never
 compared with the DCT hash. A failed or partial Honcho read leaves the
