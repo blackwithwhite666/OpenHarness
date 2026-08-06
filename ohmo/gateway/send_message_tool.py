@@ -6,10 +6,9 @@ from collections.abc import Awaitable, Callable
 
 from pydantic import BaseModel, Field
 
+from ohmo.contact_registry import ContactRecord, ContactStore
 from openharness.channels.bus.events import OutboundMessage
 from openharness.tools.base import BaseTool, ToolExecutionContext, ToolResult
-
-from ohmo.contact_registry import ContactRecord, ContactStore
 
 
 class SendTelegramMessageInput(BaseModel):
@@ -77,9 +76,11 @@ class SendTelegramMessageTool(BaseTool):
                 is_error=True,
             )
         # Trusted fixed scheduled recipient (surfaced by the runtime only for a
-        # scheduler-stamped recipient-bound reminder turn). When present, the
-        # delivery target is pinned: any resolved recipient whose chat_id
-        # differs is rejected — the model cannot widen the audience.
+        # scheduler-stamped recipient-bound reminder turn). The immutable
+        # numeric chat_id and principal pin the delivery target; the stored
+        # display label is informational and may drift. An exact stored label
+        # may look up the pinned contact, but it does not bypass the numeric
+        # identity checks below.
         fixed_chat_id = str(send_ctx.get("fixed_recipient_chat_id") or "").strip()
         fixed_principal = str(send_ctx.get("fixed_recipient_principal") or "").strip()
         fixed_label = str(send_ctx.get("fixed_recipient_label") or "").strip()
@@ -198,18 +199,6 @@ def _format_contact(contact: ContactRecord) -> str:
     return " · ".join(parts)
 
 
-def _contact_label(contact: ContactRecord) -> str:
-    """Return the stable label used when a reminder binds a contact."""
-    parts: list[str] = []
-    if contact.first_name:
-        parts.append(contact.first_name)
-    elif contact.display_name:
-        parts.append(contact.display_name)
-    if contact.username:
-        parts.append(f"@{contact.username}")
-    return " ".join(parts) or contact.chat_id
-
-
 def _contact_principal(contact: ContactRecord) -> str:
     return (contact.user_id or contact.chat_id).strip()
 
@@ -221,12 +210,12 @@ def _fixed_contact_validation_error(
     fixed_principal: str,
     fixed_label: str,
 ) -> ToolResult | None:
-    """Validate the current contact identity for a scheduled fixed target.
+    """Validate the immutable numeric identity of a scheduled fixed target.
 
     The model may address the contact through any supported alias, so this
-    check must run after resolution as well as on the exact stored label. A
-    changed contact record must not become sendable merely because an alias
-    still resolves to the pinned chat id.
+    check must run after normal resolution and exact-fixed-label lookup. The
+    stored label is only informational; authorization is bounded by the pinned
+    chat id and principal.
     """
     if fixed_chat_id and str(contact.chat_id) != fixed_chat_id:
         return ToolResult(
@@ -234,14 +223,6 @@ def _fixed_contact_validation_error(
                 "Refusing to send: this scheduled reminder is bound to "
                 f"{fixed_label or 'a fixed recipient'} "
                 f"(chat_id={fixed_chat_id}) and cannot message anyone else."
-            ),
-            is_error=True,
-        )
-    if fixed_label and _contact_label(contact) != fixed_label:
-        return ToolResult(
-            output=(
-                "Refusing to send: the fixed reminder recipient label no "
-                "longer matches the pinned Telegram contact."
             ),
             is_error=True,
         )

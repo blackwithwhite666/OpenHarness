@@ -6,14 +6,13 @@ from pathlib import Path
 
 import pytest
 
-from openharness.channels.bus.events import OutboundMessage
-from openharness.tools.base import ToolExecutionContext
-
 from ohmo.contact_registry import ContactStore
 from ohmo.gateway.send_message_tool import (
     SendTelegramMessageInput,
     SendTelegramMessageTool,
 )
+from openharness.channels.bus.events import OutboundMessage
+from openharness.tools.base import ToolExecutionContext
 
 
 def _ctx(tmp_path: Path, **send_ctx) -> ToolExecutionContext:
@@ -298,7 +297,9 @@ async def test_scheduled_send_goes_to_fixed_recipient_signed_with_reminder_id(tm
 
 
 @pytest.mark.asyncio
-async def test_scheduled_send_accepts_exact_fixed_recipient_label(tmp_path: Path):
+async def test_scheduled_send_accepts_legacy_label_drift_via_pinned_numeric_identity(
+    tmp_path: Path,
+):
     published: list[OutboundMessage] = []
 
     async def send_outbound(message: OutboundMessage) -> None:
@@ -315,8 +316,8 @@ async def test_scheduled_send_accepts_exact_fixed_recipient_label(tmp_path: Path
     tool = SendTelegramMessageTool(store, send_outbound)
 
     result = await tool.execute(
-        SendTelegramMessageInput(recipient="Marina @marina", text="Condition met"),
-        _bound_reminder_ctx(tmp_path),
+        SendTelegramMessageInput(recipient="@marina", text="Condition met"),
+        _bound_reminder_ctx(tmp_path, fixed_recipient_label="@marina"),
     )
 
     assert not result.is_error
@@ -354,7 +355,9 @@ async def test_scheduled_send_fixed_recipient_label_mismatch_does_not_bypass_res
 
 
 @pytest.mark.asyncio
-async def test_scheduled_send_rejects_stale_fixed_contact(tmp_path: Path):
+async def test_scheduled_send_accepts_changed_first_name_with_pinned_numeric_identity(
+    tmp_path: Path,
+):
     published: list[OutboundMessage] = []
 
     async def send_outbound(message: OutboundMessage) -> None:
@@ -375,9 +378,9 @@ async def test_scheduled_send_rejects_stale_fixed_contact(tmp_path: Path):
         _bound_reminder_ctx(tmp_path),
     )
 
-    assert result.is_error
-    assert "label" in result.output
-    assert published == []
+    assert not result.is_error
+    assert result.metadata == {"recipient_chat_id": "200"}
+    assert [message.chat_id for message in published] == ["200"]
 
 
 @pytest.mark.asyncio
@@ -408,18 +411,8 @@ async def test_scheduled_send_rejects_changed_fixed_principal(tmp_path: Path):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("recipient", "first_name", "expected_error"),
-    [
-        pytest.param("@marina", "Maria", "label", id="changed_label_alias"),
-        pytest.param("999", "Marina", "principal", id="changed_principal_alias"),
-    ],
-)
-async def test_scheduled_send_rejects_changed_fixed_identity_via_alias(
+async def test_scheduled_send_rejects_changed_fixed_principal_via_numeric_alias(
     tmp_path: Path,
-    recipient: str,
-    first_name: str,
-    expected_error: str,
 ):
     published: list[OutboundMessage] = []
 
@@ -430,19 +423,19 @@ async def test_scheduled_send_rejects_changed_fixed_identity_via_alias(
     store.record_inbound(
         channel="telegram",
         chat_id="200",
-        user_id="999" if expected_error == "principal" else "200",
+        user_id="999",
         username="marina",
-        first_name=first_name,
+        first_name="Marina",
     )
     tool = SendTelegramMessageTool(store, send_outbound)
 
     result = await tool.execute(
-        SendTelegramMessageInput(recipient=recipient, text="Condition met"),
+        SendTelegramMessageInput(recipient="999", text="Condition met"),
         _bound_reminder_ctx(tmp_path),
     )
 
     assert result.is_error
-    assert expected_error in result.output
+    assert "principal" in result.output
     assert published == []
 
 

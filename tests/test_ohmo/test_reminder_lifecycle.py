@@ -333,7 +333,7 @@ async def test_conditional_reminder_false_then_true_isolated_and_silent(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("case", ["missing", "stale", "alternate"])
+@pytest.mark.parametrize("case", ["missing", "alternate"])
 async def test_conditional_reminder_rejects_untrusted_delivery_without_outbound(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -372,14 +372,6 @@ async def test_conditional_reminder_rejects_untrusted_delivery_without_outbound(
         )
         assert not created.is_error, created.output
         reminder = store.list_for_chat("telegram", "100")[0]
-        if case == "stale":
-            _contacts.record_inbound(
-                channel="telegram",
-                chat_id="100",
-                user_id="100",
-                username="alice",
-                first_name="Mallory",
-            )
         reminder.next_fire_at = NOW - 1
         assert store.update(reminder)
 
@@ -395,6 +387,82 @@ async def test_conditional_reminder_rejects_untrusted_delivery_without_outbound(
         assert not cancelled.is_error, cancelled.output
         assert store.get(reminder.id).status == "done"
         assert not store.list_for_chat("telegram", "100", status="active")
+    finally:
+        bridge.stop()
+        await bridge_task
+        await pool.aclose()
+
+
+@pytest.mark.asyncio
+async def test_conditional_reminder_delivers_after_recipient_label_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (
+        bus,
+        store,
+        contacts,
+        create,
+        _cancel,
+        scheduler,
+        bridge,
+        pool,
+        engines,
+    ) = await _build_harness(
+        tmp_path,
+        monkeypatch,
+        ["stale"],
+        alternate_contact=True,
+    )
+    bridge_task = asyncio.create_task(bridge.run())
+    try:
+        created = await create.execute(
+            RemindCreateInput(
+                summary="check the condition",
+                dtstart=(datetime.now(MSK) + timedelta(hours=1)).isoformat(),
+                rrule="FREQ=DAILY",
+                mode="agentic",
+                delivery="explicit",
+            ),
+            ToolExecutionContext(cwd=tmp_path, metadata=_creator_context()),
+        )
+        assert not created.is_error, created.output
+        reminder = store.list_for_chat("telegram", "100")[0]
+        assert reminder.recipient_chat_id == "100"
+        assert reminder.recipient_principal == "100"
+        assert reminder.recipient_label == "Alice @alice"
+
+        contacts.record_inbound(
+            channel="telegram",
+            chat_id="100",
+            user_id="100",
+            username="alice",
+            first_name="Mallory",
+        )
+        reminder.next_fire_at = NOW - 1
+        assert store.update(reminder)
+
+        await scheduler.fire_due()
+        await _wait_for_bridge_idle(bus, bridge, engines, 1)
+
+        assert bus.outbound_size == 1
+        outbound = await bus.consume_outbound()
+        assert outbound.channel == "telegram"
+        assert outbound.chat_id == "100"
+        assert outbound.content == "Condition met\n\n— @alice (отправлено через бота)"
+        assert outbound.metadata == {
+            "_session_key": "telegram:100",
+            "_origin": "send_telegram_message",
+            "_reminder_id": reminder.id,
+        }
+        assert bus.outbound_size == 0
+
+        delivered_reminder = store.get(reminder.id)
+        assert delivered_reminder.status == "active"
+        assert delivered_reminder.fire_count == 1
+        assert store.list_for_chat("telegram", "100", status="active") == [
+            delivered_reminder
+        ]
     finally:
         bridge.stop()
         await bridge_task
