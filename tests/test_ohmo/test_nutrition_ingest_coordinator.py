@@ -193,7 +193,7 @@ def _recent_message(
 class _NutritionModelStream:
     """A model-only fake: emits one validated nutrition trace and final text."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, protein_g: object = 30, answer: str | None = None) -> None:
         self.api_client = object()
         self.decision_trace_recorder = None
         self.engine = self
@@ -203,6 +203,8 @@ class _NutritionModelStream:
         self.tool_metadata: dict[str, object] = {}
         self.total_usage = UsageSnapshot()
         self.system_prompt = ""
+        self.protein_g = protein_g
+        self.answer = answer or "Записала съеденный приём пищи: 999 ккал."
 
     def set_decision_trace_recorder(self, recorder) -> None:
         self.decision_trace_recorder = recorder
@@ -226,11 +228,14 @@ class _NutritionModelStream:
                         "basis": ["image"],
                         "consumption_status": "consumed",
                         "energy_kcal_best": 550,
+                        "protein_g": self.protein_g,
+                        "fat_g": 20,
+                        "carbohydrate_g": 45,
                     }
                 },
             },
         )
-        answer = "Записала съеденный приём пищи: 550 ккал."
+        answer = self.answer
         yield AssistantTextDelta(answer)
         assistant = ConversationMessage(role="assistant", content=[TextBlock(text=answer)])
         self.messages.append(assistant)
@@ -241,6 +246,8 @@ def _nutrition_runtime_pool(
     tmp_path: Path,
     workspace: Path,
     honcho: _HonchoStore,
+    *,
+    model_stream: _NutritionModelStream | None = None,
 ) -> OhmoSessionRuntimePool:
     config = GatewayConfig(
         honcho_base_url="https://honcho.test",
@@ -292,7 +299,7 @@ def _nutrition_runtime_pool(
         session_key,
     )
     bundle = SimpleNamespace(
-        engine=_NutritionModelStream(),
+        engine=model_stream or _NutritionModelStream(),
         session_id="nutrition-runtime-session",
         cwd=message_cwd,
         tool_registry=ToolRegistry(),
@@ -368,6 +375,8 @@ async def test_marina_queue_has_one_native_prompt_and_decline_has_no_estimation(
     assert sidecar.state == ResultState.completed
     assert sidecar.consumption_status == "not_consumed"
     assert sidecar.emitted_honcho_message_id is None
+    assert len(outbound) == 2
+    assert "КБЖУ" not in outbound[-1].content
     events = metrics.snapshot()["events"]
     assert events["verified_candidate|scan|"] == 1
     assert events["confirmation|prompt|declined"] == 1
@@ -893,7 +902,25 @@ async def test_runtime_pool_nutrition_chain_reconciles_crash_after_honcho_commit
     sidecar = NutritionResultStore(tmp_path / candidate / "result.json").load()
     assert sidecar.state == ResultState.completed
     assert sidecar.emitted_honcho_message_id == "honcho-2"
-    assert len(outbound) == 1
+    assert len(outbound) == 2
+    summary = outbound[1]
+    assert summary.metadata["_trusted_outbound_operation_id"] == f"{candidate}:summary:v1"
+    assert summary.metadata["_nutrition_display_summary"] == {
+        "schema_version": 1,
+        "calories_kcal": 550.0,
+        "protein_g": 30.0,
+        "fat_g": 20.0,
+        "carbohydrate_g": 45.0,
+    }
+    assert summary.reply_to == "42"
+    assert "КБЖУ" in summary.content
+    assert "550" in summary.content
+    assert "999" not in summary.content
+    assert "Б 30" in summary.content
+    assert "Ж 20" in summary.content
+    assert "У 45" in summary.content
+    await restarted.poll_once()
+    assert len(outbound) == 2
     assert len(honcho.messages) == 2
 
     by_role = {message.metadata["role"]: message for message in honcho.messages}
@@ -916,6 +943,58 @@ async def test_runtime_pool_nutrition_chain_reconciles_crash_after_honcho_commit
     assert annotation["record_type"] == "meal_observation"
     assert annotation["consumption_status"] == "consumed"
     assert annotation["energy_kcal_best"] == 550
+
+
+@pytest.mark.asyncio
+async def test_runtime_pool_missing_macro_fails_closed_without_result(tmp_path: Path) -> None:
+    candidate = _candidate(tmp_path, file_id="id:missing-macro", rev="rev:missing-macro")
+    workspace = tmp_path / ".ohmo-home"
+    initialize_workspace(workspace)
+    honcho = _HonchoStore()
+    pool = _nutrition_runtime_pool(
+        tmp_path,
+        workspace,
+        honcho,
+        model_stream=_NutritionModelStream(protein_g=None),
+    )
+    config = NutritionIngestConfig(
+        enabled=True,
+        synchronized_root=tmp_path,
+        principal="123",
+        chat_id="123",
+        session_key="telegram:123",
+        retry_backoff_seconds=0,
+    )
+    outbound = []
+    coordinator = NutritionIngestCoordinator(
+        config,
+        honcho_client=_RecentSource(),
+        publish_outbound=outbound.append,
+        runtime_pool=pool,
+    )
+    await coordinator.poll_once()
+    prompt = outbound[0]
+    await coordinator.on_send_success(
+        prompt,
+        OutboundDeliveryReceipt(
+            "telegram", "123", (42,), prompt.metadata["_trusted_outbound_operation_id"]
+        ),
+    )
+    await coordinator.handle_inbound(
+        InboundMessage(
+            channel="telegram",
+            sender_id="123",
+            chat_id="123",
+            content="Да",
+            session_key_override="telegram:123",
+            metadata={"callback_query": True, "native_message_id": 42},
+        )
+    )
+
+    sidecar = NutritionResultStore(tmp_path / candidate / "result.json").load()
+    assert sidecar.state == ResultState.retryable_error
+    assert len(honcho.messages) == 0
+    assert len(outbound) == 1
 
 
 @pytest.mark.asyncio

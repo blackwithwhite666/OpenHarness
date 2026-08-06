@@ -34,11 +34,14 @@ def build_post_confirmation_prompt(
         f"Candidate: {candidate_id}\n"
         "The user confirmed that the pictured food was consumed. Estimate the meal "
         "from the attached photo and emit a schema-v2 meal_observation with "
-        "consumption_status=consumed and at least one finite energy value. "
+        "consumption_status=consumed, finite non-negative calories, and finite "
+        "non-negative protein_g, fat_g, and carbohydrate_g values. Populate all "
+        "three macro fields; never leave them null. "
         "Do not emit a correction, deletion, planned meal, or pre-confirmation record.\n"
         "EXIF is evidence only, not proof of eating or authoritative meal time. "
         f"Capture time evidence: {capture_time}. GPS is unavailable by design.\n"
-        "Keep the answer concise and state visual portion uncertainty."
+        "Keep your own answer concise and state visual portion uncertainty; the "
+        "trusted client renders the numeric result from the structured fields."
     )
     return prompt[:max_chars]
 

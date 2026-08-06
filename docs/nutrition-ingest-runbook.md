@@ -102,10 +102,16 @@ the compact tombstone preserves the final local state summary for audit.
 
 - A verified candidate is queued in deterministic discovery order. There is at
   most one pending Marina confirmation.
-- `Нет` records `not_consumed`, emits no meal observation, and advances the
-  queue. `Да` records `consumed` and only then invokes the existing nutrition
-  estimator, producing exactly one consumed observation under its stable
-  operation id.
+- `Нет` records `not_consumed`, emits only the existing acknowledgement, and
+  advances the queue. `Да` records `consumed` and only then invokes the existing
+  nutrition estimator, producing exactly one consumed observation under its
+  stable operation id. After the observation is durably committed, Marina
+  receives one concise reply such as `КБЖУ: 550 ккал · Б 30 г · Ж 20 г · У 45 г`
+  followed by a short note that the photo-based portion is uncertain. The
+  numbers come from the validated schema-v2 annotation; model prose is not
+  parsed. Missing, negative, non-finite, boolean, or otherwise invalid calorie
+  or macro values fail closed and are retried without sending a misleading
+  result.
 - A decision is accepted only from a native Telegram inline-button callback
   whose message id exactly matches the currently pending prompt's native
   message id and Marina binding. Plain-text `Да`/`Нет`, callbacks without a
@@ -124,6 +130,16 @@ Exactly-once processing here means stable candidate and Honcho operation ids,
 durable state transitions, and suppression of already-seen media. It does not
 make Telegram transport exactly-once. Telegram can accept a prompt while its
 receipt is lost, so prompt delivery remains inherently ambiguous.
+
+The КБЖУ reply is marked completed before its outbound Telegram send, with a
+stable per-candidate `:summary:v1` operation id and the confirmation photo's
+native message id when the channel supports reply binding. This preserves
+at-most-once completion ordering but intentionally does not invent exactly-once
+Telegram transport: a crash or send failure after local completion can leave
+the user-facing summary undelivered, while a channel-side acceptance followed
+by a lost receipt can leave delivery ambiguous. Reconcile that residual
+ambiguity from local sidecar/channel evidence; do not automatically resend a
+completed summary.
 
 If a prompt send has no unambiguous single-message receipt, the result sidecar
 enters `delivery_unknown`. Quarantine it without automatic resend so later

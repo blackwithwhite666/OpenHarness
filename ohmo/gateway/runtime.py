@@ -44,7 +44,10 @@ from openharness.ui.runtime import (
 )
 
 from ohmo.evals import GatewayEvalRecorder
-from ohmo.evals.nutrition_trace import NutritionAnnotationV2
+from ohmo.evals.nutrition_trace import (
+    NutritionAnnotationV2,
+    build_nutrition_display_summary,
+)
 from ohmo.gateway.attachment_fingerprints import compute_attachment_fingerprints
 from ohmo.gateway.config import load_gateway_config
 from ohmo.gateway.group_tool import (
@@ -1176,6 +1179,7 @@ class OhmoSessionRuntimePool:
         memory_scope: MemoryScope | None,
         recorder: GatewayEvalRecorder | None = None,
     ):
+        trusted_nutrition = _trusted_nutrition_request(message)
         bundle.engine.set_system_prompt(
             await self._runtime_system_prompt(
                 bundle,
@@ -1293,6 +1297,12 @@ class OhmoSessionRuntimePool:
                 user_text=message.content or user_prompt,
                 assistant_text=reply,
             )
+            display_summary = None
+            if trusted_nutrition is not None:
+                annotation = recorder.validated_nutrition_envelope if recorder is not None else None
+                if annotation is None:
+                    raise ValueError("trusted nutrition estimation has no validated envelope")
+                display_summary = build_nutrition_display_summary(annotation)
             logger.info(
                 "ohmo runtime processing complete session_key=%s session_id=%s reply=%r",
                 session_key,
@@ -1304,6 +1314,10 @@ class OhmoSessionRuntimePool:
             if append_receipt is not None:
                 metadata["_trusted_nutrition_assistant_message_id"] = append_receipt.assistant_message_id
                 metadata["_trusted_nutrition_client_op_id"] = append_receipt.assistant_client_op_id
+            if trusted_nutrition is not None and display_summary is not None:
+                metadata["_trusted_nutrition_display_summary"] = display_summary.model_dump(
+                    mode="json"
+                )
             if final_media:
                 metadata.update({"_media": final_media, "_final_media_fallback": True})
             yield GatewayStreamUpdate(
@@ -1332,6 +1346,7 @@ class OhmoSessionRuntimePool:
                 raise ValueError("trusted nutrition estimation has no validated envelope")
             try:
                 validated = NutritionAnnotationV2.model_validate(annotation)
+                build_nutrition_display_summary(annotation)
             except Exception as exc:  # pydantic validation is part of the trust boundary
                 raise ValueError("trusted nutrition estimation envelope is invalid") from exc
             if (

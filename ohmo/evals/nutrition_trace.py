@@ -5,12 +5,11 @@ from __future__ import annotations
 import math
 from collections.abc import Mapping
 from datetime import date, datetime
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 from openharness.evals import DecisionTraceValidationError
-
 
 NUTRITION_TRACE_SCHEMA_VERSION = 1
 NUTRITION_TRACE_SCHEMA_VERSION_V2 = 2
@@ -469,6 +468,60 @@ class NutritionAnnotationV2(BaseModel):
             raise ValueError("explicit_new_consumption is only allowed for meal_observation")
 
         return self
+
+
+class NutritionDisplaySummaryV1(BaseModel):
+    """Bounded values that a trusted consumer may render for a user."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal[1] = 1
+    calories_kcal: float
+    protein_g: float
+    fat_g: float
+    carbohydrate_g: float
+
+    @field_validator("calories_kcal", "protein_g", "fat_g", "carbohydrate_g", mode="before")
+    @classmethod
+    def _validate_display_value(cls, value: Any) -> float:
+        return _validate_finite_non_negative(value, "display nutrient value")
+
+
+def build_nutrition_display_summary(
+    annotation: Mapping[str, Any],
+) -> NutritionDisplaySummaryV1:
+    """Derive user-visible totals only from a validated schema-v2 observation."""
+
+    validated = NutritionAnnotationV2.model_validate(annotation)
+    if validated.record_type != RECORD_TYPE_MEAL_OBSERVATION:
+        raise ValueError("display summary requires a meal_observation")
+    if validated.consumption_status != "consumed":
+        raise ValueError("display summary requires a consumed observation")
+
+    if validated.energy_kcal_best is not None:
+        calories = validated.energy_kcal_best
+    elif validated.energy_kcal_min is not None and validated.energy_kcal_max is not None:
+        calories = (validated.energy_kcal_min + validated.energy_kcal_max) / 2
+    else:
+        calories = (
+            validated.energy_kcal_min
+            if validated.energy_kcal_min is not None
+            else validated.energy_kcal_max
+        )
+    if calories is None:
+        raise ValueError("display summary requires a calorie value")
+    if any(
+        value is None
+        for value in (validated.protein_g, validated.fat_g, validated.carbohydrate_g)
+    ):
+        raise ValueError("display summary requires all macro values")
+
+    return NutritionDisplaySummaryV1(
+        calories_kcal=calories,
+        protein_g=validated.protein_g,
+        fat_g=validated.fat_g,
+        carbohydrate_g=validated.carbohydrate_g,
+    )
 
 
 def _nutrition_annotation_model(annotation: Mapping[str, Any]) -> type[BaseModel]:

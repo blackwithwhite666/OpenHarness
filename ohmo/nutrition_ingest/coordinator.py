@@ -15,6 +15,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Protocol
 
+from ohmo.evals.nutrition_trace import NutritionDisplaySummaryV1
 from ohmo.gateway.attachment_fingerprints import (
     ATTACHMENT_FINGERPRINT_MAX,
     PHASH_ALGORITHM,
@@ -53,6 +54,13 @@ _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _PHASH_RE = re.compile(r"^[0-9a-f]{1,256}$")
 _METADATA_MAX_BYTES = 32 * 1024
 _FINGERPRINT_ALGORITHM_MAX = 64
+
+
+def _format_nutrition_number(value: float) -> str:
+    """Format a validated numeric total without exposing model prose."""
+    if value.is_integer():
+        return str(int(value))
+    return f"{value:.2f}".rstrip("0").rstrip(".")
 
 
 class HonchoRecentMessageSource(Protocol):
@@ -904,7 +912,23 @@ class NutritionIngestCoordinator:
                 raise NutritionCoordinatorError(
                     "injected estimator returned no Honcho assistant id"
                 )
-            self._complete_after_estimation(artifact, sidecar, assistant_id)
+            raw_summary = (
+                result.get("_trusted_nutrition_display_summary")
+                if isinstance(result, dict)
+                else None
+            )
+            if raw_summary is not None:
+                try:
+                    summary = NutritionDisplaySummaryV1.model_validate(raw_summary)
+                except Exception as exc:  # pydantic validation is part of the trust boundary
+                    raise NutritionCoordinatorError(
+                        "injected estimator returned no valid display summary"
+                    ) from exc
+                completed_now = self._complete_after_estimation(artifact, sidecar, assistant_id)
+                if completed_now:
+                    await self._publish_nutrition_result(artifact, sidecar, summary)
+            else:
+                self._complete_after_estimation(artifact, sidecar, assistant_id)
             return
         elif self._runtime_pool is not None:
             stream = self._runtime_pool.stream_message(synthetic, self.config.session_key)
@@ -917,7 +941,16 @@ class NutritionIngestCoordinator:
                 raise NutritionCoordinatorError(
                     "trusted estimation returned no Honcho assistant id"
                 )
-            self._complete_after_estimation(artifact, sidecar, assistant_id)
+            raw_summary = final_metadata.get("_trusted_nutrition_display_summary")
+            try:
+                summary = NutritionDisplaySummaryV1.model_validate(raw_summary)
+            except Exception as exc:  # pydantic validation is part of the trust boundary
+                raise NutritionCoordinatorError(
+                    "trusted estimation returned no valid display summary"
+                ) from exc
+            completed_now = self._complete_after_estimation(artifact, sidecar, assistant_id)
+            if completed_now:
+                await self._publish_nutrition_result(artifact, sidecar, summary)
             return
         raise NutritionCoordinatorError("nutrition estimator/runtime is unavailable")
 
@@ -926,7 +959,7 @@ class NutritionIngestCoordinator:
         artifact: ReadyNutritionArtifact,
         sidecar: NutritionResultSidecar,
         assistant_id: str | None,
-    ) -> None:
+    ) -> bool:
         if not isinstance(assistant_id, str) or not assistant_id.strip():
             raise NutritionCoordinatorError("estimation completion requires a Honcho assistant id")
         store = self._store(artifact)
@@ -935,12 +968,54 @@ class NutritionIngestCoordinator:
             current = self._advance(store, current, ResultState.estimated)
         elif current.state == ResultState.completed:
             self._metrics.duplicate_suppression("observation")
-            return
+            return False
         if current.state == ResultState.estimated:
             completed = self._advance(
                 store, current, ResultState.completed, emitted_honcho_message_id=assistant_id
             )
             self._record_end_to_end_latency(completed)
+            return True
+        return False
+
+    async def _publish_nutrition_result(
+        self,
+        artifact: ReadyNutritionArtifact,
+        sidecar: NutritionResultSidecar,
+        summary: NutritionDisplaySummaryV1,
+    ) -> None:
+        if self._publish_outbound is None:
+            raise NutritionCoordinatorError("nutrition outbound publisher is unavailable")
+        operation_id = f"{artifact.candidate_id}:summary:v1"
+        native_prompt_id = sidecar.prompt_message_id
+        metadata: dict[str, object] = {
+            "_trusted_outbound_operation_id": operation_id,
+            "_nutrition_result": True,
+            "_nutrition_candidate_id": artifact.candidate_id,
+            "_nutrition_principal": self.config.principal,
+            "_nutrition_chat_id": str(self.config.chat_id),
+            "_nutrition_session_key": self.config.session_key,
+            "_nutrition_phase": "summary",
+            "_nutrition_display_summary": summary.model_dump(mode="json"),
+        }
+        if native_prompt_id is not None:
+            metadata["message_id"] = native_prompt_id
+        message = OutboundMessage(
+            channel="telegram",
+            chat_id=str(self.config.chat_id),
+            content=(
+                "КБЖУ: "
+                f"{_format_nutrition_number(summary.calories_kcal)} ккал · "
+                f"Б {_format_nutrition_number(summary.protein_g)} г · "
+                f"Ж {_format_nutrition_number(summary.fat_g)} г · "
+                f"У {_format_nutrition_number(summary.carbohydrate_g)} г.\n"
+                "Оценка по фото; возможна погрешность порции."
+            ),
+            reply_to=str(native_prompt_id) if native_prompt_id is not None else None,
+            metadata=metadata,
+        )
+        result = self._publish_outbound(message)
+        if asyncio.iscoroutine(result):
+            await result
 
     def _record_end_to_end_latency(self, sidecar: NutritionResultSidecar) -> None:
         published = next(
