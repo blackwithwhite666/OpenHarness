@@ -448,7 +448,6 @@ class NutritionIngestCoordinator:
                 continue
             if sidecar.state in {
                 ResultState.prompt_sending,
-                ResultState.delivery_unknown,
                 ResultState.pending_confirmation,
                 ResultState.confirmed,
                 ResultState.estimated,
@@ -791,15 +790,13 @@ class NutritionIngestCoordinator:
             self._skip_candidate(self._store(artifact), sidecar, reason)
             return False
         native_id = message.metadata.get("native_message_id")
-        callback = bool(message.metadata.get("callback_query"))
-        if callback and str(native_id) != str(sidecar.prompt_message_id):
+        if not message.metadata.get("callback_query") or str(native_id) != str(
+            sidecar.prompt_message_id
+        ):
             await self._clarify(message)
             return True
         answer = message.content.strip().casefold()
         if answer not in _YES | _NO:
-            await self._clarify(message)
-            return True
-        if callback and str(native_id) != str(sidecar.prompt_message_id):
             await self._clarify(message)
             return True
         if answer in _NO:

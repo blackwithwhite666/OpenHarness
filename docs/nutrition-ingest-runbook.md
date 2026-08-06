@@ -106,9 +106,14 @@ the compact tombstone preserves the final local state summary for audit.
   queue. `Да` records `consumed` and only then invokes the existing nutrition
   estimator, producing exactly one consumed observation under its stable
   operation id.
-- An unrelated, ambiguous, or unknown reply remains pending and is clarified;
-  it never becomes an acceptance or decline. Callback handling must match the
-  exact native prompt id and Marina binding.
+- A decision is accepted only from a native Telegram inline-button callback
+  whose message id exactly matches the currently pending prompt's native
+  message id and Marina binding. Plain-text `Да`/`Нет`, callbacks without a
+  valid native message id, and callbacks for an older, quarantined, or unknown
+  prompt are clarified and never mutate a candidate.
+- An ambiguous prompt is quarantined as `delivery_unknown`. It is not resent
+  automatically and does not block later eligible candidates, while the
+  coordinator still permits only one actual `pending_confirmation` prompt.
 - Pending latency, confirmation outcome, retry/dead-letter, delivery-unknown,
   duplicate suppression, and end-to-end latency are aggregate metrics with
   bounded stage/error labels only.
@@ -121,10 +126,13 @@ make Telegram transport exactly-once. Telegram can accept a prompt while its
 receipt is lost, so prompt delivery remains inherently ambiguous.
 
 If a prompt send has no unambiguous single-message receipt, the result sidecar
-enters `delivery_unknown`. Do not resend automatically. Reconcile the channel
-receipt and sidecar locally, then either acknowledge the existing prompt or
-use the operator replay command. A retryable error may use capped exponential
-backoff; exhausted prompt or estimation attempts become a dead letter.
+enters `delivery_unknown`. Quarantine it without automatic resend so later
+eligible candidates can proceed; the native callback guard prevents a callback
+for the quarantined prompt from confirming another candidate. Reconcile the
+channel receipt and sidecar locally, then either acknowledge the existing
+prompt or use the operator replay command. A retryable error may use capped
+exponential backoff; exhausted prompt or estimation attempts become a dead
+letter.
 
 ```bash
 .venv/bin/python -m ohmo nutrition-ingest replay --workspace "$OHMO_WORKSPACE" \

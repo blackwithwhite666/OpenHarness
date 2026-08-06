@@ -359,6 +359,7 @@ async def test_marina_queue_has_one_native_prompt_and_decline_has_no_estimation(
             chat_id="123",
             content="Нет",
             session_key_override="telegram:123",
+            metadata={"callback_query": True, "native_message_id": 42},
         )
     )
     assert handled is True
@@ -542,6 +543,19 @@ async def test_unknown_typed_reply_is_clarified_and_yes_creates_one_durable_comp
             session_key_override="telegram:123",
         )
     ) is True
+    assert len(estimates) == 0
+    assert NutritionResultStore(tmp_path / candidate / "result.json").load().state == ResultState.pending_confirmation
+
+    assert await coordinator.handle_inbound(
+        InboundMessage(
+            channel="telegram",
+            sender_id="123",
+            chat_id="123",
+            content="Да",
+            session_key_override="telegram:123",
+            metadata={"callback_query": True, "native_message_id": 42},
+        )
+    ) is True
     assert len(estimates) == 1
     assert await coordinator.poll_once() == [candidate]
     assert len(estimates) == 1
@@ -578,6 +592,7 @@ async def test_completed_candidate_leaves_later_correction_on_normal_ohmo_path(
             chat_id="123",
             content="Нет",
             session_key_override="telegram:123",
+            metadata={"callback_query": True, "native_message_id": 42},
         )
     )
     before = NutritionResultStore(tmp_path / candidate / "result.json").load().model_dump(mode="json")
@@ -638,6 +653,135 @@ async def test_ambiguous_failure_is_not_republished(tmp_path: Path) -> None:
     assert NutritionResultStore(tmp_path / candidate / "result.json").load().state == ResultState.delivery_unknown
     await coordinator.poll_once()
     assert len(outbound) == 1
+
+
+@pytest.mark.asyncio
+async def test_delivery_unknown_does_not_block_later_candidate(tmp_path: Path) -> None:
+    _candidate(tmp_path, file_id="id:first-unknown", rev="rev:first-unknown")
+    _candidate(tmp_path, file_id="id:later", rev="rev:later")
+    config = NutritionIngestConfig(
+        enabled=True,
+        synchronized_root=tmp_path,
+        principal="123",
+        chat_id="123",
+        session_key="telegram:123",
+    )
+    outbound = []
+    coordinator = NutritionIngestCoordinator(
+        config, honcho_client=_RecentSource(), publish_outbound=outbound.append
+    )
+    ordered = [item.candidate_id for item in coordinator._scanner.scan_ready()]
+    head, later = ordered
+
+    await coordinator.poll_once()
+    assert outbound[0].metadata["_nutrition_candidate_id"] == head
+    assert await coordinator.on_send_failure(outbound[0], RuntimeError("telegram timeout"))
+    assert NutritionResultStore(tmp_path / head / "result.json").load().state == ResultState.delivery_unknown
+
+    await coordinator.poll_once()
+    assert len(outbound) == 2
+    assert outbound[1].metadata["_nutrition_candidate_id"] == later
+    assert NutritionResultStore(tmp_path / later / "result.json").load().state == ResultState.prompt_sending
+
+
+@pytest.mark.asyncio
+async def test_delivery_unknown_still_allows_only_one_later_pending_prompt(tmp_path: Path) -> None:
+    for index in range(3):
+        _candidate(tmp_path, file_id=f"id:candidate-{index}", rev=f"rev:candidate-{index}")
+    config = NutritionIngestConfig(
+        enabled=True,
+        synchronized_root=tmp_path,
+        principal="123",
+        chat_id="123",
+        session_key="telegram:123",
+    )
+    outbound = []
+    coordinator = NutritionIngestCoordinator(
+        config, honcho_client=_RecentSource(), publish_outbound=outbound.append
+    )
+    ordered = [item.candidate_id for item in coordinator._scanner.scan_ready()]
+    head, later, tail = ordered
+
+    await coordinator.poll_once()
+    await coordinator.on_send_failure(outbound[0], RuntimeError("telegram timeout"))
+    await coordinator.poll_once()
+    await coordinator.on_send_success(
+        outbound[1],
+        OutboundDeliveryReceipt(
+            "telegram", "123", (42,), outbound[1].metadata["_trusted_outbound_operation_id"]
+        ),
+    )
+    await coordinator.poll_once()
+
+    assert NutritionResultStore(tmp_path / head / "result.json").load().state == ResultState.delivery_unknown
+    assert NutritionResultStore(tmp_path / later / "result.json").load().state == ResultState.pending_confirmation
+    assert NutritionResultStore(tmp_path / tail / "result.json").load().state == ResultState.published
+    assert [item.metadata["_nutrition_candidate_id"] for item in outbound] == [head, later]
+
+
+@pytest.mark.asyncio
+async def test_plain_text_and_old_callback_do_not_mutate_quarantined_or_current_candidate(
+    tmp_path: Path,
+) -> None:
+    _candidate(tmp_path, file_id="id:quarantined", rev="rev:quarantined")
+    _candidate(tmp_path, file_id="id:current", rev="rev:current")
+    config = NutritionIngestConfig(
+        enabled=True,
+        synchronized_root=tmp_path,
+        principal="123",
+        chat_id="123",
+        session_key="telegram:123",
+    )
+    outbound = []
+    coordinator = NutritionIngestCoordinator(
+        config, honcho_client=_RecentSource(), publish_outbound=outbound.append
+    )
+    ordered = [item.candidate_id for item in coordinator._scanner.scan_ready()]
+    quarantined, current = ordered
+
+    await coordinator.poll_once()
+    await coordinator.on_send_failure(outbound[0], RuntimeError("telegram timeout"))
+    await coordinator.poll_once()
+    await coordinator.on_send_success(
+        outbound[1],
+        OutboundDeliveryReceipt(
+            "telegram", "123", (42,), outbound[1].metadata["_trusted_outbound_operation_id"]
+        ),
+    )
+    before = {
+        candidate_id: NutritionResultStore(tmp_path / candidate_id / "result.json").load().model_dump(
+            mode="json"
+        )
+        for candidate_id in (quarantined, current)
+    }
+
+    for message in (
+        InboundMessage(
+            channel="telegram",
+            sender_id="123",
+            chat_id="123",
+            content="Да",
+            session_key_override="telegram:123",
+        ),
+        InboundMessage(
+            channel="telegram",
+            sender_id="123",
+            chat_id="123",
+            content="Нет",
+            session_key_override="telegram:123",
+            metadata={"callback_query": True, "native_message_id": 41},
+        ),
+    ):
+        assert await coordinator.handle_inbound(message) is True
+
+    after = {
+        candidate_id: NutritionResultStore(tmp_path / candidate_id / "result.json").load().model_dump(
+            mode="json"
+        )
+        for candidate_id in (quarantined, current)
+    }
+    assert after == before
+    assert len([item for item in outbound if item.metadata.get("_nutrition_confirmation")]) == 2
 
 
 @pytest.mark.asyncio
@@ -734,6 +878,7 @@ async def test_runtime_pool_nutrition_chain_reconciles_crash_after_honcho_commit
             chat_id="123",
             content="Да",
             session_key_override="telegram:123",
+            metadata={"callback_query": True, "native_message_id": 42},
         )
     )
     sidecar = NutritionResultStore(tmp_path / candidate / "result.json").load()
@@ -828,6 +973,7 @@ async def test_missing_estimator_receipt_is_retryable_not_completed(tmp_path: Pa
             chat_id="123",
             content="Да",
             session_key_override="telegram:123",
+            metadata={"callback_query": True, "native_message_id": 42},
         )
     ) is True
     sidecar = NutritionResultStore(tmp_path / candidate / "result.json").load()
@@ -873,6 +1019,7 @@ async def test_estimation_retries_are_bounded_without_reprompting(tmp_path: Path
             chat_id="123",
             content="Да",
             session_key_override="telegram:123",
+            metadata={"callback_query": True, "native_message_id": 42},
         )
     )
     await coordinator.poll_once()
@@ -933,6 +1080,7 @@ async def test_retry_backoff_keeps_head_candidate_in_front_of_later_prompt(tmp_p
             chat_id="123",
             content="Нет",
             session_key_override="telegram:123",
+            metadata={"callback_query": True, "native_message_id": 42},
         )
     )
     await coordinator.poll_once()
@@ -1008,6 +1156,7 @@ async def test_operator_replay_resumes_consumed_estimation_without_reprompt(tmp_
             chat_id="123",
             content="Да",
             session_key_override="telegram:123",
+            metadata={"callback_query": True, "native_message_id": 42},
         )
     )
     assert NutritionResultStore(tmp_path / candidate / "result.json").load().state == ResultState.dead_letter
@@ -1060,6 +1209,7 @@ async def test_estimation_backoff_doubles_caps_and_does_not_reconfirm(tmp_path: 
             chat_id="123",
             content="Да",
             session_key_override="telegram:123",
+            metadata={"callback_query": True, "native_message_id": 42},
         )
     )
     assert len(estimates) == 1
@@ -1218,7 +1368,8 @@ async def test_consumed_estimation_retry_expires_with_bounded_state_summary(
     )
     await coordinator.handle_inbound(InboundMessage(
         channel="telegram", sender_id="123", chat_id="123", content="Да",
-        session_key_override="telegram:123"))
+        session_key_override="telegram:123",
+        metadata={"callback_query": True, "native_message_id": 42}))
     clock.advance(7 * 24 * 60 * 60 + 1)
     await coordinator.poll_once()
     assert len(calls) == 1
