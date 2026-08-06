@@ -171,8 +171,8 @@ async def test_callback_propagates_native_binding_metadata() -> None:
     class Query:
         data = "ask:0"
         message = SimpleNamespace(
-            caption="Вы это съели?",
-            caption_html="Вы это съели?",
+            caption="Вы это съели?\nДата: 05.08.2026 12:00 (по EXIF фото)",
+            caption_html="Вы это съели?\nДата: 05.08.2026 12:00 (по EXIF фото)",
             text=None,
             message_id=7,
             chat_id=123,

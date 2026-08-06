@@ -50,6 +50,20 @@ git log -1 --oneline
 ```
 
 Only the reviewed deploy-branch change may be installed.
+Before starting or restarting the gateway, require the Dropbox daemon/service
+that creates synchronized files on the consumer host to run with a systemd
+drop-in setting `UMask=0077`. As a one-time prerequisite, harden the existing
+`nutrition-assets` tree to owner-only permissions and verify that no group or
+other permission bits remain, for example:
+
+```bash
+chmod -R go-rwx "$NUTRITION_ASSETS_ROOT"
+find "$NUTRITION_ASSETS_ROOT" -perm /go-rwx -print -quit
+```
+
+Setting the root mode once is insufficient: future synchronized children
+inherit the Dropbox daemon's umask.
+
 After deployment, verify the Dropbox selective sync for the synchronized
 `nutrition-assets` root, owner-only permissions, free space, and service
 readiness. Do not recursively print the tree. The scanner ignores temporary
@@ -92,7 +106,8 @@ the compact tombstone preserves the final local state summary for audit.
    counts, privacy checks, and idempotency evidence.
 3. **Publish canary:** after shadow acceptance, enable the consumer for the
    fixed Marina binding only. One ready positive artifact produces one native
-   Telegram photo with caption `Вы это съели?` and buttons `Да` and `Нет`.
+   Telegram photo with the two-line caption `Вы это съели?` followed by
+   `Дата: DD.MM.YYYY HH:MM (по EXIF фото)` and buttons `Да` and `Нет`.
 4. **Normal publish:** expand only after the canary proves exact routing,
    confirmation-before-estimation, durable observation reconciliation, and
    restart idempotency. Keep CLIP shadow until its recorded recall/shadow gate

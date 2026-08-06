@@ -67,7 +67,7 @@ async def test_one_photo_prompt_returns_native_photo_id_and_trusted_operation(tm
         OutboundMessage(
             channel="telegram",
             chat_id="123",
-            content="Вы это съели?",
+            content="Вы это съели?\nДата: 05.08.2026 12:00 (по EXIF фото)",
             media=[str(image)],
             buttons=["Да", "Нет"],
             metadata={
@@ -82,7 +82,7 @@ async def test_one_photo_prompt_returns_native_photo_id_and_trusted_operation(tm
     assert receipt.outbound_operation_id == "candidate:confirm:v1"
     assert len(bot.calls) == 1
     assert bot.calls[0][0] == "send_photo"
-    assert bot.calls[0][1]["caption"] == "Вы это съели?"
+    assert bot.calls[0][1]["caption"] == "Вы это съели?\nДата: 05.08.2026 12:00 (по EXIF фото)"
     assert bot.calls[0][1]["reply_markup"].inline_keyboard[0][0].text == "Да"
 
 
@@ -165,8 +165,8 @@ async def test_photo_caption_callback_uses_caption_api_and_forwards_native_id() 
     class Query:
         data = "ask:0"
         message = SimpleNamespace(
-            caption="Вы это съели?",
-            caption_html="Вы это съели?",
+            caption="Вы это съели?\nДата: 05.08.2026 12:00 (по EXIF фото)",
+            caption_html="Вы это съели?\nДата: 05.08.2026 12:00 (по EXIF фото)",
             text=None,
             message_id=55,
             chat_id=123,

@@ -4,6 +4,21 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 
+from .freshness import normalized_exif_capture_time
+from .models import ExifMetadata
+
+
+def build_confirmation_prompt(exif: ExifMetadata) -> str:
+    """Build the native confirmation caption from authoritative ``ManifestV1.exif``.
+
+    The coordinator calls this only after EXIF freshness validation succeeds.
+    Normalization is deliberately the sole source of the displayed camera-local
+    wall time: this helper never consults Dropbox or discovery timestamps and
+    never converts the normalized value through the host timezone.
+    """
+    capture_time = normalized_exif_capture_time(exif)
+    return f"Вы это съели?\nДата: {capture_time:%d.%m.%Y %H:%M} (по EXIF фото)"
+
 
 def build_post_confirmation_prompt(
     *,
@@ -46,4 +61,4 @@ def build_post_confirmation_prompt(
     return prompt[:max_chars]
 
 
-__all__ = ["build_post_confirmation_prompt"]
+__all__ = ["build_confirmation_prompt", "build_post_confirmation_prompt"]

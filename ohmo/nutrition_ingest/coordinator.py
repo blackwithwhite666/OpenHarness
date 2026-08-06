@@ -40,7 +40,7 @@ from .models import (
     StageAttempt,
     StateHistoryEntry,
 )
-from .prompts import build_post_confirmation_prompt
+from .prompts import build_confirmation_prompt, build_post_confirmation_prompt
 from .sidecars import NutritionResultStore
 from .tombstones import SeenTombstoneStore
 from .trust import COORDINATOR_TRUST_TOKEN
@@ -519,7 +519,7 @@ class NutritionIngestCoordinator:
         message = OutboundMessage(
             channel="telegram",
             chat_id=str(self.config.chat_id),
-            content="Вы это съели?",
+            content=build_confirmation_prompt(artifact.manifest.exif),
             media=[str(artifact.image_path)],
             buttons=["Да", "Нет"],
             metadata={

@@ -352,7 +352,7 @@ async def test_marina_queue_has_one_native_prompt_and_decline_has_no_estimation(
     await coordinator.poll_once()
     assert len(outbound) == 1
     prompt = outbound[0]
-    assert prompt.content == "Вы это съели?"
+    assert prompt.content == "Вы это съели?\nДата: 01.01.2099 00:00 (по EXIF фото)"
     assert prompt.buttons == ["Да", "Нет"]
     assert len(prompt.media) == 1
     await coordinator.on_send_success(
@@ -524,7 +524,7 @@ async def test_unknown_typed_reply_is_clarified_and_yes_creates_one_durable_comp
     await coordinator.poll_once()
     prompt = outbound[0]
     assert prompt.media and len(prompt.media) == 1
-    assert prompt.content == "Вы это съели?"
+    assert prompt.content == "Вы это съели?\nДата: 01.01.2099 00:00 (по EXIF фото)"
     assert prompt.buttons == ["Да", "Нет"]
     await coordinator.on_send_success(
         prompt,

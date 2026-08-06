@@ -3,7 +3,33 @@ from __future__ import annotations
 import pytest
 
 from ohmo.evals.nutrition_trace import build_nutrition_display_summary
-from ohmo.nutrition_ingest.prompts import build_post_confirmation_prompt
+from ohmo.nutrition_ingest.models import ExifMetadata
+from ohmo.nutrition_ingest.prompts import build_confirmation_prompt, build_post_confirmation_prompt
+
+
+@pytest.mark.parametrize(
+    ("exif", "expected"),
+    [
+        (
+            ExifMetadata(
+                timezone_status="known",
+                normalized_capture_time="2026-08-05T12:34:56+05:00",
+            ),
+            "Вы это съели?\nДата: 05.08.2026 12:34 (по EXIF фото)",
+        ),
+        (
+            ExifMetadata(
+                timezone_status="missing",
+                normalized_capture_time="2026-08-05T12:34:56",
+            ),
+            "Вы это съели?\nДата: 05.08.2026 12:34 (по EXIF фото)",
+        ),
+    ],
+)
+def test_confirmation_prompt_formats_authoritative_exif_wall_time(
+    exif: ExifMetadata, expected: str
+) -> None:
+    assert build_confirmation_prompt(exif) == expected
 
 
 def test_post_confirmation_prompt_is_bounded_and_excludes_gps() -> None:
