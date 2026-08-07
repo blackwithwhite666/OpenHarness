@@ -109,7 +109,12 @@ class NutritionResultStore:
     def _file_lock(self) -> Iterator[None]:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         lock_path = self.path.with_name(f".{self.path.name}.lock")
-        with lock_path.open("a+") as lock:
+        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_APPEND, 0o600)
+        lock = None
+        try:
+            os.fchmod(fd, 0o600)
+            lock = os.fdopen(fd, "a+")
+            fd = -1
             if fcntl is not None:
                 fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
             try:
@@ -117,6 +122,11 @@ class NutritionResultStore:
             finally:
                 if fcntl is not None:
                     fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+        finally:
+            if lock is not None:
+                lock.close()
+            elif fd != -1:
+                os.close(fd)
 
     @staticmethod
     def _validate_transition(previous: ResultState, current: ResultState) -> None:

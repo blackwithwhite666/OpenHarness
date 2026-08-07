@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import stat
 from pathlib import Path
 
 from ohmo.nutrition_ingest.models import candidate_id_for
@@ -100,6 +101,31 @@ def test_result_store_crash_before_replace_preserves_last_good_sidecar(tmp_path:
         pass
     assert store.load() == first
     assert not list(path.parent.glob("*.tmp"))
+
+
+def test_result_store_lock_is_owner_only_under_umask(tmp_path: Path) -> None:
+    path = tmp_path / "candidate" / "result.json"
+    store = NutritionResultStore(path)
+    previous_umask = os.umask(0o0002)
+    try:
+        _write_sidecar(store, revision=1, state="published")
+    finally:
+        os.umask(previous_umask)
+
+    lock_path = path.with_name(".result.json.lock")
+    assert stat.S_IMODE(lock_path.stat().st_mode) == 0o600
+
+
+def test_result_store_lock_repairs_pre_existing_mode(tmp_path: Path) -> None:
+    path = tmp_path / "candidate" / "result.json"
+    lock_path = path.with_name(".result.json.lock")
+    lock_path.parent.mkdir(parents=True)
+    lock_path.touch(mode=0o664)
+    os.chmod(lock_path, 0o664)
+
+    _write_sidecar(NutritionResultStore(path), revision=1, state="published")
+
+    assert stat.S_IMODE(lock_path.stat().st_mode) == 0o600
 
 
 def _write_sidecar(store: NutritionResultStore, *, revision: int, state: str):

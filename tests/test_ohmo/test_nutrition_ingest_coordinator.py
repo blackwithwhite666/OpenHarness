@@ -505,6 +505,65 @@ async def test_exact_callback_confirmation_reaches_estimator_once(tmp_path: Path
 
 
 @pytest.mark.asyncio
+async def test_confirmation_and_poll_serialize_estimation(tmp_path: Path) -> None:
+    candidate = _candidate(tmp_path, file_id="id:race", rev="rev:race")
+    config = NutritionIngestConfig(
+        enabled=True,
+        synchronized_root=tmp_path,
+        principal="123",
+        chat_id="123",
+        session_key="telegram:123",
+    )
+    outbound = []
+    estimates = []
+    estimator_started = asyncio.Event()
+    release_estimator = asyncio.Event()
+
+    async def estimate(message):
+        estimates.append(message)
+        estimator_started.set()
+        await release_estimator.wait()
+        return "honcho-race"
+
+    coordinator = NutritionIngestCoordinator(
+        config,
+        honcho_client=_RecentSource(),
+        publish_outbound=outbound.append,
+        estimate=estimate,
+    )
+    await coordinator.poll_once()
+    prompt = outbound[0]
+    await coordinator.on_send_success(
+        prompt,
+        OutboundDeliveryReceipt(
+            "telegram", "123", (42,), prompt.metadata["_trusted_outbound_operation_id"]
+        ),
+    )
+
+    confirmation = InboundMessage(
+        channel="telegram",
+        sender_id="123",
+        chat_id="123",
+        content="Да",
+        session_key_override="telegram:123",
+        metadata={"callback_query": True, "native_message_id": 42},
+    )
+    handle_task = asyncio.create_task(coordinator.handle_inbound(confirmation))
+    await asyncio.wait_for(estimator_started.wait(), timeout=1)
+    poll_task = asyncio.create_task(coordinator.poll_once())
+    await asyncio.sleep(0)
+    assert len(estimates) == 1
+
+    release_estimator.set()
+    assert await handle_task is True
+    assert await poll_task == [candidate]
+    assert len(estimates) == 1
+    sidecar = NutritionResultStore(tmp_path / candidate / "result.json").load()
+    assert sidecar.state == ResultState.completed
+    assert sidecar.emitted_honcho_message_id == "honcho-race"
+
+
+@pytest.mark.asyncio
 async def test_unknown_typed_reply_is_clarified_and_yes_creates_one_durable_completion(
     tmp_path: Path,
 ) -> None:

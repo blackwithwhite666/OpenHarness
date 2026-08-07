@@ -822,6 +822,10 @@ class NutritionIngestCoordinator:
             return False
         if message.session_key != self.config.session_key:
             return False
+        async with self._lock:
+            return await self._handle_bound_confirmation(message)
+
+    async def _handle_bound_confirmation(self, message: InboundMessage) -> bool:
         pending = self._pending_confirmations()
         if len(pending) == 0:
             return False
