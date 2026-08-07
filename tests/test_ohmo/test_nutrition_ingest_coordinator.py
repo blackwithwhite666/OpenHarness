@@ -172,6 +172,7 @@ def _recent_message(
     ingest_source: str | None = None,
     peer_id: str = "marina",
     session_id: str = "ohmo",
+    created_at: datetime | None = None,
 ) -> RecentMessageMetadata:
     metadata: dict[str, object] = {
         "role": role,
@@ -186,7 +187,7 @@ def _recent_message(
         peer_id=peer_id,
         session_id=session_id,
         metadata=metadata,
-        created_at=datetime(2026, 8, 5, 9, tzinfo=UTC),
+        created_at=created_at or datetime(2026, 8, 5, 9, tzinfo=UTC),
     )
 
 
@@ -943,6 +944,8 @@ async def test_runtime_pool_nutrition_chain_reconciles_crash_after_honcho_commit
     assert annotation["record_type"] == "meal_observation"
     assert annotation["consumption_status"] == "consumed"
     assert annotation["energy_kcal_best"] == 550
+    assert annotation["meal_at"] == "2099-01-01T00:00:00+00:00"
+    assert "EXIF is evidence only" not in json.dumps(annotation)
 
 
 @pytest.mark.asyncio
@@ -1624,6 +1627,7 @@ async def test_phash_metadata_matches_at_threshold_and_rejects_above_it(
         tmp_path,
         file_id="id:phash-match",
         rev="rev:phash-match",
+        capture_time="2026-08-05T09:00:00+00:00",
         data=data,
         filename="photo.png",
     )
@@ -1661,7 +1665,7 @@ async def test_phash_metadata_matches_at_threshold_and_rejects_above_it(
 
 
 @pytest.mark.asyncio
-async def test_untrusted_non_user_and_dropbox_honcho_records_are_excluded(
+async def test_untrusted_non_user_and_trusted_dropbox_sha_records_are_handled(
     tmp_path: Path,
 ) -> None:
     candidate = _candidate(tmp_path, file_id="id:exclude", rev="rev:exclude")
@@ -1692,6 +1696,80 @@ async def test_untrusted_non_user_and_dropbox_honcho_records_are_excluded(
         publish_outbound=outbound.append,
         honcho_client=source,
         now=_Clock(),
+    ).poll_once()
+    assert outbound == []
+    assert not (tmp_path / candidate).exists()
+
+
+@pytest.mark.asyncio
+async def test_dropbox_phash_only_record_is_not_a_duplicate(tmp_path: Path) -> None:
+    data = _png((50, 100, 150))
+    descriptor = fingerprint_image_bytes(data)
+    assert descriptor is not None
+    candidate = _candidate(
+        tmp_path,
+        file_id="id:dropbox-phash-only",
+        rev="rev:dropbox-phash-only",
+        capture_time="2026-08-05T09:00:00+00:00",
+        data=data,
+        filename="photo.png",
+    )
+    source = _RecentSource(
+        [
+            _recent_message(
+                [{"phash": descriptor["phash"], "phash_algorithm": PHASH_ALGORITHM}],
+                ingest_source="dropbox_camera",
+            )
+        ]
+    )
+    config = NutritionIngestConfig(
+        enabled=True,
+        synchronized_root=tmp_path,
+        principal="123",
+        chat_id="123",
+        session_key="telegram:123",
+    )
+    outbound = []
+    await NutritionIngestCoordinator(
+        config, publish_outbound=outbound.append, honcho_client=source, now=_Clock()
+    ).poll_once()
+    assert len(outbound) == 1
+    assert outbound[0].metadata["_nutrition_candidate_id"] == candidate
+
+
+@pytest.mark.asyncio
+async def test_ordinary_telegram_phash_outside_capture_time_gate_is_not_duplicate(
+    tmp_path: Path,
+) -> None:
+    data = _png((50, 100, 150))
+    descriptor = fingerprint_image_bytes(data)
+    assert descriptor is not None
+    candidate = _candidate(
+        tmp_path,
+        file_id="id:phash-time-gate",
+        rev="rev:phash-time-gate",
+        capture_time="2026-08-05T09:00:00+00:00",
+        data=data,
+        filename="photo.png",
+    )
+    source = _RecentSource(
+        [
+            _recent_message(
+                [{"phash": descriptor["phash"], "phash_algorithm": PHASH_ALGORITHM}],
+                created_at=datetime(2026, 8, 5, 6, tzinfo=UTC),
+            )
+        ]
+    )
+    config = NutritionIngestConfig(
+        enabled=True,
+        synchronized_root=tmp_path,
+        principal="123",
+        chat_id="123",
+        session_key="telegram:123",
+    )
+    outbound = []
+    await NutritionIngestCoordinator(
+        config, publish_outbound=outbound.append, honcho_client=source, now=_Clock()
     ).poll_once()
     assert len(outbound) == 1
     assert outbound[0].metadata["_nutrition_candidate_id"] == candidate

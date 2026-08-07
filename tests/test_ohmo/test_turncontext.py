@@ -6,8 +6,6 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
-from openharness.channels.bus.events import InboundMessage
-
 from ohmo.gateway.config import load_gateway_config
 from ohmo.gateway.models import GatewayConfig
 from ohmo.gateway.runtime import OhmoSessionRuntimePool
@@ -18,6 +16,7 @@ from ohmo.gateway.turn_context import (
     is_private_message,
 )
 from ohmo.workspace import initialize_workspace
+from openharness.channels.bus.events import InboundMessage
 
 
 def _message(*, sender_id: str = "12345|alice", metadata: dict | None = None) -> InboundMessage:
@@ -38,7 +37,7 @@ def test_telegram_canonical_principal_ignores_mutable_username() -> None:
 
 
 def test_owner_status_uses_only_configured_canonical_principal() -> None:
-    config = GatewayConfig(owner_principals=("12345",))
+    config = GatewayConfig(owner_principals=("12345|alice",))
 
     owner = build_turn_context(
         _message(sender_id="12345|alice"),

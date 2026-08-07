@@ -72,7 +72,11 @@ def build_turn_context(
 ) -> TurnContext:
     """Build the immutable identity context for one inbound gateway turn."""
     principal = canonical_principal(message.channel, message.sender_id)
-    owners = {str(owner).strip() for owner in owner_principals}
+    owners = {
+        canonical_principal(message.channel, str(owner).strip())
+        for owner in owner_principals
+        if str(owner).strip()
+    }
     return TurnContext(
         principal=principal,
         is_owner=principal in owners,

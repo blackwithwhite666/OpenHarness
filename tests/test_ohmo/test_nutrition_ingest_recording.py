@@ -55,6 +55,8 @@ def test_prompt_requires_consumed_observation(status: str) -> None:
         exif={"timezone_status": "ambiguous"},
     )
     assert "consumption_status=consumed" in prompt
+    assert "authoritative meal_at" in prompt
+    assert "EXIF is evidence only" not in prompt
 
 
 def test_prompt_requires_all_display_macros_and_concise_model_answer() -> None:

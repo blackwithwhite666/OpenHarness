@@ -4,21 +4,15 @@ from __future__ import annotations
 
 import asyncio
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
+from typing import ClassVar
 
 import pytest
 
-from openharness.channels.bus.events import InboundMessage
-from openharness.engine.messages import ConversationMessage
-from openharness.evals import DecisionTraceValidationError, TRACE_FINALIZATION
-from openharness.mcp.types import McpToolInfo
-from openharness.tools.base import ToolExecutionContext, ToolRegistry
-from openharness.tools.mcp_tool import McpToolAdapter, WellnessUserIdInjectingAdapter
-from ohmo.evals import GatewayEvalRecorder
-
 from ohmo.contact_registry import ContactStore
+from ohmo.evals import GatewayEvalRecorder
 from ohmo.gateway.config import save_gateway_config
 from ohmo.gateway.memory_gate import MemoryScope
 from ohmo.gateway.models import GatewayConfig
@@ -38,6 +32,12 @@ from ohmo.memory_judge import JudgeOutcome
 from ohmo.memory_tool import OhmoMemoryTool, OhmoMemoryToolInput
 from ohmo.reminders.tool import RemindCreateTool
 from ohmo.workspace import initialize_workspace
+from openharness.channels.bus.events import InboundMessage
+from openharness.engine.messages import ConversationMessage
+from openharness.evals import TRACE_FINALIZATION, DecisionTraceValidationError
+from openharness.mcp.types import McpToolInfo
+from openharness.tools.base import ToolExecutionContext, ToolRegistry
+from openharness.tools.mcp_tool import McpToolAdapter, WellnessUserIdInjectingAdapter
 
 
 class _FakeHoncho:
@@ -61,7 +61,7 @@ class _FakeHoncho:
 
 
 class _BoundFakeHoncho:
-    instances: dict[str, _BoundFakeHoncho] = {}
+    instances: ClassVar[dict[str, _BoundFakeHoncho]] = {}
 
     def __init__(self, base_url: str, jwt: str, workspace: str) -> None:
         self.base_url = base_url
@@ -137,7 +137,7 @@ def _message() -> InboundMessage:
         chat_id="100",
         content="What did I eat today?",
         metadata={"message_id": 0, "chat_type": "p2p"},
-        timestamp=datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc),
+        timestamp=datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC),
     )
 
 
@@ -303,7 +303,7 @@ async def _assert_scoped_surfaces(
     async def fake_judge(**kwargs: object) -> JudgeOutcome:
         judge_calls.append(kwargs)
         store = kwargs["store"]
-        assert getattr(store, "_tenant_id") == expected_tenant
+        assert store._tenant_id == expected_tenant
         assert expected_private in {entry.content for entry in store.list()}
         assert excluded_private not in {entry.content for entry in store.list()}
         assert "shared-family row" in {entry.content for entry in store.list()}
@@ -670,6 +670,7 @@ def _wellness_bundle() -> tuple[SimpleNamespace, _RecordingMcpManager]:
                             "type": "object",
                             "properties": {
                                 "user_id": {"type": "string"},
+                                "participant_id": {"type": "integer"},
                                 "interval": {"type": "string"},
                             },
                         }
@@ -712,18 +713,25 @@ async def test_wellness_tool_injects_resolved_tenant_and_never_leaks_across_turn
         ToolExecutionContext(cwd=tmp_path),
     )
     assert owner_result.is_error is False
-    assert manager.calls[-1][2]["params"] == {"interval": "7d", "user_id": "owner"}
+    assert manager.calls[-1][2]["params"] == {"interval": "7d", "participant_id": 100}
+
+    owner_result = await tool.execute(
+        tool.input_model(params={"interval": "7d", "participant_id": 300}),
+        ToolExecutionContext(cwd=tmp_path),
+    )
+    assert owner_result.is_error is False
+    assert manager.calls[-1][2]["params"] == {"interval": "7d", "participant_id": 300}
 
     marina_scope = pool._resolve_turn_memory_scope(marina_ctx)
     assert marina_scope is not None
     pool._configure_turn_memory_surfaces(bundle, marina_ctx, memory_scope=marina_scope)
     tool = bundle.tool_registry.get(_WELLNESS_TOOL_NAME)
     marina_result = await tool.execute(
-        tool.input_model(params={"interval": "7d"}),
+        tool.input_model(params={"interval": "7d", "participant_id": 100}),
         ToolExecutionContext(cwd=tmp_path),
     )
     assert marina_result.is_error is False
-    assert manager.calls[-1][2]["params"] == {"interval": "7d", "user_id": "marina"}
+    assert manager.calls[-1][2]["params"] == {"interval": "7d", "participant_id": 200}
 
     assert pool._resolve_turn_memory_scope(unknown_ctx) is None
     pool._configure_turn_memory_surfaces(bundle, unknown_ctx, memory_scope=None)
@@ -844,7 +852,7 @@ def test_runtime_memory_turn_metadata_normalizes_forward_provenance() -> None:
         sender_id="100|owner",
         chat_id="100",
         content="forwarded",
-        timestamp=datetime(2026, 7, 31, 19, 30, tzinfo=timezone.utc),
+        timestamp=datetime(2026, 7, 31, 19, 30, tzinfo=UTC),
         metadata={
             "is_group": False,
             "is_forwarded": True,
@@ -1049,7 +1057,7 @@ def test_runtime_memory_turn_metadata_timestamp_fallback_is_isoformat(tmp_path: 
         chat_id="100",
         content="What did I eat today?",
         metadata={"chat_type": "p2p"},
-        timestamp=datetime(2026, 2, 1, 2, 3, 4, tzinfo=timezone.utc),
+        timestamp=datetime(2026, 2, 1, 2, 3, 4, tzinfo=UTC),
     )
     assert _message_identity_for_turn(message) == "2026-02-01T02:03:04+00:00"
 
@@ -1221,7 +1229,7 @@ async def test_auto_reminder_wellness_is_revalidated_and_injected(tmp_path: Path
         ToolExecutionContext(cwd=tmp_path),
     )
     assert result.is_error is False
-    assert manager.calls[-1][2]["params"] == {"interval": "7d", "user_id": "owner"}
+    assert manager.calls[-1][2]["params"] == {"interval": "7d", "participant_id": 100}
 
 
 @pytest.mark.parametrize(
@@ -1326,7 +1334,7 @@ async def test_bound_synthetic_reminder_binds_marina_wellness_with_memory_disabl
         ToolExecutionContext(cwd=tmp_path),
     )
     assert result.is_error is False
-    assert manager.calls[-1][2]["params"] == {"interval": "7d", "user_id": "marina"}
+    assert manager.calls[-1][2]["params"] == {"interval": "7d", "participant_id": 200}
 
 
 @pytest.mark.parametrize(

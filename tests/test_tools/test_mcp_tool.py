@@ -1,5 +1,6 @@
 """Tests for MCP tool adapters — input model generation and argument serialization."""
 
+import copy
 import json
 from pathlib import Path
 
@@ -266,10 +267,63 @@ def _wellness_delegate(manager: _RecordingMcpManager) -> McpToolAdapter:
                         "properties": {
                             "user_id": {"type": "string"},
                             "health_types": {"type": "array"},
+                            "participant_id": {"type": "integer"},
                             "interval": {"type": "string"},
                             "start": {"type": "string"},
                             "end": {"type": "string"},
                             "include_health": {"type": "boolean"},
+                        },
+                    }
+                },
+            },
+        ),
+    )
+
+
+def _wellness_ref_delegate(manager: _RecordingMcpManager) -> McpToolAdapter:
+    return McpToolAdapter(
+        manager,
+        McpToolInfo(
+            server_name="worfalomey",
+            name="get_wellness_data",
+            description="wellness",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "params": {"$ref": "#/$defs/WellnessParams"},
+                },
+                "required": ["params"],
+                "$defs": {
+                    "WellnessParams": {
+                        "type": "object",
+                        "properties": {
+                            "user_id": {
+                                "anyOf": [{"type": "string"}, {"type": "null"}],
+                                "default": None,
+                            },
+                            "health_types": {
+                                "anyOf": [
+                                    {"type": "array", "items": {"type": "string"}},
+                                    {"type": "null"},
+                                ],
+                                "default": None,
+                            },
+                            "participant_id": {
+                                "anyOf": [{"type": "integer"}, {"type": "null"}],
+                                "default": None,
+                            },
+                            "interval": {
+                                "anyOf": [{"type": "string"}, {"type": "null"}],
+                                "default": None,
+                            },
+                            "start": {
+                                "anyOf": [{"type": "string"}, {"type": "null"}],
+                                "default": None,
+                            },
+                            "end": {
+                                "anyOf": [{"type": "string"}, {"type": "null"}],
+                                "default": None,
+                            },
                         },
                     }
                 },
@@ -290,7 +344,13 @@ class TestWellnessUserIdInjectingAdapter:
         )
         params_properties = scrubbed["properties"]["params"]["properties"]
         assert "user_id" not in params_properties
-        assert set(params_properties) == {"interval", "start", "end", "include_health"}
+        assert set(params_properties) == {
+            "interval",
+            "start",
+            "end",
+            "include_health",
+            "participant_id",
+        }
         assert "user_id" in delegate._tool_info.input_schema["properties"]["params"]["properties"]
         assert "user_id" not in json.dumps(adapter.input_model.model_json_schema())
         assert "user_id" not in json.dumps(adapter.to_api_schema())
@@ -312,7 +372,7 @@ class TestWellnessUserIdInjectingAdapter:
     async def test_injects_bound_tenant(self):
         manager = _RecordingMcpManager()
         adapter = WellnessUserIdInjectingAdapter(_wellness_delegate(manager))
-        adapter.set_tenant("owner")
+        adapter.set_trusted_principal("100", owner_turn=True)
 
         result = await adapter.execute(
             adapter.input_model(params={"interval": "7d"}),
@@ -323,25 +383,25 @@ class TestWellnessUserIdInjectingAdapter:
         assert len(manager.calls) == 1
         server_name, tool_name, arguments = manager.calls[0]
         assert (server_name, tool_name) == ("worfalomey", "get_wellness_data")
-        assert arguments["params"] == {"interval": "7d", "user_id": "owner"}
+        assert arguments["params"] == {"interval": "7d", "participant_id": 100}
 
     async def test_injected_tenant_overrides_model_supplied_selector(self):
         manager = _RecordingMcpManager()
         adapter = WellnessUserIdInjectingAdapter(_wellness_delegate(manager))
-        adapter.set_tenant("marina")
+        adapter.set_trusted_principal("100", owner_turn=True)
 
         result = await adapter.execute(
-            adapter.input_model(params={"interval": "7d", "user_id": "mallory"}),
+            adapter.input_model(params={"interval": "7d", "participant_id": 200}),
             ToolExecutionContext(cwd=Path(".")),
         )
 
         assert result.is_error is False
-        assert manager.calls[0][2]["params"]["user_id"] == "marina"
+        assert manager.calls[0][2]["params"]["participant_id"] == 200
 
     async def test_strips_model_supplied_health_types(self):
         manager = _RecordingMcpManager()
         adapter = WellnessUserIdInjectingAdapter(_wellness_delegate(manager))
-        adapter.set_tenant("owner")
+        adapter.set_trusted_principal("100", owner_turn=True)
 
         result = await adapter.execute(
             adapter.input_model(
@@ -357,12 +417,12 @@ class TestWellnessUserIdInjectingAdapter:
         assert len(manager.calls) == 1
         params = manager.calls[0][2]["params"]
         assert "health_types" not in params
-        assert params == {"interval": "7d", "user_id": "owner"}
+        assert params == {"interval": "7d", "participant_id": 100}
 
     async def test_forwards_interval_bounds_and_other_params_unchanged(self):
         manager = _RecordingMcpManager()
         adapter = WellnessUserIdInjectingAdapter(_wellness_delegate(manager))
-        adapter.set_tenant("owner")
+        adapter.set_trusted_principal("100", owner_turn=True)
 
         result = await adapter.execute(
             adapter.input_model(
@@ -380,7 +440,7 @@ class TestWellnessUserIdInjectingAdapter:
             "start": "2026-07-01",
             "end": "2026-07-31",
             "include_health": True,
-            "user_id": "owner",
+            "participant_id": 100,
         }
 
     async def test_missing_tenant_fails_closed_without_mcp_call(self):
@@ -396,17 +456,17 @@ class TestWellnessUserIdInjectingAdapter:
         assert "no wellness identity" in result.output
         assert manager.calls == []
 
-    async def test_cleared_tenant_drops_stale_identity(self):
+    async def test_cleared_principal_drops_stale_identity(self):
         manager = _RecordingMcpManager()
         adapter = WellnessUserIdInjectingAdapter(_wellness_delegate(manager))
-        adapter.set_tenant("owner")
+        adapter.set_trusted_principal("100", owner_turn=True)
         await adapter.execute(
             adapter.input_model(params={"interval": "7d"}),
             ToolExecutionContext(cwd=Path(".")),
         )
         assert len(manager.calls) == 1
 
-        adapter.set_tenant(None)
+        adapter.set_trusted_principal(None)
         result = await adapter.execute(
             adapter.input_model(params={"interval": "7d"}),
             ToolExecutionContext(cwd=Path(".")),
@@ -414,6 +474,96 @@ class TestWellnessUserIdInjectingAdapter:
 
         assert result.is_error is True
         assert len(manager.calls) == 1
+
+    async def test_non_telegram_principal_fails_closed(self):
+        manager = _RecordingMcpManager()
+        adapter = WellnessUserIdInjectingAdapter(_wellness_delegate(manager))
+        adapter.set_trusted_principal("100", channel="feishu", owner_turn=True)
+
+        result = await adapter.execute(
+            adapter.input_model(params={"interval": "7d"}),
+            ToolExecutionContext(cwd=Path(".")),
+        )
+
+        assert result.is_error is True
+        assert manager.calls == []
+
+    def test_resolves_fastmcp_params_ref_without_mutating_delegate_schema(self):
+        delegate = _wellness_ref_delegate(_RecordingMcpManager())
+        original_schema = copy.deepcopy(delegate._tool_info.input_schema)
+
+        adapter = WellnessUserIdInjectingAdapter(delegate)
+
+        model_schema = adapter.input_model.model_json_schema()
+        serialized_schema = json.dumps(model_schema)
+        assert "user_id" not in serialized_schema
+        assert "health_types" not in serialized_schema
+        assert delegate._tool_info.input_schema == original_schema
+
+        params_schemas = [
+            node
+            for node in [model_schema, *model_schema.get("$defs", {}).values()]
+            if isinstance(node, dict)
+            and isinstance(node.get("properties"), dict)
+            and "participant_id" in node["properties"]
+        ]
+        assert len(params_schemas) == 1
+        participant_schema = params_schemas[0]["properties"]["participant_id"]
+        assert isinstance(participant_schema, dict)
+        assert {"integer", "null"}.issubset(
+            {
+                alternative.get("type")
+                for alternative in participant_schema.get("anyOf", [])
+                if isinstance(alternative, dict)
+            }
+        )
+        assert set(params_schemas[0]["properties"]) == {"participant_id", "interval", "start", "end"}
+
+    @pytest.mark.parametrize(
+        "ref,definitions",
+        [
+            ("#/components/schemas/WellnessParams", {"WellnessParams": {"type": "object"}}),
+            ("#/$defs/MissingParams", {}),
+        ],
+    )
+    def test_rejects_unsupported_or_broken_params_ref(self, ref, definitions):
+        manager = _RecordingMcpManager()
+        delegate = _wellness_ref_delegate(manager)
+        delegate._tool_info.input_schema["properties"]["params"] = {"$ref": ref}
+        delegate._tool_info.input_schema["$defs"] = definitions
+
+        with pytest.raises(ValueError, match="JSON Schema reference"):
+            WellnessUserIdInjectingAdapter(delegate)
+
+    async def test_ref_schema_owner_selection_and_family_override(self):
+        manager = _RecordingMcpManager()
+        adapter = WellnessUserIdInjectingAdapter(_wellness_ref_delegate(manager))
+        adapter.set_trusted_principal("100", owner_turn=True)
+
+        await adapter.execute(
+            adapter.input_model(params={"interval": "7d", "participant_id": 200}),
+            ToolExecutionContext(cwd=Path(".")),
+        )
+        assert manager.calls[-1][2]["params"] == {"interval": "7d", "participant_id": 200}
+
+        adapter.set_trusted_principal("200", family_turn=True)
+        await adapter.execute(
+            adapter.input_model(params={"interval": "7d", "participant_id": 300}),
+            ToolExecutionContext(cwd=Path(".")),
+        )
+        assert manager.calls[-1][2]["params"] == {"interval": "7d", "participant_id": 200}
+
+    async def test_ref_schema_owner_omission_uses_trusted_principal(self):
+        manager = _RecordingMcpManager()
+        adapter = WellnessUserIdInjectingAdapter(_wellness_ref_delegate(manager))
+        adapter.set_trusted_principal("100", owner_turn=True)
+
+        await adapter.execute(
+            adapter.input_model(params={"interval": "7d"}),
+            ToolExecutionContext(cwd=Path(".")),
+        )
+
+        assert manager.calls[-1][2]["params"] == {"interval": "7d", "participant_id": 100}
 
 
 class TestInputModelFromSchema:

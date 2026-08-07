@@ -4,9 +4,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from openharness.memory import load_memory_prompt as load_project_memory_prompt
-from openharness.prompts.system_prompt import get_base_system_prompt
-
 from ohmo.memory import load_memory_prompt as load_ohmo_memory_prompt
 from ohmo.threat_patterns import scan_for_threats
 from ohmo.workspace import (
@@ -16,6 +13,8 @@ from ohmo.workspace import (
     get_user_path,
     get_workspace_root,
 )
+from openharness.memory import load_memory_prompt as load_project_memory_prompt
+from openharness.prompts.system_prompt import get_base_system_prompt
 
 
 def _read_text(path: Path) -> str | None:
@@ -194,6 +193,16 @@ def build_ohmo_system_prompt(
 
     sections.extend(
         [
+            "# Wellness and nutrition data",
+            (
+                "For health, nutrition, wellness, or activity questions about a "
+                "configured participant, use `get_wellness_data`. Treat its response "
+                "as authoritative: identify the participant only by the returned "
+                "`login`, never by a memory guess or by mapping an id yourself. "
+                "The gateway supplies the trusted default participant and may expose "
+                "an owner-only numeric participant selector; never use `user_id` or "
+                "`health_types` parameters."
+            ),
             "# Nutrition finalization annotations",
             (
                 "If the user asks for calorie/macronutrient estimates (including from an "
@@ -279,9 +288,8 @@ def build_ohmo_system_prompt(
         ]
     )
 
-    if include_ohmo_memory:
-        if ohmo_memory := load_ohmo_memory_prompt(root):
-            sections.append(ohmo_memory)
+    if include_ohmo_memory and (ohmo_memory := load_ohmo_memory_prompt(root)):
+        sections.append(ohmo_memory)
 
     if include_project_memory:
         project_memory = load_project_memory_prompt(cwd)
@@ -296,7 +304,9 @@ def _build_ohmo_workspace_sections(root: str | Path) -> tuple[str, ...]:
         "# ohmo Workspace",
         f"- Personal workspace root: {root}",
         "- Personal memory and sessions live under the shared ohmo workspace root.",
-        "- When a needed fact is not visible in the injected memory index, use "
-        "the memory tool's `search` action for semantic recall.",
+        (
+            "- When a needed fact is not visible in the injected memory index, use "
+            "the memory tool's `search` action for semantic recall."
+        ),
         "- Resume only within ohmo sessions; do not assume interoperability with plain OpenHarness sessions.",
     )

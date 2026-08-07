@@ -552,6 +552,7 @@ class NutritionIngestCoordinator:
             until=now,
         )
         candidate = self._candidate_fingerprint(artifact)
+        candidate_capture_time = normalized_exif_capture_time(artifact.manifest.exif)
         for message in messages:
             if message.session_id != self._honcho_session:
                 raise NutritionCoordinatorError(
@@ -575,6 +576,15 @@ class NutritionIngestCoordinator:
                         message_id=self._safe_message_id(message.id),
                         kind="sha256",
                     )
+                # Dropbox confirmations use exact bytes only. Their processing
+                # timestamps are not capture timestamps, so a pHash-only match
+                # would create false positives. Ordinary Telegram user
+                # messages may use pHash, but only within the calibrated time
+                # gate around authoritative EXIF capture time.
+                if message.metadata.get("ingest_source") is not None:
+                    continue
+                if abs(candidate_capture_time - message.created_at) > timedelta(hours=2):
+                    continue
                 phash = fingerprint.get("phash")
                 algorithm = fingerprint.get("phash_algorithm")
                 candidate_phash = candidate.get("phash")
@@ -618,7 +628,7 @@ class NutritionIngestCoordinator:
             metadata.get("role") != "user"
             or metadata.get("tenant_id") != "marina"
             or metadata.get("source_principal") != f"telegram:{self.config.principal}"
-            or metadata.get("ingest_source") is not None
+            or metadata.get("ingest_source") not in (None, "dropbox_camera")
         ):
             return None
         raw = metadata.get("attachment_fingerprints")

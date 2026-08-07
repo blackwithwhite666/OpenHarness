@@ -2,35 +2,35 @@
 
 from __future__ import annotations
 
+import copy
+import math
+import re
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field, is_dataclass
 from datetime import date, datetime
-import math
-import re
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from ohmo.evals.adapter import get_eval_store
+from ohmo.evals.nutrition_trace import validate_trace_finalization_annotations
+from ohmo.evals.resources import ResourceSnapshotWrite, write_ohmo_resource_snapshot
 from openharness.channels.bus.events import InboundMessage
-from openharness.evals import (
-    DecisionTraceRecorder,
-    DecisionTraceValidationError,
-    EvalEpisode,
-    EvalEvent,
-    EvalStore,
-    TRACE_FINALIZATION,
-)
-from openharness.evals.tool_labels import effective_tool_label, tool_call_binaries
 from openharness.engine.stream_events import (
     AssistantTurnComplete,
     ErrorEvent,
     ToolExecutionCompleted,
     ToolExecutionStarted,
 )
-
-from ohmo.evals.adapter import get_eval_store
-from ohmo.evals.nutrition_trace import validate_trace_finalization_annotations
-from ohmo.evals.resources import ResourceSnapshotWrite, write_ohmo_resource_snapshot
+from openharness.evals import (
+    TRACE_FINALIZATION,
+    DecisionTraceRecorder,
+    DecisionTraceValidationError,
+    EvalEpisode,
+    EvalEvent,
+    EvalStore,
+)
+from openharness.evals.tool_labels import effective_tool_label, tool_call_binaries
 
 
 @dataclass
@@ -59,7 +59,7 @@ class GatewayEvalRecorder:
         )
 
     @property
-    def decision_trace_recorder(self) -> "_GatewayDecisionTraceRecorderAdapter":
+    def decision_trace_recorder(self) -> _GatewayDecisionTraceRecorderAdapter:
         """Return the runtime recorder adapter for one gateway engine turn."""
         return self._runtime_recorder
 
@@ -73,7 +73,7 @@ class GatewayEvalRecorder:
         session_key: str,
         user_text: str,
         user_goal: str | None = None,
-    ) -> "GatewayEvalRecorder":
+    ) -> GatewayEvalRecorder:
         normalized_user_goal = user_goal or ""
         recorder = cls(
             store=get_eval_store(workspace),
@@ -278,6 +278,10 @@ class GatewayEvalRecorder:
         nutrition = annotations.get("nutrition")
         return nutrition if isinstance(nutrition, Mapping) else None
 
+    def set_authoritative_nutrition_meal_at(self, meal_at: datetime | None) -> None:
+        """Stamp the trusted Dropbox capture time before trace validation."""
+        self._runtime_recorder.set_authoritative_nutrition_meal_at(meal_at)
+
 
 _RUNTIME_STRUCTURAL_SKIP_KINDS = frozenset(
     {
@@ -336,6 +340,12 @@ class _GatewayDecisionTraceRecorderAdapter:
         self._latest_finalization: EvalEvent | None = None
         self._saw_invalid_finalization = False
         self._nutrition_applicable = False
+        self._authoritative_nutrition_meal_at: datetime | None = None
+
+    def set_authoritative_nutrition_meal_at(self, meal_at: datetime | None) -> None:
+        if meal_at is not None and (meal_at.tzinfo is None or meal_at.utcoffset() is None):
+            raise ValueError("authoritative nutrition meal_at must be timezone-aware")
+        self._authoritative_nutrition_meal_at = meal_at
 
     def record(
         self,
@@ -347,8 +357,10 @@ class _GatewayDecisionTraceRecorderAdapter:
         is_error: bool = False,
     ) -> EvalEvent | None:
         if kind == TRACE_FINALIZATION:
+            payload = self._stamp_authoritative_nutrition_meal_at(payload)
             try:
                 payload = validate_trace_finalization_annotations(payload)
+                payload = self._stamp_authoritative_nutrition_meal_at(payload)
                 event = self._recorder.record(
                     kind,
                     payload,
@@ -369,6 +381,32 @@ class _GatewayDecisionTraceRecorderAdapter:
             tool_call_id=tool_call_id,
             is_error=is_error,
         )
+
+    def _stamp_authoritative_nutrition_meal_at(
+        self, payload: Mapping[str, Any]
+    ) -> Mapping[str, Any]:
+        meal_at = self._authoritative_nutrition_meal_at
+        if meal_at is None:
+            return payload
+        annotations = payload.get("annotations")
+        nutrition = annotations.get("nutrition") if isinstance(annotations, Mapping) else None
+        if not isinstance(nutrition, Mapping) or nutrition.get("schema_version") != 2:
+            return payload
+        stamped = copy.deepcopy(dict(payload))
+        stamped_annotations = dict(stamped.get("annotations") or {})
+        stamped_nutrition = dict(stamped_annotations.get("nutrition") or {})
+        stamped_nutrition["meal_at"] = meal_at.isoformat()
+        for field_name in ("assumptions", "warnings"):
+            values = stamped_nutrition.get(field_name)
+            if isinstance(values, list):
+                stamped_nutrition[field_name] = [
+                    value
+                    for value in values
+                    if not (isinstance(value, str) and "exif" in value.casefold())
+                ]
+        stamped_annotations["nutrition"] = stamped_nutrition
+        stamped["annotations"] = stamped_annotations
+        return stamped
 
     def trace_requirement_signals(self, final_text: str) -> tuple[str, ...]:
         if _contains_nutrition_marker(final_text, self._user_goal):

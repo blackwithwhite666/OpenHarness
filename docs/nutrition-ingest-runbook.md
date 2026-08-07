@@ -83,10 +83,13 @@ Before each confirmation attempt, the consumer fail-closed checks the inclusive
 last-seven-day window of the configured Marina Honcho session. Only
 gateway-owned Marina user metadata participates. Exact SHA-256 matches and
 same-algorithm DCT pHash matches (`dct-phash-16x16-v1`, Hamming distance <= 4)
-become terminal `seen` results; Dropbox-created synthetic meal turns are
-excluded. SHA-256 is checked first, and the old aHash algorithm is never
-compared with the DCT hash. A failed or partial Honcho read leaves the
-candidate unsent and retryable.
+become terminal `seen` results. SHA-256 covers both ordinary Marina Telegram
+user messages and trusted `dropbox_camera` observations. DCT pHash is limited
+to ordinary Telegram messages and requires the candidate's authoritative EXIF
+capture time to be within two hours of the Honcho message creation time; a
+Dropbox observation is exact-SHA-only. SHA-256 is checked first, and the old
+aHash algorithm is never compared with the DCT hash. A failed or partial
+Honcho read leaves the candidate unsent and retryable.
 
 The consumer writes owner-only, atomic suppression tombstones below `_seen`.
 Once authoritative normalized EXIF is strictly older than seven days, it writes
@@ -109,7 +112,8 @@ the compact tombstone preserves the final local state summary for audit.
    Telegram photo with the two-line caption `Вы это съели?` followed by
    `Дата: DD.MM.YYYY HH:MM (по EXIF фото)` and buttons `Да` and `Нет`.
 4. **Normal publish:** expand only after the canary proves exact routing,
-   confirmation-before-estimation, durable observation reconciliation, and
+   confirmation-before-estimation, authoritative EXIF meal timestamps after
+   `Да`, durable observation reconciliation, and
    restart idempotency. Keep CLIP shadow until its recorded recall/shadow gate
    is accepted; never make the consumer a second classifier.
 

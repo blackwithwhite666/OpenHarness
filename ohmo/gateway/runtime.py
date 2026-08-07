@@ -3,46 +3,19 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
 import hashlib
+import json
 import logging
 import mimetypes
-from datetime import date, datetime, timezone
-from pathlib import Path
-import json
 import os
 import re
 import string
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
+from datetime import UTC, date, datetime
+from pathlib import Path
 
-from openharness.channels.bus.events import InboundMessage, OutboundMessage
-from openharness.commands import CommandContext, CommandResult, lookup_skill_slash_command
-from openharness.engine.messages import (
-    ConversationMessage,
-    ImageBlock,
-    TextBlock,
-    sanitize_conversation_messages,
-)
-from openharness.engine.query import MaxTurnsExceeded
-from openharness.engine.stream_events import (
-    AssistantTextDelta,
-    AssistantTurnComplete,
-    CompactProgressEvent,
-    ErrorEvent,
-    StatusEvent,
-    ToolExecutionCompleted,
-    ToolExecutionStarted,
-)
-from openharness.prompts import build_runtime_system_prompt
-from openharness.tools.mcp_tool import McpToolAdapter, WellnessUserIdInjectingAdapter
-from openharness.ui.runtime import (
-    RuntimeBundle,
-    _last_user_text,
-    build_runtime,
-    close_runtime,
-    start_runtime,
-)
-
+from ohmo.contact_registry import ContactStore
 from ohmo.evals import GatewayEvalRecorder
 from ohmo.evals.nutrition_trace import (
     NutritionAnnotationV2,
@@ -70,7 +43,6 @@ from ohmo.gateway.router import session_key_for_message
 from ohmo.gateway.send_message_tool import SendTelegramMessageTool
 from ohmo.gateway.turn_context import TurnContext, build_turn_context, canonical_principal
 from ohmo.group_registry import load_managed_group_record, normalize_cwd
-from ohmo.contact_registry import ContactStore
 from ohmo.memory import create_memory_command_backend, ensure_catalog_migrated
 from ohmo.memory_backend import (
     CatalogMemoryBackend,
@@ -81,10 +53,12 @@ from ohmo.memory_backend import (
     make_memory_backend,
     make_tenant_shadow_backend,
 )
-from ohmo.memory_store import MemoryStore
-from ohmo.nutrition_ingest.trust import COORDINATOR_TRUST_TOKEN
 from ohmo.memory_judge import judge_enabled, judge_interval, run_memory_judge
+from ohmo.memory_store import MemoryStore
 from ohmo.memory_tool import OhmoMemoryTool
+from ohmo.nutrition_ingest.freshness import normalized_exif_capture_time
+from ohmo.nutrition_ingest.models import ExifMetadata
+from ohmo.nutrition_ingest.trust import COORDINATOR_TRUST_TOKEN
 from ohmo.prompt_seam import compose_runtime_prompt, prepare_turn
 from ohmo.prompts import build_ohmo_system_prompt
 from ohmo.reminders.store import ReminderStore
@@ -108,6 +82,33 @@ from ohmo.workspace import (
     get_sessions_dir,
     get_skills_dir,
     initialize_workspace,
+)
+from openharness.channels.bus.events import InboundMessage, OutboundMessage
+from openharness.commands import CommandContext, CommandResult, lookup_skill_slash_command
+from openharness.engine.messages import (
+    ConversationMessage,
+    ImageBlock,
+    TextBlock,
+    sanitize_conversation_messages,
+)
+from openharness.engine.query import MaxTurnsExceeded
+from openharness.engine.stream_events import (
+    AssistantTextDelta,
+    AssistantTurnComplete,
+    CompactProgressEvent,
+    ErrorEvent,
+    StatusEvent,
+    ToolExecutionCompleted,
+    ToolExecutionStarted,
+)
+from openharness.prompts import build_runtime_system_prompt
+from openharness.tools.mcp_tool import McpToolAdapter, WellnessUserIdInjectingAdapter
+from openharness.ui.runtime import (
+    RuntimeBundle,
+    _last_user_text,
+    build_runtime,
+    close_runtime,
+    start_runtime,
 )
 
 logger = logging.getLogger(__name__)
@@ -207,7 +208,7 @@ def _trusted_utc_iso(value: object) -> str | None:
         timestamp = value
     elif isinstance(value, str):
         try:
-            timestamp = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+            timestamp = datetime.fromisoformat(value.strip())
         except ValueError:
             return None
     else:
@@ -215,7 +216,7 @@ def _trusted_utc_iso(value: object) -> str | None:
     try:
         if timestamp.tzinfo is None or timestamp.utcoffset() is None:
             return None
-        return timestamp.astimezone(timezone.utc).isoformat()
+        return timestamp.astimezone(UTC).isoformat()
     except (OverflowError, ValueError):
         return None
 
@@ -727,7 +728,7 @@ class OhmoSessionRuntimePool:
         if bundle is not None:
             try:
                 await close_runtime(bundle)
-            except Exception:  # noqa: BLE001 — reset must never fail
+            except Exception:
                 logger.warning(
                     "ohmo runtime reset close failed session_key=%s", session_key, exc_info=True
                 )
@@ -735,7 +736,7 @@ class OhmoSessionRuntimePool:
         if clear is not None:
             try:
                 clear(session_key)
-            except Exception:  # noqa: BLE001
+            except Exception:
                 logger.warning(
                     "ohmo runtime reset clear-snapshot failed session_key=%s",
                     session_key,
@@ -749,7 +750,7 @@ class OhmoSessionRuntimePool:
         # recreated lazily on the next write).
         try:
             clear_session_work_dir(session_key, self._workspace)
-        except Exception:  # noqa: BLE001 — reset must never fail
+        except Exception:
             logger.warning(
                 "ohmo runtime reset work-dir clear failed session_key=%s",
                 session_key,
@@ -919,6 +920,14 @@ class OhmoSessionRuntimePool:
             if _evals_capture_enabled(self._gateway_config)
             else None
         )
+        if recorder is not None and nutrition_request is not None:
+            raw_exif = message.metadata.get("_nutrition_exif")
+            if not isinstance(raw_exif, dict):
+                raise ValueError("trusted nutrition estimation has no validated EXIF")
+            exif = ExifMetadata.model_validate(raw_exif)
+            recorder.set_authoritative_nutrition_meal_at(
+                normalized_exif_capture_time(exif)
+            )
         episode_status = "completed"
         decision_trace_restore = _install_gateway_decision_trace_recorder(
             bundle.engine,
@@ -1976,7 +1985,7 @@ class OhmoSessionRuntimePool:
                 metadata.pop("autodream_context", None)
             else:
                 metadata["autodream_context"] = autodream_context
-        self._bind_wellness_tool_tenant(bundle, scope)
+        self._bind_wellness_turn(bundle, turn_ctx)
         return engaged
 
     def _apply_bound_reminder_turn(
@@ -1994,7 +2003,12 @@ class OhmoSessionRuntimePool:
         closed, the adapter then refuses every call and no MCP call is made.
         """
         tenant = self._validated_bound_wellness_tenant(bound)
-        self._bind_wellness_tenant(bundle, tenant)
+        principal = (
+            canonical_principal("telegram", bound.get("recipient_principal") or "")
+            if tenant is not None
+            else None
+        )
+        self._bind_wellness_principal(bundle, principal)
 
     def _apply_reminder_wellness_turn(
         self,
@@ -2003,7 +2017,12 @@ class OhmoSessionRuntimePool:
     ) -> None:
         """Bind wellness for an auto-delivered current-chat reminder."""
         tenant = self._validated_reminder_wellness_tenant(reminder)
-        self._bind_wellness_tenant(bundle, tenant)
+        principal = (
+            canonical_principal("telegram", reminder.get("wellness_principal") or "")
+            if tenant is not None
+            else None
+        )
+        self._bind_wellness_principal(bundle, principal)
 
     def _validated_bound_wellness_tenant(self, bound: dict[str, str | None]) -> str | None:
         tenant = bound.get("wellness_tenant")
@@ -2036,43 +2055,91 @@ class OhmoSessionRuntimePool:
             return None
         return tenant
 
-    @staticmethod
-    def _bind_wellness_tool_tenant(
+    def _bind_wellness_turn(
+        self,
         bundle: RuntimeBundle,
-        scope: MemoryScope | None,
+        turn_ctx: TurnContext | None,
     ) -> None:
-        OhmoSessionRuntimePool._bind_wellness_tenant(
+        """Bind wellness to the authenticated Telegram principal for a turn."""
+        if turn_ctx is None:
+            self._bind_wellness_principal(bundle, None)
+            return
+        principal = canonical_principal(turn_ctx.channel, turn_ctx.principal)
+        owners = {
+            canonical_principal("telegram", owner)
+            for owner in self._gateway_config.owner_principals
+            if str(owner).strip()
+        }
+        family_tenant = self._gateway_config.family_principals.get(principal)
+        legacy_owner_mode = (
+            not self._gateway_config.family_principals
+            and not self._gateway_config.enabled_memory_tenants
+        )
+        family_enabled = family_tenant is not None and (
+            legacy_owner_mode or family_tenant in self._gateway_config.enabled_memory_tenants
+        )
+        owner_turn = (
+            turn_ctx.is_owner is True
+            and turn_ctx.channel.strip().lower() == "telegram"
+            and principal in owners
+        )
+        family_turn = (
+            turn_ctx.channel.strip().lower() == "telegram"
+            and principal.isdigit()
+            and not owner_turn
+            and family_enabled
+        )
+        if not owner_turn and not family_turn:
+            self._bind_wellness_principal(bundle, None)
+            return
+        self._bind_wellness_principal(
             bundle,
-            scope.private_tenant if scope is not None else None,
+            principal,
+            owner_turn=owner_turn,
+            family_turn=family_turn,
         )
 
-    @staticmethod
-    def _bind_wellness_tenant(
+    def _bind_wellness_principal(
+        self,
         bundle: RuntimeBundle,
-        tenant: str | None,
+        principal: str | None,
+        *,
+        owner_turn: bool = False,
+        family_turn: bool = False,
     ) -> None:
-        """Bind the OHMO-scoped wellness MCP tool to this turn's trusted tenant.
-
-        The worfalomey ``get_wellness_data`` selector is never model-controlled:
-        the plain adapter is wrapped once per bundle so ``params.user_id`` is
-        hidden from the model schema and force-injected at execution time from
-        the resolved ``MemoryScope.private_tenant`` (itself derived only from
-        the immutable Telegram principal). Every turn re-binds — or clears —
-        the tenant, so a bundle refresh or a later turn without a resolved
-        scope fails closed instead of reusing a previous turn's identity.
-        """
+        """Bind only a trusted principal; no tenant is sent to Telegent."""
+        if principal is not None and not owner_turn and not family_turn:
+            owners = {
+                canonical_principal("telegram", owner)
+                for owner in self._gateway_config.owner_principals
+                if str(owner).strip()
+            }
+            owner_turn = principal in owners
+            family_tenant = self._gateway_config.family_principals.get(principal)
+            family_turn = (
+                principal.isdigit()
+                and not owner_turn
+                and family_tenant is not None
+                and (
+                    not self._gateway_config.enabled_memory_tenants
+                    or family_tenant in self._gateway_config.enabled_memory_tenants
+                )
+            )
         registry = getattr(bundle, "tool_registry", None)
         if registry is None:
             return
         tool = registry.get(_WELLNESS_TOOL_NAME)
-        if tool is None:
-            return
         if isinstance(tool, McpToolAdapter):
             tool = WellnessUserIdInjectingAdapter(tool)
             registry.register(tool)
         if not isinstance(tool, WellnessUserIdInjectingAdapter):
             return
-        tool.set_tenant(tenant)
+        tool.set_trusted_principal(
+            principal,
+            channel="telegram" if principal is not None else "",
+            owner_turn=owner_turn,
+            family_turn=family_turn,
+        )
 
     def _register_gateway_tools(
         self,
@@ -2146,7 +2213,7 @@ class OhmoSessionRuntimePool:
             settings = bundle.current_settings()
             model = settings.model
             timeout = float(getattr(settings, "timeout", None) or 30.0)
-        except Exception:  # noqa: BLE001 — never break the turn
+        except Exception:
             logger.warning(
                 "ohmo memory judge schedule failed session_key=%s", session_key, exc_info=True
             )
@@ -2205,7 +2272,7 @@ class OhmoSessionRuntimePool:
             )
         except asyncio.CancelledError:
             raise
-        except Exception:  # noqa: BLE001 — best-effort
+        except Exception:
             logger.exception("ohmo memory judge crashed session_key=%s", session_key)
 
     def _register_todo_tool(self, bundle: RuntimeBundle) -> None:
@@ -2346,7 +2413,7 @@ def _sanitize_snapshot_messages(raw_messages: object) -> list[dict[str, object]]
     for raw in raw_messages:
         try:
             messages.append(ConversationMessage.model_validate(raw))
-        except Exception:
+        except ValueError:
             logger.warning(
                 "ohmo runtime skipped invalid restored message while sanitizing snapshot"
             )
@@ -2396,7 +2463,8 @@ def _remember_update_media(seen: set[str], update: GatewayStreamUpdate) -> None:
             if not path.is_absolute():
                 path = path.resolve()
             seen.add(str(path))
-        except Exception:
+        except (OSError, RuntimeError, ValueError):
+            logger.debug("ohmo runtime skipped invalid emitted media path", exc_info=True)
             continue
 
 
@@ -2628,7 +2696,7 @@ def _format_channel_progress(
         return text
     prefers_chinese = _prefers_chinese_progress(content)
     if kind == "thinking":
-        seed = f"{session_key}|{content}".encode("utf-8")
+        seed = f"{session_key}|{content}".encode()
         phrases = _CHANNEL_THINKING_PHRASES if prefers_chinese else _CHANNEL_THINKING_PHRASES_EN
         idx = int(hashlib.sha256(seed).hexdigest(), 16) % len(phrases)
         return phrases[idx]

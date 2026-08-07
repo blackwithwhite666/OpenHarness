@@ -271,9 +271,13 @@ For the ohmo gateway, applicable nutrition turns extend the existing
   - `extra="forbid"` on both top-level and nested nutrition objects.
 
 `meal_at` may be emitted only when the user explicitly states the meal or
-consumption time. It must never be populated from a forwarded source timestamp,
-receive timestamp, image metadata, or a model guess. An image without explicit
-consumption language keeps `meal_at=null` and `consumption_status=unknown`.
+consumption time. The trusted Marina Dropbox confirmation path is the one
+gateway-owned exception: after the user presses `Да`, it stamps the validated
+normalized EXIF capture time into the schema-v2 consumed observation before
+validation and durable append. It must never be populated from a forwarded
+source timestamp, receive timestamp, or a model guess. An image without
+explicit consumption language keeps `meal_at=null` and
+`consumption_status=unknown`.
 
 Decision-trace status fields are now attached to each conversation-learning turn:
 
