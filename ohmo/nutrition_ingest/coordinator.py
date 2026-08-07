@@ -52,6 +52,9 @@ _NO = {"нет"}
 logger = logging.getLogger(__name__)
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _PHASH_RE = re.compile(r"^[0-9a-f]{1,256}$")
+_LEGACY_STAGING_RE = re.compile(
+    r"^\.dropbox-camera-v1-[0-9a-f]{64}-[a-z0-9_]{8}$"
+)
 _METADATA_MAX_BYTES = 32 * 1024
 _FINGERPRINT_ALGORITHM_MAX = 64
 
@@ -201,6 +204,7 @@ class NutritionIngestCoordinator:
         if not self.enabled:
             return []
         async with self._lock:
+            self._cleanup_legacy_staging_directories()
             artifacts = self._scanner.scan_ready()
             retained: list[ReadyNutritionArtifact] = []
             for artifact in artifacts:
@@ -400,6 +404,30 @@ class NutritionIngestCoordinator:
         if manifest.parent != directory or image.parent != directory:
             raise NutritionCoordinatorError("candidate deletion evidence escapes target directory")
         shutil.rmtree(directory)
+        self._fsync_root()
+
+    def _cleanup_legacy_staging_directories(self) -> None:
+        root = self.root
+        current_time = self._current_time()
+        threshold = current_time.timestamp() - timedelta(hours=1).total_seconds()
+        for directory in root.iterdir():
+            if not _LEGACY_STAGING_RE.fullmatch(directory.name):
+                continue
+            if directory.parent != root:
+                raise NutritionCoordinatorError("legacy staging target is not a direct child")
+            stat_result = os.lstat(directory)
+            mode = stat_result.st_mode
+            if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
+                continue
+            if directory.resolve() != directory:
+                raise NutritionCoordinatorError("legacy staging target escapes configured root")
+            if stat_result.st_mtime >= threshold:
+                continue
+            shutil.rmtree(directory)
+            self._fsync_root()
+
+    def _fsync_root(self) -> None:
+        root = self.root
         descriptor = os.open(root, os.O_RDONLY)
         try:
             os.fsync(descriptor)

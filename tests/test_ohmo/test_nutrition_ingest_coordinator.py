@@ -112,6 +112,10 @@ class _Clock:
         self.value += timedelta(seconds=seconds)
 
 
+def _legacy_staging_name(*, suffix: str = "a1_b2c3d") -> str:
+    return f".dropbox-camera-v1-{'a' * 64}-{suffix}"
+
+
 class _HonchoStore:
     """Deterministic remote transport with the real client-op lookup contract."""
 
@@ -2047,6 +2051,137 @@ async def test_expiry_removes_pending_and_delivery_unknown_but_preserves_reserve
             metadata={"callback_query": True, "native_message_id": 42, "message_id": 43},
         )
         assert await coordinator.handle_inbound(late_callback) is False
+
+
+@pytest.mark.asyncio
+async def test_poll_deletes_old_legacy_staging_directory_with_contents(tmp_path: Path) -> None:
+    clock = _Clock()
+    staging = tmp_path / _legacy_staging_name()
+    staging.mkdir()
+    (staging / "old.mov").write_bytes(b"legacy scratch")
+    old_mtime = clock().timestamp() - timedelta(hours=1, seconds=1).total_seconds()
+    os.utime(staging, (old_mtime, old_mtime))
+    config = NutritionIngestConfig(
+        enabled=True,
+        synchronized_root=tmp_path,
+        principal="123",
+        chat_id="123",
+        session_key="telegram:123",
+    )
+    coordinator = NutritionIngestCoordinator(config, now=clock)
+
+    assert await coordinator.poll_once() == []
+    assert not staging.exists()
+    assert not (tmp_path / "_seen").exists()
+
+
+@pytest.mark.asyncio
+async def test_poll_preserves_legacy_staging_at_exact_one_hour_boundary(tmp_path: Path) -> None:
+    clock = _Clock()
+    staging = tmp_path / _legacy_staging_name()
+    staging.mkdir()
+    boundary_mtime = clock().timestamp() - timedelta(hours=1).total_seconds()
+    os.utime(staging, (boundary_mtime, boundary_mtime))
+    config = NutritionIngestConfig(
+        enabled=True,
+        synchronized_root=tmp_path,
+        principal="123",
+        chat_id="123",
+        session_key="telegram:123",
+    )
+    coordinator = NutritionIngestCoordinator(config, now=clock)
+
+    await coordinator.poll_once()
+
+    assert staging.is_dir()
+
+
+@pytest.mark.asyncio
+async def test_poll_preserves_non_legacy_staging_paths_and_symlink(tmp_path: Path) -> None:
+    clock = _Clock()
+    old_mtime = clock().timestamp() - timedelta(hours=2).total_seconds()
+    names = [
+        ".dropbox-camera-v1-" + "a" * 64 + "-short",
+        "_producer",
+        "_errors",
+        "_seen",
+        ".hidden",
+        "candidate.tmp",
+    ]
+    for name in names:
+        path = tmp_path / name
+        path.mkdir()
+        os.utime(path, (old_mtime, old_mtime))
+    exact_file = tmp_path / _legacy_staging_name(suffix="z9_8y7x6")
+    exact_file.write_bytes(b"not a directory")
+    valid_candidate = _candidate(tmp_path, file_id="id:legacy-preserve", rev="rev:legacy-preserve")
+    os.utime(tmp_path / valid_candidate, (old_mtime, old_mtime))
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "keep.txt").write_text("keep")
+    symlink = tmp_path / _legacy_staging_name(suffix="q1w2e3r4")
+    os.symlink(outside, symlink)
+    config = NutritionIngestConfig(
+        enabled=True,
+        synchronized_root=tmp_path,
+        principal="123",
+        chat_id="123",
+        session_key="telegram:123",
+    )
+    outbound = []
+    coordinator = NutritionIngestCoordinator(
+        config,
+        publish_outbound=outbound.append,
+        honcho_client=_RecentSource(),
+        now=clock,
+    )
+
+    await coordinator.poll_once()
+
+    assert all((tmp_path / name).is_dir() for name in names)
+    assert exact_file.is_file()
+    assert (tmp_path / valid_candidate).is_dir()
+    assert symlink.is_symlink()
+    assert (outside / "keep.txt").is_file()
+    assert len(outbound) == 1
+
+
+@pytest.mark.asyncio
+async def test_legacy_staging_deletion_failure_blocks_prompt_delivery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = _Clock()
+    staging = tmp_path / _legacy_staging_name()
+    staging.mkdir()
+    old_mtime = clock().timestamp() - timedelta(hours=2).total_seconds()
+    os.utime(staging, (old_mtime, old_mtime))
+    candidate = _candidate(tmp_path, file_id="id:cleanup-failure", rev="rev:cleanup-failure")
+    config = NutritionIngestConfig(
+        enabled=True,
+        synchronized_root=tmp_path,
+        principal="123",
+        chat_id="123",
+        session_key="telegram:123",
+    )
+    outbound = []
+    coordinator = NutritionIngestCoordinator(
+        config,
+        publish_outbound=outbound.append,
+        honcho_client=_RecentSource(),
+        now=clock,
+    )
+
+    def fail_deletion(_path: Path) -> None:
+        raise OSError("simulated staging deletion failure")
+
+    monkeypatch.setattr("ohmo.nutrition_ingest.coordinator.shutil.rmtree", fail_deletion)
+
+    with pytest.raises(OSError, match="simulated staging deletion failure"):
+        await coordinator.poll_once()
+
+    assert outbound == []
+    assert staging.is_dir()
+    assert not (tmp_path / candidate / "result.json").exists()
 
 
 def test_tombstone_path_rejects_invalid_candidate_and_seen_symlink(tmp_path: Path) -> None:

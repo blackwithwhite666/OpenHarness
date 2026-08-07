@@ -98,6 +98,17 @@ exact seven-day boundary is retained. This expiry is unconditional, including
 pending or ambiguous Telegram delivery and incomplete consumed estimation;
 the compact tombstone preserves the final local state summary for audit.
 
+At the beginning of each enabled poll, under the coordinator lock, the consumer
+also removes only direct-child directories matching the legacy producer staging
+name `.dropbox-camera-v1-<64 lowercase hex>-<8 lowercase alphanumeric or
+underscore>` when their filesystem mtime is strictly older than one hour. It
+uses the same direct-child, real-directory, containment, and root-fsync checks
+as candidate deletion. These raw staging directories are deleted without
+writing `_seen` tombstones. Any inspection or deletion failure stops the poll
+before an outbound prompt; files, symlinks, malformed names, reserved
+directories, valid candidate directories, and staging at the one-hour boundary
+are preserved.
+
 ## Rollout order
 
 1. **Disabled:** producer discovery and consumer notifications are disabled.
