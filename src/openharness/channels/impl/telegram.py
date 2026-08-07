@@ -621,7 +621,9 @@ class TelegramChannel(BaseChannel):
             self._app = None
 
     @staticmethod
-    def _build_keyboard(buttons: list[str]) -> InlineKeyboardMarkup | None:
+    def _build_keyboard(
+        buttons: list[str], callback_data_prefix: str | None = None
+    ) -> InlineKeyboardMarkup | None:
         """One vertical inline button per ``[[ask: …]]`` option. The callback
         carries the index; the chosen label is recovered from the keyboard on
         tap (so no option text has to be squeezed into 64-byte callback_data)."""
@@ -629,8 +631,19 @@ class TelegramChannel(BaseChannel):
         if not options:
             return None
         return InlineKeyboardMarkup(
-            [[InlineKeyboardButton(text=opt[:60], callback_data=f"ask:{i}")]
-             for i, opt in enumerate(options)]
+            [
+                [
+                    InlineKeyboardButton(
+                        text=opt[:60],
+                        callback_data=(
+                            f"{callback_data_prefix}{i}"
+                            if callback_data_prefix is not None
+                            else f"ask:{i}"
+                        ),
+                    )
+                ]
+                for i, opt in enumerate(options)
+            ]
         )
 
     @staticmethod
@@ -883,7 +896,10 @@ class TelegramChannel(BaseChannel):
 
         # Send media files
         media_paths = list(msg.media or [])
-        keyboard = self._build_keyboard(msg.buttons)
+        callback_data_prefix = msg.metadata.get("_nutrition_callback_prefix")
+        if not isinstance(callback_data_prefix, str):
+            callback_data_prefix = None
+        keyboard = self._build_keyboard(msg.buttons, callback_data_prefix)
         if (
             len(media_paths) == 1
             and self._get_media_type(media_paths[0]) == "photo"
@@ -1132,10 +1148,10 @@ class TelegramChannel(BaseChannel):
         data = query.data or ""
         message = query.message
         user = update.effective_user
-        if not data.startswith("ask:") or message is None or user is None:
+        if not data.startswith(("ask:", "nutrition:")) or message is None or user is None:
             return
         try:
-            idx = int(data.split(":", 1)[1])
+            idx = int(data.rsplit(":", 1)[1])
         except ValueError:
             return
 

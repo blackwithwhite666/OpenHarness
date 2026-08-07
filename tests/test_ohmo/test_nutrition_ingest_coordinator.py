@@ -112,6 +112,14 @@ class _Clock:
         self.value += timedelta(seconds=seconds)
 
 
+def _nutrition_callback(prompt, index: int = 0, native_message_id: int = 42) -> dict[str, object]:
+    return {
+        "callback_query": True,
+        "native_message_id": native_message_id,
+        "callback_data": f'{prompt.metadata["_nutrition_callback_prefix"]}{index}',
+    }
+
+
 def _legacy_staging_name(*, suffix: str = "a1_b2c3d") -> str:
     return f".dropbox-camera-v1-{'a' * 64}-{suffix}"
 
@@ -358,7 +366,7 @@ async def test_marina_queue_has_one_native_prompt_and_decline_has_no_estimation(
     assert len(outbound) == 1
     prompt = outbound[0]
     assert prompt.content == "Вы это съели?\nДата: 01.01.2099 00:00 (по EXIF фото)"
-    assert prompt.buttons == ["Да", "Нет"]
+    assert prompt.buttons == ["Да, я это съела", "Нет, не ела", "Это не еда"]
     assert len(prompt.media) == 1
     await coordinator.on_send_success(
         prompt,
@@ -369,9 +377,9 @@ async def test_marina_queue_has_one_native_prompt_and_decline_has_no_estimation(
             channel="telegram",
             sender_id="123",
             chat_id="123",
-            content="Нет",
+            content="Нет, не ела",
             session_key_override="telegram:123",
-            metadata={"callback_query": True, "native_message_id": 42},
+            metadata=_nutrition_callback(prompt, 1),
         )
     )
     assert handled is True
@@ -453,9 +461,9 @@ async def test_callback_requires_exact_marina_binding_and_photo_id(
         channel="telegram",
         sender_id="123",
         chat_id="123",
-        content="Да",
+        content="Да, я это съела",
         session_key_override="telegram:123",
-        metadata={"callback_query": True, "native_message_id": 42},
+        metadata=_nutrition_callback(prompt),
     )
     if field == "native_message_id":
         message.metadata[field] = value
@@ -495,9 +503,9 @@ async def test_exact_callback_confirmation_reaches_estimator_once(tmp_path: Path
             channel="telegram",
             sender_id="123",
             chat_id="123",
-            content="Да",
+            content="Да, я это съела",
             session_key_override="telegram:123",
-            metadata={"callback_query": True, "native_message_id": 42},
+            metadata=_nutrition_callback(prompt),
         )
     ) is True
     assert len(estimates) == 1
@@ -544,9 +552,9 @@ async def test_confirmation_and_poll_serialize_estimation(tmp_path: Path) -> Non
         channel="telegram",
         sender_id="123",
         chat_id="123",
-        content="Да",
+        content="Да, я это съела",
         session_key_override="telegram:123",
-        metadata={"callback_query": True, "native_message_id": 42},
+        metadata=_nutrition_callback(prompt),
     )
     handle_task = asyncio.create_task(coordinator.handle_inbound(confirmation))
     await asyncio.wait_for(estimator_started.wait(), timeout=1)
@@ -589,7 +597,7 @@ async def test_unknown_typed_reply_is_clarified_and_yes_creates_one_durable_comp
     prompt = outbound[0]
     assert prompt.media and len(prompt.media) == 1
     assert prompt.content == "Вы это съели?\nДата: 01.01.2099 00:00 (по EXIF фото)"
-    assert prompt.buttons == ["Да", "Нет"]
+    assert prompt.buttons == ["Да, я это съела", "Нет, не ела", "Это не еда"]
     await coordinator.on_send_success(
         prompt,
         OutboundDeliveryReceipt("telegram", "123", (42,), prompt.metadata["_trusted_outbound_operation_id"]),
@@ -603,8 +611,8 @@ async def test_unknown_typed_reply_is_clarified_and_yes_creates_one_durable_comp
             content="может быть",
             session_key_override="telegram:123",
         )
-    ) is True
-    assert outbound[-1].content.startswith("Пожалуйста")
+    ) is False
+    assert len(outbound) == 1
     assert estimates == []
 
     assert await coordinator.handle_inbound(
@@ -612,10 +620,10 @@ async def test_unknown_typed_reply_is_clarified_and_yes_creates_one_durable_comp
             channel="telegram",
             sender_id="123",
             chat_id="123",
-            content="Да",
+            content="Да, я это съела",
             session_key_override="telegram:123",
         )
-    ) is True
+    ) is False
     assert len(estimates) == 0
     assert NutritionResultStore(tmp_path / candidate / "result.json").load().state == ResultState.pending_confirmation
 
@@ -624,9 +632,9 @@ async def test_unknown_typed_reply_is_clarified_and_yes_creates_one_durable_comp
             channel="telegram",
             sender_id="123",
             chat_id="123",
-            content="Да",
+            content="Да, я это съела",
             session_key_override="telegram:123",
-            metadata={"callback_query": True, "native_message_id": 42},
+            metadata=_nutrition_callback(prompt),
         )
     ) is True
     assert len(estimates) == 1
@@ -663,9 +671,9 @@ async def test_completed_candidate_leaves_later_correction_on_normal_ohmo_path(
             channel="telegram",
             sender_id="123",
             chat_id="123",
-            content="Нет",
+            content="Нет, не ела",
             session_key_override="telegram:123",
-            metadata={"callback_query": True, "native_message_id": 42},
+            metadata=_nutrition_callback(prompt, 1),
         )
     )
     before = NutritionResultStore(tmp_path / candidate / "result.json").load().model_dump(mode="json")
@@ -845,7 +853,7 @@ async def test_plain_text_and_old_callback_do_not_mutate_quarantined_or_current_
             metadata={"callback_query": True, "native_message_id": 41},
         ),
     ):
-        assert await coordinator.handle_inbound(message) is True
+        assert await coordinator.handle_inbound(message) is False
 
     after = {
         candidate_id: NutritionResultStore(tmp_path / candidate_id / "result.json").load().model_dump(
@@ -949,9 +957,9 @@ async def test_runtime_pool_nutrition_chain_reconciles_crash_after_honcho_commit
             channel="telegram",
             sender_id="123",
             chat_id="123",
-            content="Да",
+            content="Да, я это съела",
             session_key_override="telegram:123",
-            metadata={"callback_query": True, "native_message_id": 42},
+            metadata=_nutrition_callback(prompt),
         )
     )
     sidecar = NutritionResultStore(tmp_path / candidate / "result.json").load()
@@ -1051,9 +1059,9 @@ async def test_runtime_pool_missing_macro_fails_closed_without_result(tmp_path: 
             channel="telegram",
             sender_id="123",
             chat_id="123",
-            content="Да",
+            content="Да, я это съела",
             session_key_override="telegram:123",
-            metadata={"callback_query": True, "native_message_id": 42},
+            metadata=_nutrition_callback(prompt),
         )
     )
 
@@ -1116,9 +1124,9 @@ async def test_missing_estimator_receipt_is_retryable_not_completed(tmp_path: Pa
             channel="telegram",
             sender_id="123",
             chat_id="123",
-            content="Да",
+            content="Да, я это съела",
             session_key_override="telegram:123",
-            metadata={"callback_query": True, "native_message_id": 42},
+            metadata=_nutrition_callback(prompt),
         )
     ) is True
     sidecar = NutritionResultStore(tmp_path / candidate / "result.json").load()
@@ -1162,9 +1170,9 @@ async def test_estimation_retries_are_bounded_without_reprompting(tmp_path: Path
             channel="telegram",
             sender_id="123",
             chat_id="123",
-            content="Да",
+            content="Да, я это съела",
             session_key_override="telegram:123",
-            metadata={"callback_query": True, "native_message_id": 42},
+            metadata=_nutrition_callback(prompt),
         )
     )
     await coordinator.poll_once()
@@ -1223,9 +1231,9 @@ async def test_retry_backoff_keeps_head_candidate_in_front_of_later_prompt(tmp_p
             channel="telegram",
             sender_id="123",
             chat_id="123",
-            content="Нет",
+            content="Нет, не ела",
             session_key_override="telegram:123",
-            metadata={"callback_query": True, "native_message_id": 42},
+            metadata=_nutrition_callback(outbound[1], 1),
         )
     )
     await coordinator.poll_once()
@@ -1299,9 +1307,9 @@ async def test_operator_replay_resumes_consumed_estimation_without_reprompt(tmp_
             channel="telegram",
             sender_id="123",
             chat_id="123",
-            content="Да",
+            content="Да, я это съела",
             session_key_override="telegram:123",
-            metadata={"callback_query": True, "native_message_id": 42},
+            metadata=_nutrition_callback(prompt),
         )
     )
     assert NutritionResultStore(tmp_path / candidate / "result.json").load().state == ResultState.dead_letter
@@ -1352,9 +1360,9 @@ async def test_estimation_backoff_doubles_caps_and_does_not_reconfirm(tmp_path: 
             channel="telegram",
             sender_id="123",
             chat_id="123",
-            content="Да",
+            content="Да, я это съела",
             session_key_override="telegram:123",
-            metadata={"callback_query": True, "native_message_id": 42},
+            metadata=_nutrition_callback(prompt),
         )
     )
     assert len(estimates) == 1
@@ -1480,7 +1488,7 @@ async def test_old_pending_confirmation_cannot_consume_reply(tmp_path: Path) -> 
     )
     clock.advance(7 * 24 * 60 * 60 + 0.000001)
     handled = await coordinator.handle_inbound(InboundMessage(
-        channel="telegram", sender_id="123", chat_id="123", content="Да",
+        channel="telegram", sender_id="123", chat_id="123", content="Да, я это съела",
         session_key_override="telegram:123"))
     assert handled is False and estimates == []
     assert NutritionResultStore(tmp_path / candidate / "result.json").load().state == ResultState.pending_confirmation
@@ -1512,9 +1520,9 @@ async def test_consumed_estimation_retry_expires_with_bounded_state_summary(
                                               outbound[0].metadata["_trusted_outbound_operation_id"])
     )
     await coordinator.handle_inbound(InboundMessage(
-        channel="telegram", sender_id="123", chat_id="123", content="Да",
+        channel="telegram", sender_id="123", chat_id="123", content="Да, я это съела",
         session_key_override="telegram:123",
-        metadata={"callback_query": True, "native_message_id": 42}))
+        metadata=_nutrition_callback(outbound[0])))
     clock.advance(7 * 24 * 60 * 60 + 1)
     await coordinator.poll_once()
     assert len(calls) == 1

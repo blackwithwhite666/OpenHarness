@@ -162,11 +162,13 @@ class NutritionResultStore:
             ResultState.pending_confirmation: {
                 ResultState.confirmed,
                 ResultState.declined,
+                ResultState.non_food,
                 ResultState.retryable_error,
                 ResultState.skipped,
             },
             ResultState.confirmed: {
                 ResultState.estimated,
+                ResultState.non_food,
                 ResultState.retryable_error,
                 ResultState.dead_letter,
             },
@@ -182,6 +184,7 @@ class NutritionResultStore:
                 ResultState.prompt_sending,
                 ResultState.pending_confirmation,
                 ResultState.confirmed,
+                ResultState.non_food,
                 ResultState.estimated,
                 ResultState.retryable_error,
                 ResultState.skipped,
@@ -189,6 +192,7 @@ class NutritionResultStore:
                 ResultState.seen,
             },
             ResultState.declined: {ResultState.completed},
+            ResultState.non_food: set(),
             ResultState.dead_letter: {
                 ResultState.discovered,
                 ResultState.published,

@@ -227,6 +227,7 @@ class ResultState(StrEnum):
     pending_confirmation = "pending_confirmation"
     confirmed = "confirmed"
     declined = "declined"
+    non_food = "non_food"
     estimated = "estimated"
     completed = "completed"
     retryable_error = "retryable_error"
@@ -239,6 +240,7 @@ SkipReason = Literal["exif_missing", "exif_ambiguous", "exif_invalid", "exif_sta
 SeenReason = Literal["duplicate_honcho"]
 SeenFingerprintKind = Literal["sha256", "phash"]
 TombstoneReason = Literal["duplicate_honcho", "expired"]
+NonFoodReason = Literal["explicit_feedback", "no_visible_consumable_portion"]
 
 
 def _validate_optional_audit_id(value: str | None) -> str | None:
@@ -294,6 +296,7 @@ class NutritionResultSidecar(_StrictModel):
     matched_honcho_message_id: str | None = Field(default=None, max_length=256)
     seen_fingerprint_kind: SeenFingerprintKind | None = None
     seen_phash_algorithm: str | None = Field(default=None, max_length=64)
+    non_food_reason: NonFoodReason | None = None
 
     @field_validator("schema_version")
     @classmethod
@@ -325,7 +328,13 @@ class NutritionResultSidecar(_StrictModel):
             raise ValueError("confirmation operation id is not bound to candidate")
         if self.meal_observation_operation_id != f"{self.candidate_id}:meal-observation:v1":
             raise ValueError("meal operation id is not bound to candidate")
-        if self.consumption_status not in {"unknown", "consumed", "planned", "not_consumed"}:
+        if self.consumption_status not in {
+            "unknown",
+            "consumed",
+            "planned",
+            "not_consumed",
+            "not_food",
+        }:
             raise ValueError("invalid consumption status")
         if (
             self.state in {ResultState.confirmed, ResultState.estimated}
@@ -343,6 +352,15 @@ class NutritionResultSidecar(_StrictModel):
                 raise ValueError("skipped result must not have a Honcho message id")
         elif self.skip_reason is not None:
             raise ValueError("skip reason is only valid for skipped results")
+        if self.state == ResultState.non_food:
+            if self.non_food_reason is None:
+                raise ValueError("non-food result requires an explicit reason")
+            if self.consumption_status != "not_food":
+                raise ValueError("non-food result requires not_food consumption status")
+            if self.emitted_honcho_message_id is not None:
+                raise ValueError("non-food result must not have a Honcho message id")
+        elif self.non_food_reason is not None:
+            raise ValueError("non-food reason is only valid for non-food results")
         if self.state == ResultState.seen:
             if self.seen_reason != "duplicate_honcho":
                 raise ValueError("seen result requires duplicate_honcho provenance")
@@ -378,6 +396,8 @@ class NutritionResultSidecar(_StrictModel):
             elif self.consumption_status == "not_consumed":
                 if self.emitted_honcho_message_id is not None:
                     raise ValueError("declined completion must not have a meal id")
+            elif self.consumption_status == "not_food":
+                raise ValueError("non-food results must use the non_food terminal state")
             else:
                 raise ValueError("completion requires consumed or not_consumed status")
         return self

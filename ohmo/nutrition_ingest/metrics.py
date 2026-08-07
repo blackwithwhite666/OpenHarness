@@ -24,7 +24,7 @@ _EVENTS = frozenset(
 )
 _STAGES = frozenset({"scan", "dedup", "prompt", "estimation", "observation"})
 _ERROR_CLASSES = frozenset({"", "runtime", "integrity", "transport", "acknowledgement"})
-_CONFIRMATION_OUTCOMES = frozenset({"accepted", "declined"})
+_CONFIRMATION_OUTCOMES = frozenset({"accepted", "declined", "non_food"})
 _DUPLICATE_OPERATIONS = frozenset({"dedup", "prompt", "observation"})
 
 

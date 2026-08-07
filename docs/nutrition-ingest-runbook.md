@@ -121,7 +121,8 @@ are preserved.
 3. **Publish canary:** after shadow acceptance, enable the consumer for the
    fixed Marina binding only. One ready positive artifact produces one native
    Telegram photo with the two-line caption `Вы это съели?` followed by
-   `Дата: DD.MM.YYYY HH:MM (по EXIF фото)` and buttons `Да` and `Нет`.
+   `Дата: DD.MM.YYYY HH:MM (по EXIF фото)` and exactly these buttons, in order:
+   `Да, я это съела`, `Нет, не ела`, `Это не еда`.
 4. **Normal publish:** expand only after the canary proves exact routing,
    confirmation-before-estimation, authoritative EXIF meal timestamps after
    `Да`, durable observation reconciliation, and
@@ -132,9 +133,9 @@ are preserved.
 
 - A verified candidate is queued in deterministic discovery order. There is at
   most one pending Marina confirmation.
-- `Нет` records `not_consumed`, emits only the existing acknowledgement, and
-  advances the queue. `Да` records `consumed` and only then invokes the existing
-  nutrition estimator, producing exactly one consumed observation under its
+- `Нет, не ела` records `not_consumed`, emits only the existing acknowledgement,
+  and advances the queue. `Да, я это съела` records `consumed` and only then invokes
+  the existing nutrition estimator, producing exactly one consumed observation under its
   stable operation id. After the observation is durably committed, Marina
   receives one concise reply such as `КБЖУ: 550 ккал · Б 30 г · Ж 20 г · У 45 г`
   followed by a short note that the photo-based portion is uncertain. The
@@ -142,11 +143,29 @@ are preserved.
   parsed. Missing, negative, non-finite, boolean, or otherwise invalid calorie
   or macro values fail closed and are retried without sending a misleading
   result.
-- A decision is accepted only from a native Telegram inline-button callback
-  whose message id exactly matches the currently pending prompt's native
-  message id and Marina binding. Plain-text `Да`/`Нет`, callbacks without a
-  valid native message id, and callbacks for an older, quarantined, or unknown
-  prompt are clarified and never mutate a candidate.
+- `Это не еда` is an audited terminal `non_food` sidecar outcome. It retains
+  the Marina recipient, prompt, and reply binding, creates no `meal_observation`,
+  produces no KBJU result, and never enters estimation. A native confirmation
+  callback is accepted only when its exact callback data and message id bind to
+  the current prompt. Plain text and ordinary Marina chat pass through the
+  normal gateway path. A bound `nutrition:` callback with a wrong/old candidate
+  prefix, wrong/missing option, or no pending candidate is swallowed without
+  mutation. For compatibility, a legacy `ask:` callback is swallowed only when
+  its native message id exactly matches the current nutrition prompt; unrelated
+  `ask:` callbacks pass through to normal Ohmo.
+- While an ordinary Marina chat turn is in flight, the coordinator pauses
+  publication of the next confirmation. The gateway sends an explicit start
+  lifecycle event and releases it on completion, exception, or cancellation.
+  The queue remains sequential and has no hourly throttle.
+- After `Да, я это съела`, the trusted prompt requires inspection of visible
+  pixels before estimation. Packaging, labels, menus, advertisements without
+  edible contents, residue/smears or an empty dish, a face/person without food,
+  plain water or a non-caloric drink alone, and context-only/off-camera food
+  must return exactly `{"code":"no_visible_consumable_portion"}`. The trusted
+  runtime validates that exact response, skips the Honcho append, records a
+  terminal `non_food` sidecar outcome with no observation or KBJU, and sends a
+  concise acknowledgement that nothing was recorded. A malformed response or
+  missing annotation remains a retryable fail-closed error.
 - An ambiguous prompt is quarantined as `delivery_unknown`. It is not resent
   automatically and does not block later eligible candidates, while the
   coordinator still permits only one actual `pending_confirmation` prompt.

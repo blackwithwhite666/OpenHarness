@@ -7,6 +7,8 @@ from collections.abc import Mapping
 from .freshness import normalized_exif_capture_time
 from .models import ExifMetadata
 
+NO_VISIBLE_CONSUMABLE_PORTION_REJECTION = '{"code":"no_visible_consumable_portion"}'
+
 
 def build_confirmation_prompt(exif: ExifMetadata) -> str:
     """Build the native confirmation caption from authoritative ``ManifestV1.exif``.
@@ -47,20 +49,32 @@ def build_post_confirmation_prompt(
     prompt = (
         "[Trusted Dropbox meal estimation turn]\n"
         f"Candidate: {candidate_id}\n"
+        "GPS is unavailable by design.\n"
+        f"Authoritative capture time: {capture_time}.\n"
         "The user confirmed that the pictured food was consumed. Estimate the meal "
         "from the attached photo and emit a schema-v2 meal_observation with "
         "consumption_status=consumed, finite non-negative calories, and finite "
         "non-negative protein_g, fat_g, and carbohydrate_g values. Populate all "
         "three macro fields; never leave them null. "
         "Do not emit a correction, deletion, planned meal, or pre-confirmation record.\n"
+        "Before estimating, inspect the visible pixels and verify that an edible "
+        "consumable portion is visibly present. Reject packaging, labels, menus, "
+        "advertisements without visible edible contents, food residue or smears, "
+        "an empty dish, a face or person without visible food, plain water or a "
+        "non-caloric drink alone, and food that is only contextual or off-camera. "
+        f"For any such case, return exactly {NO_VISIBLE_CONSUMABLE_PORTION_REJECTION} "
+        "and no other text.\n"
         "The user confirmation proves consumption. The validated normalized EXIF "
         "capture time is the authoritative meal_at for this observation; do not "
         "copy or alter it in the annotation. "
-        f"Authoritative capture time: {capture_time}. GPS is unavailable by design.\n"
         "Keep your own answer concise and state visual portion uncertainty; the "
         "trusted client renders the numeric result from the structured fields."
     )
     return prompt[:max_chars]
 
 
-__all__ = ["build_confirmation_prompt", "build_post_confirmation_prompt"]
+__all__ = [
+    "NO_VISIBLE_CONSUMABLE_PORTION_REJECTION",
+    "build_confirmation_prompt",
+    "build_post_confirmation_prompt",
+]

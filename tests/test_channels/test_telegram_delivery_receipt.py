@@ -69,10 +69,11 @@ async def test_one_photo_prompt_returns_native_photo_id_and_trusted_operation(tm
             chat_id="123",
             content="Вы это съели?\nДата: 05.08.2026 12:00 (по EXIF фото)",
             media=[str(image)],
-            buttons=["Да", "Нет"],
+            buttons=["Да, я это съела", "Нет, не ела", "Это не еда"],
             metadata={
                 "operation_id": "model-fabricated",
                 "_trusted_outbound_operation_id": "candidate:confirm:v1",
+                "_nutrition_callback_prefix": "nutrition:bound-candidate:",
             },
         )
     )
@@ -83,7 +84,19 @@ async def test_one_photo_prompt_returns_native_photo_id_and_trusted_operation(tm
     assert len(bot.calls) == 1
     assert bot.calls[0][0] == "send_photo"
     assert bot.calls[0][1]["caption"] == "Вы это съели?\nДата: 05.08.2026 12:00 (по EXIF фото)"
-    assert bot.calls[0][1]["reply_markup"].inline_keyboard[0][0].text == "Да"
+    flat = [button for row in bot.calls[0][1]["reply_markup"].inline_keyboard for button in row]
+    assert [button.text for button in flat] == ["Да, я это съела", "Нет, не ела", "Это не еда"]
+    assert [button.callback_data for button in flat] == [
+        "nutrition:bound-candidate:0",
+        "nutrition:bound-candidate:1",
+        "nutrition:bound-candidate:2",
+    ]
+
+
+def test_ordinary_keyboard_keeps_legacy_ask_callbacks() -> None:
+    keyboard = TelegramChannel._build_keyboard(["Да", "Нет"])
+    flat = [button for row in keyboard.inline_keyboard for button in row]
+    assert [button.callback_data for button in flat] == ["ask:0", "ask:1"]
 
 
 @pytest.mark.asyncio
@@ -163,7 +176,7 @@ async def test_photo_caption_callback_uses_caption_api_and_forwards_native_id() 
     edited = []
 
     class Query:
-        data = "ask:0"
+        data = "nutrition:bound-candidate:2"
         message = SimpleNamespace(
             caption="Вы это съели?\nДата: 05.08.2026 12:00 (по EXIF фото)",
             caption_html="Вы это съели?\nДата: 05.08.2026 12:00 (по EXIF фото)",
@@ -172,7 +185,23 @@ async def test_photo_caption_callback_uses_caption_api_and_forwards_native_id() 
             chat_id=123,
             chat=SimpleNamespace(type="private"),
             reply_markup=InlineKeyboardMarkup(
-                [[InlineKeyboardButton("Да", callback_data="ask:0")]]
+                [
+                    [
+                        InlineKeyboardButton(
+                            "Да, я это съела", callback_data="nutrition:bound-candidate:0"
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            "Нет, не ела", callback_data="nutrition:bound-candidate:1"
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            "Это не еда", callback_data="nutrition:bound-candidate:2"
+                        )
+                    ],
+                ]
             ),
         )
 
@@ -190,6 +219,8 @@ async def test_photo_caption_callback_uses_caption_api_and_forwards_native_id() 
     await channel._on_callback(update, None)
 
     assert edited[0][0] == "caption"
-    assert captured[0].content == "Да"
+    assert captured[0].content == "Это не еда"
     assert captured[0].metadata["message_id"] == 55
+    assert captured[0].metadata["native_message_id"] == 55
+    assert captured[0].metadata["callback_data"] == "nutrition:bound-candidate:2"
     assert captured[0].chat_id == "123"

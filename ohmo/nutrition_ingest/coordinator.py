@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -40,15 +41,22 @@ from .models import (
     StageAttempt,
     StateHistoryEntry,
 )
-from .prompts import build_confirmation_prompt, build_post_confirmation_prompt
+from .prompts import (
+    NO_VISIBLE_CONSUMABLE_PORTION_REJECTION,
+    build_confirmation_prompt,
+    build_post_confirmation_prompt,
+)
 from .sidecars import NutritionResultStore
 from .tombstones import SeenTombstoneStore
 from .trust import COORDINATOR_TRUST_TOKEN
 from .watcher import NutritionArtifactScanner, ReadyNutritionArtifact
 
 _PRINCIPAL_RE = re.compile(r"^[1-9][0-9]*$")
-_YES = {"да"}
-_NO = {"нет"}
+_YES_LABEL = "Да, я это съела"
+_NO_LABEL = "Нет, не ела"
+_NON_FOOD_LABEL = "Это не еда"
+_CONFIRMATION_LABELS = [_YES_LABEL, _NO_LABEL, _NON_FOOD_LABEL]
+_CALLBACK_PREFIX = "nutrition:"
 logger = logging.getLogger(__name__)
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _PHASH_RE = re.compile(r"^[0-9a-f]{1,256}$")
@@ -135,11 +143,40 @@ class NutritionIngestCoordinator:
         self._current_time()
         self._lock = asyncio.Lock()
         self._running = False
+        self._ordinary_turns_in_flight = 0
         self._tombstones = SeenTombstoneStore(self.root) if config.enabled else None
 
     @property
     def enabled(self) -> bool:
         return bool(self.config.enabled)
+
+    @property
+    def ordinary_turn_in_flight(self) -> bool:
+        return self._ordinary_turns_in_flight > 0
+
+    def on_ordinary_turn_start(self, message: InboundMessage) -> None:
+        """Pause publication while a normal Marina gateway turn is running."""
+        if self._is_ordinary_marina_turn(message):
+            self._ordinary_turns_in_flight += 1
+
+    def on_ordinary_turn_finish(self, message: InboundMessage) -> None:
+        """Release the publication pause on success, error, or cancellation."""
+        if self._is_ordinary_marina_turn(message):
+            if self._ordinary_turns_in_flight <= 0:
+                raise NutritionCoordinatorError("ordinary nutrition turn lifecycle is imbalanced")
+            self._ordinary_turns_in_flight -= 1
+
+    def _is_ordinary_marina_turn(self, message: InboundMessage) -> bool:
+        return bool(
+            self.enabled
+            and message.channel == "telegram"
+            and str(message.sender_id).split("|", 1)[0].strip() == self.config.principal
+            and str(message.chat_id) == str(self.config.chat_id)
+            and message.session_key == self.config.session_key
+            and not message.metadata.get("callback_query")
+            and not message.metadata.get("_nutrition_trusted")
+            and message.sender_id != "__nutrition_ingest__"
+        )
 
     @property
     def root(self) -> Path:
@@ -203,7 +240,11 @@ class NutritionIngestCoordinator:
         """Discover candidates and publish at most one confirmation prompt."""
         if not self.enabled:
             return []
+        if self.ordinary_turn_in_flight:
+            return []
         async with self._lock:
+            if self.ordinary_turn_in_flight:
+                return []
             self._cleanup_legacy_staging_directories()
             artifacts = self._scanner.scan_ready()
             retained: list[ReadyNutritionArtifact] = []
@@ -501,6 +542,8 @@ class NutritionIngestCoordinator:
     async def _publish_prompt(
         self, artifact: ReadyNutritionArtifact, sidecar: NutritionResultSidecar
     ) -> None:
+        if self.ordinary_turn_in_flight:
+            return
         store = self._store(artifact)
         reason = self._freshness_reason(artifact)
         if reason == "exif_stale":
@@ -513,12 +556,16 @@ class NutritionIngestCoordinator:
         try:
             match = await self._find_duplicate(artifact)
         except Exception as exc:  # noqa: BLE001 - incomplete history must fail closed
+            if self.ordinary_turn_in_flight:
+                return
             self._record_failure(
                 store,
                 store.load() or sidecar,
                 stage="dedup",
                 error=exc,
             )
+            return
+        if self.ordinary_turn_in_flight:
             return
         if match is not None:
             seen = self._advance(
@@ -542,6 +589,8 @@ class NutritionIngestCoordinator:
             self._delete_candidate_directory(artifact)
             self._metrics.duplicate_suppression("dedup")
             return
+        if self.ordinary_turn_in_flight:
+            return
         operation_id = sidecar.confirmation_operation_id
         sending = self._advance(store, sidecar, ResultState.prompt_sending)
         message = OutboundMessage(
@@ -549,7 +598,7 @@ class NutritionIngestCoordinator:
             chat_id=str(self.config.chat_id),
             content=build_confirmation_prompt(artifact.manifest.exif),
             media=[str(artifact.image_path)],
-            buttons=["Да", "Нет"],
+            buttons=list(_CONFIRMATION_LABELS),
             metadata={
                 "_trusted_outbound_operation_id": operation_id,
                 "_nutrition_confirmation": True,
@@ -558,6 +607,7 @@ class NutritionIngestCoordinator:
                 "_nutrition_chat_id": str(self.config.chat_id),
                 "_nutrition_session_key": self.config.session_key,
                 "_nutrition_phase": "confirmation",
+                "_nutrition_callback_prefix": self._callback_prefix(artifact.candidate_id),
             },
         )
         try:
@@ -813,6 +863,11 @@ class NutritionIngestCoordinator:
             None,
         )
 
+    @staticmethod
+    def _callback_prefix(candidate_id: str) -> str:
+        token = hashlib.sha256(candidate_id.encode("utf-8")).hexdigest()[:16]
+        return f"{_CALLBACK_PREFIX}{token}:"
+
     async def handle_inbound(self, message: InboundMessage) -> bool:
         """Intercept only bound Marina confirmation traffic."""
         if not self.enabled or message.channel != "telegram":
@@ -822,34 +877,64 @@ class NutritionIngestCoordinator:
             return False
         if message.session_key != self.config.session_key:
             return False
+        if not message.metadata.get("callback_query"):
+            return False
+        callback_data = message.metadata.get("callback_data")
+        if isinstance(callback_data, str) and callback_data.startswith(_CALLBACK_PREFIX):
+            async with self._lock:
+                return await self._handle_bound_confirmation(message)
+        if not isinstance(callback_data, str) or not callback_data.startswith("ask:"):
+            return False
+        if not self._callback_matches_pending_prompt(message):
+            return False
         async with self._lock:
             return await self._handle_bound_confirmation(message)
 
+    def _callback_matches_pending_prompt(self, message: InboundMessage) -> bool:
+        native_id = message.metadata.get("native_message_id")
+        if native_id is None:
+            return False
+        return any(
+            str(sidecar.prompt_message_id) == str(native_id)
+            for _, sidecar in self._pending_confirmations()
+        )
+
     async def _handle_bound_confirmation(self, message: InboundMessage) -> bool:
+        callback_data = message.metadata.get("callback_data")
+        is_nutrition_callback = isinstance(callback_data, str) and callback_data.startswith(
+            _CALLBACK_PREFIX
+        )
         pending = self._pending_confirmations()
         if len(pending) == 0:
-            return False
+            return is_nutrition_callback
         if len(pending) != 1:
-            await self._clarify(message)
-            return True
+            return is_nutrition_callback or self._callback_matches_pending_prompt(message)
         artifact, sidecar = pending[0]
+        native_id = message.metadata.get("native_message_id")
+        answer = message.content.strip()
+        is_legacy_callback = isinstance(callback_data, str) and callback_data.startswith("ask:")
+        if is_legacy_callback and str(native_id) == str(sidecar.prompt_message_id):
+            return True
+        label_index = {label: index for index, label in enumerate(_CONFIRMATION_LABELS)}
+        callback_prefix = self._callback_prefix(artifact.candidate_id)
+        expected_callback = (
+            f"{callback_prefix}{label_index[answer]}" if answer in label_index else None
+        )
+        if (
+            not message.metadata.get("callback_query")
+            or str(native_id) != str(sidecar.prompt_message_id)
+            or expected_callback is None
+            or callback_data != expected_callback
+        ):
+            return is_nutrition_callback
         reason = self._freshness_reason(artifact)
         if reason == "exif_stale":
-            return False
+            self._archive_expired_and_delete(artifact, sidecar)
+            return True
         if reason is not None:
             self._skip_candidate(self._store(artifact), sidecar, reason)
-            return False
-        native_id = message.metadata.get("native_message_id")
-        if not message.metadata.get("callback_query") or str(native_id) != str(
-            sidecar.prompt_message_id
-        ):
-            await self._clarify(message)
             return True
-        answer = message.content.strip().casefold()
-        if answer not in _YES | _NO:
-            await self._clarify(message)
-            return True
-        if answer in _NO:
+        if answer == _NO_LABEL:
             self._metrics.confirmation("declined")
             self._record_pending_latency(sidecar)
             store = self._store(artifact)
@@ -863,6 +948,18 @@ class NutritionIngestCoordinator:
             completed = self._advance(store, declined, ResultState.completed)
             self._record_end_to_end_latency(completed)
             await self._ack(message, "Понял, не записываю этот снимок как съеденное.")
+            return True
+        if answer == _NON_FOOD_LABEL:
+            self._metrics.confirmation("non_food")
+            self._record_pending_latency(sidecar)
+            completed = self._complete_non_food(
+                artifact,
+                sidecar,
+                reason="explicit_feedback",
+                reply_message_id=message.metadata.get("message_id"),
+            )
+            self._record_end_to_end_latency(completed)
+            await self._ack(message, "Понял, ничего не записываю: это не еда.")
             return True
         store = self._store(artifact)
         self._metrics.confirmation("accepted")
@@ -887,13 +984,7 @@ class NutritionIngestCoordinator:
         for artifact in self._scanner.scan_ready():
             current = self._store(artifact).load()
             if current is not None and current.state == ResultState.pending_confirmation:
-                reason = self._freshness_reason(artifact)
-                if reason is None:
-                    pending.append((artifact, current))
-                elif reason == "exif_stale":
-                    continue
-                else:
-                    self._skip_candidate(self._store(artifact), current, reason)
+                pending.append((artifact, current))
         return pending
 
     async def _ack(self, message: InboundMessage, content: str) -> None:
@@ -905,8 +996,52 @@ class NutritionIngestCoordinator:
         if asyncio.iscoroutine(result):
             await result
 
-    async def _clarify(self, message: InboundMessage) -> None:
-        await self._ack(message, "Пожалуйста, ответьте кнопкой «Да» или «Нет» для текущего фото.")
+    @staticmethod
+    def _is_trusted_no_visible_rejection(metadata: dict[str, object]) -> bool:
+        return (
+            metadata.get("_trusted_nutrition_terminal_outcome") == "non_food"
+            and metadata.get("_trusted_nutrition_rejection") == "no_visible_consumable_portion"
+            and metadata.get("_trusted_nutrition_rejection_payload")
+            == NO_VISIBLE_CONSUMABLE_PORTION_REJECTION
+        )
+
+    def _complete_non_food(
+        self,
+        artifact: ReadyNutritionArtifact,
+        sidecar: NutritionResultSidecar,
+        *,
+        reason: str,
+        reply_message_id: int | str | None = None,
+    ) -> NutritionResultSidecar:
+        if reason not in {"explicit_feedback", "no_visible_consumable_portion"}:
+            raise NutritionCoordinatorError("unsupported non-food outcome")
+        store = self._store(artifact)
+        current = store.load() or sidecar
+        if current.state == ResultState.non_food:
+            return current
+        if reason == "explicit_feedback":
+            allowed = current.state == ResultState.pending_confirmation
+        else:
+            allowed = current.state in {ResultState.confirmed} or (
+                current.state == ResultState.retryable_error
+                and current.consumption_status == "consumed"
+                and bool(current.attempts)
+                and current.attempts[-1].stage == "estimation"
+            )
+        if not allowed:
+            raise NutritionCoordinatorError("non-food outcome has no pending confirmation")
+        updates: dict[str, object] = {}
+        if reply_message_id is not None:
+            updates["reply_message_id"] = reply_message_id
+        return self._advance(
+            store,
+            current,
+            ResultState.non_food,
+            consumption_status="not_food",
+            non_food_reason=reason,
+            emitted_honcho_message_id=None,
+            **updates,
+        )
 
     async def _estimate_candidate(
         self, artifact: ReadyNutritionArtifact, sidecar: NutritionResultSidecar
@@ -943,6 +1078,18 @@ class NutritionIngestCoordinator:
             result = self._estimate(synthetic)
             if asyncio.iscoroutine(result):
                 result = await result
+            if isinstance(result, dict) and self._is_trusted_no_visible_rejection(result):
+                completed = self._complete_non_food(
+                    artifact,
+                    sidecar,
+                    reason="no_visible_consumable_portion",
+                )
+                await self._ack(
+                    synthetic,
+                    "Понял, ничего не записываю: на фото нет видимой порции еды.",
+                )
+                self._record_end_to_end_latency(completed)
+                return
             assistant_id = None
             if isinstance(result, str) and result:
                 assistant_id = result
@@ -978,6 +1125,18 @@ class NutritionIngestCoordinator:
             async for update in stream:
                 if getattr(update, "kind", None) == "final":
                     final_metadata = dict(getattr(update, "metadata", {}) or {})
+            if self._is_trusted_no_visible_rejection(final_metadata):
+                completed = self._complete_non_food(
+                    artifact,
+                    sidecar,
+                    reason="no_visible_consumable_portion",
+                )
+                await self._ack(
+                    synthetic,
+                    "Понял, ничего не записываю: на фото нет видимой порции еды.",
+                )
+                self._record_end_to_end_latency(completed)
+                return
             assistant_id = final_metadata.get("_trusted_nutrition_assistant_message_id")
             if not isinstance(assistant_id, str) or not assistant_id:
                 raise NutritionCoordinatorError(

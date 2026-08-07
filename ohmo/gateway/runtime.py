@@ -58,6 +58,7 @@ from ohmo.memory_store import MemoryStore
 from ohmo.memory_tool import OhmoMemoryTool
 from ohmo.nutrition_ingest.freshness import normalized_exif_capture_time
 from ohmo.nutrition_ingest.models import ExifMetadata
+from ohmo.nutrition_ingest.prompts import NO_VISIBLE_CONSUMABLE_PORTION_REJECTION
 from ohmo.nutrition_ingest.trust import COORDINATOR_TRUST_TOKEN
 from ohmo.prompt_seam import compose_runtime_prompt, prepare_turn
 from ohmo.prompts import build_ohmo_system_prompt
@@ -112,6 +113,18 @@ from openharness.ui.runtime import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _is_exact_no_visible_consumable_portion_rejection(reply: str) -> bool:
+    """Recognize only the bounded, exact rejection on trusted nutrition turns."""
+    if reply != NO_VISIBLE_CONSUMABLE_PORTION_REJECTION:
+        return False
+    try:
+        parsed = json.loads(reply)
+    except (TypeError, ValueError):
+        return False
+    return parsed == {"code": "no_visible_consumable_portion"}
+
 
 _CHANNEL_THINKING_PHRASES = (
     "🤔 想一想…",
@@ -1290,13 +1303,29 @@ class OhmoSessionRuntimePool:
         self._restore_group_request_context(bundle, previous_group_request)
         self._clear_reminder_context(bundle)
         await self._save_snapshot(bundle, session_key, user_prompt)
-        self._maybe_schedule_memory_judge(
-            bundle,
-            session_key,
-            turn_ctx=turn_ctx,
-            memory_scope=memory_scope,
-        )
         reply = "".join(reply_parts).strip()
+        exact_no_visible_rejection = bool(
+            trusted_nutrition and _is_exact_no_visible_consumable_portion_rejection(reply)
+        )
+        if not exact_no_visible_rejection:
+            self._maybe_schedule_memory_judge(
+                bundle,
+                session_key,
+                turn_ctx=turn_ctx,
+                memory_scope=memory_scope,
+            )
+        if exact_no_visible_rejection:
+            yield GatewayStreamUpdate(
+                kind="final",
+                text=reply,
+                metadata={
+                    "_session_key": session_key,
+                    "_trusted_nutrition_terminal_outcome": "non_food",
+                    "_trusted_nutrition_rejection": "no_visible_consumable_portion",
+                    "_trusted_nutrition_rejection_payload": reply,
+                },
+            )
+            return
         if reply:
             append_receipt = await self._append_conversation_turn(
                 turn_ctx=turn_ctx,

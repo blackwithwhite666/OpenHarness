@@ -347,13 +347,19 @@ class OhmoGatewayBridge:
                 metadata={"_progress": True, "_session_key": session_key},
             ),
         )
+        if self._nutrition_coordinator is not None:
+            self._nutrition_coordinator.on_ordinary_turn_start(message)
         task = asyncio.create_task(
             self._process_message(message, session_key),
             name=f"ohmo-session:{session_key}",
         )
         self._session_tasks[session_key] = task
         self._inflight[session_key] = message
-        task.add_done_callback(lambda finished, key=session_key: self._cleanup_task(key, finished))
+        task.add_done_callback(
+            lambda finished, key=session_key, started_message=message: self._cleanup_task(
+                key, finished, started_message
+            )
+        )
 
     def _next_flush_timeout(self) -> float:
         if not self._pending_deadline:
@@ -737,11 +743,19 @@ class OhmoGatewayBridge:
             )
         )
 
-    def _cleanup_task(self, session_key: str, task: asyncio.Task[None]) -> None:
+    def _cleanup_task(
+        self,
+        session_key: str,
+        task: asyncio.Task[None],
+        started_message: InboundMessage | None = None,
+    ) -> None:
         current = self._session_tasks.get(session_key)
+        message = started_message or self._inflight.get(session_key)
         if current is task:
             self._session_tasks.pop(session_key, None)
             self._inflight.pop(session_key, None)
+        if message is not None and self._nutrition_coordinator is not None:
+            self._nutrition_coordinator.on_ordinary_turn_finish(message)
         self._session_cancel_reasons.pop(session_key, None)
 
     def _should_process_message(self, message: InboundMessage) -> bool:
