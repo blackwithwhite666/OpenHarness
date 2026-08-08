@@ -56,6 +56,8 @@ _COMPACT_IDLE_S = 90.0  # no new event for this long → the turn likely died; s
 _COMPACT_TAIL = 3  # rolling number of recent step lines shown under the spinner
 _COMPACT_LINE_MAX = 160  # per-step line truncation
 _COMPACT_TOOL_LABEL_MAX = 160
+_TODO_PANEL_TITLE = "📋 To-do"
+_TODO_PANEL_MAX = TELEGRAM_MAX_MESSAGE_LEN
 
 
 def _compact_step_line(text: str) -> str:
@@ -75,12 +77,89 @@ class _CompactStatus:
     lines: deque[str] = field(default_factory=deque)
     tool_rows: dict[str, tuple[str, str, bool]] = field(default_factory=dict)
     tool_line_positions: dict[str, int] = field(default_factory=dict)
+    todo_text: str | None = None
     invalid_tool_event_seq: int = 0
     spinner_idx: int = 0
     dirty: bool = True
     tick: float = _COMPACT_TICK
     last_event: float = 0.0
     anim: asyncio.Task | None = None
+
+
+@dataclass
+class _TodoPanel:
+    """Single-writer state for one detailed todo panel in a chat."""
+
+    message_id: int | None = None
+    desired_text: str | None = None
+    plan_id: str | None = None
+    version: int = 0
+    task: asyncio.Task | None = None
+    retry_after: float = 0.0
+
+
+def _todo_event(metadata: object) -> dict[str, object] | None:
+    """Return a validated structured todo event, if present."""
+    if not isinstance(metadata, dict) or metadata.get("kind") != "todo":
+        return None
+    if metadata.get("changed") is not True:
+        return None
+    todos = metadata.get("todos")
+    if todos is None:
+        snapshot = metadata.get("snapshot")
+        todos = snapshot.get("todos") if isinstance(snapshot, dict) else None
+    if not isinstance(todos, list):
+        return None
+    return {**metadata, "todos": todos}
+
+
+def _render_todo_panel(event: dict[str, object]) -> str | None:
+    """Render trusted typed todo rows and bound the result for Telegram."""
+    todos = event.get("todos")
+    if not isinstance(todos, list):
+        return None
+    if not todos:
+        return None
+    markers = {
+        "pending": "⬜",
+        "in_progress": "⏳",
+        "completed": "✅",
+        "blocked": "⛔",
+    }
+    rows: list[str] = []
+    for item in todos:
+        if not isinstance(item, dict):
+            return None
+        content = item.get("content")
+        status = item.get("status")
+        if not isinstance(content, str) or status not in markers:
+            return None
+        row = f"{markers[status]} {content.strip()}"
+        if status == "blocked":
+            reason = item.get("blocked_reason")
+            if not isinstance(reason, str) or not reason.strip():
+                return None
+            row += f" — {reason.strip()}"
+        rows.append(row)
+    text = _TODO_PANEL_TITLE + "\n" + "\n".join(rows)
+    if len(text) > _TODO_PANEL_MAX:
+        text = text[: _TODO_PANEL_MAX - 2].rstrip() + "…"
+    return text
+
+
+def _todo_panel_lost(error: BaseException) -> bool:
+    message = str(error).lower()
+    return any(
+        marker in message
+        for marker in (
+            "message to edit not found",
+            "message not found",
+            "message can't be edited",
+            "message cannot be edited",
+            "message is too old",
+            "does not exist",
+        )
+    )
 
 
 def _compact_tool_event(metadata: object) -> dict[str, object] | None:
@@ -575,6 +654,8 @@ class TelegramChannel(BaseChannel):
         self._chat_ids: dict[str, int] = {}  # Map sender_id to chat_id for replies
         self._typing_tasks: dict[str, asyncio.Task] = {}  # chat_id -> typing loop task
         self._status: dict[str, _CompactStatus] = {}  # chat_id -> live compact status
+        self._todo_panels: dict[str, _TodoPanel] = {}  # chat_id -> detailed panel
+        self._todo_writers_enabled = True
         self._media_group_buffers: dict[str, dict] = {}
         self._media_group_tasks: dict[str, asyncio.Task] = {}
         # Last known location per chat. ANY inbound location (pin / venue / live
@@ -592,6 +673,7 @@ class TelegramChannel(BaseChannel):
             return
 
         self._running = True
+        self._todo_writers_enabled = True
         self.last_error = None
         self.polling_started = False
         silence_telegram_token_url_loggers()
@@ -675,6 +757,16 @@ class TelegramChannel(BaseChannel):
             if status.anim is not None and not status.anim.done():
                 status.anim.cancel()
         self._status.clear()
+
+        self._todo_writers_enabled = False
+        todo_tasks = []
+        for panel in list(self._todo_panels.values()):
+            if panel.task is not None and not panel.task.done():
+                panel.task.cancel()
+                todo_tasks.append(panel.task)
+        if todo_tasks:
+            await asyncio.gather(*todo_tasks, return_exceptions=True)
+        self._todo_panels.clear()
 
         for task in self._media_group_tasks.values():
             task.cancel()
@@ -935,12 +1027,30 @@ class TelegramChannel(BaseChannel):
         native_message_ids: list[int | str] = []
 
         chat_key = str(msg.chat_id)
+        raw_progress_event = msg.metadata.get("progress_event")
+        todo_event = _todo_event(raw_progress_event)
+        if (
+            isinstance(raw_progress_event, dict)
+            and raw_progress_event.get("kind") == "todo"
+            and todo_event is None
+        ):
+            # ``changed=False`` and malformed snapshots are strict no-ops,
+            # including when a stale human-readable content field is present.
+            return self._receipt(msg, native_message_ids)
+
+        # Detailed todo progress has its own edit-in-place panel.  It is not
+        # governed by the ordinary progress/tool-hint switches and never falls
+        # through to the normal send path.
+        if todo_event is not None and not msg.metadata.get("_collapse"):
+            await self._debug_todo_progress(chat_key, chat_id, todo_event)
+            return self._receipt(msg, native_message_ids)
 
         # Compact progress: fold this event into the chat's single live status
         # message (spinner-animated, edited in place) instead of a fresh message.
         progress_event = _compact_tool_event(msg.metadata.get("progress_event"))
         if msg.metadata.get("_collapse") and (
             progress_event is not None
+            or todo_event is not None
             or (msg.content and msg.content != "[empty message]")
         ):
             await self._compact_progress(
@@ -948,12 +1058,19 @@ class TelegramChannel(BaseChannel):
                 chat_id,
                 msg.content,
                 progress_event=progress_event,
+                todo_event=todo_event,
             )
             return self._receipt(msg, native_message_ids)
 
         # Any non-collapse send (final answer, error, command reply, /stop notify)
         # ends the collapsed run: tear the status message down before sending, so
         # the chat is left with just the user's message + the real answer.
+        if not msg.metadata.get("_progress", False):
+            # Detailed todo panels have their own writer.  Await it before the
+            # final/command/error send so the latest panel edit or completed
+            # cleanup is visible first.  A non-empty (including blocked) panel
+            # remains tracked; only its pending write is flushed.
+            await self._flush_todo_panels(chat_key)
         await self._clear_compact_status(chat_key)
 
         # Only stop typing indicator for final responses
@@ -1078,8 +1195,14 @@ class TelegramChannel(BaseChannel):
     def _render_status(self, status: _CompactStatus) -> str:
         """Spinner header + the rolling tail of recent step lines."""
         head = f"{_SPINNER_FRAMES[status.spinner_idx]} Работаю…"
-        body = "\n".join(status.lines)
-        return f"{head}\n{body}" if body else head
+        sections = list(status.lines)
+        if status.todo_text:
+            sections.append(status.todo_text)
+        body = "\n".join(sections)
+        rendered = f"{head}\n{body}" if body else head
+        if len(rendered) > TELEGRAM_MAX_MESSAGE_LEN:
+            rendered = rendered[: TELEGRAM_MAX_MESSAGE_LEN - 2].rstrip() + "…"
+        return rendered
 
     async def _compact_progress(
         self,
@@ -1088,6 +1211,7 @@ class TelegramChannel(BaseChannel):
         content: str,
         *,
         progress_event: dict[str, object] | None = None,
+        todo_event: dict[str, object] | None = None,
     ) -> None:
         """Fold one progress event into the chat's single live status message.
 
@@ -1095,11 +1219,20 @@ class TelegramChannel(BaseChannel):
         Subsequent events → append the step and mark dirty; the loop (the single
         writer) performs the throttled ``edit_message_text``.
         """
+        todo_text = _render_todo_panel(todo_event) if todo_event is not None else None
+        if todo_event is not None and todo_text is None and todo_event.get("todos") != []:
+            # An empty changed snapshot removes the section.  A malformed event
+            # is ignored, just like an unchanged snapshot.
+            return
         status = self._status.get(chat_key)
         if status is None:
+            if todo_event is not None and todo_text is None:
+                return
             status = _CompactStatus(message_id=0, last_event=time.monotonic())
             if progress_event is not None:
                 self._record_compact_tool_event(status, progress_event)
+            elif todo_event is not None:
+                status.todo_text = todo_text
             else:
                 line = _compact_step_line(content)
                 if line:
@@ -1119,6 +1252,11 @@ class TelegramChannel(BaseChannel):
             return
         if progress_event is not None:
             self._record_compact_tool_event(status, progress_event)
+        elif todo_event is not None:
+            status.todo_text = todo_text
+            if status.todo_text is None and not status.lines:
+                await self._clear_compact_status(chat_key)
+                return
         else:
             line = _compact_step_line(content)
             if line:
@@ -1169,6 +1307,127 @@ class TelegramChannel(BaseChannel):
         status.tool_line_positions[call_id] = len(status.lines)
         status.lines.append(_compact_tool_row(label, state))
         self._trim_compact_ordinary_lines(status)
+
+    async def _debug_todo_progress(
+        self, chat_key: str, chat_id: int, event: dict[str, object]
+    ) -> None:
+        """Queue one detailed todo-panel snapshot for the single panel writer."""
+        state = self._todo_panels.get(chat_key)
+        if state is None:
+            state = _TodoPanel()
+            self._todo_panels[chat_key] = state
+        plan_id = event.get("session_id") or event.get("plan_id")
+        if isinstance(plan_id, str) and state.plan_id not in (None, plan_id):
+            # A new active plan must not reuse a panel belonging to a previous
+            # plan.  The writer deletes it before sending the new snapshot.
+            state.desired_text = None
+            state.version += 1
+            if state.task is None or state.task.done():
+                state.task = asyncio.create_task(
+                    self._write_todo_panel(chat_key, chat_id, state),
+                    name=f"telegram-todo-panel:{chat_key}",
+                )
+            await self._flush_todo_panels(chat_key)
+            if self._todo_panels.get(chat_key) is not state:
+                state = _TodoPanel(plan_id=plan_id)
+                self._todo_panels[chat_key] = state
+            elif state.message_id is not None:
+                # A failed delete must not turn the old panel into the new
+                # plan's panel or create a duplicate beside it.  Keep the old
+                # state recoverable and wait for a later snapshot to retry.
+                return
+            else:
+                state.plan_id = plan_id
+        elif isinstance(plan_id, str):
+            state.plan_id = plan_id
+        state.desired_text = _render_todo_panel(event)
+        state.version += 1
+        if state.task is None or state.task.done():
+            state.task = asyncio.create_task(
+                self._write_todo_panel(chat_key, chat_id, state),
+                name=f"telegram-todo-panel:{chat_key}",
+            )
+
+    async def _write_todo_panel(
+        self, chat_key: str, chat_id: int, state: _TodoPanel
+    ) -> None:
+        """Single writer: latest desired state wins, with no duplicate sends."""
+        while self._todo_writers_enabled and self._todo_panels.get(chat_key) is state:
+            # Let a burst of synchronous producers settle before the first
+            # network request. Tests can await the explicit flush seam.
+            await asyncio.sleep(0)
+            if not self._todo_writers_enabled or self._todo_panels.get(chat_key) is not state:
+                return
+            version = state.version
+            desired = state.desired_text
+            try:
+                if desired is None:
+                    if state.message_id is not None:
+                        message_id = state.message_id
+                        await self._app.bot.delete_message(
+                            chat_id=chat_id, message_id=message_id
+                        )
+                        if not self._todo_writers_enabled or self._todo_panels.get(chat_key) is not state:
+                            return
+                        state.message_id = None
+                elif state.message_id is None:
+                    sent = await self._app.bot.send_message(
+                        chat_id=chat_id, text=desired, parse_mode=None
+                    )
+                    if not self._todo_writers_enabled or self._todo_panels.get(chat_key) is not state:
+                        return
+                    state.message_id = sent.message_id
+                else:
+                    await self._app.bot.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=state.message_id,
+                        text=desired,
+                        parse_mode=None,
+                    )
+            except RetryAfter as error:
+                if not self._todo_writers_enabled or self._todo_panels.get(chat_key) is not state:
+                    return
+                state.retry_after = max(state.retry_after, float(error.retry_after) + 0.5)
+                await asyncio.sleep(state.retry_after)
+                continue
+            except BadRequest as error:
+                if "not modified" in str(error).lower():
+                    pass
+                elif state.message_id is not None and _todo_panel_lost(error):
+                    # The next pass recreates exactly one panel from the
+                    # latest desired snapshot.
+                    if not self._todo_writers_enabled or self._todo_panels.get(chat_key) is not state:
+                        return
+                    state.message_id = None
+                    continue
+                else:
+                    logger.debug("todo panel request failed chat=%s: %s", chat_key, error)
+                    break
+            except Exception as error:  # noqa: BLE001
+                # Unknown failures are not safe to retry: a send may have
+                # succeeded remotely. Keep the id/state and wait for the
+                # next changed snapshot rather than duplicating a panel.
+                logger.debug("todo panel request failed chat=%s: %s", chat_key, error)
+                break
+            if state.version == version:
+                if desired is None and self._todo_panels.get(chat_key) is state:
+                    # A stable empty snapshot has been applied.  Remove the
+                    # in-memory state too, but only after the version check so
+                    # a newer non-empty snapshot cannot be popped.
+                    self._todo_panels.pop(chat_key, None)
+                break
+
+    async def _flush_todo_panels(self, chat_key: str | None = None) -> None:
+        """Deterministic test/maintenance seam for pending panel writers."""
+        tasks = [
+            state.task
+            for key, state in self._todo_panels.items()
+            if (chat_key is None or key == chat_key)
+            and state.task is not None
+            and not state.task.done()
+        ]
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     @staticmethod
     def _trim_compact_ordinary_lines(status: _CompactStatus) -> None:

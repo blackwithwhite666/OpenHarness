@@ -144,6 +144,29 @@ async def test_collapse_progress_bypasses_progress_and_tool_hint_drop() -> None:
 
 
 @pytest.mark.asyncio
+async def test_telegram_todo_progress_bypasses_generic_progress_switches() -> None:
+    channel = _FakeChannel(raise_on_send=False)
+    manager = _manager_flags(channel, send_progress=False, send_tool_hints=False)
+    todo = OutboundMessage(
+        channel="telegram",
+        chat_id="1",
+        content="",
+        metadata={
+            "_progress": True,
+            "progress_event": {
+                "kind": "todo",
+                "todos": [{"content": "A", "status": "pending"}],
+                "changed": True,
+            },
+        },
+    )
+
+    await _dispatch_one(manager, todo)
+
+    assert channel.sent == [todo]
+
+
+@pytest.mark.asyncio
 async def test_success_hook_receives_optional_receipt() -> None:
     receipts = []
 

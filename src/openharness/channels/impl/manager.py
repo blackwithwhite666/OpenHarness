@@ -236,7 +236,13 @@ class ChannelManager:
                     timeout=1.0
                 )
 
-                if msg.metadata.get("_progress") and not msg.metadata.get("_collapse"):
+                progress_event = msg.metadata.get("progress_event")
+                telegram_todo = (
+                    msg.channel == "telegram"
+                    and isinstance(progress_event, dict)
+                    and progress_event.get("kind") == "todo"
+                )
+                if msg.metadata.get("_progress") and not msg.metadata.get("_collapse") and not telegram_todo:
                     if msg.metadata.get("_tool_hint") and not self.config.channels.send_tool_hints:
                         continue
                     if not msg.metadata.get("_tool_hint") and not self.config.channels.send_progress:

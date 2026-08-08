@@ -4,6 +4,7 @@ answer is sent."""
 
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 
 import pytest
@@ -118,6 +119,23 @@ def _todo_progress(
 
 def _final(chat_id: str, text: str) -> OutboundMessage:
     return OutboundMessage(channel="telegram", chat_id=chat_id, content=text, metadata={})
+
+
+def _debug_todo(chat_id: str, todos: list[dict], *, changed: bool = True, session_id: str = "plan-1") -> OutboundMessage:
+    return OutboundMessage(
+        channel="telegram",
+        chat_id=chat_id,
+        content="",
+        metadata={
+            "_progress": True,
+            "progress_event": {
+                "kind": "todo",
+                "todos": todos,
+                "changed": changed,
+                "session_id": session_id,
+            },
+        },
+    )
 
 
 def _kill_anim(channel: TelegramChannel, chat_id: str) -> None:
@@ -525,4 +543,277 @@ async def test_repeated_todo_snapshots_update_one_compact_panel():
         )
     )
 
-    assert list(ch._status["424242"].lines) == ["📋 To-do\n✅ Step A"]
+    assert list(ch._status["424242"].lines) == []
+    assert ch._status["424242"].todo_text == "📋 To-do\n✅ Step A"
+
+
+@pytest.mark.asyncio
+async def test_compact_todo_empty_removes_only_todo_section_and_final_clears_status():
+    bot = FakeBot()
+    ch = _channel(bot)
+    todo = [{"content": "Plan", "status": "pending"}]
+    await ch.send(_progress("42", "ordinary"))
+    await ch.send(_todo_progress("42", "", snapshot={"todos": todo}, changed=True))
+    assert ch._status["42"].todo_text == "📋 To-do\n⬜ Plan"
+    await ch.send(_todo_progress("42", "stale", snapshot={"todos": todo}, changed=False))
+    assert ch._status["42"].todo_text == "📋 To-do\n⬜ Plan"
+    await ch.send(_todo_progress("42", "", snapshot={"todos": []}, changed=True))
+    assert "42" in ch._status
+    assert ch._status["42"].todo_text is None
+    assert list(ch._status["42"].lines) == ["ordinary"]
+
+    await ch.send(_final("42", "answer"))
+    assert "42" not in ch._status
+
+
+@pytest.mark.asyncio
+async def test_compact_todo_only_empty_snapshot_deletes_status_once():
+    bot = FakeBot()
+    ch = _channel(bot)
+    todo = [{"content": "Plan", "status": "pending"}]
+
+    await ch.send(_todo_progress("42", "", snapshot={"todos": todo}, changed=True))
+    _kill_anim(ch, "42")
+    await ch.send(_todo_progress("42", "", snapshot={"todos": []}, changed=True))
+
+    assert "42" not in ch._status
+    assert bot.count("delete_message") == 1
+
+
+@pytest.mark.asyncio
+async def test_compact_todo_rows_are_typed_bounded_and_coexist_with_tools():
+    bot = FakeBot()
+    ch = _channel(bot)
+    rows = [
+        {"content": "pending", "status": "pending"},
+        {"content": "working", "status": "in_progress"},
+        {"content": "done", "status": "completed"},
+        {"content": "blocked", "status": "blocked", "blocked_reason": "waiting for user"},
+    ] + [{"content": f"long-{i}-" + "x" * 500, "status": "pending"} for i in range(20)]
+    await ch.send(_progress("42", "ordinary"))
+    await ch.send(
+        _tool_progress(
+            "42", "payload", tool_name="bash", tool_call_id="call", display_label="Bash",
+            phase="started", status="running",
+        )
+    )
+    await ch.send(_todo_progress("42", "", snapshot={"todos": rows}, changed=True))
+    text = ch._render_status(ch._status["42"])
+    assert len(text) <= 4000
+    assert "⬜ pending" in text
+    assert "⏳ working" in text
+    assert "✅ done" in text
+    assert "⛔ blocked — waiting for user" in text
+    assert "Bash ⏳" in text
+    assert "ordinary" in text
+
+
+@pytest.mark.asyncio
+async def test_debug_todo_panel_sends_once_then_edits_same_message_and_coalesces():
+    bot = FakeBot()
+    ch = _channel(bot)
+    first = [{"content": "A", "status": "pending"}]
+    second = [{"content": "A", "status": "completed"}]
+    await ch.send(_debug_todo("42", first))
+    await ch._flush_todo_panels("42")
+    assert bot.count("send_message") == 1
+    panel_id = ch._todo_panels["42"].message_id
+
+    await ch.send(_debug_todo("42", first, changed=False))
+    await ch._flush_todo_panels("42")
+    assert bot.count("edit_message_text") == 0
+
+    await ch.send(_debug_todo("42", second))
+    await ch.send(_debug_todo("42", [{"content": "A", "status": "completed"}, {"content": "B", "status": "pending"}]))
+    await ch._flush_todo_panels("42")
+    assert bot.count("send_message") == 1
+    assert bot.count("edit_message_text") == 1
+    assert bot.calls[-1][1]["message_id"] == panel_id
+    assert "B" in bot.calls[-1][1]["text"]
+
+
+@pytest.mark.asyncio
+async def test_debug_todo_panel_blocked_long_list_and_empty_cleanup():
+    bot = FakeBot()
+    ch = _channel(bot)
+    rows = [{"content": "blocked", "status": "blocked", "blocked_reason": "need input"}]
+    rows.extend({"content": str(i) * 500, "status": "pending"} for i in range(20))
+    await ch.send(_debug_todo("42", rows))
+    await ch._flush_todo_panels("42")
+    assert len(bot.calls[-1][1]["text"]) <= 4000
+    assert "⛔ blocked — need input" in bot.calls[-1][1]["text"]
+    await ch.send(_debug_todo("42", []))
+    await ch._flush_todo_panels("42")
+    assert bot.count("delete_message") == 1
+    assert "42" not in ch._todo_panels
+
+
+@pytest.mark.asyncio
+async def test_debug_todo_blocked_panel_flushes_before_final_and_remains_tracked():
+    bot = FakeBot()
+    ch = _channel(bot)
+
+    await ch.send(
+        _debug_todo(
+            "42",
+            [{"content": "Need input", "status": "blocked", "blocked_reason": "user"}],
+        )
+    )
+    await ch.send(_final("42", "answer"))
+
+    assert bot.calls[0][0] == "send_message"
+    assert bot.calls[-1][0] == "send_message"
+    assert bot.calls[-1][1]["text"] == "answer"
+    assert "42" in ch._todo_panels
+    assert ch._todo_panels["42"].message_id is not None
+
+
+@pytest.mark.asyncio
+async def test_debug_todo_empty_cleanup_flushes_before_final_and_removes_state():
+    bot = FakeBot()
+    ch = _channel(bot)
+
+    await ch.send(_debug_todo("42", [{"content": "A", "status": "pending"}]))
+    await ch._flush_todo_panels("42")
+    await ch.send(_debug_todo("42", []))
+    await ch.send(_final("42", "answer"))
+
+    assert [name for name, _ in bot.calls] == [
+        "send_message",
+        "delete_message",
+        "send_message",
+    ]
+    assert bot.calls[-1][1]["text"] == "answer"
+    assert "42" not in ch._todo_panels
+
+
+@pytest.mark.asyncio
+async def test_debug_todo_new_session_deletes_old_panel_before_sending_new_one():
+    bot = FakeBot()
+    ch = _channel(bot)
+
+    await ch.send(_debug_todo("42", [{"content": "old", "status": "pending"}], session_id="old"))
+    await ch._flush_todo_panels("42")
+    old_message_id = ch._todo_panels["42"].message_id
+
+    await ch.send(_debug_todo("42", [{"content": "new", "status": "pending"}], session_id="new"))
+    await ch._flush_todo_panels("42")
+
+    assert [name for name, _ in bot.calls] == [
+        "send_message",
+        "delete_message",
+        "send_message",
+    ]
+    assert bot.calls[1][1]["message_id"] == old_message_id
+    assert ch._todo_panels["42"].plan_id == "new"
+    assert ch._todo_panels["42"].message_id != old_message_id
+
+
+@pytest.mark.asyncio
+async def test_debug_todo_writer_is_joined_and_cannot_mutate_after_shutdown():
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    class BlockingBot(FakeBot):
+        async def send_message(self, **kwargs):
+            self.calls.append(("send_message", kwargs))
+            started.set()
+            await release.wait()
+            self._next_id += 1
+            return SimpleNamespace(message_id=self._next_id)
+
+    bot = BlockingBot()
+    ch = _channel(bot)
+    ch._app.updater = SimpleNamespace(stop=lambda: asyncio.sleep(0))
+    ch._app.stop = lambda: asyncio.sleep(0)
+    ch._app.shutdown = lambda: asyncio.sleep(0)
+
+    await ch.send(_debug_todo("42", [{"content": "A", "status": "pending"}]))
+    await started.wait()
+    task = ch._todo_panels["42"].task
+    await ch.stop()
+    await asyncio.sleep(0)
+
+    assert task is not None and task.done()
+    assert ch._todo_panels == {}
+    assert bot.count("send_message") == 1
+
+
+@pytest.mark.asyncio
+async def test_debug_todo_panel_recreates_lost_message_without_duplicates():
+    class LostBot(FakeBot):
+        def __init__(self):
+            super().__init__()
+            self.lost_once = True
+
+        async def edit_message_text(self, **kwargs):
+            self.calls.append(("edit_message_text", kwargs))
+            if self.lost_once:
+                self.lost_once = False
+                raise BadRequest("Message to edit not found")
+
+    bot = LostBot()
+    ch = _channel(bot)
+    await ch.send(_debug_todo("42", [{"content": "A", "status": "pending"}]))
+    await ch._flush_todo_panels("42")
+    first_id = ch._todo_panels["42"].message_id
+    await ch.send(_debug_todo("42", [{"content": "A", "status": "completed"}]))
+    await ch._flush_todo_panels("42")
+    assert bot.count("send_message") == 2
+    assert bot.count("edit_message_text") == 1
+    assert ch._todo_panels["42"].message_id != first_id
+
+
+@pytest.mark.asyncio
+async def test_debug_todo_panel_handles_retry_after_and_not_modified():
+    class RetryBot(FakeBot):
+        def __init__(self, error):
+            super().__init__()
+            self.error = error
+
+        async def edit_message_text(self, **kwargs):
+            self.calls.append(("edit_message_text", kwargs))
+            if self.error is not None:
+                error, self.error = self.error, None
+                raise error
+
+    bot = RetryBot(RetryAfter(0))
+    ch = _channel(bot)
+    await ch.send(_debug_todo("42", [{"content": "A", "status": "pending"}]))
+    await ch._flush_todo_panels("42")
+    await ch.send(_debug_todo("42", [{"content": "A", "status": "completed"}]))
+    await ch._flush_todo_panels("42")
+    assert ch._todo_panels["42"].message_id is not None
+
+    not_modified_bot = RetryBot(BadRequest("Message is not modified"))
+    not_modified = _channel(not_modified_bot)
+    await not_modified.send(_debug_todo("42", [{"content": "A", "status": "pending"}]))
+    await not_modified._flush_todo_panels("42")
+    await not_modified.send(_debug_todo("42", [{"content": "A", "status": "completed"}]))
+    await not_modified._flush_todo_panels("42")
+    assert not_modified._todo_panels["42"].message_id is not None
+
+
+@pytest.mark.asyncio
+async def test_debug_todo_panel_does_not_recreate_after_unknown_edit_error():
+    class UnknownBot(FakeBot):
+        def __init__(self):
+            super().__init__()
+            self.fail = True
+
+        async def edit_message_text(self, **kwargs):
+            self.calls.append(("edit_message_text", kwargs))
+            if self.fail:
+                self.fail = False
+                raise RuntimeError("network status unknown")
+
+    bot = UnknownBot()
+    ch = _channel(bot)
+    await ch.send(_debug_todo("42", [{"content": "A", "status": "pending"}]))
+    await ch._flush_todo_panels("42")
+    await ch.send(_debug_todo("42", [{"content": "A", "status": "completed"}]))
+    await ch._flush_todo_panels("42")
+    await ch.send(_debug_todo("42", [{"content": "A", "status": "blocked", "blocked_reason": "user"}]))
+    await ch._flush_todo_panels("42")
+    assert bot.count("send_message") == 1
+    assert bot.count("edit_message_text") == 2

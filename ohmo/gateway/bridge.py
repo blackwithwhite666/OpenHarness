@@ -628,7 +628,12 @@ class OhmoGatewayBridge:
                     continue
                 progress_event = (update.metadata or {}).get("progress_event")
                 has_structured_progress = (
-                    isinstance(progress_event, dict) and progress_event.get("kind") == "tool"
+                    isinstance(progress_event, dict)
+                    and progress_event.get("kind") == "tool"
+                ) or (
+                    message.channel == "telegram"
+                    and isinstance(progress_event, dict)
+                    and progress_event.get("kind") == "todo"
                 )
                 if not update.text and not has_structured_progress:
                     continue

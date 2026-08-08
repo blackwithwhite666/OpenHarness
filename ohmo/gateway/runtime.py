@@ -75,7 +75,7 @@ from ohmo.session_storage import (
     get_session_work_dir,
     reap_stale_work_dirs,
 )
-from ohmo.todo_store import TodoStore
+from ohmo.todo_store import TodoStore, canonicalize_todos
 from ohmo.todo_write_tool import OhmoTodoWriteTool
 from ohmo.workspace import (
     get_memory_dir,
@@ -1316,7 +1316,11 @@ class OhmoSessionRuntimePool:
                 )
                 if todo_lifecycle:
                     try:
-                        self._finalize_todo_after_successful_answer(session_id=bundle.session_id)
+                        cleanup = self._todo_cleanup_update(
+                            bundle=bundle, session_key=session_key
+                        )
+                        if cleanup is not None:
+                            yield cleanup
                     except Exception:
                         logger.warning(
                             "ohmo.todo.cleanup_failure session_id=%s",
@@ -1555,7 +1559,11 @@ class OhmoSessionRuntimePool:
             )
             if todo_lifecycle:
                 try:
-                    self._finalize_todo_after_successful_answer(session_id=bundle.session_id)
+                    cleanup = self._todo_cleanup_update(
+                        bundle=bundle, session_key=session_key
+                    )
+                    if cleanup is not None:
+                        yield cleanup
                 except Exception:
                     logger.warning(
                         "ohmo.todo.cleanup_failure session_id=%s",
@@ -1768,34 +1776,40 @@ class OhmoSessionRuntimePool:
             if event.tool_name == "todo_write":
                 metadata = event.metadata if isinstance(event.metadata, dict) else {}
                 changed = metadata.get("changed")
-                if changed is False:
+                if not event.is_error and changed is False:
                     logger.info(
                         "ohmo.todo.write.noop session_id=%s",
                         bundle.session_id,
                     )
                 todos = metadata.get("todos")
-                if isinstance(todos, list):
+                canonical_todos = None
+                if not event.is_error and changed is True and isinstance(todos, list):
+                    try:
+                        canonical_todos = canonicalize_todos(todos)
+                    except (TypeError, ValueError):
+                        canonical_todos = None
+                if canonical_todos is not None:
                     blocked_count = sum(
-                        isinstance(item, dict) and item.get("status") == "blocked"
-                        for item in todos
+                        item.get("status") == "blocked" for item in canonical_todos
                     )
-                    if changed is True and blocked_count:
+                    if blocked_count:
                         logger.info(
                             "ohmo.todo.blocked.persisted session_id=%s count=%s",
                             bundle.session_id,
                             blocked_count,
                         )
-                # Render the updated per-session list as a compact checklist
-                # (Claude-Code todo panel) instead of the per-item JSON.
-                checklist = _render_todo_checklist(self._todo_store.active_path(bundle.session_id))
-                if checklist:
                     yield GatewayStreamUpdate(
-                        kind="tool_hint",
-                        text=checklist,
+                        kind="progress",
+                        text="",
                         metadata={
                             "_progress": True,
-                            "_tool_hint": True,
                             "_session_key": session_key,
+                            "progress_event": {
+                                "kind": "todo",
+                                "todos": canonical_todos,
+                                "changed": True,
+                                "session_id": str(bundle.session_id),
+                            },
                         },
                     )
                 return
@@ -2221,6 +2235,27 @@ class OhmoSessionRuntimePool:
             fresh,
         )
         return True
+
+    def _todo_cleanup_update(
+        self, *, bundle: RuntimeBundle, session_key: str
+    ) -> GatewayStreamUpdate | None:
+        """Return the post-final empty todo snapshot when cleanup succeeded."""
+        if not self._finalize_todo_after_successful_answer(session_id=bundle.session_id):
+            return None
+        return GatewayStreamUpdate(
+            kind="progress",
+            text="",
+            metadata={
+                "_progress": True,
+                "_session_key": session_key,
+                "progress_event": {
+                    "kind": "todo",
+                    "todos": [],
+                    "changed": True,
+                    "session_id": str(bundle.session_id),
+                },
+            },
+        )
 
     async def _runtime_system_prompt(
         self,

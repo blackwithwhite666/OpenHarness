@@ -30,8 +30,8 @@ from openharness.engine.stream_events import (
 from openharness.tools.base import ToolExecutionContext, ToolRegistry
 
 
-async def test_noop_todo_write_still_renders_the_full_checklist(tmp_path: Path):
-    """Characterize the runtime's post-write checklist emission for a no-op."""
+async def test_noop_todo_write_emits_no_progress_event(tmp_path: Path):
+    """An unchanged canonical snapshot is a strict runtime no-op."""
     store = TodoStore(tmp_path)
     sid = "noop-progress-01"
     tool = OhmoTodoWriteTool(store, lambda: sid)
@@ -60,7 +60,65 @@ async def test_noop_todo_write_still_renders_the_full_checklist(tmp_path: Path):
     ]
 
     assert '"changed": false' in result.output
-    assert [update.text for update in updates] == ["📋 To-do\n⬜ Step A"]
+    assert updates == []
+
+
+@pytest.mark.parametrize("metadata", [{"changed": False, "todos": [{"content": "A", "status": "pending"}]}, {"changed": True, "todos": [{"content": "A", "status": "unknown"}]}])
+async def test_todo_write_unchanged_or_malformed_metadata_emits_no_event(
+    tmp_path: Path, metadata: dict
+):
+    runtime = object.__new__(OhmoSessionRuntimePool)
+    event = ToolExecutionCompleted(
+        tool_name="todo_write", output="provider payload", metadata=metadata
+    )
+    updates = [
+        update
+        async for update in runtime._convert_stream_event(
+            event=event,
+            bundle=SimpleNamespace(session_id="session"),
+            message=InboundMessage(channel="telegram", sender_id="u", chat_id="c", content="x"),
+            session_key="telegram:c",
+            content="x",
+            reply_parts=[],
+        )
+    ]
+    assert updates == []
+
+
+async def test_changed_todo_write_emits_canonical_typed_event_without_provider_text(
+    tmp_path: Path,
+):
+    runtime = object.__new__(OhmoSessionRuntimePool)
+    event = ToolExecutionCompleted(
+        tool_name="todo_write",
+        output='{"todos": [{"content": "A", "status": "pending"}]}',
+        metadata={
+            "changed": True,
+            "todos": [
+                {"content": "A", "status": "pending"},
+                {"content": "B", "status": "blocked", "blocked_reason": "user"},
+            ],
+        },
+    )
+    updates = [
+        update
+        async for update in runtime._convert_stream_event(
+            event=event,
+            bundle=SimpleNamespace(session_id="session"),
+            message=InboundMessage(channel="telegram", sender_id="u", chat_id="c", content="x"),
+            session_key="telegram:c",
+            content="x",
+            reply_parts=[],
+        )
+    ]
+    assert len(updates) == 1
+    assert updates[0].text == ""
+    assert updates[0].metadata["progress_event"] == {
+        "kind": "todo",
+        "todos": event.metadata["todos"],
+        "changed": True,
+        "session_id": "session",
+    }
 
 
 async def test_completed_snapshot_is_retained_until_successful_finalization(tmp_path: Path):
@@ -344,6 +402,10 @@ async def test_reconciliation_provider_or_tool_error_does_not_fake_completion(
     assert bundle.engine.internal_calls == 1
     assert not [update for update in updates if update.kind == "final"]
     assert store.read_snapshot(sid)[0][0]["status"] == "pending"
+    assert not any(
+        (update.metadata.get("progress_event") or {}).get("kind") == "todo"
+        for update in updates
+    )
 
 
 async def test_completed_cleanup_waits_for_final_yield_resume_and_aclose_keeps_plan(
@@ -394,6 +456,42 @@ async def test_fully_consumed_successful_final_archives_completed_plan(tmp_path:
 
     assert [update.text for update in updates if update.kind == "final"] == ["candidate"]
     assert store.read_snapshot(sid)[0] == []
+    cleanup = [
+        update
+        for update in updates
+        if (update.metadata.get("progress_event") or {}).get("kind") == "todo"
+    ]
+    assert len(cleanup) == 1
+    assert cleanup[0].metadata["progress_event"]["todos"] == []
+
+
+async def test_blocked_final_keeps_panel_state_and_emits_no_cleanup_event(tmp_path: Path):
+    store = TodoStore(tmp_path)
+    sid = "cleanup-blocked"
+    store.replace_snapshot(
+        sid, [{"content": "Need input", "status": "blocked", "blocked_reason": "user"}]
+    )
+    runtime, bundle, message = _lifecycle_runtime(store, sid, [])
+
+    updates = [
+        update
+        async for update in runtime._stream_engine_message(
+            bundle=bundle,
+            message=message,
+            session_key="telegram:chat",
+            user_prompt=message.content,
+            user_message=message.content,
+            turn_ctx=SimpleNamespace(),
+            memory_scope=None,
+        )
+    ]
+
+    assert [update.text for update in updates if update.kind == "final"] == ["candidate"]
+    assert store.read_snapshot(sid)[0][0]["status"] == "blocked"
+    assert not any(
+        (update.metadata.get("progress_event") or {}).get("kind") == "todo"
+        for update in updates
+    )
 
 
 async def test_cleanup_failure_is_logged_once_and_keeps_recoverable_plan(
@@ -424,6 +522,10 @@ async def test_cleanup_failure_is_logged_once_and_keeps_recoverable_plan(
         ]
 
     assert [update.text for update in updates if update.kind == "final"] == ["candidate"]
+    assert not any(
+        (update.metadata.get("progress_event") or {}).get("kind") == "todo"
+        for update in updates
+    )
     assert store.read_snapshot(sid)[0][0]["status"] == "completed"
     assert sum("ohmo.todo.cleanup_failure" in record.getMessage() for record in caplog.records) == 1
 
@@ -772,8 +874,34 @@ async def test_runtime_noop_logging_has_one_lifecycle_event(tmp_path: Path, capl
             )
         ]
 
-    assert [update.text for update in updates] == ["📋 To-do\n⬜ Step"]
+    assert updates == []
     assert sum("ohmo.todo.write.noop" in record.getMessage() for record in caplog.records) == 1
+
+
+async def test_errored_todo_write_changed_false_is_not_logged_as_noop(tmp_path: Path, caplog):
+    runtime = object.__new__(OhmoSessionRuntimePool)
+    with caplog.at_level(logging.INFO, logger="ohmo.gateway.runtime"):
+        updates = [
+            update
+            async for update in runtime._convert_stream_event(
+                event=ToolExecutionCompleted(
+                    tool_name="todo_write",
+                    output="todo storage failed",
+                    is_error=True,
+                    metadata={"changed": False, "todos": []},
+                ),
+                bundle=SimpleNamespace(session_id="errored-noop"),
+                message=InboundMessage(
+                    channel="telegram", sender_id="user", chat_id="chat", content="check"
+                ),
+                session_key="telegram:chat",
+                content="check",
+                reply_parts=[],
+            )
+        ]
+
+    assert updates == []
+    assert not any("ohmo.todo.write.noop" in record.getMessage() for record in caplog.records)
 
 
 async def test_blocked_noop_does_not_log_new_blocked_lifecycle_event(tmp_path: Path, caplog):
