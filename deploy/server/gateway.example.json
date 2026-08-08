@@ -4,6 +4,7 @@
   "session_routing": "chat-thread",
   "send_progress": true,
   "send_tool_hints": true,
+  "debug_progress_chats": [],
   "permission_mode": "default",
   "sandbox_enabled": false,
   "log_level": "INFO",

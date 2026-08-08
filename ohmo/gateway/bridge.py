@@ -12,17 +12,15 @@ import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 
-from openharness.channels.bus.events import InboundMessage
-from openharness.channels.bus.events import OutboundMessage
-from openharness.channels.bus.queue import MessageBus
-
 from ohmo.contact_registry import ContactStore
-from ohmo.group_registry import load_managed_group_record
 from ohmo.gateway.config import load_gateway_config, save_gateway_config
 from ohmo.gateway.router import session_key_for_message
 from ohmo.gateway.runtime import OhmoSessionRuntimePool
-from ohmo.workspace import get_gateway_interrupted_requests_path
+from ohmo.group_registry import load_managed_group_record
 from ohmo.nutrition_ingest.coordinator import NutritionIngestCoordinator
+from ohmo.workspace import get_gateway_interrupted_requests_path
+from openharness.channels.bus.events import InboundMessage, OutboundMessage
+from openharness.channels.bus.queue import MessageBus
 
 logger = logging.getLogger(__name__)
 
@@ -163,9 +161,7 @@ class OhmoGatewayBridge:
         message_coalesce_media_window: float = 0.0,
         message_coalesce_max: int = 20,
         contact_store: ContactStore | None = None,
-        compact_progress_default: bool = False,
-        compact_progress_chats: list[str] | None = None,
-        verbose_progress_chats: list[str] | None = None,
+        debug_progress_chats: list[str] | None = None,
         nutrition_coordinator: NutritionIngestCoordinator | None = None,
     ) -> None:
         self._bus = bus
@@ -184,13 +180,9 @@ class OhmoGatewayBridge:
         # In-flight dispatched turns, so a shutdown can record what it interrupts.
         self._inflight: dict[str, InboundMessage] = {}
         self._contact_store = contact_store
-        # Telegram progress defaults and per-chat overrides. Mutated live by
-        # /quiet and /verbose and persisted to gateway.json.
-        self._compact_progress_default = bool(compact_progress_default)
-        self._verbose_chats: set[str] = {str(c) for c in (verbose_progress_chats or [])}
-        self._compact_chats: set[str] = {
-            str(c) for c in (compact_progress_chats or [])
-        } - self._verbose_chats
+        # Telegram progress is quiet by default.  Only this exact chat-ID
+        # allowlist opts into detailed progress; /debug and /quiet mutate it.
+        self._debug_chats: set[str] = {str(c) for c in (debug_progress_chats or [])}
         self._nutrition_coordinator = nutrition_coordinator
 
     async def run(self) -> None:
@@ -236,13 +228,15 @@ class OhmoGatewayBridge:
             group_args = _parse_group_command(message.content)
             is_synthetic = bool(message.metadata.get("_synthetic")) or message.sender_id == "__scheduler__"
             is_special = (
-                stripped in ("/stop", "/restart", "/new", "/clear", "/quiet", "/verbose")
+                stripped in ("/stop", "/restart", "/new", "/clear", "/debug", "/quiet", "/verbose")
                 or group_args is not None
                 or is_synthetic
             )
 
             if is_special:
-                is_control = stripped in ("/stop", "/restart", "/new", "/clear", "/quiet", "/verbose")
+                is_control = stripped in (
+                    "/stop", "/restart", "/new", "/clear", "/debug", "/quiet", "/verbose"
+                )
                 # Dispatch any buffered plain messages first (arrival order, no
                 # loss), THEN handle the special message verbatim. Control
                 # commands stop/reset the session, so cancelling the just-flushed
@@ -260,8 +254,12 @@ class OhmoGatewayBridge:
                 if stripped in ("/new", "/clear"):
                     await self._handle_new(message, session_key)
                     continue
-                if stripped in ("/quiet", "/verbose"):
-                    await self._handle_compact_toggle(message, session_key, enable=stripped == "/quiet")
+                if stripped in ("/debug", "/quiet", "/verbose"):
+                    await self._handle_progress_toggle(
+                        message,
+                        session_key,
+                        enable_debug=stripped in ("/debug", "/verbose"),
+                    )
                     continue
                 if group_args is not None:
                     prepared = await self._prepare_group_prompt_message(message, session_key, group_args)
@@ -482,33 +480,27 @@ class OhmoGatewayBridge:
             message, session_key, "🧹 Контекст сброшен — начинаю новую сессию."
         )
 
-    async def _handle_compact_toggle(self, message, session_key: str, *, enable: bool) -> None:
-        """/quiet (enable) or /verbose (disable): set this chat's progress override.
-
-        Mutates the in-memory sets (read per-turn to tag ``_collapse``) and
-        persists both to gateway.json so the choice survives a restart. Does
-        NOT touch the running session — it takes effect on the next turn.
-        """
+    async def _handle_progress_toggle(
+        self, message, session_key: str, *, enable_debug: bool
+    ) -> None:
+        """Add or remove this Telegram chat from the detailed-progress allowlist."""
         chat_id = str(message.chat_id)
-        if enable:
-            self._verbose_chats.discard(chat_id)
-            self._compact_chats.add(chat_id)
-            reply = "🔇 Компактный прогресс включён для этого чата — покажу один статус со спиннером."
+        if enable_debug:
+            self._debug_chats.add(chat_id)
+            reply = "🔊 Подробный прогресс включён для этого чата."
         else:
-            self._compact_chats.discard(chat_id)
-            self._verbose_chats.add(chat_id)
-            reply = "🔊 Показываю все шаги."
+            self._debug_chats.discard(chat_id)
+            reply = "🔇 Тихий прогресс включён для этого чата — покажу один статус со спиннером."
         try:
             self._persist_progress_overrides()
-        except Exception:  # noqa: BLE001 — the in-memory flip already took effect
+        except Exception:
             logger.exception("ohmo failed to persist progress overrides chat_id=%s", chat_id)
         await self._publish_command_reply(message, session_key, reply)
 
     def _persist_progress_overrides(self) -> None:
-        """Round-trip gateway.json, updating both progress override lists."""
+        """Round-trip gateway.json, updating the canonical progress allowlist."""
         config = load_gateway_config(self._workspace)
-        config.compact_progress_chats = sorted(self._compact_chats)
-        config.verbose_progress_chats = sorted(self._verbose_chats)
+        config.debug_progress_chats = sorted(self._debug_chats)
         save_gateway_config(config, self._workspace)
 
     async def _handle_restart(self, message, session_key: str) -> None:
@@ -612,12 +604,11 @@ class OhmoGatewayBridge:
             if "message_id" in message.metadata:
                 inbound_meta["message_id"] = message.metadata["message_id"]
         # Collapse this turn's progress into one live status message? Read the
-        # overrides per-turn so a prior /quiet or /verbose is already in effect.
+        # exact Telegram chat-ID per-turn so a prior /quiet or /debug is in effect.
         chat_id = str(message.chat_id)
         collapse = (
             message.channel == "telegram"
-            and chat_id not in self._verbose_chats
-            and (self._compact_progress_default or chat_id in self._compact_chats)
+            and chat_id not in self._debug_chats
         )
         # Trusted recipient-bound reminder turn: still run the turn (tool-made
         # outbound sends are unaffected), but publish NO progress/tool hints and

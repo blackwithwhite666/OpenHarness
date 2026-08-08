@@ -38,6 +38,4 @@ def test_initialize_workspace_creates_expected_files(tmp_path: Path):
     assert "learn enough to help well, not to build a dossier" in user_text
     assert "Name: ohmo" in identity_text
     assert "first conversation" in bootstrap_text
-    assert gateway_config["compact_progress_default"] is False
-    assert gateway_config["compact_progress_chats"] == []
-    assert gateway_config["verbose_progress_chats"] == []
+    assert gateway_config["debug_progress_chats"] == []
