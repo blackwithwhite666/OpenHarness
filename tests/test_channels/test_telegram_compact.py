@@ -191,6 +191,102 @@ async def test_final_deletes_status_then_sends_answer():
 
 
 @pytest.mark.asyncio
+async def test_trusted_stop_ack_terminalizes_live_compact_tools_in_place_and_keeps_todo():
+    bot = FakeBot()
+    ch = _channel(bot)
+
+    await ch.send(
+        _tool_progress(
+            "42",
+            "provider payload",
+            tool_name="bash",
+            tool_call_id="call-1",
+            display_label="Run command",
+            phase="started",
+            status="running",
+        )
+    )
+    await ch.send(
+        _todo_progress(
+            "42",
+            "",
+            snapshot={"todos": [{"content": "Keep this plan", "status": "pending"}]},
+            changed=True,
+        )
+    )
+    _kill_anim(ch, "42")
+    status = ch._status["42"]
+    message_id = status.message_id
+
+    await ch.send(
+        OutboundMessage(
+            channel="telegram",
+            chat_id="42",
+            content="⏹️ Остановил текущую задачу.",
+            metadata={"_trusted_stop_acknowledgement": True},
+        )
+    )
+
+    assert "42" not in ch._status
+    assert bot.count("delete_message") == 0
+    assert bot.count("send_message") == 1
+    edits = [kwargs for name, kwargs in bot.calls if name == "edit_message_text"]
+    assert len(edits) == 1
+    assert edits[0]["message_id"] == message_id
+    assert edits[0]["text"].startswith("⏹️ Остановлено\n")
+    assert "Run command ⏹️" in edits[0]["text"]
+    assert "📋 To-do\n⬜ Keep this plan" in edits[0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_debug_and_no_status_stop_ack_remain_ordinary_replies():
+    bot = FakeBot()
+    ch = _channel(bot)
+
+    await ch.send(
+        OutboundMessage(
+            channel="telegram",
+            chat_id="42",
+            content="debug payload",
+            metadata={
+                "_progress": True,
+                "progress_event": {
+                    "kind": "tool",
+                    "tool": "bash",
+                    "tool_call_id": "debug-call",
+                    "display_label": "Debug command",
+                    "phase": "started",
+                    "status": "running",
+                },
+            },
+        )
+    )
+    await ch.send(
+        OutboundMessage(
+            channel="telegram",
+            chat_id="42",
+            content="⏹️ Остановил текущую задачу.",
+            metadata={"_trusted_stop_acknowledgement": True},
+        )
+    )
+    assert ch._status == {}
+    assert bot.count("delete_message") == 0
+    assert bot.count("send_message") == 2
+
+    await ch.send(
+        OutboundMessage(
+            channel="telegram",
+            chat_id="43",
+            content="⏹️ Остановил текущую задачу.",
+            metadata={"_trusted_stop_acknowledgement": True},
+        )
+    )
+    assert ch._status == {}
+    assert bot.count("delete_message") == 0
+    assert bot.count("send_message") == 3
+
+
+@pytest.mark.asyncio
 async def test_verbose_chat_untouched_no_status():
     bot = FakeBot()
     ch = _channel(bot)

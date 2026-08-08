@@ -456,12 +456,15 @@ class OhmoGatewayBridge:
             reason="stopped by user command",
         )
         content = "⏹️ Остановил текущую задачу." if stopped else "Сейчас нет активной задачи."
+        metadata: dict[str, object] = {"_session_key": session_key}
+        if stopped:
+            metadata["_trusted_stop_acknowledgement"] = True
         await self._bus.publish_outbound(
             OutboundMessage(
                 channel=message.channel,
                 chat_id=message.chat_id,
                 content=content,
-                metadata={"_session_key": session_key},
+                metadata=metadata,
             )
         )
 
