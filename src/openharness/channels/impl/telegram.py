@@ -635,7 +635,12 @@ class TelegramChannel(BaseChannel):
     BOT_COMMANDS = [
         BotCommand("start", "Start the bot"),
         BotCommand("new", "Start a new conversation"),
+        BotCommand("clear", "Clear the conversation"),
+        BotCommand("debug", "Show detailed progress"),
+        BotCommand("quiet", "Show compact progress"),
+        BotCommand("verbose", "Show detailed progress"),
         BotCommand("stop", "Stop the current task"),
+        BotCommand("restart", "Restart the gateway"),
         BotCommand("help", "Show available commands"),
     ]
 
@@ -689,6 +694,12 @@ class TelegramChannel(BaseChannel):
         # Add command handlers
         self._app.add_handler(CommandHandler("start", self._on_start))
         self._app.add_handler(CommandHandler("new", self._forward_command))
+        self._app.add_handler(CommandHandler("clear", self._forward_command))
+        self._app.add_handler(CommandHandler("debug", self._forward_command))
+        self._app.add_handler(CommandHandler("quiet", self._forward_command))
+        self._app.add_handler(CommandHandler("verbose", self._forward_command))
+        self._app.add_handler(CommandHandler("stop", self._forward_command))
+        self._app.add_handler(CommandHandler("restart", self._forward_command))
         self._app.add_handler(CommandHandler("help", self._on_help))
 
         # Add message handler for text, photos, voice, documents, and geo
@@ -1523,7 +1534,12 @@ class TelegramChannel(BaseChannel):
         await update.message.reply_text(
             f"🐈 {self.config.bot_name} commands:\n"
             "/new — Start a new conversation\n"
+            "/clear — Clear the conversation\n"
+            "/debug — Show detailed progress\n"
+            "/quiet — Show compact progress\n"
+            "/verbose — Show detailed progress\n"
             "/stop — Stop the current task\n"
+            "/restart — Restart the gateway\n"
             "/help — Show available commands"
         )
 
