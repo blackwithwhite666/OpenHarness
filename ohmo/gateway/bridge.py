@@ -626,7 +626,11 @@ class OhmoGatewayBridge:
                     final_metadata = dict(update.metadata or {})
                     final_metadata.pop("_collapse", None)
                     continue
-                if not update.text:
+                progress_event = (update.metadata or {}).get("progress_event")
+                has_structured_progress = (
+                    isinstance(progress_event, dict) and progress_event.get("kind") == "tool"
+                )
+                if not update.text and not has_structured_progress:
                     continue
                 if suppress_output:
                     continue

@@ -55,6 +55,7 @@ _COMPACT_TICK_BACKOFF = 3.0  # slower tick after a RetryAfter
 _COMPACT_IDLE_S = 90.0  # no new event for this long → the turn likely died; stop spinning
 _COMPACT_TAIL = 3  # rolling number of recent step lines shown under the spinner
 _COMPACT_LINE_MAX = 160  # per-step line truncation
+_COMPACT_TOOL_LABEL_MAX = 160
 
 
 def _compact_step_line(text: str) -> str:
@@ -71,12 +72,79 @@ class _CompactStatus:
     """Live per-chat status message that collapses a turn's progress events."""
 
     message_id: int
-    lines: deque[str] = field(default_factory=lambda: deque(maxlen=_COMPACT_TAIL))
+    lines: deque[str] = field(default_factory=deque)
+    tool_rows: dict[str, tuple[str, str, bool]] = field(default_factory=dict)
+    tool_line_positions: dict[str, int] = field(default_factory=dict)
+    invalid_tool_event_seq: int = 0
     spinner_idx: int = 0
     dirty: bool = True
     tick: float = _COMPACT_TICK
     last_event: float = 0.0
     anim: asyncio.Task | None = None
+
+
+def _compact_tool_event(metadata: object) -> dict[str, object] | None:
+    """Return a validated tool progress payload, if one is present."""
+    if not isinstance(metadata, dict) or metadata.get("kind") != "tool":
+        return None
+    return metadata
+
+
+def _compact_tool_label(event: dict[str, object]) -> str:
+    """Use only the channel-safe human label in quiet progress rows."""
+    raw = event.get("display_label")
+    if not isinstance(raw, str):
+        return "Tool"
+    label = _compact_step_line(raw)
+    return label[:_COMPACT_TOOL_LABEL_MAX] or "Tool"
+
+
+def _compact_tool_terminal_status(event: dict[str, object]) -> str | None:
+    """Normalize lifecycle fields into the three terminal UI outcomes."""
+    status = event.get("status")
+    phase = event.get("phase")
+    normalized_status = status.strip().lower() if isinstance(status, str) else ""
+    normalized_phase = phase.strip().lower() if isinstance(phase, str) else ""
+    if normalized_status in {"succeeded", "success", "done", "ok"}:
+        return "success"
+    if normalized_status in {"failed", "failure", "error", "errored"}:
+        return "failure"
+    if normalized_status in {
+        "cancelled",
+        "canceled",
+        "stopped",
+        "aborted",
+        "cancel",
+        "stop",
+    }:
+        return "stopped"
+    if normalized_phase in {"completed", "complete", "done"}:
+        return "success"
+    if normalized_phase in {"failed", "failure", "error", "errored"}:
+        return "failure"
+    if normalized_phase in {"cancelled", "canceled", "stopped", "aborted"}:
+        return "stopped"
+    return None
+
+
+def _compact_tool_running(event: dict[str, object]) -> bool:
+    status = event.get("status")
+    phase = event.get("phase")
+    values = {
+        str(status).strip().lower() if isinstance(status, str) else "",
+        str(phase).strip().lower() if isinstance(phase, str) else "",
+    }
+    return bool(values & {"running", "pending", "started", "start", "in_progress", "executing"})
+
+
+def _compact_tool_row(label: str, state: str) -> str:
+    marker = {
+        "running": "⏳",
+        "success": "✅",
+        "failure": "❌",
+        "stopped": "⏹️",
+    }.get(state, "⏳")
+    return f"{label} {marker}"
 
 
 def silence_telegram_token_url_loggers() -> None:
@@ -870,8 +938,17 @@ class TelegramChannel(BaseChannel):
 
         # Compact progress: fold this event into the chat's single live status
         # message (spinner-animated, edited in place) instead of a fresh message.
-        if msg.metadata.get("_collapse") and msg.content and msg.content != "[empty message]":
-            await self._compact_progress(chat_key, chat_id, msg.content)
+        progress_event = _compact_tool_event(msg.metadata.get("progress_event"))
+        if msg.metadata.get("_collapse") and (
+            progress_event is not None
+            or (msg.content and msg.content != "[empty message]")
+        ):
+            await self._compact_progress(
+                chat_key,
+                chat_id,
+                msg.content,
+                progress_event=progress_event,
+            )
             return self._receipt(msg, native_message_ids)
 
         # Any non-collapse send (final answer, error, command reply, /stop notify)
@@ -1004,19 +1081,29 @@ class TelegramChannel(BaseChannel):
         body = "\n".join(status.lines)
         return f"{head}\n{body}" if body else head
 
-    async def _compact_progress(self, chat_key: str, chat_id: int, content: str) -> None:
+    async def _compact_progress(
+        self,
+        chat_key: str,
+        chat_id: int,
+        content: str,
+        *,
+        progress_event: dict[str, object] | None = None,
+    ) -> None:
         """Fold one progress event into the chat's single live status message.
 
         First event → send the status message once and start the spinner loop.
         Subsequent events → append the step and mark dirty; the loop (the single
         writer) performs the throttled ``edit_message_text``.
         """
-        line = _compact_step_line(content)
         status = self._status.get(chat_key)
         if status is None:
             status = _CompactStatus(message_id=0, last_event=time.monotonic())
-            if line:
-                status.lines.append(line)
+            if progress_event is not None:
+                self._record_compact_tool_event(status, progress_event)
+            else:
+                line = _compact_step_line(content)
+                if line:
+                    status.lines.append(line)
             text = self._render_status(status)
             try:
                 sent = await self._app.bot.send_message(
@@ -1030,10 +1117,75 @@ class TelegramChannel(BaseChannel):
             self._stop_typing(chat_key)  # the spinner replaces the typing indicator
             status.anim = asyncio.create_task(self._compact_anim(chat_key, chat_id))
             return
-        if line:
-            status.lines.append(line)
+        if progress_event is not None:
+            self._record_compact_tool_event(status, progress_event)
+        else:
+            line = _compact_step_line(content)
+            if line:
+                status.lines.append(line)
+                self._trim_compact_ordinary_lines(status)
         status.dirty = True
         status.last_event = time.monotonic()
+
+    def _record_compact_tool_event(
+        self,
+        status: _CompactStatus,
+        event: dict[str, object],
+    ) -> None:
+        """Apply one tool event without exposing its provider payload."""
+        raw_id = event.get("tool_call_id")
+        call_id = raw_id.strip() if isinstance(raw_id, str) else ""
+        if not call_id:
+            # An invalid ID cannot safely correlate two calls. Give each such
+            # event a private key instead of conflating unrelated lifecycle
+            # messages or showing the key to the user.
+            status.invalid_tool_event_seq += 1
+            call_id = f"__invalid_tool_event_{status.invalid_tool_event_seq}"
+
+        label = _compact_tool_label(event)
+        terminal = _compact_tool_terminal_status(event)
+        if terminal is None and not _compact_tool_running(event):
+            # Malformed lifecycle metadata is treated as a start, but still
+            # remains safe and human-readable in quiet mode.
+            state = "running"
+        else:
+            state = terminal or "running"
+
+        existing = status.tool_rows.get(call_id)
+        if existing is not None:
+            old_label, old_state, old_terminal = existing
+            if old_terminal:
+                # Late starts and duplicate terminal events must never regress
+                # or rewrite an already terminal row.
+                return
+            if terminal is None:
+                state = old_state
+            status.tool_rows[call_id] = (old_label, state, terminal is not None)
+            position = status.tool_line_positions[call_id]
+            status.lines[position] = _compact_tool_row(old_label, state)
+            return
+
+        status.tool_rows[call_id] = (label, state, terminal is not None)
+        status.tool_line_positions[call_id] = len(status.lines)
+        status.lines.append(_compact_tool_row(label, state))
+        self._trim_compact_ordinary_lines(status)
+
+    @staticmethod
+    def _trim_compact_ordinary_lines(status: _CompactStatus) -> None:
+        """Keep only the rolling tail of ordinary rows without moving tools."""
+        while len(status.lines) - len(status.tool_line_positions) > _COMPACT_TAIL:
+            tool_positions = set(status.tool_line_positions.values())
+            ordinary_position = next(
+                index
+                for index in range(len(status.lines))
+                if index not in tool_positions
+            )
+            lines = list(status.lines)
+            lines.pop(ordinary_position)
+            status.lines = deque(lines)
+            for call_id, position in status.tool_line_positions.items():
+                if position > ordinary_position:
+                    status.tool_line_positions[call_id] = position - 1
 
     async def _compact_anim(self, chat_key: str, chat_id: int) -> None:
         """Single-writer spinner loop: advance the frame and edit the status once

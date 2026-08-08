@@ -1547,6 +1547,13 @@ class OhmoSessionRuntimePool:
                     "_progress": True,
                     "_tool_hint": True,
                     "_session_key": session_key,
+                    "progress_event": _tool_progress_event(
+                        tool_name=event.tool_name,
+                        tool_call_id=event.tool_call_id,
+                        display_label=_pretty_tool_name(event.tool_name),
+                        phase="started",
+                        status="running",
+                    ),
                 },
             )
             return
@@ -1592,6 +1599,13 @@ class OhmoSessionRuntimePool:
                     "_progress": True,
                     "_tool_hint": True,
                     "_session_key": session_key,
+                    "progress_event": _tool_progress_event(
+                        tool_name=event.tool_name,
+                        tool_call_id=event.tool_call_id,
+                        display_label=_pretty_tool_name(event.tool_name),
+                        phase="completed",
+                        status=_tool_completion_status(event),
+                    ),
                 },
             )
             media = _extract_tool_media(event)
@@ -2636,6 +2650,42 @@ def _pretty_tool_name(tool_name: str) -> str:
     if not label:
         return tool_name
     return label[0].upper() + label[1:]
+
+
+def _tool_progress_event(
+    *,
+    tool_name: str,
+    tool_call_id: str,
+    display_label: str,
+    phase: str,
+    status: str,
+) -> dict[str, object]:
+    """Build the provider-neutral tool lifecycle payload for channels.
+
+    Tool arguments and results intentionally stay in the existing detailed
+    text.  This metadata is only the stable correlation and display contract
+    needed by quiet channel renderers.
+    """
+    return {
+        "kind": "tool",
+        "tool": tool_name,
+        "tool_call_id": tool_call_id,
+        "display_label": display_label,
+        "phase": phase,
+        "status": status,
+    }
+
+
+def _tool_completion_status(event: ToolExecutionCompleted) -> str:
+    """Normalize optional runtime cancellation metadata before channel delivery."""
+    metadata = event.metadata if isinstance(event.metadata, dict) else {}
+    raw_status = metadata.get("status")
+    normalized = raw_status.strip().lower() if isinstance(raw_status, str) else ""
+    if normalized in {"cancelled", "canceled", "stopped", "aborted"}:
+        return "stopped"
+    if normalized in {"failed", "failure", "error", "errored"}:
+        return "failed"
+    return "failed" if event.is_error else "succeeded"
 
 
 def _format_tool_args_block(tool_input: dict[str, object]) -> str:

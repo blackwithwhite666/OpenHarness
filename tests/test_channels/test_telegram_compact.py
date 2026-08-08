@@ -246,6 +246,7 @@ async def test_tool_start_and_completion_share_one_compact_row():
             status="running",
         )
     )
+    assert list(ch._status["424242"].lines) == ["Run command ⏳"]
     _kill_anim(ch, "424242")
     await ch.send(
         _tool_progress(
@@ -259,7 +260,235 @@ async def test_tool_start_and_completion_share_one_compact_row():
         )
     )
 
-    assert list(ch._status["424242"].lines) == ["Run command — succeeded"]
+    assert list(ch._status["424242"].lines) == ["Run command ✅"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "label", "expected"),
+    [
+        ("failed", "Failing tool", "Failing tool ❌"),
+        ("cancelled", "Stopped tool", "Stopped tool ⏹️"),
+    ],
+)
+async def test_tool_terminal_statuses_use_redacted_unicode_rows(status, label, expected):
+    bot = FakeBot()
+    ch = _channel(bot)
+
+    await ch.send(
+        _tool_progress(
+            "424242",
+            "secret args and output",
+            tool_name="private_tool",
+            tool_call_id="call-terminal",
+            display_label=label,
+            phase="started",
+            status="running",
+        )
+    )
+    _kill_anim(ch, "424242")
+    await ch.send(
+        _tool_progress(
+            "424242",
+            "private output hash deadbeef",
+            tool_name="private_tool",
+            tool_call_id="call-terminal",
+            display_label=label,
+            phase="completed",
+            status=status,
+        )
+    )
+
+    assert list(ch._status["424242"].lines) == [expected]
+    assert "secret" not in ch._render_status(ch._status["424242"])
+    assert "call-terminal" not in ch._render_status(ch._status["424242"])
+    assert "deadbeef" not in ch._render_status(ch._status["424242"])
+
+
+@pytest.mark.asyncio
+async def test_concurrent_tool_rows_keep_insertion_order():
+    bot = FakeBot()
+    ch = _channel(bot)
+
+    for call_id, label in (("call-a", "First"), ("call-b", "Second")):
+        await ch.send(
+            _tool_progress(
+                "424242",
+                "technical payload",
+                tool_name="tool",
+                tool_call_id=call_id,
+                display_label=label,
+                phase="started",
+                status="running",
+            )
+        )
+    _kill_anim(ch, "424242")
+    await ch.send(
+        _tool_progress(
+            "424242",
+            "technical payload",
+            tool_name="tool",
+            tool_call_id="call-b",
+            display_label="Second",
+            phase="completed",
+            status="succeeded",
+        )
+    )
+
+    assert list(ch._status["424242"].lines) == ["First ⏳", "Second ✅"]
+
+
+@pytest.mark.asyncio
+async def test_mixed_progress_keeps_ordinary_tail_and_tool_positions():
+    bot = FakeBot()
+    ch = _channel(bot)
+
+    for text in ("old one", "old two", "old three"):
+        await ch.send(_progress("424242", text))
+    for call_id, label in (("call-a", "First tool"), ("call-b", "Second tool")):
+        await ch.send(
+            _tool_progress(
+                "424242",
+                "private payload",
+                tool_name="tool",
+                tool_call_id=call_id,
+                display_label=label,
+                phase="started",
+                status="running",
+            )
+        )
+    await ch.send(_progress("424242", "fresh one"))
+    await ch.send(_progress("424242", "fresh two"))
+    _kill_anim(ch, "424242")
+
+    await ch.send(
+        _tool_progress(
+            "424242",
+            "private completion payload",
+            tool_name="tool",
+            tool_call_id="call-b",
+            display_label="Second tool",
+            phase="completed",
+            status="succeeded",
+        )
+    )
+
+    assert list(ch._status["424242"].lines) == [
+        "old three",
+        "First tool ⏳",
+        "Second tool ✅",
+        "fresh one",
+        "fresh two",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_duplicate_terminal_and_late_start_are_idempotent():
+    bot = FakeBot()
+    ch = _channel(bot)
+
+    terminal = _tool_progress(
+        "424242",
+        "technical payload",
+        tool_name="tool",
+        tool_call_id="call-a",
+        display_label="Stable label",
+        phase="completed",
+        status="succeeded",
+    )
+    await ch.send(terminal)
+    _kill_anim(ch, "424242")
+    await ch.send(terminal)
+    await ch.send(
+        _tool_progress(
+            "424242",
+            "late start payload",
+            tool_name="tool",
+            tool_call_id="call-a",
+            display_label="Changed label",
+            phase="started",
+            status="running",
+        )
+    )
+
+    assert list(ch._status["424242"].lines) == ["Stable label ✅"]
+
+
+@pytest.mark.asyncio
+async def test_terminal_before_start_stays_terminal_and_invalid_ids_do_not_merge():
+    bot = FakeBot()
+    ch = _channel(bot)
+
+    await ch.send(
+        _tool_progress(
+            "424242",
+            "terminal payload",
+            tool_name="tool",
+            tool_call_id="call-a",
+            display_label="Already done",
+            phase="completed",
+            status="succeeded",
+        )
+    )
+    _kill_anim(ch, "424242")
+    for label in ("No id one", "No id two"):
+        await ch.send(
+            _tool_progress(
+                "424242",
+                "untrusted payload",
+                tool_name="tool",
+                tool_call_id="",
+                display_label=label,
+                phase="started",
+                status="running",
+            )
+        )
+    await ch.send(
+        _tool_progress(
+            "424242",
+            "late start payload",
+            tool_name="tool",
+            tool_call_id="call-a",
+            display_label="Already done",
+            phase="started",
+            status="running",
+        )
+    )
+
+    assert list(ch._status["424242"].lines) == [
+        "Already done ✅",
+        "No id one ⏳",
+        "No id two ⏳",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_structured_event_is_ignored_by_detailed_mode():
+    bot = FakeBot()
+    ch = _channel(bot)
+
+    await ch.send(
+        OutboundMessage(
+            channel="telegram",
+            chat_id="424242",
+            content="🛠️ Tool — technical arguments",
+            metadata={
+                "_progress": True,
+                "progress_event": {
+                    "kind": "tool",
+                    "tool": "tool",
+                    "tool_call_id": "call-debug",
+                    "display_label": "Human label",
+                    "phase": "started",
+                    "status": "running",
+                },
+            },
+        )
+    )
+
+    assert ch._status == {}
+    assert bot.calls[-1][0] == "send_message"
+    assert bot.calls[-1][1]["text"] == "🛠️ Tool — technical arguments"
 
 
 @pytest.mark.asyncio

@@ -1203,6 +1203,68 @@ async def test_runtime_pool_stream_message_uses_english_progress_for_english_inp
 
 
 @pytest.mark.asyncio
+async def test_runtime_pool_emits_provider_neutral_tool_progress_metadata(tmp_path, monkeypatch):
+    workspace = tmp_path / ".ohmo-home"
+    initialize_workspace(workspace)
+
+    async def fake_build_runtime(**kwargs):
+        class FakeEngine:
+            messages = []
+            total_usage = UsageSnapshot()
+
+            def set_system_prompt(self, prompt):
+                return None
+
+            async def submit_message(self, content):
+                yield ToolExecutionStarted(
+                    tool_name="mcp__server__private_tool",
+                    tool_input={"secret": "do not render"},
+                    tool_call_id="stable-call-1",
+                )
+                yield ToolExecutionCompleted(
+                    tool_name="mcp__server__private_tool",
+                    output="private output",
+                    tool_call_id="stable-call-1",
+                    is_error=False,
+                )
+                yield AssistantTextDelta(text="done")
+
+        return SimpleNamespace(
+            engine=FakeEngine(),
+            session_id="sess123",
+            current_settings=lambda: SimpleNamespace(model="gpt-5.4"),
+            commands=SimpleNamespace(lookup=lambda raw: None),
+        )
+
+    async def fake_start_runtime(bundle):
+        return None
+
+    monkeypatch.setattr("ohmo.gateway.runtime.build_runtime", fake_build_runtime)
+    monkeypatch.setattr("ohmo.gateway.runtime.start_runtime", fake_start_runtime)
+
+    pool = OhmoSessionRuntimePool(cwd=tmp_path, workspace=workspace, provider_profile="codex")
+    message = InboundMessage(channel="telegram", sender_id="u1", chat_id="c1", content="run")
+    updates = [u async for u in pool.stream_message(message, "telegram:c1")]
+
+    started = updates[1].metadata["progress_event"]
+    completed = updates[2].metadata["progress_event"]
+    assert started == {
+        "kind": "tool",
+        "tool": "mcp__server__private_tool",
+        "tool_call_id": "stable-call-1",
+        "display_label": "Private tool",
+        "phase": "started",
+        "status": "running",
+    }
+    assert completed["tool_call_id"] == "stable-call-1"
+    assert completed["display_label"] == "Private tool"
+    assert completed["phase"] == "completed"
+    assert completed["status"] == "succeeded"
+    assert "do not render" in updates[1].text  # detailed/debug rendering remains intact
+    assert "private output" in updates[2].text
+
+
+@pytest.mark.asyncio
 async def test_runtime_pool_blocks_local_only_commands_from_remote_messages(tmp_path, monkeypatch):
     workspace = tmp_path / ".ohmo-home"
     initialize_workspace(workspace)
@@ -1764,6 +1826,48 @@ async def test_gateway_bridge_publishes_progress_updates():
     assert second.content.startswith("🛠️ ")
     assert "web_fetch" in second.content
     assert third.content == "Done"
+
+
+@pytest.mark.asyncio
+async def test_gateway_bridge_preserves_structured_tool_progress_without_text():
+    bus = MessageBus()
+
+    class FakeRuntimePool:
+        async def stream_message(self, message, session_key):
+            yield SimpleNamespace(
+                kind="tool_hint",
+                text="",
+                metadata={
+                    "_progress": True,
+                    "progress_event": {
+                        "kind": "tool",
+                        "tool": "bash",
+                        "tool_call_id": "call-1",
+                        "display_label": "Run command",
+                        "phase": "completed",
+                        "status": "succeeded",
+                    },
+                },
+            )
+            yield SimpleNamespace(kind="final", text="Done", metadata={})
+
+    bridge = OhmoGatewayBridge(bus=bus, runtime_pool=FakeRuntimePool())
+    task = asyncio.create_task(bridge.run())
+    try:
+        await bus.publish_inbound(
+            InboundMessage(channel="telegram", sender_id="u1", chat_id="c1", content="run")
+        )
+        progress = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
+        final = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
+    finally:
+        bridge.stop()
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    assert progress.content == ""
+    assert progress.metadata["progress_event"]["tool_call_id"] == "call-1"
+    assert final.content == "Done"
 
 
 @pytest.mark.asyncio
