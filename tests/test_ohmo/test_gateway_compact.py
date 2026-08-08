@@ -182,9 +182,7 @@ async def test_structured_empty_todo_progress_reaches_both_telegram_modes(debug)
         runtime_pool=TodoRuntimePool(),
         debug_progress_chats=["42"] if debug else [],
     )
-    inbound = InboundMessage(
-        channel="telegram", sender_id="42|user", chat_id="42", content="hi"
-    )
+    inbound = InboundMessage(channel="telegram", sender_id="42|user", chat_id="42", content="hi")
     progress, final = await _run_one(bridge, bus, inbound, 2)
     assert progress.content == ""
     assert progress.metadata["progress_event"]["kind"] == "todo"

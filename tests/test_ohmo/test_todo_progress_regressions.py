@@ -63,7 +63,13 @@ async def test_noop_todo_write_emits_no_progress_event(tmp_path: Path):
     assert updates == []
 
 
-@pytest.mark.parametrize("metadata", [{"changed": False, "todos": [{"content": "A", "status": "pending"}]}, {"changed": True, "todos": [{"content": "A", "status": "unknown"}]}])
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {"changed": False, "todos": [{"content": "A", "status": "pending"}]},
+        {"changed": True, "todos": [{"content": "A", "status": "unknown"}]},
+    ],
+)
 async def test_todo_write_unchanged_or_malformed_metadata_emits_no_event(
     tmp_path: Path, metadata: dict
 ):
@@ -201,13 +207,9 @@ def _lifecycle_runtime(
             action = actions[self.internal_calls]
             self.internal_calls += 1
             if action == "complete":
-                store.replace_snapshot(
-                    sid, [{"content": "Ship it", "status": "completed"}]
-                )
+                store.replace_snapshot(sid, [{"content": "Ship it", "status": "completed"}])
                 self.messages.append(
-                    ConversationMessage(
-                        role="assistant", content=[TextBlock(text="accepted")]
-                    )
+                    ConversationMessage(role="assistant", content=[TextBlock(text="accepted")])
                 )
                 yield AssistantTextDelta(text="accepted")
             elif action == "tool_pending":
@@ -248,9 +250,7 @@ def _lifecycle_runtime(
                 yield AssistantTextDelta(text="candidate after tool")
                 self.messages.remove(internal_message)
             elif action == "complete_empty":
-                store.replace_snapshot(
-                    sid, [{"content": "Ship it", "status": "completed"}]
-                )
+                store.replace_snapshot(sid, [{"content": "Ship it", "status": "completed"}])
             elif action == "error":
                 yield ErrorEvent(message="provider failed")
             elif action == "max_turns":
@@ -276,6 +276,7 @@ def _lifecycle_runtime(
     runtime._todo_store = store
     runtime._runtime_system_prompt = lambda *_args, **_kwargs: _resolved("system")
     runtime._maybe_schedule_memory_judge = lambda *_args, **_kwargs: None
+
     async def save_snapshot(*_args, **_kwargs):
         if save_calls is not None:
             save_calls.append(list(engine.messages))
@@ -288,9 +289,7 @@ def _lifecycle_runtime(
         enforce_max_turns=False,
         current_settings=lambda: SimpleNamespace(model="test-model"),
     )
-    message = InboundMessage(
-        channel="telegram", sender_id="user", chat_id="chat", content="do it"
-    )
+    message = InboundMessage(channel="telegram", sender_id="user", chat_id="chat", content="do it")
     return runtime, bundle, message
 
 
@@ -403,8 +402,7 @@ async def test_reconciliation_provider_or_tool_error_does_not_fake_completion(
     assert not [update for update in updates if update.kind == "final"]
     assert store.read_snapshot(sid)[0][0]["status"] == "pending"
     assert not any(
-        (update.metadata.get("progress_event") or {}).get("kind") == "todo"
-        for update in updates
+        (update.metadata.get("progress_event") or {}).get("kind") == "todo" for update in updates
     )
 
 
@@ -489,14 +487,11 @@ async def test_blocked_final_keeps_panel_state_and_emits_no_cleanup_event(tmp_pa
     assert [update.text for update in updates if update.kind == "final"] == ["candidate"]
     assert store.read_snapshot(sid)[0][0]["status"] == "blocked"
     assert not any(
-        (update.metadata.get("progress_event") or {}).get("kind") == "todo"
-        for update in updates
+        (update.metadata.get("progress_event") or {}).get("kind") == "todo" for update in updates
     )
 
 
-async def test_cleanup_failure_is_logged_once_and_keeps_recoverable_plan(
-    tmp_path: Path, caplog
-):
+async def test_cleanup_failure_is_logged_once_and_keeps_recoverable_plan(tmp_path: Path, caplog):
     store = TodoStore(tmp_path)
     sid = "cleanup-failure"
     store.replace_snapshot(sid, [{"content": "Ship it", "status": "completed"}])
@@ -523,8 +518,7 @@ async def test_cleanup_failure_is_logged_once_and_keeps_recoverable_plan(
 
     assert [update.text for update in updates if update.kind == "final"] == ["candidate"]
     assert not any(
-        (update.metadata.get("progress_event") or {}).get("kind") == "todo"
-        for update in updates
+        (update.metadata.get("progress_event") or {}).get("kind") == "todo" for update in updates
     )
     assert store.read_snapshot(sid)[0][0]["status"] == "completed"
     assert sum("ohmo.todo.cleanup_failure" in record.getMessage() for record in caplog.records) == 1
@@ -533,7 +527,10 @@ async def test_cleanup_failure_is_logged_once_and_keeps_recoverable_plan(
 async def test_blocked_plans_are_not_archived_and_reinject_after_fresh_store(tmp_path: Path):
     store = TodoStore(tmp_path)
     for sid, todos in (
-        ("blocked-only", [{"content": "Need input", "status": "blocked", "blocked_reason": "user"}]),
+        (
+            "blocked-only",
+            [{"content": "Need input", "status": "blocked", "blocked_reason": "user"}],
+        ),
         (
             "completed-blocked",
             [
@@ -549,9 +546,7 @@ async def test_blocked_plans_are_not_archived_and_reinject_after_fresh_store(tmp
         fresh = TodoStore(tmp_path)
         fresh_runtime = object.__new__(OhmoSessionRuntimePool)
         fresh_runtime._todo_store = fresh
-        prompt = fresh_runtime._append_todo_runtime_section(
-            SimpleNamespace(session_id=sid), "base"
-        )
+        prompt = fresh_runtime._append_todo_runtime_section(SimpleNamespace(session_id=sid), "base")
         assert "Need input" in prompt
 
 
@@ -614,15 +609,11 @@ async def test_max_turns_does_not_fake_completion_or_clean_unresolved_plan(tmp_p
 
 
 @pytest.mark.parametrize("status", ["pending", "completed"])
-async def test_partial_provider_error_never_publishes_or_cleans_plan(
-    tmp_path: Path, status: str
-):
+async def test_partial_provider_error_never_publishes_or_cleans_plan(tmp_path: Path, status: str):
     store = TodoStore(tmp_path)
     sid = f"partial-provider-error-{status}"
     store.replace_snapshot(sid, [{"content": "Ship it", "status": status}])
-    runtime, bundle, message = _lifecycle_runtime(
-        store, sid, [], initial_action="partial_error"
-    )
+    runtime, bundle, message = _lifecycle_runtime(store, sid, [], initial_action="partial_error")
 
     updates = [
         update
@@ -685,9 +676,7 @@ async def test_reconciliation_keeps_tool_trace_without_repeating_work(tmp_path: 
     sid = "reconcile-tool-trace"
     store.replace_snapshot(sid, [{"content": "Ship it", "status": "pending"}])
     saves = []
-    runtime, bundle, message = _lifecycle_runtime(
-        store, sid, ["tool_pending", "complete"], saves
-    )
+    runtime, bundle, message = _lifecycle_runtime(store, sid, ["tool_pending", "complete"], saves)
 
     updates = [
         update
@@ -709,16 +698,22 @@ async def test_reconciliation_keeps_tool_trace_without_repeating_work(tmp_path: 
         message.role == "user" and message.text in bundle.engine.internal_prompts
         for message in bundle.engine.messages
     )
-    assert sum(
-        isinstance(block, ToolUseBlock) and block.id == "toolu_reconcile_once"
-        for message in bundle.engine.messages
-        for block in message.content
-    ) == 1
-    assert sum(
-        isinstance(block, ToolResultBlock) and block.tool_use_id == "toolu_reconcile_once"
-        for message in bundle.engine.messages
-        for block in message.content
-    ) == 1
+    assert (
+        sum(
+            isinstance(block, ToolUseBlock) and block.id == "toolu_reconcile_once"
+            for message in bundle.engine.messages
+            for block in message.content
+        )
+        == 1
+    )
+    assert (
+        sum(
+            isinstance(block, ToolResultBlock) and block.tool_use_id == "toolu_reconcile_once"
+            for message in bundle.engine.messages
+            for block in message.content
+        )
+        == 1
+    )
     assert not any(message.text == "candidate after tool" for message in bundle.engine.messages)
     assert sum(message.text == "accepted" for message in bundle.engine.messages) == 1
     assert [message.text for message in saves[0] if message.text == "accepted"] == ["accepted"]
@@ -754,7 +749,9 @@ async def test_continue_pending_model_final_is_guarded(tmp_path: Path):
     ]
 
     assert [update.text for update in updates if update.kind == "final"] == ["accepted"]
-    assert "continued candidate" not in [update.text for update in updates if update.kind == "final"]
+    assert "continued candidate" not in [
+        update.text for update in updates if update.kind == "final"
+    ]
 
 
 async def test_todo_prompt_read_failure_is_explicit_and_fail_closed(tmp_path: Path):
@@ -772,9 +769,7 @@ async def test_todo_prompt_read_failure_is_explicit_and_fail_closed(tmp_path: Pa
     assert "active_todos_json: []" not in prompt
 
 
-async def test_todo_prompt_read_failure_logs_once_and_blocks_model_turn(
-    tmp_path: Path, caplog
-):
+async def test_todo_prompt_read_failure_logs_once_and_blocks_model_turn(tmp_path: Path, caplog):
     class BrokenStore(TodoStore):
         def read_snapshot(self, _session_id):
             raise OSError("snapshot unavailable")
@@ -819,8 +814,15 @@ async def test_todo_prompt_read_failure_logs_once_and_blocks_model_turn(
 
     assert bundle.engine.submit_calls == 0
     assert not [update for update in updates if update.kind == "final"]
-    assert any("No model response was accepted or published" in update.text for update in updates if update.kind == "error")
-    assert sum("ohmo.todo.prompt.read_failure" in record.getMessage() for record in caplog.records) == 1
+    assert any(
+        "No model response was accepted or published" in update.text
+        for update in updates
+        if update.kind == "error"
+    )
+    assert (
+        sum("ohmo.todo.prompt.read_failure" in record.getMessage() for record in caplog.records)
+        == 1
+    )
 
 
 async def test_resolved_without_final_has_actionable_missing_final_error(tmp_path: Path):
@@ -937,7 +939,9 @@ async def test_blocked_noop_does_not_log_new_blocked_lifecycle_event(tmp_path: P
         ]
 
     assert sum("ohmo.todo.write.noop" in record.getMessage() for record in caplog.records) == 1
-    assert not any("ohmo.todo.blocked.persisted" in record.getMessage() for record in caplog.records)
+    assert not any(
+        "ohmo.todo.blocked.persisted" in record.getMessage() for record in caplog.records
+    )
 
     caplog.clear()
     with caplog.at_level(logging.INFO, logger="ohmo.gateway.runtime"):
@@ -958,7 +962,9 @@ async def test_blocked_noop_does_not_log_new_blocked_lifecycle_event(tmp_path: P
                 reply_parts=[],
             )
         ]
-    assert sum("ohmo.todo.blocked.persisted" in record.getMessage() for record in caplog.records) == 1
+    assert (
+        sum("ohmo.todo.blocked.persisted" in record.getMessage() for record in caplog.records) == 1
+    )
 
 
 async def _broken_prompt(runtime, bundle):
@@ -1040,6 +1046,8 @@ async def test_stream_message_synthetic_turn_suspends_todo_lifecycle(
     assert any(update.kind == "final" for update in updates)
     assert observations["tool_visible"] is False
     assert observations["include_todo"] == [False, False]
-    assert all("Trusted OHMO Todo Runtime State" not in prompt for prompt in observations["prompts"])
+    assert all(
+        "Trusted OHMO Todo Runtime State" not in prompt for prompt in observations["prompts"]
+    )
     assert pool._todo_store.read_snapshot(sid)[0][0]["status"] == status
     assert registry.get("todo_write") is not None

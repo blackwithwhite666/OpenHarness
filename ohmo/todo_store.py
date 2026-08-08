@@ -60,9 +60,7 @@ def canonicalize_todos(items: Iterable[Mapping[str, object]]) -> TodoSnapshot:
         if not content:
             raise ValueError(f"todo {index} content must not be empty")
         if len(content) > MAX_TODO_CONTENT_LENGTH:
-            raise ValueError(
-                f"todo {index} content exceeds {MAX_TODO_CONTENT_LENGTH} characters"
-            )
+            raise ValueError(f"todo {index} content exceeds {MAX_TODO_CONTENT_LENGTH} characters")
 
         status = raw.get("status")
         if status not in TODO_STATUSES:
@@ -81,10 +79,7 @@ def canonicalize_todos(items: Iterable[Mapping[str, object]]) -> TodoSnapshot:
             if not reason:
                 raise ValueError("blocked todo requires a non-empty blocked_reason")
             if len(reason) > MAX_BLOCKED_REASON_LENGTH:
-                raise ValueError(
-                    "blocked_reason exceeds "
-                    f"{MAX_BLOCKED_REASON_LENGTH} characters"
-                )
+                raise ValueError(f"blocked_reason exceeds {MAX_BLOCKED_REASON_LENGTH} characters")
         elif reason is not None:
             raise ValueError("blocked_reason is only allowed for blocked todos")
 
