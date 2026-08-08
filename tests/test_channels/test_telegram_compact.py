@@ -57,8 +57,62 @@ def _channel(bot: FakeBot) -> TelegramChannel:
 
 def _progress(chat_id: str, text: str) -> OutboundMessage:
     return OutboundMessage(
-        channel="telegram", chat_id=chat_id, content=text,
+        channel="telegram",
+        chat_id=chat_id,
+        content=text,
         metadata={"_progress": True, "_collapse": True},
+    )
+
+
+def _tool_progress(
+    chat_id: str,
+    text: str,
+    *,
+    tool_name: str,
+    tool_call_id: str,
+    display_label: str,
+    phase: str,
+    status: str,
+) -> OutboundMessage:
+    return OutboundMessage(
+        channel="telegram",
+        chat_id=chat_id,
+        content=text,
+        metadata={
+            "_progress": True,
+            "_collapse": True,
+            "progress_event": {
+                "kind": "tool",
+                "tool": tool_name,
+                "tool_call_id": tool_call_id,
+                "display_label": display_label,
+                "phase": phase,
+                "status": status,
+            },
+        },
+    )
+
+
+def _todo_progress(
+    chat_id: str,
+    text: str,
+    *,
+    snapshot: dict,
+    changed: bool,
+) -> OutboundMessage:
+    return OutboundMessage(
+        channel="telegram",
+        chat_id=chat_id,
+        content=text,
+        metadata={
+            "_progress": True,
+            "_collapse": True,
+            "progress_event": {
+                "kind": "todo",
+                "snapshot": snapshot,
+                "changed": changed,
+            },
+        },
     )
 
 
@@ -123,9 +177,14 @@ async def test_verbose_chat_untouched_no_status():
     bot = FakeBot()
     ch = _channel(bot)
     # No _collapse → normal per-event message, no status, no delete.
-    await ch.send(OutboundMessage(
-        channel="telegram", chat_id="42", content="🛠️ Bash", metadata={"_progress": True},
-    ))
+    await ch.send(
+        OutboundMessage(
+            channel="telegram",
+            chat_id="42",
+            content="🛠️ Bash",
+            metadata={"_progress": True},
+        )
+    )
     assert ch._status == {}
     assert bot.count("send_message") == 1
     assert bot.count("delete_message") == 0
@@ -168,3 +227,73 @@ async def test_anim_edits_advance_the_spinner():
     text = bot.calls[-1][1]["text"]
     assert _SPINNER_FRAMES[1] in text
     assert "шаг" in text
+
+
+@pytest.mark.asyncio
+async def test_tool_start_and_completion_share_one_compact_row():
+    """Future contract: structured tool events update one correlated row."""
+    bot = FakeBot()
+    ch = _channel(bot)
+
+    await ch.send(
+        _tool_progress(
+            "424242",
+            "provider-native start payload",
+            tool_name="bash",
+            tool_call_id="call-1234",
+            display_label="Run command",
+            phase="started",
+            status="running",
+        )
+    )
+    _kill_anim(ch, "424242")
+    await ch.send(
+        _tool_progress(
+            "424242",
+            "provider-native completion payload",
+            tool_name="bash",
+            tool_call_id="call-1234",
+            display_label="Run command",
+            phase="completed",
+            status="succeeded",
+        )
+    )
+
+    assert list(ch._status["424242"].lines) == ["Run command — succeeded"]
+
+
+@pytest.mark.asyncio
+async def test_repeated_todo_snapshots_update_one_compact_panel():
+    """Future contract: canonical todo snapshots honor ``changed`` semantics."""
+    bot = FakeBot()
+    ch = _channel(bot)
+    pending = {"todos": [{"content": "Step A", "status": "pending"}]}
+    completed = {"todos": [{"content": "Step A", "status": "completed"}]}
+
+    await ch.send(
+        _todo_progress(
+            "424242",
+            "provider-native todo payload 1",
+            snapshot=pending,
+            changed=True,
+        )
+    )
+    _kill_anim(ch, "424242")
+    await ch.send(
+        _todo_progress(
+            "424242",
+            "provider-native todo payload 2",
+            snapshot=completed,
+            changed=True,
+        )
+    )
+    await ch.send(
+        _todo_progress(
+            "424242",
+            "stale display text must not create a third row",
+            snapshot=completed,
+            changed=False,
+        )
+    )
+
+    assert list(ch._status["424242"].lines) == ["📋 To-do\n✅ Step A"]

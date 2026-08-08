@@ -9,12 +9,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from openharness.channels.bus.events import InboundMessage
-from openharness.channels.bus.queue import MessageBus
-
 from ohmo.gateway.bridge import OhmoGatewayBridge
 from ohmo.gateway.config import load_gateway_config, save_gateway_config
 from ohmo.gateway.models import GatewayConfig
+from openharness.channels.bus.events import InboundMessage
+from openharness.channels.bus.queue import MessageBus
 
 
 class _FakeRuntimePool:
@@ -53,6 +52,38 @@ def test_legacy_gateway_config_keeps_opt_in_defaults(tmp_path):
     assert config.compact_progress_default is False
     assert config.compact_progress_chats == ["555"]
     assert config.verbose_progress_chats == []
+
+
+def test_default_progress_mode_is_collapsed_without_disabling_delivery():
+    """Future policy: quiet is the default, but progress events stay enabled."""
+    config = GatewayConfig()
+
+    assert config.send_progress is True
+    assert config.compact_progress_default is True
+
+
+@pytest.mark.asyncio
+async def test_debug_progress_allowlist_is_the_only_uncollapsed_override():
+    """Future policy: only an explicitly allowlisted chat gets verbose progress."""
+    bus = MessageBus()
+    bridge = OhmoGatewayBridge(
+        bus=bus,
+        runtime_pool=_FakeRuntimePool(),
+        compact_progress_default=True,
+        debug_progress_chats=["424242"],
+    )
+
+    listed = InboundMessage(
+        channel="telegram",
+        sender_id="424242|user",
+        chat_id="424242",
+        content="hi",
+        metadata={"chat_type": "private", "message_id": 7},
+    )
+    progress, tool_hint, _final = await _run_one(bridge, bus, listed, 3)
+
+    assert "_collapse" not in progress.metadata
+    assert "_collapse" not in tool_hint.metadata
 
 
 @pytest.mark.asyncio

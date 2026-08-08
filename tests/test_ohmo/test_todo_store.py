@@ -9,12 +9,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from openharness.tools.base import ToolExecutionContext
 from ohmo.todo_store import TodoStore
 from ohmo.todo_write_tool import OhmoTodoWriteTool, OhmoTodoWriteToolInput
-
+from openharness.tools.base import ToolExecutionContext
 
 # ----- TodoStore -----
+
 
 def test_active_path_is_per_session(tmp_path: Path):
     store = TodoStore(tmp_path)
@@ -33,9 +33,9 @@ def test_new_list_rotates_and_keeps_old(tmp_path: Path):
 
     second = store.new_list(sid)
     assert second.name == f"{sid}-2.md"
-    assert store.active_path(sid) == second           # pointer moved
+    assert store.active_path(sid) == second  # pointer moved
     assert first.exists() and "old task" in first.read_text()  # old kept
-    assert second.read_text() == "# TODO\n"           # new is empty
+    assert second.read_text() == "# TODO\n"  # new is empty
 
     third = store.new_list(sid)
     assert third.name == f"{sid}-3.md"
@@ -57,6 +57,7 @@ def test_session_id_is_sanitized_for_filename(tmp_path: Path):
 
 
 # ----- OhmoTodoWriteTool -----
+
 
 def _ctx(tmp_path: Path) -> ToolExecutionContext:
     return ToolExecutionContext(cwd=tmp_path)  # cwd is ignored by the ohmo tool
@@ -103,3 +104,61 @@ async def test_tool_new_list_rotates(tmp_path: Path):
     await tool.execute(OhmoTodoWriteToolInput(item="second task"), _ctx(tmp_path))
     assert "second task" in store.active_path(sid).read_text()
     assert "first task" not in store.active_path(sid).read_text()
+
+
+async def test_new_list_wins_over_clear_completed(tmp_path: Path):
+    """Characterize the legacy precedence for contradictory todo flags."""
+    store = TodoStore(tmp_path)
+    sid = "precedence-01"
+    tool = OhmoTodoWriteTool(store, lambda: sid)
+
+    await tool.execute(OhmoTodoWriteToolInput(item="Step A"), _ctx(tmp_path))
+    result = await tool.execute(
+        OhmoTodoWriteToolInput(new_list=True, clear_completed=True), _ctx(tmp_path)
+    )
+
+    assert not result.is_error
+    assert "fresh" in result.output.lower()
+    assert store.active_path(sid).read_text(encoding="utf-8") == "# TODO\n"
+
+
+def test_todo_input_is_an_atomic_snapshot_without_legacy_fields():
+    """Future model-facing API: one canonical ``todos`` snapshot."""
+    fields = OhmoTodoWriteToolInput.model_fields
+    legacy_fields = {"item", "checked", "remove", "clear_completed", "new_list"}
+
+    assert "todos" in fields
+    assert "status" not in fields
+    assert not legacy_fields.intersection(fields)
+
+    snapshot = OhmoTodoWriteToolInput.model_validate(
+        {"todos": [{"content": "Step A", "status": "completed", "blocked_reason": None}]}
+    )
+    assert snapshot.model_dump(mode="json", exclude_none=True) == {
+        "todos": [{"content": "Step A", "status": "completed"}]
+    }
+
+
+async def test_semantically_duplicate_items_are_not_added(tmp_path: Path):
+    """Desired regression: item identity must not depend on exact text."""
+    store = TodoStore(tmp_path)
+    sid = "dedupe-01"
+    tool = OhmoTodoWriteTool(store, lambda: sid)
+
+    result = await tool.execute(
+        OhmoTodoWriteToolInput.model_validate(
+            {
+                "todos": [
+                    {"content": "Step A", "status": "pending"},
+                    {"content": "  Step A  ", "status": "pending"},
+                ]
+            }
+        ),
+        _ctx(tmp_path),
+    )
+
+    assert not result.is_error
+    lines = [
+        line for line in store.active_path(sid).read_text().splitlines() if line.startswith("-")
+    ]
+    assert lines == ["- [ ] Step A"]
