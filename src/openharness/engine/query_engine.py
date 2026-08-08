@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
 from pathlib import Path
-from typing import AsyncIterator
 
 from openharness.api.client import SupportsStreamingMessages
-from openharness.engine.cost_tracker import CostTracker
+from openharness.config.settings import Settings
 from openharness.coordinator.coordinator_mode import get_coordinator_user_context
+from openharness.engine.cost_tracker import CostTracker
 from openharness.engine.messages import (
     ConversationMessage,
     TextBlock,
@@ -15,20 +16,19 @@ from openharness.engine.messages import (
     sanitize_conversation_messages,
 )
 from openharness.engine.query import (
+    _TRACE_KIND_TURN_CONTINUED,
+    _TRACE_KIND_TURN_STARTED,
     AskUserPrompt,
     DecisionTraceRecorderLike,
     PermissionPrompt,
     QueryContext,
     _record_decision_trace_structural,
-    _TRACE_KIND_TURN_CONTINUED,
-    _TRACE_KIND_TURN_STARTED,
     _turn_continued_trace_payload,
     _turn_started_trace_payload,
     remember_user_goal,
     run_query,
 )
 from openharness.engine.stream_events import AssistantTurnComplete, StreamEvent
-from openharness.config.settings import Settings
 from openharness.hooks import HookEvent, HookExecutor
 from openharness.permissions.checker import PermissionChecker
 from openharness.services.autodream.service import schedule_auto_dream
@@ -244,7 +244,7 @@ class QueryEngine:
                 messages=list(self._messages),
                 max_records=self._settings.memory.auto_extract_max_records,
             )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - best-effort memory extraction
             self._tool_metadata["memory_extract_last_error"] = str(exc)
             return
         self._tool_metadata["memory_extract_last"] = {
@@ -338,6 +338,68 @@ class QueryEngine:
             await self._update_session_memory()
             await self._extract_durable_memories()
             self._schedule_auto_dream()
+
+    async def submit_internal_message(self, prompt: str) -> AsyncIterator[StreamEvent]:
+        """Run a provider turn without recording it as an external exchange.
+
+        Internal runtime nudges (for example, todo reconciliation) need the
+        normal tool-aware query loop, but must not become user messages in the
+        persisted conversation or conversation-learning backend.  The query
+        receives a temporary user message, which is removed after the turn;
+        the assistant/tool-result trace and accepted final remain in history so
+        the provider sees a valid direct exchange from the original user.
+        """
+        base_messages = list(self._messages)
+        internal_message = ConversationMessage.from_user_text(prompt)
+        query_messages = [*base_messages, internal_message]
+        context = QueryContext(
+            api_client=self._api_client,
+            tool_registry=self._tool_registry,
+            permission_checker=self._permission_checker,
+            cwd=self._cwd,
+            model=self._model,
+            system_prompt=self._system_prompt,
+            max_tokens=self._max_tokens,
+            supports_native_images=self._supports_native_images,
+            image_provider=self._image_provider,
+            effort=self._effort,
+            cache_key=self._cache_key,
+            context_window_tokens=self._context_window_tokens,
+            auto_compact_threshold_tokens=self._auto_compact_threshold_tokens,
+            max_turns=self._max_turns,
+            permission_prompt=self._permission_prompt,
+            ask_user_prompt=self._ask_user_prompt,
+            hook_executor=self._hook_executor,
+            tool_metadata=self._tool_metadata,
+            decision_trace_recorder=self._decision_trace_recorder,
+        )
+        accepted = False
+        try:
+            async for event, usage in run_query(context, query_messages):
+                if usage is not None:
+                    self._cost_tracker.add(usage)
+                yield event
+                if isinstance(event, AssistantTurnComplete) and not event.message.tool_uses:
+                    accepted = True
+        finally:
+            if accepted:
+                # Compaction normally preserves message objects, but history
+                # replacement is allowed to rebuild an equivalent temporary
+                # user message. Remove that one internal exchange by identity
+                # first and by its exact text as a fallback; never discard the
+                # assistant tool-use/result trace that follows it.
+                for index in range(len(query_messages) - 1, -1, -1):
+                    message = query_messages[index]
+                    if message is internal_message or (
+                        message.role == "user"
+                        and message.text == internal_message.text
+                        and not any(isinstance(block, ToolResultBlock) for block in message.content)
+                    ):
+                        del query_messages[index]
+                        break
+                self._messages = query_messages
+            else:
+                self._messages = base_messages
 
     async def continue_pending(self, *, max_turns: int | None = None) -> AsyncIterator[StreamEvent]:
         """Continue an interrupted tool loop without appending a new user message."""

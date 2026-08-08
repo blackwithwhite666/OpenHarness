@@ -7,14 +7,26 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
+from pydantic import BaseModel
 
 from openharness.api.client import ApiMessageCompleteEvent, ApiRetryEvent, ApiTextDeltaEvent
 from openharness.api.errors import RequestFailure
 from openharness.api.usage import UsageSnapshot
 from openharness.config.settings import PermissionSettings, Settings
-from openharness.engine.messages import ConversationMessage, ImageBlock, TextBlock, ToolUseBlock
+from openharness.engine.messages import (
+    ConversationMessage,
+    ImageBlock,
+    TextBlock,
+    ToolResultBlock,
+    ToolUseBlock,
+)
+from openharness.engine.query import (
+    MaxTurnsExceeded,
+    QueryContext,
+    _execute_tool_call,
+    _is_prompt_too_long_error,
+)
 from openharness.engine.query_engine import QueryEngine
-from openharness.prompts.context import build_runtime_system_prompt
 from openharness.engine.stream_events import (
     AssistantTextDelta,
     AssistantTurnComplete,
@@ -24,19 +36,17 @@ from openharness.engine.stream_events import (
     ToolExecutionCompleted,
     ToolExecutionStarted,
 )
+from openharness.hooks import HookEvent, HookExecutionContext, HookExecutor
+from openharness.hooks.loader import HookRegistry
+from openharness.hooks.schemas import PromptHookDefinition
 from openharness.permissions import PermissionChecker, PermissionMode
+from openharness.prompts.context import build_runtime_system_prompt
 from openharness.tasks import get_task_manager
 from openharness.tools import create_default_tool_registry
 from openharness.tools.base import BaseTool, ToolExecutionContext, ToolRegistry, ToolResult
 from openharness.tools.glob_tool import GlobTool
 from openharness.tools.grep_tool import GrepTool
 from openharness.tools.image_to_text_tool import ImageToTextTool
-from pydantic import BaseModel
-from openharness.engine.messages import ToolResultBlock
-from openharness.hooks import HookExecutionContext, HookExecutor, HookEvent
-from openharness.hooks.loader import HookRegistry
-from openharness.hooks.schemas import PromptHookDefinition
-from openharness.engine.query import QueryContext, _execute_tool_call, _is_prompt_too_long_error
 
 
 @dataclass
@@ -244,6 +254,207 @@ async def test_query_engine_plain_text_reply(tmp_path: Path, monkeypatch):
     assert engine.total_usage.input_tokens == 10
     assert engine.total_usage.output_tokens == 5
     assert len(engine.messages) == 2
+
+
+@pytest.mark.asyncio
+async def test_query_engine_internal_message_is_not_retained_as_external_user_turn(
+    tmp_path: Path,
+):
+    engine = QueryEngine(
+        api_client=StaticApiClient("accepted internal result"),
+        tool_registry=create_default_tool_registry(),
+        permission_checker=PermissionChecker(PermissionSettings(mode=PermissionMode.FULL_AUTO)),
+        cwd=tmp_path,
+        model="claude-test",
+        system_prompt="system",
+    )
+    engine.load_messages([ConversationMessage.from_user_text("original user request")])
+
+    events = [
+        event
+        async for event in engine.submit_internal_message(
+            "Internal reconciliation instruction that must not be external"
+        )
+    ]
+
+    assert isinstance(events[-1], AssistantTurnComplete)
+    assert [message.text for message in engine.messages] == [
+        "original user request",
+        "accepted internal result",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_query_engine_internal_message_keeps_provider_valid_tool_trace(
+    tmp_path: Path,
+):
+    registry = ToolRegistry()
+    registry.register(_OkTool())
+    engine = QueryEngine(
+        api_client=FakeApiClient(
+            [
+                _FakeResponse(
+                    message=ConversationMessage(
+                        role="assistant",
+                        content=[
+                            ToolUseBlock(id="toolu_internal", name="ok_tool", input={}),
+                        ],
+                    ),
+                    usage=UsageSnapshot(input_tokens=1, output_tokens=1),
+                ),
+                _FakeResponse(
+                    message=ConversationMessage(
+                        role="assistant",
+                        content=[TextBlock(text="accepted reconciliation")],
+                    ),
+                    usage=UsageSnapshot(input_tokens=1, output_tokens=1),
+                ),
+            ]
+        ),
+        tool_registry=registry,
+        permission_checker=PermissionChecker(PermissionSettings(mode=PermissionMode.FULL_AUTO)),
+        cwd=tmp_path,
+        model="claude-test",
+        system_prompt="system",
+    )
+    engine.load_messages([ConversationMessage.from_user_text("original user request")])
+
+    events = [event async for event in engine.submit_internal_message("private reconciliation")]
+
+    assert isinstance(events[-1], AssistantTurnComplete)
+    assert all("private reconciliation" not in message.text for message in engine.messages)
+    assert [message.role for message in engine.messages] == ["user", "assistant", "user", "assistant"]
+    assert isinstance(engine.messages[1].content[0], ToolUseBlock)
+    assert isinstance(engine.messages[2].content[0], ToolResultBlock)
+    assert engine.messages[-1].text == "accepted reconciliation"
+
+
+@pytest.mark.asyncio
+async def test_query_engine_internal_message_removes_rebuilt_prompt_after_history_replacement(
+    tmp_path: Path, monkeypatch
+):
+    engine = QueryEngine(
+        api_client=StaticApiClient("unused"),
+        tool_registry=ToolRegistry(),
+        permission_checker=PermissionChecker(PermissionSettings(mode=PermissionMode.FULL_AUTO)),
+        cwd=tmp_path,
+        model="claude-test",
+        system_prompt="system",
+    )
+    engine.load_messages([ConversationMessage.from_user_text("original request")])
+
+    async def fake_run_query(_context, messages):
+        messages[:] = [
+            ConversationMessage.from_user_text("[compact boundary]"),
+            ConversationMessage.from_user_text("private reconciliation"),
+            ConversationMessage(
+                role="assistant",
+                content=[ToolUseBlock(id="toolu_rebuilt", name="ok_tool", input={})],
+            ),
+            ConversationMessage(
+                role="user",
+                content=[
+                    ToolResultBlock(tool_use_id="toolu_rebuilt", content="accepted tool result")
+                ],
+            ),
+            ConversationMessage(
+                role="assistant", content=[TextBlock(text="accepted after replacement")]
+            ),
+        ]
+        yield AssistantTurnComplete(
+            message=messages[-3], usage=UsageSnapshot(input_tokens=1, output_tokens=1)
+        ), UsageSnapshot(input_tokens=1, output_tokens=1)
+        yield AssistantTurnComplete(
+            message=messages[-1], usage=UsageSnapshot(input_tokens=1, output_tokens=1)
+        ), UsageSnapshot(input_tokens=1, output_tokens=1)
+
+    monkeypatch.setattr("openharness.engine.query_engine.run_query", fake_run_query)
+    events = [event async for event in engine.submit_internal_message("private reconciliation")]
+
+    assert isinstance(events[-1], AssistantTurnComplete)
+    assert [message.text for message in engine.messages] == [
+        "[compact boundary]",
+        "",
+        "",
+        "accepted after replacement",
+    ]
+    assert isinstance(engine.messages[1].content[0], ToolUseBlock)
+    assert isinstance(engine.messages[2].content[0], ToolResultBlock)
+    assert all(message.text != "private reconciliation" for message in engine.messages)
+
+
+@pytest.mark.asyncio
+async def test_query_engine_internal_message_cancellation_restores_base_history(
+    tmp_path: Path,
+):
+    registry = ToolRegistry()
+    registry.register(_OkTool())
+    engine = QueryEngine(
+        api_client=FakeApiClient(
+            [
+                _FakeResponse(
+                    message=ConversationMessage(
+                        role="assistant",
+                        content=[ToolUseBlock(id="toolu_cancel", name="ok_tool", input={})],
+                    ),
+                    usage=UsageSnapshot(input_tokens=1, output_tokens=1),
+                ),
+                _FakeResponse(
+                    message=ConversationMessage(
+                        role="assistant", content=[TextBlock(text="hidden final")]
+                    ),
+                    usage=UsageSnapshot(input_tokens=1, output_tokens=1),
+                ),
+            ]
+        ),
+        tool_registry=registry,
+        permission_checker=PermissionChecker(PermissionSettings(mode=PermissionMode.FULL_AUTO)),
+        cwd=tmp_path,
+        model="claude-test",
+        system_prompt="system",
+    )
+    base = ConversationMessage.from_user_text("original user request")
+    engine.load_messages([base])
+    stream = engine.submit_internal_message("temporary instruction")
+
+    while True:
+        event = await anext(stream)
+        if isinstance(event, AssistantTurnComplete):
+            break
+    await stream.aclose()
+
+    assert engine.messages == [base]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["error", "max_turns"])
+async def test_query_engine_internal_message_failure_restores_exact_base_history(
+    tmp_path: Path, monkeypatch, outcome: str
+):
+    engine = QueryEngine(
+        api_client=StaticApiClient("unused"),
+        tool_registry=ToolRegistry(),
+        permission_checker=PermissionChecker(PermissionSettings(mode=PermissionMode.FULL_AUTO)),
+        cwd=tmp_path,
+        model="claude-test",
+        system_prompt="system",
+    )
+    base = ConversationMessage.from_user_text("original user request")
+    engine.load_messages([base])
+
+    async def fake_run_query(_context, _messages):
+        if outcome == "max_turns":
+            raise MaxTurnsExceeded(1)
+        yield ErrorEvent(message="provider failed"), None
+
+    monkeypatch.setattr("openharness.engine.query_engine.run_query", fake_run_query)
+    if outcome == "max_turns":
+        with pytest.raises(MaxTurnsExceeded):
+            _ = [event async for event in engine.submit_internal_message("temporary instruction")]
+    else:
+        _ = [event async for event in engine.submit_internal_message("temporary instruction")]
+
+    assert engine.messages == [base]
 
 
 @pytest.mark.asyncio

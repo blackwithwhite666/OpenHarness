@@ -171,6 +171,21 @@ DEFAULT_REMINDER_MAX_PER_CHAT = 50
 _CONVERSATION_TRACE_DISABLED_STATUS = "disabled"
 _NUTRITION_SENDER = "__nutrition_ingest__"
 _NUTRITION_CANDIDATE_RE = re.compile(r"^dropbox-camera-v1-[0-9a-f]{64}$")
+_TODO_RECONCILIATION_MAX_ATTEMPTS = 2
+_TODO_TOOL_NAME = "todo_write"
+_TODO_STATE_READ_ERROR_MARKER = "TODO_STATE_READ_ERROR"
+
+
+class TodoRuntimeStateError(RuntimeError):
+    """The trusted todo snapshot could not be read safely."""
+
+    def __init__(self, session_id: str, cause: BaseException) -> None:
+        self.session_id = session_id
+        self.cause = cause
+        super().__init__(
+            "Todo runtime state is unavailable for session "
+            f"{session_id!r}: {type(cause).__name__}: {cause}"
+        )
 
 
 def _trusted_nutrition_request(message: InboundMessage) -> dict[str, str] | None:
@@ -434,6 +449,33 @@ def _reminder_wellness_tenants(config) -> WellnessTenantResolver:
 _SCHEDULER_SENDER = "__scheduler__"
 
 
+def _is_real_user_turn(message: InboundMessage) -> bool:
+    """Return whether todo lifecycle rules may act on this inbound turn."""
+    metadata = message.metadata or {}
+    return not (
+        bool(metadata.get("_synthetic"))
+        or message.sender_id in {_SCHEDULER_SENDER, _NUTRITION_SENDER}
+    )
+
+
+def _todo_unresolved_items(snapshot: list[dict[str, str]]) -> list[dict[str, str]]:
+    return [
+        item
+        for item in snapshot
+        if item.get("status") in {"pending", "in_progress"}
+    ]
+
+
+def _todo_unresolved_text(snapshot: list[dict[str, str]]) -> str:
+    items = _todo_unresolved_items(snapshot)
+    if not items:
+        return "none"
+    return "; ".join(
+        f"{item.get('content', '<unnamed>')} ({item.get('status', 'unknown')})"
+        for item in items
+    )
+
+
 def _trusted_bound_reminder(message: InboundMessage) -> dict[str, str | None] | None:
     """Return the trusted recipient binding of a scheduler-originated synthetic
     reminder turn, or ``None`` for any other message.
@@ -631,6 +673,7 @@ class OhmoSessionRuntimePool:
         session_key: str,
         latest_user_prompt: str | None = None,
         cwd: str | Path | None = None,
+        include_todo: bool = True,
     ) -> RuntimeBundle:
         """Return an existing bundle or create a new one."""
         initial_memory_scope = self._resolve_turn_memory_scope(None)
@@ -710,6 +753,7 @@ class OhmoSessionRuntimePool:
                 bundle,
                 latest_user_prompt,
                 memory_scope=initial_memory_scope,
+                include_todo=include_todo,
             )
         )
         if hasattr(bundle.engine, "set_cache_key"):
@@ -823,6 +867,7 @@ class OhmoSessionRuntimePool:
 
     async def stream_message(self, message: InboundMessage, session_key: str):
         """Submit an inbound channel message and yield progress + final reply updates."""
+        todo_lifecycle = _is_real_user_turn(message)
         bound_reminder = _trusted_bound_reminder(message)
         wellness_reminder = _trusted_reminder_wellness(message)
         user_message = _build_inbound_user_message(message)
@@ -831,7 +876,16 @@ class OhmoSessionRuntimePool:
         user_prompt = user_message.text
         command_prompt = (message.content or "").strip()
         session_cwd = self._cwd_for_message(message, session_key)
-        bundle = await self.get_bundle(session_key, latest_user_prompt=user_prompt, cwd=session_cwd)
+        if todo_lifecycle:
+            existing_bundle = self._bundles.get(session_key)
+            if existing_bundle is not None:
+                existing_bundle._todo_prompt_read_failure_logged = False
+        bundle = await self.get_bundle(
+            session_key,
+            latest_user_prompt=user_prompt,
+            cwd=session_cwd,
+            include_todo=todo_lifecycle,
+        )
         turn_ctx = build_turn_context(
             message,
             session_id=bundle.session_id,
@@ -857,6 +911,15 @@ class OhmoSessionRuntimePool:
             bundle,
             turn_ctx,
             memory_scope=memory_scope,
+        )
+        bundle.engine.set_system_prompt(
+            await self._runtime_system_prompt(
+                bundle,
+                user_prompt,
+                turn_ctx=turn_ctx,
+                memory_scope=memory_scope,
+                include_todo=todo_lifecycle,
+            )
         )
         if bound_reminder is not None:
             self._apply_bound_reminder_turn(bundle, bound_reminder)
@@ -946,6 +1009,11 @@ class OhmoSessionRuntimePool:
             bundle.engine,
             recorder,
         )
+        suspended_todo_tool = None
+        if not todo_lifecycle:
+            tools = getattr(getattr(bundle, "tool_registry", None), "_tools", None)
+            if isinstance(tools, dict):
+                suspended_todo_tool = tools.pop(_TODO_TOOL_NAME, None)
 
         async def record_updates(updates):
             nonlocal episode_status
@@ -1005,6 +1073,7 @@ class OhmoSessionRuntimePool:
                             turn_ctx=turn_ctx,
                             memory_scope=memory_scope,
                             recorder=recorder,
+                            todo_lifecycle=todo_lifecycle,
                         )
                     ):
                         yield update
@@ -1033,6 +1102,7 @@ class OhmoSessionRuntimePool:
                             turn_ctx=turn_ctx,
                             memory_scope=memory_scope,
                             recorder=recorder,
+                            todo_lifecycle=todo_lifecycle,
                         )
                     ):
                         yield update
@@ -1051,6 +1121,7 @@ class OhmoSessionRuntimePool:
                         turn_ctx=turn_ctx,
                         memory_scope=memory_scope,
                         recorder=recorder,
+                        todo_lifecycle=todo_lifecycle,
                     )
                 ):
                     yield update
@@ -1066,6 +1137,7 @@ class OhmoSessionRuntimePool:
                     turn_ctx=turn_ctx,
                     memory_scope=memory_scope,
                     recorder=recorder,
+                    todo_lifecycle=todo_lifecycle,
                 )
             ):
                 yield update
@@ -1075,6 +1147,10 @@ class OhmoSessionRuntimePool:
                 recorder.record_exception(exc)
             raise
         finally:
+            if suspended_todo_tool is not None:
+                registry = getattr(bundle, "tool_registry", None)
+                if registry is not None:
+                    registry.register(suspended_todo_tool)
             _restore_gateway_decision_trace_recorder(decision_trace_restore)
             if recorder is not None:
                 try:
@@ -1096,6 +1172,7 @@ class OhmoSessionRuntimePool:
         turn_ctx: TurnContext,
         memory_scope: MemoryScope | None,
         recorder: GatewayEvalRecorder | None = None,
+        todo_lifecycle: bool = True,
     ):
         if result.refresh_runtime:
             bundle = await self._refresh_bundle(
@@ -1104,7 +1181,17 @@ class OhmoSessionRuntimePool:
                 user_prompt,
                 turn_ctx=turn_ctx,
                 memory_scope=memory_scope,
+                include_todo=todo_lifecycle,
             )
+
+        todo_error = getattr(bundle, "_todo_runtime_error", None)
+        if todo_lifecycle and isinstance(todo_error, TodoRuntimeStateError):
+            yield GatewayStreamUpdate(
+                kind="error",
+                text=self._todo_runtime_error_text(todo_error),
+                metadata={"_session_key": session_key},
+            )
+            return
 
         if result.message:
             yield GatewayStreamUpdate(
@@ -1127,6 +1214,7 @@ class OhmoSessionRuntimePool:
                     turn_ctx=turn_ctx,
                     memory_scope=memory_scope,
                     recorder=recorder,
+                    todo_lifecycle=todo_lifecycle,
                 ):
                     yield update
             finally:
@@ -1144,14 +1232,25 @@ class OhmoSessionRuntimePool:
                     _last_user_text(bundle.engine.messages),
                     turn_ctx=turn_ctx,
                     memory_scope=memory_scope,
+                    include_todo=todo_lifecycle,
                 )
             )
+            todo_error = getattr(bundle, "_todo_runtime_error", None)
+            if todo_lifecycle and isinstance(todo_error, TodoRuntimeStateError):
+                yield GatewayStreamUpdate(
+                    kind="error",
+                    text=self._todo_runtime_error_text(todo_error),
+                    metadata={"_session_key": session_key},
+                )
+                return
             turns = (
                 result.continue_turns
                 if result.continue_turns is not None
                 else bundle.engine.max_turns
             )
             reply_parts: list[str] = []
+            stream_error = False
+            max_turns_exceeded = False
             decision_trace_restore = _install_gateway_decision_trace_recorder(
                 bundle.engine,
                 recorder,
@@ -1168,8 +1267,12 @@ class OhmoSessionRuntimePool:
                             reply_parts=reply_parts,
                             recorder=recorder,
                         ):
+                            if update.kind == "error":
+                                stream_error = True
                             yield update
                 except MaxTurnsExceeded as exc:
+                    max_turns_exceeded = True
+                    stream_error = True
                     yield GatewayStreamUpdate(
                         kind="error",
                         text=f"Stopped after {exc.max_turns} turns (max_turns).",
@@ -1177,14 +1280,49 @@ class OhmoSessionRuntimePool:
                     )
             finally:
                 _restore_gateway_decision_trace_recorder(decision_trace_restore)
-            await self._save_snapshot(bundle, session_key, user_prompt)
             reply = "".join(reply_parts).strip()
+            if stream_error or max_turns_exceeded:
+                await self._save_snapshot(bundle, session_key, user_prompt)
+                return
+            guard_state = {"reply": reply, "error": None}
+            if todo_lifecycle and reply and not stream_error and not max_turns_exceeded:
+                async for update in self._guard_todo_final(
+                    bundle=bundle,
+                    message=message,
+                    session_key=session_key,
+                    user_prompt=user_prompt,
+                    turn_ctx=turn_ctx,
+                    memory_scope=memory_scope,
+                    reply_parts=reply_parts,
+                    emitted_media=set(),
+                    recorder=recorder,
+                    state=guard_state,
+                ):
+                    yield update
+            await self._save_snapshot(bundle, session_key, user_prompt)
+            if guard_state["error"] is not None:
+                yield GatewayStreamUpdate(
+                    kind="error",
+                    text=str(guard_state["error"]),
+                    metadata={"_session_key": session_key},
+                )
+                return
+            reply = str(guard_state["reply"] or "")
             if reply:
                 yield GatewayStreamUpdate(
                     kind="final",
                     text=reply,
                     metadata={"_session_key": session_key},
                 )
+                if todo_lifecycle:
+                    try:
+                        self._finalize_todo_after_successful_answer(session_id=bundle.session_id)
+                    except Exception:
+                        logger.warning(
+                            "ohmo.todo.cleanup_failure session_id=%s",
+                            bundle.session_id,
+                            exc_info=True,
+                        )
             return
 
         await self._save_snapshot(bundle, session_key, user_prompt)
@@ -1200,7 +1338,16 @@ class OhmoSessionRuntimePool:
         turn_ctx: TurnContext,
         memory_scope: MemoryScope | None,
         recorder: GatewayEvalRecorder | None = None,
+        todo_lifecycle: bool = True,
     ):
+        todo_error = getattr(bundle, "_todo_runtime_error", None)
+        if todo_lifecycle and isinstance(todo_error, TodoRuntimeStateError):
+            yield GatewayStreamUpdate(
+                kind="error",
+                text=self._todo_runtime_error_text(todo_error),
+                metadata={"_session_key": session_key},
+            )
+            return
         trusted_nutrition = _trusted_nutrition_request(message)
         bundle.engine.set_system_prompt(
             await self._runtime_system_prompt(
@@ -1208,10 +1355,20 @@ class OhmoSessionRuntimePool:
                 user_prompt,
                 turn_ctx=turn_ctx,
                 memory_scope=memory_scope,
+                include_todo=todo_lifecycle,
             )
         )
+        todo_error = getattr(bundle, "_todo_runtime_error", None)
+        if todo_lifecycle and isinstance(todo_error, TodoRuntimeStateError):
+            yield GatewayStreamUpdate(
+                kind="error",
+                text=self._todo_runtime_error_text(todo_error),
+                metadata={"_session_key": session_key},
+            )
+            return
         reply_parts: list[str] = []
         emitted_media: set[str] = set()
+        stream_error = False
         yield GatewayStreamUpdate(
             kind="progress",
             text=_format_channel_progress(
@@ -1270,6 +1427,8 @@ class OhmoSessionRuntimePool:
                             reply_parts=reply_parts,
                             recorder=recorder,
                         ):
+                            if update.kind == "error":
+                                stream_error = True
                             _remember_update_media(emitted_media, update)
                             yield update
                     break
@@ -1282,6 +1441,8 @@ class OhmoSessionRuntimePool:
                     reply_parts=reply_parts,
                     recorder=recorder,
                 ):
+                    if update.kind == "error":
+                        stream_error = True
                     _remember_update_media(emitted_media, update)
                     yield update
         except MaxTurnsExceeded as exc:
@@ -1302,8 +1463,36 @@ class OhmoSessionRuntimePool:
             _restore_gateway_decision_trace_recorder(decision_trace_restore)
         self._restore_group_request_context(bundle, previous_group_request)
         self._clear_reminder_context(bundle)
-        await self._save_snapshot(bundle, session_key, user_prompt)
+        if stream_error:
+            await self._save_snapshot(bundle, session_key, user_prompt)
+            return
         reply = "".join(reply_parts).strip()
+        guard_state = {"reply": reply, "error": None}
+        if todo_lifecycle and reply and not stream_error:
+            async for update in self._guard_todo_final(
+                bundle=bundle,
+                message=message,
+                session_key=session_key,
+                user_prompt=user_prompt,
+                turn_ctx=turn_ctx,
+                memory_scope=memory_scope,
+                reply_parts=reply_parts,
+                emitted_media=emitted_media,
+                recorder=recorder,
+                state=guard_state,
+            ):
+                yield update
+
+        await self._save_snapshot(bundle, session_key, user_prompt)
+        if guard_state["error"] is not None:
+            yield GatewayStreamUpdate(
+                kind="error",
+                text=str(guard_state["error"]),
+                metadata={"_session_key": session_key},
+            )
+            return
+        reply = str(guard_state["reply"] or "")
+
         exact_no_visible_rejection = bool(
             trusted_nutrition and _is_exact_no_visible_consumable_portion_rejection(reply)
         )
@@ -1364,6 +1553,15 @@ class OhmoSessionRuntimePool:
                 metadata=metadata,
                 media=final_media or None,
             )
+            if todo_lifecycle:
+                try:
+                    self._finalize_todo_after_successful_answer(session_id=bundle.session_id)
+                except Exception:
+                    logger.warning(
+                        "ohmo.todo.cleanup_failure session_id=%s",
+                        bundle.session_id,
+                        exc_info=True,
+                    )
 
     async def _append_conversation_turn(
         self,
@@ -1568,6 +1766,25 @@ class OhmoSessionRuntimePool:
                 event.is_error,
             )
             if event.tool_name == "todo_write":
+                metadata = event.metadata if isinstance(event.metadata, dict) else {}
+                changed = metadata.get("changed")
+                if changed is False:
+                    logger.info(
+                        "ohmo.todo.write.noop session_id=%s",
+                        bundle.session_id,
+                    )
+                todos = metadata.get("todos")
+                if isinstance(todos, list):
+                    blocked_count = sum(
+                        isinstance(item, dict) and item.get("status") == "blocked"
+                        for item in todos
+                    )
+                    if changed is True and blocked_count:
+                        logger.info(
+                            "ohmo.todo.blocked.persisted session_id=%s count=%s",
+                            bundle.session_id,
+                            blocked_count,
+                        )
                 # Render the updated per-session list as a compact checklist
                 # (Claude-Code todo panel) instead of the per-item JSON.
                 checklist = _render_todo_checklist(self._todo_store.active_path(bundle.session_id))
@@ -1685,9 +1902,13 @@ class OhmoSessionRuntimePool:
         *,
         turn_ctx: TurnContext | None = None,
         memory_scope: MemoryScope | None | object = _UNRESOLVED_MEMORY_SCOPE,
+        include_todo: bool = True,
     ) -> RuntimeBundle:
         snapshot = sanitize_conversation_messages(list(bundle.engine.messages))
         prior_session_id = bundle.session_id
+        todo_prompt_read_failure_logged = getattr(
+            bundle, "_todo_prompt_read_failure_logged", False
+        )
         bundle_cwd = str(Path(getattr(bundle, "cwd", self._cwd)).resolve())
         scope = self._coerce_memory_scope(turn_ctx, memory_scope)
         engaged = scope is not None
@@ -1729,12 +1950,14 @@ class OhmoSessionRuntimePool:
             memory_scope=scope,
         )
         await start_runtime(refreshed)
+        refreshed._todo_prompt_read_failure_logged = todo_prompt_read_failure_logged
         refreshed.engine.set_system_prompt(
             await self._runtime_system_prompt(
                 refreshed,
                 latest_user_prompt,
                 turn_ctx=turn_ctx,
                 memory_scope=scope,
+                include_todo=include_todo,
             )
         )
         if hasattr(refreshed.engine, "set_cache_key"):
@@ -1748,6 +1971,257 @@ class OhmoSessionRuntimePool:
         )
         return refreshed
 
+    def _append_todo_runtime_section(self, bundle: RuntimeBundle, prompt: str) -> str:
+        """Append the trusted, deterministic todo snapshot for the live session."""
+        session_id = str(getattr(bundle, "session_id", "") or "")
+        try:
+            snapshot, _ = self._todo_store.read_snapshot(session_id)
+        except Exception as exc:
+            error = TodoRuntimeStateError(session_id, exc)
+            bundle._todo_runtime_error = error
+            if not getattr(bundle, "_todo_prompt_read_failure_logged", False):
+                bundle._todo_prompt_read_failure_logged = True
+                logger.warning(
+                    "ohmo.todo.prompt.read_failure session_id=%s",
+                    session_id,
+                    exc_info=True,
+                )
+            section = (
+                "# Trusted OHMO Todo Runtime State\n"
+                f"todo_state_status: {_TODO_STATE_READ_ERROR_MARKER}\n"
+                f"session_id: {session_id}\n"
+                "active_todos_json: <UNAVAILABLE>\n"
+                "todo_state_action: Do not produce a candidate answer; repair or atomically replace "
+                "the todo snapshot, then retry."
+            )
+            return f"{prompt.rstrip()}\n\n{section}"
+        bundle._todo_runtime_error = None
+        encoded = json.dumps(
+            snapshot,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        section = (
+            "# Trusted OHMO Todo Runtime State\n"
+            "The following state is injected by the runtime and is authoritative.\n"
+            f"session_id: {session_id}\n"
+            f"active_todos_json: {encoded}\n"
+            "Lifecycle rules:\n"
+            "- Keep the full snapshot synchronized through todo_write; never infer or fabricate completion.\n"
+            "- Pending and in_progress items must remain real work until completed, removed as unnecessary, or blocked with a non-empty reason requiring user or external input.\n"
+            "- Completed and blocked items are durable state and must be preserved unless the runtime archives a completed-only plan after a successful final answer."
+        )
+        return f"{prompt.rstrip()}\n\n{section}"
+
+    @staticmethod
+    def _todo_runtime_error_text(error: TodoRuntimeStateError) -> str:
+        return (
+            f"{error}. No model response was accepted or published. "
+            "Repair or atomically replace the todo snapshot, then retry the turn."
+        )
+
+    def _read_todo_snapshot(self, session_id: str) -> list[dict[str, str]]:
+        try:
+            snapshot, _ = self._todo_store.read_snapshot(session_id)
+        except Exception as exc:
+            raise TodoRuntimeStateError(session_id, exc) from exc
+        return snapshot
+
+    @staticmethod
+    def _discard_latest_assistant(bundle: RuntimeBundle) -> None:
+        history = list(bundle.engine.messages)
+        if (
+            history
+            and getattr(history[-1], "role", None) == "assistant"
+            and not getattr(history[-1], "tool_uses", [])
+        ):
+            history.pop()
+            if hasattr(bundle.engine, "load_messages"):
+                bundle.engine.load_messages(history)
+            else:
+                bundle.engine.messages = history
+
+    async def _guard_todo_final(
+        self,
+        *,
+        bundle: RuntimeBundle,
+        message: InboundMessage,
+        session_key: str,
+        user_prompt: str,
+        turn_ctx: TurnContext,
+        memory_scope: MemoryScope | None,
+        reply_parts: list[str],
+        emitted_media: set[str],
+        recorder: GatewayEvalRecorder | None,
+        state: dict[str, str | None],
+    ):
+        """Reconcile unresolved interactive work before accepting a model final."""
+        try:
+            snapshot = self._read_todo_snapshot(bundle.session_id)
+        except TodoRuntimeStateError as exc:
+            self._discard_latest_assistant(bundle)
+            state["error"] = self._todo_runtime_error_text(exc)
+            return
+
+        unresolved = _todo_unresolved_items(snapshot)
+        if not unresolved:
+            return
+
+        logger.info(
+            "ohmo.todo.guard.trigger session_id=%s unresolved=%s",
+            bundle.session_id,
+            _todo_unresolved_text(snapshot),
+        )
+        self._discard_latest_assistant(bundle)
+        attempts_used = 0
+        reconciliation_error = False
+        for attempt in range(1, _TODO_RECONCILIATION_MAX_ATTEMPTS + 1):
+            attempts_used = attempt
+            try:
+                snapshot = self._read_todo_snapshot(bundle.session_id)
+            except TodoRuntimeStateError as exc:
+                state["error"] = self._todo_runtime_error_text(exc)
+                return
+            logger.info(
+                "ohmo.todo.reconciliation.attempt session_id=%s attempt=%s max_attempts=%s unresolved=%s",
+                bundle.session_id,
+                attempt,
+                _TODO_RECONCILIATION_MAX_ATTEMPTS,
+                _todo_unresolved_text(snapshot),
+            )
+            instruction = (
+                "Internal OHMO todo reconciliation. This is not a user message and must not be "
+                "repeated as an external exchange. Continue the real work now. Current full "
+                "todo snapshot (authoritative JSON): "
+                f"{json.dumps(snapshot, ensure_ascii=False, sort_keys=True, separators=(',', ':'))}\n"
+                "Use tools as needed. Before stopping, atomically resubmit the full plan with "
+                "todo_write: every unresolved item must be completed, removed because it is no "
+                "longer required, or deliberately blocked with a non-empty reason only when "
+                "user or external input is actually required. Never mark work completed merely "
+                "to satisfy this check. Then provide the concise final answer."
+            )
+            bundle.engine.set_system_prompt(
+                await self._runtime_system_prompt(
+                    bundle,
+                    user_prompt,
+                    turn_ctx=turn_ctx,
+                    memory_scope=memory_scope,
+                    include_todo=True,
+                )
+            )
+            todo_error = getattr(bundle, "_todo_runtime_error", None)
+            if isinstance(todo_error, TodoRuntimeStateError):
+                state["error"] = self._todo_runtime_error_text(todo_error)
+                return
+
+            attempt_base = list(bundle.engine.messages)
+            reply_parts.clear()
+            attempt_error = False
+            try:
+                async for event in bundle.engine.submit_internal_message(instruction):
+                    async for update in self._convert_stream_event(
+                        event=event,
+                        bundle=bundle,
+                        message=message,
+                        session_key=session_key,
+                        content=user_prompt,
+                        reply_parts=reply_parts,
+                        recorder=recorder,
+                    ):
+                        if update.kind == "error":
+                            attempt_error = True
+                            continue
+                        _remember_update_media(emitted_media, update)
+                        yield update
+            except MaxTurnsExceeded:
+                attempt_error = True
+            except Exception:
+                attempt_error = True
+                logger.warning(
+                    "ohmo.todo.reconciliation.error session_id=%s attempt=%s",
+                    bundle.session_id,
+                    attempt,
+                    exc_info=True,
+                )
+
+            try:
+                snapshot = self._read_todo_snapshot(bundle.session_id)
+            except TodoRuntimeStateError as exc:
+                if hasattr(bundle.engine, "load_messages"):
+                    bundle.engine.load_messages(attempt_base)
+                else:
+                    bundle.engine.messages = attempt_base
+                state["error"] = self._todo_runtime_error_text(exc)
+                return
+            if attempt_error:
+                reconciliation_error = True
+                if hasattr(bundle.engine, "load_messages"):
+                    bundle.engine.load_messages(attempt_base)
+                else:
+                    bundle.engine.messages = attempt_base
+                break
+            if not _todo_unresolved_items(snapshot):
+                reconciled_reply = "".join(reply_parts).strip()
+                if reconciled_reply:
+                    state["reply"] = reconciled_reply
+                    logger.info(
+                        "ohmo.todo.reconciliation.success session_id=%s attempt=%s",
+                        bundle.session_id,
+                        attempt,
+                    )
+                    return
+                reconciliation_error = True
+                if hasattr(bundle.engine, "load_messages"):
+                    bundle.engine.load_messages(attempt_base)
+                else:
+                    bundle.engine.messages = attempt_base
+                break
+            reconciliation_error = reconciliation_error or attempt_error
+            # submit_internal_message accepted this turn, so preserve the
+            # completed tool-use/result trace for the next attempt. Restore
+            # attempt_base only on actual failure above; otherwise discard
+            # just the unaccepted candidate final.
+            self._discard_latest_assistant(bundle)
+
+        try:
+            snapshot = self._read_todo_snapshot(bundle.session_id)
+        except TodoRuntimeStateError as exc:
+            state["error"] = self._todo_runtime_error_text(exc)
+            return
+        logger.warning(
+            "ohmo.todo.reconciliation.exhausted session_id=%s attempts=%s error=%s unresolved=%s",
+            bundle.session_id,
+            attempts_used,
+            reconciliation_error,
+            _todo_unresolved_text(snapshot),
+        )
+        if not _todo_unresolved_items(snapshot):
+            state["error"] = (
+                "Todo reconciliation resolved the plan, but the accepted final response is missing. "
+                "Continue the task in a new turn."
+            )
+        else:
+            state["error"] = (
+                "Todo reconciliation could not finish safely; unresolved work: "
+                f"{_todo_unresolved_text(snapshot)}. Continue the task in a new turn."
+            )
+
+    def _finalize_todo_after_successful_answer(self, *, session_id: str) -> bool:
+        """Archive a completed-only plan after its final answer was accepted."""
+        snapshot, _ = self._todo_store.read_snapshot(session_id)
+        if not snapshot or any(item.get("status") != "completed" for item in snapshot):
+            return False
+        archived = self._todo_store.active_path(session_id)
+        fresh = self._todo_store.new_list(session_id)
+        logger.info(
+            "ohmo.todo.cleanup session_id=%s archived=%s active=%s",
+            session_id,
+            archived,
+            fresh,
+        )
+        return True
+
     async def _runtime_system_prompt(
         self,
         bundle: RuntimeBundle,
@@ -1755,6 +2229,7 @@ class OhmoSessionRuntimePool:
         *,
         turn_ctx: TurnContext | None = None,
         memory_scope: MemoryScope | None | object = _UNRESOLVED_MEMORY_SCOPE,
+        include_todo: bool = True,
     ) -> str:
         bundle_cwd = str(Path(getattr(bundle, "cwd", self._cwd)).resolve())
         scope = self._coerce_memory_scope(turn_ctx, memory_scope)
@@ -1802,19 +2277,23 @@ class OhmoSessionRuntimePool:
                 turn_ctx.session_id if turn_ctx is not None else "",
             )
         if not hasattr(bundle, "current_settings"):
-            return compose_runtime_prompt(
+            prompt = compose_runtime_prompt(
                 memory_free_base,
                 snapshot,
                 memory_engaged=engaged,
             )
+            return self._append_todo_runtime_section(bundle, prompt) if include_todo else prompt
         settings = bundle.current_settings()
         if not hasattr(settings, "system_prompt"):
-            return compose_runtime_prompt(
+            prompt = compose_runtime_prompt(
                 memory_free_base,
                 snapshot,
                 memory_engaged=engaged,
             )
+            return self._append_todo_runtime_section(bundle, prompt) if include_todo else prompt
         base = settings.system_prompt or memory_free_base
+        if include_todo:
+            base = self._append_todo_runtime_section(bundle, base)
         composed_settings = settings.model_copy(
             update={
                 "system_prompt": compose_runtime_prompt(
