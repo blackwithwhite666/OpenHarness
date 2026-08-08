@@ -7,8 +7,20 @@ from pathlib import Path
 
 import pytest
 
+import ohmo.evals.runner as runner_module
+from ohmo.evals import (
+    build_ohmo_eval_pack,
+    check_ohmo_eval_run_config,
+    get_eval_store,
+    run_ohmo_eval_report,
+    run_ohmo_session_eval,
+    write_ohmo_eval_mine,
+)
+from ohmo.evals.runner import _build_agent_runner, _resolve_eval_system_prompt
+from ohmo.workspace import get_reminders_path, get_skills_dir, initialize_workspace
 from openharness.api.client import ApiMessageCompleteEvent
 from openharness.api.usage import UsageSnapshot
+from openharness.config.settings import Settings
 from openharness.engine.messages import (
     ConversationMessage,
     TextBlock,
@@ -19,35 +31,19 @@ from openharness.evals import (
     EvalEpisode,
     EvalEvent,
     EvalExecutionContext,
-    EvalSessionReportCase,
-)
-from openharness.evals import (
-    FsSandboxAgentRunner,
-    LiveReadAgentRunner,
-    IronUserSpec,
-    ReplayToolsExecutor,
-    SynthContext,
-    promote_case_drafts,
-)
-from openharness.evals import (
     EvalRunPack,
     EvalRunPackCase,
+    EvalSessionReportCase,
+    FsSandboxAgentRunner,
+    IronUserSpec,
+    LiveReadAgentRunner,
+    ReplayToolsExecutor,
+    SynthContext,
     collect_text_facets,
+    promote_case_drafts,
     write_run_pack,
 )
 from openharness.evals.executor import EvalExecutorResult, EvalObservedCall
-import ohmo.evals.runner as runner_module
-from ohmo.evals import (
-    build_ohmo_eval_pack,
-    check_ohmo_eval_run_config,
-    get_eval_store,
-    run_ohmo_eval_report,
-    run_ohmo_session_eval,
-    write_ohmo_eval_mine,
-)
-from openharness.config.settings import Settings
-from ohmo.evals.runner import _build_agent_runner, _resolve_eval_system_prompt
-from ohmo.workspace import get_reminders_path, get_skills_dir, initialize_workspace
 
 
 def test_run_ohmo_session_eval_default_timeout_allows_heavy_sessions():
@@ -1582,7 +1578,7 @@ def test_query_engine_runner_executes_todo_write_live_without_gold_fixture(
     assert result.final_text == "private todo final"
     assert len(todo_calls) == 3
     assert all(not call.is_error for call in todo_calls)
-    assert all(call.output.startswith("Updated ") for call in todo_calls)
+    assert all(json.loads(call.output)["changed"] is True for call in todo_calls)
     assert all("No replay fixture" not in call.output for call in todo_calls)
     assert all("todo_write" in names for names in api_client.tool_names_by_request)
     assert len(created_roots) == 1
@@ -1595,9 +1591,8 @@ def test_live_local_factory_skill_tool_reads_workspace_skill_live(tmp_path: Path
     # mirroring prod, where create_default_tool_registry always exposes SkillTool.
     import asyncio
 
-    from openharness.tools.base import ToolExecutionContext
-
     from ohmo.workspace import get_skills_dir
+    from openharness.tools.base import ToolExecutionContext
 
     maps_skill = get_skills_dir(tmp_path) / "maps"
     maps_skill.mkdir(parents=True)
@@ -1783,6 +1778,13 @@ class _RepeatedTodoWriteApiClient:
         self.tool_names_by_request.append([tool["name"] for tool in request.tools])
         if self._sent_count < self._call_count:
             self._sent_count += 1
+            todos = [
+                {
+                    "content": f"private eval step {index}",
+                    "status": "completed" if index < self._sent_count else "pending",
+                }
+                for index in range(1, self._sent_count + 1)
+            ]
             yield ApiMessageCompleteEvent(
                 message=ConversationMessage(
                     role="assistant",
@@ -1790,7 +1792,7 @@ class _RepeatedTodoWriteApiClient:
                         ToolUseBlock(
                             id=f"toolu-todo-{self._sent_count}",
                             name="todo_write",
-                            input={"item": f"private eval step {self._sent_count}"},
+                            input={"todos": todos},
                         )
                     ],
                 ),
@@ -2119,9 +2121,8 @@ def test_live_local_tool_factory_can_exclude_skill(tmp_path):
 
 
 def test_stable_local_state_root_is_fixed_and_path_independent(tmp_path):
-    from openharness.evals import CompletionCache
-
     from ohmo.evals.runner import _stable_local_state_root
+    from openharness.evals import CompletionCache
 
     # No caching -> no override (preserves per-run mkdtemp isolation).
     assert _stable_local_state_root(None) is None

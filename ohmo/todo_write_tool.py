@@ -1,56 +1,104 @@
-"""ohmo's session-scoped ``todo_write``.
-
-Routes the to-do list through :class:`~ohmo.todo_store.TodoStore` (one file per
-session, keyed by the live ``session_id``) instead of the shared ``<cwd>/TODO.md``,
-so chats and ``/new``-separated tasks never share or inherit each other's items.
-Adds ``new_list`` to start a clean list for an unrelated task mid-conversation.
-"""
+"""OHMO's model-facing, session-scoped todo snapshot tool."""
 
 from __future__ import annotations
 
-from pathlib import Path
-from typing import Callable
+import json
+from collections.abc import Callable
+from typing import Literal
 
-from pydantic import Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from openharness.tools.base import ToolExecutionContext, ToolResult
-from openharness.tools.todo_write_tool import TodoWriteTool, TodoWriteToolInput
+from ohmo.todo_store import (
+    MAX_BLOCKED_REASON_LENGTH,
+    MAX_TODO_CONTENT_LENGTH,
+    MAX_TODOS,
+    TodoStore,
+    canonicalize_text,
+)
+from openharness.tools.base import BaseTool, ToolExecutionContext, ToolResult
 
-from ohmo.todo_store import TodoStore
+
+class OhmoTodoItem(BaseModel):
+    """One item in the complete desired todo state."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    content: str = Field(max_length=MAX_TODO_CONTENT_LENGTH)
+    status: Literal["pending", "in_progress", "completed", "blocked"]
+    blocked_reason: str | None = Field(default=None, max_length=MAX_BLOCKED_REASON_LENGTH)
+
+    @field_validator("content", "blocked_reason", mode="before")
+    @classmethod
+    def _canonicalize_text(cls, value: object) -> object:
+        return canonicalize_text(value) if isinstance(value, str) else value
+
+    @model_validator(mode="after")
+    def _validate_blocked_reason(self) -> OhmoTodoItem:
+        if self.status == "blocked":
+            if not self.blocked_reason:
+                raise ValueError("blocked todo requires a non-empty blocked_reason")
+        elif self.blocked_reason is not None:
+            raise ValueError("blocked_reason is only allowed for blocked todos")
+        if not self.content:
+            raise ValueError("todo content must not be empty")
+        return self
 
 
-class OhmoTodoWriteToolInput(TodoWriteToolInput):
-    """Adds ``new_list`` on top of the base add/check/remove/clear_completed."""
+class OhmoTodoWriteToolInput(BaseModel):
+    """The only OHMO model-facing todo API: a complete typed snapshot."""
 
-    new_list: bool = Field(
-        default=False,
-        description=(
-            "Start a FRESH to-do list for a new, unrelated task. Archives the "
-            "current list to its own file and points this chat at a new empty "
-            "one — use it instead of carrying a previous task's items forward."
-        ),
+    model_config = ConfigDict(extra="forbid")
+
+    todos: list[OhmoTodoItem] = Field(max_length=MAX_TODOS)
+
+    @model_validator(mode="after")
+    def _validate_snapshot(self) -> OhmoTodoWriteToolInput:
+        identities: set[str] = set()
+        in_progress = 0
+        for item in self.todos:
+            identity = item.content.casefold()
+            if identity in identities:
+                raise ValueError(f"duplicate todo content: {item.content!r}")
+            identities.add(identity)
+            if item.status == "in_progress":
+                in_progress += 1
+        if in_progress > 1:
+            raise ValueError("at most one todo may be in_progress")
+        return self
+
+    def canonical_todos(self) -> list[dict[str, str]]:
+        return [item.model_dump(mode="json", exclude_none=True) for item in self.todos]
+
+
+class OhmoTodoWriteTool(BaseTool):
+    """Atomically replace the active session's todo list."""
+
+    name = "todo_write"
+    description = (
+        "Replace the complete OHMO todo snapshot. Submit every item in `todos`; "
+        "use pending, in_progress, completed, or blocked (with blocked_reason). "
+        "Send todos=[] to clear the list. At most one item may be in_progress."
     )
-
-
-class OhmoTodoWriteTool(TodoWriteTool):
-    """Per-session ``todo_write``: the list lives in a TodoStore file keyed by
-    the live ``session_id`` (read at call time, so it tracks ``/new``)."""
-
     input_model = OhmoTodoWriteToolInput
 
     def __init__(self, store: TodoStore, get_session_id: Callable[[], str]):
         self._store = store
         self._get_session_id = get_session_id
 
-    def _resolve_path(self, arguments: TodoWriteToolInput, context: ToolExecutionContext) -> Path:
-        return self._store.active_path(self._get_session_id())
-
     async def execute(
         self, arguments: OhmoTodoWriteToolInput, context: ToolExecutionContext
     ) -> ToolResult:
-        if getattr(arguments, "new_list", False):
-            path = self._store.new_list(self._get_session_id())
-            return ToolResult(
-                output=f"Started a fresh to-do list ({path.name}); the previous one is archived."
-            )
-        return await super().execute(arguments, context)
+        del context
+        todos = arguments.canonical_todos()
+        try:
+            changed = self._store.replace_snapshot(self._get_session_id(), todos)
+        except OSError as exc:
+            return ToolResult(output=f"Todo storage error: {exc}", is_error=True)
+        except (TypeError, ValueError) as exc:
+            return ToolResult(output=f"Invalid todo snapshot: {exc}", is_error=True)
+
+        payload = {"todos": todos, "changed": changed}
+        return ToolResult(
+            output=json.dumps(payload, ensure_ascii=False, sort_keys=True),
+            metadata=payload,
+        )

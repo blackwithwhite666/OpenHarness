@@ -21,8 +21,9 @@ async def test_noop_todo_write_still_renders_the_full_checklist(tmp_path: Path):
     tool = OhmoTodoWriteTool(store, lambda: sid)
     context = ToolExecutionContext(cwd=tmp_path)
 
-    await tool.execute(OhmoTodoWriteToolInput(item="Step A"), context)
-    result = await tool.execute(OhmoTodoWriteToolInput(item="Step A"), context)
+    snapshot = OhmoTodoWriteToolInput(todos=[{"content": "Step A", "status": "pending"}])
+    await tool.execute(snapshot, context)
+    result = await tool.execute(snapshot, context)
 
     runtime = object.__new__(OhmoSessionRuntimePool)
     runtime._todo_store = store
@@ -42,7 +43,7 @@ async def test_noop_todo_write_still_renders_the_full_checklist(tmp_path: Path):
         )
     ]
 
-    assert "No change needed" in result.output
+    assert '"changed": false' in result.output
     assert [update.text for update in updates] == ["📋 To-do\n⬜ Step A"]
 
 

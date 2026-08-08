@@ -1,9 +1,5 @@
 from pathlib import Path
 
-from openharness.config.settings import Settings
-from openharness.memory import add_memory_entry as add_project_memory_entry
-from openharness.prompts import build_runtime_system_prompt
-
 from ohmo.memory import add_memory_entry as add_ohmo_memory_entry
 from ohmo.prompts import build_ohmo_system_prompt
 from ohmo.workspace import (
@@ -13,6 +9,9 @@ from ohmo.workspace import (
     get_user_path,
     initialize_workspace,
 )
+from openharness.config.settings import Settings
+from openharness.memory import add_memory_entry as add_project_memory_entry
+from openharness.prompts import build_runtime_system_prompt
 
 
 def test_ohmo_prompt_includes_persona_and_memory(tmp_path: Path):
@@ -89,7 +88,11 @@ def test_ohmo_prompt_nudges_todo_write(tmp_path: Path):
     prompt = build_ohmo_system_prompt(tmp_path, workspace=workspace)
     assert "todo_write" in prompt
     assert "Staying on track" in prompt
-    assert "clear_completed" in prompt  # prune leftovers from prior tasks
+    assert "COMPLETE desired snapshot" in prompt
+    assert "todos=[]" in prompt
+    assert "blocked_reason" in prompt
+    assert "clear_completed" not in prompt
+    assert "new_list" not in prompt
 
 
 def test_ohmo_prompt_has_telegram_formatting_rules(tmp_path: Path):
