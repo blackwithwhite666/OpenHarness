@@ -2375,33 +2375,6 @@ async def test_gateway_bridge_stop_command_cancels_current_session():
             await task
 
     assert stopped.content.startswith("\u23f9\ufe0f")  # localization-robust: stop notice
-    assert stopped.metadata["_trusted_stop_acknowledgement"] is True
-
-
-@pytest.mark.asyncio
-async def test_gateway_bridge_stop_without_active_session_keeps_ordinary_reply():
-    bus = MessageBus()
-
-    class FakeRuntimePool:
-        async def stream_message(self, message, session_key):
-            if False:
-                yield
-
-    bridge = OhmoGatewayBridge(bus=bus, runtime_pool=FakeRuntimePool())
-    task = asyncio.create_task(bridge.run())
-    try:
-        await bus.publish_inbound(
-            InboundMessage(channel="telegram", sender_id="u1", chat_id="c1", content="/stop")
-        )
-        reply = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
-    finally:
-        bridge.stop()
-        task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await task
-
-    assert reply.content == "Сейчас нет активной задачи."
-    assert "_trusted_stop_acknowledgement" not in reply.metadata
 
 
 @pytest.mark.asyncio

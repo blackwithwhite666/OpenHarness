@@ -84,7 +84,6 @@ class _CompactStatus:
     tick: float = _COMPACT_TICK
     last_event: float = 0.0
     anim: asyncio.Task | None = None
-    stopped: bool = False
 
 
 @dataclass
@@ -1074,10 +1073,6 @@ class TelegramChannel(BaseChannel):
             )
             return self._receipt(msg, native_message_ids)
 
-        if msg.metadata.get("_trusted_stop_acknowledgement") is True:
-            if await self._stop_compact_status(chat_key, chat_id):
-                return self._receipt(msg, native_message_ids)
-
         # Any non-collapse send (final answer, error, command reply, /stop notify)
         # ends the collapsed run: tear the status message down before sending, so
         # the chat is left with just the user's message + the real answer.
@@ -1210,9 +1205,7 @@ class TelegramChannel(BaseChannel):
 
     def _render_status(self, status: _CompactStatus) -> str:
         """Spinner header + the rolling tail of recent step lines."""
-        head = (
-            "⏹️ Остановлено" if status.stopped else f"{_SPINNER_FRAMES[status.spinner_idx]} Работаю…"
-        )
+        head = f"{_SPINNER_FRAMES[status.spinner_idx]} Работаю…"
         sections = list(status.lines)
         if status.todo_text:
             sections.append(status.todo_text)
@@ -1221,26 +1214,6 @@ class TelegramChannel(BaseChannel):
         if len(rendered) > TELEGRAM_MAX_MESSAGE_LEN:
             rendered = rendered[: TELEGRAM_MAX_MESSAGE_LEN - 2].rstrip() + "…"
         return rendered
-
-    async def _stop_compact_status(self, chat_key: str, chat_id: int) -> bool:
-        """Terminalize a live compact tool status in place for a trusted stop ack."""
-        status = self._status.get(chat_key)
-        if status is None or not any(not terminal for _, _, terminal in status.tool_rows.values()):
-            return False
-
-        for call_id, (label, _, terminal) in list(status.tool_rows.items()):
-            if terminal:
-                continue
-            status.tool_rows[call_id] = (label, "stopped", True)
-            status.lines[status.tool_line_positions[call_id]] = _compact_tool_row(label, "stopped")
-        status.stopped = True
-        self._status.pop(chat_key, None)
-        if status.anim is not None and not status.anim.done():
-            status.anim.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await status.anim
-        await self._edit_status(chat_id, status, self._render_status(status))
-        return True
 
     async def _compact_progress(
         self,
