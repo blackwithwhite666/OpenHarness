@@ -37,7 +37,7 @@ from openharness.engine.messages import ConversationMessage
 from openharness.evals import TRACE_FINALIZATION, DecisionTraceValidationError
 from openharness.mcp.types import McpToolInfo
 from openharness.tools.base import ToolExecutionContext, ToolRegistry
-from openharness.tools.mcp_tool import McpToolAdapter, WellnessUserIdInjectingAdapter
+from openharness.tools.mcp_tool import McpToolAdapter, WellnessLoginInjectingAdapter
 
 
 class _FakeHoncho:
@@ -670,7 +670,8 @@ def _wellness_bundle() -> tuple[SimpleNamespace, _RecordingMcpManager]:
                             "type": "object",
                             "properties": {
                                 "user_id": {"type": "string"},
-                                "participant_id": {"type": "integer"},
+                                "health_types": {"type": "array"},
+                                "login": {"type": "string"},
                                 "interval": {"type": "string"},
                             },
                         }
@@ -682,7 +683,18 @@ def _wellness_bundle() -> tuple[SimpleNamespace, _RecordingMcpManager]:
     return bundle, manager
 
 
-async def test_wellness_tool_injects_resolved_tenant_and_never_leaks_across_turns(
+def _wellness_contact_store(workspace: Path) -> ContactStore:
+    store = ContactStore(workspace)
+    store.record_inbound(
+        channel="telegram", chat_id="100", user_id="100", username="dmitry_owner"
+    )
+    store.record_inbound(
+        channel="telegram", chat_id="200", user_id="200", username="Marina_Lipina"
+    )
+    return store
+
+
+async def test_wellness_tool_binds_trusted_logins_and_never_leaks_across_turns(
     tmp_path: Path,
 ) -> None:
     workspace = tmp_path / ".ohmo-home"
@@ -692,6 +704,7 @@ async def test_wellness_tool_injects_resolved_tenant_and_never_leaks_across_turn
         cwd=tmp_path,
         workspace=workspace,
         provider_profile="codex",
+        contact_store=_wellness_contact_store(workspace),
     )
     pool._gateway_config = _family_config()
     bundle, manager = _wellness_bundle()
@@ -705,7 +718,7 @@ async def test_wellness_tool_injects_resolved_tenant_and_never_leaks_across_turn
     assert owner_scope is not None
     pool._configure_turn_memory_surfaces(bundle, owner_ctx, memory_scope=owner_scope)
     tool = bundle.tool_registry.get(_WELLNESS_TOOL_NAME)
-    assert isinstance(tool, WellnessUserIdInjectingAdapter)
+    assert isinstance(tool, WellnessLoginInjectingAdapter)
     assert "user_id" not in json.dumps(tool.input_model.model_json_schema())
 
     owner_result = await tool.execute(
@@ -713,25 +726,34 @@ async def test_wellness_tool_injects_resolved_tenant_and_never_leaks_across_turn
         ToolExecutionContext(cwd=tmp_path),
     )
     assert owner_result.is_error is False
-    assert manager.calls[-1][2]["params"] == {"interval": "7d", "participant_id": 100}
+    assert manager.calls[-1][2]["params"] == {
+        "interval": "7d",
+        "login": "dmitry_owner",
+    }
 
     owner_result = await tool.execute(
-        tool.input_model(params={"interval": "7d", "participant_id": 300}),
+        tool.input_model(params={"interval": "7d", "login": "@Marina_Lipina"}),
         ToolExecutionContext(cwd=tmp_path),
     )
     assert owner_result.is_error is False
-    assert manager.calls[-1][2]["params"] == {"interval": "7d", "participant_id": 300}
+    assert manager.calls[-1][2]["params"] == {
+        "interval": "7d",
+        "login": "marina_lipina",
+    }
 
     marina_scope = pool._resolve_turn_memory_scope(marina_ctx)
     assert marina_scope is not None
     pool._configure_turn_memory_surfaces(bundle, marina_ctx, memory_scope=marina_scope)
     tool = bundle.tool_registry.get(_WELLNESS_TOOL_NAME)
     marina_result = await tool.execute(
-        tool.input_model(params={"interval": "7d", "participant_id": 100}),
+        tool.input_model(params={"interval": "7d", "login": "mallory"}),
         ToolExecutionContext(cwd=tmp_path),
     )
     assert marina_result.is_error is False
-    assert manager.calls[-1][2]["params"] == {"interval": "7d", "participant_id": 200}
+    assert manager.calls[-1][2]["params"] == {
+        "interval": "7d",
+        "login": "marina_lipina",
+    }
 
     assert pool._resolve_turn_memory_scope(unknown_ctx) is None
     pool._configure_turn_memory_surfaces(bundle, unknown_ctx, memory_scope=None)
@@ -1200,6 +1222,7 @@ async def test_auto_reminder_wellness_is_revalidated_and_injected(tmp_path: Path
         cwd=tmp_path,
         workspace=workspace,
         provider_profile="codex",
+        contact_store=_wellness_contact_store(workspace),
     )
     pool._gateway_config = _family_config()
     bundle, manager = _wellness_bundle()
@@ -1223,13 +1246,16 @@ async def test_auto_reminder_wellness_is_revalidated_and_injected(tmp_path: Path
     pool._configure_turn_memory_surfaces(bundle, None, memory_scope=None)
     pool._apply_reminder_wellness_turn(bundle, reminder)
     tool = bundle.tool_registry.get(_WELLNESS_TOOL_NAME)
-    assert isinstance(tool, WellnessUserIdInjectingAdapter)
+    assert isinstance(tool, WellnessLoginInjectingAdapter)
     result = await tool.execute(
         tool.input_model(params={"interval": "7d"}),
         ToolExecutionContext(cwd=tmp_path),
     )
     assert result.is_error is False
-    assert manager.calls[-1][2]["params"] == {"interval": "7d", "participant_id": 100}
+    assert manager.calls[-1][2]["params"] == {
+        "interval": "7d",
+        "login": "dmitry_owner",
+    }
 
 
 @pytest.mark.parametrize(
@@ -1313,6 +1339,7 @@ async def test_bound_synthetic_reminder_binds_marina_wellness_with_memory_disabl
         cwd=tmp_path,
         workspace=workspace,
         provider_profile="codex",
+        contact_store=_wellness_contact_store(workspace),
     )
     pool._gateway_config = _family_config()
     bundle, manager = _wellness_bundle()
@@ -1328,13 +1355,16 @@ async def test_bound_synthetic_reminder_binds_marina_wellness_with_memory_disabl
 
     pool._apply_bound_reminder_turn(bundle, bound)
     tool = bundle.tool_registry.get(_WELLNESS_TOOL_NAME)
-    assert isinstance(tool, WellnessUserIdInjectingAdapter)
+    assert isinstance(tool, WellnessLoginInjectingAdapter)
     result = await tool.execute(
         tool.input_model(params={"interval": "7d"}),
         ToolExecutionContext(cwd=tmp_path),
     )
     assert result.is_error is False
-    assert manager.calls[-1][2]["params"] == {"interval": "7d", "participant_id": 200}
+    assert manager.calls[-1][2]["params"] == {
+        "interval": "7d",
+        "login": "marina_lipina",
+    }
 
 
 @pytest.mark.parametrize(

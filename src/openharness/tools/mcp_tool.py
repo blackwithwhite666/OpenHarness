@@ -55,18 +55,18 @@ class McpToolAdapter(BaseTool):
         return ToolResult(output=f"{UNTRUSTED_BANNER}\n\n{output}", is_error=tool_is_error)
 
 
-class WellnessUserIdInjectingAdapter(BaseTool):
+class WellnessLoginInjectingAdapter(BaseTool):
     """OHMO-scoped wrapper for the worfalomey ``get_wellness_data`` MCP tool.
 
-    Hides the legacy ``params.user_id`` and ``params.health_types`` fields
-    from the model-visible schema. The trusted gateway binds a Telegram
-    principal for every turn. An owner may additionally select a numeric
-    ``params.participant_id``; a family turn is always pinned to its own
-    principal. Telegent's response is passed through without translating
-    participant ids into names or tenants.
+    Hides legacy identity fields from the model-visible schema. The trusted
+    gateway binds a Telegram principal and, when available, its contact login
+    for every authorized turn. Owners may select another participant by login;
+    family turns are always pinned to their own trusted contact login.
+    Telegent's response is passed through without translating logins into names
+    or tenants.
     """
 
-    _HIDDEN_PARAMS = ("user_id", "health_types")
+    _HIDDEN_PARAMS = ("user_id", "health_types", "participant_id")
 
     def __init__(self, delegate: McpToolAdapter) -> None:
         self._delegate = delegate
@@ -75,9 +75,10 @@ class WellnessUserIdInjectingAdapter(BaseTool):
         schema = _schema_without_nested_params(
             delegate._tool_info.input_schema, self._HIDDEN_PARAMS
         )
-        _make_participant_optional(schema)
+        _make_login_optional(schema)
         self.input_model = _input_model_from_schema(self.name, schema)
         self._trusted_principal: str | None = None
+        self._trusted_login: str | None = None
         self._trusted_channel: str | None = None
         self._owner_turn = False
         self._family_turn = False
@@ -86,6 +87,7 @@ class WellnessUserIdInjectingAdapter(BaseTool):
         self,
         principal: str | int | None,
         *,
+        trusted_login: str | None = None,
         channel: str = "telegram",
         owner_turn: bool = False,
         family_turn: bool = False,
@@ -93,6 +95,7 @@ class WellnessUserIdInjectingAdapter(BaseTool):
         """Bind the immutable principal and turn role for the next call."""
         value = str(principal).strip() if principal is not None else ""
         self._trusted_principal = value or None
+        self._trusted_login = _normalize_login(trusted_login)
         self._trusted_channel = str(channel).strip().lower() or None
         self._owner_turn = owner_turn is True
         self._family_turn = family_turn is True
@@ -115,8 +118,9 @@ class WellnessUserIdInjectingAdapter(BaseTool):
         payload = arguments.model_dump(mode="json", exclude_none=True)
         params = payload.get("params")
         injected = dict(params) if isinstance(params, dict) else {}
-        injected.pop("health_types", None)
         injected.pop("user_id", None)
+        injected.pop("health_types", None)
+        injected.pop("participant_id", None)
         if self._trusted_principal is not None:
             if self._trusted_channel != "telegram" or not self._trusted_principal.isdigit():
                 return ToolResult(
@@ -124,29 +128,42 @@ class WellnessUserIdInjectingAdapter(BaseTool):
                     is_error=True,
                 )
             if self._family_turn:
-                selected = self._trusted_principal
-            elif self._owner_turn:
-                selected = injected.get("participant_id")
-                if selected is None:
-                    selected = int(self._trusted_principal)
-                if (
-                    isinstance(selected, bool)
-                    or not isinstance(selected, int)
-                    or selected <= 0
-                ):
+                if self._trusted_login is None:
                     return ToolResult(
                         output=(
-                            "wellness data is unavailable: participant_id must be "
-                            "a positive integer"
+                            "wellness data is unavailable: trusted Telegram contact "
+                            "has no usable username"
                         ),
                         is_error=True,
                     )
+                injected["login"] = self._trusted_login
+            elif self._owner_turn:
+                requested_login = injected.get("login")
+                selected = _normalize_login(requested_login)
+                if (
+                    "login" in injected
+                    and requested_login is not None
+                    and str(requested_login).strip()
+                    and selected is None
+                ):
+                    return ToolResult(
+                        output=(
+                            "wellness data is unavailable: params.login must match "
+                            "^[a-z0-9_]{1,64}$ after normalization"
+                        ),
+                        is_error=True,
+                    )
+                if selected is None:
+                    selected = self._trusted_login
+                if selected is None:
+                    injected.pop("login", None)
+                else:
+                    injected["login"] = selected
             else:
                 return ToolResult(
                     output="wellness data is unavailable: no authorized wellness role",
                     is_error=True,
                 )
-            injected["participant_id"] = int(selected)
         payload["params"] = injected
         return await self._delegate._execute_payload(payload)
 
@@ -224,8 +241,8 @@ def _resolve_schema_refs(schema: dict[str, object]) -> dict[str, object]:
     return resolved
 
 
-def _make_participant_optional(schema: dict[str, object]) -> None:
-    """Make the owner-selectable participant selector omission-safe."""
+def _make_login_optional(schema: dict[str, object]) -> None:
+    """Make the owner-selectable login omission-safe."""
     properties = schema.get("properties")
     if not isinstance(properties, dict):
         return
@@ -234,7 +251,16 @@ def _make_participant_optional(schema: dict[str, object]) -> None:
         return
     required = params.get("required")
     if isinstance(required, list):
-        params["required"] = [item for item in required if item != "participant_id"]
+        params["required"] = [item for item in required if item != "login"]
+
+
+def _normalize_login(value: object | None) -> str | None:
+    if value is None:
+        return None
+    normalized = str(value).strip()
+    normalized = normalized.removeprefix("@")
+    normalized = normalized.lower()
+    return normalized if re.fullmatch(r"[a-z0-9_]{1,64}", normalized) else None
 
 
 def _input_model_from_schema(tool_name: str, schema: dict[str, object]) -> type[BaseModel]:

@@ -103,7 +103,7 @@ from openharness.engine.stream_events import (
     ToolExecutionStarted,
 )
 from openharness.prompts import build_runtime_system_prompt
-from openharness.tools.mcp_tool import McpToolAdapter, WellnessUserIdInjectingAdapter
+from openharness.tools.mcp_tool import McpToolAdapter, WellnessLoginInjectingAdapter
 from openharness.ui.runtime import (
     RuntimeBundle,
     _last_user_text,
@@ -2687,16 +2687,30 @@ class OhmoSessionRuntimePool:
             return
         tool = registry.get(_WELLNESS_TOOL_NAME)
         if isinstance(tool, McpToolAdapter):
-            tool = WellnessUserIdInjectingAdapter(tool)
+            tool = WellnessLoginInjectingAdapter(tool)
             registry.register(tool)
-        if not isinstance(tool, WellnessUserIdInjectingAdapter):
+        if not isinstance(tool, WellnessLoginInjectingAdapter):
             return
+        trusted_login = self._trusted_contact_login(principal)
         tool.set_trusted_principal(
             principal,
+            trusted_login=trusted_login,
             channel="telegram" if principal is not None else "",
             owner_turn=owner_turn,
             family_turn=family_turn,
         )
+
+    def _trusted_contact_login(self, principal: str | None) -> str | None:
+        """Resolve a login only from the exact authenticated Telegram contact."""
+        if self._contact_store is None or principal is None:
+            return None
+        canonical = canonical_principal("telegram", principal)
+        if not canonical.isdigit():
+            return None
+        contact = self._contact_store.get("telegram", canonical)
+        if contact is None or not contact.username:
+            return None
+        return contact.username
 
     def _register_gateway_tools(
         self,

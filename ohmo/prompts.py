@@ -200,9 +200,11 @@ def build_ohmo_system_prompt(
                 "configured participant, use `get_wellness_data`. Treat its response "
                 "as authoritative: identify the participant only by the returned "
                 "`login`, never by a memory guess or by mapping an id yourself. "
-                "The gateway supplies the trusted default participant and may expose "
-                "an owner-only numeric participant selector; never use `user_id` or "
-                "`health_types` parameters."
+                "The gateway supplies the trusted default participant. On an owner "
+                "turn only, you may select another configured participant with the "
+                "optional `params.login` selector; never use a numeric participant "
+                "selector, `user_id`, or `health_types` parameters. Family turns are "
+                "pinned to the authenticated contact by the gateway."
             ),
             "# Nutrition finalization annotations",
             (
