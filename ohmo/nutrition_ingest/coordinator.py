@@ -99,7 +99,7 @@ class NutritionCoordinatorError(RuntimeError):
 
 
 class NutritionIngestCoordinator:
-    """Own the single global confirmation slot and durable state machine."""
+    """Own serialized nutrition work and durable per-candidate state machines."""
 
     def __init__(
         self,
@@ -519,13 +519,15 @@ class NutritionIngestCoordinator:
     def _pending_artifact(
         self, artifacts: list[ReadyNutritionArtifact]
     ) -> tuple[ReadyNutritionArtifact, NutritionResultSidecar] | None:
+        # Pending confirmations are independent queue items: an unanswered
+        # prompt must not block publication of the next candidate.  Keep all
+        # work that can mutate the shared estimation/retry flow serialized.
         for artifact in artifacts:
             sidecar = self._store(artifact).load()
             if sidecar is None:
                 continue
             if sidecar.state in {
                 ResultState.prompt_sending,
-                ResultState.pending_confirmation,
                 ResultState.confirmed,
                 ResultState.estimated,
             }:
@@ -907,9 +909,15 @@ class NutritionIngestCoordinator:
         pending = self._pending_confirmations()
         if len(pending) == 0:
             return is_nutrition_callback
-        if len(pending) != 1:
-            return is_nutrition_callback or self._callback_matches_pending_prompt(message)
-        artifact, sidecar = pending[0]
+        if is_nutrition_callback:
+            matches = self._matching_nutrition_confirmations(message, pending)
+            if len(matches) != 1:
+                return True
+            artifact, sidecar = matches[0]
+        else:
+            if len(pending) != 1:
+                return self._callback_matches_pending_prompt(message)
+            artifact, sidecar = pending[0]
         native_id = message.metadata.get("native_message_id")
         answer = message.content.strip()
         is_legacy_callback = isinstance(callback_data, str) and callback_data.startswith("ask:")
@@ -978,6 +986,30 @@ class NutritionIngestCoordinator:
             if current.state == ResultState.confirmed:
                 self._record_failure(store, current, stage="estimation", error=exc)
         return True
+
+    def _matching_nutrition_confirmations(
+        self,
+        message: InboundMessage,
+        pending: list[tuple[ReadyNutritionArtifact, NutritionResultSidecar]],
+    ) -> list[tuple[ReadyNutritionArtifact, NutritionResultSidecar]]:
+        callback_data = message.metadata.get("callback_data")
+        if not isinstance(callback_data, str):
+            return []
+        answer = message.content.strip()
+        label_index = {label: index for index, label in enumerate(_CONFIRMATION_LABELS)}
+        if answer not in label_index:
+            return []
+        native_id = message.metadata.get("native_message_id")
+        matches = []
+        for artifact, sidecar in pending:
+            callback_prefix = self._callback_prefix(artifact.candidate_id)
+            expected_callback = f"{callback_prefix}{label_index[answer]}"
+            if (
+                callback_data == expected_callback
+                and str(native_id) == str(sidecar.prompt_message_id)
+            ):
+                matches.append((artifact, sidecar))
+        return matches
 
     def _pending_confirmations(self) -> list[tuple[ReadyNutritionArtifact, NutritionResultSidecar]]:
         pending = []

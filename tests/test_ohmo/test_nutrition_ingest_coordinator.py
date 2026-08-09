@@ -766,7 +766,7 @@ async def test_delivery_unknown_does_not_block_later_candidate(tmp_path: Path) -
 
 
 @pytest.mark.asyncio
-async def test_delivery_unknown_still_allows_only_one_later_pending_prompt(tmp_path: Path) -> None:
+async def test_delivery_unknown_still_allows_multiple_later_pending_prompts(tmp_path: Path) -> None:
     for index in range(3):
         _candidate(tmp_path, file_id=f"id:candidate-{index}", rev=f"rev:candidate-{index}")
     config = NutritionIngestConfig(
@@ -796,8 +796,146 @@ async def test_delivery_unknown_still_allows_only_one_later_pending_prompt(tmp_p
 
     assert NutritionResultStore(tmp_path / head / "result.json").load().state == ResultState.delivery_unknown
     assert NutritionResultStore(tmp_path / later / "result.json").load().state == ResultState.pending_confirmation
-    assert NutritionResultStore(tmp_path / tail / "result.json").load().state == ResultState.published
-    assert [item.metadata["_nutrition_candidate_id"] for item in outbound] == [head, later]
+    assert NutritionResultStore(tmp_path / tail / "result.json").load().state == ResultState.prompt_sending
+    assert [item.metadata["_nutrition_candidate_id"] for item in outbound] == [head, later, tail]
+
+
+@pytest.mark.asyncio
+async def test_pending_confirmation_does_not_block_later_candidate_prompt(tmp_path: Path) -> None:
+    _candidate(tmp_path, file_id="id:pending-first", rev="rev:pending-first")
+    _candidate(tmp_path, file_id="id:pending-second", rev="rev:pending-second")
+    config = NutritionIngestConfig(
+        enabled=True,
+        synchronized_root=tmp_path,
+        principal="123",
+        chat_id="123",
+        session_key="telegram:123",
+    )
+    outbound = []
+    coordinator = NutritionIngestCoordinator(
+        config, honcho_client=_RecentSource(), publish_outbound=outbound.append
+    )
+    first, second = [item.candidate_id for item in coordinator._scanner.scan_ready()]
+
+    await coordinator.poll_once()
+    await coordinator.on_send_success(
+        outbound[0],
+        OutboundDeliveryReceipt(
+            "telegram", "123", (41,), outbound[0].metadata["_trusted_outbound_operation_id"]
+        ),
+    )
+    assert NutritionResultStore(tmp_path / first / "result.json").load().state == ResultState.pending_confirmation
+
+    await coordinator.poll_once()
+    assert outbound[1].metadata["_nutrition_candidate_id"] == second
+    await coordinator.on_send_success(
+        outbound[1],
+        OutboundDeliveryReceipt(
+            "telegram", "123", (42,), outbound[1].metadata["_trusted_outbound_operation_id"]
+        ),
+    )
+
+    assert [
+        NutritionResultStore(tmp_path / candidate / "result.json").load().state
+        for candidate in (first, second)
+    ] == [ResultState.pending_confirmation, ResultState.pending_confirmation]
+
+
+@pytest.mark.asyncio
+async def test_candidate_specific_decline_mutates_only_matching_pending_candidate(
+    tmp_path: Path,
+) -> None:
+    _candidate(tmp_path, file_id="id:decline-first", rev="rev:decline-first")
+    _candidate(tmp_path, file_id="id:decline-second", rev="rev:decline-second")
+    config = NutritionIngestConfig(
+        enabled=True,
+        synchronized_root=tmp_path,
+        principal="123",
+        chat_id="123",
+        session_key="telegram:123",
+    )
+    outbound = []
+    coordinator = NutritionIngestCoordinator(
+        config, honcho_client=_RecentSource(), publish_outbound=outbound.append
+    )
+    first, second = [item.candidate_id for item in coordinator._scanner.scan_ready()]
+
+    await coordinator.poll_once()
+    await coordinator.on_send_success(
+        outbound[0],
+        OutboundDeliveryReceipt(
+            "telegram", "123", (41,), outbound[0].metadata["_trusted_outbound_operation_id"]
+        ),
+    )
+    await coordinator.poll_once()
+    await coordinator.on_send_success(
+        outbound[1],
+        OutboundDeliveryReceipt(
+            "telegram", "123", (42,), outbound[1].metadata["_trusted_outbound_operation_id"]
+        ),
+    )
+
+    assert await coordinator.handle_inbound(
+        InboundMessage(
+            channel="telegram",
+            sender_id="123",
+            chat_id="123",
+            content="Нет, не ела",
+            session_key_override="telegram:123",
+            metadata=_nutrition_callback(outbound[1], 1, native_message_id=42),
+        )
+    ) is True
+    assert NutritionResultStore(tmp_path / first / "result.json").load().state == ResultState.pending_confirmation
+    assert NutritionResultStore(tmp_path / second / "result.json").load().state == ResultState.completed
+
+
+@pytest.mark.asyncio
+async def test_mismatched_candidate_specific_callback_fails_closed(
+    tmp_path: Path,
+) -> None:
+    _candidate(tmp_path, file_id="id:mismatch-first", rev="rev:mismatch-first")
+    _candidate(tmp_path, file_id="id:mismatch-second", rev="rev:mismatch-second")
+    config = NutritionIngestConfig(
+        enabled=True,
+        synchronized_root=tmp_path,
+        principal="123",
+        chat_id="123",
+        session_key="telegram:123",
+    )
+    outbound = []
+    coordinator = NutritionIngestCoordinator(
+        config, honcho_client=_RecentSource(), publish_outbound=outbound.append
+    )
+    first, second = [item.candidate_id for item in coordinator._scanner.scan_ready()]
+
+    await coordinator.poll_once()
+    await coordinator.on_send_success(
+        outbound[0],
+        OutboundDeliveryReceipt(
+            "telegram", "123", (41,), outbound[0].metadata["_trusted_outbound_operation_id"]
+        ),
+    )
+    await coordinator.poll_once()
+    await coordinator.on_send_success(
+        outbound[1],
+        OutboundDeliveryReceipt(
+            "telegram", "123", (42,), outbound[1].metadata["_trusted_outbound_operation_id"]
+        ),
+    )
+
+    mismatched = _nutrition_callback(outbound[1], 1, native_message_id=41)
+    assert await coordinator.handle_inbound(
+        InboundMessage(
+            channel="telegram",
+            sender_id="123",
+            chat_id="123",
+            content="Нет, не ела",
+            session_key_override="telegram:123",
+            metadata=mismatched,
+        )
+    ) is True
+    assert NutritionResultStore(tmp_path / first / "result.json").load().state == ResultState.pending_confirmation
+    assert NutritionResultStore(tmp_path / second / "result.json").load().state == ResultState.pending_confirmation
 
 
 @pytest.mark.asyncio
