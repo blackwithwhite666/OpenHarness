@@ -1206,7 +1206,7 @@ def nutrition_status_cmd(
     config = load_gateway_config(workspace)
     coordinator = NutritionIngestCoordinator(config.nutrition_ingest)
     status = coordinator.status()
-    print(json.dumps({"enabled": status["enabled"], "pending": status["pending"], "states": [item["state"] for item in status["items"]]}, sort_keys=True))
+    print(json.dumps(status, sort_keys=True))
 
 
 @nutrition_app.command("replay")

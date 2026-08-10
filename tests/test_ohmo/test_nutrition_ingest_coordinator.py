@@ -2410,3 +2410,379 @@ def test_tombstone_path_rejects_invalid_candidate_and_seen_symlink(tmp_path: Pat
                 state_summary="ready",
             )
         )
+
+
+# ---------------------------------------------------------------------------
+# Observability: stage latencies, privacy-safe status, SLO-gated alerts
+# ---------------------------------------------------------------------------
+
+from ohmo.evals.nutrition_trace import NutritionDisplaySummaryV1
+from ohmo.nutrition_ingest.coordinator import (
+    PENDING_CONFIRMATION_SLO_SECONDS,
+    PROMPT_RECEIPT_SLO_SECONDS,
+)
+
+_INCIDENT_PUBLISH = datetime(2026, 8, 5, 13, 6, 27, tzinfo=UTC)
+_INCIDENT_RECEIPT = datetime(2026, 8, 5, 13, 6, 29, tzinfo=UTC)
+_INCIDENT_CONFIRMATION = datetime(2026, 8, 5, 13, 8, 31, tzinfo=UTC)
+_INCIDENT_ESTIMATED = datetime(2026, 8, 5, 13, 9, 22, tzinfo=UTC)
+
+
+def _incident_summary() -> dict[str, object]:
+    return NutritionDisplaySummaryV1(
+        calories_kcal=550, protein_g=30, fat_g=20, carbohydrate_g=45
+    ).model_dump(mode="json")
+
+
+@pytest.mark.asyncio
+async def test_incident_shaped_timestamps_record_normal_stage_latencies(
+    tmp_path: Path,
+) -> None:
+    """publish→receipt ~2s, confirmation→estimation ~51s, publish→terminal ~175s."""
+    _candidate(tmp_path, file_id="id:incident", rev="rev:incident")
+    config = NutritionIngestConfig(
+        enabled=True,
+        synchronized_root=tmp_path,
+        principal="123",
+        chat_id="123",
+        session_key="telegram:123",
+        retry_backoff_seconds=0,
+        require_owner_only_filesystem=False,
+    )
+    outbound: list = []
+    metrics = NutritionMetrics()
+    clock = _Clock()
+    clock.value = _INCIDENT_PUBLISH
+
+    def estimate_with_51s_latency(message):
+        clock.advance(51.0)
+        return {
+            "assistant_message_id": "honcho-incident",
+            "_trusted_nutrition_display_summary": _incident_summary(),
+        }
+
+    coordinator = NutritionIngestCoordinator(
+        config,
+        honcho_client=_RecentSource(),
+        publish_outbound=outbound.append,
+        estimate=estimate_with_51s_latency,
+        metrics=metrics,
+        now=clock,
+    )
+
+    # publish @ 13:06:27
+    await coordinator.poll_once()
+    prompt = outbound[0]
+    # receipt @ 13:06:29 (+2s)
+    clock.advance(2.0)
+    await coordinator.on_send_success(
+        prompt,
+        OutboundDeliveryReceipt("telegram", "123", (42,), prompt.metadata["_trusted_outbound_operation_id"]),
+    )
+    # confirmation @ 13:08:31 (+122s); estimate advances +51s internally
+    clock.value = _INCIDENT_CONFIRMATION
+    await coordinator.handle_inbound(
+        InboundMessage(
+            channel="telegram",
+            sender_id="123",
+            chat_id="123",
+            content="Да, я это съела",
+            session_key_override="telegram:123",
+            metadata=_nutrition_callback(prompt),
+        )
+    )
+
+    stage = metrics.snapshot()["stage_latencies"]
+    assert stage["publish_to_receipt"] == {
+        "count": 1,
+        "sum_seconds": pytest.approx(2.0),
+        "max_seconds": pytest.approx(2.0),
+    }
+    assert stage["pending_confirmation"] == {
+        "count": 1,
+        "sum_seconds": pytest.approx(122.0),
+        "max_seconds": pytest.approx(122.0),
+    }
+    assert stage["confirmation_to_estimation"] == {
+        "count": 1,
+        "sum_seconds": pytest.approx(51.0),
+        "max_seconds": pytest.approx(51.0),
+    }
+    assert stage["publish_to_terminal"] == {
+        "count": 1,
+        "sum_seconds": pytest.approx(175.0),
+        "max_seconds": pytest.approx(175.0),
+    }
+
+
+@pytest.mark.asyncio
+async def test_status_returns_privacy_safe_aggregate_after_completion(
+    tmp_path: Path,
+) -> None:
+    candidate = _candidate(tmp_path, file_id="id:status-privacy", rev="rev:status-privacy")
+    config = NutritionIngestConfig(
+        enabled=True,
+        synchronized_root=tmp_path,
+        principal="123",
+        chat_id="123",
+        session_key="telegram:123",
+        retry_backoff_seconds=0,
+        require_owner_only_filesystem=False,
+    )
+    outbound: list = []
+    metrics = NutritionMetrics()
+    clock = _Clock()
+    clock.value = _INCIDENT_PUBLISH
+
+    def estimate_with_latency(message):
+        clock.advance(51.0)
+        return {
+            "assistant_message_id": "honcho-status",
+            "_trusted_nutrition_display_summary": _incident_summary(),
+        }
+
+    coordinator = NutritionIngestCoordinator(
+        config,
+        honcho_client=_RecentSource(),
+        publish_outbound=outbound.append,
+        estimate=estimate_with_latency,
+        metrics=metrics,
+        now=clock,
+    )
+    await coordinator.poll_once()
+    prompt = outbound[0]
+    clock.advance(2.0)
+    await coordinator.on_send_success(
+        prompt,
+        OutboundDeliveryReceipt("telegram", "123", (42,), prompt.metadata["_trusted_outbound_operation_id"]),
+    )
+    clock.value = _INCIDENT_CONFIRMATION
+    await coordinator.handle_inbound(
+        InboundMessage(
+            channel="telegram",
+            sender_id="123",
+            chat_id="123",
+            content="Да, я это съела",
+            session_key_override="telegram:123",
+            metadata=_nutrition_callback(prompt),
+        )
+    )
+
+    status = coordinator.status()
+    rendered = json.dumps(status, sort_keys=True, default=str)
+
+    # Privacy: no identifiers leak.
+    assert candidate not in rendered
+    assert "123" not in status  # principal/chat_id
+    for key in ("candidate_id", "candidate", "items"):
+        assert key not in status
+
+    # Aggregate structure.
+    assert status["enabled"] is True
+    assert status["counts_by_state"] == {"completed": 1}
+    assert "published" in status["stage_latest_at"]
+    assert "pending_confirmation" in status["stage_latest_at"]
+    assert "completed" in status["stage_latest_at"]
+    assert status["last_delivery_receipt_at"] is not None
+    assert status["alert_conditions"] == {}
+    assert status["last_error"] is None
+
+    # Metrics gauges updated.
+    assert metrics.snapshot()["state_gauges"] == {"completed": 1}
+    assert metrics.snapshot()["alert_gauges"] == {}
+
+
+@pytest.mark.asyncio
+async def test_status_disabled_coordinator_returns_empty_snapshot(tmp_path: Path) -> None:
+    config = NutritionIngestConfig(enabled=False, synchronized_root=tmp_path)
+    coordinator = NutritionIngestCoordinator(config)
+    status = coordinator.status()
+    assert status == {
+        "enabled": False,
+        "counts_by_state": {},
+        "stage_latest_at": {},
+        "last_delivery_receipt_at": None,
+        "alert_conditions": {},
+        "last_error": None,
+    }
+
+
+@pytest.mark.asyncio
+async def test_pending_confirmation_within_slo_does_not_alert(tmp_path: Path) -> None:
+    """A normal long pending owner confirmation must not page before its SLO."""
+    _candidate(tmp_path, file_id="id:slo-pending", rev="rev:slo-pending")
+    config = NutritionIngestConfig(
+        enabled=True,
+        synchronized_root=tmp_path,
+        principal="123",
+        chat_id="123",
+        session_key="telegram:123",
+        retry_backoff_seconds=0,
+        require_owner_only_filesystem=False,
+    )
+    outbound: list = []
+    metrics = NutritionMetrics()
+    clock = _Clock()
+    clock.value = _INCIDENT_PUBLISH
+
+    coordinator = NutritionIngestCoordinator(
+        config,
+        honcho_client=_RecentSource(),
+        publish_outbound=outbound.append,
+        metrics=metrics,
+        now=clock,
+    )
+    await coordinator.poll_once()
+    prompt = outbound[0]
+    clock.advance(2.0)
+    await coordinator.on_send_success(
+        prompt,
+        OutboundDeliveryReceipt("telegram", "123", (42,), prompt.metadata["_trusted_outbound_operation_id"]),
+    )
+
+    pending_at = clock.value
+    # Just under SLO — no alert.
+    clock.value = pending_at + timedelta(seconds=PENDING_CONFIRMATION_SLO_SECONDS - 1)
+    status_within = coordinator.status()
+    assert "pending_confirmation_over_slo" not in status_within["alert_conditions"]
+
+    # Past SLO — alert fires.
+    clock.value = pending_at + timedelta(seconds=PENDING_CONFIRMATION_SLO_SECONDS + 1)
+    status_past = coordinator.status()
+    assert status_past["alert_conditions"]["pending_confirmation_over_slo"] == 1
+
+
+@pytest.mark.asyncio
+async def test_prompt_without_receipt_alerts_after_slo(tmp_path: Path) -> None:
+    _candidate(tmp_path, file_id="id:receipt-slo", rev="rev:receipt-slo")
+    config = NutritionIngestConfig(
+        enabled=True,
+        synchronized_root=tmp_path,
+        principal="123",
+        chat_id="123",
+        session_key="telegram:123",
+        retry_backoff_seconds=0,
+        require_owner_only_filesystem=False,
+    )
+    outbound: list = []
+    clock = _Clock()
+
+    coordinator = NutritionIngestCoordinator(
+        config,
+        honcho_client=_RecentSource(),
+        publish_outbound=outbound.append,
+        now=clock,
+    )
+    await coordinator.poll_once()
+    assert len(outbound) == 1  # prompt_sending
+
+    published_at = clock.value
+    clock.value = published_at + timedelta(seconds=PROMPT_RECEIPT_SLO_SECONDS + 1)
+    status = coordinator.status()
+    assert status["alert_conditions"]["prompt_without_receipt"] == 1
+
+    clock.value = published_at + timedelta(seconds=PROMPT_RECEIPT_SLO_SECONDS - 1)
+    status_ok = coordinator.status()
+    assert "prompt_without_receipt" not in status_ok["alert_conditions"]
+
+
+@pytest.mark.asyncio
+async def test_status_last_error_is_privacy_safe(tmp_path: Path) -> None:
+    candidate = _candidate(tmp_path, file_id="id:last-error", rev="rev:last-error")
+    config = NutritionIngestConfig(
+        enabled=True,
+        synchronized_root=tmp_path,
+        principal="123",
+        chat_id="123",
+        session_key="telegram:123",
+        retry_backoff_seconds=0,
+        require_owner_only_filesystem=False,
+    )
+    metrics = NutritionMetrics()
+    clock = _Clock()
+
+    def fail_publish(message):
+        raise RuntimeError("transport unavailable: secret-connection-reset-by-peer-42")
+
+    coordinator = NutritionIngestCoordinator(
+        config,
+        honcho_client=_RecentSource(),
+        publish_outbound=fail_publish,
+        metrics=metrics,
+        now=clock,
+    )
+    await coordinator.poll_once()
+
+    status = coordinator.status()
+    last_error = status["last_error"]
+    assert last_error is not None
+    assert last_error["stage"] == "prompt"
+    assert last_error["error_class"] == "transport"
+    assert last_error["state"] == "retryable_error"
+    assert "at" in last_error
+
+    rendered = json.dumps(status, sort_keys=True, default=str)
+    assert candidate not in rendered
+    assert "secret-connection-reset" not in rendered
+    assert "transport unavailable" not in rendered
+
+
+@pytest.mark.asyncio
+async def test_status_last_error_collapses_free_form_stage_to_unknown(
+    tmp_path: Path,
+) -> None:
+    """A free-form/identifying StageAttempt.stage must never leak into status.
+
+    ``StageAttempt.stage`` is a free-form string on the wire (only
+    ``min_length=1``), but the privacy contract requires
+    ``status.last_error.stage`` to be one of a fixed low-cardinality enum.
+    An identifying or malicious stage string must collapse to ``"unknown"``
+    and never appear in the rendered snapshot.
+    """
+    candidate = _candidate(
+        tmp_path, file_id="id:malicious-stage", rev="rev:malicious-stage"
+    )
+    config = NutritionIngestConfig(
+        enabled=True,
+        synchronized_root=tmp_path,
+        principal="123",
+        chat_id="123",
+        session_key="telegram:123",
+        retry_backoff_seconds=0,
+        require_owner_only_filesystem=False,
+    )
+
+    def fail_publish(message):
+        raise RuntimeError("transport unavailable")
+
+    coordinator = NutritionIngestCoordinator(
+        config,
+        honcho_client=_RecentSource(),
+        publish_outbound=fail_publish,
+        metrics=NutritionMetrics(),
+        now=_Clock(),
+    )
+    await coordinator.poll_once()
+
+    # The coordinator only ever records fixed stages; simulate a sidecar
+    # written upstream whose attempt carries a free-form/identifying stage.
+    malicious_stage = "dropbox-camera-v1-secret-stage-LEAK-42"
+    sidecar_path = tmp_path / candidate / "result.json"
+    payload = json.loads(sidecar_path.read_text())
+    assert payload["attempts"], "publish failure must persist an attempt"
+    payload["attempts"][-1]["stage"] = malicious_stage
+    sidecar_path.write_text(json.dumps(payload))
+
+    status = coordinator.status()
+    last_error = status["last_error"]
+    assert last_error is not None
+    # Fixed enum value only; the malicious free-form stage is collapsed.
+    assert last_error["stage"] == "unknown"
+    assert last_error["error_class"] == "transport"
+    assert last_error["state"] == "retryable_error"
+
+    rendered = json.dumps(status, sort_keys=True, default=str)
+    assert malicious_stage not in rendered
+    assert "LEAK" not in rendered
+    assert "secret-stage" not in rendered
+    assert candidate not in rendered

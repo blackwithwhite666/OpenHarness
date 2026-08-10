@@ -181,8 +181,11 @@ def test_nutrition_status_and_replay_cli_output_is_privacy_safe(monkeypatch, cap
         def status(self):
             return {
                 "enabled": True,
-                "pending": 1,
-                "items": [{"state": "delivery_unknown", "candidate": "secret-candidate"}],
+                "counts_by_state": {"delivery_unknown": 1},
+                "stage_latest_at": {},
+                "last_delivery_receipt_at": None,
+                "alert_conditions": {"delivery_unknown": 1},
+                "last_error": None,
             }
 
         def request_replay(self, candidate):

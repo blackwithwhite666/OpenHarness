@@ -10,6 +10,7 @@ import os
 import re
 import shutil
 import stat
+from collections import Counter
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -65,6 +66,32 @@ _LEGACY_STAGING_RE = re.compile(
 )
 _METADATA_MAX_BYTES = 32 * 1024
 _FINGERPRINT_ALGORITHM_MAX = 64
+
+# SLO thresholds for alert conditions.  A normal pending confirmation (owner
+# has not yet replied) must NOT page until its SLO expires.
+PROMPT_RECEIPT_SLO_SECONDS: float = 60.0
+PENDING_CONFIRMATION_SLO_SECONDS: float = 6 * 3600.0
+CONFIRMED_ESTIMATION_SLO_SECONDS: float = 180.0
+
+# Fixed error-class enum reused for the bounded last-error snapshot field.
+_ERROR_CLASS_KEYWORDS: tuple[tuple[str, str], ...] = (
+    ("hash", "integrity"),
+    ("integrity", "integrity"),
+    ("mismatch", "integrity"),
+    ("receipt", "acknowledgement"),
+    ("ack", "acknowledgement"),
+    ("delivery", "acknowledgement"),
+    ("timeout", "transport"),
+    ("transport", "transport"),
+    ("unavailable", "transport"),
+)
+
+# Fixed low-cardinality stage enum for the privacy-safe last-error snapshot.
+# ``StageAttempt.stage`` is a free-form string on the wire, so only these
+# values are ever exported; anything else collapses to ``"unknown"``.
+_STATUS_LAST_ERROR_STAGES: frozenset[str] = frozenset(
+    {"scan", "dedup", "prompt", "estimation", "observation"}
+)
 
 
 def _format_nutrition_number(value: float) -> str:
@@ -783,6 +810,7 @@ class NutritionIngestCoordinator:
             ResultState.pending_confirmation,
             prompt_message_id=receipt.native_message_ids[0],
         )
+        self._record_publish_to_receipt(current)
         return True
 
     async def on_send_failure(self, message: OutboundMessage, error: BaseException) -> bool:
@@ -945,6 +973,7 @@ class NutritionIngestCoordinator:
         if answer == _NO_LABEL:
             self._metrics.confirmation("declined")
             self._record_pending_latency(sidecar)
+            self._record_pending_confirmation_latency(sidecar)
             store = self._store(artifact)
             declined = self._advance(
                 store,
@@ -960,6 +989,7 @@ class NutritionIngestCoordinator:
         if answer == _NON_FOOD_LABEL:
             self._metrics.confirmation("non_food")
             self._record_pending_latency(sidecar)
+            self._record_pending_confirmation_latency(sidecar)
             completed = self._complete_non_food(
                 artifact,
                 sidecar,
@@ -972,6 +1002,7 @@ class NutritionIngestCoordinator:
         store = self._store(artifact)
         self._metrics.confirmation("accepted")
         self._record_pending_latency(sidecar)
+        self._record_pending_confirmation_latency(sidecar)
         confirmed = self._advance(
             store,
             sidecar,
@@ -1198,7 +1229,9 @@ class NutritionIngestCoordinator:
         store = self._store(artifact)
         current = store.load() or sidecar
         if current.state in {ResultState.confirmed, ResultState.retryable_error}:
+            confirmed_at = self._state_at(current, ResultState.confirmed)
             current = self._advance(store, current, ResultState.estimated)
+            self._record_confirmation_to_estimation(confirmed_at, current)
         elif current.state == ResultState.completed:
             self._metrics.duplicate_suppression("observation")
             return False
@@ -1256,7 +1289,9 @@ class NutritionIngestCoordinator:
         )
         terminal = sidecar.state_history[-1] if sidecar.state_history else None
         if published is not None and terminal is not None:
-            self._metrics.end_to_end_latency(max(0.0, (terminal.at - published.at).total_seconds()))
+            seconds = max(0.0, (terminal.at - published.at).total_seconds())
+            self._metrics.end_to_end_latency(seconds)
+            self._metrics.stage_latency("publish_to_terminal", seconds)
 
     def _record_pending_latency(self, sidecar: NutritionResultSidecar) -> None:
         published = next(
@@ -1267,16 +1302,61 @@ class NutritionIngestCoordinator:
                 max(0.0, (self._current_time() - published.at).total_seconds())
             )
 
+    def _record_publish_to_receipt(self, pre_receipt: NutritionResultSidecar) -> None:
+        """Record publish → receipt latency exactly once at the durable receipt."""
+        published_at = self._state_at(pre_receipt, ResultState.published)
+        if published_at is not None:
+            self._metrics.stage_latency(
+                "publish_to_receipt",
+                max(0.0, (self._current_time() - published_at).total_seconds()),
+            )
+
+    def _record_pending_confirmation_latency(
+        self, pre_confirmation: NutritionResultSidecar
+    ) -> None:
+        """Record the owner response time (pending_confirmation → next state)."""
+        pending_at = self._state_at(pre_confirmation, ResultState.pending_confirmation)
+        if pending_at is not None:
+            self._metrics.stage_latency(
+                "pending_confirmation",
+                max(0.0, (self._current_time() - pending_at).total_seconds()),
+            )
+
+    def _record_confirmation_to_estimation(
+        self,
+        confirmed_at: datetime | None,
+        post_estimated: NutritionResultSidecar,
+    ) -> None:
+        """Record confirmed → estimated latency at the durable estimation commit."""
+        estimated_at = self._state_at(post_estimated, ResultState.estimated)
+        if confirmed_at is not None and estimated_at is not None:
+            self._metrics.stage_latency(
+                "confirmation_to_estimation",
+                max(0.0, (estimated_at - confirmed_at).total_seconds()),
+            )
+
+    @staticmethod
+    def _state_at(
+        sidecar: NutritionResultSidecar, state: ResultState
+    ) -> datetime | None:
+        """Return the timestamp of the first occurrence of *state* in history."""
+        for entry in sidecar.state_history:
+            if entry.state == state:
+                return entry.at
+        return None
+
+    @staticmethod
+    def _classify_error_text(text: str) -> str:
+        """Map raw exception text to a fixed error-class enum without leaking text."""
+        lower = text.lower()
+        for keyword, label in _ERROR_CLASS_KEYWORDS:
+            if keyword in lower:
+                return label
+        return "runtime"
+
     @staticmethod
     def _error_class(error: BaseException) -> str:
-        text = str(error).lower()
-        if "hash" in text or "integrity" in text or "mismatch" in text:
-            return "integrity"
-        if "receipt" in text or "ack" in text or "delivery" in text:
-            return "acknowledgement"
-        if "timeout" in text or "transport" in text or "unavailable" in text:
-            return "transport"
-        return "runtime"
+        return NutritionIngestCoordinator._classify_error_text(str(error))
 
     def request_replay(self, candidate_id: str) -> bool:
         """Atomically enqueue an operator-approved replay for the service."""
@@ -1327,15 +1407,169 @@ class NutritionIngestCoordinator:
         self._running = False
 
     def status(self) -> dict[str, object]:
-        items = []
-        for artifact in self._scanner.scan_ready():
-            sidecar = self._store(artifact).load()
-            if sidecar is not None:
-                items.append({"state": sidecar.state.value, "candidate": sidecar.candidate_id})
+        """Return a privacy-safe, actionable aggregate snapshot.
+
+        No candidate id, chat id, username, file path, nutrition content, or
+        raw error text is ever exported.  Counts are grouped by fixed state
+        enums; timestamps are coarse ISO strings; the last error carries only
+        fixed stage / error_class / state / time.
+        """
+        if not self.enabled:
+            return {
+                "enabled": False,
+                "counts_by_state": {},
+                "stage_latest_at": {},
+                "last_delivery_receipt_at": None,
+                "alert_conditions": {},
+                "last_error": None,
+            }
+
+        sidecars = [
+            sidecar
+            for artifact in self._scanner.scan_ready()
+            for sidecar in [self._store(artifact).load()]
+            if sidecar is not None
+        ]
+        now = self._current_time()
+        counts: Counter[str] = Counter()
+        stage_latest: dict[str, str] = {}
+        last_receipt_at: datetime | None = None
+        alerts: Counter[str] = Counter()
+        last_error: dict[str, str] | None = None
+
+        _TRACKED_STAGES = (
+            ResultState.published,
+            ResultState.pending_confirmation,
+            ResultState.confirmed,
+            ResultState.estimated,
+            ResultState.completed,
+        )
+
+        for sidecar in sidecars:
+            counts[sidecar.state.value] += 1
+
+            for stage_state in _TRACKED_STAGES:
+                at = self._state_at(sidecar, stage_state)
+                if at is None:
+                    continue
+                key = stage_state.value
+                existing = stage_latest.get(key)
+                if existing is None or at.isoformat() > existing:
+                    stage_latest[key] = at.isoformat()
+
+            receipt_at = self._state_at(sidecar, ResultState.pending_confirmation)
+            if receipt_at is not None and (
+                last_receipt_at is None or receipt_at > last_receipt_at
+            ):
+                last_receipt_at = receipt_at
+
+            alerts.update(self._alerts_for(sidecar, now))
+
+            candidate_error = self._last_error_for(sidecar)
+            if candidate_error is not None and (
+                last_error is None or candidate_error["at"] > last_error["at"]
+            ):
+                last_error = candidate_error
+
+        state_counts = dict(counts)
+        alert_counts = dict(alerts)
+        self._metrics.set_state_gauges(state_counts, alert_counts)
+
         return {
-            "enabled": self.enabled,
-            "pending": sum(item["state"] == "pending_confirmation" for item in items),
-            "items": items,
+            "enabled": True,
+            "counts_by_state": dict(sorted(state_counts.items())),
+            "stage_latest_at": dict(sorted(stage_latest.items())),
+            "last_delivery_receipt_at": (
+                last_receipt_at.isoformat() if last_receipt_at is not None else None
+            ),
+            "alert_conditions": dict(sorted(alert_counts.items())),
+            "last_error": last_error,
+        }
+
+    def _alerts_for(
+        self, sidecar: NutritionResultSidecar, now: datetime
+    ) -> Counter[str]:
+        """Compute fixed alert-condition counts without paging within SLO."""
+        alerts: Counter[str] = Counter()
+        state = sidecar.state
+
+        if state in {ResultState.published, ResultState.prompt_sending}:
+            published_at = self._state_at(sidecar, ResultState.published)
+            if (
+                published_at is not None
+                and (now - published_at).total_seconds() > PROMPT_RECEIPT_SLO_SECONDS
+            ):
+                alerts["prompt_without_receipt"] += 1
+
+        if state == ResultState.pending_confirmation:
+            pending_at = self._state_at(sidecar, ResultState.pending_confirmation)
+            if (
+                pending_at is not None
+                and (now - pending_at).total_seconds()
+                > PENDING_CONFIRMATION_SLO_SECONDS
+            ):
+                alerts["pending_confirmation_over_slo"] += 1
+
+        if state == ResultState.confirmed:
+            confirmed_at = self._state_at(sidecar, ResultState.confirmed)
+            if (
+                confirmed_at is not None
+                and (now - confirmed_at).total_seconds()
+                > CONFIRMED_ESTIMATION_SLO_SECONDS
+            ):
+                alerts["estimation_over_slo"] += 1
+
+        if state == ResultState.delivery_unknown:
+            alerts["delivery_unknown"] += 1
+
+        if state == ResultState.retryable_error:
+            alerts["retryable_error"] += 1
+
+        if state == ResultState.dead_letter:
+            alerts["dead_letter"] += 1
+
+        return alerts
+
+    def _last_error_for(
+        self, sidecar: NutritionResultSidecar
+    ) -> dict[str, str] | None:
+        """Return a bounded, privacy-safe last-error dict or None.
+
+        Only fixed stage / error_class / state / at are exported; raw exception
+        text, candidate ids, and paths are never included.
+        """
+        best_at: datetime | None = None
+        best_stage = "unknown"
+        best_error_class = "runtime"
+
+        for attempt in sidecar.attempts:
+            if not attempt.error:
+                continue
+            at = attempt.finished_at or attempt.started_at
+            if best_at is None or at > best_at:
+                best_at = at
+                best_stage = (
+                    attempt.stage
+                    if attempt.stage in _STATUS_LAST_ERROR_STAGES
+                    else "unknown"
+                )
+                best_error_class = self._classify_error_text(attempt.error)
+
+        for entry in sidecar.state_history:
+            if not entry.error:
+                continue
+            if best_at is None or entry.at > best_at:
+                best_at = entry.at
+                best_stage = "unknown"
+                best_error_class = self._classify_error_text(entry.error)
+
+        if best_at is None:
+            return None
+        return {
+            "stage": best_stage,
+            "error_class": best_error_class,
+            "state": sidecar.state.value,
+            "at": best_at.isoformat(),
         }
 
 
