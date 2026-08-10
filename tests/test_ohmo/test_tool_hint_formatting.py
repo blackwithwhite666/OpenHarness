@@ -102,8 +102,28 @@ def test_format_channel_progress_status_adds_bubble():
     assert _progress("status", "syncing") == "🫧 syncing"
 
 
-def test_format_channel_progress_thinking_picks_english_phrase():
-    assert _progress("thinking", "") in _CHANNEL_THINKING_PHRASES_EN
+def test_format_channel_progress_thinking_is_silent_on_telegram():
+    # Telegram quiet progress renders a stable per-turn Russian header plus an
+    # explicit inference state; the canned English thinking phrases (notably
+    # "🧩 Following the thread…") must never reach Telegram.
+    assert _progress("thinking", "") == ""
+    assert "🧩 Following the thread…" not in {
+        _format_channel_progress(
+            channel="telegram", kind="thinking", text="Thinking...",
+            session_key=f"s{i}", content=f"content {i}",
+        )
+        for i in range(8)
+    }
+
+
+def test_format_channel_progress_thinking_keeps_english_phrase_off_telegram():
+    assert (
+        _format_channel_progress(
+            channel="feishu", kind="thinking", text="Thinking...",
+            session_key="s", content="can you help",
+        )
+        in _CHANNEL_THINKING_PHRASES_EN
+    )
 
 
 def test_format_channel_progress_image_fallback_has_icon():

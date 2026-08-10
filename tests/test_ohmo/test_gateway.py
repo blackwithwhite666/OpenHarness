@@ -1264,6 +1264,127 @@ async def test_runtime_pool_emits_provider_neutral_tool_progress_metadata(tmp_pa
     assert "private output" in updates[2].text
 
 
+def _fake_runtime_build(engine):
+    async def fake_build_runtime(**kwargs):
+        return SimpleNamespace(
+            engine=engine,
+            session_id="sess123",
+            current_settings=lambda: SimpleNamespace(model="gpt-5.4"),
+            commands=SimpleNamespace(lookup=lambda raw: None),
+        )
+
+    return fake_build_runtime
+
+
+def _scripted_engine(events):
+    class FakeEngine:
+        messages = []
+        total_usage = UsageSnapshot()
+
+        def set_system_prompt(self, prompt):
+            return None
+
+        async def submit_message(self, content):
+            for event in events:
+                yield event
+
+    return FakeEngine()
+
+
+async def _collect_telegram_updates(tmp_path, monkeypatch, events):
+    workspace = tmp_path / ".ohmo-home"
+    initialize_workspace(workspace)
+    monkeypatch.setattr(
+        "ohmo.gateway.runtime.build_runtime",
+        _fake_runtime_build(_scripted_engine(events)),
+    )
+
+    async def fake_start_runtime(bundle):
+        return None
+
+    monkeypatch.setattr("ohmo.gateway.runtime.start_runtime", fake_start_runtime)
+    pool = OhmoSessionRuntimePool(cwd=tmp_path, workspace=workspace, provider_profile="codex")
+    message = InboundMessage(channel="telegram", sender_id="u1", chat_id="c1", content="проверь")
+    return [u async for u in pool.stream_message(message, "telegram:c1")]
+
+
+@pytest.mark.asyncio
+async def test_runtime_pool_telegram_turn_start_emits_inference_event_without_canned_text(
+    tmp_path, monkeypatch
+):
+    updates = await _collect_telegram_updates(
+        tmp_path, monkeypatch, [AssistantTextDelta(text="готово")]
+    )
+
+    first = updates[0]
+    assert first.kind == "progress"
+    # No canned English thinking line on Telegram; the structured inference
+    # activity state is what quiet channels render instead.
+    assert first.text == ""
+    assert first.metadata["progress_event"] == {"kind": "inference", "state": "active"}
+
+
+@pytest.mark.asyncio
+async def test_runtime_pool_tool_start_carries_bounded_model_purpose(tmp_path, monkeypatch):
+    narration = (
+        "Сейчас я очень внимательно проверю расписание всех поездов на завтра утром, "
+        "сравню цены и выберу самый удобный вариант по времени в пути и пересадкам\n"
+        "Вторая строка не должна попасть."
+    )
+    updates = await _collect_telegram_updates(
+        tmp_path,
+        monkeypatch,
+        [
+            AssistantTextDelta(text=narration),
+            ToolExecutionStarted(
+                tool_name="bash", tool_input={"command": "ls"}, tool_call_id="call-1"
+            ),
+            ToolExecutionCompleted(
+                tool_name="bash", output="ok", is_error=False, tool_call_id="call-1"
+            ),
+            AssistantTextDelta(text="готово"),
+        ],
+    )
+
+    started = next(
+        u for u in updates
+        if (u.metadata or {}).get("progress_event", {}).get("phase") == "started"
+    )
+    event = started.metadata["progress_event"]
+    purpose = event["purpose"]
+    # First meaningful line only, validated and bounded to <=20 words.
+    assert "Вторая строка" not in purpose
+    assert len(purpose.rstrip("…").split()) <= 20
+    assert purpose.endswith("…")  # the over-long narration was truncated
+    # Completion carries no purpose of its own — correlation is by call id.
+    completed = next(
+        u for u in updates
+        if (u.metadata or {}).get("progress_event", {}).get("phase") == "completed"
+    )
+    assert "purpose" not in completed.metadata["progress_event"]
+    assert completed.metadata["progress_event"]["tool_call_id"] == "call-1"
+
+
+@pytest.mark.asyncio
+async def test_runtime_pool_tool_start_without_narration_has_no_purpose(tmp_path, monkeypatch):
+    updates = await _collect_telegram_updates(
+        tmp_path,
+        monkeypatch,
+        [
+            ToolExecutionStarted(
+                tool_name="bash", tool_input={"command": "ls"}, tool_call_id="call-9"
+            ),
+            AssistantTextDelta(text="готово"),
+        ],
+    )
+
+    started = next(
+        u for u in updates
+        if (u.metadata or {}).get("progress_event", {}).get("phase") == "started"
+    )
+    assert "purpose" not in started.metadata["progress_event"]
+
+
 @pytest.mark.asyncio
 async def test_runtime_pool_blocks_local_only_commands_from_remote_messages(tmp_path, monkeypatch):
     workspace = tmp_path / ".ohmo-home"

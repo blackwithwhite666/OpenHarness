@@ -349,6 +349,34 @@ async def test_unsuppressed_telegram_scheduler_turn_uses_chat_debug_policy(
 
 
 @pytest.mark.asyncio
+async def test_inference_progress_event_reaches_quiet_telegram_despite_empty_text():
+    class InferenceRuntimePool:
+        async def stream_message(self, message, session_key):
+            yield SimpleNamespace(
+                kind="progress",
+                text="",
+                metadata={
+                    "_progress": True,
+                    "progress_event": {"kind": "inference", "state": "active"},
+                },
+            )
+            yield SimpleNamespace(kind="final", text="Done", metadata={})
+
+        async def reset_session(self, session_key):  # pragma: no cover - unused here
+            pass
+
+    bus = MessageBus()
+    bridge = OhmoGatewayBridge(bus=bus, runtime_pool=InferenceRuntimePool())
+    inbound = InboundMessage(channel="telegram", sender_id="42|user", chat_id="42", content="hi")
+    progress, final = await _run_one(bridge, bus, inbound, 2)
+
+    assert progress.content == ""
+    assert progress.metadata["_collapse"] is True
+    assert progress.metadata["progress_event"] == {"kind": "inference", "state": "active"}
+    assert "_collapse" not in final.metadata
+
+
+@pytest.mark.asyncio
 async def test_quiet_default_does_not_change_non_telegram_progress():
     bus = MessageBus()
     bridge = OhmoGatewayBridge(bus=bus, runtime_pool=_FakeRuntimePool())

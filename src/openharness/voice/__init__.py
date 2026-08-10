@@ -2,6 +2,20 @@
 
 from openharness.voice.keyterms import extract_keyterms
 from openharness.voice.stream_stt import transcribe_stream
+from openharness.voice.transcription import (
+    SubprocessVoiceTranscriber,
+    TranscriptionError,
+    VoiceTranscriber,
+)
 from openharness.voice.voice_mode import VoiceDiagnostics, inspect_voice_capabilities, toggle_voice_mode
 
-__all__ = ["VoiceDiagnostics", "extract_keyterms", "inspect_voice_capabilities", "toggle_voice_mode", "transcribe_stream"]
+__all__ = [
+    "SubprocessVoiceTranscriber",
+    "TranscriptionError",
+    "VoiceDiagnostics",
+    "VoiceTranscriber",
+    "extract_keyterms",
+    "inspect_voice_capabilities",
+    "toggle_voice_mode",
+    "transcribe_stream",
+]

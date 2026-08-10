@@ -1382,7 +1382,14 @@ class OhmoSessionRuntimePool:
                 session_key=session_key,
                 content=user_prompt,
             ),
-            metadata={"_progress": True, "_session_key": session_key},
+            metadata={
+                "_progress": True,
+                "_session_key": session_key,
+                # Provider-neutral inference activity: the turn's model call
+                # starts here. Quiet channels render this as an explicit
+                # "inference" state instead of a canned thinking line.
+                "progress_event": {"kind": "inference", "state": "active"},
+            },
         )
         previous_group_request = self._set_group_request_context(bundle, message, session_key)
         decision_trace_restore = _install_gateway_decision_trace_recorder(
@@ -1708,6 +1715,9 @@ class OhmoSessionRuntimePool:
             # ToolExecutionStarted (see engine/query.py), so the
             # `and not reply_parts` fallback below has already run for this turn.
             pending_reasoning = "".join(reply_parts).strip()
+            # The pre-tool narration doubles as the quiet-mode action purpose
+            # for this call (validated + bounded; not chain-of-thought).
+            purpose = _normalize_tool_purpose(pending_reasoning)
             if pending_reasoning:
                 reply_parts.clear()
                 yield GatewayStreamUpdate(
@@ -1759,6 +1769,7 @@ class OhmoSessionRuntimePool:
                         display_label=_pretty_tool_name(event.tool_name),
                         phase="started",
                         status="running",
+                        purpose=purpose,
                     ),
                 },
             )
@@ -3180,6 +3191,27 @@ def _pretty_tool_name(tool_name: str) -> str:
     return label[0].upper() + label[1:]
 
 
+_TOOL_PURPOSE_MAX_WORDS = 20
+
+
+def _normalize_tool_purpose(text: str) -> str:
+    """Model-authored pre-tool narration -> a bounded action purpose.
+
+    The first meaningful line, whitespace-collapsed and truncated to <=20
+    words. This is an action label ("Проверяю расписание поездов"), not
+    chain-of-thought. Empty when there is no usable narration.
+    """
+    for raw in (text or "").splitlines():
+        line = " ".join(raw.split())
+        if not line:
+            continue
+        words = line.split()
+        if len(words) > _TOOL_PURPOSE_MAX_WORDS:
+            line = " ".join(words[:_TOOL_PURPOSE_MAX_WORDS]).rstrip("….,;:") + "…"
+        return line
+    return ""
+
+
 def _tool_progress_event(
     *,
     tool_name: str,
@@ -3187,14 +3219,16 @@ def _tool_progress_event(
     display_label: str,
     phase: str,
     status: str,
+    purpose: str = "",
 ) -> dict[str, object]:
     """Build the provider-neutral tool lifecycle payload for channels.
 
     Tool arguments and results intentionally stay in the existing detailed
     text.  This metadata is only the stable correlation and display contract
-    needed by quiet channel renderers.
+    needed by quiet channel renderers: the call id for correlation, a safe
+    display label, and the validated model-authored action ``purpose``.
     """
-    return {
+    event: dict[str, object] = {
         "kind": "tool",
         "tool": tool_name,
         "tool_call_id": tool_call_id,
@@ -3202,6 +3236,9 @@ def _tool_progress_event(
         "phase": phase,
         "status": status,
     }
+    if purpose:
+        event["purpose"] = purpose
+    return event
 
 
 def _tool_completion_status(event: ToolExecutionCompleted) -> str:
@@ -3303,6 +3340,12 @@ def _format_channel_progress(
         return text
     prefers_chinese = _prefers_chinese_progress(content)
     if kind == "thinking":
+        if channel == "telegram":
+            # Quiet Telegram renders a stable per-turn Russian header plus an
+            # explicit inference state instead of a canned thinking line
+            # (bead agents-playgroud-fe2); verbose Telegram sends no separate
+            # canned line either — the narration itself is shown as 🧠 text.
+            return ""
         seed = f"{session_key}|{content}".encode()
         phrases = _CHANNEL_THINKING_PHRASES if prefers_chinese else _CHANNEL_THINKING_PHRASES_EN
         idx = int(hashlib.sha256(seed).hexdigest(), 16) % len(phrases)

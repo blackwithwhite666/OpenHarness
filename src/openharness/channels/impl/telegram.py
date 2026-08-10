@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import logging
 import math
+import random
 import re
 import time
 from collections import deque
@@ -41,6 +42,7 @@ from openharness.channels.last_location import LastLocationStore
 from openharness.config.schema import TelegramConfig
 from openharness.untrusted import UNTRUSTED_BANNER
 from openharness.utils.helpers import split_message
+from openharness.voice.transcription import VoiceTranscriber
 
 logger = logging.getLogger(__name__)
 
@@ -50,14 +52,54 @@ _TELEGRAM_URL_LOGGERS = ("httpx", "httpcore", "telegram.ext")
 
 # --- Compact progress (one live spinner-animated status message per turn) ------
 _SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
-_COMPACT_TICK = 1.5  # seconds between spinner edits (≈0.67 edits/s — well under flood limits)
+_COMPACT_TICK = 1.5  # wake cadence: content changes are coalesced into ≤1 edit per tick
 _COMPACT_TICK_BACKOFF = 3.0  # slower tick after a RetryAfter
 _COMPACT_IDLE_S = 90.0  # no new event for this long → the turn likely died; stop spinning
-_COMPACT_TAIL = 3  # rolling number of recent step lines shown under the spinner
+_COMPACT_HEARTBEAT_S = 20.0  # spinner-only refresh when nothing changed (edit pressure bound)
 _COMPACT_LINE_MAX = 160  # per-step line truncation
 _COMPACT_TOOL_LABEL_MAX = 160
+_COMPACT_PURPOSE_MAX_WORDS = 20  # model-authored action purpose bound
+_COMPACT_EVICTED_TOOL_IDS_MAX = 64  # bounded memory of evicted call ids
+_COMPACT_HEADERS_RU = (
+    "Разбираюсь…",
+    "Проверяю детали…",
+    "Ищу причину…",
+    "Собираю результат…",
+    "Продолжаю…",
+)
+_COMPACT_INFERENCE_LINE = "Размышляю…"
+_COMPACT_TOOL_ROW_LIMIT_DEFAULT = 3
+_COMPACT_TOOL_ROW_LIMIT_MAX = 10
 _TODO_PANEL_TITLE = "📋 To-do"
 _TODO_PANEL_MAX = TELEGRAM_MAX_MESSAGE_LEN
+
+
+def _coerce_compact_tool_row_limit(value: object) -> int:
+    """Safely coerce a (possibly validator-bypassed) ``compact_tool_rows``.
+
+    ``build_channel_manager_config`` builds ``TelegramConfig`` via
+    ``model_copy(update=...)``, which skips pydantic validators — so a
+    malformed gateway override (bool, non-numeric string, list, out-of-range)
+    reaches the channel as-is. This never raises: it returns a usable 1..10
+    limit, defaulting to ``_COMPACT_TOOL_ROW_LIMIT_DEFAULT`` on anything that
+    is not a clean positive row count and clamping only the high end.
+    """
+    # bool is a subclass of int but is never a usable row count.
+    if isinstance(value, bool):
+        return _COMPACT_TOOL_ROW_LIMIT_DEFAULT
+    try:
+        coerced: int = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return _COMPACT_TOOL_ROW_LIMIT_DEFAULT
+    if coerced < 1:
+        return _COMPACT_TOOL_ROW_LIMIT_DEFAULT
+    return min(coerced, _COMPACT_TOOL_ROW_LIMIT_MAX)
+
+
+def _choose_compact_header(previous: str | None) -> str:
+    """Pick the per-turn header once; never repeat the chat's previous one."""
+    candidates = [h for h in _COMPACT_HEADERS_RU if h != previous]
+    return random.choice(candidates or list(_COMPACT_HEADERS_RU))
 
 
 def _compact_step_line(text: str) -> str:
@@ -74,15 +116,21 @@ class _CompactStatus:
     """Live per-chat status message that collapses a turn's progress events."""
 
     message_id: int
-    lines: deque[str] = field(default_factory=deque)
+    header: str = ""
+    # call_id -> (label, state, terminal); insertion-ordered and bounded to
+    # the configured number of visible rows.
     tool_rows: dict[str, tuple[str, str, bool]] = field(default_factory=dict)
-    tool_line_positions: dict[str, int] = field(default_factory=dict)
+    evicted_tool_ids: deque[str] = field(
+        default_factory=lambda: deque(maxlen=_COMPACT_EVICTED_TOOL_IDS_MAX)
+    )
     todo_text: str | None = None
+    inference_active: bool = False
     invalid_tool_event_seq: int = 0
     spinner_idx: int = 0
     dirty: bool = True
     tick: float = _COMPACT_TICK
     last_event: float = 0.0
+    last_edit: float = 0.0
     anim: asyncio.Task | None = None
 
 
@@ -182,6 +230,15 @@ def _compact_cancelled_event(metadata: object) -> dict[str, object] | None:
     return metadata
 
 
+def _compact_inference_event(metadata: object) -> dict[str, object] | None:
+    """Return a validated inference activity payload, if one is present."""
+    if not isinstance(metadata, dict) or metadata.get("kind") != "inference":
+        return None
+    if metadata.get("state") not in ("active", "idle"):
+        return None
+    return metadata
+
+
 def _compact_tool_label(event: dict[str, object]) -> str:
     """Use only the channel-safe human label in quiet progress rows."""
     raw = event.get("display_label")
@@ -189,6 +246,29 @@ def _compact_tool_label(event: dict[str, object]) -> str:
         return "Tool"
     label = _compact_step_line(raw)
     return label[:_COMPACT_TOOL_LABEL_MAX] or "Tool"
+
+
+def _compact_tool_purpose(event: dict[str, object]) -> str:
+    """Validated model-authored action purpose, or "" when unusable.
+
+    The purpose is an action label, not chain-of-thought: the first meaningful
+    line, whitespace-collapsed and bounded to <=20 words. Anything else
+    (missing, non-string, empty) falls back to the safe tool-name label.
+    """
+    raw = event.get("purpose")
+    if not isinstance(raw, str):
+        return ""
+    for line in raw.splitlines():
+        normalized = " ".join(line.split())
+        if not normalized:
+            continue
+        words = normalized.split()
+        if len(words) > _COMPACT_PURPOSE_MAX_WORDS:
+            normalized = (
+                " ".join(words[:_COMPACT_PURPOSE_MAX_WORDS]).rstrip("….,;:") + "…"
+            )
+        return normalized[:_COMPACT_TOOL_LABEL_MAX]
+    return ""
 
 
 def _compact_tool_terminal_status(event: dict[str, object]) -> str | None:
@@ -683,17 +763,25 @@ class TelegramChannel(BaseChannel):
         self,
         config: TelegramConfig,
         bus: MessageBus,
-        groq_api_key: str = "",
+        transcriber: VoiceTranscriber | None = None,
     ):
         super().__init__(config, bus)
         self.config: TelegramConfig = config
-        self.groq_api_key = groq_api_key
+        # Injectable voice/audio transcriber (None = fail-closed, no ASR).
+        self._transcriber = transcriber
+        # compact_tool_rows may bypass TelegramConfig validators via the
+        # gateway's model_copy(update=...) path; coerce+clamp it here so a
+        # malformed override never crashes channel startup.
+        self._compact_tool_row_limit = _coerce_compact_tool_row_limit(
+            getattr(config, "compact_tool_rows", _COMPACT_TOOL_ROW_LIMIT_DEFAULT)
+        )
         self._app: Application | None = None
         self.last_error: str | None = None
         self.polling_started = False
         self._chat_ids: dict[str, int] = {}  # Map sender_id to chat_id for replies
         self._typing_tasks: dict[str, asyncio.Task] = {}  # chat_id -> typing loop task
         self._status: dict[str, _CompactStatus] = {}  # chat_id -> live compact status
+        self._compact_last_headers: dict[str, str] = {}  # chat_id -> last header
         self._todo_panels: dict[str, _TodoPanel] = {}  # chat_id -> detailed panel
         self._todo_writers_enabled = True
         self._media_group_buffers: dict[str, dict] = {}
@@ -1058,6 +1146,38 @@ class TelegramChannel(BaseChannel):
                     reply_markup=keyboard,
                 )
 
+    async def _publish_voice_transcript(
+        self, chat_id: int, message_id: int, transcript: str | None
+    ) -> None:
+        """Publish the durable, reply-linked voice transcript/failure notice.
+
+        The notice travels through the normal outbound manager path (bounded
+        RetryAfter retry, failure hooks) and is explicitly linked to the source
+        voice message via trusted channel-owned metadata — independent of the
+        global ``reply_to_message`` setting. It never carries ``_progress`` or
+        ``_collapse``, so compact/final cleanup can never delete or edit it.
+        On ASR failure exactly one actionable notice is produced; there is no
+        model-driven ASR fallback.
+        """
+        if transcript:
+            content = f"📝 {transcript}"
+        else:
+            content = (
+                "⚠️ Не удалось распознать голосовое сообщение — "
+                "попробуйте ещё раз или отправьте текстом."
+            )
+        await self.bus.publish_outbound(
+            OutboundMessage(
+                channel=self.name,
+                chat_id=str(chat_id),
+                content=content,
+                metadata={
+                    "_voice_transcript": True,
+                    "_voice_transcript_message_id": message_id,
+                },
+            )
+        )
+
     async def send(self, msg: OutboundMessage) -> OutboundDeliveryReceipt | None:
         """Send a message through Telegram and return trusted native ids."""
         if not self._app:
@@ -1095,10 +1215,21 @@ class TelegramChannel(BaseChannel):
         # message (spinner-animated, edited in place) instead of a fresh message.
         progress_event = _compact_tool_event(msg.metadata.get("progress_event"))
         cancelled_event = _compact_cancelled_event(msg.metadata.get("progress_event"))
+        inference_event = _compact_inference_event(msg.metadata.get("progress_event"))
+        raw_progress = msg.metadata.get("progress_event")
+        if (
+            isinstance(raw_progress, dict)
+            and raw_progress.get("kind") == "inference"
+            and inference_event is None
+        ):
+            # Malformed inference metadata is a strict no-op, same contract as
+            # malformed todo snapshots above.
+            return self._receipt(msg, native_message_ids)
         if msg.metadata.get("_collapse") and (
             progress_event is not None
             or todo_event is not None
             or cancelled_event is not None
+            or inference_event is not None
             or (msg.content and msg.content != "[empty message]")
         ):
             await self._compact_progress(
@@ -1108,26 +1239,44 @@ class TelegramChannel(BaseChannel):
                 progress_event=progress_event,
                 todo_event=todo_event,
                 cancelled_event=cancelled_event,
+                inference_event=inference_event,
             )
             return self._receipt(msg, native_message_ids)
+
+        # Durable voice transcript/failure replies are linked to their source
+        # voice message through trusted channel-owned metadata, never depend on
+        # the global reply_to_message setting, and are NOT a turn boundary:
+        # they must not tear down a live compact status or stop typing.
+        voice_transcript_id = msg.metadata.get("_voice_transcript_message_id")
+        is_voice_transcript = (
+            msg.metadata.get("_voice_transcript") is True
+            and isinstance(voice_transcript_id, int)
+            and not isinstance(voice_transcript_id, bool)
+        )
 
         # Any non-collapse send (final answer, error, command reply, /stop notify)
         # ends the collapsed run: tear the status message down before sending, so
         # the chat is left with just the user's message + the real answer.
-        if not msg.metadata.get("_progress", False):
+        if not msg.metadata.get("_progress", False) and not is_voice_transcript:
             # Detailed todo panels have their own writer.  Await it before the
             # final/command/error send so the latest panel edit or completed
             # cleanup is visible first.  A non-empty (including blocked) panel
             # remains tracked; only its pending write is flushed.
             await self._flush_todo_panels(chat_key)
-        await self._clear_compact_status(chat_key)
+        if not is_voice_transcript:
+            await self._clear_compact_status(chat_key)
 
         # Only stop typing indicator for final responses
-        if not msg.metadata.get("_progress", False):
+        if not msg.metadata.get("_progress", False) and not is_voice_transcript:
             self._stop_typing(msg.chat_id)
 
         reply_params = None
-        if getattr(self.config, "reply_to_message", False):
+        if is_voice_transcript:
+            reply_params = ReplyParameters(
+                message_id=voice_transcript_id,
+                allow_sending_without_reply=True,
+            )
+        elif getattr(self.config, "reply_to_message", False):
             reply_to_message_id = msg.metadata.get("message_id")
             if reply_to_message_id:
                 reply_params = ReplyParameters(
@@ -1248,13 +1397,24 @@ class TelegramChannel(BaseChannel):
         return self._receipt(msg, native_message_ids)
 
     def _render_status(self, status: _CompactStatus) -> str:
-        """Spinner header + the rolling tail of recent step lines."""
-        head = f"{_SPINNER_FRAMES[status.spinner_idx]} Работаю…"
-        sections = list(status.lines)
+        """Three present blocks joined by exactly one blank line:
+        1. the stable per-turn header with the spinner,
+        2. the last N tool activities (or, while inference is active and no
+           tool has run yet, exactly ``Размышляю…``),
+        3. the structured todo snapshot — only when non-empty."""
+        header = status.header or _COMPACT_HEADERS_RU[0]
+        blocks = [f"{_SPINNER_FRAMES[status.spinner_idx]} {header}"]
+        rows = [
+            _compact_tool_row(label, state)
+            for label, state, _terminal in status.tool_rows.values()
+        ]
+        if rows:
+            blocks.append("\n".join(rows))
+        elif status.inference_active:
+            blocks.append(_COMPACT_INFERENCE_LINE)
         if status.todo_text:
-            sections.append(status.todo_text)
-        body = "\n".join(sections)
-        rendered = f"{head}\n{body}" if body else head
+            blocks.append(status.todo_text)
+        rendered = "\n\n".join(blocks)
         if len(rendered) > TELEGRAM_MAX_MESSAGE_LEN:
             rendered = rendered[: TELEGRAM_MAX_MESSAGE_LEN - 2].rstrip() + "…"
         return rendered
@@ -1268,6 +1428,7 @@ class TelegramChannel(BaseChannel):
         progress_event: dict[str, object] | None = None,
         todo_event: dict[str, object] | None = None,
         cancelled_event: dict[str, object] | None = None,
+        inference_event: dict[str, object] | None = None,
     ) -> None:
         """Fold one progress event into the chat's single live status message.
 
@@ -1294,15 +1455,17 @@ class TelegramChannel(BaseChannel):
         if status is None:
             if todo_event is not None and todo_text is None:
                 return
-            status = _CompactStatus(message_id=0, last_event=time.monotonic())
+            status = _CompactStatus(
+                message_id=0,
+                header=self._next_compact_header(chat_key),
+                last_event=time.monotonic(),
+            )
             if progress_event is not None:
                 self._record_compact_tool_event(status, progress_event)
+            elif inference_event is not None:
+                status.inference_active = inference_event.get("state") == "active"
             elif todo_event is not None:
                 status.todo_text = todo_text
-            else:
-                line = _compact_step_line(content)
-                if line:
-                    status.lines.append(line)
             text = self._render_status(status)
             try:
                 sent = await self._app.bot.send_message(
@@ -1312,23 +1475,33 @@ class TelegramChannel(BaseChannel):
                 logger.warning("compact status create failed chat=%s: %s", chat_key, e)
                 return
             status.message_id = sent.message_id
+            status.dirty = False
+            status.last_edit = time.monotonic()
             self._status[chat_key] = status
             self._stop_typing(chat_key)  # the spinner replaces the typing indicator
             status.anim = asyncio.create_task(self._compact_anim(chat_key, chat_id))
             return
+        changed = False
         if progress_event is not None:
-            self._record_compact_tool_event(status, progress_event)
+            changed = self._record_compact_tool_event(status, progress_event)
+        elif inference_event is not None:
+            active = inference_event.get("state") == "active"
+            changed = active != status.inference_active
+            status.inference_active = active
         elif todo_event is not None:
+            changed = status.todo_text != todo_text
             status.todo_text = todo_text
-            if status.todo_text is None and not status.lines:
+            if (
+                status.todo_text is None
+                and not status.tool_rows
+                and not status.inference_active
+            ):
                 await self._clear_compact_status(chat_key)
                 return
-        else:
-            line = _compact_step_line(content)
-            if line:
-                status.lines.append(line)
-                self._trim_compact_ordinary_lines(status)
-        status.dirty = True
+        # Content-only events only keep the turn alive: quiet mode renders no
+        # ordinary lines — the header, tool purposes and todo snapshot carry
+        # the visible state.
+        status.dirty = status.dirty or changed
         status.last_event = time.monotonic()
         # Restart the animator if it stopped (idle break without popping). New
         # events after idle should resume rendering, not leave a stale spinner.
@@ -1376,12 +1549,25 @@ class TelegramChannel(BaseChannel):
             chat_id=chat_id, text=notice, parse_mode=None
         )
 
+    def _next_compact_header(self, chat_key: str) -> str:
+        """Pick the stable header for a chat's next turn (never an instant repeat)."""
+        header = _choose_compact_header(self._compact_last_headers.get(chat_key))
+        self._compact_last_headers[chat_key] = header
+        return header
+
     def _record_compact_tool_event(
         self,
         status: _CompactStatus,
         event: dict[str, object],
-    ) -> None:
-        """Apply one tool event without exposing its provider payload."""
+    ) -> bool:
+        """Apply one tool event without exposing its provider payload.
+
+        Returns whether the visible state changed. Rows are bounded to the
+        configured last-N calls: the oldest row is evicted on overflow, and a
+        late lifecycle event for an evicted call is dropped instead of
+        resurrecting its row. Completion correlates strictly by
+        ``tool_call_id`` and updates the existing purpose row in place.
+        """
         raw_id = event.get("tool_call_id")
         call_id = raw_id.strip() if isinstance(raw_id, str) else ""
         if not call_id:
@@ -1390,8 +1576,10 @@ class TelegramChannel(BaseChannel):
             # messages or showing the key to the user.
             status.invalid_tool_event_seq += 1
             call_id = f"__invalid_tool_event_{status.invalid_tool_event_seq}"
+        elif call_id in status.evicted_tool_ids:
+            return False
 
-        label = _compact_tool_label(event)
+        label = _compact_tool_purpose(event) or _compact_tool_label(event)
         terminal = _compact_tool_terminal_status(event)
         if terminal is None and not _compact_tool_running(event):
             # Malformed lifecycle metadata is treated as a start, but still
@@ -1406,18 +1594,20 @@ class TelegramChannel(BaseChannel):
             if old_terminal:
                 # Late starts and duplicate terminal events must never regress
                 # or rewrite an already terminal row.
-                return
+                return False
             if terminal is None:
                 state = old_state
+            if state == old_state:
+                return False
             status.tool_rows[call_id] = (old_label, state, terminal is not None)
-            position = status.tool_line_positions[call_id]
-            status.lines[position] = _compact_tool_row(old_label, state)
-            return
+            return True
 
         status.tool_rows[call_id] = (label, state, terminal is not None)
-        status.tool_line_positions[call_id] = len(status.lines)
-        status.lines.append(_compact_tool_row(label, state))
-        self._trim_compact_ordinary_lines(status)
+        while len(status.tool_rows) > self._compact_tool_row_limit:
+            oldest = next(iter(status.tool_rows))
+            del status.tool_rows[oldest]
+            status.evicted_tool_ids.append(oldest)
+        return True
 
     async def _debug_todo_progress(
         self, chat_key: str, chat_id: int, event: dict[str, object]
@@ -1540,27 +1730,11 @@ class TelegramChannel(BaseChannel):
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
 
-    @staticmethod
-    def _trim_compact_ordinary_lines(status: _CompactStatus) -> None:
-        """Keep only the rolling tail of ordinary rows without moving tools."""
-        while len(status.lines) - len(status.tool_line_positions) > _COMPACT_TAIL:
-            tool_positions = set(status.tool_line_positions.values())
-            ordinary_position = next(
-                index
-                for index in range(len(status.lines))
-                if index not in tool_positions
-            )
-            lines = list(status.lines)
-            lines.pop(ordinary_position)
-            status.lines = deque(lines)
-            for call_id, position in status.tool_line_positions.items():
-                if position > ordinary_position:
-                    status.tool_line_positions[call_id] = position - 1
-
     async def _compact_anim(self, chat_key: str, chat_id: int) -> None:
-        """Single-writer spinner loop: advance the frame and edit the status once
-        per tick. Coalesces bursts, backs off on RetryAfter, self-expires if the
-        turn goes idle (cancelled with no final)."""
+        """Single-writer loop: edit promptly when content changed (coalescing
+        bursts into at most one edit per tick), otherwise refresh the spinner
+        only on a slow bounded heartbeat. Backs off on RetryAfter and
+        self-expires if the turn goes idle (cancelled with no final)."""
         try:
             while self._app:
                 status = self._status.get(chat_key)
@@ -1578,9 +1752,14 @@ class TelegramChannel(BaseChannel):
                     # spinner does not spin forever; leave the status in place
                     # so a later final/command/error can clean it up.
                     break
+                now = time.monotonic()
+                if not status.dirty and now - status.last_edit < _COMPACT_HEARTBEAT_S:
+                    # Nothing changed since the last edit — skip the API call.
+                    continue
                 status.spinner_idx = (status.spinner_idx + 1) % len(_SPINNER_FRAMES)
                 await self._edit_status(chat_id, status, self._render_status(status))
                 status.dirty = False
+                status.last_edit = time.monotonic()
         except asyncio.CancelledError:
             pass
         except Exception as e:  # noqa: BLE001
@@ -1843,22 +2022,28 @@ class TelegramChannel(BaseChannel):
 
             if file_path is not None:
                 # Transcription is best-effort and SEPARATE from the download:
-                # a missing local STT must not be reported as "download failed".
+                # a failed local ASR must not be reported as "download failed".
                 transcription = None
-                if media_type in ("voice", "audio"):
+                transcription_attempted = False
+                if media_type in ("voice", "audio") and self._transcriber is not None:
+                    transcription_attempted = True
                     try:
-                        from openharness.providers.transcription import GroqTranscriptionProvider  # noqa: F401
-                        transcriber = GroqTranscriptionProvider(api_key=self.groq_api_key)
-                        transcription = await transcriber.transcribe(file_path)
+                        transcription = await self._transcriber.transcribe(str(file_path))
                     except Exception as e:
-                        logger.info("Local transcription unavailable for %s: %s", media_type, e)
+                        logger.warning("Voice transcription failed for %s: %s", media_type, e)
                 if transcription:
                     logger.info("Transcribed %s: %s...", media_type, transcription[:50])
+                    # Keep the media path/provenance AND the exact transcript.
+                    content_parts.append(f"[{media_type}: {file_path}]")
                     content_parts.append(f"[transcription: {transcription}]")
                 else:
                     # Carry the per-file path so a coalesced burst stays
                     # individually addressable (each voice → its own path).
                     content_parts.append(f"[{media_type}: {file_path}]")
+                if transcription_attempted:
+                    await self._publish_voice_transcript(
+                        chat_id, message.message_id, transcription
+                    )
                 logger.debug("Downloaded %s to %s", media_type, file_path)
 
         # Inject the chat's last known location (if any) so a request like

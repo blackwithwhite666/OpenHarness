@@ -167,6 +167,42 @@ def test_ohmo_prompt_nutrition_contract_distinguishes_corrections_and_summaries(
     assert "the trusted gateway attaches them" in prompt
 
 
+def test_ohmo_prompt_contracts_pre_tool_action_purpose(tmp_path: Path) -> None:
+    """The user asked the model itself to author the short purpose shown for
+    each tool call. The runtime only truncates whatever pre-tool narration
+    happens to exist and binds it to the next ToolExecutionStarted as
+    ``purpose``; the OHMO system prompt must actually instruct the model to
+    produce that narration. Generic OpenHarness prompts must stay untouched
+    (only OHMO surfaces render the quiet tool row)."""
+    workspace = tmp_path / ".ohmo-home"
+    initialize_workspace(workspace)
+    prompt = build_ohmo_system_prompt(tmp_path, workspace=workspace)
+
+    assert "Action purpose" in prompt
+    # The contract: one short user-visible line before every tool call.
+    assert "before every tool call" in prompt
+    assert "user's language" in prompt
+    # The hard bound the runtime enforces when it truncates narration.
+    assert "20 words" in prompt
+    # What it must NOT carry (action label, not chain-of-thought/args/identifiers).
+    assert "chain-of-thought" in prompt
+    assert "raw tool arguments" in prompt
+    assert "tool identifiers" in prompt
+    # The example must be a concrete Russian action label, not a plan/generic phrase.
+    assert "Проверяю расписание поездов" in prompt
+
+
+def test_generic_openharness_prompt_is_not_altered_for_action_purpose() -> None:
+    """The action-purpose contract lives in the OHMO layer only; the generic
+    OpenHarness base prompt must not be touched (non-OHMO surfaces don't
+    render the quiet tool row)."""
+    from openharness.prompts.system_prompt import get_base_system_prompt
+
+    base = get_base_system_prompt()
+    assert "Action purpose" not in base
+    assert "before every tool call" not in base
+
+
 def test_ohmo_prompt_nutrition_contract_explicit_new_consumption_rule(
     tmp_path: Path,
 ) -> None:

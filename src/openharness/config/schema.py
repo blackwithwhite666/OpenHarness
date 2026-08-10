@@ -6,7 +6,7 @@ OpenHarness settings system evolves independently.
 
 from __future__ import annotations
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class _CompatModel(BaseModel):
@@ -37,6 +37,35 @@ class TelegramConfig(BaseChannelConfig):
     proxy: str | None = None
     reply_to_message: bool = True
     bot_name: str = "ohmo"
+    # Local ASR subprocess wiring for voice/audio messages (fail-closed by
+    # default: disabled, no command configured). When enabled, the argv list is
+    # the full command template (program + flags, no shell); the downloaded
+    # audio path is appended as the final, separate argv element. The command
+    # must print a JSON object with a ``text`` field on stdout.
+    voice_transcription_enabled: bool = False
+    voice_transcription_argv: list[str] = Field(default_factory=list)
+    voice_transcription_timeout_seconds: float = 30.0
+    # Quiet progress: how many of the most recent tool activities stay visible.
+    compact_tool_rows: int = Field(default=3, ge=1, le=10)
+
+    @model_validator(mode="after")
+    def _validate_voice_transcription(self) -> "TelegramConfig":
+        if not 0 < float(self.voice_transcription_timeout_seconds) <= 600:
+            raise ValueError(
+                "voice_transcription_timeout_seconds must be in (0, 600]"
+            )
+        if self.voice_transcription_enabled and (
+            not self.voice_transcription_argv
+            or any(
+                not isinstance(part, str) or not part.strip()
+                for part in self.voice_transcription_argv
+            )
+        ):
+            raise ValueError(
+                "voice_transcription_argv must be a non-empty list of non-empty "
+                "strings when voice transcription is enabled"
+            )
+        return self
 
 
 class SlackConfig(BaseChannelConfig):

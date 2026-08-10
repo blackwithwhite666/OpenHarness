@@ -101,6 +101,27 @@ def build_ohmo_system_prompt(
 
     sections.extend(
         [
+            "# Action purpose before tools",
+            (
+                "Immediately before every tool call, write ONE short "
+                "user-visible line stating what you are about to do and why — "
+                "the action purpose — in the user's language (Russian for this "
+                "chat). Keep it to at most 20 words: a concrete action label "
+                "such as «Проверяю расписание поездов на завтра», not a full "
+                "plan, question, or preamble. This line is shown to the user "
+                "as the live activity label while the tool runs, so it must "
+                "never contain hidden reasoning or chain-of-thought, raw tool "
+                "arguments or results, or provider/tool identifiers or names. "
+                "It is normal text output (not a marker): emit it as ordinary "
+                "assistant text right before the tool call, then call the tool. "
+                "Skip it only when a tool call follows directly with no useful "
+                "action to name."
+            ),
+        ]
+    )
+
+    sections.extend(
+        [
             "# Channel",
             (
                 "You talk to your human(s) over Telegram (a chat app), one message "

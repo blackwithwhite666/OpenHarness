@@ -108,10 +108,25 @@ class ChannelManager:
         if self.config.channels.telegram.enabled:
             try:
                 from openharness.channels.impl.telegram import TelegramChannel
+                telegram_config = self.config.channels.telegram
+                transcriber = None
+                if telegram_config.voice_transcription_enabled:
+                    from openharness.voice.transcription import SubprocessVoiceTranscriber
+                    try:
+                        transcriber = SubprocessVoiceTranscriber(
+                            telegram_config.voice_transcription_argv,
+                            timeout_seconds=telegram_config.voice_transcription_timeout_seconds,
+                        )
+                    except ValueError as voice_error:
+                        # Fail closed: an unusable ASR command disables
+                        # transcription rather than breaking the channel.
+                        logger.warning(
+                            "Telegram voice transcription disabled: %s", voice_error
+                        )
                 self.channels["telegram"] = TelegramChannel(
-                    self.config.channels.telegram,
+                    telegram_config,
                     self.bus,
-                    groq_api_key=self.config.providers.groq.api_key,
+                    transcriber=transcriber,
                 )
                 logger.info("Telegram channel enabled")
             except ImportError as e:

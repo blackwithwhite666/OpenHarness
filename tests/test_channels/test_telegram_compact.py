@@ -5,6 +5,7 @@ answer is sent."""
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import time
 from types import SimpleNamespace
 
@@ -14,9 +15,12 @@ from telegram.error import BadRequest, RetryAfter
 from openharness.channels.bus.events import OutboundMessage
 from openharness.channels.bus.queue import MessageBus
 from openharness.channels.impl.telegram import (
+    _COMPACT_HEADERS_RU,
+    _COMPACT_HEARTBEAT_S,
     _SPINNER_FRAMES,
     TelegramChannel,
     _compact_step_line,
+    _CompactStatus,
 )
 from openharness.config.schema import TelegramConfig
 
@@ -75,7 +79,18 @@ def _tool_progress(
     display_label: str,
     phase: str,
     status: str,
+    purpose: str | None = None,
 ) -> OutboundMessage:
+    event = {
+        "kind": "tool",
+        "tool": tool_name,
+        "tool_call_id": tool_call_id,
+        "display_label": display_label,
+        "phase": phase,
+        "status": status,
+    }
+    if purpose is not None:
+        event["purpose"] = purpose
     return OutboundMessage(
         channel="telegram",
         chat_id=chat_id,
@@ -83,16 +98,31 @@ def _tool_progress(
         metadata={
             "_progress": True,
             "_collapse": True,
-            "progress_event": {
-                "kind": "tool",
-                "tool": tool_name,
-                "tool_call_id": tool_call_id,
-                "display_label": display_label,
-                "phase": phase,
-                "status": status,
-            },
+            "progress_event": event,
         },
     )
+
+
+def _inference_progress(chat_id: str, state: str = "active") -> OutboundMessage:
+    return OutboundMessage(
+        channel="telegram",
+        chat_id=chat_id,
+        content="",
+        metadata={
+            "_progress": True,
+            "_collapse": True,
+            "progress_event": {"kind": "inference", "state": state},
+        },
+    )
+
+
+def _tool_rows(channel: TelegramChannel, chat_id: str) -> list[tuple[str, str]]:
+    """The visible tool rows (label, state) in insertion order."""
+    status = channel._status[chat_id]
+    return [
+        (label, state)
+        for label, state, _terminal in status.tool_rows.values()
+    ]
 
 
 def _todo_progress(
@@ -161,18 +191,18 @@ async def test_first_event_creates_one_status_then_events_coalesce():
     assert bot.count("send_message") == 1
     status = ch._status["42"]
     assert status.message_id == 1001
-    assert list(status.lines) == ["🤔 Думаю…"]
-    # Spinner frame present in the created text.
+    # Spinner frame + a stable per-turn Russian header in the created text.
     created_text = bot.calls[0][1]["text"]
     assert _SPINNER_FRAMES[0] in created_text
+    assert created_text.split(" ", 1)[1] in _COMPACT_HEADERS_RU
 
-    # A second + third event append lines, mark dirty, but do NOT send/edit.
+    # Content-only events keep the turn alive but change nothing visible, so
+    # they trigger neither sends nor edits.
     await ch.send(_progress("42", "🛠️ Bash — a1b2"))
     await ch.send(_progress("42", "🧠 Свожу результат"))
     assert bot.count("send_message") == 1
     assert bot.count("edit_message_text") == 0
-    assert status.dirty is True
-    assert list(status.lines)[-1] == "🧠 Свожу результат"
+    assert status.dirty is False
 
 
 @pytest.mark.asyncio
@@ -237,20 +267,18 @@ async def test_anim_edits_advance_the_spinner():
     bot = FakeBot()
     ch = _channel(bot)
     # Drive one manual edit through the real render path.
-    from openharness.channels.impl.telegram import _CompactStatus
-
-    st = _CompactStatus(message_id=1001)
-    st.lines.append("шаг")
+    st = _CompactStatus(message_id=1001, header="Разбираюсь…", inference_active=True)
     st.spinner_idx = 1
     await ch._edit_status(1001, st, ch._render_status(st))
     text = bot.calls[-1][1]["text"]
     assert _SPINNER_FRAMES[1] in text
-    assert "шаг" in text
+    assert "Разбираюсь…" in text
+    assert "Размышляю…" in text
 
 
 @pytest.mark.asyncio
 async def test_tool_start_and_completion_share_one_compact_row():
-    """Future contract: structured tool events update one correlated row."""
+    """Structured tool events update one row correlated by tool_call_id."""
     bot = FakeBot()
     ch = _channel(bot)
 
@@ -265,7 +293,7 @@ async def test_tool_start_and_completion_share_one_compact_row():
             status="running",
         )
     )
-    assert list(ch._status["424242"].lines) == ["Run command ⏳"]
+    assert _tool_rows(ch, "424242") == [("Run command", "running")]
     _kill_anim(ch, "424242")
     await ch.send(
         _tool_progress(
@@ -279,7 +307,8 @@ async def test_tool_start_and_completion_share_one_compact_row():
         )
     )
 
-    assert list(ch._status["424242"].lines) == ["Run command ✅"]
+    assert _tool_rows(ch, "424242") == [("Run command", "success")]
+    assert "Run command ✅" in ch._render_status(ch._status["424242"])
 
 
 @pytest.mark.asyncio
@@ -318,10 +347,11 @@ async def test_tool_terminal_statuses_use_redacted_unicode_rows(status, label, e
         )
     )
 
-    assert list(ch._status["424242"].lines) == [expected]
-    assert "secret" not in ch._render_status(ch._status["424242"])
-    assert "call-terminal" not in ch._render_status(ch._status["424242"])
-    assert "deadbeef" not in ch._render_status(ch._status["424242"])
+    rendered = ch._render_status(ch._status["424242"])
+    assert expected in rendered
+    assert "secret" not in rendered
+    assert "call-terminal" not in rendered
+    assert "deadbeef" not in rendered
 
 
 @pytest.mark.asyncio
@@ -354,11 +384,13 @@ async def test_concurrent_tool_rows_keep_insertion_order():
         )
     )
 
-    assert list(ch._status["424242"].lines) == ["First ⏳", "Second ✅"]
+    assert _tool_rows(ch, "424242") == [("First", "running"), ("Second", "success")]
 
 
 @pytest.mark.asyncio
-async def test_mixed_progress_keeps_ordinary_tail_and_tool_positions():
+async def test_content_only_events_keep_turn_alive_but_never_render():
+    """Quiet mode renders no ordinary lines: narration/status texts only keep
+    the live status fresh; the visible state is header + tools + todo."""
     bot = FakeBot()
     ch = _channel(bot)
 
@@ -377,28 +409,14 @@ async def test_mixed_progress_keeps_ordinary_tail_and_tool_positions():
             )
         )
     await ch.send(_progress("424242", "fresh one"))
-    await ch.send(_progress("424242", "fresh two"))
     _kill_anim(ch, "424242")
 
-    await ch.send(
-        _tool_progress(
-            "424242",
-            "private completion payload",
-            tool_name="tool",
-            tool_call_id="call-b",
-            display_label="Second tool",
-            phase="completed",
-            status="succeeded",
-        )
-    )
-
-    assert list(ch._status["424242"].lines) == [
-        "old three",
-        "First tool ⏳",
-        "Second tool ✅",
-        "fresh one",
-        "fresh two",
-    ]
+    status = ch._status["424242"]
+    rendered = ch._render_status(status)
+    assert "old one" not in rendered
+    assert "fresh one" not in rendered
+    assert "First tool ⏳" in rendered
+    assert "Second tool ⏳" in rendered
 
 
 @pytest.mark.asyncio
@@ -430,7 +448,7 @@ async def test_duplicate_terminal_and_late_start_are_idempotent():
         )
     )
 
-    assert list(ch._status["424242"].lines) == ["Stable label ✅"]
+    assert _tool_rows(ch, "424242") == [("Stable label", "success")]
 
 
 @pytest.mark.asyncio
@@ -474,10 +492,10 @@ async def test_terminal_before_start_stays_terminal_and_invalid_ids_do_not_merge
         )
     )
 
-    assert list(ch._status["424242"].lines) == [
-        "Already done ✅",
-        "No id one ⏳",
-        "No id two ⏳",
+    assert _tool_rows(ch, "424242") == [
+        ("Already done", "success"),
+        ("No id one", "running"),
+        ("No id two", "running"),
     ]
 
 
@@ -544,24 +562,26 @@ async def test_repeated_todo_snapshots_update_one_compact_panel():
         )
     )
 
-    assert list(ch._status["424242"].lines) == []
+    assert list(ch._status["424242"].tool_rows) == []
     assert ch._status["424242"].todo_text == "📋 To-do\n✅ Step A"
 
 
 @pytest.mark.asyncio
-async def test_compact_todo_empty_removes_only_todo_section_and_final_clears_status():
+async def test_compact_todo_empty_removes_todo_section_and_final_clears_status():
     bot = FakeBot()
     ch = _channel(bot)
     todo = [{"content": "Plan", "status": "pending"}]
-    await ch.send(_progress("42", "ordinary"))
+    await ch.send(_inference_progress("42"))
     await ch.send(_todo_progress("42", "", snapshot={"todos": todo}, changed=True))
     assert ch._status["42"].todo_text == "📋 To-do\n⬜ Plan"
     await ch.send(_todo_progress("42", "stale", snapshot={"todos": todo}, changed=False))
     assert ch._status["42"].todo_text == "📋 To-do\n⬜ Plan"
     await ch.send(_todo_progress("42", "", snapshot={"todos": []}, changed=True))
+    # The todo block disappears while the turn (inference) is still active.
     assert "42" in ch._status
     assert ch._status["42"].todo_text is None
-    assert list(ch._status["42"].lines) == ["ordinary"]
+    rendered = ch._render_status(ch._status["42"])
+    assert "📋" not in rendered
 
     await ch.send(_final("42", "answer"))
     assert "42" not in ch._status
@@ -606,7 +626,12 @@ async def test_compact_todo_rows_are_typed_bounded_and_coexist_with_tools():
     assert "✅ done" in text
     assert "⛔ blocked — waiting for user" in text
     assert "Bash ⏳" in text
-    assert "ordinary" in text
+    # Content-only lines are not rendered; blocks are blank-line separated.
+    assert "ordinary" not in text
+    head, tool_block, todo_block = text.split("\n\n", 2)
+    assert head.split(" ", 1)[1] in _COMPACT_HEADERS_RU
+    assert tool_block == "Bash ⏳"
+    assert todo_block.startswith("📋 To-do\n")
 
 
 @pytest.mark.asyncio
@@ -984,3 +1009,420 @@ async def test_cancelled_live_status_edit_stays_best_effort():
     assert "424242" not in ch._status
     # No duplicate standalone notice after the failed edit.
     assert bot.count("send_message") == 1  # only the initial status create
+
+
+# ---------------------------------------------------------------------------
+# Three-block compact progress contract (bead agents-playgroud-fe2)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_three_block_render_exact_snapshot_and_blank_line_separators():
+    ch = _channel(FakeBot())
+    st = _CompactStatus(message_id=1, header="Ищу причину…")
+    st.tool_rows["call-1"] = ("Проверяю расписание поездов", "running", False)
+    st.tool_rows["call-2"] = ("Смотрю цены", "success", True)
+    st.todo_text = "📋 To-do\n⬜ Купить билет"
+
+    rendered = ch._render_status(st)
+
+    assert rendered == (
+        f"{_SPINNER_FRAMES[0]} Ищу причину…"
+        "\n\nПроверяю расписание поездов ⏳\nСмотрю цены ✅"
+        "\n\n📋 To-do\n⬜ Купить билет"
+    )
+
+
+@pytest.mark.asyncio
+async def test_render_has_no_empty_todo_block_and_no_empty_middle_block():
+    ch = _channel(FakeBot())
+    st = _CompactStatus(message_id=1, header="Продолжаю…")
+
+    # Header only: no inference line, no todo block, no trailing separators.
+    assert ch._render_status(st) == f"{_SPINNER_FRAMES[0]} Продолжаю…"
+
+    st.todo_text = "📋 To-do\n✅ Готово"
+    assert ch._render_status(st) == (
+        f"{_SPINNER_FRAMES[0]} Продолжаю…\n\n📋 To-do\n✅ Готово"
+    )
+
+
+@pytest.mark.asyncio
+async def test_header_is_stable_within_a_turn_and_varies_between_turns():
+    bot = FakeBot()
+    ch = _channel(bot)
+
+    await ch.send(_progress("42", "turn one"))
+    _kill_anim(ch, "42")
+    status = ch._status["42"]
+    first = status.header
+    assert first in _COMPACT_HEADERS_RU
+    # Stable across spinner frames and re-renders within the same turn.
+    assert ch._render_status(status).split("\n", 1)[0] == f"{_SPINNER_FRAMES[0]} {first}"
+    status.spinner_idx = 4
+    assert ch._render_status(status).split("\n", 1)[0] == f"{_SPINNER_FRAMES[4]} {first}"
+
+    # Subsequent turns never instantly repeat the previous header.
+    seen = {first}
+    for _ in range(3):
+        await ch.send(_final("42", "answer"))
+        await ch.send(_progress("42", "next turn"))
+        _kill_anim(ch, "42")
+        current = ch._status["42"].header
+        assert current in _COMPACT_HEADERS_RU
+        seen.add(current)
+    assert len(seen) > 1
+
+
+@pytest.mark.asyncio
+async def test_inference_event_renders_exactly_razmyshlyayu_until_first_tool():
+    bot = FakeBot()
+    ch = _channel(bot)
+
+    await ch.send(_inference_progress("424242", "active"))
+    _kill_anim(ch, "424242")
+    status = ch._status["424242"]
+    rendered = ch._render_status(status)
+    blocks = rendered.split("\n\n")
+    assert len(blocks) == 2
+    assert blocks[1] == "Размышляю…"
+
+    # A tool activity replaces the inference line with the purpose row.
+    await ch.send(
+        _tool_progress(
+            "424242",
+            "payload",
+            tool_name="bash",
+            tool_call_id="call-1",
+            display_label="Bash",
+            phase="started",
+            status="running",
+            purpose="Проверяю логи",
+        )
+    )
+    rendered = ch._render_status(ch._status["424242"])
+    assert "Размышляю…" not in rendered
+    assert "Проверяю логи ⏳" in rendered
+
+
+@pytest.mark.asyncio
+async def test_inference_idle_event_hides_the_inference_line():
+    bot = FakeBot()
+    ch = _channel(bot)
+    await ch.send(_inference_progress("424242", "active"))
+    _kill_anim(ch, "424242")
+    await ch.send(_inference_progress("424242", "idle"))
+    rendered = ch._render_status(ch._status["424242"])
+    assert "Размышляю…" not in rendered
+    assert "\n\n" not in rendered
+
+
+@pytest.mark.asyncio
+async def test_malformed_inference_event_is_a_strict_noop():
+    bot = FakeBot()
+    ch = _channel(bot)
+    msg = OutboundMessage(
+        channel="telegram",
+        chat_id="424242",
+        content="",
+        metadata={
+            "_progress": True,
+            "_collapse": True,
+            "progress_event": {"kind": "inference", "state": "exploding"},
+        },
+    )
+    await ch.send(msg)
+    assert ch._status == {}
+    assert bot.count("send_message") == 0
+
+
+@pytest.mark.asyncio
+async def test_purpose_is_validated_and_truncated_to_twenty_words():
+    bot = FakeBot()
+    ch = _channel(bot)
+    long_purpose = " ".join(f"слово{i}" for i in range(30))
+    await ch.send(
+        _tool_progress(
+            "424242",
+            "payload",
+            tool_name="bash",
+            tool_call_id="call-1",
+            display_label="Bash",
+            phase="started",
+            status="running",
+            purpose=long_purpose,
+        )
+    )
+    _kill_anim(ch, "424242")
+    (label, state), = _tool_rows(ch, "424242")
+    assert state == "running"
+    assert label.endswith("…")
+    assert len(label.rstrip("…").split()) == 20
+
+
+@pytest.mark.asyncio
+async def test_purpose_multiline_uses_first_meaningful_line_only():
+    bot = FakeBot()
+    ch = _channel(bot)
+    await ch.send(
+        _tool_progress(
+            "424242",
+            "payload",
+            tool_name="bash",
+            tool_call_id="call-1",
+            display_label="Bash",
+            phase="started",
+            status="running",
+            purpose="\n\n  Первая   строка   с   пробелами  \nВторая строка не должна попасть",
+        )
+    )
+    _kill_anim(ch, "424242")
+    (label, _), = _tool_rows(ch, "424242")
+    assert label == "Первая строка с пробелами"
+
+
+@pytest.mark.asyncio
+async def test_missing_or_invalid_purpose_falls_back_to_safe_tool_label():
+    bot = FakeBot()
+    ch = _channel(bot)
+    for call_id, purpose in (("call-1", None), ("call-2", 123), ("call-3", "  \n  ")):
+        event = {
+            "kind": "tool",
+            "tool": "read_file",
+            "tool_call_id": call_id,
+            "display_label": "Read file",
+            "phase": "started",
+            "status": "running",
+        }
+        if purpose is not None:
+            event["purpose"] = purpose
+        await ch.send(
+            OutboundMessage(
+                channel="telegram",
+                chat_id="424242",
+                content="payload",
+                metadata={"_progress": True, "_collapse": True, "progress_event": event},
+            )
+        )
+    _kill_anim(ch, "424242")
+    assert _tool_rows(ch, "424242") == [("Read file", "running")] * 3
+
+
+@pytest.mark.asyncio
+async def test_tool_rows_are_bounded_to_last_n_and_late_completion_does_not_resurrect():
+    bot = FakeBot()
+    ch = _channel(bot)  # default compact_tool_rows=3
+
+    for i in range(4):
+        await ch.send(
+            _tool_progress(
+                "424242",
+                "payload",
+                tool_name="tool",
+                tool_call_id=f"call-{i}",
+                display_label=f"Tool {i}",
+                phase="started",
+                status="running",
+            )
+        )
+    _kill_anim(ch, "424242")
+    # The oldest row was evicted; only the last 3 remain visible.
+    assert _tool_rows(ch, "424242") == [
+        ("Tool 1", "running"),
+        ("Tool 2", "running"),
+        ("Tool 3", "running"),
+    ]
+
+    # A late completion for the evicted call must not resurrect its row.
+    await ch.send(
+        _tool_progress(
+            "424242",
+            "payload",
+            tool_name="tool",
+            tool_call_id="call-0",
+            display_label="Tool 0",
+            phase="completed",
+            status="succeeded",
+        )
+    )
+    assert _tool_rows(ch, "424242") == [
+        ("Tool 1", "running"),
+        ("Tool 2", "running"),
+        ("Tool 3", "running"),
+    ]
+    rendered = ch._render_status(ch._status["424242"])
+    assert "Tool 0" not in rendered
+
+
+@pytest.mark.asyncio
+async def test_tool_row_limit_is_configurable():
+    bot = FakeBot()
+    channel = TelegramChannel(
+        TelegramConfig(token="token", compact_tool_rows=2), MessageBus()
+    )
+    channel._app = SimpleNamespace(bot=bot)
+
+    for i in range(3):
+        await channel.send(
+            _tool_progress(
+                "9",
+                "payload",
+                tool_name="tool",
+                tool_call_id=f"call-{i}",
+                display_label=f"Tool {i}",
+                phase="started",
+                status="running",
+            )
+        )
+    _kill_anim(channel, "9")
+    assert _tool_rows(channel, "9") == [("Tool 1", "running"), ("Tool 2", "running")]
+
+
+@pytest.mark.asyncio
+async def test_completion_after_eviction_of_another_call_updates_its_own_row():
+    bot = FakeBot()
+    ch = _channel(bot)
+    for i in range(4):
+        await ch.send(
+            _tool_progress(
+                "424242", "payload", tool_name="tool", tool_call_id=f"call-{i}",
+                display_label=f"Tool {i}", phase="started", status="running",
+            )
+        )
+    _kill_anim(ch, "424242")
+    await ch.send(
+        _tool_progress(
+            "424242", "payload", tool_name="tool", tool_call_id="call-3",
+            display_label="Tool 3", phase="completed", status="failed",
+        )
+    )
+    assert _tool_rows(ch, "424242")[-1] == ("Tool 3", "failure")
+
+
+@pytest.mark.asyncio
+async def test_animator_skips_edits_without_changes_and_heartbeats_slowly():
+    bot = FakeBot()
+    ch = _channel(bot)
+    await ch.send(_progress("42", "turn start"))
+    status = ch._status["42"]
+    _kill_anim(ch, "42")
+    status.tick = 0.01
+    anim = asyncio.create_task(ch._compact_anim("42", 42))
+    # Keep the channel's animator-restart check satisfied so it neither spawns
+    # a replacement loop nor resets the fast test tick.
+    status.anim = anim
+    try:
+        await asyncio.sleep(0.05)
+        # No content change since creation → zero edits despite several ticks.
+        assert bot.count("edit_message_text") == 0
+
+        # A content change is coalesced into exactly one edit.
+        await ch.send(
+            _tool_progress(
+                "42", "payload", tool_name="bash", tool_call_id="call-1",
+                display_label="Bash", phase="started", status="running",
+            )
+        )
+        await asyncio.sleep(0.05)
+        assert bot.count("edit_message_text") == 1
+
+        # Still no changes → no further edits (heartbeat is far away).
+        await asyncio.sleep(0.05)
+        assert bot.count("edit_message_text") == 1
+
+        # Once the bounded heartbeat elapses, a spinner-only edit goes out.
+        status.last_edit = time.monotonic() - (_COMPACT_HEARTBEAT_S + 1)
+        await asyncio.sleep(0.05)
+        assert bot.count("edit_message_text") == 2
+    finally:
+        anim.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await anim
+
+
+@pytest.mark.asyncio
+async def test_final_teardown_stays_prompt_under_the_new_cadence():
+    bot = FakeBot()
+    ch = _channel(bot)
+    await ch.send(_progress("42", "turn start"))
+    status = ch._status["42"]
+    anim = status.anim
+    await ch.send(_final("42", "answer"))
+    assert "42" not in ch._status
+    assert anim is not None and anim.done()
+    assert bot.calls[-1][0] == "send_message"
+    assert bot.count("delete_message") == 1
+
+
+# ---------------------------------------------------------------------------
+# Runtime coercion of compact_tool_rows (validator-bypass safe path)
+# ---------------------------------------------------------------------------
+# build_channel_manager_config uses model_copy(update=...), which skips
+# TelegramConfig validators. The channel must coerce+clamp any malformed value
+# to 1..10 (default 3) and never crash on startup.
+
+
+def _bypassed_config(compact_tool_rows: object) -> TelegramConfig:
+    """Mirror the gateway's validator-bypassing model_copy(update=...) path."""
+    return TelegramConfig().model_copy(update={"compact_tool_rows": compact_tool_rows})
+
+
+def test_compact_tool_row_limit_default_is_three():
+    ch = _channel(FakeBot())
+    assert ch._compact_tool_row_limit == 3
+
+
+def test_compact_tool_row_limit_valid_value_is_preserved():
+    ch = TelegramChannel(
+        TelegramConfig(token="token", compact_tool_rows=5), MessageBus()
+    )
+    assert ch._compact_tool_row_limit == 5
+
+
+def test_compact_tool_row_limit_bypassed_zero_clamps_to_default():
+    # 0 is below the 1..10 range → fall back to the default 3, not 1.
+    ch = TelegramChannel(_bypassed_config(0), MessageBus())
+    assert ch._compact_tool_row_limit == 3
+
+
+def test_compact_tool_row_limit_bypassed_hundred_is_clamped_to_ten():
+    ch = TelegramChannel(_bypassed_config(100), MessageBus())
+    assert ch._compact_tool_row_limit == 10
+
+
+def test_compact_tool_row_limit_bypassed_string_is_default_not_crash():
+    # A non-numeric string bypassed through model_copy would crash int();
+    # startup must not fail and the limit falls back to 3.
+    ch = TelegramChannel(_bypassed_config("not-a-number"), MessageBus())
+    assert ch._compact_tool_row_limit == 3
+
+
+def test_compact_tool_row_limit_bypassed_numeric_string_is_coerced():
+    ch = TelegramChannel(_bypassed_config("7"), MessageBus())
+    assert ch._compact_tool_row_limit == 7
+
+
+def test_compact_tool_row_limit_bypassed_none_is_default():
+    ch = TelegramChannel(_bypassed_config(None), MessageBus())
+    assert ch._compact_tool_row_limit == 3
+
+
+def test_compact_tool_row_limit_bypassed_true_is_default_not_one():
+    # bool is not a usable row count → default 3 (not int(True)==1).
+    ch = TelegramChannel(_bypassed_config(True), MessageBus())
+    assert ch._compact_tool_row_limit == 3
+
+
+def test_compact_tool_row_limit_bypassed_false_is_default():
+    ch = TelegramChannel(_bypassed_config(False), MessageBus())
+    assert ch._compact_tool_row_limit == 3
+
+
+def test_compact_tool_row_limit_bypassed_list_is_default():
+    ch = TelegramChannel(_bypassed_config([1, 2, 3]), MessageBus())
+    assert ch._compact_tool_row_limit == 3
+
+
+def test_compact_tool_row_limit_bypassed_out_of_range_string_is_clamped():
+    ch = TelegramChannel(_bypassed_config("42"), MessageBus())
+    assert ch._compact_tool_row_limit == 10

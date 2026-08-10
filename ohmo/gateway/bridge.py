@@ -679,7 +679,7 @@ class OhmoGatewayBridge:
                 progress_event = (update.metadata or {}).get("progress_event")
                 has_structured_progress = (
                     isinstance(progress_event, dict)
-                    and progress_event.get("kind") == "tool"
+                    and progress_event.get("kind") in {"tool", "inference"}
                 ) or (
                     message.channel == "telegram"
                     and isinstance(progress_event, dict)
