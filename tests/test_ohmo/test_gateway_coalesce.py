@@ -614,3 +614,210 @@ async def test_flush_due_isolates_per_session_failures():
     assert flushed == ["s-good"]  # sibling still flushed, not stranded
     assert not bridge._pending  # both sessions cleared
     assert not bridge._pending_deadline
+
+
+# ---------------------------------------------------------------------------
+# Structured cancelled/terminal progress event (bead agents-playgroud-98i)
+# ---------------------------------------------------------------------------
+
+
+async def _collect_outbounds(bus: MessageBus, *, count: int, budget: float = 2.0):
+    """Collect exactly *count* outbound messages, raising on timeout."""
+    outboxes: list = []
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + budget
+    while len(outboxes) < count:
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            raise AssertionError(
+                f"wanted {count} outbounds; got {len(outboxes)}: "
+                f"{[m.content for m in outboxes]}"
+            )
+        out = await asyncio.wait_for(bus.consume_outbound(), timeout=remaining)
+        outboxes.append(out)
+    return outboxes
+
+
+@pytest.mark.asyncio
+async def test_quiet_telegram_interrupt_publishes_cancelled_collapse_event():
+    """In quiet Telegram mode, interrupting a running task publishes a
+    structured ``cancelled`` collapse event instead of a free-text notice —
+    so the compact status (not a standalone message) is the single owner."""
+    bus = MessageBus()
+    first_running = asyncio.Event()
+    release_first = asyncio.Event()
+
+    class FakeRuntimePool:
+        async def stream_message(self, message, session_key):
+            yield SimpleNamespace(
+                kind="progress", text="🤔", metadata={"_progress": True}
+            )
+            first_running.set()
+            await release_first.wait()
+            yield SimpleNamespace(kind="final", text="first-done", metadata={})
+
+    bridge = _make_bridge(bus, FakeRuntimePool())
+    task = asyncio.create_task(bridge.run())
+    try:
+        await bus.publish_inbound(
+            InboundMessage(channel="telegram", sender_id="u1", chat_id="c1", content="first")
+        )
+        await asyncio.wait_for(bus.consume_outbound(), timeout=2.0)  # progress
+        await asyncio.wait_for(first_running.wait(), timeout=2.0)
+        await bus.publish_inbound(
+            InboundMessage(channel="telegram", sender_id="u1", chat_id="c1", content="second")
+        )
+        # The interrupt must publish a structured cancelled event.
+        cancelled = await asyncio.wait_for(bus.consume_outbound(), timeout=2.0)
+    finally:
+        release_first.set()
+        bridge.stop()
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    event = cancelled.metadata.get("progress_event")
+    assert isinstance(event, dict)
+    assert event.get("kind") == "cancelled"
+    assert cancelled.metadata.get("_collapse") is True
+
+
+@pytest.mark.asyncio
+async def test_verbose_telegram_interrupt_publishes_standalone_notice():
+    """In verbose Telegram mode (chat in debug_chats), interrupting a running
+    task sends at most one standalone notice — not a structured collapse event."""
+    bus = MessageBus()
+    first_running = asyncio.Event()
+    release_first = asyncio.Event()
+
+    class FakeRuntimePool:
+        async def stream_message(self, message, session_key):
+            yield SimpleNamespace(
+                kind="progress", text="🤔", metadata={"_progress": True}
+            )
+            first_running.set()
+            await release_first.wait()
+            yield SimpleNamespace(kind="final", text="first-done", metadata={})
+
+    bridge = _make_bridge(bus, FakeRuntimePool(), debug_progress_chats=["c1"])
+    task = asyncio.create_task(bridge.run())
+    try:
+        await bus.publish_inbound(
+            InboundMessage(channel="telegram", sender_id="u1", chat_id="c1", content="first")
+        )
+        await asyncio.wait_for(bus.consume_outbound(), timeout=2.0)  # progress
+        await asyncio.wait_for(first_running.wait(), timeout=2.0)
+        await bus.publish_inbound(
+            InboundMessage(channel="telegram", sender_id="u1", chat_id="c1", content="second")
+        )
+        notice = await asyncio.wait_for(bus.consume_outbound(), timeout=2.0)
+    finally:
+        release_first.set()
+        bridge.stop()
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    assert notice.content.startswith("\u23f9\ufe0f")  # ⏹️ — standalone notice
+    assert "_collapse" not in notice.metadata
+    assert "progress_event" not in notice.metadata
+
+
+@pytest.mark.asyncio
+async def test_non_telegram_interrupt_publishes_standalone_notice():
+    """Non-Telegram channels always get a standalone notice (no compact status
+    to fold into)."""
+    bus = MessageBus()
+    first_running = asyncio.Event()
+    release_first = asyncio.Event()
+
+    class FakeRuntimePool:
+        async def stream_message(self, message, session_key):
+            yield SimpleNamespace(
+                kind="progress", text="🤔", metadata={"_progress": True}
+            )
+            first_running.set()
+            await release_first.wait()
+            yield SimpleNamespace(kind="final", text="first-done", metadata={})
+
+    bridge = _make_bridge(bus, FakeRuntimePool())
+    task = asyncio.create_task(bridge.run())
+    try:
+        await bus.publish_inbound(
+            InboundMessage(channel="feishu", sender_id="u1", chat_id="c1", content="first")
+        )
+        await asyncio.wait_for(bus.consume_outbound(), timeout=2.0)  # progress
+        await asyncio.wait_for(first_running.wait(), timeout=2.0)
+        await bus.publish_inbound(
+            InboundMessage(channel="feishu", sender_id="u1", chat_id="c1", content="second")
+        )
+        notice = await asyncio.wait_for(bus.consume_outbound(), timeout=2.0)
+    finally:
+        release_first.set()
+        bridge.stop()
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    assert notice.content.startswith("\u23f9\ufe0f")
+    assert "_collapse" not in notice.metadata
+
+
+@pytest.mark.asyncio
+async def test_quiet_telegram_stop_command_publishes_cancelled_event():
+    """/stop in quiet Telegram mode publishes a structured cancelled event."""
+    bus = MessageBus()
+    release = asyncio.Event()
+
+    class FakeRuntimePool:
+        async def stream_message(self, message, session_key):
+            yield SimpleNamespace(kind="progress", text="🤔", metadata={"_progress": True})
+            await release.wait()
+
+    bridge = _make_bridge(bus, FakeRuntimePool())
+    task = asyncio.create_task(bridge.run())
+    try:
+        await bus.publish_inbound(
+            InboundMessage(channel="telegram", sender_id="u1", chat_id="c1", content="task")
+        )
+        await asyncio.wait_for(bus.consume_outbound(), timeout=2.0)  # progress
+        await bus.publish_inbound(
+            InboundMessage(channel="telegram", sender_id="u1", chat_id="c1", content="/stop")
+        )
+        cancelled = await asyncio.wait_for(bus.consume_outbound(), timeout=2.0)
+    finally:
+        release.set()
+        bridge.stop()
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    event = cancelled.metadata.get("progress_event")
+    assert isinstance(event, dict)
+    assert event.get("kind") == "cancelled"
+    assert cancelled.metadata.get("_collapse") is True
+
+
+@pytest.mark.asyncio
+async def test_quiet_telegram_stop_no_active_task_sends_standalone_reply():
+    """/stop with no active task still sends the 'no active task' reply."""
+    bus = MessageBus()
+
+    class FakeRuntimePool:
+        async def stream_message(self, message, session_key):
+            yield SimpleNamespace(kind="final", text="done", metadata={})
+
+    bridge = _make_bridge(bus, FakeRuntimePool())
+    task = asyncio.create_task(bridge.run())
+    try:
+        await bus.publish_inbound(
+            InboundMessage(channel="telegram", sender_id="u1", chat_id="c1", content="/stop")
+        )
+        reply = await asyncio.wait_for(bus.consume_outbound(), timeout=2.0)
+    finally:
+        bridge.stop()
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    assert "нет активной" in reply.content.lower() or "no active" in reply.content.lower()

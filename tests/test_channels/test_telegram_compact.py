@@ -5,6 +5,7 @@ answer is sent."""
 from __future__ import annotations
 
 import asyncio
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -817,3 +818,169 @@ async def test_debug_todo_panel_does_not_recreate_after_unknown_edit_error():
     await ch._flush_todo_panels("42")
     assert bot.count("send_message") == 1
     assert bot.count("edit_message_text") == 2
+
+
+# ---------------------------------------------------------------------------
+# Unified cancelled/terminal progress event (bead agents-playgroud-98i)
+# ---------------------------------------------------------------------------
+
+
+def _cancelled_progress(
+    chat_id: str,
+    *,
+    reason: str = "replaced by a newer user message",
+) -> OutboundMessage:
+    # Mirrors the bridge's production metadata: a cancelled notice is NOT
+    # ``_progress`` — it is durable, so the dispatcher retries it on RetryAfter.
+    return OutboundMessage(
+        channel="telegram",
+        chat_id=chat_id,
+        content="",
+        metadata={
+            "_collapse": True,
+            "progress_event": {"kind": "cancelled", "reason": reason},
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_cancelled_event_edits_live_status_to_terminal_and_removes_state():
+    """In quiet mode with a live compact status, a cancelled event must stop
+    the animator, edit the status once to a terminal phrase, and remove it
+    from active state — without sending a standalone notice."""
+    bot = FakeBot()
+    ch = _channel(bot)
+    await ch.send(_progress("424242", "🤔 Думаю…"))
+    assert "424242" in ch._status
+    status = ch._status["424242"]
+    message_id = status.message_id
+    _kill_anim(ch, "424242")
+
+    await ch.send(_cancelled_progress("424242"))
+
+    # Status removed from active state, animator cancelled.
+    assert "424242" not in ch._status
+    # No new send_message — only an edit of the existing status.
+    edits = [c for c in bot.calls if c[0] == "edit_message_text"]
+    assert len(edits) >= 1
+    assert edits[-1][1]["message_id"] == message_id
+    # The terminal edit must contain a stop marker, not a spinner.
+    assert "⏹" in edits[-1][1]["text"]
+    assert _SPINNER_FRAMES[0] not in edits[-1][1]["text"]
+
+
+@pytest.mark.asyncio
+async def test_cancelled_event_without_live_status_sends_standalone_notice():
+    """In quiet mode when there is no live compact status (verbose mode or
+    already cleared), a cancelled event sends at most one standalone notice."""
+    bot = FakeBot()
+    ch = _channel(bot)
+    # No prior progress — no live status.
+    assert "424242" not in ch._status
+
+    await ch.send(_cancelled_progress("424242"))
+
+    sends = [c for c in bot.calls if c[0] == "send_message"]
+    assert len(sends) == 1
+    assert "⏹" in sends[0][1]["text"]
+    # No compact status was created.
+    assert "424242" not in ch._status
+
+
+@pytest.mark.asyncio
+async def test_cancelled_then_new_turn_creates_fresh_status():
+    """After a cancelled event removes the status, the next turn's first
+    progress event must create a fresh status (new message_id)."""
+    bot = FakeBot()
+    ch = _channel(bot)
+    await ch.send(_progress("424242", "first turn"))
+    old_message_id = ch._status["424242"].message_id
+    _kill_anim(ch, "424242")
+
+    await ch.send(_cancelled_progress("424242"))
+    assert "424242" not in ch._status
+
+    await ch.send(_progress("424242", "second turn"))
+    assert "424242" in ch._status
+    assert ch._status["424242"].message_id != old_message_id
+    _kill_anim(ch, "424242")
+
+
+@pytest.mark.asyncio
+async def test_idle_expiry_does_not_render_terminal_stop_text():
+    """Idle expiry must not assert 'stopped' while the runtime can still be
+    active. It may stop animation but only an explicit lifecycle event may
+    render terminal cancellation."""
+    bot = FakeBot()
+    ch = _channel(bot)
+    await ch.send(_progress("424242", "working"))
+    status = ch._status["424242"]
+    message_id = status.message_id
+
+    edits_before = bot.count("edit_message_text")
+    # Force idle: set last_event far in the past.
+    status.last_event = time.monotonic() - 999.0
+    # Run one animator tick (sleep + check + break).
+    await ch._compact_anim("424242", 424242)
+    await asyncio.sleep(0.01)
+
+    # Any edit that happened during idle expiry must NOT contain a stop marker.
+    for _, kwargs in bot.calls:
+        if kwargs.get("message_id") == message_id and "text" in kwargs:
+            assert "⏹" not in kwargs["text"], "idle expiry must not claim stopped"
+
+
+@pytest.mark.asyncio
+async def test_cancelled_event_cancels_running_animator():
+    """The cancelled event must cancel a still-running animator task so it
+    cannot keep editing after terminal cancellation."""
+    bot = FakeBot()
+    ch = _channel(bot)
+    await ch.send(_progress("424242", "working"))
+    status = ch._status["424242"]
+    anim = status.anim
+    assert anim is not None and not anim.done()
+
+    await ch.send(_cancelled_progress("424242"))
+    await asyncio.sleep(0.01)
+    assert anim.done()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_standalone_notice_send_failure_propagates():
+    """With no live compact status, the standalone cancelled notice is a real
+    send — a Telegram rejection (e.g. RetryAfter) must NOT be swallowed into a
+    false success. It must propagate so ChannelManager can retry (RetryAfter)
+    or invoke the failure hook."""
+    class _RetryAfterSendBot(FakeBot):
+        async def send_message(self, **kwargs):
+            raise RetryAfter(0.1)
+
+    bot = _RetryAfterSendBot()
+    ch = _channel(bot)
+
+    with pytest.raises(RetryAfter):
+        await ch.send(_cancelled_progress("424242"))
+
+    assert "424242" not in ch._status
+
+
+@pytest.mark.asyncio
+async def test_cancelled_live_status_edit_stays_best_effort():
+    """With a live compact status, the terminal edit remains best-effort: an
+    edit failure must not raise (and must not fall back to a duplicate
+    standalone notice)."""
+    class _FailingEditBot(FakeBot):
+        async def edit_message_text(self, **kwargs):
+            raise BadRequest("message to edit not found")
+
+    bot = _FailingEditBot()
+    ch = _channel(bot)
+    await ch.send(_progress("424242", "working"))
+    _kill_anim(ch, "424242")
+
+    await ch.send(_cancelled_progress("424242"))  # must not raise
+
+    assert "424242" not in ch._status
+    # No duplicate standalone notice after the failed edit.
+    assert bot.count("send_message") == 1  # only the initial status create

@@ -338,12 +338,7 @@ class OhmoGatewayBridge:
             reason="replaced by a newer user message",
             notify=None
             if suppress
-            else OutboundMessage(
-                channel=message.channel,
-                chat_id=message.chat_id,
-                content="⏹️ Остановил предыдущую задачу, перехожу к новому сообщению.",
-                metadata={"_progress": True, "_session_key": session_key},
-            ),
+            else self._build_interrupt_notice(message, session_key),
         )
         if self._nutrition_coordinator is not None:
             self._nutrition_coordinator.on_ordinary_turn_start(message)
@@ -357,6 +352,47 @@ class OhmoGatewayBridge:
             lambda finished, key=session_key, started_message=message: self._cleanup_task(
                 key, finished, started_message
             )
+        )
+
+    def _is_quiet_telegram(self, message: InboundMessage) -> bool:
+        """Whether this chat uses compact (quiet) progress on Telegram."""
+        return (
+            message.channel == "telegram"
+            and str(message.chat_id) not in self._debug_chats
+        )
+
+    def _build_interrupt_notice(
+        self, message: InboundMessage, session_key: str
+    ) -> OutboundMessage:
+        """Build the cancellation notice for the previous task.
+
+        In quiet Telegram mode: a structured ``cancelled`` collapse event so
+        the compact status is the single owner — it is edited once to a
+        terminal phrase instead of sending a standalone message.
+
+        In verbose mode or on non-Telegram channels: a standalone notice
+        (no ``_progress`` so it is durable and not subject to progress
+        drop logic).
+        """
+        if self._is_quiet_telegram(message):
+            return OutboundMessage(
+                channel=message.channel,
+                chat_id=message.chat_id,
+                content="",
+                metadata={
+                    "_collapse": True,
+                    "_session_key": session_key,
+                    "progress_event": {
+                        "kind": "cancelled",
+                        "reason": "replaced by a newer user message",
+                    },
+                },
+            )
+        return OutboundMessage(
+            channel=message.channel,
+            chat_id=message.chat_id,
+            content="⏹️ Остановил предыдущую задачу, перехожу к новому сообщению.",
+            metadata={"_session_key": session_key},
         )
 
     def _next_flush_timeout(self) -> float:
@@ -455,15 +491,29 @@ class OhmoGatewayBridge:
             session_key,
             reason="stopped by user command",
         )
-        content = "⏹️ Остановил текущую задачу." if stopped else "Сейчас нет активной задачи."
-        await self._bus.publish_outbound(
-            OutboundMessage(
-                channel=message.channel,
-                chat_id=message.chat_id,
-                content=content,
-                metadata={"_session_key": session_key},
+        if not stopped:
+            await self._publish_command_reply(message, session_key, "Сейчас нет активной задачи.")
+            return
+        if self._is_quiet_telegram(message):
+            await self._bus.publish_outbound(
+                OutboundMessage(
+                    channel=message.channel,
+                    chat_id=message.chat_id,
+                    content="",
+                    metadata={
+                        "_collapse": True,
+                        "_session_key": session_key,
+                        "progress_event": {
+                            "kind": "cancelled",
+                            "reason": "stopped by user command",
+                        },
+                    },
+                )
             )
-        )
+        else:
+            await self._publish_command_reply(
+                message, session_key, "⏹️ Остановил текущую задачу."
+            )
 
     async def _handle_new(self, message, session_key: str) -> None:
         """/new (alias /clear): cancel the in-flight turn and HARD-reset the

@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.error import BadRequest
+from telegram.error import BadRequest, RetryAfter
 
 from openharness.channels.bus.events import OutboundMessage
 from openharness.channels.bus.queue import MessageBus
@@ -224,3 +224,162 @@ async def test_photo_caption_callback_uses_caption_api_and_forwards_native_id() 
     assert captured[0].metadata["native_message_id"] == 55
     assert captured[0].metadata["callback_data"] == "nutrition:bound-candidate:2"
     assert captured[0].chat_id == "123"
+
+
+# ---------------------------------------------------------------------------
+# RetryAfter must NOT trigger the HTML→plain fallback (bead agents-playgroud-axd)
+# ---------------------------------------------------------------------------
+
+
+class _TextSendBot:
+    """Bot that raises on the first ``send_message`` HTML attempt."""
+
+    def __init__(self, *, error: BaseException | None = None):
+        self.calls: list[tuple[str, dict]] = []
+        self._error = error
+        self._next_id = 200
+
+    async def send_message(self, **kwargs):
+        self.calls.append(("send_message", kwargs))
+        if self._error is not None:
+            error = self._error
+            self._error = None
+            raise error
+        self._next_id += 1
+        return SimpleNamespace(message_id=self._next_id)
+
+    async def send_chat_action(self, **kwargs):
+        self.calls.append(("send_chat_action", kwargs))
+
+
+@pytest.mark.asyncio
+async def test_retry_after_on_html_send_propagates_without_plain_fallback() -> None:
+    """RetryAfter on the HTML ``send_message`` must NOT silently fall back to
+    plain text (which would double-send or mask the rate limit). It must
+    propagate so the dispatcher can apply bounded RetryAfter retry."""
+    bot = _TextSendBot(error=RetryAfter(0.1))
+    ch = _channel(bot)
+
+    with pytest.raises(RetryAfter):
+        await ch.send(
+            OutboundMessage(
+                channel="telegram", chat_id="42", content="**important final**"
+            )
+        )
+    assert len(bot.calls) == 1
+    assert bot.calls[0][1].get("parse_mode") == "HTML"
+
+
+@pytest.mark.asyncio
+async def test_bad_request_format_error_still_falls_back_to_plain() -> None:
+    """An actual ``BadRequest`` parse/format error on ``send_message`` must still
+    trigger the plain-text fallback — the scoped narrowing only excludes
+    RetryAfter and other non-formatting errors."""
+    bot = _TextSendBot(error=BadRequest("Bad Request: can't parse entities"))
+    ch = _channel(bot)
+
+    receipt = await ch.send(
+        OutboundMessage(
+            channel="telegram", chat_id="42", content="**important final**"
+        )
+    )
+    assert receipt is not None
+    assert len(bot.calls) == 2
+    assert bot.calls[0][1].get("parse_mode") == "HTML"
+    assert "parse_mode" not in bot.calls[1]
+
+
+@pytest.mark.asyncio
+async def test_non_formatting_bad_request_propagates_without_plain_fallback() -> None:
+    """A ``BadRequest`` that is NOT a parse/format error (e.g. chat not found)
+    must propagate rather than silently retrying as plain text."""
+    bot = _TextSendBot(error=BadRequest("Bad Request: chat not found"))
+    ch = _channel(bot)
+
+    with pytest.raises(BadRequest):
+        await ch.send(
+            OutboundMessage(
+                channel="telegram", chat_id="42", content="**final**"
+            )
+        )
+    assert len(bot.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_e2e_retry_after_then_success_delivers_exactly_one_native_final() -> None:
+    """End-to-end: the ChannelManager dispatcher sends a durable final through
+    a real TelegramChannel. The first HTML attempt raises RetryAfter. The
+    dispatcher waits the delay, retries, and the second attempt succeeds.
+
+    Asserts: exactly one native message delivered, no plain-text fallback on
+    RetryAfter, and the dispatcher continues to the next message.
+    """
+    import asyncio
+    import time
+
+    from openharness.channels.impl.manager import ChannelManager
+
+    class _RetryOnceBot:
+        def __init__(self):
+            self.calls: list[tuple[str, dict]] = []
+            self._failed = False
+            self._next_id = 500
+
+        async def send_message(self, **kwargs):
+            self.calls.append(("send_message", kwargs))
+            if not self._failed:
+                self._failed = True
+                raise RetryAfter(0.01)
+            self._next_id += 1
+            return SimpleNamespace(message_id=self._next_id)
+
+        async def send_chat_action(self, **kwargs):
+            pass
+
+    bot = _RetryOnceBot()
+    channel = TelegramChannel(TelegramConfig(token="token"), MessageBus())
+    channel._app = SimpleNamespace(bot=bot)
+
+    # Bypass ChannelManager.__init__ — only exercise the dispatcher.
+    manager = ChannelManager.__new__(ChannelManager)
+    manager.bus = MessageBus()
+    manager.channels = {"telegram": channel}
+    manager._on_send_failure = None
+    manager._on_send_success = None
+
+    class _Channels:
+        send_tool_hints = True
+        send_progress = True
+
+    class _Config:
+        channels = _Channels()
+
+    manager.config = _Config()
+
+    final1 = OutboundMessage(channel="telegram", chat_id="42", content="**first final**")
+    final2 = OutboundMessage(channel="telegram", chat_id="42", content="second final")
+
+    await manager.bus.publish_outbound(final1)
+    await manager.bus.publish_outbound(final2)
+    task = asyncio.create_task(manager._dispatch_outbound())
+    try:
+        # Wait for both messages to be delivered (RetryAfter retry + second msg).
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            await asyncio.sleep(0.02)
+            if len(bot.calls) >= 3:  # 1 failed + 1 retry + 1 second = 3
+                break
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    # No plain-text fallback on RetryAfter — every send uses HTML parse mode.
+    html_sends = [c for c in bot.calls if c[1].get("parse_mode") == "HTML"]
+    plain_sends = [c for c in bot.calls if "parse_mode" not in c[1]]
+    # 3 HTML calls: first-final (failed RetryAfter) + first-final (retry) +
+    # second-final. Zero plain fallbacks.
+    assert len(html_sends) == 3
+    assert len(plain_sends) == 0  # no plain fallback on RetryAfter

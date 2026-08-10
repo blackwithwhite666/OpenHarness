@@ -169,6 +169,19 @@ def _compact_tool_event(metadata: object) -> dict[str, object] | None:
     return metadata
 
 
+def _compact_cancelled_event(metadata: object) -> dict[str, object] | None:
+    """Return a validated cancelled/terminal progress payload, if present.
+
+    This is the provider-neutral structured lifecycle event for explicit
+    task cancellation (bead agents-playgroud-98i). It replaces two
+    independent free-text terminal writers — the compact animator's idle
+    expiry and the bridge's interrupt notice — with a single owner.
+    """
+    if not isinstance(metadata, dict) or metadata.get("kind") != "cancelled":
+        return None
+    return metadata
+
+
 def _compact_tool_label(event: dict[str, object]) -> str:
     """Use only the channel-safe human label in quiet progress rows."""
     raw = event.get("display_label")
@@ -548,6 +561,28 @@ def _is_caption_formatting_bad_request(error: BadRequest) -> bool:
             "unsupported start tag",
             "caption is too long",
             "message caption is too long",
+        )
+    )
+
+
+def _is_message_formatting_bad_request(error: BadRequest) -> bool:
+    """Return whether Telegram rejected the message body's HTML formatting.
+
+    Only actual parse/format errors qualify — NOT RetryAfter (which is a rate
+    limit, not a formatting failure) or other BadRequest variants (e.g. chat
+    not found, message is not modified).  This prevents the HTML→plain-text
+    fallback from silently swallowing RetryAfter and double-sending.
+    """
+    message = str(error).lower()
+    return any(
+        marker in message
+        for marker in (
+            "can't parse entities",
+            "cannot parse entities",
+            "can't find end of the entity",
+            "unsupported start tag",
+            "unsupported end tag",
+            "message is too long",
         )
     )
 
@@ -1059,9 +1094,11 @@ class TelegramChannel(BaseChannel):
         # Compact progress: fold this event into the chat's single live status
         # message (spinner-animated, edited in place) instead of a fresh message.
         progress_event = _compact_tool_event(msg.metadata.get("progress_event"))
+        cancelled_event = _compact_cancelled_event(msg.metadata.get("progress_event"))
         if msg.metadata.get("_collapse") and (
             progress_event is not None
             or todo_event is not None
+            or cancelled_event is not None
             or (msg.content and msg.content != "[empty message]")
         ):
             await self._compact_progress(
@@ -1070,6 +1107,7 @@ class TelegramChannel(BaseChannel):
                 msg.content,
                 progress_event=progress_event,
                 todo_event=todo_event,
+                cancelled_event=cancelled_event,
             )
             return self._receipt(msg, native_message_ids)
 
@@ -1178,7 +1216,13 @@ class TelegramChannel(BaseChannel):
                         if message_id is not None:
                             native_message_ids.append(message_id)
                         reply_params_for_next_send = None
-                except Exception as e:
+                except BadRequest as e:
+                    # Only fall back to plain text for actual parse/format
+                    # errors. RetryAfter, Forbidden, "chat not found" and other
+                    # non-formatting errors must propagate so the dispatcher
+                    # can apply bounded RetryAfter retry or the failure hook.
+                    if not _is_message_formatting_bad_request(e):
+                        raise
                     logger.warning("HTML parse failed, falling back to plain text: %s", e)
                     try:
                         if is_progress and draft_id:
@@ -1223,13 +1267,24 @@ class TelegramChannel(BaseChannel):
         *,
         progress_event: dict[str, object] | None = None,
         todo_event: dict[str, object] | None = None,
+        cancelled_event: dict[str, object] | None = None,
     ) -> None:
         """Fold one progress event into the chat's single live status message.
 
         First event → send the status message once and start the spinner loop.
         Subsequent events → append the step and mark dirty; the loop (the single
         writer) performs the throttled ``edit_message_text``.
+
+        A ``cancelled`` event is the single explicit lifecycle terminal: it
+        stops the animator, edits the live status once to a terminal phrase,
+        and removes it from active state. If no live status exists, a single
+        standalone notice is sent instead. A new turn then creates a fresh
+        status (bead agents-playgroud-98i).
         """
+        if cancelled_event is not None:
+            await self._handle_cancelled_event(chat_key, chat_id, content, cancelled_event)
+            return
+
         todo_text = _render_todo_panel(todo_event) if todo_event is not None else None
         if todo_event is not None and todo_text is None and todo_event.get("todos") != []:
             # An empty changed snapshot removes the section.  A malformed event
@@ -1275,6 +1330,51 @@ class TelegramChannel(BaseChannel):
                 self._trim_compact_ordinary_lines(status)
         status.dirty = True
         status.last_event = time.monotonic()
+        # Restart the animator if it stopped (idle break without popping). New
+        # events after idle should resume rendering, not leave a stale spinner.
+        if status.anim is None or status.anim.done():
+            status.tick = _COMPACT_TICK
+            status.anim = asyncio.create_task(self._compact_anim(chat_key, chat_id))
+
+    async def _handle_cancelled_event(
+        self,
+        chat_key: str,
+        chat_id: int,
+        content: str,
+        event: dict[str, object],
+    ) -> None:
+        """Explicit cancellation is the single terminal lifecycle event.
+
+        In quiet mode with a live compact status: stop the animator, edit the
+        status once to a terminal phrase, and remove it from active state. A
+        new turn creates a fresh status.
+
+        In quiet mode with NO live compact status: send at most one standalone
+        notice. (Verbose mode sends a standalone notice via the non-collapse
+        path; a cancelled event with ``_collapse`` and no live status is the
+        rare case where the turn was cancelled before any progress arrived.)
+        """
+        status = self._status.pop(chat_key, None)
+        notice = _compact_step_line(content) or "⏹️ Остановлено"
+        if status is not None:
+            # Cancel the animator first so it cannot edit the status after the
+            # terminal phrase is applied.
+            if status.anim is not None and not status.anim.done():
+                status.anim.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await status.anim
+            # Best-effort edit: a failed edit must not fall back to a
+            # duplicate standalone notice.
+            await self._edit_status(chat_id, status, notice)
+            return
+        # No live status — send a single standalone notice. Unlike the
+        # best-effort compact edits above, a rejection here (e.g. RetryAfter)
+        # must propagate: the cancelled notice is durable, and swallowing the
+        # error would silently claim the user was notified. The dispatcher
+        # applies bounded RetryAfter retry or the failure hook.
+        await self._app.bot.send_message(
+            chat_id=chat_id, text=notice, parse_mode=None
+        )
 
     def _record_compact_tool_event(
         self,
@@ -1471,10 +1571,12 @@ class TelegramChannel(BaseChannel):
                 if status is None:
                     break
                 if time.monotonic() - status.last_event > _COMPACT_IDLE_S:
-                    # No new event for a while — the turn most likely died without a
-                    # final. Leave a terminal marker instead of spinning forever.
-                    await self._edit_status(chat_id, status, "⏹️ остановлено")
-                    self._status.pop(chat_key, None)
+                    # No new event for a while — the turn may have died without
+                    # a final, or the runtime may still be active. We must NOT
+                    # assert "stopped" (only an explicit lifecycle event may
+                    # render terminal cancellation). Stop animating so the
+                    # spinner does not spin forever; leave the status in place
+                    # so a later final/command/error can clean it up.
                     break
                 status.spinner_idx = (status.spinner_idx + 1) % len(_SPINNER_FRAMES)
                 await self._edit_status(chat_id, status, self._render_status(status))
