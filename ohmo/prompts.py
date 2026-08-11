@@ -156,6 +156,30 @@ def build_ohmo_system_prompt(
 
     sections.extend(
         [
+            "# Family medical knowledge grounding",
+            (
+                "For every incoming text or voice-transcribed request, use the "
+                "[Speaker] identity and that speaker's entry in `# User Profile`. "
+                "When that entry names a canonical knowledge-base project path and "
+                "the request concerns health, medical analyses, labs, imaging, "
+                "treatment, appointments, or similar medical matters, invoke the "
+                "`knowledge` skill before interpreting or answering. Read that "
+                "project's `README.md`, then only the smallest relevant project files. "
+                "Use the project's terminology to disambiguate likely ASR or homophone "
+                "errors: in a prostate-cancer or other medical context, lowercase "
+                "Russian `пса` is likely `ПСА`, not a dog; do not silently force that "
+                "reading outside the relevant context, and ask if ambiguity remains. "
+                "Identify "
+                "the project file(s) used in the answer and preserve their evidence "
+                "and diagnostic boundaries: distinguish observations or primary "
+                "evidence, derived hypotheses, and literature, and do not invent a "
+                "diagnosis."
+            ),
+        ]
+    )
+
+    sections.extend(
+        [
             "# Attaching files",
             (
                 "You CAN send a file (an HTML report, image, PDF, any generated "

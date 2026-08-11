@@ -107,6 +107,52 @@ def test_ohmo_prompt_has_telegram_formatting_rules(tmp_path: Path):
     assert "# Channel" in prompt and "[Speaker]" in prompt  # knows it talks via Telegram + who
 
 
+def test_ohmo_prompt_has_generic_family_medical_grounding_contract(tmp_path: Path):
+    workspace = tmp_path / ".ohmo-home"
+    initialize_workspace(workspace)
+    prompt = build_ohmo_system_prompt(tmp_path, workspace=workspace)
+
+    assert "Family medical knowledge grounding" in prompt
+    assert "[Speaker] identity" in prompt
+    assert "# User Profile" in prompt
+    assert "canonical knowledge-base project path" in prompt
+    assert "health, medical analyses, labs, imaging, treatment, appointments" in prompt
+    assert "invoke the `knowledge` skill before interpreting or answering" in prompt
+    assert "Read that project's `README.md`" in prompt
+    assert "only the smallest relevant project files" in prompt
+    assert "voice-transcribed request" in prompt
+    assert "lowercase Russian `пса` is likely `ПСА`, not a dog" in prompt
+    assert "do not silently force that reading" in prompt
+    assert "ask if ambiguity remains" in prompt
+
+
+def test_ohmo_prompt_preserves_medical_grounding_and_diagnostic_boundaries(tmp_path: Path):
+    workspace = tmp_path / ".ohmo-home"
+    initialize_workspace(workspace)
+    prompt = build_ohmo_system_prompt(tmp_path, workspace=workspace)
+
+    assert "Identify the project file(s) used in the answer" in prompt
+    assert "preserve their evidence and diagnostic boundaries" in prompt
+    assert "observations or primary evidence" in prompt
+    assert "derived hypotheses" in prompt
+    assert "literature" in prompt
+    assert "do not invent a diagnosis" in prompt
+
+
+def test_ohmo_prompt_includes_synthetic_profile_project_path_verbatim(tmp_path: Path):
+    workspace = tmp_path / ".ohmo-home"
+    initialize_workspace(workspace)
+    synthetic_path = "/private/synthetic-family/project-medical/README.md"
+    get_user_path(workspace).write_text(
+        f"Other people:\n- [Speaker] has canonical knowledge-base project path: {synthetic_path}\n",
+        encoding="utf-8",
+    )
+
+    prompt = build_ohmo_system_prompt(tmp_path, workspace=workspace)
+
+    assert synthetic_path in prompt
+
+
 def test_ohmo_prompt_explains_file_attachment(tmp_path: Path):
     """The [[attach:]] marker is the only way the bot can send a file to
     Telegram; if the prompt omits it the model thinks it has no attach tool
