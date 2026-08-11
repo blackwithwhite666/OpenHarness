@@ -24,6 +24,7 @@ from telegram import (
     ReplyParameters,
     Update,
 )
+from telegram.error import BadRequest, RetryAfter
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -32,7 +33,6 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
-from telegram.error import BadRequest, RetryAfter
 from telegram.request import HTTPXRequest
 
 from openharness.channels.bus.events import OutboundDeliveryReceipt, OutboundMessage
@@ -42,7 +42,8 @@ from openharness.channels.last_location import LastLocationStore
 from openharness.config.schema import TelegramConfig
 from openharness.untrusted import UNTRUSTED_BANNER
 from openharness.utils.helpers import split_message
-from openharness.voice.transcription import VoiceTranscriber
+from openharness.voice.dedupe import VoiceTranscriptionDedupe, voice_dedupe_key_for_path
+from openharness.voice.transcription import TranscriptionError, VoiceTranscriber
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +73,22 @@ _COMPACT_TOOL_ROW_LIMIT_DEFAULT = 3
 _COMPACT_TOOL_ROW_LIMIT_MAX = 10
 _TODO_PANEL_TITLE = "📋 To-do"
 _TODO_PANEL_MAX = TELEGRAM_MAX_MESSAGE_LEN
+
+
+def _safe_transcription_error_class(error: TranscriptionError | None) -> str:
+    value = error.error_class if error is not None else "unknown"
+    return value if re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", value) else "unknown"
+
+
+def _provider_failure(error: BaseException) -> TranscriptionError:
+    if isinstance(error, TranscriptionError):
+        return error
+    return TranscriptionError(
+        "transcription provider failed",
+        provider="unknown",
+        error_class="provider_failure",
+        retryable=False,
+    )
 
 
 def _coerce_compact_tool_row_limit(value: object) -> int:
@@ -793,6 +810,14 @@ class TelegramChannel(BaseChannel):
         self._last_location = LastLocationStore(
             resolve_channel_state_dir(self.name, "last_location")
         )
+        try:
+            voice_state_dir = resolve_channel_state_dir(self.name, "voice_transcription")
+        except OSError:
+            # Cache persistence is an optimization. If the state root is
+            # unavailable, retain in-process dedupe and keep the channel alive.
+            logger.warning("telegram voice transcription cache unavailable; using memory only")
+            voice_state_dir = None
+        self._voice_dedupe = VoiceTranscriptionDedupe(voice_state_dir)
 
     async def start(self) -> None:
         """Start the Telegram bot with long polling."""
@@ -1147,7 +1172,11 @@ class TelegramChannel(BaseChannel):
                 )
 
     async def _publish_voice_transcript(
-        self, chat_id: int, message_id: int, transcript: str | None
+        self,
+        chat_id: int,
+        message_id: int,
+        transcript: str | None,
+        error: TranscriptionError | None = None,
     ) -> None:
         """Publish the durable, reply-linked voice transcript/failure notice.
 
@@ -1164,6 +1193,7 @@ class TelegramChannel(BaseChannel):
         else:
             content = (
                 "⚠️ Не удалось распознать голосовое сообщение — "
+                f"код={_safe_transcription_error_class(error)}; "
                 "попробуйте ещё раз или отправьте текстом."
             )
         await self.bus.publish_outbound(
@@ -2014,37 +2044,105 @@ class TelegramChannel(BaseChannel):
 
                 file_path = media_dir / _media_filename(media_file, ext)
                 await file.download_to_drive(str(file_path))
-                media_paths.append(str(file_path))
-            except Exception as e:
-                logger.error("Failed to download media: %s", e)
-                content_parts.append(f"[{media_type}: download failed]")
+            except Exception:  # noqa: BLE001 - media download is a channel boundary
+                logger.error(
+                    "Telegram media download failed media_type=%s error_class=download_failed",
+                    media_type,
+                )
                 file_path = None
 
-            if file_path is not None:
-                # Transcription is best-effort and SEPARATE from the download:
-                # a failed local ASR must not be reported as "download failed".
-                transcription = None
-                transcription_attempted = False
-                if media_type in ("voice", "audio") and self._transcriber is not None:
-                    transcription_attempted = True
+            is_voice_media = media_type in ("voice", "audio")
+            transcription_enabled = bool(
+                self.config.voice_transcription_enabled or self._transcriber is not None
+            )
+            transcription_error: TranscriptionError | None = None
+            transcription = None
+            if file_path is None:
+                if is_voice_media and transcription_enabled:
+                    transcription_error = TranscriptionError(
+                        "voice media download failed",
+                        provider="unknown",
+                        error_class="download_failed",
+                        retryable=False,
+                    )
+                elif media_type:
+                    content_parts.append(f"[{media_type}: download failed]")
+            elif is_voice_media and transcription_enabled:
+                if self._transcriber is None:
+                    transcription_error = TranscriptionError(
+                        "voice transcription is unavailable",
+                        provider="unknown",
+                        error_class="transcriber_unavailable",
+                        retryable=False,
+                    )
+                else:
                     try:
-                        transcription = await self._transcriber.transcribe(str(file_path))
-                    except Exception as e:
-                        logger.warning("Voice transcription failed for %s: %s", media_type, e)
+                        key = await voice_dedupe_key_for_path(
+                            chat_id,
+                            message.message_id,
+                            file_path,
+                        )
+                        transcription = await self._voice_dedupe.transcribe(
+                            key,
+                            lambda: self._transcriber.transcribe(str(file_path)),
+                        )
+                    except Exception as exc:  # noqa: BLE001 - ASR boundary is fail-closed
+                        transcription_error = _provider_failure(exc)
+                        logger.warning(
+                            "Voice transcription failed media_type=%s error_class=%s "
+                            "retryable=%s",
+                            media_type,
+                            _safe_transcription_error_class(transcription_error),
+                            transcription_error.retryable,
+                        )
                 if transcription:
-                    logger.info("Transcribed %s: %s...", media_type, transcription[:50])
-                    # Keep the media path/provenance AND the exact transcript.
+                    media_paths.append(str(file_path))
                     content_parts.append(f"[{media_type}: {file_path}]")
                     content_parts.append(f"[transcription: {transcription}]")
-                else:
-                    # Carry the per-file path so a coalesced burst stays
-                    # individually addressable (each voice → its own path).
-                    content_parts.append(f"[{media_type}: {file_path}]")
-                if transcription_attempted:
                     await self._publish_voice_transcript(
-                        chat_id, message.message_id, transcription
+                        chat_id,
+                        message.message_id,
+                        transcription,
                     )
-                logger.debug("Downloaded %s to %s", media_type, file_path)
+                elif transcription_error is not None:
+                    marker = (
+                        f"[transcription_failure: "
+                        f"error_class={_safe_transcription_error_class(transcription_error)}]"
+                    )
+                    if message.text or message.caption:
+                        content_parts.append(marker)
+                    await self._publish_voice_transcript(
+                        chat_id,
+                        message.message_id,
+                        None,
+                        transcription_error,
+                    )
+                    if not (message.text or message.caption):
+                        return
+            elif file_path is not None:
+                media_paths.append(str(file_path))
+                if media_type:
+                    content_parts.append(f"[{media_type}: {file_path}]")
+            if file_path is None and transcription_error is not None:
+                marker = (
+                    f"[transcription_failure: "
+                    f"error_class={_safe_transcription_error_class(transcription_error)}]"
+                )
+                if message.text or message.caption:
+                    content_parts.append(marker)
+                await self._publish_voice_transcript(
+                    chat_id,
+                    message.message_id,
+                    None,
+                    transcription_error,
+                )
+                if not (message.text or message.caption):
+                    return
+            logger.debug(
+                "Downloaded Telegram media media_type=%s bytes=%s",
+                media_type,
+                file_path.stat().st_size if file_path is not None else 0,
+            )
 
         # Inject the chat's last known location (if any) so a request like
         # "what's nearby?" has coordinates. Location messages returned earlier, so
@@ -2062,7 +2160,12 @@ class TelegramChannel(BaseChannel):
         if reply_prefix:
             content = f"{reply_prefix}\n{content}"
 
-        logger.debug("Telegram message from %s: %s...", sender_id, content[:50])
+        logger.debug(
+            "Telegram message received sender_id=%s content_length=%d media_count=%d",
+            sender_id,
+            len(content),
+            len(media_paths),
+        )
 
         str_chat_id = str(chat_id)
 

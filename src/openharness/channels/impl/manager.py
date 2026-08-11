@@ -10,7 +10,6 @@ from collections.abc import Awaitable, Callable
 from functools import partial
 from typing import Any
 
-
 from openharness.channels.bus.events import OutboundDeliveryReceipt, OutboundMessage
 from openharness.channels.bus.queue import MessageBus
 from openharness.channels.impl.base import BaseChannel
@@ -111,11 +110,23 @@ class ChannelManager:
                 telegram_config = self.config.channels.telegram
                 transcriber = None
                 if telegram_config.voice_transcription_enabled:
-                    from openharness.voice.transcription import SubprocessVoiceTranscriber
+                    from openharness.voice.transcription import (
+                        RetryingVoiceTranscriber,
+                        SubprocessVoiceTranscriber,
+                    )
                     try:
-                        transcriber = SubprocessVoiceTranscriber(
-                            telegram_config.voice_transcription_argv,
-                            timeout_seconds=telegram_config.voice_transcription_timeout_seconds,
+                        transcriber = RetryingVoiceTranscriber(
+                            SubprocessVoiceTranscriber(
+                                telegram_config.voice_transcription_argv,
+                                timeout_seconds=telegram_config.voice_transcription_timeout_seconds,
+                            ),
+                            max_attempts=telegram_config.voice_transcription_max_attempts,
+                            base_backoff_seconds=(
+                                telegram_config.voice_transcription_base_backoff_seconds
+                            ),
+                            total_budget_seconds=(
+                                telegram_config.voice_transcription_total_budget_seconds
+                            ),
                         )
                     except ValueError as voice_error:
                         # Fail closed: an unusable ASR command disables

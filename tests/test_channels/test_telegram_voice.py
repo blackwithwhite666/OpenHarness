@@ -10,8 +10,6 @@ never delete or edit it.
 
 from __future__ import annotations
 
-import sys
-import time
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -23,11 +21,7 @@ from openharness.channels.bus.events import OutboundMessage
 from openharness.channels.bus.queue import MessageBus
 from openharness.channels.impl.telegram import TelegramChannel
 from openharness.config.schema import TelegramConfig
-from openharness.voice import (
-    SubprocessVoiceTranscriber,
-    TranscriptionError,
-)
-
+from openharness.voice import TranscriptionError
 
 # ---------------------------------------------------------------------------
 # Config validation
@@ -39,6 +33,9 @@ def test_voice_transcription_config_defaults_are_disabled_and_fail_closed():
     assert config.voice_transcription_enabled is False
     assert config.voice_transcription_argv == []
     assert config.voice_transcription_timeout_seconds > 0
+    assert config.voice_transcription_max_attempts == 2
+    assert config.voice_transcription_base_backoff_seconds == 0.5
+    assert config.voice_transcription_total_budget_seconds == 90.0
 
 
 def test_voice_transcription_enabled_requires_non_empty_argv():
@@ -59,6 +56,22 @@ def test_voice_transcription_timeout_is_bounded():
         TelegramConfig(voice_transcription_timeout_seconds=99999)
 
 
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("voice_transcription_max_attempts", 0),
+        ("voice_transcription_max_attempts", 4),
+        ("voice_transcription_base_backoff_seconds", -1),
+        ("voice_transcription_base_backoff_seconds", 31),
+        ("voice_transcription_total_budget_seconds", 0),
+        ("voice_transcription_total_budget_seconds", 901),
+    ],
+)
+def test_voice_transcription_retry_config_is_bounded(field, value):
+    with pytest.raises(ValidationError):
+        TelegramConfig(**{field: value})
+
+
 def test_voice_transcription_valid_config_round_trips_through_telegram_config():
     config = TelegramConfig(
         voice_transcription_enabled=True,
@@ -68,83 +81,6 @@ def test_voice_transcription_valid_config_round_trips_through_telegram_config():
     assert config.voice_transcription_enabled is True
     assert config.voice_transcription_argv[-1] == "--json"
     assert config.voice_transcription_timeout_seconds == 60.0
-
-
-def test_subprocess_transcriber_rejects_empty_argv():
-    with pytest.raises(ValueError):
-        SubprocessVoiceTranscriber([])
-    with pytest.raises(ValueError):
-        SubprocessVoiceTranscriber(["ok", ""])
-
-
-# ---------------------------------------------------------------------------
-# Subprocess transcriber behaviour (real child processes)
-# ---------------------------------------------------------------------------
-
-
-def _script_transcriber(script: str, *, timeout: float = 10.0) -> SubprocessVoiceTranscriber:
-    return SubprocessVoiceTranscriber(
-        [sys.executable, "-c", script], timeout_seconds=timeout
-    )
-
-
-@pytest.mark.asyncio
-async def test_subprocess_transcriber_success_appends_path_as_separate_argv(tmp_path):
-    target = tmp_path / "voice sample.ogg"
-    target.write_bytes(b"ogg")
-    # The child echoes back the LAST argv element it received as the transcript.
-    transcriber = _script_transcriber(
-        "import json, sys; print(json.dumps({'text': sys.argv[-1]}))"
-    )
-
-    text = await transcriber.transcribe(str(target))
-
-    assert text == str(target)
-
-
-@pytest.mark.asyncio
-async def test_subprocess_transcriber_nonzero_exit_is_an_explicit_failure(tmp_path):
-    target = tmp_path / "v.ogg"
-    target.write_bytes(b"ogg")
-    transcriber = _script_transcriber(
-        "import sys; sys.stderr.write('boom'); sys.exit(3)"
-    )
-
-    with pytest.raises(TranscriptionError):
-        await transcriber.transcribe(str(target))
-
-
-@pytest.mark.asyncio
-async def test_subprocess_transcriber_timeout_kills_the_child(tmp_path):
-    target = tmp_path / "v.ogg"
-    target.write_bytes(b"ogg")
-    transcriber = _script_transcriber("import time; time.sleep(30)", timeout=0.2)
-
-    started = time.monotonic()
-    with pytest.raises(TranscriptionError):
-        await transcriber.transcribe(str(target))
-    # The child must be killed, not left running for its full 30s sleep.
-    assert time.monotonic() - started < 10
-
-
-@pytest.mark.asyncio
-async def test_subprocess_transcriber_invalid_json_is_an_explicit_failure(tmp_path):
-    target = tmp_path / "v.ogg"
-    target.write_bytes(b"ogg")
-    transcriber = _script_transcriber("print('not json at all')")
-
-    with pytest.raises(TranscriptionError):
-        await transcriber.transcribe(str(target))
-
-
-@pytest.mark.asyncio
-async def test_subprocess_transcriber_empty_text_is_an_explicit_failure(tmp_path):
-    target = tmp_path / "v.ogg"
-    target.write_bytes(b"ogg")
-    transcriber = _script_transcriber("import json; print(json.dumps({'text': '   '}))")
-
-    with pytest.raises(TranscriptionError):
-        await transcriber.transcribe(str(target))
 
 
 # ---------------------------------------------------------------------------
@@ -204,8 +140,15 @@ def _channel(
     monkeypatch.setenv("OPENHARNESS_CHANNEL_STATE_DIR", str(tmp_path / "state"))
     monkeypatch.setenv("OPENHARNESS_CHANNEL_MEDIA_DIR", str(tmp_path / "media"))
     bot = _Bot()
+    enabled = transcriber is not None
     channel = TelegramChannel(
-        TelegramConfig(token="token", allow_from=["*"], reply_to_message=reply_to_message),
+        TelegramConfig(
+            token="token",
+            allow_from=["*"],
+            reply_to_message=reply_to_message,
+            voice_transcription_enabled=enabled,
+            voice_transcription_argv=["test-asr"] if enabled else [],
+        ),
         MessageBus(),
         transcriber=transcriber,
     )
@@ -238,7 +181,7 @@ def _voice_message(message_id: int, unique: str) -> SimpleNamespace:
         media_group_id=None,
         reply_to_message=None,
         forward_origin=None,
-        date=datetime(2026, 8, 1, 12, 0, tzinfo=timezone.utc),
+        date=datetime(2026, 8, 1, 12, 0, tzinfo=timezone.utc),  # noqa: UP017
     )
 
 
@@ -275,7 +218,7 @@ async def test_voice_transcribed_before_inbound_with_path_and_durable_reply(
 
 
 @pytest.mark.asyncio
-async def test_voice_transcription_failure_keeps_path_and_sends_one_actionable_notice(
+async def test_voice_transcription_failure_voice_only_sends_notice_without_inbound(
     tmp_path, monkeypatch
 ):
     transcriber = _FakeTranscriber(TranscriptionError("exit 3"))
@@ -288,9 +231,7 @@ async def test_voice_transcription_failure_keeps_path_and_sends_one_actionable_n
     assert "📝" not in notice.content
     assert notice.content.strip()  # exactly one durable, actionable indication
 
-    inbound = await channel.bus.consume_inbound()
-    assert f"[voice: {transcriber.calls[0]}]" in inbound.content
-    assert "[transcription:" not in inbound.content
+    assert channel.bus.inbound_size == 0
 
 
 @pytest.mark.asyncio
@@ -302,6 +243,44 @@ async def test_voice_without_transcriber_is_fail_closed_and_silent(tmp_path, mon
     inbound = await channel.bus.consume_inbound()
     assert inbound.content.startswith("[voice: ")
     assert channel.bus.outbound_size == 0
+
+
+@pytest.mark.asyncio
+async def test_voice_enabled_without_transcriber_is_fail_closed(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENHARNESS_CHANNEL_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("OPENHARNESS_CHANNEL_MEDIA_DIR", str(tmp_path / "media"))
+    channel = TelegramChannel(
+        TelegramConfig(
+            token="token",
+            allow_from=["*"],
+            voice_transcription_enabled=True,
+            voice_transcription_argv=["test-asr"],
+        ),
+        MessageBus(),
+        transcriber=None,
+    )
+    channel._app = SimpleNamespace(bot=_Bot())
+    await channel._on_message(_update(_voice_message(104, "voice-d")), None)
+    assert channel.bus.inbound_size == 0
+    assert channel.bus.outbound_size == 1
+
+
+@pytest.mark.asyncio
+async def test_voice_caption_failure_forwards_only_caption_and_marker(tmp_path, monkeypatch):
+    transcriber = _FakeTranscriber(TranscriptionError("failure", error_class="auth"))
+    channel, _bot = _channel(tmp_path, monkeypatch, transcriber)
+    message = _voice_message(105, "voice-caption")
+    message.caption = "please summarize"
+
+    await channel._on_message(_update(message), None)
+
+    notice = await channel.bus.consume_outbound()
+    inbound = await channel.bus.consume_inbound()
+    assert "please summarize" in inbound.content
+    assert "error_class=auth" in inbound.content
+    assert inbound.media == []
+    assert "voice:" not in inbound.content
+    assert notice.metadata["_voice_transcript_message_id"] == 105
 
 
 @pytest.mark.asyncio
