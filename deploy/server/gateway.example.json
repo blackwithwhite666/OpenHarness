@@ -13,7 +13,10 @@
       "enabled": true,
       "voice_transcription_enabled": false,
       "voice_transcription_argv": ["elevenlabs-cli", "asr", "--timestamps", "none", "--json"],
-      "voice_transcription_timeout_seconds": 60.0
+      "voice_transcription_timeout_seconds": 60.0,
+      "voice_transcription_max_attempts": 2,
+      "voice_transcription_base_backoff_seconds": 0.5,
+      "voice_transcription_total_budget_seconds": 90.0
     }
   },
   "default_tz": "Europe/Moscow",

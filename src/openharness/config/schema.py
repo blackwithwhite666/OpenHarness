@@ -41,15 +41,20 @@ class TelegramConfig(BaseChannelConfig):
     # default: disabled, no command configured). When enabled, the argv list is
     # the full command template (program + flags, no shell); the downloaded
     # audio path is appended as the final, separate argv element. The command
-    # must print a JSON object with a ``text`` field on stdout.
+    # must print a JSON object with a ``text`` field on stdout. Non-zero exits
+    # must write the ElevenLabs schema_version=1 JSON error object to stderr;
+    # prose stderr is intentionally treated as a non-retryable failure.
     voice_transcription_enabled: bool = False
     voice_transcription_argv: list[str] = Field(default_factory=list)
     voice_transcription_timeout_seconds: float = 30.0
+    voice_transcription_max_attempts: int = 2
+    voice_transcription_base_backoff_seconds: float = 0.5
+    voice_transcription_total_budget_seconds: float = 90.0
     # Quiet progress: how many of the most recent tool activities stay visible.
     compact_tool_rows: int = Field(default=3, ge=1, le=10)
 
     @model_validator(mode="after")
-    def _validate_voice_transcription(self) -> "TelegramConfig":
+    def _validate_voice_transcription(self) -> TelegramConfig:
         if not 0 < float(self.voice_transcription_timeout_seconds) <= 600:
             raise ValueError(
                 "voice_transcription_timeout_seconds must be in (0, 600]"
@@ -64,6 +69,16 @@ class TelegramConfig(BaseChannelConfig):
             raise ValueError(
                 "voice_transcription_argv must be a non-empty list of non-empty "
                 "strings when voice transcription is enabled"
+            )
+        if not 1 <= int(self.voice_transcription_max_attempts) <= 3:
+            raise ValueError("voice_transcription_max_attempts must be in [1, 3]")
+        if not 0 <= float(self.voice_transcription_base_backoff_seconds) <= 30:
+            raise ValueError(
+                "voice_transcription_base_backoff_seconds must be in [0, 30]"
+            )
+        if not 0 < float(self.voice_transcription_total_budget_seconds) <= 900:
+            raise ValueError(
+                "voice_transcription_total_budget_seconds must be in (0, 900]"
             )
         return self
 
