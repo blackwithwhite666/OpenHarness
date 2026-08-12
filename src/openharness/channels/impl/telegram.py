@@ -55,8 +55,7 @@ _TELEGRAM_URL_LOGGERS = ("httpx", "httpcore", "telegram.ext")
 _SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 _COMPACT_TICK = 1.5  # wake cadence: content changes are coalesced into ≤1 edit per tick
 _COMPACT_TICK_BACKOFF = 3.0  # slower tick after a RetryAfter
-_COMPACT_IDLE_S = 90.0  # no new event for this long → the turn likely died; stop spinning
-_COMPACT_HEARTBEAT_S = 20.0  # spinner-only refresh when nothing changed (edit pressure bound)
+_COMPACT_HEARTBEAT_S = 3.0  # spinner-only refresh when nothing changed
 _COMPACT_LINE_MAX = 160  # per-step line truncation
 _COMPACT_TOOL_LABEL_MAX = 160
 _COMPACT_PURPOSE_MAX_WORDS = 20  # model-authored action purpose bound
@@ -1763,8 +1762,8 @@ class TelegramChannel(BaseChannel):
     async def _compact_anim(self, chat_key: str, chat_id: int) -> None:
         """Single-writer loop: edit promptly when content changed (coalescing
         bursts into at most one edit per tick), otherwise refresh the spinner
-        only on a slow bounded heartbeat. Backs off on RetryAfter and
-        self-expires if the turn goes idle (cancelled with no final)."""
+        on a bounded heartbeat. Backs off on RetryAfter and remains alive until
+        an explicit lifecycle path tears it down."""
         try:
             while self._app:
                 status = self._status.get(chat_key)
@@ -1773,14 +1772,6 @@ class TelegramChannel(BaseChannel):
                 await asyncio.sleep(status.tick)
                 status = self._status.get(chat_key)
                 if status is None:
-                    break
-                if time.monotonic() - status.last_event > _COMPACT_IDLE_S:
-                    # No new event for a while — the turn may have died without
-                    # a final, or the runtime may still be active. We must NOT
-                    # assert "stopped" (only an explicit lifecycle event may
-                    # render terminal cancellation). Stop animating so the
-                    # spinner does not spin forever; leave the status in place
-                    # so a later final/command/error can clean it up.
                     break
                 now = time.monotonic()
                 if not status.dirty and now - status.last_edit < _COMPACT_HEARTBEAT_S:
@@ -1804,12 +1795,25 @@ class TelegramChannel(BaseChannel):
             )
         except RetryAfter as e:
             status.tick = max(status.tick, _COMPACT_TICK_BACKOFF, e.retry_after + 0.5)
+            logger.warning(
+                "compact status edit rate limited chat=%s retry_after=%s",
+                chat_id,
+                e.retry_after,
+            )
             await asyncio.sleep(e.retry_after + 0.5)
         except BadRequest as e:
             if "not modified" not in str(e).lower():
-                logger.debug("compact status edit failed chat=%s: %s", chat_id, e)
+                logger.warning(
+                    "compact status edit failed chat=%s error_type=%s",
+                    chat_id,
+                    type(e).__name__,
+                )
         except Exception as e:  # noqa: BLE001
-            logger.debug("compact status edit failed chat=%s: %s", chat_id, e)
+            logger.warning(
+                "compact status edit failed chat=%s error_type=%s",
+                chat_id,
+                type(e).__name__,
+            )
 
     async def _clear_compact_status(self, chat_key: str) -> None:
         """Cancel the spinner and delete the status message (best-effort). No-op

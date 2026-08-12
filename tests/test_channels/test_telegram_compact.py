@@ -6,12 +6,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import time
 from types import SimpleNamespace
 
 import pytest
 from telegram.error import BadRequest, RetryAfter
 
+import openharness.channels.impl.telegram as telegram_impl
 from openharness.channels.bus.events import OutboundMessage
 from openharness.channels.bus.queue import MessageBus
 from openharness.channels.impl.telegram import (
@@ -932,27 +934,25 @@ async def test_cancelled_then_new_turn_creates_fresh_status():
 
 
 @pytest.mark.asyncio
-async def test_idle_expiry_does_not_render_terminal_stop_text():
-    """Idle expiry must not assert 'stopped' while the runtime can still be
-    active. It may stop animation but only an explicit lifecycle event may
-    render terminal cancellation."""
+async def test_old_idle_status_remains_active_until_explicit_teardown(monkeypatch):
+    """A stale progress event must not stop a still-live compact animator."""
     bot = FakeBot()
     ch = _channel(bot)
     await ch.send(_progress("424242", "working"))
     status = ch._status["424242"]
-    message_id = status.message_id
-
-    edits_before = bot.count("edit_message_text")
-    # Force idle: set last_event far in the past.
+    monkeypatch.setattr(telegram_impl, "_COMPACT_HEARTBEAT_S", 0.02)
+    status.tick = 0.005
+    status.last_edit = time.monotonic() - 999.0
     status.last_event = time.monotonic() - 999.0
-    # Run one animator tick (sleep + check + break).
-    await ch._compact_anim("424242", 424242)
-    await asyncio.sleep(0.01)
+    anim = asyncio.create_task(ch._compact_anim("424242", 424242))
+    status.anim = anim
+    await asyncio.sleep(0.05)
 
-    # Any edit that happened during idle expiry must NOT contain a stop marker.
-    for _, kwargs in bot.calls:
-        if kwargs.get("message_id") == message_id and "text" in kwargs:
-            assert "⏹" not in kwargs["text"], "idle expiry must not claim stopped"
+    assert "424242" in ch._status
+    assert bot.count("edit_message_text") >= 2
+
+    await ch.send(_final("424242", "answer"))
+    assert anim.done()
 
 
 @pytest.mark.asyncio
@@ -1300,9 +1300,11 @@ async def test_completion_after_eviction_of_another_call_updates_its_own_row():
 
 
 @pytest.mark.asyncio
-async def test_animator_skips_edits_without_changes_and_heartbeats_slowly():
+async def test_animator_skips_edits_without_changes_and_heartbeats_at_configured_cadence(monkeypatch):
     bot = FakeBot()
     ch = _channel(bot)
+    assert _COMPACT_HEARTBEAT_S == 3.0
+    monkeypatch.setattr(telegram_impl, "_COMPACT_HEARTBEAT_S", 0.02)
     await ch.send(_progress("42", "turn start"))
     status = ch._status["42"]
     _kill_anim(ch, "42")
@@ -1313,8 +1315,9 @@ async def test_animator_skips_edits_without_changes_and_heartbeats_slowly():
     status.anim = anim
     try:
         await asyncio.sleep(0.05)
-        # No content change since creation → zero edits despite several ticks.
-        assert bot.count("edit_message_text") == 0
+        # No content change since creation → recurring spinner-only edits.
+        edits_before_change = bot.count("edit_message_text")
+        assert edits_before_change >= 2
 
         # A content change is coalesced into exactly one edit.
         await ch.send(
@@ -1324,20 +1327,54 @@ async def test_animator_skips_edits_without_changes_and_heartbeats_slowly():
             )
         )
         await asyncio.sleep(0.05)
-        assert bot.count("edit_message_text") == 1
+        edits_after_change = bot.count("edit_message_text")
+        assert edits_after_change > edits_before_change
 
-        # Still no changes → no further edits (heartbeat is far away).
+        # Still no changes → recurring spinner-only edits at the configured
+        # heartbeat cadence.
         await asyncio.sleep(0.05)
-        assert bot.count("edit_message_text") == 1
-
-        # Once the bounded heartbeat elapses, a spinner-only edit goes out.
-        status.last_edit = time.monotonic() - (_COMPACT_HEARTBEAT_S + 1)
-        await asyncio.sleep(0.05)
-        assert bot.count("edit_message_text") == 2
+        assert bot.count("edit_message_text") > edits_after_change
     finally:
         anim.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await anim
+
+
+@pytest.mark.asyncio
+async def test_compact_edit_failures_warn_except_not_modified(caplog):
+    class ErrorBot(FakeBot):
+        def __init__(self):
+            super().__init__()
+            self.error: BaseException | None = None
+
+        async def edit_message_text(self, **kwargs):
+            self.calls.append(("edit_message_text", kwargs))
+            if self.error is not None:
+                raise self.error
+
+    bot = ErrorBot()
+    ch = _channel(bot)
+    await ch.send(_progress("42", "turn start"))
+    status = ch._status["42"]
+    _kill_anim(ch, "42")
+
+    with caplog.at_level(logging.WARNING, logger=telegram_impl.__name__):
+        bot.error = RetryAfter(0)
+        await ch._edit_status(42, status, "retry")
+        bot.error = BadRequest("message to edit not found")
+        await ch._edit_status(42, status, "failure")
+
+    warning_messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelno == logging.WARNING
+    ]
+    assert any("rate limited" in message for message in warning_messages)
+    assert any("edit failed" in message for message in warning_messages)
+    warning_count = len(caplog.records)
+    bot.error = BadRequest("Message is not modified")
+    await ch._edit_status(42, status, "same")
+    assert len(caplog.records) == warning_count
 
 
 @pytest.mark.asyncio
