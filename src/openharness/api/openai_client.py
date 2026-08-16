@@ -7,7 +7,7 @@ import json
 import logging
 import os
 import re
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Callable
 from urllib.parse import urlsplit, urlunsplit
 
 from openai import AsyncOpenAI
@@ -298,10 +298,20 @@ class OpenAICompatibleClient:
     so it can be used as a drop-in replacement in the agent loop.
     """
 
-    def __init__(self, api_key: str, *, base_url: str | None = None, timeout: float | None = None) -> None:
+    def __init__(
+        self,
+        api_key: str,
+        *,
+        base_url: str | None = None,
+        timeout: float | None = None,
+        default_headers: dict[str, str] | None = None,
+        api_key_resolver: Callable[[], str] | None = None,
+    ) -> None:
+        self._custom_headers: dict[str, str] = dict(default_headers or {})
+        self._api_key_resolver = api_key_resolver
         kwargs: dict[str, Any] = {
             "api_key": api_key,
-            "default_headers": {"Authorization": f"Bearer {api_key}"},
+            "default_headers": {**self._custom_headers, "Authorization": f"Bearer {api_key}"},
         }
         normalized_base_url = _normalize_openai_base_url(base_url)
         if normalized_base_url:
@@ -309,6 +319,22 @@ class OpenAICompatibleClient:
         if timeout is not None:
             kwargs["timeout"] = timeout
         self._client = AsyncOpenAI(**kwargs)
+
+    def _refresh_client_auth(self) -> None:
+        """Re-resolve the access token before a request so a long-running client
+        picks up a refreshed/rotated OAuth token instead of 401-ing until restart.
+        Best-effort: a resolver failure leaves the previous token in place."""
+        if self._api_key_resolver is None:
+            return
+        try:
+            next_key = self._api_key_resolver()
+        except Exception as exc:
+            log.warning("api key refresh failed, using previous token: %s", exc)
+            return
+        if next_key and next_key != self._client.api_key:
+            self._client.api_key = next_key
+            self._custom_headers["Authorization"] = f"Bearer {next_key}"
+            self._client._custom_headers["Authorization"] = f"Bearer {next_key}"
 
     async def close(self) -> None:
         """Close the underlying HTTP client."""
@@ -320,6 +346,8 @@ class OpenAICompatibleClient:
 
         for attempt in range(MAX_RETRIES + 1):
             try:
+                # Off the event loop: the resolver may do a blocking HTTPS refresh.
+                await asyncio.to_thread(self._refresh_client_auth)
                 async for event in self._stream_once(request):
                     yield event
                 return

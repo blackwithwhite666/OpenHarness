@@ -58,6 +58,19 @@ def resolve_api_client_from_settings(settings: Settings) -> SupportsStreamingMes
         )
     if settings.api_format in ("openai", "openai_compat"):
         auth = _safe_resolve_auth()
+        if settings.provider == "kimi_coding":
+            from openharness.auth.external import kimi_api_headers
+
+            return OpenAICompatibleClient(
+                api_key=auth.value,
+                base_url=settings.base_url,
+                timeout=settings.timeout,
+                default_headers=kimi_api_headers(),
+                # Re-resolve before each request so a long-running gateway picks
+                # up a refreshed/rotated kimi token (resolve_auth refreshes on
+                # expiry) instead of 401-ing on the captured token until restart.
+                api_key_resolver=lambda: settings.resolve_auth().value,
+            )
         return OpenAICompatibleClient(
             api_key=auth.value,
             base_url=settings.base_url,

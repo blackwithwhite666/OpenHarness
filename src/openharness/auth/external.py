@@ -23,6 +23,26 @@ from openharness.utils.fs import atomic_write_text
 
 CODEX_PROVIDER = "openai_codex"
 CLAUDE_PROVIDER = "anthropic_claude"
+KIMI_PROVIDER = "kimi_coding"
+# Kimi For Coding subscription OAuth (device flow + rotating refresh_token).
+# Values mirror the official kimi-cli v1.41.0 (client_id is a public constant
+# shipped inside that CLI, not a secret). The api.kimi.com backend 403s any
+# request without the KimiCLI user agent and the X-Msh-* device headers
+# ("access_terminated_error: only available for Coding Agents").
+KIMI_CLI_VERSION = "1.41.0"
+KIMI_USER_AGENT = f"KimiCLI/{KIMI_CLI_VERSION}"
+KIMI_OAUTH_DEVICE_AUTH_URL = "https://auth.kimi.com/api/oauth/device_authorization"
+KIMI_OAUTH_TOKEN_URL = "https://auth.kimi.com/api/oauth/token"
+KIMI_OAUTH_CLIENT_ID = "17e5f671-d194-4dfb-9706-5516cb48c098"
+KIMI_DEVICE_GRANT = "urn:ietf:params:oauth:grant-type:device_code"
+KIMI_REFRESH_GRANT = "refresh_token"
+KIMI_API_BASE_URL = "https://api.kimi.com/coding/v1"
+# Same rationale as the codex lock: kimi refresh tokens rotate, so two
+# concurrent refreshes would consume the same token and brick the chain.
+_KIMI_REFRESH_LOCK = threading.Lock()
+_KIMI_REFRESH_SKEW_MS = 60_000
+_KIMI_REFRESH_RETRYABLE_STATUSES = {429, 500, 502, 503, 504}
+_KIMI_REFRESH_MAX_RETRIES = 3
 # ChatGPT/Codex subscription OAuth: refresh the short-lived access token in
 # ~/.codex/auth.json with its (rotating) refresh_token, so a long-running gateway
 # self-heals instead of 401-ing until restart. client_id = the codex app audience
@@ -125,6 +145,15 @@ def default_binding_for_provider(provider: str) -> ExternalAuthBinding:
             managed_by="claude-cli",
             profile_label="Claude CLI",
         )
+    if provider == KIMI_PROVIDER:
+        kimi_home = Path(os.environ.get("KIMI_HOME", "~/.kimi")).expanduser()
+        return ExternalAuthBinding(
+            provider=provider,
+            source_path=str(kimi_home / "openharness_auth.json"),
+            source_kind="kimi_oauth_json",
+            managed_by="openharness",
+            profile_label="Kimi For Coding",
+        )
     raise ValueError(f"Unsupported external auth provider: {provider}")
 
 
@@ -154,6 +183,17 @@ def load_external_credential(
             refresh_if_needed=refresh_if_needed,
             keychain_service=keychain_service,
             keychain_account=keychain_account,
+        )
+    if binding.provider == KIMI_PROVIDER:
+        source_path = Path(binding.source_path).expanduser()
+        if not source_path.exists():
+            raise ValueError(f"External auth source not found: {source_path}")
+        try:
+            payload = json.loads(source_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Invalid JSON in external auth source: {source_path}") from exc
+        return _load_kimi_credential(
+            payload, source_path, binding, refresh_if_needed=refresh_if_needed
         )
     raise ValueError(f"Unsupported external auth provider: {binding.provider}")
 
@@ -308,6 +348,283 @@ def _write_codex_auth_json(
     atomic_write_text(source_path, json.dumps(updated, indent=2))
 
 
+def _ascii_header_value(value: str, fallback: str = "unknown") -> str:
+    """Strip non-ASCII/control chars so the value is a legal HTTP header."""
+    sanitized = re.sub(r"[^\x20-\x7e]", "", value).strip()
+    return sanitized or fallback
+
+
+def _kimi_home() -> Path:
+    return Path(os.environ.get("KIMI_HOME", "~/.kimi")).expanduser()
+
+
+def _kimi_device_id() -> str:
+    """Persistent device fingerprint, shared with the official kimi-cli."""
+    kimi_home = _kimi_home()
+    kimi_home.mkdir(parents=True, exist_ok=True, mode=0o700)
+    device_id_path = kimi_home / "device_id"
+    try:
+        existing = device_id_path.read_text(encoding="utf-8").strip()
+    except OSError:
+        existing = ""
+    if existing:
+        return existing
+    device_id = uuid.uuid4().hex
+    atomic_write_text(device_id_path, device_id)
+    os.chmod(device_id_path, 0o600)
+    return device_id
+
+
+def _kimi_device_model() -> str:
+    system = platform.system()
+    release = platform.release()
+    machine = platform.machine()
+    if system == "Darwin":
+        mac_version = platform.mac_ver()[0] or release
+        if mac_version and machine:
+            return f"macOS {mac_version} {machine}"
+        if mac_version:
+            return f"macOS {mac_version}"
+        return f"macOS {machine}".strip()
+    if system and release and machine:
+        return f"{system} {release} {machine}"
+    if system and release:
+        return f"{system} {release}"
+    if system:
+        return f"{system} {machine}".strip()
+    return "Unknown"
+
+
+def kimi_api_headers() -> dict[str, str]:
+    """Headers the kimi-for-coding backend requires on every request.
+
+    Missing or deviating values make api.kimi.com 403 with
+    "access_terminated_error: Kimi For Coding is currently only available for
+    Coding Agents". Values mirror kimi-cli's `_common_headers`.
+    """
+    return {
+        "User-Agent": KIMI_USER_AGENT,
+        "X-Msh-Platform": "kimi_cli",
+        "X-Msh-Version": KIMI_CLI_VERSION,
+        "X-Msh-Device-Name": _ascii_header_value(platform.node() or "unknown"),
+        "X-Msh-Device-Model": _ascii_header_value(_kimi_device_model()),
+        "X-Msh-Device-Id": _kimi_device_id(),
+        "X-Msh-Os-Version": _ascii_header_value(platform.version() or f"{platform.system()} {platform.release()}"),
+    }
+
+
+def _kimi_post_form(url: str, params: dict[str, str], *, timeout: float = 30.0) -> dict[str, Any]:
+    """Form-POST to a kimi OAuth endpoint with the mandatory CLI headers."""
+    data = urllib.parse.urlencode(params).encode("utf-8")
+    request = urllib.request.Request(
+        url,
+        data=data,
+        headers={
+            **kimi_api_headers(),
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            body = response.read().decode("utf-8")
+            status = response.status
+    except urllib.error.HTTPError as exc:
+        try:
+            body = exc.read().decode("utf-8", errors="replace")
+        except Exception:
+            body = ""
+        status = exc.code
+    try:
+        result = json.loads(body) if body.strip() else {}
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Kimi OAuth: non-JSON response from {url} (status {status}): {body[:200]}") from exc
+    if status >= 400:
+        error = result.get("error", status)
+        description = result.get("error_description", body[:200])
+        err = ValueError(f"Kimi OAuth {error}: {description}")
+        err.kimi_error = error  # type: ignore[attr-defined]
+        err.kimi_status = status  # type: ignore[attr-defined]
+        raise err
+    return result
+
+
+def kimi_start_device_auth() -> dict[str, Any]:
+    """Begin the RFC 8628 device flow for a Kimi For Coding subscription."""
+    return _kimi_post_form(KIMI_OAUTH_DEVICE_AUTH_URL, {"client_id": KIMI_OAUTH_CLIENT_ID})
+
+
+def kimi_poll_device_token(
+    device: dict[str, Any],
+    *,
+    sleep_fn: Any = time.sleep,
+    now_fn: Any = time.monotonic,
+) -> dict[str, Any]:
+    """Poll the token endpoint until the user approves the device code."""
+    interval = max(1.0, float(device.get("interval", 5) or 5))
+    deadline = now_fn() + float(device.get("expires_in", 600) or 600)
+    while now_fn() < deadline:
+        sleep_fn(interval)
+        try:
+            return _kimi_post_form(
+                KIMI_OAUTH_TOKEN_URL,
+                {
+                    "client_id": KIMI_OAUTH_CLIENT_ID,
+                    "device_code": str(device.get("device_code", "")),
+                    "grant_type": KIMI_DEVICE_GRANT,
+                },
+            )
+        except ValueError as exc:
+            code = getattr(exc, "kimi_error", None)
+            if code == "authorization_pending":
+                continue
+            if code == "slow_down":
+                interval += 5.0
+                continue
+            if code == "expired_token":
+                raise ValueError("Kimi OAuth: device code expired — run `oh auth kimi-login` again.") from exc
+            raise
+    raise ValueError("Kimi OAuth: device code expired before it was approved — run `oh auth kimi-login` again.")
+
+
+def refresh_kimi_oauth_credential(refresh_token: str) -> dict[str, Any]:
+    """Refresh a Kimi For Coding access token via its rotating refresh_token.
+
+    Returns the new ``access_token``, the (rotated) ``refresh_token``, and
+    ``expires_at_ms``. Does not write files. Transient 429/5xx responses are
+    retried with backoff; ``invalid_grant`` tells the user to re-login.
+    """
+    if not refresh_token:
+        raise ValueError("refresh_token is required")
+    last_error: Exception | None = None
+    for attempt in range(_KIMI_REFRESH_MAX_RETRIES):
+        try:
+            result = _kimi_post_form(
+                KIMI_OAUTH_TOKEN_URL,
+                {
+                    "client_id": KIMI_OAUTH_CLIENT_ID,
+                    "refresh_token": refresh_token,
+                    "grant_type": KIMI_REFRESH_GRANT,
+                },
+            )
+        except ValueError as exc:
+            status = getattr(exc, "kimi_status", None)
+            if getattr(exc, "kimi_error", None) == "invalid_grant":
+                raise ValueError(
+                    "Kimi OAuth refresh token is invalid or expired. "
+                    "Run `oh auth kimi-login` to re-authenticate."
+                ) from exc
+            last_error = exc
+            if status is not None and status not in _KIMI_REFRESH_RETRYABLE_STATUSES:
+                raise
+            if attempt < _KIMI_REFRESH_MAX_RETRIES - 1:
+                time.sleep(2**attempt)
+            continue
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            last_error = exc
+            if attempt < _KIMI_REFRESH_MAX_RETRIES - 1:
+                time.sleep(2**attempt)
+            continue
+        access_token = str(result.get("access_token", "") or "")
+        if not access_token:
+            raise ValueError("Kimi OAuth refresh response missing access_token")
+        expires_at_ms = int(time.time() * 1000) + int(result.get("expires_in", 3600) or 3600) * 1000
+        return {
+            "access_token": access_token,
+            "refresh_token": str(result.get("refresh_token", refresh_token) or refresh_token),
+            "expires_at_ms": expires_at_ms,
+        }
+    assert last_error is not None
+    raise last_error
+
+
+def store_kimi_oauth_tokens(source_path: Path, tokens: dict[str, Any]) -> None:
+    """Persist kimi OAuth tokens (login or rotated refresh) to the auth file."""
+    source_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    atomic_write_text(source_path, json.dumps(tokens, indent=2))
+    os.chmod(source_path, 0o600)
+
+
+def _write_kimi_auth_json(source_path: Path, payload: dict[str, Any], refreshed: dict[str, Any]) -> None:
+    """Persist refreshed kimi tokens back to the auth file (preserving extras)."""
+    updated = dict(payload)
+    updated["access_token"] = str(refreshed["access_token"])
+    if refreshed.get("refresh_token"):
+        updated["refresh_token"] = str(refreshed["refresh_token"])
+    if refreshed.get("expires_at_ms"):
+        updated["expires_at_ms"] = int(refreshed["expires_at_ms"])
+    store_kimi_oauth_tokens(source_path, updated)
+
+
+def _kimi_should_refresh(credential: ExternalAuthCredential, *, now_ms: int | None = None) -> bool:
+    """True when the kimi access token is expired or within the refresh skew."""
+    if credential.expires_at_ms is None:
+        return False
+    if now_ms is None:
+        now_ms = int(time.time() * 1000)
+    return credential.expires_at_ms - now_ms <= _KIMI_REFRESH_SKEW_MS
+
+
+def _load_kimi_credential(
+    payload: dict[str, Any],
+    source_path: Path,
+    binding: ExternalAuthBinding,
+    *,
+    refresh_if_needed: bool = False,
+) -> ExternalAuthCredential:
+    access_token = str(payload.get("access_token", "") or "")
+    refresh_token = str(payload.get("refresh_token", "") or "")
+    if not access_token:
+        raise ValueError("Kimi auth source does not contain an access token.")
+    expires_at_raw = payload.get("expires_at_ms")
+    expires_at_ms = int(expires_at_raw) if isinstance(expires_at_raw, (int, float)) else None
+
+    def _build(token: str, rtoken: str, expiry: int | None) -> ExternalAuthCredential:
+        return ExternalAuthCredential(
+            provider=KIMI_PROVIDER,
+            value=token,
+            auth_kind="oauth",
+            source_path=source_path,
+            managed_by=binding.managed_by,
+            profile_label=binding.profile_label,
+            refresh_token=rtoken,
+            expires_at_ms=expiry,
+        )
+
+    credential = _build(access_token, refresh_token, expires_at_ms)
+    # Self-heal an expired Kimi For Coding access token the same way the codex
+    # loader does: the refresh_token rotates, so serialize check→refresh→persist
+    # in-process with a double-checked re-read inside the lock.
+    if refresh_if_needed and _kimi_should_refresh(credential):
+        if not refresh_token:
+            raise ValueError(
+                f"Kimi credentials at {source_path} are expired and cannot be refreshed "
+                "(no refresh_token). Run `oh auth kimi-login` to re-authenticate."
+            )
+        with _KIMI_REFRESH_LOCK:
+            try:
+                cur_payload = json.loads(source_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                cur_payload = payload
+            cur_access = str(cur_payload.get("access_token", "") or "")
+            cur_refresh = str(cur_payload.get("refresh_token", "") or refresh_token)
+            cur_expiry_raw = cur_payload.get("expires_at_ms")
+            cur_expiry = int(cur_expiry_raw) if isinstance(cur_expiry_raw, (int, float)) else None
+            if cur_access:
+                cur_cred = _build(cur_access, cur_refresh, cur_expiry)
+                if not _kimi_should_refresh(cur_cred):
+                    return cur_cred  # another task already refreshed
+            refreshed = refresh_kimi_oauth_credential(cur_refresh)
+            _write_kimi_auth_json(source_path, cur_payload, refreshed)
+            credential = _build(
+                str(refreshed["access_token"]),
+                str(refreshed.get("refresh_token", cur_refresh) or cur_refresh),
+                int(refreshed["expires_at_ms"]),
+            )
+    return credential
+
+
 def _load_claude_credential(
     payload: dict[str, Any],
     source_path: Path,
@@ -457,7 +774,7 @@ def describe_external_binding(binding: ExternalAuthBinding) -> ExternalAuthState
             detail=detail,
         )
     resolved_source = credential.source_path
-    if binding.provider == CLAUDE_PROVIDER and is_credential_expired(credential):
+    if binding.provider in {CLAUDE_PROVIDER, KIMI_PROVIDER} and is_credential_expired(credential):
         if credential.refresh_token:
             return ExternalAuthState(
                 configured=True,

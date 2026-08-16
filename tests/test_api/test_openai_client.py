@@ -8,7 +8,7 @@ import httpx
 
 import pytest
 
-from openharness.api.client import ApiMessageRequest
+from openharness.api.client import ApiMessageRequest, ApiTextDeltaEvent
 from openharness.api.openai_client import (
     OpenAICompatibleClient,
     _convert_assistant_message,
@@ -497,3 +497,59 @@ class TestReasoningContentEmission:
         msg = ConversationMessage(role="assistant", content=[TextBlock(text="hi")])
         out = _convert_assistant_message(msg)
         assert "reasoning_content" not in out
+
+
+class TestClientAuthAndHeaders:
+    """Constructor header merging + per-request token re-resolution."""
+
+    def test_default_headers_merged_with_authorization_last(self):
+        client = OpenAICompatibleClient(
+            "sk-test",
+            default_headers={"User-Agent": "KimiCLI/1.41.0", "X-Msh-Platform": "kimi_cli"},
+        )
+        headers = client._client.default_headers
+        assert headers["User-Agent"] == "KimiCLI/1.41.0"
+        assert headers["X-Msh-Platform"] == "kimi_cli"
+        assert headers["Authorization"] == "Bearer sk-test"
+
+    def test_refresh_client_auth_rotates_token(self):
+        tokens = iter(["tok-2", "tok-3"])
+        client = OpenAICompatibleClient("tok-1", api_key_resolver=lambda: next(tokens))
+
+        client._refresh_client_auth()
+
+        assert client._client.api_key == "tok-2"
+        assert client._client.default_headers["Authorization"] == "Bearer tok-2"
+
+    def test_refresh_client_auth_keeps_token_on_resolver_failure(self):
+        def _boom():
+            raise RuntimeError("refresh failed")
+
+        client = OpenAICompatibleClient("tok-1", api_key_resolver=_boom)
+        client._refresh_client_auth()
+        assert client._client.api_key == "tok-1"
+
+    def test_refresh_client_auth_noop_without_resolver(self):
+        client = OpenAICompatibleClient("tok-1")
+        client._refresh_client_auth()
+        assert client._client.api_key == "tok-1"
+
+    @pytest.mark.asyncio
+    async def test_stream_message_re_resolves_token_per_attempt(self, monkeypatch):
+        resolved: list[str] = []
+
+        def _resolver():
+            resolved.append("x")
+            return "tok-fresh"
+
+        client = OpenAICompatibleClient("tok-1", api_key_resolver=_resolver)
+
+        async def _fake_stream_once(request):
+            yield ApiTextDeltaEvent(text="hi")
+
+        monkeypatch.setattr(client, "_stream_once", _fake_stream_once)
+
+        request = ApiMessageRequest(model="k3", messages=[ConversationMessage.from_user_text("hi")])
+        events = [e async for e in client.stream_message(request)]
+        assert events and resolved == ["x"]
+        assert client._client.api_key == "tok-fresh"

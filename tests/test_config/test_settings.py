@@ -912,3 +912,35 @@ class TestModelScopeProvider:
         assert materialized.model == "deepseek-ai/DeepSeek-V4-Flash"
         assert materialized.provider == "modelscope"
         assert materialized.api_format == "openai"
+
+
+class TestKimiProvider:
+    """Tests for the Kimi For Coding (OAuth) provider profile."""
+
+    def test_kimi_in_default_provider_profiles(self):
+        from openharness.config.settings import default_provider_profiles
+
+        profiles = default_provider_profiles()
+        assert "kimi" in profiles
+        profile = profiles["kimi"]
+        assert profile.provider == "kimi_coding"
+        assert profile.api_format == "openai"
+        assert profile.auth_source == "kimi_coding_oauth"
+        assert profile.default_model == "k3"
+        assert profile.base_url == "https://api.kimi.com/coding/v1"
+
+    def test_auth_source_provider_name_kimi(self):
+        from openharness.config.settings import auth_source_provider_name
+
+        assert auth_source_provider_name("kimi_coding_oauth") == "kimi_coding"
+
+    def test_default_auth_source_for_kimi_provider(self):
+        from openharness.config.settings import default_auth_source_for_provider
+
+        assert default_auth_source_for_provider("kimi_coding") == "kimi_coding_oauth"
+
+    def test_resolve_auth_requires_kimi_binding(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("OPENHARNESS_CONFIG_DIR", str(tmp_path / "config"))
+
+        with pytest.raises(ValueError, match="kimi-login"):
+            Settings(active_profile="kimi").resolve_auth()
