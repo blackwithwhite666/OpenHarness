@@ -786,3 +786,332 @@ def test_get_claude_code_version_uses_fallback(monkeypatch):
     monkeypatch.setattr("openharness.auth.external._claude_code_version_cache", None)
 
     assert get_claude_code_version() == "2.1.92"
+
+
+# ---- Kimi For Coding (OAuth) ----
+
+
+def _kimi_binding(tmp_path: Path) -> ExternalAuthBinding:
+    return ExternalAuthBinding(
+        provider="kimi_coding",
+        source_path=str(tmp_path / "kimi-home" / "openharness_auth.json"),
+        source_kind="kimi_oauth_json",
+        managed_by="openharness",
+        profile_label="Kimi For Coding",
+    )
+
+
+def _write_kimi_auth(path: Path, access: str, refresh: str, expires_at_ms: int) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({"access_token": access, "refresh_token": refresh, "expires_at_ms": expires_at_ms}),
+        encoding="utf-8",
+    )
+
+
+def test_default_kimi_binding_uses_kimi_home(monkeypatch, tmp_path: Path):
+    from openharness.auth.external import KIMI_PROVIDER
+
+    monkeypatch.setenv("KIMI_HOME", str(tmp_path / "kimi-home"))
+
+    binding = default_binding_for_provider(KIMI_PROVIDER)
+
+    assert binding.source_kind == "kimi_oauth_json"
+    assert Path(binding.source_path) == tmp_path / "kimi-home" / "openharness_auth.json"
+    assert binding.managed_by == "openharness"
+
+
+def test_load_kimi_external_credential(tmp_path: Path):
+    from openharness.auth.external import load_external_credential
+
+    binding = _kimi_binding(tmp_path)
+    source = Path(binding.source_path)
+    _write_kimi_auth(source, "kimi-access", "kimi-refresh", 4_102_444_800_000)
+
+    credential = load_external_credential(binding)
+
+    assert credential.provider == "kimi_coding"
+    assert credential.value == "kimi-access"
+    assert credential.refresh_token == "kimi-refresh"
+    assert credential.expires_at_ms == 4_102_444_800_000
+
+
+def test_load_kimi_credential_does_not_refresh_fresh_token(monkeypatch, tmp_path: Path):
+    from openharness.auth.external import load_external_credential
+
+    binding = _kimi_binding(tmp_path)
+    source = Path(binding.source_path)
+    _write_kimi_auth(source, "kimi-access", "kimi-refresh", 4_102_444_800_000)
+    calls = {"n": 0}
+
+    def _should_not_run(rt):
+        calls["n"] += 1
+        return {}
+
+    monkeypatch.setattr("openharness.auth.external.refresh_kimi_oauth_credential", _should_not_run)
+    credential = load_external_credential(binding, refresh_if_needed=True)
+    assert credential.value == "kimi-access" and calls["n"] == 0
+
+
+def test_load_kimi_credential_refreshes_and_persists_when_expired(monkeypatch, tmp_path: Path):
+    from openharness.auth.external import load_external_credential
+
+    binding = _kimi_binding(tmp_path)
+    source = Path(binding.source_path)
+    _write_kimi_auth(source, "stale-access", "rt1", 1)
+    monkeypatch.setattr(
+        "openharness.auth.external.refresh_kimi_oauth_credential",
+        lambda rt: {"access_token": "fresh-access", "refresh_token": "rt2", "expires_at_ms": 4_102_444_800_000},
+    )
+
+    credential = load_external_credential(binding, refresh_if_needed=True)
+
+    assert credential.value == "fresh-access"
+    assert credential.refresh_token == "rt2"
+    saved = json.loads(source.read_text())
+    assert saved["access_token"] == "fresh-access"
+    assert saved["refresh_token"] == "rt2"  # rotation persisted
+    assert saved["expires_at_ms"] == 4_102_444_800_000
+
+
+def test_load_kimi_double_check_skips_refresh_when_already_rotated(monkeypatch, tmp_path: Path):
+    # Race guard: caller saw an expired token, but another task already refreshed
+    # the file before we took the lock -> no second refresh with the consumed token.
+    from openharness.auth.external import _load_kimi_credential
+
+    source = tmp_path / "auth.json"
+    _write_kimi_auth(source, "fresh-access", "rt-new", 4_102_444_800_000)
+    stale_payload = {"access_token": "stale-access", "refresh_token": "rt-old", "expires_at_ms": 1}
+    binding = _kimi_binding(tmp_path)
+    calls = {"n": 0}
+
+    def _should_not_run(rt):
+        calls["n"] += 1
+        return {}
+
+    monkeypatch.setattr("openharness.auth.external.refresh_kimi_oauth_credential", _should_not_run)
+    credential = _load_kimi_credential(stale_payload, source, binding, refresh_if_needed=True)
+    assert credential.value == "fresh-access" and calls["n"] == 0
+
+
+def test_refresh_kimi_oauth_credential_builds_form_request(monkeypatch):
+    from openharness.auth.external import refresh_kimi_oauth_credential
+
+    captured: dict[str, object] = {}
+
+    class _Resp:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return json.dumps(
+                {"access_token": "new-access", "refresh_token": "rt2", "expires_in": 3600}
+            ).encode()
+
+    def fake_urlopen(req, timeout=None):
+        captured["url"] = req.full_url
+        captured["data"] = req.data.decode()
+        captured["headers"] = {k.lower(): v for k, v in req.header_items()}
+        return _Resp()
+
+    monkeypatch.setattr("openharness.auth.external.urllib.request.urlopen", fake_urlopen)
+    monkeypatch.setattr("openharness.auth.external.time.time", lambda: 1000)
+    out = refresh_kimi_oauth_credential("rt1")
+
+    import urllib.parse
+
+    form = dict(urllib.parse.parse_qsl(captured["data"]))
+    assert captured["url"] == "https://auth.kimi.com/api/oauth/token"
+    assert form["grant_type"] == "refresh_token"
+    assert form["refresh_token"] == "rt1"
+    assert form["client_id"] == "17e5f671-d194-4dfb-9706-5516cb48c098"
+    headers = captured["headers"]
+    assert headers["user-agent"] == "KimiCLI/1.41.0"
+    assert headers["x-msh-platform"] == "kimi_cli"
+    assert out["access_token"] == "new-access"
+    assert out["refresh_token"] == "rt2"  # rotation surfaced
+    assert out["expires_at_ms"] == 1000 * 1000 + 3600 * 1000
+
+
+def test_refresh_kimi_invalid_grant_raises(monkeypatch):
+    from openharness.auth.external import refresh_kimi_oauth_credential
+
+    def fake_urlopen(req, timeout=None):
+        raise urllib.error.HTTPError(
+            req.full_url, 400, "Bad Request", {}, io.BytesIO(b'{"error":"invalid_grant"}')
+        )
+
+    monkeypatch.setattr("openharness.auth.external.urllib.request.urlopen", fake_urlopen)
+    with pytest.raises(ValueError, match="kimi-login"):
+        refresh_kimi_oauth_credential("rt-dead")
+
+
+def test_kimi_device_flow_pending_then_success(monkeypatch):
+    from openharness.auth.external import kimi_poll_device_token
+
+    responses = iter(
+        [
+            {"error": "authorization_pending"},
+            {"access_token": "kimi-access", "refresh_token": "kimi-refresh", "expires_in": 3600},
+        ]
+    )
+    statuses = iter([400, 200])
+    captured: list[dict[str, str]] = []
+
+    class _Resp:
+        def __init__(self, status, payload):
+            self.status = status
+            self._payload = payload
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return json.dumps(self._payload).encode()
+
+    def fake_urlopen(req, timeout=None):
+        captured.append(dict(urllib.parse.parse_qsl(req.data.decode())))
+        status = next(statuses)
+        payload = next(responses)
+        if status >= 400:
+            raise urllib.error.HTTPError(
+                req.full_url, status, "err", {}, io.BytesIO(json.dumps(payload).encode())
+            )
+        return _Resp(status, payload)
+
+    import urllib.parse
+
+    monkeypatch.setattr("openharness.auth.external.urllib.request.urlopen", fake_urlopen)
+    sleeps: list[float] = []
+    tokens = kimi_poll_device_token(
+        {"device_code": "dc", "interval": 1, "expires_in": 60},
+        sleep_fn=sleeps.append,
+    )
+    assert tokens["access_token"] == "kimi-access"
+    assert sleeps == [1.0, 1.0]
+    assert captured[-1]["device_code"] == "dc"
+    assert captured[-1]["grant_type"] == "urn:ietf:params:oauth:grant-type:device_code"
+
+
+def test_kimi_device_flow_slow_down_increases_interval(monkeypatch):
+    from openharness.auth.external import kimi_poll_device_token
+
+    calls = {"n": 0}
+
+    def fake_post(url, params, *, timeout=30.0):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            err = ValueError("slow down")
+            err.kimi_error = "slow_down"
+            err.kimi_status = 400
+            raise err
+        return {"access_token": "a", "refresh_token": "r", "expires_in": 3600}
+
+    monkeypatch.setattr("openharness.auth.external._kimi_post_form", fake_post)
+    sleeps: list[float] = []
+    tokens = kimi_poll_device_token(
+        {"device_code": "dc", "interval": 2, "expires_in": 60},
+        sleep_fn=sleeps.append,
+    )
+    assert tokens["access_token"] == "a"
+    assert sleeps == [2.0, 7.0]
+
+
+def test_kimi_device_flow_expired_raises(monkeypatch):
+    from openharness.auth.external import kimi_poll_device_token
+
+    def fake_post(url, params, *, timeout=30.0):
+        err = ValueError("expired")
+        err.kimi_error = "expired_token"
+        err.kimi_status = 400
+        raise err
+
+    monkeypatch.setattr("openharness.auth.external._kimi_post_form", fake_post)
+    with pytest.raises(ValueError, match="kimi-login"):
+        kimi_poll_device_token({"device_code": "dc", "interval": 1, "expires_in": 60}, sleep_fn=lambda s: None)
+
+
+def test_kimi_api_headers_and_device_id(monkeypatch, tmp_path: Path):
+    from openharness.auth.external import kimi_api_headers
+
+    monkeypatch.setenv("KIMI_HOME", str(tmp_path / "kimi-home"))
+    headers = kimi_api_headers()
+    assert headers["User-Agent"] == "KimiCLI/1.41.0"
+    assert headers["X-Msh-Platform"] == "kimi_cli"
+    assert headers["X-Msh-Version"] == "1.41.0"
+    assert headers["X-Msh-Device-Id"]
+    assert "-" not in headers["X-Msh-Device-Id"]
+    assert headers["X-Msh-Device-Name"]
+    assert headers["X-Msh-Device-Model"]
+    assert headers["X-Msh-Os-Version"]
+    # device id persisted and reused
+    assert kimi_api_headers()["X-Msh-Device-Id"] == headers["X-Msh-Device-Id"]
+    device_id_file = tmp_path / "kimi-home" / "device_id"
+    assert device_id_file.read_text() == headers["X-Msh-Device-Id"]
+    assert (device_id_file.stat().st_mode & 0o777) == 0o600
+
+
+def test_settings_resolve_auth_uses_kimi_binding(monkeypatch, tmp_path: Path):
+    config_dir = tmp_path / "config"
+    monkeypatch.setenv("OPENHARNESS_CONFIG_DIR", str(config_dir))
+    source = tmp_path / "kimi-auth.json"
+    _write_kimi_auth(source, "bound-kimi-token", "kimi-refresh", 4_102_444_800_000)
+    store_external_binding(
+        ExternalAuthBinding(
+            provider="kimi_coding",
+            source_path=str(source),
+            source_kind="kimi_oauth_json",
+            managed_by="openharness",
+            profile_label="Kimi For Coding",
+        )
+    )
+
+    resolved = Settings(active_profile="kimi").resolve_auth()
+
+    assert resolved.value == "bound-kimi-token"
+    assert str(source) in resolved.source
+
+
+def test_cli_kimi_login_device_flow(monkeypatch, tmp_path: Path):
+    config_dir = tmp_path / "config"
+    kimi_home = tmp_path / "kimi-home"
+    monkeypatch.setenv("OPENHARNESS_CONFIG_DIR", str(config_dir))
+    monkeypatch.setenv("KIMI_HOME", str(kimi_home))
+
+    monkeypatch.setattr(
+        "openharness.auth.external.kimi_start_device_auth",
+        lambda: {
+            "device_code": "dc",
+            "user_code": "ABCD-1234",
+            "verification_uri": "https://kimi.com/device",
+            "verification_uri_complete": "https://kimi.com/device?code=ABCD-1234",
+            "expires_in": 600,
+            "interval": 1,
+        },
+    )
+    monkeypatch.setattr(
+        "openharness.auth.external.kimi_poll_device_token",
+        lambda device: {"access_token": "kimi-access", "refresh_token": "kimi-refresh", "expires_in": 3600},
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(app, ["auth", "kimi-login"])
+
+    assert result.exit_code == 0
+    assert "https://kimi.com/device?code=ABCD-1234" in result.stdout
+    assert "Use `oh provider use kimi` to activate it." in result.stdout
+    saved = json.loads((kimi_home / "openharness_auth.json").read_text())
+    assert saved["access_token"] == "kimi-access"
+    assert saved["refresh_token"] == "kimi-refresh"
+    assert saved["expires_at_ms"] > 0
+    binding = load_external_binding("kimi_coding")
+    assert binding is not None
+    assert Path(binding.source_path) == kimi_home / "openharness_auth.json"

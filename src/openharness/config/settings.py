@@ -238,6 +238,14 @@ def default_provider_profiles() -> dict[str, ProviderProfile]:
             auth_source="codex_subscription",
             default_model="gpt-5.4",
         ),
+        "kimi": ProviderProfile(
+            label="Kimi For Coding (OAuth)",
+            provider="kimi_coding",
+            api_format="openai",
+            auth_source="kimi_coding_oauth",
+            default_model="k3",
+            base_url="https://api.kimi.com/coding/v1",
+        ),
         "copilot": ProviderProfile(
             label="GitHub Copilot",
             provider="copilot",
@@ -373,6 +381,7 @@ def auth_source_provider_name(auth_source: str) -> str:
         "anthropic_api_key": "anthropic",
         "openai_api_key": "openai",
         "codex_subscription": "openai_codex",
+        "kimi_coding_oauth": "kimi_coding",
         "claude_subscription": "anthropic_claude",
         "copilot_oauth": "copilot",
         "dashscope_api_key": "dashscope",
@@ -434,6 +443,8 @@ def default_auth_source_for_provider(provider: str, api_format: str | None = Non
         return "claude_subscription"
     if provider == "openai_codex":
         return "codex_subscription"
+    if provider == "kimi_coding":
+        return "kimi_coding_oauth"
     if provider == "copilot":
         return "copilot_oauth"
     if provider == "dashscope":
@@ -780,7 +791,7 @@ class Settings(BaseModel):
         profile_name, profile = self.resolve_profile()
         provider = profile.provider.strip()
         auth_source = profile.auth_source.strip() or default_auth_source_for_provider(provider, profile.api_format)
-        if auth_source in {"codex_subscription", "claude_subscription"}:
+        if auth_source in {"codex_subscription", "claude_subscription", "kimi_coding_oauth"}:
             env_auth_token = os.environ.get("ANTHROPIC_AUTH_TOKEN", "").strip()
             if auth_source == "claude_subscription" and env_auth_token:
                 return ResolvedAuth(
@@ -803,14 +814,18 @@ class Settings(BaseModel):
                 )
             binding = load_external_binding(auth_source_provider_name(auth_source))
             if binding is None:
+                login_command = {
+                    "codex_subscription": "codex-login",
+                    "claude_subscription": "claude-login",
+                    "kimi_coding_oauth": "kimi-login",
+                }[auth_source]
                 raise ValueError(
                     f"No external auth binding found for {auth_source}. Run 'oh auth "
-                    f"{'codex-login' if auth_source == 'codex_subscription' else 'claude-login'}' first."
+                    f"{login_command}' first."
                 )
             credential = load_external_credential(
                 binding,
-                refresh_if_needed=refresh
-                and auth_source in {"claude_subscription", "codex_subscription"},
+                refresh_if_needed=refresh,
             )
             return ResolvedAuth(
                 provider=provider,

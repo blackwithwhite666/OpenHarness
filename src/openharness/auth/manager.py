@@ -30,6 +30,7 @@ _KNOWN_PROVIDERS = [
     "anthropic_claude",
     "openai",
     "openai_codex",
+    "kimi_coding",
     "copilot",
     "dashscope",
     "bedrock",
@@ -45,6 +46,7 @@ _AUTH_SOURCES = [
     "openai_api_key",
     "codex_subscription",
     "claude_subscription",
+    "kimi_coding_oauth",
     "copilot_oauth",
     "dashscope_api_key",
     "bedrock_api_key",
@@ -60,6 +62,7 @@ _PROFILE_BY_PROVIDER = {
     "anthropic_claude": "claude-subscription",
     "openai": "openai-compatible",
     "openai_codex": "codex",
+    "kimi_coding": "kimi",
     "copilot": "copilot",
     "moonshot": "moonshot",
     "gemini": "gemini",
@@ -145,7 +148,7 @@ class AuthManager:
                     configured = True
                     origin = "file"
                     state = "configured"
-            elif source in {"codex_subscription", "claude_subscription"}:
+            elif source in {"codex_subscription", "claude_subscription", "kimi_coding_oauth"}:
                 binding = load_external_binding(storage_provider)
                 if binding is not None:
                     external_state = describe_external_binding(binding)
@@ -228,7 +231,7 @@ class AuthManager:
                     configured = True
                     source = "file"
 
-            elif provider == "openai_codex":
+            elif provider in ("openai_codex", "kimi_coding"):
                 binding = load_external_binding(provider)
                 if binding is not None:
                     configured = True

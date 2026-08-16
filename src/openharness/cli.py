@@ -1265,6 +1265,7 @@ _PROVIDER_LABELS: dict[str, str] = {
     "anthropic_claude": "Claude subscription (Claude CLI)",
     "openai": "OpenAI / compatible",
     "openai_codex": "OpenAI Codex subscription (Codex CLI)",
+    "kimi_coding": "Kimi For Coding subscription",
     "copilot": "GitHub Copilot",
     "dashscope": "Alibaba DashScope",
     "bedrock": "AWS Bedrock",
@@ -1280,6 +1281,7 @@ _AUTH_SOURCE_LABELS: dict[str, str] = {
     "openai_api_key": "OpenAI API key",
     "codex_subscription": "Codex subscription",
     "claude_subscription": "Claude subscription",
+    "kimi_coding_oauth": "Kimi For Coding subscription",
     "copilot_oauth": "GitHub Copilot OAuth",
     "dashscope_api_key": "DashScope API key",
     "bedrock_api_key": "Bedrock credentials",
@@ -1702,6 +1704,59 @@ def _maybe_update_default_model_for_provider(provider: str) -> None:
     manager.update_profile(profile_name, default_model=target_model, last_model=target_model)
 
 
+def _run_kimi_login() -> None:
+    """Run the Kimi For Coding OAuth device flow and bind the profile."""
+    from openharness.auth.external import (
+        KIMI_PROVIDER,
+        default_binding_for_provider,
+        kimi_poll_device_token,
+        kimi_start_device_auth,
+        store_kimi_oauth_tokens,
+    )
+    from openharness.auth.storage import store_external_binding
+
+    binding = default_binding_for_provider(KIMI_PROVIDER)
+    try:
+        device = kimi_start_device_auth()
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr, flush=True)
+        raise typer.Exit(1)
+
+    verification = str(device.get("verification_uri_complete") or "").strip()
+    if not verification:
+        uri = str(device.get("verification_uri") or "").strip()
+        code = str(device.get("user_code") or "").strip()
+        verification = f"{uri} (code: {code})" if code else uri
+    print("Open this URL to authorize OpenHarness for Kimi For Coding:", flush=True)
+    print(f"  {verification}", flush=True)
+    print("Waiting for authorization...", flush=True)
+
+    try:
+        tokens = kimi_poll_device_token(device)
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr, flush=True)
+        raise typer.Exit(1)
+
+    access_token = str(tokens.get("access_token", "") or "")
+    if not access_token:
+        print("Error: Kimi OAuth response missing access_token.", file=sys.stderr, flush=True)
+        raise typer.Exit(1)
+    import time as _time
+
+    source_path = Path(binding.source_path).expanduser()
+    store_kimi_oauth_tokens(
+        source_path,
+        {
+            "access_token": access_token,
+            "refresh_token": str(tokens.get("refresh_token", "") or ""),
+            "expires_at_ms": int(_time.time() * 1000)
+            + int(tokens.get("expires_in", 3600) or 3600) * 1000,
+        },
+    )
+    store_external_binding(binding)
+    print(f"Kimi For Coding authenticated; tokens saved to {source_path}.", flush=True)
+    print("Use `oh provider use kimi` to activate it.", flush=True)
+
 def _bind_external_provider(provider: str) -> None:
     """Bind a provider to credentials managed by an external CLI."""
     from openharness.auth.external import default_binding_for_provider, load_external_credential
@@ -1752,6 +1807,10 @@ def _login_provider(provider: str) -> None:
 
     if provider in ("openai_codex", "anthropic_claude"):
         _bind_external_provider(provider)
+        return
+
+    if provider == "kimi_coding":
+        _run_kimi_login()
         return
 
     if provider in ("anthropic", "openai", "dashscope", "bedrock", "vertex", "moonshot", "gemini", "minimax", "modelscope"):
@@ -1983,6 +2042,12 @@ def auth_codex_login() -> None:
 def auth_claude_login() -> None:
     """Bind OpenHarness to a local Claude CLI subscription session."""
     _bind_external_provider("anthropic_claude")
+
+
+@auth_app.command("kimi-login")
+def auth_kimi_login() -> None:
+    """Authenticate a Kimi For Coding subscription via the OAuth device flow."""
+    _run_kimi_login()
 
 
 @auth_app.command("copilot-logout")
