@@ -458,6 +458,40 @@ async def test_query_engine_internal_message_failure_restores_exact_base_history
 
 
 @pytest.mark.asyncio
+async def test_run_query_surfaces_quota_exceeded_as_explicit_error(tmp_path: Path):
+    # A provider quota error must surface as a distinct, greppable
+    # "Provider quota exceeded: ..." ErrorEvent instead of the generic
+    # "API error: ..." dump.
+    from openharness.api.errors import QuotaExceededError
+    from openharness.engine.query import QueryContext, run_query
+
+    class _QuotaExceededApiClient:
+        async def stream_message(self, request):
+            raise QuotaExceededError(
+                "You've reached your usage limit for this billing cycle."
+            )
+            yield  # unreachable: marks this function as an async generator
+
+    ctx = QueryContext(
+        api_client=_QuotaExceededApiClient(),
+        tool_registry=ToolRegistry(),
+        permission_checker=PermissionChecker(PermissionSettings(mode=PermissionMode.FULL_AUTO)),
+        cwd=tmp_path,
+        model="k3",
+        system_prompt="system",
+        max_tokens=64,
+    )
+    messages = [ConversationMessage.from_user_text("hi")]
+
+    events = [event async for event, _usage in run_query(ctx, messages)]
+
+    error_events = [event for event in events if isinstance(event, ErrorEvent)]
+    assert error_events, "expected an ErrorEvent for the quota failure"
+    assert error_events[0].message.startswith("Provider quota exceeded: ")
+    assert "usage limit" in error_events[0].message
+
+
+@pytest.mark.asyncio
 async def test_query_engine_passes_native_images_without_fallback_tool_schema(
     tmp_path: Path,
 ) -> None:

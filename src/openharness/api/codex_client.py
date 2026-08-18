@@ -22,7 +22,14 @@ from openharness.api.client import (
     ApiStreamEvent,
     ApiTextDeltaEvent,
 )
-from openharness.api.errors import AuthenticationFailure, OpenHarnessApiError, RateLimitFailure, RequestFailure
+from openharness.api.errors import (
+    AuthenticationFailure,
+    OpenHarnessApiError,
+    QuotaExceededError,
+    RateLimitFailure,
+    RequestFailure,
+    is_quota_error_message,
+)
 from openharness.api.usage import UsageSnapshot
 from openharness.engine.messages import ConversationMessage, ImageBlock, TextBlock, ToolResultBlock, ToolUseBlock
 
@@ -253,7 +260,22 @@ def _format_codex_stream_error(event: dict[str, Any], *, fallback: str) -> str:
     return " ".join(parts)
 
 
+def _quota_aware_request_failure(message: str) -> OpenHarnessApiError:
+    """Classify a provider failure message as quota exhaustion when it is one.
+
+    A codex "usage limit" error can arrive either as an HTTP 429/403 status or
+    as an SSE ``error`` event; both mean the subscription quota is exhausted
+    until the window resets, so retrying is pointless. Log at ERROR so the
+    quota hit is visible per request, not only after a retry storm."""
+    if is_quota_error_message(message):
+        log.error("codex quota exceeded, failing fast without retry: %s", message)
+        return QuotaExceededError(message)
+    return RequestFailure(message)
+
+
 def _translate_status_error(status_code: int, message: str) -> OpenHarnessApiError:
+    if is_quota_error_message(message):
+        return _quota_aware_request_failure(message)
     if status_code in {401, 403}:
         return AuthenticationFailure(message)
     if status_code == 429:
@@ -427,7 +449,7 @@ class CodexApiClient:
                     elif event_type == "response.failed":
                         response_payload = event.get("response")
                         if isinstance(response_payload, dict):
-                            raise RequestFailure(
+                            raise _quota_aware_request_failure(
                                 _format_codex_stream_error(
                                     response_payload,
                                     fallback="Codex response failed",
@@ -435,7 +457,7 @@ class CodexApiClient:
                             )
                         raise RequestFailure("Codex response failed")
                     elif event_type == "error":
-                        raise RequestFailure(
+                        raise _quota_aware_request_failure(
                             _format_codex_stream_error(event, fallback="Codex error")
                         )
 
@@ -551,6 +573,12 @@ class CodexApiClient:
 
     @staticmethod
     def _is_retryable(exc: Exception) -> bool:
+        if isinstance(exc, QuotaExceededError):
+            return False
+        if is_quota_error_message(str(exc)):
+            # Exhausted subscription quota (e.g. codex "usage limit" over HTTP
+            # 429) never clears within a backoff window — fail fast.
+            return False
         if isinstance(exc, StreamStalled):
             return True
         if isinstance(exc, httpx.HTTPStatusError):

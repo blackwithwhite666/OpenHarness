@@ -21,6 +21,7 @@ from openharness.api.client import (
     ApiTextDeltaEvent,
     SupportsStreamingMessages,
 )
+from openharness.api.errors import QuotaExceededError
 from openharness.api.provider import is_model_multimodal
 from openharness.api.usage import UsageSnapshot
 from openharness.config.paths import get_data_dir
@@ -1523,7 +1524,19 @@ async def run_query(
                     messages[:] = compacted_messages
                 if was_compacted:
                     continue
-            if "connect" in error_msg.lower() or "timeout" in error_msg.lower() or "network" in error_msg.lower():
+            if isinstance(exc, QuotaExceededError):
+                _record_decision_trace_structural(
+                    context.decision_trace_recorder,
+                    _TRACE_KIND_ENGINE_ERROR,
+                    _engine_error_trace_payload(
+                        error_msg,
+                        recoverable=False,
+                        error_type=type(exc).__name__,
+                    ),
+                    is_error=True,
+                )
+                yield ErrorEvent(message=f"Provider quota exceeded: {error_msg}"), None
+            elif "connect" in error_msg.lower() or "timeout" in error_msg.lower() or "network" in error_msg.lower():
                 _record_decision_trace_structural(
                     context.decision_trace_recorder,
                     _TRACE_KIND_ENGINE_ERROR,

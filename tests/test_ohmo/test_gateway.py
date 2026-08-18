@@ -2270,6 +2270,62 @@ async def test_gateway_bridge_suppresses_output_for_trusted_bound_reminder_turn(
 
 
 @pytest.mark.asyncio
+async def test_gateway_bridge_suppressed_reminder_turn_still_publishes_errors(tmp_path):
+    # Engine errors on a suppressed recipient-bound reminder turn (e.g. the
+    # provider quota dying overnight) must still reach the creator's chat:
+    # the error carries no recipient data, and a silently dead scheduled
+    # report is exactly what the creator needs to hear about.
+    bus = MessageBus()
+    calls: list[InboundMessage] = []
+
+    class FakeRuntimePool:
+        async def stream_message(self, message, session_key):
+            calls.append(message)
+            yield SimpleNamespace(kind="progress", text="🤔…", metadata={"_progress": True})
+            yield SimpleNamespace(
+                kind="error",
+                text="Provider quota exceeded: You've reached your usage limit.",
+                metadata={"_session_key": "telegram:reminder:r1"},
+            )
+            yield SimpleNamespace(kind="final", text="marina wellness digest", metadata={})
+
+    bridge = OhmoGatewayBridge(bus=bus, runtime_pool=FakeRuntimePool(), workspace=tmp_path)
+    task = asyncio.create_task(bridge.run())
+    try:
+        await bus.publish_inbound(
+            InboundMessage(
+                channel="telegram",
+                sender_id="__scheduler__",
+                chat_id="100",
+                content="send Marina her wellness digest",
+                session_key_override="telegram:reminder:r1",
+                metadata={
+                    "_synthetic": True,
+                    "_reminder_id": "r1",
+                    "_reminder_recipient_chat_id": "200",
+                    "_suppress_bridge_output": True,
+                },
+            )
+        )
+        for _ in range(200):
+            if calls and not bridge._session_tasks:
+                break
+            await asyncio.sleep(0.01)
+        published = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
+    finally:
+        bridge.stop()
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    assert len(calls) == 1
+    assert published.content.startswith("Provider quota exceeded:")
+    # Progress stays suppressed: the only outbound message is the error.
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(bus.consume_outbound(), timeout=0.2)
+
+
+@pytest.mark.asyncio
 async def test_gateway_bridge_never_suppresses_output_from_live_user_metadata(tmp_path):
     # A live human message carrying a forged suppression marker must NOT be
     # honored: suppression is trusted only with the scheduler sender sentinel.

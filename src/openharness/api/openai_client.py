@@ -22,8 +22,10 @@ from openharness.api.client import (
 from openharness.api.errors import (
     AuthenticationFailure,
     OpenHarnessApiError,
+    QuotaExceededError,
     RateLimitFailure,
     RequestFailure,
+    is_quota_error_message,
 )
 from openharness.api.usage import UsageSnapshot
 from openharness.engine.messages import (
@@ -484,6 +486,13 @@ class OpenAICompatibleClient:
 
     @staticmethod
     def _is_retryable(exc: Exception) -> bool:
+        if isinstance(exc, QuotaExceededError):
+            return False
+        if is_quota_error_message(str(exc)):
+            # Subscription quota exhausted (e.g. Kimi 403 "usage limit ...
+            # billing cycle", OpenAI 429 insufficient_quota) — never clears
+            # within a backoff window, so fail fast.
+            return False
         status = getattr(exc, "status_code", None)
         if status and status in {429, 500, 502, 503}:
             return True
@@ -495,6 +504,9 @@ class OpenAICompatibleClient:
     def _translate_error(exc: Exception) -> OpenHarnessApiError:
         status = getattr(exc, "status_code", None)
         msg = str(exc)
+        if is_quota_error_message(msg):
+            log.error("provider quota exceeded, failing fast without retry: %s", msg)
+            return QuotaExceededError(msg)
         if status == 401 or status == 403:
             return AuthenticationFailure(msg)
         if status == 429:

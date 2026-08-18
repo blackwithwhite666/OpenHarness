@@ -687,7 +687,11 @@ class OhmoGatewayBridge:
                 )
                 if not update.text and not has_structured_progress:
                     continue
-                if suppress_output:
+                # Suppressed reminder turns must still surface engine errors
+                # (e.g. "Provider quota exceeded: ..."): an error carries no
+                # recipient data, and a silently dying scheduled report is
+                # exactly what the creator needs to hear about.
+                if suppress_output and update.kind != "error":
                     continue
                 logger.info(
                     "ohmo outbound update channel=%s chat_id=%s session_key=%s kind=%s content=%r",
