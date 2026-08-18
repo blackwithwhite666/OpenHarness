@@ -11,6 +11,7 @@ import pytest
 from openharness.api.client import ApiMessageRequest, ApiTextDeltaEvent
 from openharness.api.openai_client import (
     OpenAICompatibleClient,
+    _build_openai_body,
     _convert_assistant_message,
     _convert_messages_to_openai,
     _convert_tools_to_openai,
@@ -18,6 +19,8 @@ from openharness.api.openai_client import (
     _strip_think_blocks,
     _token_limit_param_for_model,
 )
+from openharness.api.provider import is_model_multimodal
+from openharness.config.settings import PermissionSettings, ResolvedAuth, Settings
 from openharness.engine.messages import (
     ConversationMessage,
     ImageBlock,
@@ -553,3 +556,241 @@ class TestClientAuthAndHeaders:
         events = [e async for e in client.stream_message(request)]
         assert events and resolved == ["x"]
         assert client._client.api_key == "tok-fresh"
+
+
+class TestReasoningEffortBody:
+    """``reasoning_effort`` must only reach providers that accept it."""
+
+    def _request(self, *, effort: str | None = "medium", model: str = "openai/gpt-5.6-terra") -> ApiMessageRequest:
+        return ApiMessageRequest(
+            model=model,
+            messages=[ConversationMessage.from_user_text("hi")],
+            effort=effort,
+        )
+
+    def test_flag_on_sends_reasoning_effort(self):
+        body = _build_openai_body(self._request(), supports_reasoning_effort=True)
+        assert body["reasoning_effort"] == "medium"
+
+    def test_flag_on_normalizes_effort(self):
+        body = _build_openai_body(self._request(effort="  High "), supports_reasoning_effort=True)
+        assert body["reasoning_effort"] == "high"
+
+    @pytest.mark.parametrize("effort", [None, "", "   "])
+    def test_flag_on_omits_blank_effort(self, effort):
+        body = _build_openai_body(self._request(effort=effort), supports_reasoning_effort=True)
+        assert "reasoning_effort" not in body
+
+    def test_flag_off_omits_reasoning_effort(self):
+        # Kimi and other strict OpenAI-compatible gateways reject the field.
+        body = _build_openai_body(self._request(effort="high", model="k3"))
+        assert "reasoning_effort" not in body
+
+    @pytest.mark.asyncio
+    async def test_openrouter_client_streams_reasoning_effort(self):
+        client = OpenAICompatibleClient(api_key="test-key", supports_reasoning_effort=True)
+        fake_sdk = _FakeOpenAIClient()
+        client._client = fake_sdk
+
+        events = [event async for event in client.stream_message(self._request())]
+
+        assert events
+        assert fake_sdk.chat.completions.last_kwargs is not None
+        assert fake_sdk.chat.completions.last_kwargs["reasoning_effort"] == "medium"
+
+    @pytest.mark.asyncio
+    async def test_default_client_never_streams_reasoning_effort(self):
+        client = OpenAICompatibleClient(api_key="test-key")
+        fake_sdk = _FakeOpenAIClient()
+        client._client = fake_sdk
+
+        events = [event async for event in client.stream_message(self._request(effort="high", model="k3"))]
+
+        assert events
+        assert fake_sdk.chat.completions.last_kwargs is not None
+        assert "reasoning_effort" not in fake_sdk.chat.completions.last_kwargs
+
+
+class TestResolverReasoningEffortIsolation:
+    """Only the OpenRouter client is built with the reasoning-effort capability."""
+
+    @staticmethod
+    def _resolved(provider: str) -> ResolvedAuth:
+        return ResolvedAuth(
+            provider=provider,
+            auth_kind="api_key",
+            value="test-key",
+            source="test",
+        )
+
+    def test_openrouter_client_gets_reasoning_effort_flag(self, monkeypatch):
+        from openharness.api.resolver import resolve_api_client_from_settings
+
+        monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
+        settings = Settings(active_profile="openrouter").materialize_active_profile()
+
+        client = resolve_api_client_from_settings(settings)
+
+        assert isinstance(client, OpenAICompatibleClient)
+        assert client._supports_reasoning_effort is True
+        assert str(client._client.base_url) == "https://openrouter.ai/api/v1/"
+
+    def test_kimi_client_does_not_get_reasoning_effort_flag(self, monkeypatch):
+        from openharness.api.resolver import resolve_api_client_from_settings
+
+        settings = Settings(active_profile="kimi")
+        resolved = self._resolved("kimi_coding")
+        monkeypatch.setattr(
+            Settings,
+            "resolve_auth",
+            lambda _settings, **kwargs: resolved,
+        )
+
+        client = resolve_api_client_from_settings(settings)
+
+        assert isinstance(client, OpenAICompatibleClient)
+        assert client._supports_reasoning_effort is False
+
+    def test_generic_openai_compat_client_does_not_get_reasoning_effort_flag(self):
+        from openharness.api.resolver import resolve_api_client_from_settings
+
+        settings = Settings(active_profile="openai-compatible", api_key="sk-test")
+        client = resolve_api_client_from_settings(settings)
+
+        assert isinstance(client, OpenAICompatibleClient)
+        assert client._supports_reasoning_effort is False
+
+
+class TestOpenRouterImageSerialization:
+    """OpenRouter GPT-5.6 Terra keeps native images as OpenAI image_url parts."""
+
+    def test_openrouter_model_is_classified_multimodal(self):
+        assert is_model_multimodal("openai/gpt-5.6-terra")
+        assert is_model_multimodal("openai/gpt-5.6-terra", provider="openrouter")
+
+    def test_image_block_serialized_as_image_url_data_url(self):
+        messages = [
+            ConversationMessage(
+                role="user",
+                content=[
+                    TextBlock(text="Describe this."),
+                    ImageBlock(media_type="image/jpeg", data="YWJj", source_path="/tmp/x.jpg"),
+                ],
+            )
+        ]
+        result = _convert_messages_to_openai(messages, None)
+        assert result[0]["role"] == "user"
+        content = result[0]["content"]
+        assert content[0] == {"type": "text", "text": "Describe this."}
+        assert content[1] == {
+            "type": "image_url",
+            "image_url": {"url": "data:image/jpeg;base64,YWJj"},
+        }
+
+    @pytest.mark.asyncio
+    async def test_openrouter_client_sends_image_url_data_url(self):
+        client = OpenAICompatibleClient(api_key="test-key", supports_reasoning_effort=True)
+        fake_sdk = _FakeOpenAIClient()
+        client._client = fake_sdk
+
+        request = ApiMessageRequest(
+            model="openai/gpt-5.6-terra",
+            messages=[
+                ConversationMessage(
+                    role="user",
+                    content=[
+                        TextBlock(text="Describe this."),
+                        ImageBlock(media_type="image/png", data="YWJj", source_path="/tmp/x.png"),
+                    ],
+                )
+            ],
+        )
+        events = [event async for event in client.stream_message(request)]
+
+        assert events
+        message = fake_sdk.chat.completions.last_kwargs["messages"][0]
+        assert message["content"][1] == {
+            "type": "image_url",
+            "image_url": {"url": "data:image/png;base64,YWJj"},
+        }
+
+
+class TestKimiImagesFailClosed:
+    """Kimi For Coding k3 is text-only: images fail closed before any request."""
+
+    def test_kimi_k3_is_text_only(self):
+        assert not is_model_multimodal("k3")
+        assert not is_model_multimodal("k3", provider="kimi_coding")
+
+    @staticmethod
+    def _context(tmp_path, *, model: str, image_provider: str):
+        from openharness.engine.query import QueryContext
+        from openharness.permissions import PermissionChecker, PermissionMode
+        from openharness.tools.base import ToolRegistry
+
+        class RecordingApiClient:
+            def __init__(self) -> None:
+                self.requests: list[object] = []
+
+            async def stream_message(self, request):
+                self.requests.append(request)
+                yield
+
+        client = RecordingApiClient()
+        context = QueryContext(
+            api_client=client,
+            tool_registry=ToolRegistry(),
+            permission_checker=PermissionChecker(
+                PermissionSettings(mode=PermissionMode.FULL_AUTO)
+            ),
+            cwd=tmp_path,
+            model=model,
+            system_prompt="",
+            max_tokens=128,
+            image_provider=image_provider,
+        )
+        return client, context
+
+    @pytest.mark.asyncio
+    async def test_kimi_image_yields_non_recoverable_error_before_provider_call(self, tmp_path):
+        from openharness.engine.query import _preprocess_images_in_messages
+        from openharness.engine.stream_events import ErrorEvent
+
+        client, context = self._context(tmp_path, model="k3", image_provider="kimi_coding")
+        messages = [
+            ConversationMessage(
+                role="user",
+                content=[ImageBlock(media_type="image/png", data="YWJj")],
+            )
+        ]
+
+        events = [event async for event in _preprocess_images_in_messages(messages, context)]
+
+        assert client.requests == []
+        assert len(events) == 1
+        assert isinstance(events[0], ErrorEvent)
+        assert events[0].recoverable is False
+        assert "cannot process image input" in events[0].message
+        assert "vision" in events[0].message
+        # The image block is left in place — nothing was silently dropped.
+        assert isinstance(messages[0].content[0], ImageBlock)
+
+    @pytest.mark.asyncio
+    async def test_openrouter_images_are_preserved_for_provider(self, tmp_path):
+        from openharness.engine.query import _preprocess_images_in_messages
+
+        client, context = self._context(
+            tmp_path, model="openai/gpt-5.6-terra", image_provider="openrouter"
+        )
+        messages = [
+            ConversationMessage(
+                role="user",
+                content=[ImageBlock(media_type="image/png", data="YWJj")],
+            )
+        ]
+
+        events = [event async for event in _preprocess_images_in_messages(messages, context)]
+
+        assert events == []
+        assert client.requests == []
+        assert isinstance(messages[0].content[0], ImageBlock)

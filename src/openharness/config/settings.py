@@ -238,6 +238,15 @@ def default_provider_profiles() -> dict[str, ProviderProfile]:
             auth_source="codex_subscription",
             default_model="gpt-5.4",
         ),
+        "openrouter": ProviderProfile(
+            label="OpenRouter",
+            provider="openrouter",
+            api_format="openai",
+            auth_source="openrouter_api_key",
+            default_model="openai/gpt-5.6-terra",
+            base_url="https://openrouter.ai/api/v1",
+            allowed_models=["openai/gpt-5.6-terra"],
+        ),
         "kimi": ProviderProfile(
             label="Kimi For Coding (OAuth)",
             provider="kimi_coding",
@@ -392,6 +401,7 @@ def auth_source_provider_name(auth_source: str) -> str:
         "minimax_api_key": "minimax",
         "nvidia_api_key": "nvidia",
         "modelscope_api_key": "modelscope",
+        "openrouter_api_key": "openrouter",
     }
     return mapping.get(auth_source, auth_source)
 
@@ -412,6 +422,7 @@ def auth_source_env_var_candidates(auth_source: str) -> tuple[str, ...]:
         "minimax_api_key": ("OPENHARNESS_MINIMAX_API_KEY", "MINIMAX_API_KEY"),
         "nvidia_api_key": ("OPENHARNESS_NVIDIA_API_KEY", "NVIDIA_API_KEY"),
         "modelscope_api_key": ("OPENHARNESS_MODELSCOPE_API_KEY", "MODELSCOPE_API_KEY"),
+        "openrouter_api_key": ("OPENHARNESS_OPENROUTER_API_KEY", "OPENROUTER_API_KEY"),
     }
     return mapping.get(auth_source, ())
 
@@ -443,6 +454,8 @@ def default_auth_source_for_provider(provider: str, api_format: str | None = Non
         return "claude_subscription"
     if provider == "openai_codex":
         return "codex_subscription"
+    if provider == "openrouter":
+        return "openrouter_api_key"
     if provider == "kimi_coding":
         return "kimi_coding_oauth"
     if provider == "copilot":
@@ -479,6 +492,8 @@ def _infer_profile_name_from_flat_settings(settings: "Settings") -> str:
     provider = (settings.provider or "").strip()
     if provider == "openai_codex":
         return "codex"
+    if provider == "openrouter":
+        return "openrouter"
     if provider == "anthropic_claude":
         return "claude-subscription"
     if provider == "copilot" or settings.api_format == "copilot":

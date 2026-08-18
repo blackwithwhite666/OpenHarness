@@ -1628,16 +1628,16 @@ def _specialize_setup_target(manager, target: str) -> str:
         base_url = _text_prompt("Base URL", default="https://openrouter.ai/api/v1").strip()
         if not base_url:
             raise typer.BadParameter("Base URL cannot be empty.")
-        model = _text_prompt("Default model", default="").strip()
+        model = _text_prompt("Default model", default="openai/gpt-5.6-terra").strip()
         if not model:
             raise typer.BadParameter("Default model cannot be empty.")
         return _ensure_preset_profile(
             manager,
             name="openrouter",
             label="OpenRouter",
-            provider="openai",
+            provider="openrouter",
             api_format="openai",
-            auth_source=default_auth_source_for_provider("openai", "openai"),
+            auth_source=default_auth_source_for_provider("openrouter", "openai"),
             base_url=base_url,
             model=model,
             lock_model=False,

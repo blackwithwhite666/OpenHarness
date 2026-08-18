@@ -139,7 +139,11 @@ def _convert_messages_to_openai(
     return openai_messages
 
 
-def _build_openai_body(request: ApiMessageRequest) -> dict[str, Any]:
+def _build_openai_body(
+    request: ApiMessageRequest,
+    *,
+    supports_reasoning_effort: bool = False,
+) -> dict[str, Any]:
     openai_messages = _convert_messages_to_openai(request.messages, request.system_prompt)
     openai_tools = _convert_tools_to_openai(request.tools) if request.tools else None
 
@@ -152,6 +156,14 @@ def _build_openai_body(request: ApiMessageRequest) -> dict[str, Any]:
     body.update(_token_limit_param_for_model(request.model, request.max_tokens))
     if request.cache_key:
         body["prompt_cache_key"] = request.cache_key
+    if supports_reasoning_effort:
+        # OpenRouter accepts OpenAI's reasoning_effort hint; most other
+        # OpenAI-compatible gateways reject the field outright, so it is
+        # gated on an explicit client capability flag instead of the
+        # request builder guessing from the base URL.
+        effort = (request.effort or "").strip().lower()
+        if effort:
+            body["reasoning_effort"] = effort
     if openai_tools:
         body["tools"] = openai_tools
         # Some providers (Kimi) error on empty reasoning_content in
@@ -308,9 +320,11 @@ class OpenAICompatibleClient:
         timeout: float | None = None,
         default_headers: dict[str, str] | None = None,
         api_key_resolver: Callable[[], str] | None = None,
+        supports_reasoning_effort: bool = False,
     ) -> None:
         self._custom_headers: dict[str, str] = dict(default_headers or {})
         self._api_key_resolver = api_key_resolver
+        self._supports_reasoning_effort = supports_reasoning_effort
         kwargs: dict[str, Any] = {
             "api_key": api_key,
             "default_headers": {**self._custom_headers, "Authorization": f"Bearer {api_key}"},
@@ -378,7 +392,10 @@ class OpenAICompatibleClient:
 
     async def _stream_once(self, request: ApiMessageRequest) -> AsyncIterator[ApiStreamEvent]:
         """Single attempt: stream an OpenAI chat completion."""
-        params = _build_openai_body(request)
+        params = _build_openai_body(
+            request,
+            supports_reasoning_effort=self._supports_reasoning_effort,
+        )
 
         # Collect full response while streaming text deltas
         collected_content = ""

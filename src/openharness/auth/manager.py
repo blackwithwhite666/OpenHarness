@@ -30,6 +30,7 @@ _KNOWN_PROVIDERS = [
     "anthropic_claude",
     "openai",
     "openai_codex",
+    "openrouter",
     "kimi_coding",
     "copilot",
     "dashscope",
@@ -55,6 +56,7 @@ _AUTH_SOURCES = [
     "gemini_api_key",
     "minimax_api_key",
     "modelscope_api_key",
+    "openrouter_api_key",
 ]
 
 _PROFILE_BY_PROVIDER = {
@@ -62,6 +64,7 @@ _PROFILE_BY_PROVIDER = {
     "anthropic_claude": "claude-subscription",
     "openai": "openai-compatible",
     "openai_codex": "codex",
+    "openrouter": "openrouter",
     "kimi_coding": "kimi",
     "copilot": "copilot",
     "moonshot": "moonshot",
@@ -172,6 +175,15 @@ class AuthManager:
                     configured = True
                     origin = "file"
                     state = "configured"
+            elif source == "openrouter_api_key":
+                if os.environ.get("OPENHARNESS_OPENROUTER_API_KEY") or os.environ.get("OPENROUTER_API_KEY"):
+                    configured = True
+                    origin = "env"
+                    state = "configured"
+                elif load_credential(storage_provider, "api_key"):
+                    configured = True
+                    origin = "file"
+                    state = "configured"
             elif load_credential(storage_provider, "api_key"):
                 configured = True
                 origin = "file"
@@ -273,6 +285,14 @@ class AuthManager:
                     configured = True
                     source = "env"
                 elif load_credential("modelscope", "api_key"):
+                    configured = True
+                    source = "file"
+
+            elif provider == "openrouter":
+                if os.environ.get("OPENHARNESS_OPENROUTER_API_KEY") or os.environ.get("OPENROUTER_API_KEY"):
+                    configured = True
+                    source = "env"
+                elif load_credential("openrouter", "api_key"):
                     configured = True
                     source = "file"
 

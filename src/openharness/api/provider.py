@@ -111,6 +111,8 @@ def auth_status(settings: Settings) -> str:
     except ValueError as exc:
         if settings.provider == "openai_codex":
             return "missing (run 'oh auth codex-login')"
+        if settings.provider == "openrouter":
+            return "missing (set OPENROUTER_API_KEY or run 'oh setup')"
         if settings.provider == "anthropic_claude":
             binding = load_external_binding("anthropic_claude")
             if binding is not None:

@@ -767,6 +767,8 @@ class TelegramChannel(BaseChannel):
         BotCommand("start", "Start the bot"),
         BotCommand("new", "Start a new conversation"),
         BotCommand("clear", "Clear the conversation"),
+        BotCommand("provider", "Show or switch provider profile"),
+        BotCommand("model", "Show or switch model"),
         BotCommand("debug", "Show detailed progress"),
         BotCommand("quiet", "Show compact progress"),
         BotCommand("verbose", "Show detailed progress"),
@@ -842,6 +844,8 @@ class TelegramChannel(BaseChannel):
         self._app.add_handler(CommandHandler("start", self._on_start))
         self._app.add_handler(CommandHandler("new", self._forward_command))
         self._app.add_handler(CommandHandler("clear", self._forward_command))
+        self._app.add_handler(CommandHandler("provider", self._forward_command))
+        self._app.add_handler(CommandHandler("model", self._forward_command))
         self._app.add_handler(CommandHandler("debug", self._forward_command))
         self._app.add_handler(CommandHandler("quiet", self._forward_command))
         self._app.add_handler(CommandHandler("verbose", self._forward_command))
@@ -1850,6 +1854,8 @@ class TelegramChannel(BaseChannel):
             f"🐈 {self.config.bot_name} commands:\n"
             "/new — Start a new conversation\n"
             "/clear — Clear the conversation\n"
+            "/provider — Show or switch provider profile\n"
+            "/model — Show or switch model\n"
             "/debug — Show detailed progress\n"
             "/quiet — Show compact progress\n"
             "/verbose — Show detailed progress\n"

@@ -944,3 +944,132 @@ class TestKimiProvider:
 
         with pytest.raises(ValueError, match="kimi-login"):
             Settings(active_profile="kimi").resolve_auth()
+
+
+class TestOpenRouterProvider:
+    """Tests for the OpenRouter provider profile and auth integration."""
+
+    def _clear_env(self, monkeypatch):
+        monkeypatch.delenv("OPENHARNESS_OPENROUTER_API_KEY", raising=False)
+        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+
+    def test_openrouter_in_default_provider_profiles(self):
+        from openharness.config.settings import default_provider_profiles
+
+        profiles = default_provider_profiles()
+        assert "openrouter" in profiles
+        profile = profiles["openrouter"]
+        assert profile.provider == "openrouter"
+        assert profile.api_format == "openai"
+        assert profile.auth_source == "openrouter_api_key"
+        assert profile.default_model == "openai/gpt-5.6-terra"
+        assert profile.allowed_models == ["openai/gpt-5.6-terra"]
+        assert profile.base_url == "https://openrouter.ai/api/v1"
+
+    def test_auth_source_provider_name_openrouter(self):
+        from openharness.config.settings import auth_source_provider_name
+
+        assert auth_source_provider_name("openrouter_api_key") == "openrouter"
+
+    def test_auth_source_env_var_candidates_openrouter(self):
+        from openharness.config.settings import auth_source_env_var_candidates
+
+        assert auth_source_env_var_candidates("openrouter_api_key") == (
+            "OPENHARNESS_OPENROUTER_API_KEY",
+            "OPENROUTER_API_KEY",
+        )
+
+    def test_default_auth_source_for_openrouter_provider(self):
+        from openharness.config.settings import default_auth_source_for_provider
+
+        assert default_auth_source_for_provider("openrouter", "openai") == "openrouter_api_key"
+
+    def test_resolve_auth_reads_openrouter_api_key_env(self, monkeypatch):
+        self._clear_env(monkeypatch)
+        monkeypatch.setenv("OPENROUTER_API_KEY", "or-native-key")
+
+        resolved = Settings(active_profile="openrouter").resolve_auth()
+
+        assert resolved.value == "or-native-key"
+        assert resolved.source == "env:OPENROUTER_API_KEY"
+
+    def test_resolve_auth_prefers_openharness_env(self, monkeypatch):
+        self._clear_env(monkeypatch)
+        monkeypatch.setenv("OPENHARNESS_OPENROUTER_API_KEY", "or-pref-key")
+        monkeypatch.setenv("OPENROUTER_API_KEY", "or-native-key")
+
+        resolved = Settings(active_profile="openrouter").resolve_auth()
+
+        assert resolved.value == "or-pref-key"
+        assert resolved.source == "env:OPENHARNESS_OPENROUTER_API_KEY"
+
+    def test_resolve_auth_reads_stored_credential(self, monkeypatch, tmp_path):
+        self._clear_env(monkeypatch)
+        monkeypatch.setenv("OPENHARNESS_CONFIG_DIR", str(tmp_path))
+        store_credential("openrouter", "api_key", "or-file-key", use_keyring=False)
+
+        resolved = Settings(active_profile="openrouter").resolve_auth()
+
+        assert resolved.value == "or-file-key"
+        assert resolved.source == "file:openrouter"
+
+    def test_resolve_auth_missing_raises(self, monkeypatch, tmp_path):
+        self._clear_env(monkeypatch)
+        monkeypatch.setenv("OPENHARNESS_CONFIG_DIR", str(tmp_path))
+
+        with pytest.raises(ValueError, match="openrouter_api_key"):
+            Settings(active_profile="openrouter").resolve_auth()
+
+    def test_openrouter_profile_materializes_defaults(self):
+        materialized = Settings(active_profile="openrouter").materialize_active_profile()
+
+        assert materialized.provider == "openrouter"
+        assert materialized.api_format == "openai"
+        assert materialized.model == "openai/gpt-5.6-terra"
+        assert materialized.base_url == "https://openrouter.ai/api/v1"
+
+    def test_flat_openrouter_settings_infer_builtin_profile(self):
+        from openharness.config.settings import _infer_profile_name_from_flat_settings
+
+        settings = Settings(active_profile="openrouter").materialize_active_profile()
+        assert _infer_profile_name_from_flat_settings(settings) == "openrouter"
+
+    def test_auth_manager_reports_openrouter_status(self, monkeypatch):
+        from openharness.auth.manager import AuthManager
+
+        self._clear_env(monkeypatch)
+        manager = AuthManager(Settings(active_profile="openrouter"))
+
+        missing = manager.get_auth_status()["openrouter"]
+        assert missing["configured"] is False
+        assert missing["source"] == "missing"
+        assert missing["active"] is True
+
+        monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
+        configured = manager.get_auth_status()["openrouter"]
+        assert configured["configured"] is True
+        assert configured["source"] == "env"
+        assert configured["active"] is True
+
+        profile_status = manager.get_profile_statuses()["openrouter"]
+        assert profile_status["configured"] is True
+        assert profile_status["provider"] == "openrouter"
+        assert profile_status["model"] == "openai/gpt-5.6-terra"
+
+    def test_auth_status_missing_suggests_openrouter_key(self, monkeypatch, tmp_path):
+        from openharness.api.provider import auth_status
+
+        self._clear_env(monkeypatch)
+        monkeypatch.setenv("OPENHARNESS_CONFIG_DIR", str(tmp_path))
+        settings = Settings(active_profile="openrouter").materialize_active_profile()
+
+        assert auth_status(settings) == "missing (set OPENROUTER_API_KEY or run 'oh setup')"
+
+    def test_auth_status_configured_via_env(self, monkeypatch):
+        from openharness.api.provider import auth_status
+
+        self._clear_env(monkeypatch)
+        monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
+        settings = Settings(active_profile="openrouter").materialize_active_profile()
+
+        assert auth_status(settings) == "configured"

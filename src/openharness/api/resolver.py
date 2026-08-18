@@ -71,6 +71,15 @@ def resolve_api_client_from_settings(settings: Settings) -> SupportsStreamingMes
                 # expiry) instead of 401-ing on the captured token until restart.
                 api_key_resolver=lambda: settings.resolve_auth().value,
             )
+        if settings.provider == "openrouter":
+            # OpenRouter accepts OpenAI's reasoning_effort hint; the flag keeps
+            # the parameter off requests to Kimi and other strict gateways.
+            return OpenAICompatibleClient(
+                api_key=auth.value,
+                base_url=settings.base_url,
+                timeout=settings.timeout,
+                supports_reasoning_effort=True,
+            )
         return OpenAICompatibleClient(
             api_key=auth.value,
             base_url=settings.base_url,
