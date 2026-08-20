@@ -119,6 +119,10 @@ def test_result_sidecar_has_stable_operation_ids_and_bounded_history() -> None:
     assert result.meal_observation_operation_id.endswith(":meal-observation:v1")
 
 
+def test_result_state_str_matches_value() -> None:
+    assert str(ResultState.published) == "published"
+
+
 def test_skipped_sidecar_has_terminal_invariants() -> None:
     payload = _result(ResultState.published).model_dump(mode="json")
     payload.update(

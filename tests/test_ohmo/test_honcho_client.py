@@ -512,8 +512,8 @@ async def test_recent_message_metadata_paginates_and_keeps_inclusive_window() ->
         found = await client.list_recent_message_metadata(
             "session-one",
             expected_peer_id="marina-peer",
-            since=dt.datetime(2026, 8, 1, 10, tzinfo=dt.UTC),
-            until=dt.datetime(2026, 8, 8, 10, tzinfo=dt.UTC),
+            since=dt.datetime(2026, 8, 1, 10, tzinfo=dt.timezone.utc),
+            until=dt.datetime(2026, 8, 8, 10, tzinfo=dt.timezone.utc),
             page_size=1,
         )
 
@@ -551,8 +551,8 @@ async def test_recent_message_metadata_rejects_malformed_pages_and_timestamps(
             await client.list_recent_message_metadata(
                 "session-one",
                 expected_peer_id="marina-peer",
-                since=dt.datetime(2026, 8, 1, tzinfo=dt.UTC),
-                until=dt.datetime(2026, 8, 8, tzinfo=dt.UTC),
+                since=dt.datetime(2026, 8, 1, tzinfo=dt.timezone.utc),
+                until=dt.datetime(2026, 8, 8, tzinfo=dt.timezone.utc),
                 page_size=1,
             )
 
@@ -576,8 +576,8 @@ async def test_recent_message_metadata_rejects_history_over_page_cap() -> None:
             await client.list_recent_message_metadata(
                 "session-one",
                 expected_peer_id="marina-peer",
-                since=dt.datetime(2026, 8, 1, tzinfo=dt.UTC),
-                until=dt.datetime(2026, 8, 8, tzinfo=dt.UTC),
+                since=dt.datetime(2026, 8, 1, tzinfo=dt.timezone.utc),
+                until=dt.datetime(2026, 8, 8, tzinfo=dt.timezone.utc),
                 page_size=1,
                 max_pages=2,
             )
@@ -620,8 +620,8 @@ async def test_recent_message_metadata_rejects_wrong_peer_and_out_of_window(
             await client.list_recent_message_metadata(
                 "session-one",
                 expected_peer_id="marina-peer",
-                since=dt.datetime(2026, 8, 1, tzinfo=dt.UTC),
-                until=dt.datetime(2026, 8, 8, tzinfo=dt.UTC),
+                since=dt.datetime(2026, 8, 1, tzinfo=dt.timezone.utc),
+                until=dt.datetime(2026, 8, 8, tzinfo=dt.timezone.utc),
                 page_size=1,
             )
 

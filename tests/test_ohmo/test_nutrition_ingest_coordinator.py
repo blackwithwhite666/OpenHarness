@@ -8,12 +8,13 @@ import os
 import stat
 import struct
 import zlib
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+from ohmo.evals.nutrition_trace import NutritionDisplaySummaryV1
 from ohmo.gateway.attachment_fingerprints import (
     PHASH_ALGORITHM,
     PHASH_HAMMING_THRESHOLD,
@@ -25,7 +26,11 @@ from ohmo.gateway.runtime import OhmoSessionRuntimePool
 from ohmo.memory_backend import CatalogMemoryBackend, ShadowMemoryBackend
 from ohmo.memory_catalog import MemoryCatalog
 from ohmo.memory_service.honcho_client import Message, RecentMessageMetadata
-from ohmo.nutrition_ingest.coordinator import NutritionIngestCoordinator
+from ohmo.nutrition_ingest.coordinator import (
+    PENDING_CONFIRMATION_SLO_SECONDS,
+    PROMPT_RECEIPT_SLO_SECONDS,
+    NutritionIngestCoordinator,
+)
 from ohmo.nutrition_ingest.freshness import exif_freshness_reason
 from ohmo.nutrition_ingest.metrics import NutritionMetrics
 from ohmo.nutrition_ingest.models import (
@@ -103,7 +108,7 @@ def _png(pixel: tuple[int, int, int]) -> bytes:
 
 class _Clock:
     def __init__(self) -> None:
-        self.value = datetime(2026, 8, 5, 10, 0, tzinfo=UTC)
+        self.value = datetime(2026, 8, 5, 10, 0, tzinfo=timezone.utc)
 
     def __call__(self) -> datetime:
         return self.value
@@ -146,7 +151,7 @@ class _HonchoStore:
                 peer_id=str(value["peer_id"]),
                 session_id=session,
                 metadata=dict(value["metadata"]),
-                created_at=datetime.now(UTC),
+                created_at=datetime.now(timezone.utc),
                 workspace_id="family-marina",
                 token_count=1,
             )
@@ -199,7 +204,7 @@ def _recent_message(
         peer_id=peer_id,
         session_id=session_id,
         metadata=metadata,
-        created_at=created_at or datetime(2026, 8, 5, 9, tzinfo=UTC),
+        created_at=created_at or datetime(2026, 8, 5, 9, tzinfo=timezone.utc),
     )
 
 
@@ -1536,7 +1541,7 @@ async def test_exif_boundary_is_inclusive_and_stale_candidate_does_not_block_fre
     tmp_path: Path,
 ) -> None:
     clock = _Clock()
-    clock.value = datetime(2026, 8, 12, 9, 0, tzinfo=UTC)
+    clock.value = datetime(2026, 8, 12, 9, 0, tzinfo=timezone.utc)
     stale = _candidate(tmp_path, file_id="id:stale", rev="rev:stale",
                        capture_time="2026-08-05T11:59:59.999999+03:00")
     fresh = _candidate(tmp_path, file_id="id:fresh", rev="rev:fresh",
@@ -1589,7 +1594,7 @@ async def test_unusable_exif_is_terminally_skipped(tmp_path: Path, exif_updates,
 @pytest.mark.asyncio
 async def test_offsetless_moscow_capture_is_checked_again_before_send(tmp_path: Path) -> None:
     clock = _Clock()
-    clock.value = datetime(2026, 8, 12, 9, 0, tzinfo=UTC)
+    clock.value = datetime(2026, 8, 12, 9, 0, tzinfo=timezone.utc)
     candidate = _candidate(tmp_path, file_id="id:offsetless", rev="rev:offsetless",
                            capture_time="2026-08-05T12:00:00",
                            exif_updates={"timezone_status": "missing", "capture_timezone_offset": None})
@@ -1808,8 +1813,8 @@ async def test_exact_sha_duplicate_becomes_seen_and_writes_owner_only_tombstone(
         {
             "session": "marina-session",
             "expected_peer_id": "marina-peer",
-            "since": datetime(2026, 7, 29, 10, tzinfo=UTC),
-            "until": datetime(2026, 8, 5, 10, tzinfo=UTC),
+            "since": datetime(2026, 7, 29, 10, tzinfo=timezone.utc),
+            "until": datetime(2026, 8, 5, 10, tzinfo=timezone.utc),
         }
     ]
 
@@ -1965,7 +1970,7 @@ async def test_ordinary_telegram_phash_outside_capture_time_gate_is_not_duplicat
         [
             _recent_message(
                 [{"phash": descriptor["phash"], "phash_algorithm": PHASH_ALGORITHM}],
-                created_at=datetime(2026, 8, 5, 6, tzinfo=UTC),
+                created_at=datetime(2026, 8, 5, 6, tzinfo=timezone.utc),
             )
         ]
     )
@@ -2133,7 +2138,7 @@ async def test_expiry_writes_tombstone_before_direct_child_deletion_and_keeps_bo
     tmp_path: Path,
 ) -> None:
     clock = _Clock()
-    clock.value = datetime(2026, 8, 12, 9, tzinfo=UTC)
+    clock.value = datetime(2026, 8, 12, 9, tzinfo=timezone.utc)
     expired = _candidate(
         tmp_path,
         file_id="id:expired-delete",
@@ -2405,8 +2410,8 @@ def test_tombstone_path_rejects_invalid_candidate_and_seen_symlink(tmp_path: Pat
                 candidate_id=candidate,
                 original_sha256="0" * 64,
                 terminal_reason="expired",
-                capture_time=datetime(2026, 8, 1, tzinfo=UTC),
-                archived_at=datetime(2026, 8, 8, tzinfo=UTC),
+                capture_time=datetime(2026, 8, 1, tzinfo=timezone.utc),
+                archived_at=datetime(2026, 8, 8, tzinfo=timezone.utc),
                 state_summary="ready",
             )
         )
@@ -2416,16 +2421,10 @@ def test_tombstone_path_rejects_invalid_candidate_and_seen_symlink(tmp_path: Pat
 # Observability: stage latencies, privacy-safe status, SLO-gated alerts
 # ---------------------------------------------------------------------------
 
-from ohmo.evals.nutrition_trace import NutritionDisplaySummaryV1
-from ohmo.nutrition_ingest.coordinator import (
-    PENDING_CONFIRMATION_SLO_SECONDS,
-    PROMPT_RECEIPT_SLO_SECONDS,
-)
-
-_INCIDENT_PUBLISH = datetime(2026, 8, 5, 13, 6, 27, tzinfo=UTC)
-_INCIDENT_RECEIPT = datetime(2026, 8, 5, 13, 6, 29, tzinfo=UTC)
-_INCIDENT_CONFIRMATION = datetime(2026, 8, 5, 13, 8, 31, tzinfo=UTC)
-_INCIDENT_ESTIMATED = datetime(2026, 8, 5, 13, 9, 22, tzinfo=UTC)
+_INCIDENT_PUBLISH = datetime(2026, 8, 5, 13, 6, 27, tzinfo=timezone.utc)
+_INCIDENT_RECEIPT = datetime(2026, 8, 5, 13, 6, 29, tzinfo=timezone.utc)
+_INCIDENT_CONFIRMATION = datetime(2026, 8, 5, 13, 8, 31, tzinfo=timezone.utc)
+_INCIDENT_ESTIMATED = datetime(2026, 8, 5, 13, 9, 22, tzinfo=timezone.utc)
 
 
 def _incident_summary() -> dict[str, object]:
