@@ -2270,6 +2270,55 @@ async def test_gateway_bridge_suppresses_output_for_trusted_bound_reminder_turn(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("sender_id", "metadata", "reply", "published"),
+    [
+        (
+            "__scheduler__",
+            {
+                "_synthetic": True,
+                "_reminder_id": "r1",
+            },
+            "  NO_REPLY\n",
+            False,
+        ),
+        ("200|alice", {}, "NO_REPLY", True),
+        ("__scheduler__", {"_synthetic": True, "_reminder_id": "r1"}, "NO_REPLY later", True),
+    ],
+)
+async def test_gateway_bridge_suppresses_only_standalone_no_reply_for_synthetic_reminders(
+    tmp_path, caplog, sender_id, metadata, reply, published
+):
+    bus = MessageBus()
+
+    class FakeRuntimePool:
+        async def stream_message(self, message, session_key):
+            del message, session_key
+            yield SimpleNamespace(kind="final", text=reply, metadata={})
+
+    bridge = OhmoGatewayBridge(bus=bus, runtime_pool=FakeRuntimePool(), workspace=tmp_path)
+    caplog.set_level(logging.INFO)
+    await bridge._process_message(
+        InboundMessage(
+            channel="telegram",
+            sender_id=sender_id,
+            chat_id="200",
+            content="reminder",
+            metadata=metadata,
+        ),
+        "telegram:200",
+    )
+
+    if published:
+        outbound = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
+        assert outbound.content == reply
+    else:
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(bus.consume_outbound(), timeout=0.2)
+        assert "suppressed standalone NO_REPLY" in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_gateway_bridge_suppressed_reminder_turn_still_publishes_errors(tmp_path):
     # Engine errors on a suppressed recipient-bound reminder turn (e.g. the
     # provider quota dying overnight) must still reach the creator's chat:
@@ -3344,6 +3393,143 @@ async def test_runtime_pool_provider_command_refresh_uses_gateway_profile(tmp_pa
     assert updates[-1].text.startswith("ohmo gateway provider_profile set to codex")
     assert build_calls[0]["active_profile"] == "kimi-anthropic"
     assert build_calls[1]["active_profile"] == "codex"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("command_name", "args", "initial_profile", "expected_profile"),
+    [
+        ("provider", "codex", "kimi-anthropic", "codex"),
+        ("model", "gpt-5.5", "codex", "codex"),
+    ],
+)
+async def test_runtime_pool_lazily_refreshes_other_cached_bundles_after_gateway_change(
+    tmp_path, monkeypatch, command_name, args, initial_profile, expected_profile
+):
+    workspace = tmp_path / ".ohmo-home"
+    initialize_workspace(workspace)
+    save_gateway_config(GatewayConfig(provider_profile=initial_profile), workspace)
+    build_calls: list[dict[str, object]] = []
+    close_calls: list[str] = []
+
+    statuses = {
+        "codex": {
+            "label": "Codex subscription",
+            "configured": True,
+            "base_url": None,
+            "model": "gpt-5.4",
+        },
+        "kimi-anthropic": {
+            "label": "Kimi Anthropic",
+            "configured": True,
+            "base_url": "https://api.example.test",
+            "model": "kimi-k2.5",
+        },
+    }
+    profile = ProviderProfile(
+        label="Codex",
+        provider="openai_codex",
+        api_format="responses",
+        auth_source="codex_subscription",
+        default_model="gpt-5.4",
+        allowed_models=["gpt-5.4", "gpt-5.5"],
+    )
+
+    class FakeAuthManager:
+        def __init__(self, settings):
+            del settings
+
+        def get_profile_statuses(self):
+            return statuses
+
+        def list_profiles(self):
+            return {"codex": profile}
+
+        def update_profile(self, name, **kwargs):
+            del name, kwargs
+
+    class FakeEngine:
+        def __init__(self, label):
+            self.messages = [ConversationMessage.from_user_text(f"before-{label}")]
+            self.tool_metadata = {"preserved": label}
+            self.total_usage = UsageSnapshot()
+            self.model = "gpt-5.4"
+
+        def set_system_prompt(self, prompt):
+            del prompt
+
+    async def fake_build_runtime(**kwargs):
+        label = str(len(build_calls))
+        build_calls.append(kwargs)
+        return SimpleNamespace(
+            engine=FakeEngine(label),
+            session_id=f"sess-{label}",
+            current_settings=lambda: SimpleNamespace(model="gpt-5.4"),
+            commands=create_default_command_registry(),
+            hook_summary=lambda: "",
+            mcp_summary=lambda: "",
+            plugin_summary=lambda: "",
+            cwd=str(tmp_path),
+            tool_registry=None,
+            app_state=None,
+            session_backend=None,
+            extra_skill_dirs=(),
+            extra_plugin_roots=(),
+            enforce_max_turns=False,
+        )
+
+    async def fake_start_runtime(bundle):
+        del bundle
+
+    async def fake_close_runtime(bundle):
+        close_calls.append(bundle.session_id)
+
+    monkeypatch.setattr("ohmo.gateway.provider_commands.load_settings", lambda: object())
+    monkeypatch.setattr("ohmo.gateway.provider_commands.AuthManager", FakeAuthManager)
+    monkeypatch.setattr("ohmo.gateway.runtime.build_runtime", fake_build_runtime)
+    monkeypatch.setattr("ohmo.gateway.runtime.start_runtime", fake_start_runtime)
+    monkeypatch.setattr("ohmo.gateway.runtime.close_runtime", fake_close_runtime)
+
+    pool = OhmoSessionRuntimePool(
+        cwd=tmp_path,
+        workspace=workspace,
+        provider_profile=initial_profile,
+    )
+    bundle_a = await pool.get_bundle("session-a", cwd=tmp_path)
+    bundle_b = await pool.get_bundle("session-b", cwd=tmp_path)
+    old_b_session_id = bundle_b.session_id
+
+    updates = [
+        update
+        async for update in pool.stream_message(
+            InboundMessage(
+                channel="feishu",
+                sender_id="u1",
+                chat_id="a",
+                content=f"/{command_name} {args}",
+            ),
+            "session-a",
+        )
+    ]
+
+    assert updates[-1].text.startswith("ohmo gateway")
+    assert pool._bundles["session-a"] is not bundle_a
+    assert "sess-0" in close_calls
+
+    refreshed_b = await pool.get_bundle("session-b", latest_user_prompt="next", cwd=tmp_path)
+    assert refreshed_b is not bundle_b
+    assert refreshed_b.session_id == old_b_session_id
+    assert build_calls[-1]["active_profile"] == expected_profile
+    assert build_calls[-1]["cwd"] == str(tmp_path)
+    assert build_calls[-1]["restore_messages"] == [
+        ConversationMessage.from_user_text("before-1").model_dump(mode="json")
+    ]
+    assert build_calls[-1]["restore_tool_metadata"]["preserved"] == "1"
+    assert "sess-1" in close_calls
+
+    same_bundle = refreshed_b
+    _ = pool._handle_gateway_scoped_command(command_name, "show")
+    assert await pool.get_bundle("session-b", cwd=tmp_path) is same_bundle
 
 
 @pytest.mark.asyncio
