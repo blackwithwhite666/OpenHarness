@@ -12,7 +12,7 @@ import re
 import string
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from datetime import UTC, date, datetime
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 from ohmo.contact_registry import ContactStore
@@ -244,7 +244,7 @@ def _trusted_utc_iso(value: object) -> str | None:
     try:
         if timestamp.tzinfo is None or timestamp.utcoffset() is None:
             return None
-        return timestamp.astimezone(UTC).isoformat()
+        return timestamp.astimezone(timezone.utc).isoformat()
     except (OverflowError, ValueError):
         return None
 

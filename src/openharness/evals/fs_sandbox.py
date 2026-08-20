@@ -384,7 +384,7 @@ class FsSandboxBashTool(BaseTool):
                     process.communicate(),
                     timeout=self._timeout,
                 )
-            except TimeoutError:
+            except asyncio.TimeoutError:
                 process.kill()
                 await process.wait()
                 return ToolResult(

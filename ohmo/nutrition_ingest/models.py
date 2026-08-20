@@ -6,7 +6,7 @@ import hashlib
 import json
 import re
 from datetime import datetime
-from enum import StrEnum
+from enum import Enum
 from pathlib import Path
 from typing import Any, Literal
 
@@ -218,7 +218,7 @@ def parse_manifest(manifest_path: str | Path, configured_root: str | Path) -> Ma
     return manifest
 
 
-class ResultState(StrEnum):
+class ResultState(str, Enum):
     discovered = "discovered"
     classified = "classified"
     published = "published"
@@ -234,6 +234,9 @@ class ResultState(StrEnum):
     dead_letter = "dead_letter"
     skipped = "skipped"
     seen = "seen"
+
+    def __str__(self) -> str:
+        return self.value
 
 
 SkipReason = Literal["exif_missing", "exif_ambiguous", "exif_invalid", "exif_stale"]

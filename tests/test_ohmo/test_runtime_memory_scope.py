@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import ClassVar
@@ -137,7 +137,7 @@ def _message() -> InboundMessage:
         chat_id="100",
         content="What did I eat today?",
         metadata={"message_id": 0, "chat_type": "p2p"},
-        timestamp=datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC),
+        timestamp=datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc),
     )
 
 
@@ -874,7 +874,7 @@ def test_runtime_memory_turn_metadata_normalizes_forward_provenance() -> None:
         sender_id="100|owner",
         chat_id="100",
         content="forwarded",
-        timestamp=datetime(2026, 7, 31, 19, 30, tzinfo=UTC),
+        timestamp=datetime(2026, 7, 31, 19, 30, tzinfo=timezone.utc),
         metadata={
             "is_group": False,
             "is_forwarded": True,
@@ -1079,7 +1079,7 @@ def test_runtime_memory_turn_metadata_timestamp_fallback_is_isoformat(tmp_path: 
         chat_id="100",
         content="What did I eat today?",
         metadata={"chat_type": "p2p"},
-        timestamp=datetime(2026, 2, 1, 2, 3, 4, tzinfo=UTC),
+        timestamp=datetime(2026, 2, 1, 2, 3, 4, tzinfo=timezone.utc),
     )
     assert _message_identity_for_turn(message) == "2026-02-01T02:03:04+00:00"
 

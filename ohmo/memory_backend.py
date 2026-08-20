@@ -829,7 +829,7 @@ class ShadowMemoryBackend(MemoryBackend):
                 timeout=timeout,
             )
             honcho_latency_ms = (perf_counter() - started) * 1_000
-        except TimeoutError:
+        except asyncio.TimeoutError:
             logger.warning("ohmo visible Honcho recall timed out")
             return None
         except Exception:  # noqa: BLE001 - derived recall is additive only

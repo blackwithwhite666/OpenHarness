@@ -183,7 +183,7 @@ class SubprocessVoiceTranscriber:
         except asyncio.CancelledError:
             await self._terminate_child(proc)
             raise
-        except TimeoutError as exc:
+        except asyncio.TimeoutError as exc:
             await self._terminate_child(proc)
             raise _error(
                 "transcription timed out",
@@ -325,7 +325,7 @@ class RetryingVoiceTranscriber:
                     max(0.0, self._clock() - attempt_started),
                 )
                 raise
-            except TimeoutError:
+            except asyncio.TimeoutError:
                 error = _error("transcription timed out", error_class="timeout", retryable=True)
                 last_error = error
                 self._log_attempt(attempt, attempt_started, error)

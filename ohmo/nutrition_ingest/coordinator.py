@@ -13,7 +13,7 @@ import stat
 from collections import Counter
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -166,7 +166,7 @@ class NutritionIngestCoordinator:
             )
         self._estimate = estimate
         self._metrics = metrics or NutritionMetrics()
-        self._now = now or (lambda: datetime.now(UTC))
+        self._now = now or (lambda: datetime.now(timezone.utc))
         self._current_time()
         self._lock = asyncio.Lock()
         self._running = False
