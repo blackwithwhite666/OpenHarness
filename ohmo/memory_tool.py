@@ -211,7 +211,7 @@ async def _search_memory(query: str, top_k: int) -> ToolResult:
 
     try:
         stdout, _ = await asyncio.wait_for(process.communicate(), timeout=30)
-    except TimeoutError:
+    except asyncio.TimeoutError:
         with suppress(Exception):
             process.kill()
             await process.wait()

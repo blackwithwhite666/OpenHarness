@@ -319,7 +319,7 @@ class SynthesizedFixtureTool(ReplayFixtureTool):
                     process.communicate(payload),
                     timeout=self._exec_timeout,
                 )
-            except TimeoutError:
+            except asyncio.TimeoutError:
                 process.kill()
                 await process.wait()
                 return None
