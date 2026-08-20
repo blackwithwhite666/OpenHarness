@@ -622,6 +622,7 @@ class OhmoSessionRuntimePool:
         self._reminder_store = ReminderStore(workspace=self._workspace)
         self._reminder_lock = asyncio.Lock()
         self._bundles: dict[str, RuntimeBundle] = {}
+        self._gateway_config_generation = 0
         self._session_owner_principals: dict[str, str | None] = {}
         reaped = reap_stale_work_dirs(self._workspace)
         if reaped:
@@ -666,6 +667,7 @@ class OhmoSessionRuntimePool:
         if result[1]:
             self._gateway_config = load_gateway_config(self._workspace)
             self._provider_profile = self._gateway_config.provider_profile
+            self._gateway_config_generation += 1
         return result
 
     async def get_bundle(
@@ -690,6 +692,21 @@ class OhmoSessionRuntimePool:
                 )
                 await close_runtime(bundle)
                 self._bundles.pop(session_key, None)
+            elif (
+                getattr(bundle, "_gateway_config_generation", self._gateway_config_generation)
+                != self._gateway_config_generation
+            ):
+                logger.info(
+                    "ohmo runtime lazily refreshing stale gateway configuration session_key=%s session_id=%s",
+                    session_key,
+                    bundle.session_id,
+                )
+                return await self._refresh_bundle(
+                    session_key,
+                    bundle,
+                    latest_user_prompt,
+                    include_todo=include_todo,
+                )
             else:
                 logger.info(
                     "ohmo runtime reusing session session_key=%s session_id=%s prompt=%r",
@@ -758,6 +775,7 @@ class OhmoSessionRuntimePool:
         )
         if hasattr(bundle.engine, "set_cache_key"):
             bundle.engine.set_cache_key(bundle.session_id)
+        setattr(bundle, "_gateway_config_generation", self._gateway_config_generation)
         logger.info(
             "ohmo runtime started session_key=%s session_id=%s restored_messages=%s",
             session_key,
@@ -1987,6 +2005,7 @@ class OhmoSessionRuntimePool:
         )
         if hasattr(refreshed.engine, "set_cache_key"):
             refreshed.engine.set_cache_key(refreshed.session_id)
+        setattr(refreshed, "_gateway_config_generation", self._gateway_config_generation)
         self._bundles[session_key] = refreshed
         logger.info(
             "ohmo runtime refreshed session_key=%s session_id=%s message_count=%s",

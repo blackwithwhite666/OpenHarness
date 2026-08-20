@@ -90,6 +90,16 @@ def _is_trusted_suppressed_reminder_turn(message: InboundMessage) -> bool:
     )
 
 
+def _is_trusted_synthetic_reminder_turn(message: InboundMessage) -> bool:
+    """True only for a scheduler-originated synthetic reminder turn."""
+    metadata = message.metadata or {}
+    return (
+        message.sender_id == "__scheduler__"
+        and bool(metadata.get("_synthetic"))
+        and bool(metadata.get("_reminder_id"))
+    )
+
+
 _ASK_RE = re.compile(r"\[\[\s*ask\s*:\s*([^\]]+?)\s*\]\]", re.IGNORECASE)
 
 
@@ -665,6 +675,7 @@ class OhmoGatewayBridge:
         # NO final reply to message.chat_id — recipient data must not reach the
         # creator's chat.
         suppress_output = _is_trusted_suppressed_reminder_turn(message)
+        suppress_standalone_no_reply = _is_trusted_synthetic_reminder_turn(message)
         try:
             reply = ""
             final_media: list[str] = []
@@ -740,6 +751,15 @@ class OhmoGatewayBridge:
                 message.channel,
                 message.chat_id,
                 session_key,
+            )
+            return
+        if suppress_standalone_no_reply and reply.strip() == "NO_REPLY":
+            logger.info(
+                "ohmo suppressed standalone NO_REPLY for synthetic reminder turn channel=%s chat_id=%s session_key=%s reminder_id=%s",
+                message.channel,
+                message.chat_id,
+                session_key,
+                message.metadata.get("_reminder_id"),
             )
             return
         if suppress_output:
