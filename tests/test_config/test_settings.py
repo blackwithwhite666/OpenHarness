@@ -1034,10 +1034,11 @@ class TestOpenRouterProvider:
         settings = Settings(active_profile="openrouter").materialize_active_profile()
         assert _infer_profile_name_from_flat_settings(settings) == "openrouter"
 
-    def test_auth_manager_reports_openrouter_status(self, monkeypatch):
+    def test_auth_manager_reports_openrouter_status(self, monkeypatch, tmp_path):
         from openharness.auth.manager import AuthManager
 
         self._clear_env(monkeypatch)
+        monkeypatch.setenv("OPENHARNESS_CONFIG_DIR", str(tmp_path))
         manager = AuthManager(Settings(active_profile="openrouter"))
 
         missing = manager.get_auth_status()["openrouter"]
