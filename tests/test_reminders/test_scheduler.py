@@ -186,7 +186,7 @@ async def test_agentic_publishes_inbound() -> None:
     assert len(bus.inbound) == 1
     msg = bus.inbound[0]
     assert msg.sender_id == "__scheduler__"
-    assert msg.session_key_override == "telegram:100"
+    assert msg.session_key_override == "telegram:reminder:r1"
     assert msg.metadata["_synthetic"] is True
     assert msg.content == "ping-r1"
     # The creator is carried so a tool fired from this synthetic turn can sign
@@ -211,11 +211,26 @@ async def test_auto_wellness_agentic_keeps_current_chat_delivery() -> None:
 
     assert len(bus.inbound) == 1
     msg = bus.inbound[0]
-    assert msg.session_key_override == "telegram:100"
+    assert msg.session_key_override == "telegram:reminder:r1"
     assert msg.metadata["_reminder_wellness_principal"] == "100|dmitry"
     assert msg.metadata["_reminder_wellness_tenant"] == "owner"
     assert "_reminder_recipient_chat_id" not in msg.metadata
     assert "_suppress_bridge_output" not in msg.metadata
+
+
+async def test_due_agentic_reminders_same_chat_use_distinct_sessions() -> None:
+    store = ReminderStore()
+    store.add(_reminder("r1", mode="agentic"))
+    store.add(_reminder("r2", mode="agentic"))
+    bus = FakeBus()
+    sched = _make_scheduler(bus, store)
+
+    await sched.fire_due()
+
+    assert [msg.session_key_override for msg in bus.inbound] == [
+        "telegram:reminder:r1",
+        "telegram:reminder:r2",
+    ]
 
 
 async def test_bound_agentic_uses_isolated_session_and_trusted_metadata() -> None:

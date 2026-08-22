@@ -9,6 +9,7 @@ import logging
 import math
 import platform
 import random
+from collections import Counter
 from collections.abc import Awaitable, Callable
 from contextlib import AsyncExitStack
 from typing import Any, AsyncIterator, TypeVar
@@ -40,6 +41,21 @@ JWT_CLAIM_PATH = "https://api.openai.com/auth"
 MAX_RETRIES = 5
 BASE_DELAY_SECONDS = 1.0
 MAX_DELAY_SECONDS = 30.0
+_MAX_DIAGNOSTIC_LABELS = 16
+_MAX_DIAGNOSTIC_COUNT = 1000
+_DIAGNOSTIC_EVENT_TYPES = frozenset({
+    "response.completed",
+    "response.failed",
+    "response.in_progress",
+    "response.output_item.added",
+    "response.output_item.done",
+    "response.output_text.delta",
+    "response.reasoning_summary_text.done",
+    "error",
+})
+_DIAGNOSTIC_ITEM_TYPES = frozenset({"function_call", "message", "reasoning"})
+_DIAGNOSTIC_CONTENT_TYPES = frozenset({"output_text", "refusal", "reasoning"})
+_DIAGNOSTIC_STATUSES = frozenset({"completed", "failed", "incomplete", "in_progress", "cancelled"})
 
 _T = TypeVar("_T")
 
@@ -215,6 +231,79 @@ def _stop_reason_from_response(response: dict[str, Any], *, has_tool_calls: bool
     return None
 
 
+def _diagnostic_label(value: Any, allowed: frozenset[str]) -> str:
+    return value if isinstance(value, str) and value in allowed else "other"
+
+
+def _bounded_count(counter: Counter[str], label: str) -> None:
+    if len(counter) < _MAX_DIAGNOSTIC_LABELS or label in counter:
+        counter[label] = min(counter[label] + 1, _MAX_DIAGNOSTIC_COUNT)
+
+
+def _empty_response_diagnostics(
+    response: dict[str, Any],
+    *,
+    event_types: Counter[str],
+    stop_reason: str | None,
+) -> dict[str, Any]:
+    output_item_types: Counter[str] = Counter()
+    message_content_types: Counter[str] = Counter()
+    has_output_text = False
+    has_refusal = False
+    has_function_call = False
+    output = response.get("output")
+    if isinstance(output, list):
+        for item in output[:_MAX_DIAGNOSTIC_LABELS]:
+            if not isinstance(item, dict):
+                _bounded_count(output_item_types, "other")
+                continue
+            item_type = _diagnostic_label(item.get("type"), _DIAGNOSTIC_ITEM_TYPES)
+            _bounded_count(output_item_types, item_type)
+            if item_type == "function_call":
+                has_function_call = True
+            if item_type != "message":
+                continue
+            content = item.get("content")
+            if not isinstance(content, list):
+                continue
+            for block in content[:_MAX_DIAGNOSTIC_LABELS]:
+                if not isinstance(block, dict):
+                    _bounded_count(message_content_types, "other")
+                    continue
+                block_type = _diagnostic_label(block.get("type"), _DIAGNOSTIC_CONTENT_TYPES)
+                _bounded_count(message_content_types, block_type)
+                if block_type == "output_text" and isinstance(block.get("text"), str):
+                    has_output_text |= bool(block["text"].strip())
+                elif block_type == "refusal" and isinstance(block.get("refusal"), str):
+                    has_refusal |= bool(block["refusal"].strip())
+
+    usage = _usage_from_response(response)
+    response_id = response.get("id")
+    safe_response_id = (
+        response_id
+        if isinstance(response_id, str)
+        and len(response_id) <= 128
+        and all(char.isalnum() or char in "._:-" for char in response_id)
+        else None
+    )
+    return {
+        "response_id": safe_response_id,
+        "status": _diagnostic_label(response.get("status"), _DIAGNOSTIC_STATUSES),
+        "stop_reason": stop_reason,
+        "event_types": dict(event_types),
+        "output_item_types": dict(output_item_types),
+        "message_content_types": dict(message_content_types),
+        "has_output_text": has_output_text,
+        "has_refusal": has_refusal,
+        "has_function_call": has_function_call,
+        "usage": {
+            "input_tokens": usage.input_tokens,
+            "output_tokens": usage.output_tokens,
+            "cached_input_tokens": usage.cached_input_tokens,
+        },
+    }
+
+
 def _format_error_message(status_code: int, payload: str) -> str:
     try:
         parsed = json.loads(payload)
@@ -370,6 +459,7 @@ class CodexApiClient:
         content: list[TextBlock | ToolUseBlock] = []
         current_text_parts: list[str] = []
         completed_response: dict[str, Any] | None = None
+        event_types: Counter[str] = Counter()
 
         headers = _build_codex_headers(self._auth_token)
         async with AsyncExitStack() as client_stack:
@@ -403,6 +493,7 @@ class CodexApiClient:
                         break
 
                     event_type = event.get("type")
+                    _bounded_count(event_types, _diagnostic_label(event_type, _DIAGNOSTIC_EVENT_TYPES))
                     if event_type == "response.output_text.delta":
                         delta = event.get("delta")
                         if isinstance(delta, str) and delta:
@@ -470,6 +561,18 @@ class CodexApiClient:
             completed_response or {},
             has_tool_calls=bool(final_message.tool_uses),
         )
+        if final_message.is_effectively_empty():
+            diagnostics = _empty_response_diagnostics(
+                completed_response or {},
+                event_types=event_types,
+                stop_reason=stop_reason,
+            )
+            diagnostic_json = json.dumps(diagnostics, sort_keys=True, separators=(",", ":"))
+            log.warning(
+                "codex empty assistant response metadata=%s",
+                diagnostic_json,
+                extra={"codex_empty_response": diagnostics},
+            )
         yield ApiMessageCompleteEvent(
             message=final_message,
             usage=usage,
