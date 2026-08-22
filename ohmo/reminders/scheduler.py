@@ -196,6 +196,7 @@ class ReminderScheduler:
         )
 
     async def _deliver_agentic(self, reminder: Reminder) -> None:
+        session_key = f"{reminder.channel}:reminder:{reminder.id}"
         if reminder.recipient_chat_id is not None:
             # Recipient-bound reminder: run the turn in a reminder-specific
             # isolated session (NEVER the creator's or the recipient's chat
@@ -204,7 +205,6 @@ class ReminderScheduler:
             # send_telegram_message to the fixed recipient; progress/final
             # replies are suppressed by the bridge so recipient wellness/tool
             # results can never leak into the creator's interactive session.
-            session_key = f"{reminder.channel}:reminder:{reminder.id}"
             metadata = {
                 "_synthetic": True,
                 "_reminder_id": reminder.id,
@@ -216,8 +216,8 @@ class ReminderScheduler:
                 "_suppress_bridge_output": True,
             }
         else:
-            # Legacy this-chat reminder: unchanged session + output behavior.
-            session_key = reminder.session_key
+            # Legacy this-chat reminder: preserve output behavior while
+            # isolating each synthetic turn from other reminders.
             metadata = {
                 "_synthetic": True,
                 "_reminder_id": reminder.id,

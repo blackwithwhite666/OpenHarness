@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 from typing import Any
 
@@ -132,6 +133,135 @@ def _codex_request() -> ApiMessageRequest:
 
 async def _collect_stream(client: CodexApiClient, request: ApiMessageRequest) -> list[Any]:
     return [event async for event in client.stream_message(request)]
+
+
+def _empty_response_events(response: dict[str, Any]) -> list[str]:
+    return [
+        'data: {"type":"response.reasoning_summary_text.done"}',
+        "",
+        f"data: {json.dumps({'type': 'response.completed', 'response': response})}",
+        "",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_codex_empty_reasoning_response_logs_safe_shape(monkeypatch, caplog):
+    sink: dict[str, Any] = {}
+    response = {"id": "resp_safe", "status": "completed", "output": [{"type": "reasoning"}], "usage": {"input_tokens": 4, "output_tokens": 0}}
+    monkeypatch.setattr(
+        "openharness.api.codex_client.httpx.AsyncClient",
+        lambda *args, **kwargs: _FakeAsyncClient(_FakeStreamResponse(lines=_empty_response_events(response)), sink),
+    )
+
+    with caplog.at_level(logging.WARNING, logger="openharness.api.codex_client"):
+        events = await _collect_stream(CodexApiClient(_fake_codex_token()), _codex_request())
+
+    record = next(record for record in caplog.records if record.message.startswith("codex empty assistant response"))
+    metadata = record.codex_empty_response
+    rendered_metadata = json.loads(record.message.split(" metadata=", 1)[1])
+    assert rendered_metadata["response_id"] == "resp_safe"
+    assert '"has_output_text":false' in record.message
+    assert metadata["response_id"] == "resp_safe"
+    assert metadata["status"] == "completed"
+    assert metadata["stop_reason"] == "stop"
+    assert metadata["output_item_types"] == {"reasoning": 1}
+    assert metadata["has_output_text"] is False
+    assert metadata["has_refusal"] is False
+    assert metadata["has_function_call"] is False
+    assert metadata["usage"] == {"input_tokens": 4, "output_tokens": 0, "cached_input_tokens": 0}
+    assert events[-1].message.content == []
+
+
+@pytest.mark.asyncio
+async def test_codex_unassembled_completed_output_text_is_diagnosed_without_recovery(monkeypatch, caplog):
+    sink: dict[str, Any] = {}
+    response = {
+        "id": "resp_text",
+        "status": "completed",
+        "output": [{"type": "message", "content": [{"type": "output_text", "text": "secret text"}]}],
+    }
+    monkeypatch.setattr(
+        "openharness.api.codex_client.httpx.AsyncClient",
+        lambda *args, **kwargs: _FakeAsyncClient(_FakeStreamResponse(lines=_empty_response_events(response)), sink),
+    )
+
+    with caplog.at_level(logging.WARNING, logger="openharness.api.codex_client"):
+        events = await _collect_stream(CodexApiClient(_fake_codex_token()), _codex_request())
+
+    record = next(record for record in caplog.records if record.message.startswith("codex empty assistant response"))
+    assert record.codex_empty_response["has_output_text"] is True
+    assert events[-1].message.content == []
+
+
+@pytest.mark.asyncio
+async def test_codex_empty_response_log_is_bounded_and_does_not_contain_sensitive_values(monkeypatch, caplog):
+    sink: dict[str, Any] = {}
+    unknown = "evil-type-with-sensitive-argument"
+    response = {
+        "id": "resp_sensitive",
+        "status": "completed",
+        "output": [
+            {
+                "type": "message",
+                "content": [
+                    {"type": unknown, "refusal": "unknown private value"},
+                    {"type": "refusal", "refusal": "private refusal"},
+                ],
+            },
+            {"type": "function_call", "arguments": "private arguments"},
+        ],
+    }
+    lines = [f'data: {json.dumps({"type": unknown})}', "", *_empty_response_events(response)]
+    monkeypatch.setattr(
+        "openharness.api.codex_client.httpx.AsyncClient",
+        lambda *args, **kwargs: _FakeAsyncClient(_FakeStreamResponse(lines=lines), sink),
+    )
+
+    with caplog.at_level(logging.WARNING, logger="openharness.api.codex_client"):
+        await _collect_stream(CodexApiClient(_fake_codex_token()), _codex_request())
+
+    record = next(record for record in caplog.records if record.message.startswith("codex empty assistant response"))
+    metadata = record.codex_empty_response
+    rendered = caplog.text
+    assert "private refusal" not in rendered
+    assert "private arguments" not in rendered
+    assert unknown not in rendered
+    assert metadata["event_types"] == {"other": 1, "response.reasoning_summary_text.done": 1, "response.completed": 1}
+    assert metadata["output_item_types"] == {"message": 1, "function_call": 1}
+    assert metadata["message_content_types"] == {"other": 1, "refusal": 1}
+    assert metadata["has_refusal"] is True
+    assert metadata["has_function_call"] is True
+
+
+@pytest.mark.asyncio
+async def test_codex_nonempty_response_does_not_log_empty_warning(monkeypatch, caplog):
+    sink: dict[str, Any] = {}
+    monkeypatch.setattr(
+        "openharness.api.codex_client.httpx.AsyncClient",
+        lambda *args, **kwargs: _FakeAsyncClient(_FakeStreamResponse(lines=_successful_text_lines("answer")), sink),
+    )
+
+    with caplog.at_level(logging.WARNING, logger="openharness.api.codex_client"):
+        await _collect_stream(CodexApiClient(_fake_codex_token()), _codex_request())
+
+    assert not any(record.message.startswith("codex empty assistant response") for record in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_codex_whitespace_only_response_logs_empty_warning(monkeypatch, caplog):
+    sink: dict[str, Any] = {}
+    monkeypatch.setattr(
+        "openharness.api.codex_client.httpx.AsyncClient",
+        lambda *args, **kwargs: _FakeAsyncClient(
+            _FakeStreamResponse(lines=_successful_text_lines("   ")), sink
+        ),
+    )
+
+    with caplog.at_level(logging.WARNING, logger="openharness.api.codex_client"):
+        events = await _collect_stream(CodexApiClient(_fake_codex_token()), _codex_request())
+
+    assert any(record.message.startswith("codex empty assistant response") for record in caplog.records)
+    assert events[-1].message.is_effectively_empty()
 
 
 def _successful_text_lines(*deltas: str) -> list[str]:
