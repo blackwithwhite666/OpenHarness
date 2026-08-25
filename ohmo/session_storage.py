@@ -19,6 +19,7 @@ from openharness.services.session_storage import (
 )
 from openharness.utils.fs import atomic_write_text
 
+from ohmo.attachment_store import AttachmentStore
 from ohmo.workspace import get_sessions_dir, get_work_dir
 
 
@@ -107,7 +108,11 @@ def save_session_snapshot(
     session_dir = get_session_dir(workspace)
     sid = session_id or uuid4().hex[:12]
     now = time.time()
-    messages = sanitize_conversation_messages(messages)
+    attachment_store = AttachmentStore(workspace)
+    messages = attachment_store.externalize_messages(
+        sanitize_conversation_messages(messages)
+    )
+    attachment_store.assert_externalized(messages)
     summary = ""
     for msg in messages:
         if msg.role == "user" and msg.text.strip():
@@ -138,17 +143,40 @@ def save_session_snapshot(
     return latest_path
 
 
+def _externalize_snapshot_payload(
+    payload: dict[str, Any],
+    workspace: str | Path | None,
+) -> dict[str, Any]:
+    sanitized = _sanitize_snapshot_payload(payload)
+    raw_messages = sanitized.get("messages", [])
+    if not isinstance(raw_messages, list):
+        return sanitized
+    store = AttachmentStore(workspace)
+    messages = store.externalize_messages(
+        [ConversationMessage.model_validate(item) for item in raw_messages]
+    )
+    store.assert_externalized(messages)
+    sanitized = dict(sanitized)
+    sanitized["messages"] = [message.model_dump(mode="json") for message in messages]
+    sanitized["message_count"] = len(messages)
+    return sanitized
+
+
 def load_latest(workspace: str | Path | None = None) -> dict[str, Any] | None:
     path = get_session_dir(workspace) / "latest.json"
     if not path.exists():
         return None
-    return _sanitize_snapshot_payload(json.loads(path.read_text(encoding="utf-8")))
+    return _externalize_snapshot_payload(
+        json.loads(path.read_text(encoding="utf-8")), workspace
+    )
 
 
 def load_latest_for_session_key(workspace: str | Path | None, session_key: str) -> dict[str, Any] | None:
     path = _session_key_latest_path(workspace, session_key)
     if path.exists():
-        return _sanitize_snapshot_payload(json.loads(path.read_text(encoding="utf-8")))
+        return _externalize_snapshot_payload(
+            json.loads(path.read_text(encoding="utf-8")), workspace
+        )
     return None
 
 
@@ -177,7 +205,9 @@ def list_snapshots(workspace: str | Path | None = None, limit: int = 20) -> list
 def load_by_id(workspace: str | Path | None, session_id: str) -> dict[str, Any] | None:
     path = get_session_dir(workspace) / f"session-{session_id}.json"
     if path.exists():
-        return _sanitize_snapshot_payload(json.loads(path.read_text(encoding="utf-8")))
+        return _externalize_snapshot_payload(
+            json.loads(path.read_text(encoding="utf-8")), workspace
+        )
     latest = load_latest(workspace)
     if latest and (latest.get("session_id") == session_id or session_id == "latest"):
         return latest
@@ -206,6 +236,12 @@ class OhmoSessionBackend(SessionBackend):
 
     def __init__(self, workspace: str | Path | None = None) -> None:
         self._workspace = workspace
+        self._attachment_store = AttachmentStore(workspace)
+
+    @property
+    def attachment_store(self) -> AttachmentStore:
+        """Return the store shared by snapshot and active-turn boundaries."""
+        return self._attachment_store
 
     def get_session_dir(self, cwd: str | Path) -> Path:
         return get_session_dir(self._workspace)

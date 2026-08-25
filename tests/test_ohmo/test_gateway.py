@@ -18,7 +18,13 @@ from openharness.channels.bus.queue import MessageBus
 from openharness.commands import CommandResult
 from openharness.commands.registry import SlashCommand, create_default_command_registry
 from openharness.config.settings import PermissionSettings, ProviderProfile, Settings
-from openharness.engine.messages import ConversationMessage, ImageBlock, TextBlock, ToolUseBlock
+from openharness.engine.messages import (
+    AttachmentRefBlock,
+    ConversationMessage,
+    ImageBlock,
+    TextBlock,
+    ToolUseBlock,
+)
 from openharness.engine.query_engine import QueryEngine
 from openharness.engine.stream_events import (
     AssistantTextDelta,
@@ -46,10 +52,12 @@ from ohmo.gateway.runtime import (
     OhmoSessionRuntimePool,
     _build_inbound_user_message,
     _evals_capture_enabled,
+    _event_id_for_inbound_message,
     _format_channel_progress,
     _sanitize_group_command_metadata,
     _sanitize_group_command_prompts,
 )
+from ohmo.nutrition_ingest.trust import COORDINATOR_TRUST_TOKEN
 from ohmo.gateway.service import OhmoGatewayService, gateway_status, start_gateway_process, stop_gateway_process
 from ohmo.group_registry import load_managed_group_record, save_managed_group_record
 from ohmo.memory import add_memory_entry as add_ohmo_memory_entry
@@ -1767,17 +1775,33 @@ async def test_runtime_pool_includes_media_paths_in_prompt(tmp_path, monkeypatch
     report_path = tmp_path / "report.txt"
     report_path.write_text("Quarterly summary\nRevenue up 12%\n", encoding="utf-8")
     captured: dict[str, object] = {}
+    registry = ToolRegistry()
 
     async def fake_build_runtime(**kwargs):
         class FakeEngine:
-            messages = []
-            total_usage = UsageSnapshot()
+            def __init__(self):
+                self.messages = []
+                self.total_usage = UsageSnapshot()
 
             def set_system_prompt(self, prompt):
                 return None
 
             async def submit_message(self, content):
                 captured["content"] = content
+                captured["tools_during_submit"] = {
+                    tool.name for tool in registry.list_tools()
+                }
+                self.messages.append(
+                    content.model_copy(
+                        update={
+                            "content": [
+                                block
+                                for block in content.content
+                                if not isinstance(block, ImageBlock)
+                            ]
+                        }
+                    )
+                )
                 yield AssistantTextDelta(text="done")
 
         return SimpleNamespace(
@@ -1785,9 +1809,13 @@ async def test_runtime_pool_includes_media_paths_in_prompt(tmp_path, monkeypatch
             session_id="sess123",
             current_settings=lambda: SimpleNamespace(model="gpt-5.4"),
             commands=SimpleNamespace(lookup=lambda raw: None),
+            tool_registry=registry,
         )
 
     async def fake_start_runtime(bundle):
+        captured["tools_at_start"] = {
+            tool.name for tool in bundle.tool_registry.list_tools()
+        }
         return None
 
     monkeypatch.setattr("ohmo.gateway.runtime.build_runtime", fake_build_runtime)
@@ -1802,8 +1830,17 @@ async def test_runtime_pool_includes_media_paths_in_prompt(tmp_path, monkeypatch
         media=[str(image_path), str(report_path)],
     )
     updates = [u async for u in pool.stream_message(message, "feishu:c1")]
+    bundle = pool._bundles["feishu:c1"]
 
     assert updates[-1].text == "done"
+    assert "load_conversation_image" not in captured["tools_at_start"]
+    assert "load_conversation_image" in captured["tools_during_submit"]
+    assert bundle.tool_registry.get("load_conversation_image") is not None
+    assert any(
+        isinstance(block, AttachmentRefBlock)
+        for item in bundle.engine.messages
+        for block in item.content
+    )
     submitted = captured["content"]
     assert isinstance(submitted, ConversationMessage)
     assert any(isinstance(block, ImageBlock) for block in submitted.content)
@@ -1912,6 +1949,39 @@ def test_runtime_pool_includes_group_speaker_context():
     assert "Tang Jiabin" in text
     assert "Sender id: ou_123" in text
     assert "请帮我看一下" in text
+
+
+def test_inbound_event_id_uses_channel_message_id_and_trusted_nutrition_candidate() -> None:
+    ordinary = InboundMessage(
+        channel="telegram",
+        sender_id="42",
+        chat_id="42",
+        content="hello",
+        metadata={"message_id": 123},
+    )
+    candidate = "dropbox-camera-v1-" + "a" * 64
+    nutrition = InboundMessage(
+        channel="telegram",
+        sender_id="__nutrition_ingest__",
+        chat_id="42",
+        content="estimate",
+        session_key_override="telegram:42",
+        metadata={
+            "_nutrition_trusted": True,
+            "_nutrition_trust_token": COORDINATOR_TRUST_TOKEN,
+            "_nutrition_candidate_id": candidate,
+            "_nutrition_client_op_id": f"{candidate}:meal-observation:v1",
+            "_nutrition_phase": "estimation",
+            "_nutrition_principal": "42",
+            "_nutrition_tenant_id": "marina",
+            "_nutrition_chat_id": "42",
+            "_nutrition_session_key": "telegram:42",
+        },
+    )
+
+    assert _event_id_for_inbound_message(ordinary) == _event_id_for_inbound_message(ordinary)
+    assert _event_id_for_inbound_message(ordinary).startswith("ohmo-event-")
+    assert _event_id_for_inbound_message(nutrition) == f"ohmo-nutrition-{candidate}"
 
 
 @pytest.mark.asyncio

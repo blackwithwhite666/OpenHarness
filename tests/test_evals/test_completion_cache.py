@@ -68,6 +68,42 @@ def test_key_changes_with_message_content():
     assert request_cache_key(_req("a")) != request_cache_key(_req("b"))
 
 
+def test_key_ignores_event_id_but_keeps_visible_message_sensitivity():
+    without_event_id = _req("same visible text")
+    event_one = ApiMessageRequest(
+        model="m",
+        messages=[
+            ConversationMessage.from_user_text("same visible text").model_copy(
+                update={"event_id": "event-1"}
+            )
+        ],
+        system_prompt="s",
+    )
+    event_two = ApiMessageRequest(
+        model="m",
+        messages=[
+            ConversationMessage.from_user_text("same visible text").model_copy(
+                update={"event_id": "event-2"}
+            )
+        ],
+        system_prompt="s",
+    )
+    changed_text = ApiMessageRequest(
+        model="m",
+        messages=[
+            ConversationMessage.from_user_text("different visible text").model_copy(
+                update={"event_id": "event-1"}
+            )
+        ],
+        system_prompt="s",
+    )
+
+    assert event_one.messages[0].model_dump(mode="json")["event_id"] == "event-1"
+    assert request_cache_key(without_event_id) == request_cache_key(event_one)
+    assert request_cache_key(event_one) == request_cache_key(event_two)
+    assert request_cache_key(event_one) != request_cache_key(changed_text)
+
+
 def test_key_ignores_tool_dict_ordering_but_not_list_order():
     a = _req("x", tools=[{"a": 1, "b": 2}])
     b = _req("x", tools=[{"b": 2, "a": 1}])

@@ -32,7 +32,15 @@ from openharness.api.errors import (
     is_quota_error_message,
 )
 from openharness.api.usage import UsageSnapshot
-from openharness.engine.messages import ConversationMessage, ImageBlock, TextBlock, ToolResultBlock, ToolUseBlock
+from openharness.engine.messages import (
+    AttachmentRefBlock,
+    ConversationMessage,
+    ImageBlock,
+    TextBlock,
+    ToolResultBlock,
+    ToolUseBlock,
+    attachment_ref_placeholder,
+)
 
 log = logging.getLogger(__name__)
 
@@ -130,6 +138,10 @@ def _convert_messages_to_codex(messages: list[ConversationMessage]) -> list[dict
             for block in msg.content:
                 if isinstance(block, TextBlock) and block.text.strip():
                     user_content.append({"type": "input_text", "text": block.text})
+                elif isinstance(block, AttachmentRefBlock):
+                    user_content.append(
+                        {"type": "input_text", "text": attachment_ref_placeholder(block)}
+                    )
                 elif isinstance(block, ImageBlock):
                     user_content.append({
                         "type": "input_image",

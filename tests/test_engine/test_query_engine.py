@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -14,6 +15,7 @@ from openharness.api.errors import RequestFailure
 from openharness.api.usage import UsageSnapshot
 from openharness.config.settings import PermissionSettings, Settings
 from openharness.engine.messages import (
+    AttachmentRefBlock,
     ConversationMessage,
     ImageBlock,
     TextBlock,
@@ -134,6 +136,184 @@ class RecordingApiClient:
             usage=UsageSnapshot(input_tokens=1, output_tokens=1),
             stop_reason=None,
         )
+
+
+class FailingApiClient:
+    async def stream_message(self, request):
+        del request
+        raise RuntimeError("provider failed")
+        yield  # pragma: no cover
+
+
+def _externalize_test_images(
+    messages: list[ConversationMessage],
+) -> list[ConversationMessage]:
+    durable: list[ConversationMessage] = []
+    for message in messages:
+        blocks = [
+            AttachmentRefBlock(
+                attachment_id="a" * 64,
+                media_type=block.media_type,
+                byte_size=3,
+                label="test.png",
+            )
+            if isinstance(block, ImageBlock)
+            else block
+            for block in message.content
+        ]
+        durable.append(message.model_copy(update={"content": blocks}))
+    return durable
+
+
+@pytest.mark.asyncio
+async def test_query_engine_same_event_id_retries_without_duplicate_user_turn(
+    tmp_path: Path,
+) -> None:
+    client = RecordingApiClient()
+    engine = QueryEngine(
+        api_client=client,
+        tool_registry=ToolRegistry(),
+        permission_checker=PermissionChecker(PermissionSettings(mode=PermissionMode.FULL_AUTO)),
+        cwd=tmp_path,
+        model="claude-test",
+        system_prompt="system",
+        supports_native_images=True,
+        durable_message_transform=_externalize_test_images,
+    )
+    inbound = ConversationMessage(
+        role="user",
+        event_id="event-123",
+        content=[TextBlock(text="meal"), ImageBlock(media_type="image/png", data="YWJj")],
+    )
+
+    for _ in range(5):
+        _ = [event async for event in engine.submit_message(inbound)]
+
+    users = [message for message in engine.messages if message.role == "user"]
+    assert len(users) == 1
+    assert users[0].event_id == "event-123"
+    assert isinstance(users[0].content[-1], AttachmentRefBlock)
+    assert all(
+        any(isinstance(block, ImageBlock) for block in request.messages[0].content)
+        for request in client.requests
+    )
+
+
+@pytest.mark.asyncio
+async def test_query_engine_text_turn_has_ref_but_zero_historical_images(
+    tmp_path: Path,
+) -> None:
+    client = RecordingApiClient()
+    engine = QueryEngine(
+        api_client=client,
+        tool_registry=ToolRegistry(),
+        permission_checker=PermissionChecker(PermissionSettings(mode=PermissionMode.FULL_AUTO)),
+        cwd=tmp_path,
+        model="claude-test",
+        system_prompt="system",
+        supports_native_images=True,
+        durable_message_transform=_externalize_test_images,
+    )
+
+    _ = [
+        event
+        async for event in engine.submit_message(
+            ConversationMessage(
+                role="user",
+                event_id="image-event",
+                content=[ImageBlock(media_type="image/png", data="YWJj")],
+            )
+        )
+    ]
+    _ = [
+        event
+        async for event in engine.submit_message(
+            ConversationMessage.from_user_text("what next?").model_copy(
+                update={"event_id": "text-event"}
+            )
+        )
+    ]
+
+    second_request = client.requests[1]
+    assert all(
+        not isinstance(block, ImageBlock)
+        for message in second_request.messages
+        for block in message.content
+    )
+    assert any(
+        isinstance(block, AttachmentRefBlock)
+        for message in second_request.messages
+        for block in message.content
+    )
+
+
+@pytest.mark.asyncio
+async def test_query_engine_error_path_externalizes_active_image(tmp_path: Path) -> None:
+    engine = QueryEngine(
+        api_client=FailingApiClient(),
+        tool_registry=ToolRegistry(),
+        permission_checker=PermissionChecker(PermissionSettings(mode=PermissionMode.FULL_AUTO)),
+        cwd=tmp_path,
+        model="claude-test",
+        system_prompt="system",
+        supports_native_images=True,
+        durable_message_transform=_externalize_test_images,
+    )
+
+    events = [
+        event
+        async for event in engine.submit_message(
+            ConversationMessage(
+                role="user",
+                event_id="failed-image-event",
+                content=[ImageBlock(media_type="image/png", data="YWJj")],
+            )
+        )
+    ]
+
+    assert any(isinstance(event, ErrorEvent) for event in events)
+    assert all(
+        not isinstance(block, ImageBlock)
+        for message in engine.messages
+        for block in message.content
+    )
+    assert isinstance(engine.messages[0].content[0], AttachmentRefBlock)
+
+
+@pytest.mark.asyncio
+async def test_query_engine_rejects_stale_event_retry_after_later_user_turn(
+    tmp_path: Path,
+) -> None:
+    engine = QueryEngine(
+        api_client=RecordingApiClient(),
+        tool_registry=ToolRegistry(),
+        permission_checker=PermissionChecker(PermissionSettings(mode=PermissionMode.FULL_AUTO)),
+        cwd=tmp_path,
+        model="claude-test",
+        system_prompt="system",
+    )
+    _ = [
+        event
+        async for event in engine.submit_message(
+            ConversationMessage.from_user_text("first").model_copy(update={"event_id": "one"})
+        )
+    ]
+    _ = [
+        event
+        async for event in engine.submit_message(
+            ConversationMessage.from_user_text("second").model_copy(update={"event_id": "two"})
+        )
+    ]
+
+    with pytest.raises(ValueError, match="stale event_id"):
+        _ = [
+            event
+            async for event in engine.submit_message(
+                ConversationMessage.from_user_text("first retry").model_copy(
+                    update={"event_id": "one"}
+                )
+            )
+        ]
 
 
 class MaxTokensTooLargeThenSuccessApiClient:
@@ -1550,6 +1730,122 @@ class _BoomTool(BaseTool):
     async def execute(self, arguments: BaseModel, context: ToolExecutionContext) -> ToolResult:
         del arguments, context
         raise RuntimeError("boom")
+
+
+class _LoadConversationImageTool(BaseTool):
+    name = "load_conversation_image"
+    description = "Test-only trusted conversation image loader."
+    input_model = _OkInput
+
+    def is_read_only(self, arguments: BaseModel) -> bool:
+        return True
+
+    async def execute(self, arguments: BaseModel, context: ToolExecutionContext) -> ToolResult:
+        del arguments, context
+        return ToolResult(
+            output="Loaded conversation image aaaaaaaaaaaa (image/png, 3 bytes).",
+            metadata={
+                "attachment_id": "a" * 64,
+                "media_type": "image/png",
+                "byte_size": 3,
+                "_openharness_transient_image": ImageBlock(
+                    media_type="image/png",
+                    data="YWJj",
+                ),
+            },
+        )
+
+
+@pytest.mark.asyncio
+async def test_exact_conversation_image_tool_adds_transient_image_for_next_request_only(
+    tmp_path: Path,
+) -> None:
+    client = FakeApiClient(
+        [
+            _FakeResponse(
+                message=ConversationMessage(
+                    role="assistant",
+                    content=[
+                        ToolUseBlock(
+                            id="toolu_image",
+                            name="load_conversation_image",
+                            input={},
+                        )
+                    ],
+                ),
+                usage=UsageSnapshot(input_tokens=1, output_tokens=1),
+            ),
+            _FakeResponse(
+                message=ConversationMessage.from_user_text("loaded").model_copy(
+                    update={"role": "assistant"}
+                ),
+                usage=UsageSnapshot(input_tokens=1, output_tokens=1),
+            ),
+        ]
+    )
+    requests = []
+    original_stream = client.stream_message
+
+    async def recording_stream(request):
+        requests.append(request)
+        async for event in original_stream(request):
+            yield event
+
+    client.stream_message = recording_stream
+    registry = ToolRegistry()
+    registry.register(_LoadConversationImageTool())
+    engine = QueryEngine(
+        api_client=client,
+        tool_registry=registry,
+        permission_checker=PermissionChecker(PermissionSettings(mode=PermissionMode.FULL_AUTO)),
+        cwd=tmp_path,
+        model="claude-test",
+        system_prompt="system",
+        supports_native_images=True,
+        durable_message_transform=_externalize_test_images,
+    )
+    engine.load_messages(
+        [
+            ConversationMessage(
+                role="user",
+                content=[
+                    AttachmentRefBlock(
+                        attachment_id="a" * 64,
+                        media_type="image/png",
+                        byte_size=3,
+                        label="test.png",
+                    )
+                ],
+            )
+        ]
+    )
+
+    _ = [event async for event in engine.submit_message("please reopen it")]
+
+    assert len(requests) == 2
+    first_images = [
+        block
+        for message in requests[0].messages
+        for block in message.content
+        if isinstance(block, ImageBlock)
+    ]
+    second_images = [
+        block
+        for message in requests[1].messages
+        for block in message.content
+        if isinstance(block, ImageBlock)
+    ]
+    assert first_images == []
+    assert len(second_images) == 1
+    assert second_images[0].data == "YWJj"
+    assert all(
+        not isinstance(block, ImageBlock)
+        for message in engine.messages
+        for block in message.content
+    )
+    assert "YWJj" not in json.dumps(
+        [message.model_dump(mode="json") for message in engine.messages]
+    )
 
 
 @pytest.mark.asyncio
