@@ -203,6 +203,63 @@ async def test_existing_unreferenced_attachment_is_indistinguishable_from_missin
     assert ref.attachment_id not in unauthorized.output
 
 
+@pytest.mark.parametrize(
+    "messages",
+    [[], [ConversationMessage.from_user_text("restored text-only turn")]],
+    ids=["new", "restored"],
+)
+def test_conversation_image_tool_is_absent_for_ref_free_bundles(
+    tmp_path: Path,
+    messages: list[ConversationMessage],
+) -> None:
+    workspace = initialize_workspace(tmp_path / ".ohmo-home")
+    pool = object.__new__(OhmoSessionRuntimePool)
+    pool._attachment_store = AttachmentStore(workspace)
+    bundle = SimpleNamespace(
+        engine=SimpleNamespace(messages=messages),
+        tool_registry=ToolRegistry(),
+    )
+
+    pool._register_conversation_image_tool(bundle)
+
+    assert bundle.tool_registry.get("load_conversation_image") is None
+
+
+@pytest.mark.asyncio
+async def test_conversation_image_tool_active_turn_allowance_is_torn_down(
+    tmp_path: Path,
+) -> None:
+    workspace = initialize_workspace(tmp_path / ".ohmo-home")
+    store = AttachmentStore(workspace)
+    ref = store.ingest_bytes(PNG_BYTES, media_type="image/png", label="new.png")
+    pool = object.__new__(OhmoSessionRuntimePool)
+    pool._attachment_store = store
+    bundle = SimpleNamespace(
+        engine=SimpleNamespace(messages=[]),
+        tool_registry=ToolRegistry(),
+    )
+    current_message = ConversationMessage(role="user", content=[ref, _inline_image()])
+
+    pool._register_conversation_image_tool(bundle, current_message=current_message)
+    active_tool = bundle.tool_registry.get("load_conversation_image")
+    assert isinstance(active_tool, LoadConversationImageTool)
+    active_result = await active_tool.execute(
+        LoadConversationImageInput(attachment_id=ref.attachment_id),
+        ToolExecutionContext(cwd=tmp_path),
+    )
+    assert active_result.is_error is False
+
+    pool._register_conversation_image_tool(bundle)
+
+    assert bundle.tool_registry.get("load_conversation_image") is None
+    stale_result = await active_tool.execute(
+        LoadConversationImageInput(attachment_id=ref.attachment_id),
+        ToolExecutionContext(cwd=tmp_path),
+    )
+    assert stale_result.is_error is True
+    assert stale_result.output == "Conversation image unavailable."
+
+
 @pytest.mark.asyncio
 async def test_two_bundles_sharing_store_cannot_load_each_others_attachment(
     tmp_path: Path,

@@ -18,7 +18,13 @@ from openharness.channels.bus.queue import MessageBus
 from openharness.commands import CommandResult
 from openharness.commands.registry import SlashCommand, create_default_command_registry
 from openharness.config.settings import PermissionSettings, ProviderProfile, Settings
-from openharness.engine.messages import ConversationMessage, ImageBlock, TextBlock, ToolUseBlock
+from openharness.engine.messages import (
+    AttachmentRefBlock,
+    ConversationMessage,
+    ImageBlock,
+    TextBlock,
+    ToolUseBlock,
+)
 from openharness.engine.query_engine import QueryEngine
 from openharness.engine.stream_events import (
     AssistantTextDelta,
@@ -1769,17 +1775,33 @@ async def test_runtime_pool_includes_media_paths_in_prompt(tmp_path, monkeypatch
     report_path = tmp_path / "report.txt"
     report_path.write_text("Quarterly summary\nRevenue up 12%\n", encoding="utf-8")
     captured: dict[str, object] = {}
+    registry = ToolRegistry()
 
     async def fake_build_runtime(**kwargs):
         class FakeEngine:
-            messages = []
-            total_usage = UsageSnapshot()
+            def __init__(self):
+                self.messages = []
+                self.total_usage = UsageSnapshot()
 
             def set_system_prompt(self, prompt):
                 return None
 
             async def submit_message(self, content):
                 captured["content"] = content
+                captured["tools_during_submit"] = {
+                    tool.name for tool in registry.list_tools()
+                }
+                self.messages.append(
+                    content.model_copy(
+                        update={
+                            "content": [
+                                block
+                                for block in content.content
+                                if not isinstance(block, ImageBlock)
+                            ]
+                        }
+                    )
+                )
                 yield AssistantTextDelta(text="done")
 
         return SimpleNamespace(
@@ -1787,9 +1809,13 @@ async def test_runtime_pool_includes_media_paths_in_prompt(tmp_path, monkeypatch
             session_id="sess123",
             current_settings=lambda: SimpleNamespace(model="gpt-5.4"),
             commands=SimpleNamespace(lookup=lambda raw: None),
+            tool_registry=registry,
         )
 
     async def fake_start_runtime(bundle):
+        captured["tools_at_start"] = {
+            tool.name for tool in bundle.tool_registry.list_tools()
+        }
         return None
 
     monkeypatch.setattr("ohmo.gateway.runtime.build_runtime", fake_build_runtime)
@@ -1804,8 +1830,17 @@ async def test_runtime_pool_includes_media_paths_in_prompt(tmp_path, monkeypatch
         media=[str(image_path), str(report_path)],
     )
     updates = [u async for u in pool.stream_message(message, "feishu:c1")]
+    bundle = pool._bundles["feishu:c1"]
 
     assert updates[-1].text == "done"
+    assert "load_conversation_image" not in captured["tools_at_start"]
+    assert "load_conversation_image" in captured["tools_during_submit"]
+    assert bundle.tool_registry.get("load_conversation_image") is not None
+    assert any(
+        isinstance(block, AttachmentRefBlock)
+        for item in bundle.engine.messages
+        for block in item.content
+    )
     submitted = captured["content"]
     assert isinstance(submitted, ConversationMessage)
     assert any(isinstance(block, ImageBlock) for block in submitted.content)

@@ -1206,6 +1206,7 @@ class OhmoSessionRuntimePool:
                 memory_scope=memory_scope,
                 include_todo=todo_lifecycle,
             )
+        self._register_conversation_image_tool(bundle)
 
         todo_error = getattr(bundle, "_todo_runtime_error", None)
         if todo_lifecycle and isinstance(todo_error, TodoRuntimeStateError):
@@ -1278,6 +1279,7 @@ class OhmoSessionRuntimePool:
                 bundle.engine,
                 recorder,
             )
+            self._register_conversation_image_tool(bundle)
             try:
                 try:
                     async for event in bundle.engine.continue_pending(max_turns=turns):
@@ -1303,6 +1305,7 @@ class OhmoSessionRuntimePool:
                     )
             finally:
                 _restore_gateway_decision_trace_recorder(decision_trace_restore)
+                self._register_conversation_image_tool(bundle)
             reply = "".join(reply_parts).strip()
             if stream_error or max_turns_exceeded:
                 await self._save_snapshot(bundle, session_key, user_prompt)
@@ -1419,6 +1422,10 @@ class OhmoSessionRuntimePool:
             bundle.engine,
             recorder,
         )
+        self._register_conversation_image_tool(
+            bundle,
+            current_message=user_message,
+        )
         try:
             async for event in bundle.engine.submit_message(user_message):
                 if isinstance(event, ErrorEvent) and _should_retry_without_image_input(
@@ -1497,6 +1504,7 @@ class OhmoSessionRuntimePool:
             raise
         finally:
             _restore_gateway_decision_trace_recorder(decision_trace_restore)
+            self._register_conversation_image_tool(bundle)
         self._restore_group_request_context(bundle, previous_group_request)
         self._clear_reminder_context(bundle)
         if stream_error:
@@ -2771,20 +2779,55 @@ class OhmoSessionRuntimePool:
         if callable(setter):
             setter(self._attachment_store.externalize_messages)
 
-    def _register_conversation_image_tool(self, bundle: RuntimeBundle) -> None:
+    def _register_conversation_image_tool(
+        self,
+        bundle: RuntimeBundle,
+        *,
+        current_message: ConversationMessage | str | None = None,
+    ) -> None:
         registry = getattr(bundle, "tool_registry", None)
-        if registry is not None:
-            registry.register(
-                LoadConversationImageTool(
-                    self._attachment_store,
-                    is_attachment_allowed=lambda attachment_id: any(
-                        isinstance(block, AttachmentRefBlock)
-                        and block.attachment_id == attachment_id
-                        for message in getattr(bundle.engine, "messages", [])
-                        for block in message.content
-                    ),
-                )
+        tools = getattr(registry, "_tools", None)
+        if registry is None or not isinstance(tools, dict):
+            return
+        active_ids = frozenset(
+            block.attachment_id
+            for block in getattr(current_message, "content", ())
+            if isinstance(block, AttachmentRefBlock)
+        )
+        setattr(bundle, "_ohmo_active_attachment_ids", active_ids)
+        if not active_ids and not self._conversation_has_attachment_refs(bundle):
+            tools.pop(LoadConversationImageTool.name, None)
+            return
+        registry.register(
+            LoadConversationImageTool(
+                self._attachment_store,
+                is_attachment_allowed=lambda attachment_id: self._conversation_attachment_allowed(
+                    bundle, attachment_id
+                ),
             )
+        )
+
+    @staticmethod
+    def _conversation_has_attachment_refs(bundle: RuntimeBundle) -> bool:
+        return any(
+            isinstance(block, AttachmentRefBlock)
+            for message in getattr(getattr(bundle, "engine", None), "messages", [])
+            for block in getattr(message, "content", ())
+        )
+
+    @staticmethod
+    def _conversation_attachment_allowed(
+        bundle: RuntimeBundle,
+        attachment_id: str,
+    ) -> bool:
+        if attachment_id in getattr(bundle, "_ohmo_active_attachment_ids", ()):
+            return True
+        return any(
+            isinstance(block, AttachmentRefBlock)
+            and block.attachment_id == attachment_id
+            for message in getattr(getattr(bundle, "engine", None), "messages", [])
+            for block in getattr(message, "content", ())
+        )
 
     def _register_memory_tool(
         self,

@@ -48,6 +48,11 @@ from openharness.engine.messages import ConversationMessage, TextBlock
 CACHE_FORMAT_VERSION = 1
 
 
+def _cache_message_payload(message: ConversationMessage) -> dict[str, Any]:
+    """Exclude durable-only metadata that providers never receive."""
+    return message.model_dump(mode="json", exclude={"event_id"})
+
+
 def request_cache_key(request: ApiMessageRequest) -> str:
     """Return a stable hash of everything that determines a completion.
 
@@ -63,7 +68,7 @@ def request_cache_key(request: ApiMessageRequest) -> str:
         "max_tokens": request.max_tokens,
         "effort": request.effort,
         "tools": request.tools,
-        "messages": [message.model_dump(mode="json") for message in request.messages],
+        "messages": [_cache_message_payload(message) for message in request.messages],
     }
     encoded = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
