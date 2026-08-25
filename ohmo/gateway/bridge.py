@@ -680,6 +680,8 @@ class OhmoGatewayBridge:
             reply = ""
             final_media: list[str] = []
             final_metadata: dict[str, object] = {}
+            delivered_assistant_updates: set[str] = set()
+            stream_error = False
             async for update in self._runtime_pool.stream_message(message, session_key):
                 if update.kind == "final":
                     reply = update.text
@@ -687,6 +689,10 @@ class OhmoGatewayBridge:
                     final_metadata = dict(update.metadata or {})
                     final_metadata.pop("_collapse", None)
                     continue
+                if update.kind == "assistant_update" and update.text.strip():
+                    delivered_assistant_updates.add(update.text.strip())
+                if update.kind == "error":
+                    stream_error = True
                 progress_event = (update.metadata or {}).get("progress_event")
                 has_structured_progress = (
                     isinstance(progress_event, dict)
@@ -713,7 +719,7 @@ class OhmoGatewayBridge:
                     _content_snippet(update.text),
                 )
                 update_meta = {**inbound_meta, **(update.metadata or {})}
-                if collapse:
+                if collapse and update.kind != "assistant_update":
                     # Tag every non-final progress/tool_hint so the Telegram
                     # channel folds it into the chat's single live status message.
                     update_meta["_collapse"] = True
@@ -746,6 +752,15 @@ class OhmoGatewayBridge:
             )
             reply = _format_gateway_error(exc)
         if not reply:
+            if delivered_assistant_updates and not stream_error and not suppress_output:
+                await self._bus.publish_outbound(
+                    OutboundMessage(
+                        channel=message.channel,
+                        chat_id=message.chat_id,
+                        content="⚠️ Ответ не завершён; выше показан частичный результат.",
+                        metadata={**inbound_meta, "_session_key": session_key, "_partial": True},
+                    )
+                )
             logger.info(
                 "ohmo inbound finished without final reply channel=%s chat_id=%s session_key=%s",
                 message.channel,
@@ -771,6 +786,7 @@ class OhmoGatewayBridge:
                 message.metadata.get("_reminder_id"),
             )
             return
+        duplicate_assistant_update = reply.strip() in delivered_assistant_updates
         # Resolve a relative [[attach:]] path against the session's cwd (its
         # per-chat work dir) so the agent can attach a file it wrote with a plain
         # name. getattr keeps the bridge resilient to pool stubs lacking session_cwd.
@@ -789,6 +805,18 @@ class OhmoGatewayBridge:
         # would send — the file twice. Dedup (order-preserving) so an image
         # referenced by an absolute [[attach:]] path is delivered exactly once.
         final_media_paths = list(dict.fromkeys([*final_media, *media]))
+        if duplicate_assistant_update and not final_media_paths and not options:
+            logger.info(
+                "ohmo final duplicates already-delivered assistant update channel=%s chat_id=%s session_key=%s",
+                message.channel,
+                message.chat_id,
+                session_key,
+            )
+            return
+        if duplicate_assistant_update:
+            # The user already saw the text, but a repeated final can still
+            # carry a file or interactive controls that must be delivered.
+            content = question if options else ""
         logger.info(
             "ohmo outbound final channel=%s chat_id=%s session_key=%s media=%d buttons=%d content=%r",
             message.channel,

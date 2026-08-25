@@ -142,6 +142,119 @@ async def test_bash_tool_timeout_returns_partial_output_for_real_command(tmp_pat
 
 
 @pytest.mark.asyncio
+async def test_bash_tool_drains_output_while_the_process_is_running(tmp_path: Path):
+    result = await asyncio.wait_for(
+        BashTool().execute(
+            BashToolInput(
+                command="python -u -c \"import sys; sys.stdout.write('x' * 200000)\"",
+                timeout_seconds=2,
+            ),
+            ToolExecutionContext(cwd=tmp_path),
+        ),
+        timeout=3.0,
+    )
+
+    assert result.is_error is False
+    assert result.metadata["returncode"] == 0
+    assert result.metadata.get("timed_out") is None
+    assert result.output.endswith("\n...[truncated]...")
+
+
+@pytest.mark.asyncio
+async def test_bash_tool_keeps_resource_kill_hint_when_marker_follows_retained_prefix(
+    monkeypatch, tmp_path: Path
+):
+    process = _FakeProcess(
+        stdout=_FakeStdout(
+            [
+                b"x" * (bash_tool_module._MAX_RETAINED_OUTPUT_BYTES + 1024),
+                b"Out of memory\n",
+                b"",
+            ]
+        ),
+        returncode=0,
+    )
+    process._oh_scope_unit = "oh-task-test.scope"
+
+    async def fake_create_shell_subprocess(*args, **kwargs):
+        return process
+
+    monkeypatch.setitem(BashTool.execute.__globals__, "create_shell_subprocess", fake_create_shell_subprocess)
+    result = await BashTool().execute(
+        BashToolInput(command="python alloc.py"), ToolExecutionContext(cwd=tmp_path)
+    )
+
+    assert result.is_error is False
+    assert result.output.endswith("likely exceeded the per-task memory limit (MemoryMax). "
+        "Raise sandbox.resources.memory_max or split the work.]")
+
+
+@pytest.mark.asyncio
+async def test_bash_tool_disables_git_pager(monkeypatch, tmp_path: Path):
+    monkeypatch.delenv("GIT_PAGER", raising=False)
+    monkeypatch.delenv("PAGER", raising=False)
+    setup = await BashTool().execute(
+        BashToolInput(
+            command=(
+                "git init -q && git config user.email test@example.com && "
+                "git config user.name test && printf before > file && git add file && "
+                "git commit -qm initial && printf after > file"
+            )
+        ),
+        ToolExecutionContext(cwd=tmp_path),
+    )
+    assert setup.is_error is False
+
+    result = await BashTool().execute(
+        BashToolInput(
+            command=(
+                "git -c core.pager=\"sh -c 'echo PAGER_INVOKED >&2; cat'\" "
+                "--paginate diff"
+            )
+        ),
+        ToolExecutionContext(cwd=tmp_path),
+    )
+
+    assert result.is_error is False
+    assert "diff --git" in result.output
+    assert "PAGER_INVOKED" not in result.output
+
+
+@pytest.mark.asyncio
+async def test_bash_tool_sets_default_git_pager_but_preserves_explicit_pager(
+    monkeypatch, tmp_path: Path
+):
+    process = _FakeProcess(stdout=_FakeStdout([b"ok\n", b""]), returncode=0)
+    seen_environments: list[dict[str, str]] = []
+
+    async def fake_create_shell_subprocess(*args, **kwargs):
+        del args
+        seen_environments.append(kwargs["env"])
+        return process
+
+    monkeypatch.setitem(BashTool.execute.__globals__, "create_shell_subprocess", fake_create_shell_subprocess)
+    monkeypatch.delenv("GIT_PAGER", raising=False)
+    monkeypatch.delenv("PAGER", raising=False)
+    result = await BashTool().execute(BashToolInput(command="git diff"), ToolExecutionContext(cwd=tmp_path))
+
+    assert result.is_error is False
+    assert seen_environments[-1]["GIT_PAGER"] == "cat"
+
+    monkeypatch.setenv("PAGER", "custom-generic-pager")
+    result = await BashTool().execute(BashToolInput(command="git diff"), ToolExecutionContext(cwd=tmp_path))
+
+    assert result.is_error is False
+    assert seen_environments[-1]["GIT_PAGER"] == "cat"
+    assert seen_environments[-1]["PAGER"] == "custom-generic-pager"
+
+    monkeypatch.setenv("GIT_PAGER", "custom-pager")
+    result = await BashTool().execute(BashToolInput(command="git diff"), ToolExecutionContext(cwd=tmp_path))
+
+    assert result.is_error is False
+    assert seen_environments[-1]["GIT_PAGER"] == "custom-pager"
+
+
+@pytest.mark.asyncio
 async def test_bash_tool_collects_combined_output(monkeypatch, tmp_path: Path):
     process = _FakeProcess(
         stdout=_FakeStdout([b"line one\n", b"line two\n", b""]),
