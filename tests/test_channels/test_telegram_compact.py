@@ -177,6 +177,16 @@ def _kill_anim(channel: TelegramChannel, chat_id: str) -> None:
         st.anim.cancel()
 
 
+def test_compact_headers_ru_are_the_approved_phrase_inventory():
+    assert _COMPACT_HEADERS_RU == (
+        "Думаю. Прошу не мешать.",
+        "Бессвязиц не бывает.",
+        "Есть идея.",
+        "Вот об этом я сейчас и думаю.",
+        "Работать! Работать!",
+    )
+
+
 def test_compact_step_line_takes_first_nonempty_trimmed():
     assert _compact_step_line("\n🛠️ Bash — a1b2\n<args>\n") == "🛠️ Bash — a1b2"
     assert _compact_step_line("x" * 500).__len__() <= 160
@@ -269,12 +279,12 @@ async def test_anim_edits_advance_the_spinner():
     bot = FakeBot()
     ch = _channel(bot)
     # Drive one manual edit through the real render path.
-    st = _CompactStatus(message_id=1001, header="Разбираюсь…", inference_active=True)
+    st = _CompactStatus(message_id=1001, header="Думаю. Прошу не мешать.", inference_active=True)
     st.spinner_idx = 1
     await ch._edit_status(1001, st, ch._render_status(st))
     text = bot.calls[-1][1]["text"]
     assert _SPINNER_FRAMES[1] in text
-    assert "Разбираюсь…" in text
+    assert "Думаю. Прошу не мешать." in text
     assert "Размышляю…" in text
 
 
@@ -1019,7 +1029,7 @@ async def test_cancelled_live_status_edit_stays_best_effort():
 @pytest.mark.asyncio
 async def test_three_block_render_exact_snapshot_and_blank_line_separators():
     ch = _channel(FakeBot())
-    st = _CompactStatus(message_id=1, header="Ищу причину…")
+    st = _CompactStatus(message_id=1, header="Есть идея.")
     st.tool_rows["call-1"] = ("Проверяю расписание поездов", "running", False)
     st.tool_rows["call-2"] = ("Смотрю цены", "success", True)
     st.todo_text = "📋 To-do\n⬜ Купить билет"
@@ -1027,7 +1037,7 @@ async def test_three_block_render_exact_snapshot_and_blank_line_separators():
     rendered = ch._render_status(st)
 
     assert rendered == (
-        f"{_SPINNER_FRAMES[0]} Ищу причину…"
+        f"{_SPINNER_FRAMES[0]} Есть идея."
         "\n\nПроверяю расписание поездов ⏳\nСмотрю цены ✅"
         "\n\n📋 To-do\n⬜ Купить билет"
     )
@@ -1036,14 +1046,14 @@ async def test_three_block_render_exact_snapshot_and_blank_line_separators():
 @pytest.mark.asyncio
 async def test_render_has_no_empty_todo_block_and_no_empty_middle_block():
     ch = _channel(FakeBot())
-    st = _CompactStatus(message_id=1, header="Продолжаю…")
+    st = _CompactStatus(message_id=1, header="Работать! Работать!")
 
     # Header only: no inference line, no todo block, no trailing separators.
-    assert ch._render_status(st) == f"{_SPINNER_FRAMES[0]} Продолжаю…"
+    assert ch._render_status(st) == f"{_SPINNER_FRAMES[0]} Работать! Работать!"
 
     st.todo_text = "📋 To-do\n✅ Готово"
     assert ch._render_status(st) == (
-        f"{_SPINNER_FRAMES[0]} Продолжаю…\n\n📋 To-do\n✅ Готово"
+        f"{_SPINNER_FRAMES[0]} Работать! Работать!\n\n📋 To-do\n✅ Готово"
     )
 
 

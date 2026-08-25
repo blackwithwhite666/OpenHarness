@@ -61,11 +61,11 @@ _COMPACT_TOOL_LABEL_MAX = 160
 _COMPACT_PURPOSE_MAX_WORDS = 20  # model-authored action purpose bound
 _COMPACT_EVICTED_TOOL_IDS_MAX = 64  # bounded memory of evicted call ids
 _COMPACT_HEADERS_RU = (
-    "Разбираюсь…",
-    "Проверяю детали…",
-    "Ищу причину…",
-    "Собираю результат…",
-    "Продолжаю…",
+    "Думаю. Прошу не мешать.",
+    "Бессвязиц не бывает.",
+    "Есть идея.",
+    "Вот об этом я сейчас и думаю.",
+    "Работать! Работать!",
 )
 _COMPACT_INFERENCE_LINE = "Размышляю…"
 _COMPACT_TOOL_ROW_LIMIT_DEFAULT = 3
