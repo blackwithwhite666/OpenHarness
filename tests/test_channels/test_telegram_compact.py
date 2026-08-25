@@ -285,7 +285,7 @@ async def test_anim_edits_advance_the_spinner():
     text = bot.calls[-1][1]["text"]
     assert _SPINNER_FRAMES[1] in text
     assert "Думаю. Прошу не мешать." in text
-    assert "Размышляю…" in text
+    assert "Размышляю…" not in text
 
 
 @pytest.mark.asyncio
@@ -1085,7 +1085,7 @@ async def test_header_is_stable_within_a_turn_and_varies_between_turns():
 
 
 @pytest.mark.asyncio
-async def test_inference_event_renders_exactly_razmyshlyayu_until_first_tool():
+async def test_inference_event_renders_header_only_until_first_tool():
     bot = FakeBot()
     ch = _channel(bot)
 
@@ -1094,10 +1094,10 @@ async def test_inference_event_renders_exactly_razmyshlyayu_until_first_tool():
     status = ch._status["424242"]
     rendered = ch._render_status(status)
     blocks = rendered.split("\n\n")
-    assert len(blocks) == 2
-    assert blocks[1] == "Размышляю…"
+    assert len(blocks) == 1
+    assert "Размышляю…" not in rendered
 
-    # A tool activity replaces the inference line with the purpose row.
+    # A tool activity adds the purpose row below the header.
     await ch.send(
         _tool_progress(
             "424242",
@@ -1116,7 +1116,7 @@ async def test_inference_event_renders_exactly_razmyshlyayu_until_first_tool():
 
 
 @pytest.mark.asyncio
-async def test_inference_idle_event_hides_the_inference_line():
+async def test_inference_idle_event_keeps_header_only():
     bot = FakeBot()
     ch = _channel(bot)
     await ch.send(_inference_progress("424242", "active"))

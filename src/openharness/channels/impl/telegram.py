@@ -67,7 +67,6 @@ _COMPACT_HEADERS_RU = (
     "Вот об этом я сейчас и думаю.",
     "Работать! Работать!",
 )
-_COMPACT_INFERENCE_LINE = "Размышляю…"
 _COMPACT_TOOL_ROW_LIMIT_DEFAULT = 3
 _COMPACT_TOOL_ROW_LIMIT_MAX = 10
 _TODO_PANEL_TITLE = "📋 To-do"
@@ -1432,8 +1431,7 @@ class TelegramChannel(BaseChannel):
     def _render_status(self, status: _CompactStatus) -> str:
         """Three present blocks joined by exactly one blank line:
         1. the stable per-turn header with the spinner,
-        2. the last N tool activities (or, while inference is active and no
-           tool has run yet, exactly ``Размышляю…``),
+        2. the last N tool activities, when present,
         3. the structured todo snapshot — only when non-empty."""
         header = status.header or _COMPACT_HEADERS_RU[0]
         blocks = [f"{_SPINNER_FRAMES[status.spinner_idx]} {header}"]
@@ -1443,8 +1441,6 @@ class TelegramChannel(BaseChannel):
         ]
         if rows:
             blocks.append("\n".join(rows))
-        elif status.inference_active:
-            blocks.append(_COMPACT_INFERENCE_LINE)
         if status.todo_text:
             blocks.append(status.todo_text)
         rendered = "\n\n".join(blocks)
