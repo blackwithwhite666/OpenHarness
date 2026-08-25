@@ -552,11 +552,8 @@ async def test_runtime_pool_does_not_restore_other_group_sender_session_key(tmp_
 
 
 @pytest.mark.asyncio
-async def test_runtime_pool_splits_per_turn_narration_into_reasoning(tmp_path, monkeypatch):
-    """A tool-using turn's interstitial narration is surfaced live as a 🧠
-    reasoning message, and the final reply holds ONLY the last (tool-free)
-    turn's text — earlier turns' narration is no longer concatenated into the
-    final message with no separator."""
+async def test_runtime_pool_splits_per_turn_assistant_updates_from_final(tmp_path, monkeypatch):
+    """Public pre-tool text is durable, while the final remains the last turn."""
     workspace = tmp_path / ".ohmo-home"
     initialize_workspace(workspace)
 
@@ -594,17 +591,19 @@ async def test_runtime_pool_splits_per_turn_narration_into_reasoning(tmp_path, m
     message = InboundMessage(channel="telegram", sender_id="u1", chat_id="c1", content="купе в Тамбов")
     updates = [u async for u in pool.stream_message(message, "telegram:c1")]
 
-    # turn-1 narration is surfaced live as a 🧠 reasoning progress message
-    reasoning = [u for u in updates if u.kind == "progress" and "Проверю через travel-cli." in u.text]
-    assert reasoning, [(u.kind, u.text) for u in updates]
-    assert reasoning[0].text == "🧠 Проверю через travel-cli."
+    assistant_updates = [
+        u for u in updates if u.kind == "assistant_update" and "Проверю через travel-cli." in u.text
+    ]
+    assert assistant_updates, [(u.kind, u.text) for u in updates]
+    assert assistant_updates[0].text == "Проверю через travel-cli."
+    assert assistant_updates[0].metadata["_assistant_update"] is True
 
-    # the reasoning message precedes the tool hint
-    reasoning_idx = updates.index(reasoning[0])
+    # The public assistant update precedes the tool hint.
+    assistant_update_idx = updates.index(assistant_updates[0])
     tool_hint_idx = next(i for i, u in enumerate(updates) if u.kind == "tool_hint")
-    assert reasoning_idx < tool_hint_idx
+    assert assistant_update_idx < tool_hint_idx
 
-    # the final reply is ONLY the last turn — earlier narration is not glued in
+    # The final reply is ONLY the last turn — earlier text is not glued in.
     final = updates[-1]
     assert final.kind == "final"
     assert final.text == "Готово: купе есть."
@@ -1374,6 +1373,35 @@ async def test_runtime_pool_tool_start_carries_bounded_model_purpose(tmp_path, m
 
 
 @pytest.mark.asyncio
+async def test_runtime_pool_keeps_public_assistant_text_before_tool_as_assistant_update(
+    tmp_path, monkeypatch
+):
+    answer = "The useful answer is already here."
+    updates = await _collect_telegram_updates(
+        tmp_path,
+        monkeypatch,
+        [
+            AssistantTextDelta(text=answer),
+            ToolExecutionStarted(
+                tool_name="bash", tool_input={"command": "sleep 600"}, tool_call_id="call-hang"
+            ),
+        ],
+    )
+
+    assistant_update = next(update for update in updates if update.kind == "assistant_update")
+    assert assistant_update.text == answer
+    assert assistant_update.metadata["_assistant_update"] is True
+    assert all(
+        not (
+            update.kind == "progress"
+            and answer in update.text
+            and "reasoning" in update.text.lower()
+        )
+        for update in updates
+    )
+
+
+@pytest.mark.asyncio
 async def test_runtime_pool_tool_start_without_narration_has_no_purpose(tmp_path, monkeypatch):
     updates = await _collect_telegram_updates(
         tmp_path,
@@ -2059,6 +2087,181 @@ async def test_gateway_bridge_preserves_structured_tool_progress_without_text():
     assert progress.content == ""
     assert progress.metadata["progress_event"]["tool_call_id"] == "call-1"
     assert final.content == "Done"
+
+
+@pytest.mark.asyncio
+async def test_gateway_bridge_keeps_assistant_update_when_turn_ends_without_final():
+    class FakeRuntimePool:
+        async def stream_message(self, message, session_key):
+            yield SimpleNamespace(
+                kind="assistant_update",
+                text="The answer before verification.",
+                metadata={"_assistant_update": True, "_session_key": session_key},
+            )
+
+    bus = MessageBus()
+    bridge = OhmoGatewayBridge(bus=bus, runtime_pool=FakeRuntimePool())
+    message = InboundMessage(channel="telegram", sender_id="u1", chat_id="c1", content="check")
+
+    await bridge._process_message(message, "telegram:c1")
+
+    update = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
+    partial = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
+    assert update.content == "The answer before verification."
+    assert update.metadata["_assistant_update"] is True
+    assert "_collapse" not in update.metadata
+    assert "частич" in partial.content.lower()
+    assert bus.outbound_size == 0
+
+
+@pytest.mark.asyncio
+async def test_gateway_bridge_does_not_duplicate_final_that_repeats_assistant_update():
+    class FakeRuntimePool:
+        async def stream_message(self, message, session_key):
+            yield SimpleNamespace(
+                kind="assistant_update",
+                text="The answer before verification.",
+                metadata={"_assistant_update": True, "_session_key": session_key},
+            )
+            yield SimpleNamespace(
+                kind="final",
+                text="The answer before verification.",
+                metadata={"_session_key": session_key},
+            )
+
+    bus = MessageBus()
+    bridge = OhmoGatewayBridge(bus=bus, runtime_pool=FakeRuntimePool())
+    message = InboundMessage(channel="telegram", sender_id="u1", chat_id="c1", content="check")
+
+    await bridge._process_message(message, "telegram:c1")
+
+    update = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
+    assert update.content == "The answer before verification."
+    assert bus.outbound_size == 0
+
+
+@pytest.mark.asyncio
+async def test_gateway_bridge_sends_duplicate_final_attachment_without_repeating_text(tmp_path):
+    attachment = tmp_path / "answer.txt"
+    attachment.write_text("attachment payload\n", encoding="utf-8")
+    reply = f"The answer before verification. [[attach: {attachment}]]"
+
+    class FakeRuntimePool:
+        async def stream_message(self, message, session_key):
+            yield SimpleNamespace(
+                kind="assistant_update",
+                text=reply,
+                metadata={"_assistant_update": True, "_session_key": session_key},
+            )
+            yield SimpleNamespace(kind="final", text=reply, metadata={"_session_key": session_key})
+
+    bus = MessageBus()
+    bridge = OhmoGatewayBridge(bus=bus, runtime_pool=FakeRuntimePool())
+    message = InboundMessage(channel="telegram", sender_id="u1", chat_id="c1", content="check")
+
+    await bridge._process_message(message, "telegram:c1")
+
+    update = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
+    attachment_delivery = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
+    assert update.content == reply
+    assert attachment_delivery.content == ""
+    assert attachment_delivery.media == [str(attachment)]
+    assert bus.outbound_size == 0
+
+
+@pytest.mark.asyncio
+async def test_gateway_bridge_sends_duplicate_final_ask_question_without_repeating_text():
+    reply = "The answer before verification. [[ask: Continue? | Yes | No]]"
+
+    class FakeRuntimePool:
+        async def stream_message(self, message, session_key):
+            yield SimpleNamespace(
+                kind="assistant_update",
+                text=reply,
+                metadata={"_assistant_update": True, "_session_key": session_key},
+            )
+            yield SimpleNamespace(kind="final", text=reply, metadata={"_session_key": session_key})
+
+    bus = MessageBus()
+    bridge = OhmoGatewayBridge(bus=bus, runtime_pool=FakeRuntimePool())
+    message = InboundMessage(channel="telegram", sender_id="u1", chat_id="c1", content="check")
+
+    await bridge._process_message(message, "telegram:c1")
+
+    update = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
+    ask_delivery = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
+    assert update.content == reply
+    assert ask_delivery.content == "Continue?"
+    assert ask_delivery.buttons == ["Yes", "No"]
+    assert bus.outbound_size == 0
+
+
+@pytest.mark.asyncio
+async def test_gateway_bridge_keeps_assistant_update_visible_when_turn_is_cancelled():
+    answer_emitted = asyncio.Event()
+    first_cancelled = asyncio.Event()
+
+    class FakeRuntimePool:
+        async def stream_message(self, message, session_key):
+            if message.content == "first":
+                try:
+                    yield SimpleNamespace(
+                        kind="assistant_update",
+                        text="Useful answer before the tool hangs.",
+                        metadata={"_assistant_update": True, "_session_key": session_key},
+                    )
+                    answer_emitted.set()
+                    yield SimpleNamespace(
+                        kind="tool_hint",
+                        text="🛠️ Bash — running",
+                        metadata={
+                            "_progress": True,
+                            "_tool_hint": True,
+                            "_session_key": session_key,
+                            "progress_event": {
+                                "kind": "tool",
+                                "tool": "bash",
+                                "tool_call_id": "call-hang",
+                                "display_label": "Bash",
+                                "phase": "started",
+                                "status": "running",
+                            },
+                        },
+                    )
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    first_cancelled.set()
+                    raise
+            else:
+                yield SimpleNamespace(kind="final", text="second-done", metadata={})
+
+    bus = MessageBus()
+    bridge = OhmoGatewayBridge(bus=bus, runtime_pool=FakeRuntimePool())
+    task = asyncio.create_task(bridge.run())
+    try:
+        await bus.publish_inbound(
+            InboundMessage(channel="feishu", sender_id="u1", chat_id="c1", content="first")
+        )
+        answer = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
+        await asyncio.wait_for(answer_emitted.wait(), timeout=1.0)
+        tool_started = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
+        await bus.publish_inbound(
+            InboundMessage(channel="feishu", sender_id="u1", chat_id="c1", content="second")
+        )
+        interrupted = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
+        final = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
+        await asyncio.wait_for(first_cancelled.wait(), timeout=1.0)
+    finally:
+        bridge.stop()
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    assert answer.content == "Useful answer before the tool hangs."
+    assert answer.metadata["_assistant_update"] is True
+    assert tool_started.metadata["progress_event"]["tool_call_id"] == "call-hang"
+    assert interrupted.content.startswith("⏹️")
+    assert final.content == "second-done"
 
 
 @pytest.mark.asyncio

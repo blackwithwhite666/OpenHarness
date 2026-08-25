@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import os
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
 
@@ -14,12 +16,39 @@ from openharness.utils.shell import create_shell_subprocess
 
 
 _READ_REMAINING_OUTPUT_TIMEOUT_SECONDS = 2.0
+_MAX_FORMATTED_OUTPUT_CHARS = 12000
+_MAX_RETAINED_OUTPUT_BYTES = _MAX_FORMATTED_OUTPUT_CHARS * 4
 _RESOURCE_KILL_OUTPUT_MARKERS: tuple[str, ...] = (
     "Session terminated, killing",
     "Out of memory",
     "oom-kill",
     "Killed process",
 )
+_MAX_RESOURCE_KILL_MARKER_BYTES = max(len(marker.encode()) for marker in _RESOURCE_KILL_OUTPUT_MARKERS)
+
+
+@dataclass
+class _OutputCapture:
+    """Bounded output prefix plus metadata observed while continuously draining."""
+
+    output_buffer: bytearray = field(default_factory=bytearray)
+    resource_kill_marker_seen: bool = False
+    truncated: bool = False
+    _marker_tail: bytes = b""
+
+    def append(self, chunk: bytes) -> None:
+        marker_window = self._marker_tail + chunk
+        if any(marker.encode() in marker_window for marker in _RESOURCE_KILL_OUTPUT_MARKERS):
+            self.resource_kill_marker_seen = True
+        self._marker_tail = marker_window[-(_MAX_RESOURCE_KILL_MARKER_BYTES - 1) :]
+
+        remaining = _MAX_RETAINED_OUTPUT_BYTES - len(self.output_buffer)
+        if remaining <= 0:
+            self.truncated = True
+            return
+        self.output_buffer.extend(chunk[:remaining])
+        if len(chunk) > remaining:
+            self.truncated = True
 
 
 class BashToolInput(BaseModel):
@@ -47,6 +76,8 @@ class BashTool(BaseTool):
                 metadata={"interactive_required": True},
             )
         process: asyncio.subprocess.Process | None = None
+        output_capture = _OutputCapture()
+        output_task: asyncio.Task[None] | None = None
         try:
             process = await create_shell_subprocess(
                 arguments.command,
@@ -55,6 +86,10 @@ class BashTool(BaseTool):
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
+                env=_noninteractive_environment(),
+            )
+            output_task = asyncio.create_task(
+                _drain_process_output(process.stdout, output_capture)
             )
         except SandboxUnavailableError as exc:
             return ToolResult(output=str(exc), is_error=True)
@@ -66,45 +101,57 @@ class BashTool(BaseTool):
         try:
             await asyncio.wait_for(process.wait(), timeout=arguments.timeout_seconds)
         except asyncio.TimeoutError:
-            output_buffer = await _drain_available_output(process.stdout)
             await _terminate_process(process, force=True)
-            output_buffer.extend(await _read_remaining_output(process))
+            await _wait_for_output_drain(output_task)
             return ToolResult(
                 output=_format_timeout_output(
-                    output_buffer,
+                    output_capture.output_buffer,
                     command=arguments.command,
                     timeout_seconds=arguments.timeout_seconds,
+                    truncated=output_capture.truncated,
                 ),
                 is_error=True,
                 metadata={"returncode": process.returncode, "timed_out": True},
             )
         except asyncio.CancelledError:
             await _terminate_process(process, force=False)
+            await _wait_for_output_drain(output_task)
             raise
-
-        output_buffer = await _read_remaining_output(process)
-        text = _format_output(output_buffer)
-        if _looks_resource_killed(process, text):
-            # Accurate detection would read the scope's cgroup memory.events oom_kill,
-            # but the transient scope is gone by then, so this is a best-effort heuristic.
-            text += (
-                "\n\n[task killed: likely exceeded the per-task memory limit (MemoryMax). "
-                "Raise sandbox.resources.memory_max or split the work.]"
+        else:
+            await _wait_for_output_drain(output_task)
+            text = _format_output(
+                output_capture.output_buffer, truncated=output_capture.truncated
             )
-        return ToolResult(
-            output=text,
-            is_error=process.returncode != 0,
-            metadata={"returncode": process.returncode},
-        )
+            if _looks_resource_killed(
+                process, text, marker_seen=output_capture.resource_kill_marker_seen
+            ):
+                # Accurate detection would read the scope's cgroup memory.events oom_kill,
+                # but the transient scope is gone by then, so this is a best-effort heuristic.
+                text += (
+                    "\n\n[task killed: likely exceeded the per-task memory limit (MemoryMax). "
+                    "Raise sandbox.resources.memory_max or split the work.]"
+                )
+            return ToolResult(
+                output=text,
+                is_error=process.returncode != 0,
+                metadata={"returncode": process.returncode},
+            )
+        finally:
+            if output_task is not None and not output_task.done():
+                output_task.cancel()
+                await asyncio.gather(output_task, return_exceptions=True)
 
 
-def _looks_resource_killed(process: asyncio.subprocess.Process, text: str) -> bool:
+def _looks_resource_killed(
+    process: asyncio.subprocess.Process, text: str, *, marker_seen: bool = False
+) -> bool:
     if getattr(process, "_oh_scope_unit", None) is None:
         return False
     returncode = process.returncode
     return (
         returncode in (137, -9)
         or (returncode is not None and returncode < 0)
+        or marker_seen
         or any(marker in text for marker in _RESOURCE_KILL_OUTPUT_MARKERS)
     )
 
@@ -138,50 +185,62 @@ def _reap_resource_scope(process: asyncio.subprocess.Process) -> None:
         pass
 
 
-async def _read_remaining_output(process: asyncio.subprocess.Process) -> bytearray:
-    output_buffer = bytearray()
-    if process.stdout is not None:
-        try:
-            remaining = await asyncio.wait_for(
-                process.stdout.read(),
-                timeout=_READ_REMAINING_OUTPUT_TIMEOUT_SECONDS,
-            )
-        except asyncio.TimeoutError:
-            remaining = b""
-        output_buffer.extend(remaining)
-    return output_buffer
-
-
-async def _drain_available_output(
-    stream: asyncio.StreamReader | None,
-    *,
-    read_timeout: float = 0.05,
-) -> bytearray:
-    output_buffer = bytearray()
+async def _drain_process_output(
+    stream: asyncio.StreamReader | None, output_capture: _OutputCapture
+) -> None:
+    """Drain combined subprocess output until EOF so pipe writers cannot block."""
     if stream is None:
-        return output_buffer
+        return
     while True:
-        try:
-            chunk = await asyncio.wait_for(stream.read(65536), timeout=read_timeout)
-        except asyncio.TimeoutError:
-            return output_buffer
+        chunk = await stream.read(65536)
         if not chunk:
-            return output_buffer
-        output_buffer.extend(chunk)
+            return
+        output_capture.append(chunk)
 
 
-def _format_output(output_buffer: bytearray) -> str:
+async def _wait_for_output_drain(output_task: asyncio.Task[None] | None) -> None:
+    if output_task is None:
+        return
+    try:
+        await asyncio.wait_for(
+            asyncio.shield(output_task), timeout=_READ_REMAINING_OUTPUT_TIMEOUT_SECONDS
+        )
+    except asyncio.TimeoutError:
+        return
+
+
+def _noninteractive_environment() -> dict[str, str]:
+    """Return the caller environment with a safe default Git pager.
+
+    A PTY makes Git consider its output interactive, so it may invoke a pager
+    that waits for input even though bash-tool stdin is closed.  Preserve an
+    explicit Git pager, but otherwise override Git config/defaults (and generic
+    PAGER) without changing the caller's environment values.
+    """
+    environment = dict(os.environ)
+    if "GIT_PAGER" not in environment:
+        environment["GIT_PAGER"] = "cat"
+    return environment
+
+
+def _format_output(output_buffer: bytearray, *, truncated: bool = False) -> str:
     text = output_buffer.decode("utf-8", errors="replace").replace("\r\n", "\n").strip()
     if not text:
         return "(no output)"
-    if len(text) > 12000:
-        return f"{text[:12000]}\n...[truncated]..."
+    if len(text) > _MAX_FORMATTED_OUTPUT_CHARS or truncated:
+        return f"{text[:_MAX_FORMATTED_OUTPUT_CHARS]}\n...[truncated]..."
     return text
 
 
-def _format_timeout_output(output_buffer: bytearray, *, command: str, timeout_seconds: int) -> str:
+def _format_timeout_output(
+    output_buffer: bytearray,
+    *,
+    command: str,
+    timeout_seconds: int,
+    truncated: bool = False,
+) -> str:
     parts = [f"Command timed out after {timeout_seconds} seconds."]
-    text = _format_output(output_buffer)
+    text = _format_output(output_buffer, truncated=truncated)
     if text != "(no output)":
         parts.extend(["", "Partial output:", text])
     hint = _interactive_command_hint(command=command, output=text)
