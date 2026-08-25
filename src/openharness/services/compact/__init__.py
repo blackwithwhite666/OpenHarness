@@ -19,12 +19,14 @@ from typing import Any, Awaitable, Callable, Literal
 from uuid import uuid4
 
 from openharness.engine.messages import (
+    AttachmentRefBlock,
     ConversationMessage,
     ContentBlock,
     ImageBlock,
     TextBlock,
     ToolResultBlock,
     ToolUseBlock,
+    attachment_ref_placeholder,
     sanitize_conversation_messages,
 )
 from openharness.engine.stream_events import CompactProgressEvent
@@ -128,6 +130,8 @@ def estimate_message_tokens(messages: list[ConversationMessage]) -> int:
                 total += estimate_tokens(str(block.input))
             elif isinstance(block, ImageBlock):
                 total += image_token_estimate
+            elif isinstance(block, AttachmentRefBlock):
+                total += estimate_tokens(attachment_ref_placeholder(block))
     return int(total * TOKEN_ESTIMATION_PADDING)
 
 
@@ -332,7 +336,7 @@ def try_context_collapse(
                 )
             else:
                 new_blocks.append(block)
-        collapsed_older.append(ConversationMessage(role=message.role, content=new_blocks))
+        collapsed_older.append(message.model_copy(update={"content": new_blocks}))
 
     if not changed:
         return None

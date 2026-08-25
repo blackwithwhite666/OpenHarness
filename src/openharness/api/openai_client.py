@@ -29,12 +29,14 @@ from openharness.api.errors import (
 )
 from openharness.api.usage import UsageSnapshot
 from openharness.engine.messages import (
+    AttachmentRefBlock,
     ConversationMessage,
     ContentBlock,
     ImageBlock,
     TextBlock,
     ToolResultBlock,
     ToolUseBlock,
+    attachment_ref_placeholder,
 )
 
 log = logging.getLogger(__name__)
@@ -115,7 +117,11 @@ def _convert_messages_to_openai(
         elif msg.role == "user":
             # User messages may contain text or tool_result blocks
             tool_results = [b for b in msg.content if isinstance(b, ToolResultBlock)]
-            user_blocks = [b for b in msg.content if isinstance(b, (TextBlock, ImageBlock))]
+            user_blocks = [
+                block
+                for block in msg.content
+                if isinstance(block, (TextBlock, ImageBlock, AttachmentRefBlock))
+            ]
 
             if tool_results:
                 # Each tool result becomes a separate message with role="tool"
@@ -178,12 +184,20 @@ def _convert_user_content_to_openai(blocks: list[ContentBlock]) -> str | list[di
     """Convert user text/image blocks into OpenAI chat content."""
     has_image = any(isinstance(block, ImageBlock) for block in blocks)
     if not has_image:
-        return "".join(block.text for block in blocks if isinstance(block, TextBlock))
+        return "".join(
+            block.text
+            if isinstance(block, TextBlock)
+            else attachment_ref_placeholder(block)
+            for block in blocks
+            if isinstance(block, (TextBlock, AttachmentRefBlock))
+        )
 
     content: list[dict[str, Any]] = []
     for block in blocks:
         if isinstance(block, TextBlock) and block.text:
             content.append({"type": "text", "text": block.text})
+        elif isinstance(block, AttachmentRefBlock):
+            content.append({"type": "text", "text": attachment_ref_placeholder(block)})
         elif isinstance(block, ImageBlock):
             content.append({
                 "type": "image_url",

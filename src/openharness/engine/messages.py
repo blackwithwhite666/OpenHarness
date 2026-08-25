@@ -8,7 +8,10 @@ from pathlib import Path
 from typing import Any, Annotated, Literal
 from uuid import uuid4
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+
+MAX_ATTACHMENT_LABEL_LENGTH = 160
 
 
 class TextBlock(BaseModel):
@@ -37,6 +40,40 @@ class ImageBlock(BaseModel):
         return cls(media_type=media_type, data=payload, source_path=str(resolved))
 
 
+class AttachmentRefBlock(BaseModel):
+    """Durable content-addressed reference to an external image attachment."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["attachment_ref"] = "attachment_ref"
+    attachment_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    media_type: str
+    byte_size: int = Field(ge=0)
+    label: str = Field(default="image", max_length=MAX_ATTACHMENT_LABEL_LENGTH)
+
+    @field_validator("media_type")
+    @classmethod
+    def _validate_media_type(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if not normalized.startswith("image/"):
+            raise ValueError("attachment media_type must be an image MIME type")
+        return normalized
+
+    @field_validator("label", mode="before")
+    @classmethod
+    def _normalize_label(cls, value: object) -> str:
+        rendered = " ".join(str(value or "image").split())
+        return (rendered or "image")[:MAX_ATTACHMENT_LABEL_LENGTH]
+
+
+def attachment_ref_placeholder(block: AttachmentRefBlock) -> str:
+    """Return the bounded model-visible placeholder for a durable image ref."""
+    return (
+        "[conversation image attachment_id="
+        f"{block.attachment_id} label={block.label}]"
+    )
+
+
 class ToolUseBlock(BaseModel):
     """A request from the model to execute a named tool."""
 
@@ -57,7 +94,7 @@ class ToolResultBlock(BaseModel):
 
 
 ContentBlock = Annotated[
-    TextBlock | ImageBlock | ToolUseBlock | ToolResultBlock,
+    TextBlock | ImageBlock | AttachmentRefBlock | ToolUseBlock | ToolResultBlock,
     Field(discriminator="type"),
 ]
 
@@ -67,6 +104,7 @@ class ConversationMessage(BaseModel):
 
     role: Literal["user", "assistant"]
     content: list[ContentBlock] = Field(default_factory=list)
+    event_id: str | None = Field(default=None, max_length=256)
 
     @field_validator("content", mode="before")
     @classmethod
@@ -111,7 +149,10 @@ class ConversationMessage(BaseModel):
             for block in self.content:
                 if isinstance(block, TextBlock) and block.text.strip():
                     return False
-                if isinstance(block, (ImageBlock, ToolUseBlock, ToolResultBlock)):
+                if isinstance(
+                    block,
+                    (ImageBlock, AttachmentRefBlock, ToolUseBlock, ToolResultBlock),
+                ):
                     return False
         return True
 
@@ -157,7 +198,7 @@ def sanitize_conversation_messages(messages: list[ConversationMessage]) -> list[
             ]
             if not content:
                 continue
-            message = ConversationMessage(role="user", content=content)
+            message = message.model_copy(update={"content": content})
 
         sanitized.append(message)
 
@@ -185,6 +226,9 @@ def serialize_content_block(block: ContentBlock) -> dict[str, Any]:
                 "data": block.data,
             },
         }
+
+    if isinstance(block, AttachmentRefBlock):
+        return {"type": "text", "text": attachment_ref_placeholder(block)}
 
     if isinstance(block, ToolUseBlock):
         return {

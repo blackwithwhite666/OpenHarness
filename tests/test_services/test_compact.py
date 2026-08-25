@@ -8,7 +8,14 @@ import pytest
 
 from openharness.api.client import ApiMessageCompleteEvent
 from openharness.api.usage import UsageSnapshot
-from openharness.engine.messages import ConversationMessage, ImageBlock, TextBlock, ToolResultBlock, ToolUseBlock
+from openharness.engine.messages import (
+    AttachmentRefBlock,
+    ConversationMessage,
+    ImageBlock,
+    TextBlock,
+    ToolResultBlock,
+    ToolUseBlock,
+)
 from openharness.hooks import HookEvent
 from openharness.services import (
     build_post_compact_messages,
@@ -167,6 +174,36 @@ def test_try_context_collapse_trims_oversized_messages():
 
     assert result is not None
     assert "[collapsed" in result[0].text
+
+
+def test_attachment_refs_are_counted_and_event_ids_survive_context_collapse():
+    giant = ("alpha " * 1200).strip()
+    ref = AttachmentRefBlock(
+        attachment_id="d" * 64,
+        media_type="image/png",
+        byte_size=123,
+        label="meal.png",
+    )
+    messages = [
+        ConversationMessage(
+            role="user",
+            event_id="event-1",
+            content=[TextBlock(text=giant), ref],
+        ),
+        ConversationMessage(role="assistant", content=[TextBlock(text=giant)]),
+        ConversationMessage(role="user", content=[TextBlock(text=giant)]),
+        ConversationMessage(role="assistant", content=[TextBlock(text=giant)]),
+        ConversationMessage(role="user", content=[TextBlock(text="latest")]),
+    ]
+
+    assert estimate_compact_message_tokens(
+        [ConversationMessage(role="user", content=[ref])]
+    ) > 0
+    result = try_context_collapse(messages, preserve_recent=1)
+
+    assert result is not None
+    assert result[0].event_id == "event-1"
+    assert any(isinstance(block, AttachmentRefBlock) for block in result[0].content)
 
 
 def test_try_context_collapse_trims_oversized_tool_results():

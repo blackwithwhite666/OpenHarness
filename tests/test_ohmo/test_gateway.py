@@ -46,10 +46,12 @@ from ohmo.gateway.runtime import (
     OhmoSessionRuntimePool,
     _build_inbound_user_message,
     _evals_capture_enabled,
+    _event_id_for_inbound_message,
     _format_channel_progress,
     _sanitize_group_command_metadata,
     _sanitize_group_command_prompts,
 )
+from ohmo.nutrition_ingest.trust import COORDINATOR_TRUST_TOKEN
 from ohmo.gateway.service import OhmoGatewayService, gateway_status, start_gateway_process, stop_gateway_process
 from ohmo.group_registry import load_managed_group_record, save_managed_group_record
 from ohmo.memory import add_memory_entry as add_ohmo_memory_entry
@@ -1912,6 +1914,39 @@ def test_runtime_pool_includes_group_speaker_context():
     assert "Tang Jiabin" in text
     assert "Sender id: ou_123" in text
     assert "请帮我看一下" in text
+
+
+def test_inbound_event_id_uses_channel_message_id_and_trusted_nutrition_candidate() -> None:
+    ordinary = InboundMessage(
+        channel="telegram",
+        sender_id="42",
+        chat_id="42",
+        content="hello",
+        metadata={"message_id": 123},
+    )
+    candidate = "dropbox-camera-v1-" + "a" * 64
+    nutrition = InboundMessage(
+        channel="telegram",
+        sender_id="__nutrition_ingest__",
+        chat_id="42",
+        content="estimate",
+        session_key_override="telegram:42",
+        metadata={
+            "_nutrition_trusted": True,
+            "_nutrition_trust_token": COORDINATOR_TRUST_TOKEN,
+            "_nutrition_candidate_id": candidate,
+            "_nutrition_client_op_id": f"{candidate}:meal-observation:v1",
+            "_nutrition_phase": "estimation",
+            "_nutrition_principal": "42",
+            "_nutrition_tenant_id": "marina",
+            "_nutrition_chat_id": "42",
+            "_nutrition_session_key": "telegram:42",
+        },
+    )
+
+    assert _event_id_for_inbound_message(ordinary) == _event_id_for_inbound_message(ordinary)
+    assert _event_id_for_inbound_message(ordinary).startswith("ohmo-event-")
+    assert _event_id_for_inbound_message(nutrition) == f"ohmo-nutrition-{candidate}"
 
 
 @pytest.mark.asyncio

@@ -18,7 +18,7 @@ from openharness.api.codex_client import (
     _format_codex_stream_error,
     _resolve_codex_url,
 )
-from openharness.engine.messages import ConversationMessage, ImageBlock, TextBlock, ToolResultBlock, ToolUseBlock
+from openharness.engine.messages import AttachmentRefBlock, ConversationMessage, ImageBlock, TextBlock, ToolResultBlock, ToolUseBlock
 
 
 class _FakeStreamResponse:
@@ -128,6 +128,36 @@ def _codex_request() -> ApiMessageRequest:
         model="gpt-5.5",
         messages=[ConversationMessage.from_user_text("hi")],
         system_prompt="Be helpful.",
+    )
+
+
+def test_codex_attachment_ref_is_placeholder_not_input_image() -> None:
+    converted = _convert_messages_to_codex(
+        [
+            ConversationMessage(
+                role="user",
+                content=[
+                    AttachmentRefBlock(
+                        attachment_id="a" * 64,
+                        media_type="image/png",
+                        byte_size=123,
+                        label="meal.png",
+                    )
+                ],
+            )
+        ]
+    )
+
+    assert converted[0]["content"] == [
+        {
+            "type": "input_text",
+            "text": "[conversation image attachment_id=" + "a" * 64 + " label=meal.png]",
+        }
+    ]
+    assert all(
+        block["type"] != "input_image"
+        for item in converted
+        for block in item.get("content", [])
     )
 
 

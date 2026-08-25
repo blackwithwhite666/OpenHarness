@@ -22,6 +22,7 @@ from openharness.api.openai_client import (
 from openharness.api.provider import is_model_multimodal
 from openharness.config.settings import PermissionSettings, ResolvedAuth, Settings
 from openharness.engine.messages import (
+    AttachmentRefBlock,
     ConversationMessage,
     ImageBlock,
     TextBlock,
@@ -108,6 +109,33 @@ class TestConvertMessagesToOpenai:
             "type": "image_url",
             "image_url": {"url": "data:image/png;base64,YWJj"},
         }
+
+    def test_attachment_ref_is_placeholder_not_image_url(self):
+        messages = [
+            ConversationMessage(
+                role="user",
+                content=[
+                    AttachmentRefBlock(
+                        attachment_id="b" * 64,
+                        media_type="image/jpeg",
+                        byte_size=456,
+                        label="breakfast.jpg",
+                    )
+                ],
+            )
+        ]
+
+        result = _convert_messages_to_openai(messages, None)
+
+        assert result == [
+            {
+                "role": "user",
+                "content": "[conversation image attachment_id="
+                + "b" * 64
+                + " label=breakfast.jpg]",
+            }
+        ]
+        assert "image_url" not in json.dumps(result)
 
     def test_assistant_text_message(self):
         msg = ConversationMessage(

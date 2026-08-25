@@ -1256,6 +1256,28 @@ def _offload_tool_output_if_needed(
 # ---------------------------------------------------------------------------
 
 _IMAGE_PREPROCESS_STATUS = "Converting image to text description via vision model…"
+_CONVERSATION_IMAGE_TOOL_NAME = "load_conversation_image"
+_TRANSIENT_IMAGE_METADATA_KEY = "_openharness_transient_image"
+
+
+def _take_trusted_transient_image(
+    tool_name: str,
+    result: ToolResultBlock,
+) -> ImageBlock | None:
+    """Remove and return request-local pixels from the exact image loader."""
+    candidate = result.result_metadata.pop(_TRANSIENT_IMAGE_METADATA_KEY, None)
+    if (
+        tool_name == _CONVERSATION_IMAGE_TOOL_NAME
+        and not result.is_error
+        and isinstance(candidate, ImageBlock)
+    ):
+        log.info(
+            "conversation image loaded for current query attachment_id=%s bytes_b64=%d",
+            str(result.result_metadata.get("attachment_id") or "")[:64],
+            len(candidate.data),
+        )
+        return candidate
+    return None
 
 
 async def _preprocess_images_in_messages(
@@ -1390,14 +1412,6 @@ async def run_query(
         auto_compact_if_needed,
     )
 
-    image_preprocessing_failed = False
-    async for event in _preprocess_images_in_messages(messages, context):
-        if isinstance(event, ErrorEvent):
-            image_preprocessing_failed = True
-        yield event, None
-    if image_preprocessing_failed:
-        return
-
     compact_state = AutoCompactState()
     reactive_compact_attempted = False
     last_compaction_result: tuple[list[ConversationMessage], bool] = (messages, False)
@@ -1452,6 +1466,13 @@ async def run_query(
     turn_count = 0
     while context.max_turns is None or turn_count < context.max_turns:
         turn_count += 1
+        image_preprocessing_failed = False
+        async for event in _preprocess_images_in_messages(messages, context):
+            if isinstance(event, ErrorEvent):
+                image_preprocessing_failed = True
+            yield event, None
+        if image_preprocessing_failed:
+            return
         if effective_max_tokens != context.max_tokens and not reported_token_clamp:
             reported_token_clamp = True
             yield StatusEvent(
@@ -1476,7 +1497,7 @@ async def run_query(
             async for event in context.api_client.stream_message(
                 ApiMessageRequest(
                     model=context.model,
-                    messages=messages,
+                    messages=list(messages),
                     system_prompt=context.system_prompt,
                     max_tokens=effective_max_tokens,
                     tools=context.tool_registry.to_api_schema(),
@@ -1707,6 +1728,11 @@ async def run_query(
                 tool_call_id=tc.id,
                 is_error=result.is_error,
             )
+            transient_images = [
+                image
+                for image in [_take_trusted_transient_image(tc.name, result)]
+                if image is not None
+            ]
             yield ToolExecutionCompleted(
                 tool_name=tc.name,
                 output=result.content,
@@ -1743,6 +1769,7 @@ async def run_query(
                 *[_run(tc) for tc in tool_calls], return_exceptions=True
             )
             tool_results = []
+            transient_images = []
             durations_ms = []
             for tc, result in zip(tool_calls, raw_results):
                 duration_ms = 0.0
@@ -1761,6 +1788,9 @@ async def run_query(
                         is_error=True,
                     )
                 tool_results.append(result)
+                transient_image = _take_trusted_transient_image(tc.name, result)
+                if transient_image is not None:
+                    transient_images.append(transient_image)
                 durations_ms.append(duration_ms)
                 trace_run_state.tool_result_count += 1
                 if result.is_error:
@@ -1792,7 +1822,12 @@ async def run_query(
                     metadata=result.result_metadata,
                 ), None
 
-        messages.append(ConversationMessage(role="user", content=tool_results))
+        messages.append(
+            ConversationMessage(
+                role="user",
+                content=[*tool_results, *transient_images],
+            )
+        )
 
     if context.max_turns is not None:
         _record_decision_trace_structural(

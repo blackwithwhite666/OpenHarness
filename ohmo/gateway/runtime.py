@@ -15,7 +15,9 @@ from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
 
+from ohmo.attachment_store import AttachmentStore
 from ohmo.contact_registry import ContactStore
+from ohmo.conversation_image_tool import LoadConversationImageTool
 from ohmo.evals import GatewayEvalRecorder
 from ohmo.evals.nutrition_trace import (
     NutritionAnnotationV2,
@@ -87,6 +89,7 @@ from ohmo.workspace import (
 from openharness.channels.bus.events import InboundMessage, OutboundMessage
 from openharness.commands import CommandContext, CommandResult, lookup_skill_slash_command
 from openharness.engine.messages import (
+    AttachmentRefBlock,
     ConversationMessage,
     ImageBlock,
     TextBlock,
@@ -612,6 +615,7 @@ class OhmoSessionRuntimePool:
         self._workspace = initialize_workspace(workspace)
         self._gateway_config = load_gateway_config(self._workspace)
         self._session_backend = OhmoSessionBackend(self._workspace)
+        self._attachment_store = self._session_backend.attachment_store
         self._todo_store = TodoStore(self._workspace)
         self._memory_store = MemoryStore(self._workspace)
         self._prompt_memory_backend = make_memory_backend(self._gateway_config, self._workspace)
@@ -755,6 +759,7 @@ class OhmoSessionRuntimePool:
         )
         if snapshot and snapshot.get("session_id"):
             bundle.session_id = str(snapshot["session_id"])
+        self._configure_attachment_boundary(bundle)
         self._register_gateway_tools(
             bundle,
             memory_engaged=initial_memory_scope is not None,
@@ -888,7 +893,7 @@ class OhmoSessionRuntimePool:
         todo_lifecycle = _is_real_user_turn(message)
         bound_reminder = _trusted_bound_reminder(message)
         wellness_reminder = _trusted_reminder_wellness(message)
-        user_message = _build_inbound_user_message(message)
+        user_message = _build_inbound_user_message(message, self._attachment_store)
         if bound_reminder is not None:
             user_message = _augment_bound_reminder_message(user_message, bound_reminder)
         user_prompt = user_message.text
@@ -1418,7 +1423,9 @@ class OhmoSessionRuntimePool:
             async for event in bundle.engine.submit_message(user_message):
                 if isinstance(event, ErrorEvent) and _should_retry_without_image_input(
                     event.message,
-                    bundle.engine.messages,
+                    [*bundle.engine.messages, user_message]
+                    if isinstance(user_message, ConversationMessage)
+                    else bundle.engine.messages,
                 ):
                     if recorder is not None:
                         recorder.record_engine_error(event)
@@ -1911,7 +1918,10 @@ class OhmoSessionRuntimePool:
             tool_metadata, dict
         ):
             bundle.engine.tool_metadata.update(tool_metadata)
-        messages = _sanitize_group_command_prompts(list(bundle.engine.messages))
+        messages = self._attachment_store.externalize_messages(
+            _sanitize_group_command_prompts(list(bundle.engine.messages))
+        )
+        self._attachment_store.assert_externalized(messages)
         if messages != list(bundle.engine.messages):
             if hasattr(bundle.engine, "load_messages"):
                 bundle.engine.load_messages(messages)
@@ -1986,6 +1996,7 @@ class OhmoSessionRuntimePool:
             autodream_context=self._autodream_context() if engaged else None,
         )
         refreshed.session_id = prior_session_id
+        self._configure_attachment_boundary(refreshed)
         self._register_gateway_tools(refreshed, memory_engaged=engaged)
         self._configure_turn_memory_surfaces(
             refreshed,
@@ -2753,6 +2764,27 @@ class OhmoSessionRuntimePool:
         self._register_memory_tool(bundle, memory_engaged=memory_engaged)
         self._register_reminder_tools(bundle)
         self._register_send_message_tool(bundle)
+        self._register_conversation_image_tool(bundle)
+
+    def _configure_attachment_boundary(self, bundle: RuntimeBundle) -> None:
+        setter = getattr(getattr(bundle, "engine", None), "set_durable_message_transform", None)
+        if callable(setter):
+            setter(self._attachment_store.externalize_messages)
+
+    def _register_conversation_image_tool(self, bundle: RuntimeBundle) -> None:
+        registry = getattr(bundle, "tool_registry", None)
+        if registry is not None:
+            registry.register(
+                LoadConversationImageTool(
+                    self._attachment_store,
+                    is_attachment_allowed=lambda attachment_id: any(
+                        isinstance(block, AttachmentRefBlock)
+                        and block.attachment_id == attachment_id
+                        for message in getattr(bundle.engine, "messages", [])
+                        for block in message.content
+                    ),
+                )
+            )
 
     def _register_memory_tool(
         self,
@@ -3112,7 +3144,7 @@ def _sanitize_group_command_prompts(
 
 def _sanitize_group_command_prompt(message: ConversationMessage) -> ConversationMessage:
     changed = False
-    content: list[TextBlock | ImageBlock] = []
+    content: list[TextBlock | ImageBlock | AttachmentRefBlock] = []
     for block in message.content:
         if isinstance(block, TextBlock) and _GROUP_AGENT_PROMPT_PREFIX in block.text:
             content.append(TextBlock(text=_format_group_command_history_note(block.text)))
@@ -3439,9 +3471,12 @@ def _format_channel_progress(
     return text
 
 
-def _build_inbound_user_message(message: InboundMessage) -> ConversationMessage:
+def _build_inbound_user_message(
+    message: InboundMessage,
+    attachment_store: AttachmentStore | None = None,
+) -> ConversationMessage:
     """Convert an inbound channel message into user content blocks."""
-    content: list[TextBlock | ImageBlock] = []
+    content: list[TextBlock | ImageBlock | AttachmentRefBlock] = []
     speaker_context = _build_speaker_context(message)
     base = (message.content or "").strip()
     if speaker_context:
@@ -3458,11 +3493,46 @@ def _build_inbound_user_message(message: InboundMessage) -> ConversationMessage:
         if not _is_image_attachment(media_path):
             continue
         try:
-            content.append(ImageBlock.from_path(media_path))
+            image = ImageBlock.from_path(media_path)
+            if attachment_store is not None:
+                content.append(attachment_store.ingest_image_block(image))
+            content.append(image)
         except Exception:
             logger.exception("ohmo runtime failed to encode image attachment path=%s", media_path)
 
-    return ConversationMessage.from_user_content(content)
+    return ConversationMessage(
+        role="user",
+        content=content,
+        event_id=_event_id_for_inbound_message(message),
+    )
+
+
+def _event_id_for_inbound_message(message: InboundMessage) -> str | None:
+    """Derive idempotency only from gateway-validated channel identifiers."""
+    trusted_nutrition = _trusted_nutrition_request(message)
+    if trusted_nutrition is not None:
+        return f"ohmo-nutrition-{trusted_nutrition['candidate_id']}"
+
+    metadata = message.metadata or {}
+    source_message_id = next(
+        (
+            normalized
+            for key in ("message_id", "messageId", "message-id")
+            if (normalized := _normalize_source_message_ref(metadata.get(key))) is not None
+        ),
+        None,
+    )
+    if source_message_id is None:
+        return None
+    seed = "\x00".join(
+        (
+            str(message.channel).strip().lower(),
+            str(message.chat_id),
+            canonical_principal(message.channel, str(message.sender_id)),
+            source_message_id,
+        )
+    ).encode("utf-8")
+    return f"ohmo-event-{hashlib.sha256(seed).hexdigest()}"
 
 
 def _should_retry_without_image_input(

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 
 from openharness.api.client import SupportsStreamingMessages
@@ -59,6 +59,10 @@ class QueryEngine:
         tool_metadata: dict[str, object] | None = None,
         decision_trace_recorder: DecisionTraceRecorderLike | None = None,
         settings: Settings | None = None,
+        durable_message_transform: Callable[
+            [list[ConversationMessage]], list[ConversationMessage]
+        ]
+        | None = None,
     ) -> None:
         self._api_client = api_client
         self._tool_registry = tool_registry
@@ -80,6 +84,7 @@ class QueryEngine:
         self._tool_metadata = tool_metadata or {}
         self._decision_trace_recorder = decision_trace_recorder
         self._settings = settings
+        self._durable_message_transform = durable_message_transform
         self._messages: list[ConversationMessage] = []
         self._cost_tracker = CostTracker()
 
@@ -180,7 +185,67 @@ class QueryEngine:
 
     def load_messages(self, messages: list[ConversationMessage]) -> None:
         """Replace the in-memory conversation history."""
-        self._messages = list(messages)
+        self._messages = self._to_durable_messages(messages)
+
+    def set_durable_message_transform(
+        self,
+        transform: Callable[[list[ConversationMessage]], list[ConversationMessage]] | None,
+    ) -> None:
+        """Set the boundary that removes request-local content from history."""
+        self._durable_message_transform = transform
+        self._messages = self._to_durable_messages(self._messages)
+
+    def _to_durable_messages(
+        self,
+        messages: list[ConversationMessage],
+    ) -> list[ConversationMessage]:
+        copied = list(messages)
+        if self._durable_message_transform is None:
+            return copied
+        return list(self._durable_message_transform(copied))
+
+    def _prepare_idempotent_user_turn(
+        self,
+        user_message: ConversationMessage,
+    ) -> list[ConversationMessage]:
+        """Build request history while storing at most one turn per event id."""
+        event_id = user_message.event_id
+        if event_id is None:
+            self._messages.extend(self._to_durable_messages([user_message]))
+            query_messages = list(self._messages)
+            query_messages[-1] = user_message
+            return query_messages
+
+        matches = [
+            index
+            for index, message in enumerate(self._messages)
+            if message.role == "user" and message.event_id == event_id
+        ]
+        if not matches:
+            self._messages.extend(self._to_durable_messages([user_message]))
+            query_messages = list(self._messages)
+            query_messages[-1] = user_message
+            return query_messages
+
+        match_index = matches[-1]
+        later_distinct_user = any(
+            message.role == "user"
+            and message.event_id != event_id
+            and (
+                not message.content
+                or any(
+                    not isinstance(block, ToolResultBlock) for block in message.content
+                )
+            )
+            for message in self._messages[match_index + 1 :]
+        )
+        if later_distinct_user:
+            raise ValueError(f"stale event_id retry rejected: {event_id}")
+
+        self._messages = self._messages[: match_index + 1]
+        query_messages = list(self._messages)
+        query_messages[match_index] = user_message
+        return query_messages
 
     def _schedule_auto_dream(self) -> None:
         """Fire-and-forget background memory consolidation after a user turn."""
@@ -283,8 +348,10 @@ class QueryEngine:
         # in-memory history. The persisted snapshot is sanitized, but
         # self._messages is not — so repair it before extending, else the next
         # request is rejected ("No tool output found for function call ...").
-        self._messages = sanitize_conversation_messages(self._messages)
-        self._messages.append(user_message)
+        self._messages = self._to_durable_messages(
+            sanitize_conversation_messages(self._messages)
+        )
+        query_messages = self._prepare_idempotent_user_turn(user_message)
         if self._hook_executor is not None:
             await self._hook_executor.execute(
                 HookEvent.USER_PROMPT_SUBMIT,
@@ -323,18 +390,18 @@ class QueryEngine:
                 cwd=self._cwd,
             ),
         )
-        query_messages = list(self._messages)
         coordinator_context = self._build_coordinator_context_message()
         if coordinator_context is not None:
             query_messages.append(coordinator_context)
         try:
             async for event, usage in run_query(context, query_messages):
                 if isinstance(event, AssistantTurnComplete):
-                    self._messages = list(query_messages)
+                    self._messages = self._to_durable_messages(query_messages)
                 if usage is not None:
                     self._cost_tracker.add(usage)
                 yield event
         finally:
+            self._messages = self._to_durable_messages(query_messages)
             await self._update_session_memory()
             await self._extract_durable_memories()
             self._schedule_auto_dream()
@@ -349,7 +416,7 @@ class QueryEngine:
         the assistant/tool-result trace and accepted final remain in history so
         the provider sees a valid direct exchange from the original user.
         """
-        base_messages = list(self._messages)
+        base_messages = self._to_durable_messages(self._messages)
         internal_message = ConversationMessage.from_user_text(prompt)
         query_messages = [*base_messages, internal_message]
         context = QueryContext(
@@ -397,14 +464,16 @@ class QueryEngine:
                     ):
                         del query_messages[index]
                         break
-                self._messages = query_messages
+                self._messages = self._to_durable_messages(query_messages)
             else:
                 self._messages = base_messages
 
     async def continue_pending(self, *, max_turns: int | None = None) -> AsyncIterator[StreamEvent]:
         """Continue an interrupted tool loop without appending a new user message."""
         self._prepare_session_memory()
-        self._messages = sanitize_conversation_messages(self._messages)
+        self._messages = self._to_durable_messages(
+            sanitize_conversation_messages(self._messages)
+        )
         context = QueryContext(
             api_client=self._api_client,
             tool_registry=self._tool_registry,
@@ -436,9 +505,13 @@ class QueryEngine:
                 max_turns=context.max_turns,
             ),
         )
-        async for event, usage in run_query(context, self._messages):
-            if usage is not None:
-                self._cost_tracker.add(usage)
-            yield event
-        await self._update_session_memory()
-        await self._extract_durable_memories()
+        query_messages = list(self._messages)
+        try:
+            async for event, usage in run_query(context, query_messages):
+                if usage is not None:
+                    self._cost_tracker.add(usage)
+                yield event
+        finally:
+            self._messages = self._to_durable_messages(query_messages)
+            await self._update_session_memory()
+            await self._extract_durable_memories()
