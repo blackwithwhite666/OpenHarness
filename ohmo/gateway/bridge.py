@@ -689,7 +689,8 @@ class OhmoGatewayBridge:
                     final_metadata = dict(update.metadata or {})
                     final_metadata.pop("_collapse", None)
                     continue
-                if update.kind == "assistant_update" and update.text.strip():
+                ephemeral_assistant_update = collapse and update.kind == "assistant_update"
+                if update.kind == "assistant_update" and update.text.strip() and not ephemeral_assistant_update:
                     delivered_assistant_updates.add(update.text.strip())
                 if update.kind == "error":
                     stream_error = True
@@ -719,10 +720,14 @@ class OhmoGatewayBridge:
                     _content_snippet(update.text),
                 )
                 update_meta = {**inbound_meta, **(update.metadata or {})}
-                if collapse and update.kind != "assistant_update":
-                    # Tag every non-final progress/tool_hint so the Telegram
-                    # channel folds it into the chat's single live status message.
+                if collapse:
+                    # Tag every non-final update so Telegram folds it into the
+                    # chat's single live status message.
                     update_meta["_collapse"] = True
+                if ephemeral_assistant_update:
+                    # In quiet Telegram, public pre-tool narration is part of
+                    # the compact status rather than a durable assistant reply.
+                    update_meta["_progress"] = True
                 await self._bus.publish_outbound(
                     OutboundMessage(
                         channel=message.channel,
