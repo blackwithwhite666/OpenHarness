@@ -2090,7 +2090,7 @@ async def test_gateway_bridge_preserves_structured_tool_progress_without_text():
 
 
 @pytest.mark.asyncio
-async def test_gateway_bridge_keeps_assistant_update_when_turn_ends_without_final():
+async def test_gateway_bridge_keeps_non_telegram_assistant_update_when_turn_ends_without_final():
     class FakeRuntimePool:
         async def stream_message(self, message, session_key):
             yield SimpleNamespace(
@@ -2101,9 +2101,9 @@ async def test_gateway_bridge_keeps_assistant_update_when_turn_ends_without_fina
 
     bus = MessageBus()
     bridge = OhmoGatewayBridge(bus=bus, runtime_pool=FakeRuntimePool())
-    message = InboundMessage(channel="telegram", sender_id="u1", chat_id="c1", content="check")
+    message = InboundMessage(channel="feishu", sender_id="u1", chat_id="c1", content="check")
 
-    await bridge._process_message(message, "telegram:c1")
+    await bridge._process_message(message, "feishu:c1")
 
     update = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
     partial = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
@@ -2115,9 +2115,19 @@ async def test_gateway_bridge_keeps_assistant_update_when_turn_ends_without_fina
 
 
 @pytest.mark.asyncio
-async def test_gateway_bridge_does_not_duplicate_final_that_repeats_assistant_update():
+async def test_gateway_bridge_quiet_telegram_collapses_assistant_updates_and_sends_repeated_final():
     class FakeRuntimePool:
         async def stream_message(self, message, session_key):
+            yield SimpleNamespace(
+                kind="assistant_update",
+                text="I will check the source.",
+                metadata={"_assistant_update": True, "_session_key": session_key},
+            )
+            yield SimpleNamespace(
+                kind="tool_hint",
+                text="🛠️ Bash — running",
+                metadata={"_progress": True, "_session_key": session_key},
+            )
             yield SimpleNamespace(
                 kind="assistant_update",
                 text="The answer before verification.",
@@ -2135,8 +2145,43 @@ async def test_gateway_bridge_does_not_duplicate_final_that_repeats_assistant_up
 
     await bridge._process_message(message, "telegram:c1")
 
+    first_update = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
+    tool_hint = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
+    second_update = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
+    final = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
+    for update in (first_update, second_update):
+        assert update.metadata["_assistant_update"] is True
+        assert update.metadata["_collapse"] is True
+        assert update.metadata["_progress"] is True
+    assert tool_hint.metadata["_collapse"] is True
+    assert final.content == "The answer before verification."
+    assert bus.outbound_size == 0
+
+
+@pytest.mark.asyncio
+async def test_gateway_bridge_debug_telegram_does_not_duplicate_final_that_repeats_assistant_update():
+    class FakeRuntimePool:
+        async def stream_message(self, message, session_key):
+            yield SimpleNamespace(
+                kind="assistant_update",
+                text="The answer before verification.",
+                metadata={"_assistant_update": True, "_session_key": session_key},
+            )
+            yield SimpleNamespace(
+                kind="final",
+                text="The answer before verification.",
+                metadata={"_session_key": session_key},
+            )
+
+    bus = MessageBus()
+    bridge = OhmoGatewayBridge(bus=bus, runtime_pool=FakeRuntimePool(), debug_progress_chats=["c1"])
+    message = InboundMessage(channel="telegram", sender_id="u1", chat_id="c1", content="check")
+
+    await bridge._process_message(message, "telegram:c1")
+
     update = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
     assert update.content == "The answer before verification."
+    assert "_collapse" not in update.metadata
     assert bus.outbound_size == 0
 
 
@@ -2156,7 +2201,7 @@ async def test_gateway_bridge_sends_duplicate_final_attachment_without_repeating
             yield SimpleNamespace(kind="final", text=reply, metadata={"_session_key": session_key})
 
     bus = MessageBus()
-    bridge = OhmoGatewayBridge(bus=bus, runtime_pool=FakeRuntimePool())
+    bridge = OhmoGatewayBridge(bus=bus, runtime_pool=FakeRuntimePool(), debug_progress_chats=["c1"])
     message = InboundMessage(channel="telegram", sender_id="u1", chat_id="c1", content="check")
 
     await bridge._process_message(message, "telegram:c1")
@@ -2183,7 +2228,7 @@ async def test_gateway_bridge_sends_duplicate_final_ask_question_without_repeati
             yield SimpleNamespace(kind="final", text=reply, metadata={"_session_key": session_key})
 
     bus = MessageBus()
-    bridge = OhmoGatewayBridge(bus=bus, runtime_pool=FakeRuntimePool())
+    bridge = OhmoGatewayBridge(bus=bus, runtime_pool=FakeRuntimePool(), debug_progress_chats=["c1"])
     message = InboundMessage(channel="telegram", sender_id="u1", chat_id="c1", content="check")
 
     await bridge._process_message(message, "telegram:c1")
