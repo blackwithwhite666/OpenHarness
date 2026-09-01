@@ -37,6 +37,7 @@ from ohmo.gateway.memory_gate import (
     principal_isolated_session,
     resolve_memory_scope,
 )
+from ohmo.gateway.profile_context import render_profile_context
 from ohmo.gateway.provider_commands import (
     handle_gateway_model_command,
     handle_gateway_provider_command,
@@ -2313,6 +2314,9 @@ class OhmoSessionRuntimePool:
             include_ohmo_memory=False,
             include_ohmo_workspace=engaged,
         )
+        profile_context = render_profile_context(self._gateway_config, turn_ctx)
+        if profile_context:
+            memory_free_base = f"{memory_free_base}\n\n{profile_context}"
         session_owner_principal = (
             self._session_owner_principals.get(turn_ctx.session_id)
             if turn_ctx is not None
@@ -2364,6 +2368,8 @@ class OhmoSessionRuntimePool:
             )
             return self._append_todo_runtime_section(bundle, prompt) if include_todo else prompt
         base = settings.system_prompt or memory_free_base
+        if profile_context and profile_context not in base:
+            base = f"{base}\n\n{profile_context}"
         if include_todo:
             base = self._append_todo_runtime_section(bundle, base)
         composed_settings = settings.model_copy(

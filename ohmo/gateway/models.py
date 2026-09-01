@@ -11,6 +11,11 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 _TENANT_ID_RE = re.compile(r"[a-z0-9_-]+")
 _NUMERIC_PRINCIPAL_RE = re.compile(r"[1-9][0-9]*")
+_PROFILE_PRINCIPAL_RE = re.compile(r"[1-9][0-9]{0,19}")
+_PROJECT_SLUG_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
+_MAX_PROFILE_PROJECTS_PER_PRINCIPAL = 8
+_MAX_PROFILE_PRINCIPALS = 100
+_MAX_PROJECT_SLUG_LENGTH = 64
 _HONCHO_SESSION_RE = re.compile(r"[A-Za-z0-9_-]{1,512}")
 
 
@@ -46,6 +51,8 @@ class GatewayConfig(BaseModel):
     memory_service_secret_file: str | None = None
     owner_principals: tuple[str, ...] = ()
     family_principals: dict[str, str] = Field(default_factory=dict)
+    knowledge_base_root: Path | None = None
+    principal_knowledge_projects: dict[str, tuple[str, ...]] = Field(default_factory=dict)
     shared_tenants: tuple[str, ...] = ()
     enabled_memory_tenants: tuple[str, ...] = ()
     honcho_base_url: str | None = None
@@ -64,6 +71,26 @@ class GatewayConfig(BaseModel):
                 raise ValueError("memory tenant ids must match [a-z0-9_-]+")
             if tenant_id == "owner":
                 raise ValueError("the owner tenant is reserved for owner_principals")
+
+        if len(self.principal_knowledge_projects) > _MAX_PROFILE_PRINCIPALS:
+            raise ValueError("principal_knowledge_projects has too many principals")
+        if self.principal_knowledge_projects and self.knowledge_base_root is None:
+            raise ValueError("knowledge_base_root is required for principal knowledge projects")
+        if self.knowledge_base_root is not None and not self.knowledge_base_root.is_absolute():
+            raise ValueError("knowledge_base_root must be an absolute path")
+        for principal, project_slugs in self.principal_knowledge_projects.items():
+            if _PROFILE_PRINCIPAL_RE.fullmatch(principal) is None:
+                raise ValueError("principal_knowledge_projects keys must be bounded canonical numeric ids")
+            if not project_slugs or len(project_slugs) > _MAX_PROFILE_PROJECTS_PER_PRINCIPAL:
+                raise ValueError("each principal must have a bounded non-empty project list")
+            if len(set(project_slugs)) != len(project_slugs):
+                raise ValueError("principal knowledge project slugs must not repeat")
+            for slug in project_slugs:
+                if (
+                    len(slug) > _MAX_PROJECT_SLUG_LENGTH
+                    or _PROJECT_SLUG_RE.fullmatch(slug) is None
+                ):
+                    raise ValueError("knowledge project slugs must be lowercase kebab-case")
 
         for tenant_id in (*self.shared_tenants, *self.enabled_memory_tenants):
             if _TENANT_ID_RE.fullmatch(tenant_id) is None:
