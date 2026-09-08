@@ -189,21 +189,15 @@ class McpClientManager:
         # cancel scope in a different task" and crashing the whole gateway.
         self._conn_tasks: dict[str, asyncio.Task] = {}
         self._shutdown_events: dict[str, asyncio.Event] = {}
+        self._reconnect_locks: dict[str, asyncio.Lock] = {
+            name: asyncio.Lock() for name in server_configs
+        }
 
     async def connect_all(self) -> None:
         """Connect all configured MCP servers supported by the current build."""
         for name, config in self._server_configs.items():
             if isinstance(config, (McpStdioServerConfig, McpHttpServerConfig)):
-                shutdown = asyncio.Event()
-                ready = asyncio.Event()
-                self._shutdown_events[name] = shutdown
-                self._conn_tasks[name] = asyncio.create_task(
-                    self._serve(name, config, shutdown, ready),
-                    name=f"mcp-conn:{name}",
-                )
-                # Wait for this connection's connect attempt to finish (success or
-                # failure) before the next, preserving sequential-connect order.
-                await ready.wait()
+                await self._connect_server(name, config)
             else:
                 detail = f"Unsupported MCP transport in current build: {config.type}"
                 log.warning("MCP server %r not connected: %s", name, detail)
@@ -227,6 +221,7 @@ class McpClientManager:
     def update_server_config(self, name: str, config: object) -> None:
         """Replace one server config in memory."""
         self._server_configs[name] = config
+        self._reconnect_locks.setdefault(name, asyncio.Lock())
 
     def get_server_config(self, name: str) -> object | None:
         """Return one configured server object if present."""
@@ -283,6 +278,56 @@ class McpClientManager:
         self._shutdown_events.clear()
         self._sessions.clear()
 
+    async def _connect_server(self, name: str, config: object) -> ClientSession | None:
+        """Start one owner task and wait for its connection attempt to finish."""
+        shutdown = asyncio.Event()
+        ready = asyncio.Event()
+        self._shutdown_events[name] = shutdown
+        self._conn_tasks[name] = asyncio.create_task(
+            self._serve(name, config, shutdown, ready),
+            name=f"mcp-conn:{name}",
+        )
+        await ready.wait()
+        return self._sessions.get(name)
+
+    async def _disconnect_server(self, name: str, session: ClientSession) -> None:
+        """Stop one session by signalling and awaiting its owning task."""
+        if self._sessions.get(name) is session:
+            self._sessions.pop(name, None)
+        shutdown = self._shutdown_events.get(name)
+        task = self._conn_tasks.get(name)
+        if shutdown is not None:
+            shutdown.set()
+        if task is not None:
+            await asyncio.gather(task, return_exceptions=True)
+        if self._conn_tasks.get(name) is task:
+            self._conn_tasks.pop(name, None)
+        if self._shutdown_events.get(name) is shutdown:
+            self._shutdown_events.pop(name, None)
+
+    async def _recover_server(
+        self, name: str, stale_session: ClientSession
+    ) -> ClientSession | None:
+        """Replace a failed session, or reuse a replacement made by a peer."""
+        lock = self._reconnect_locks.setdefault(name, asyncio.Lock())
+        async with lock:
+            current = self._sessions.get(name)
+            if current is not stale_session:
+                return current
+
+            config = self._server_configs.get(name)
+            if not isinstance(config, (McpStdioServerConfig, McpHttpServerConfig)):
+                return None
+
+            log.warning("MCP server %r tool call failed; reconnecting", name)
+            await self._disconnect_server(name, stale_session)
+            self._statuses[name] = McpConnectionStatus(
+                name=name,
+                state="pending",
+                transport=getattr(config, "type", "unknown"),
+            )
+            return await self._connect_server(name, config)
+
     def list_statuses(self) -> list[McpConnectionStatus]:
         """Return statuses for all configured servers."""
         return [self._statuses[name] for name in sorted(self._statuses)]
@@ -321,22 +366,36 @@ class McpClientManager:
                 f"MCP server '{server_name}' is not connected: {detail}"
             )
         timeout = _mcp_tool_timeout()
-        try:
-            if timeout is None:
-                result: CallToolResult = await session.call_tool(tool_name, arguments)
-            else:
-                result = await asyncio.wait_for(
-                    session.call_tool(tool_name, arguments), timeout=timeout
+        for attempt in range(2):
+            try:
+                if timeout is None:
+                    result: CallToolResult = await session.call_tool(tool_name, arguments)
+                else:
+                    result = await asyncio.wait_for(
+                        session.call_tool(tool_name, arguments), timeout=timeout
+                    )
+                break
+            except (asyncio.TimeoutError, TimeoutError) as exc:
+                replacement = await self._recover_server(server_name, session)
+                if attempt == 0 and replacement is not None:
+                    session = replacement
+                    continue
+                timeout_detail = (
+                    f" after {timeout:.0f}s (set OPENHARNESS_MCP_TOOL_TIMEOUT to adjust)"
+                    if timeout is not None
+                    else ""
                 )
-        except (asyncio.TimeoutError, TimeoutError) as exc:
-            raise McpToolTimeoutError(
-                f"MCP server '{server_name}' tool '{tool_name}' timed out after "
-                f"{timeout:.0f}s (set OPENHARNESS_MCP_TOOL_TIMEOUT to adjust)"
-            ) from exc
-        except Exception as exc:
-            raise McpServerNotConnectedError(
-                f"MCP server '{server_name}' call failed: {_describe_mcp_exc(exc)}"
-            ) from exc
+                raise McpToolTimeoutError(
+                    f"MCP server '{server_name}' tool '{tool_name}' timed out{timeout_detail}"
+                ) from exc
+            except Exception as exc:
+                replacement = await self._recover_server(server_name, session)
+                if attempt == 0 and replacement is not None:
+                    session = replacement
+                    continue
+                raise McpServerNotConnectedError(
+                    f"MCP server '{server_name}' call failed: {_describe_mcp_exc(exc)}"
+                ) from exc
         parts: list[str] = []
         for item in result.content:
             if getattr(item, "type", None) == "text":

@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 import asyncio
+import logging
 from contextlib import AsyncExitStack
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
+import anyio
 import pytest
 from mcp.types import CallToolResult, TextContent
 
@@ -26,6 +28,8 @@ from openharness.tools.mcp_tool import McpToolAdapter
 from openharness.tools.read_mcp_resource_tool import ReadMcpResourceTool
 from openharness.untrusted import UNTRUSTED_BANNER
 
+_LOGGER = "openharness.mcp.client"
+
 
 class _AsyncContextManager:
     def __init__(self, value):
@@ -36,6 +40,28 @@ class _AsyncContextManager:
 
     async def __aexit__(self, exc_type, exc, tb):
         return False
+
+
+async def _install_owned_session(
+    manager: McpClientManager, name: str, session: AsyncMock
+) -> asyncio.Event:
+    """Install a session with a minimal owner task matching manager lifecycle."""
+    shutdown = asyncio.Event()
+    closed = asyncio.Event()
+
+    async def _owner() -> None:
+        await shutdown.wait()
+        closed.set()
+
+    manager._sessions[name] = session
+    manager._shutdown_events[name] = shutdown
+    manager._conn_tasks[name] = asyncio.create_task(_owner())
+    await asyncio.sleep(0)
+    return closed
+
+
+def _text_result(text: str) -> CallToolResult:
+    return CallToolResult(content=[TextContent(type="text", text=text)], isError=False)
 
 
 # --- McpClientManager.call_tool ---
@@ -140,6 +166,136 @@ async def test_call_tool_times_out_when_session_hangs(monkeypatch):
         await manager.call_tool("slow", "tool", {})
     # subclass of McpServerNotConnectedError so existing handlers catch it too
     assert issubclass(McpToolTimeoutError, McpServerNotConnectedError)
+
+
+@pytest.mark.asyncio
+async def test_call_tool_timeout_reconnects_and_retries_once(monkeypatch):
+    monkeypatch.setenv("OPENHARNESS_MCP_TOOL_TIMEOUT", "0.01")
+    manager = McpClientManager(
+        {"slow": McpStdioServerConfig(command="unused", args=[])}
+    )
+    stale_session = AsyncMock()
+
+    async def _hang(*_args, **_kwargs):
+        await asyncio.sleep(30)
+
+    stale_session.call_tool.side_effect = _hang
+    closed = await _install_owned_session(manager, "slow", stale_session)
+    replacement = AsyncMock()
+    replacement.call_tool.return_value = _text_result("recovered")
+
+    async def _connect(name, _config):
+        manager._sessions[name] = replacement
+        return replacement
+
+    connect = AsyncMock(side_effect=_connect)
+    monkeypatch.setattr(manager, "_connect_server", connect)
+
+    assert await manager.call_tool("slow", "tool", {}) == "recovered"
+    assert closed.is_set()
+    assert stale_session.call_tool.await_count == 1
+    assert replacement.call_tool.await_count == 1
+    connect.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_call_tool_closed_transport_reconnects_and_retries(monkeypatch, caplog):
+    manager = McpClientManager(
+        {"flaky": McpStdioServerConfig(command="unused", args=[])}
+    )
+    stale_session = AsyncMock()
+    stale_session.call_tool.side_effect = anyio.ClosedResourceError()
+    await _install_owned_session(manager, "flaky", stale_session)
+    replacement = AsyncMock()
+    replacement.call_tool.return_value = _text_result("ok")
+
+    async def _connect(name, _config):
+        manager._sessions[name] = replacement
+        return replacement
+
+    connect = AsyncMock(side_effect=_connect)
+    monkeypatch.setattr(manager, "_connect_server", connect)
+
+    with caplog.at_level(logging.WARNING, logger=_LOGGER):
+        assert await manager.call_tool("flaky", "tool", {}) == "ok"
+
+    assert stale_session.call_tool.await_count == 1
+    assert replacement.call_tool.await_count == 1
+    connect.assert_awaited_once()
+    reconnect_logs = [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelno == logging.WARNING and "reconnecting" in record.getMessage()
+    ]
+    assert reconnect_logs == ["MCP server 'flaky' tool call failed; reconnecting"]
+
+
+@pytest.mark.asyncio
+async def test_call_tool_retry_failure_refreshes_for_future_without_third_call(monkeypatch):
+    manager = McpClientManager(
+        {"flaky": McpStdioServerConfig(command="unused", args=[])}
+    )
+    stale_session = AsyncMock()
+    stale_session.call_tool.side_effect = RuntimeError("first transport closed")
+    await _install_owned_session(manager, "flaky", stale_session)
+    retry_session = AsyncMock()
+    retry_session.call_tool.side_effect = RuntimeError("retry transport closed")
+    future_session = AsyncMock()
+    replacements = iter((retry_session, future_session))
+
+    async def _connect(name, _config):
+        replacement = next(replacements)
+        manager._sessions[name] = replacement
+        return replacement
+
+    connect = AsyncMock(side_effect=_connect)
+    monkeypatch.setattr(manager, "_connect_server", connect)
+
+    with pytest.raises(McpServerNotConnectedError, match="retry transport closed"):
+        await manager.call_tool("flaky", "tool", {})
+
+    assert stale_session.call_tool.await_count == 1
+    assert retry_session.call_tool.await_count == 1
+    assert future_session.call_tool.await_count == 0
+    assert connect.await_count == 2
+    assert manager._sessions["flaky"] is future_session
+
+
+@pytest.mark.asyncio
+async def test_concurrent_stale_failures_share_one_reconnect(monkeypatch, caplog):
+    manager = McpClientManager(
+        {"flaky": McpStdioServerConfig(command="unused", args=[])}
+    )
+    stale_session = AsyncMock()
+    stale_session.call_tool.side_effect = RuntimeError("transport closed")
+    await _install_owned_session(manager, "flaky", stale_session)
+    replacement = AsyncMock()
+    replacement.call_tool.return_value = _text_result("ok")
+
+    async def _connect(name, _config):
+        await asyncio.sleep(0)
+        manager._sessions[name] = replacement
+        return replacement
+
+    connect = AsyncMock(side_effect=_connect)
+    monkeypatch.setattr(manager, "_connect_server", connect)
+
+    with caplog.at_level(logging.WARNING, logger=_LOGGER):
+        outcomes = await asyncio.gather(
+            manager.call_tool("flaky", "one", {}),
+            manager.call_tool("flaky", "two", {}),
+        )
+
+    assert outcomes == ["ok", "ok"]
+    assert stale_session.call_tool.await_count == 2
+    assert replacement.call_tool.await_count == 2
+    connect.assert_awaited_once()
+    reconnect_logs = [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelno == logging.WARNING and "reconnecting" in record.getMessage()
+    ]
+    assert reconnect_logs == ["MCP server 'flaky' tool call failed; reconnecting"]
 
 
 @pytest.mark.asyncio
