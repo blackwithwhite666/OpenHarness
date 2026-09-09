@@ -360,6 +360,14 @@ class McpClientManager:
         """Invoke one MCP tool, preserving the tool-level ``isError`` flag."""
         session = self._sessions.get(server_name)
         if session is None:
+            # A peer may have removed the stale session while holding the
+            # per-server reconnect lock. Wait for that recovery to finish,
+            # then use its replacement (or fail below if it produced none).
+            lock = self._reconnect_locks.get(server_name)
+            if lock is not None:
+                async with lock:
+                    session = self._sessions.get(server_name)
+        if session is None:
             status = self._statuses.get(server_name)
             detail = status.detail if status else "unknown server"
             raise McpServerNotConnectedError(
