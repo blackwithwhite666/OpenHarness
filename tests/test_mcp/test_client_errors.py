@@ -42,6 +42,19 @@ class _AsyncContextManager:
         return False
 
 
+class _ObservedSessions(dict):
+    def __init__(self, sessions, name: str, missing_observed: asyncio.Event):
+        super().__init__(sessions)
+        self._name = name
+        self._missing_observed = missing_observed
+
+    def get(self, key, default=None):
+        value = super().get(key, default)
+        if key == self._name and value is None:
+            self._missing_observed.set()
+        return value
+
+
 async def _install_owned_session(
     manager: McpClientManager, name: str, session: AsyncMock
 ) -> asyncio.Event:
@@ -271,9 +284,16 @@ async def test_concurrent_stale_failures_share_one_reconnect(monkeypatch, caplog
     await _install_owned_session(manager, "flaky", stale_session)
     replacement = AsyncMock()
     replacement.call_tool.return_value = _text_result("ok")
+    reconnect_started = asyncio.Event()
+    allow_reconnect = asyncio.Event()
+    missing_session_observed = asyncio.Event()
+    manager._sessions = _ObservedSessions(
+        manager._sessions, "flaky", missing_session_observed
+    )
 
     async def _connect(name, _config):
-        await asyncio.sleep(0)
+        reconnect_started.set()
+        await allow_reconnect.wait()
         manager._sessions[name] = replacement
         return replacement
 
@@ -281,13 +301,17 @@ async def test_concurrent_stale_failures_share_one_reconnect(monkeypatch, caplog
     monkeypatch.setattr(manager, "_connect_server", connect)
 
     with caplog.at_level(logging.WARNING, logger=_LOGGER):
-        outcomes = await asyncio.gather(
-            manager.call_tool("flaky", "one", {}),
-            manager.call_tool("flaky", "two", {}),
-        )
+        first_call = asyncio.create_task(manager.call_tool("flaky", "one", {}))
+        await reconnect_started.wait()
+        second_call = asyncio.create_task(manager.call_tool("flaky", "two", {}))
+        await missing_session_observed.wait()
+        second_call_waited = not second_call.done()
+        allow_reconnect.set()
+        assert second_call_waited
+        outcomes = await asyncio.gather(first_call, second_call)
 
     assert outcomes == ["ok", "ok"]
-    assert stale_session.call_tool.await_count == 2
+    assert stale_session.call_tool.await_count == 1
     assert replacement.call_tool.await_count == 2
     connect.assert_awaited_once()
     reconnect_logs = [
@@ -296,6 +320,45 @@ async def test_concurrent_stale_failures_share_one_reconnect(monkeypatch, caplog
         if record.levelno == logging.WARNING and "reconnecting" in record.getMessage()
     ]
     assert reconnect_logs == ["MCP server 'flaky' tool call failed; reconnecting"]
+
+
+@pytest.mark.asyncio
+async def test_call_during_reconnect_fails_when_no_replacement_is_registered(monkeypatch):
+    manager = McpClientManager(
+        {"flaky": McpStdioServerConfig(command="unused", args=[])}
+    )
+    stale_session = AsyncMock()
+    stale_session.call_tool.side_effect = RuntimeError("transport closed")
+    await _install_owned_session(manager, "flaky", stale_session)
+    reconnect_started = asyncio.Event()
+    allow_reconnect = asyncio.Event()
+    missing_session_observed = asyncio.Event()
+    manager._sessions = _ObservedSessions(
+        manager._sessions, "flaky", missing_session_observed
+    )
+
+    async def _connect(_name, _config):
+        reconnect_started.set()
+        await allow_reconnect.wait()
+        return None
+
+    connect = AsyncMock(side_effect=_connect)
+    monkeypatch.setattr(manager, "_connect_server", connect)
+
+    first_call = asyncio.create_task(manager.call_tool("flaky", "one", {}))
+    await reconnect_started.wait()
+    second_call = asyncio.create_task(manager.call_tool("flaky", "two", {}))
+    await missing_session_observed.wait()
+    second_call_waited = not second_call.done()
+    allow_reconnect.set()
+    outcomes = await asyncio.gather(first_call, second_call, return_exceptions=True)
+
+    assert second_call_waited
+    assert all(isinstance(outcome, McpServerNotConnectedError) for outcome in outcomes)
+    assert "transport closed" in str(outcomes[0])
+    assert "not connected" in str(outcomes[1])
+    assert stale_session.call_tool.await_count == 1
+    connect.assert_awaited_once()
 
 
 @pytest.mark.asyncio
