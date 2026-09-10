@@ -13,8 +13,9 @@ from types import SimpleNamespace
 import pytest
 from telegram.error import BadRequest, RetryAfter
 
+from ohmo.gateway.bridge import OhmoGatewayBridge
 import openharness.channels.impl.telegram as telegram_impl
-from openharness.channels.bus.events import OutboundMessage
+from openharness.channels.bus.events import InboundMessage, OutboundMessage
 from openharness.channels.bus.queue import MessageBus
 from openharness.channels.impl.telegram import (
     _COMPACT_HEADERS_RU,
@@ -231,6 +232,66 @@ async def test_final_deletes_status_then_sends_answer():
     assert bot.calls[-1][0] == "send_message"
     assert bot.calls[-1][1]["text"] == "Готовый ответ" or "Готовый" in bot.calls[-1][1]["text"]
     assert "42" not in ch._status
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("debug", [False, True], ids=["quiet", "debug"])
+@pytest.mark.parametrize("progress_first", [False, True], ids=["error-first", "progress-first"])
+async def test_gateway_runtime_error_bypasses_compact_progress_and_reaches_telegram(
+    debug: bool, progress_first: bool, tmp_path
+):
+    """A runtime error is durable even when the turn has no final reply."""
+
+    quota_text = "Provider quota exhausted: synthetic-test-limit"
+
+    class ErrorRuntimePool:
+        async def stream_message(self, message, session_key):
+            if progress_first:
+                yield SimpleNamespace(
+                    kind="progress",
+                    text="Synthetic progress",
+                    metadata={"_progress": True},
+                )
+            yield SimpleNamespace(kind="error", text=quota_text, metadata={})
+
+        async def reset_session(self, session_key):  # pragma: no cover - unused here
+            pass
+
+    bus = MessageBus()
+    bridge = OhmoGatewayBridge(
+        bus=bus,
+        runtime_pool=ErrorRuntimePool(),
+        workspace=tmp_path,
+        debug_progress_chats=["424242"] if debug else [],
+    )
+    task = asyncio.create_task(bridge.run())
+    try:
+        await bus.publish_inbound(
+            InboundMessage(
+                channel="telegram",
+                sender_id="424242|synthetic-user",
+                chat_id="424242",
+                content="synthetic request",
+            )
+        )
+        outbound = [
+            await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
+            for _ in range(1 + progress_first)
+        ]
+    finally:
+        bridge.stop()
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    bot = FakeBot()
+    channel = _channel(bot)
+    for message in outbound:
+        await channel.send(message)
+
+    sent_texts = [kwargs["text"] for name, kwargs in bot.calls if name == "send_message"]
+    assert sent_texts.count(quota_text) == 1
+    assert channel._status == {}
 
 
 @pytest.mark.asyncio

@@ -720,9 +720,9 @@ class OhmoGatewayBridge:
                     _content_snippet(update.text),
                 )
                 update_meta = {**inbound_meta, **(update.metadata or {})}
-                if collapse:
-                    # Tag every non-final update so Telegram folds it into the
-                    # chat's single live status message.
+                if collapse and update.kind != "error":
+                    # Runtime errors must use Telegram's normal send path: it
+                    # clears any live compact status and renders the error.
                     update_meta["_collapse"] = True
                 if ephemeral_assistant_update:
                     # In quiet Telegram, public pre-tool narration is part of
