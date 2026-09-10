@@ -41,9 +41,11 @@ labels `self-hosted, Linux, X64`. Host already has python3.12, pipx, node18.
   path), so no extra skip list is needed.
 - `deploy` job: `needs: test`, `if push && ref == refs/heads/deploy`:
   1. `pipx install --force git+…@deploy` — reinstalls from the pushed HEAD
-     (the local checkout is only used for the idle script).
+     (the local checkout is only used for CI helper scripts).
   2. `ci/wait_for_idle.sh` — hold until no in-flight turn.
-  3. restart `ohmo-gateway.service` and assert `is-active`.
+  3. `ci/restart_gateway.sh` stops the user unit, safely stops and waits for a
+     matching detached workspace gateway, then starts `ohmo-gateway.service`
+     and asserts `is-active`.
 - `concurrency: deploy-${{ github.ref }}` + the single runner serialize
   `test`→`deploy`.
 
@@ -85,4 +87,4 @@ automatically once `test` is green on a `deploy` push.
   repos/blackwithwhite666/OpenHarness/actions/runners/registration-token`, then
   `~/ci/actions-runner/config.sh … --replace`.
 - Manual deploy still works: `pipx install --force git+…@deploy` +
-  `bash ci/wait_for_idle.sh` + `systemctl --user restart ohmo-gateway.service`.
+  `bash ci/wait_for_idle.sh` + `bash ci/restart_gateway.sh`.

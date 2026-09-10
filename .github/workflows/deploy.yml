@@ -6,7 +6,8 @@ name: Deploy (self-hosted)
 #
 # Deploy = reinstall the pipx package from the pushed `deploy` HEAD, wait for the
 # gateway to be idle (so a restart doesn't drop an in-flight user turn), then
-# restart the user-systemd unit. See adrs/ci-cd.md and ci/wait_for_idle.sh.
+# stop all known gateway ownership modes, then start the user-systemd unit. See
+# adrs/ci-cd.md, ci/wait_for_idle.sh, and ci/restart_gateway.sh.
 # (The upstream ci.yml still runs the GitHub-hosted matrix on main / PRs.)
 
 on:
@@ -90,12 +91,5 @@ jobs:
       - name: Wait for the gateway to be idle
         run: bash ci/wait_for_idle.sh
 
-      - name: Restart the gateway (user systemd)
-        run: |
-          uid="$(id -u)"
-          export XDG_RUNTIME_DIR="/run/user/${uid}"
-          export DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${uid}/bus"
-          systemctl --user restart ohmo-gateway.service
-          sleep 3
-          systemctl --user is-active ohmo-gateway.service
-          journalctl --user -u ohmo-gateway.service -n 15 --no-pager
+      - name: Stop old gateway and start the user-systemd unit
+        run: bash ci/restart_gateway.sh
