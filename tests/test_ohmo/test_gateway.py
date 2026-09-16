@@ -3496,6 +3496,101 @@ def test_gateway_provider_command_uses_ohmo_gateway_profile(tmp_path, monkeypatc
     assert load_gateway_config(workspace).provider_profile == "codex"
 
 
+def test_gateway_provider_command_survives_nutrition_child_mode_drift(tmp_path, monkeypatch):
+    assets = tmp_path / "nutrition-assets"
+    assets.mkdir(mode=0o700)
+    workspace = initialize_workspace(tmp_path / ".ohmo-home")
+    save_gateway_config(
+        GatewayConfig(
+            provider_profile="kimi-anthropic",
+            conversation_learning=True,
+            family_principals={"123": "marina"},
+            enabled_memory_tenants=("marina",),
+            honcho_base_url="https://honcho.test",
+            tenant_honcho={
+                "marina": {
+                    "workspace": "marina-workspace",
+                    "api_key": "marina-key",
+                    "observed_peer": "marina",
+                }
+            },
+            nutrition_ingest=NutritionIngestConfig(
+                enabled=True,
+                synchronized_root=assets,
+                principal="123",
+                chat_id="123",
+                session_key="telegram:123",
+            ),
+        ),
+        workspace,
+    )
+    (assets / "synchronized.json").write_text("{}", encoding="utf-8")
+    (assets / "synchronized.json").chmod(0o644)
+
+    statuses = {
+        "codex": {
+            "label": "Codex subscription",
+            "configured": True,
+            "base_url": None,
+            "model": "gpt-5.4",
+        },
+        "kimi-anthropic": {
+            "label": "Kimi Anthropic",
+            "configured": True,
+            "base_url": "https://api.example.test",
+            "model": "kimi-k2.5",
+        },
+    }
+
+    class FakeAuthManager:
+        def __init__(self, settings):
+            del settings
+
+        def get_profile_statuses(self):
+            return statuses
+
+    monkeypatch.setattr("ohmo.gateway.provider_commands.load_settings", lambda: object())
+    monkeypatch.setattr("ohmo.gateway.provider_commands.AuthManager", FakeAuthManager)
+
+    text, refresh = handle_gateway_provider_command("codex", workspace=workspace)
+
+    assert refresh is True
+    assert "provider_profile set to codex" in text
+    assert load_gateway_config(workspace).provider_profile == "codex"
+
+
+def test_gateway_service_rejects_nutrition_child_mode_drift(tmp_path, monkeypatch):
+    assets = tmp_path / "nutrition-assets"
+    assets.mkdir(mode=0o700)
+    workspace = initialize_workspace(tmp_path / ".ohmo-home")
+    config = GatewayConfig(
+        conversation_learning=True,
+        family_principals={"123": "marina"},
+        enabled_memory_tenants=("marina",),
+        honcho_base_url="https://honcho.test",
+        tenant_honcho={
+            "marina": {
+                "workspace": "marina-workspace",
+                "api_key": "marina-key",
+                "observed_peer": "marina",
+            }
+        },
+        nutrition_ingest=NutritionIngestConfig(
+            enabled=True,
+            synchronized_root=assets,
+            principal="123",
+            chat_id="123",
+            session_key="telegram:123",
+        ),
+    )
+    (assets / "synchronized.json").write_text("{}", encoding="utf-8")
+    (assets / "synchronized.json").chmod(0o644)
+    monkeypatch.setattr("ohmo.gateway.service.load_gateway_config", lambda _workspace: config)
+
+    with pytest.raises(ValueError, match="filesystem must be owner-only"):
+        OhmoGatewayService(cwd=tmp_path, workspace=workspace)
+
+
 def test_gateway_model_command_updates_selected_gateway_profile(tmp_path, monkeypatch):
     workspace = initialize_workspace(tmp_path / ".ohmo-home")
     save_gateway_config(GatewayConfig(provider_profile="codex"), workspace)

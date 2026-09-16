@@ -184,7 +184,7 @@ class NutritionIngestConfig(BaseModel):
         return self
 
     def validate_runtime(self, gateway: GatewayConfig) -> None:
-        """Validate cross-config and filesystem invariants at service startup."""
+        """Validate cross-config invariants during every gateway config validation."""
         if not self.enabled:
             return
         if gateway.conversation_learning is not True:
@@ -201,6 +201,11 @@ class NutritionIngestConfig(BaseModel):
             for key in ("workspace", "api_key", "observed_peer")
         ):
             raise ValueError("tenant_honcho marina binding is incomplete")
+
+    def validate_filesystem_runtime(self) -> None:
+        """Validate filesystem invariants at service startup."""
+        if not self.enabled:
+            return
         root = self.synchronized_root.expanduser().resolve()
         if not root.is_dir():
             raise ValueError("nutrition ingest synchronized_root must be a directory")

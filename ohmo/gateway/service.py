@@ -51,6 +51,7 @@ class OhmoGatewayService:
         root = initialize_workspace(self._workspace)
         os.environ["OHMO_WORKSPACE"] = str(root)
         self._config = load_gateway_config(self._workspace)
+        self._config.nutrition_ingest.validate_filesystem_runtime()
         if self._config.allow_remote_admin_commands and self._config.allowed_remote_admin_commands:
             logger.warning(
                 "ohmo gateway remote administrative commands enabled commands=%s",
