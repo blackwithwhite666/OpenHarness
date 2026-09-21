@@ -549,6 +549,16 @@ async def test_cron_create_rejects_gateway_agent_turn(
 
     assert result.is_error
     assert "remind_create" in result.output
+    assert "current chat" in result.output
+    prompt_and_error_surfaces = [
+        CronCreateTool.description,
+        *(field.description or "" for field in CronCreateToolInput.model_fields.values()),
+        result.output,
+    ]
+    assert all(
+        "delivery=explicit" not in surface.replace("'", "").replace('"', "")
+        for surface in prompt_and_error_surfaces
+    )
     list_result = await CronListTool().execute(CronListToolInput(), context)
     assert "chat-poll" not in list_result.output
 

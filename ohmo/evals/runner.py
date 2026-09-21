@@ -73,10 +73,6 @@ from ohmo.prompts import build_ohmo_system_prompt
 from ohmo.reminders.store import ReminderStore
 from ohmo.reminders.tool import RemindCancelTool, RemindCreateTool, RemindListTool
 from ohmo.todo_store import TodoStore
-from ohmo.gateway.send_message_tool import (
-    SendTelegramMessageInput,
-    SendTelegramMessageTool,
-)
 from ohmo.todo_write_tool import OhmoTodoWriteTool
 from ohmo.workspace import get_attachments_dir, get_plugins_dir, get_skills_dir
 
@@ -887,9 +883,9 @@ def _resolve_eval_system_prompt(
 _MOCK_STATIC_PUBLISHER_SH = """#!/bin/bash
 # Eval-only mock of static_publisher-cli: returns a content-addressed
 # https://worfalomey.top/static/<hash>/ URL WITHOUT uploading (no network, no
-# side effect). Mirrors _MockSendTelegramMessageTool — the real publisher's
-# ACL/upload is tested elsewhere; in fs-sandbox eval we only need the publish
-# step to yield a stable, groundable URL.
+# side effect). The real publisher's ACL/upload is tested elsewhere; in
+# fs-sandbox eval we only need the publish step to yield a stable, groundable
+# URL.
 cmd="${1:-}"
 publish=0
 json=0
@@ -1375,38 +1371,6 @@ def _ohmo_todo_write_tool_factory(state_root: Path) -> Sequence[BaseTool]:
     return (OhmoTodoWriteTool(TodoStore(state_root), lambda: "eval-sandbox"),)
 
 
-class _MockSendTelegramMessageTool(BaseTool):
-    """Eval-only mock of ``send_telegram_message`` — returns a deterministic
-    success WITHOUT sending anything.
-
-    The real tool fail-closes on a non-human sender (e.g. ``__scheduler__``
-    background turns), but gold trajectories for scheduler tasks were captured
-    from a successful human-origin send; replaying the refusal makes those tasks
-    unsatisfiable in eval (the agent can never complete the required send). The
-    send tool's real ACL / signing / contact-resolution behaviour is unit-tested
-    separately; in eval we only need the send step to proceed so the judge can
-    score the rest of the task. No real Telegram side effect ever happens in
-    eval — this mock is the faithful stand-in for "the message was sent".
-    """
-
-    name = "send_telegram_message"
-    description = SendTelegramMessageTool.description
-    input_model = SendTelegramMessageInput
-
-    def is_read_only(self, arguments: SendTelegramMessageInput) -> bool:
-        del arguments
-        return False
-
-    async def execute(
-        self, arguments: SendTelegramMessageInput, context: ToolExecutionContext
-    ) -> ToolResult:
-        del context
-        return ToolResult(
-            output=f"Message queued for delivery to {arguments.recipient}.",
-            metadata={"mock": True, "tool": "send_telegram_message"},
-        )
-
-
 def _make_live_local_tool_factory(
     workspace: Path | None,
     *,
@@ -1451,7 +1415,6 @@ def _make_live_local_tool_factory(
                     },
                 )
             )
-        tools.append(_MockSendTelegramMessageTool())
         return tuple(tools)
 
     return factory

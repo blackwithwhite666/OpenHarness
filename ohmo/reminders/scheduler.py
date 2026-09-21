@@ -111,6 +111,24 @@ class ReminderScheduler:
             await self._fire_one(reminder, now)
 
     async def _fire_one(self, reminder: Reminder, now: float) -> None:
+        if any(
+            value is not None
+            for value in (
+                reminder.recipient_chat_id,
+                reminder.recipient_principal,
+                reminder.recipient_label,
+            )
+        ):
+            logger.warning(
+                "ohmo legacy recipient-bound reminder paused without delivery id=%s chat_id=%s",
+                reminder.id,
+                reminder.chat_id,
+            )
+            async with self._lock:
+                current = self._store.get(reminder.id)
+                if current is not None and current.status == "active":
+                    self._store.set_status(reminder.id, "paused")
+            return
         next_fire_at = self._next_after(reminder, now)
         # Persist BEFORE delivery — idempotency across crash / overlapping tick.
         # ``mark_fired`` re-reads under the lock and returns False if the reminder
@@ -197,38 +215,16 @@ class ReminderScheduler:
 
     async def _deliver_agentic(self, reminder: Reminder) -> None:
         session_key = f"{reminder.channel}:reminder:{reminder.id}"
-        if reminder.recipient_chat_id is not None:
-            # Recipient-bound reminder: run the turn in a reminder-specific
-            # isolated session (NEVER the creator's or the recipient's chat
-            # session) and stamp the trusted binding + the bridge-output
-            # suppression marker. Delivery then happens ONLY via
-            # send_telegram_message to the fixed recipient; progress/final
-            # replies are suppressed by the bridge so recipient wellness/tool
-            # results can never leak into the creator's interactive session.
-            metadata = {
-                "_synthetic": True,
-                "_reminder_id": reminder.id,
-                "_reminder_created_by": reminder.created_by,
-                "_reminder_recipient_chat_id": reminder.recipient_chat_id,
-                "_reminder_recipient_principal": reminder.recipient_principal,
-                "_reminder_recipient_label": reminder.recipient_label,
-                "_reminder_wellness_tenant": reminder.wellness_tenant,
-                "_suppress_bridge_output": True,
-            }
-        else:
-            # Legacy this-chat reminder: preserve output behavior while
-            # isolating each synthetic turn from other reminders.
-            metadata = {
-                "_synthetic": True,
-                "_reminder_id": reminder.id,
-                "_reminder_created_by": reminder.created_by,
-            }
-            if reminder.wellness_tenant:
-                # Auto-delivery keeps the original chat/session semantics. The
-                # runtime validates this creator principal against current
-                # gateway configuration before binding the tenant.
-                metadata["_reminder_wellness_principal"] = reminder.created_by
-                metadata["_reminder_wellness_tenant"] = reminder.wellness_tenant
+        metadata = {
+            "_synthetic": True,
+            "_reminder_id": reminder.id,
+            "_reminder_created_by": reminder.created_by,
+        }
+        if reminder.wellness_tenant:
+            # The runtime validates this creator principal against current
+            # gateway configuration before binding the tenant.
+            metadata["_reminder_wellness_principal"] = reminder.created_by
+            metadata["_reminder_wellness_tenant"] = reminder.wellness_tenant
         await self._bus.publish_inbound(
             InboundMessage(
                 channel=reminder.channel,
@@ -237,10 +233,8 @@ class ReminderScheduler:
                 content=reminder.summary,
                 session_key_override=session_key,
                 # ``_reminder_created_by`` carries the human who scheduled this
-                # reminder (the creator's channel sender_id, e.g. Telegram
-                # "<id>|<username>"). The turn itself is synthetic
-                # (sender_id=__scheduler__), but a tool like send_telegram_message
-                # can sign on the creator's behalf — see runtime ohmo_send_ctx.
+                # reminder for trusted wellness tenant revalidation. The turn
+                # itself is synthetic (sender_id=__scheduler__).
                 metadata=metadata,
             )
         )

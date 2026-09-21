@@ -70,36 +70,6 @@ def _extract_attachments(
     return clean, paths
 
 
-def _is_trusted_suppressed_reminder_turn(message: InboundMessage) -> bool:
-    """True only for a scheduler-originated synthetic turn of a recipient-bound
-    reminder whose bridge output must be suppressed.
-
-    The suppression marker is honored ONLY together with the scheduler sender
-    sentinel, the synthetic flag and the recipient binding stamped at fire
-    time — arbitrary live user metadata can never suppress output (channel
-    adapters don't accept these keys, and the sentinel is only set by the
-    in-process scheduler).
-    """
-    metadata = message.metadata or {}
-    return (
-        message.sender_id == "__scheduler__"
-        and bool(metadata.get("_synthetic"))
-        and bool(metadata.get("_suppress_bridge_output"))
-        and bool(metadata.get("_reminder_id"))
-        and bool(metadata.get("_reminder_recipient_chat_id"))
-    )
-
-
-def _is_trusted_synthetic_reminder_turn(message: InboundMessage) -> bool:
-    """True only for a scheduler-originated synthetic reminder turn."""
-    metadata = message.metadata or {}
-    return (
-        message.sender_id == "__scheduler__"
-        and bool(metadata.get("_synthetic"))
-        and bool(metadata.get("_reminder_id"))
-    )
-
-
 _ASK_RE = re.compile(r"\[\[\s*ask\s*:\s*([^\]]+?)\s*\]\]", re.IGNORECASE)
 
 
@@ -339,16 +309,10 @@ class OhmoGatewayBridge:
             )
 
     async def _dispatch(self, message: InboundMessage, session_key: str) -> None:
-        # A suppressed recipient-bound reminder turn never emits to the chat —
-        # including the "stopped previous task" notice when a recurring fire
-        # replaces its own still-running previous turn.
-        suppress = _is_trusted_suppressed_reminder_turn(message)
         await self._interrupt_session(
             session_key,
             reason="replaced by a newer user message",
-            notify=None
-            if suppress
-            else self._build_interrupt_notice(message, session_key),
+            notify=self._build_interrupt_notice(message, session_key),
         )
         if self._nutrition_coordinator is not None:
             self._nutrition_coordinator.on_ordinary_turn_start(message)
@@ -670,12 +634,6 @@ class OhmoGatewayBridge:
             message.channel == "telegram"
             and chat_id not in self._debug_chats
         )
-        # Trusted recipient-bound reminder turn: still run the turn (tool-made
-        # outbound sends are unaffected), but publish NO progress/tool hints and
-        # NO final reply to message.chat_id — recipient data must not reach the
-        # creator's chat.
-        suppress_output = _is_trusted_suppressed_reminder_turn(message)
-        suppress_standalone_no_reply = _is_trusted_synthetic_reminder_turn(message)
         try:
             reply = ""
             final_media: list[str] = []
@@ -704,12 +662,6 @@ class OhmoGatewayBridge:
                     and progress_event.get("kind") == "todo"
                 )
                 if not update.text and not has_structured_progress:
-                    continue
-                # Suppressed reminder turns must still surface engine errors
-                # (e.g. "Provider quota exceeded: ..."): an error carries no
-                # recipient data, and a silently dying scheduled report is
-                # exactly what the creator needs to hear about.
-                if suppress_output and update.kind != "error":
                     continue
                 logger.info(
                     "ohmo outbound update channel=%s chat_id=%s session_key=%s kind=%s content=%r",
@@ -757,7 +709,7 @@ class OhmoGatewayBridge:
             )
             reply = _format_gateway_error(exc)
         if not reply:
-            if delivered_assistant_updates and not stream_error and not suppress_output:
+            if delivered_assistant_updates and not stream_error:
                 await self._bus.publish_outbound(
                     OutboundMessage(
                         channel=message.channel,
@@ -771,24 +723,6 @@ class OhmoGatewayBridge:
                 message.channel,
                 message.chat_id,
                 session_key,
-            )
-            return
-        if suppress_standalone_no_reply and reply.strip() == "NO_REPLY":
-            logger.info(
-                "ohmo suppressed standalone NO_REPLY for synthetic reminder turn channel=%s chat_id=%s session_key=%s reminder_id=%s",
-                message.channel,
-                message.chat_id,
-                session_key,
-                message.metadata.get("_reminder_id"),
-            )
-            return
-        if suppress_output:
-            logger.info(
-                "ohmo suppressed final reply for recipient-bound reminder turn channel=%s chat_id=%s session_key=%s reminder_id=%s",
-                message.channel,
-                message.chat_id,
-                session_key,
-                message.metadata.get("_reminder_id"),
             )
             return
         duplicate_assistant_update = reply.strip() in delivered_assistant_updates

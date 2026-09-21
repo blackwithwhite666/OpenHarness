@@ -245,16 +245,34 @@ def build_ohmo_system_prompt(
                 "configured participant, use `get_wellness_data`. Treat its response "
                 "as authoritative: identify the participant only by the returned "
                 "`login`, never by a memory guess or by mapping an id yourself. "
-                "The gateway supplies the trusted default participant. On an owner "
-                "turn only, you may select another configured participant with the "
-                "optional `params.login` selector; never use a numeric participant "
-                "selector, `user_id`, or `health_types` parameters. Family turns are "
-                "pinned to the authenticated contact by the gateway."
+                "For wellness reports, request raw weight only with "
+                '`raw_health_types=["HealthAutoExportMetric_weight_body_mass"]`; basal '
+                "and active energy must remain aggregate-only. Filter every displayed "
+                "daily value to the participant's local calendar day. Until a trusted "
+                "per-type Health completion checkpoint exists, basal and active energy "
+                "may be shown only as partial; never calculate an energy deficit, surplus, "
+                "or derived calorie target. If `nutrition_status` is not `complete`, "
+                "treat nutrition as unavailable or incomplete: an empty nutrition list "
+                "is never zero intake (never display it as `0 kcal`), and daily intake "
+                "must never be reconstructed from conversation memory. A weight mentioned "
+                "in chat is conversation-only; there is no durable weight-write tool, so "
+                "never claim that it was recorded. The gateway supplies the trusted "
+                "default participant. On an owner turn only, you may select another "
+                "configured participant with the optional `params.login` selector; never "
+                "use a numeric participant selector, `user_id`, or legacy `health_types` "
+                "parameters. Family turns are pinned to the authenticated contact by the "
+                "gateway."
             ),
             "# Nutrition finalization annotations",
             (
                 "If the user asks for calorie/macronutrient estimates (including from an "
-                "image), include `annotations.nutrition` in `trace_finalization`."
+                "image), include `annotations.nutrition` in `trace_finalization` only "
+                "when the turn has explicit consumed/log intent; read-only, advisory, "
+                "hypothetical, and image-analysis-only turns do not create a "
+                "`meal_observation`. Durable recording starts only for explicit "
+                "consumption or logging intent. For example, oatmeal advice or an oatmeal "
+                "calorie estimate without a statement that it was consumed or a request "
+                "to log it must not create a nutrition annotation."
             ),
             (
                 "Required shape (schema v2):\n"
@@ -303,13 +321,25 @@ def build_ohmo_system_prompt(
                 "`meal_deletion`, `day_summary`. Use `meal_observation` for a new possible "
                 'consumption event. When the user CORRECTS an earlier meal ("that was '
                 'breakfast on 1 August", "it was 300 kcal, not 500"), emit '
-                "`meal_correction`: list ONLY the fields being changed in `changed_fields` "
-                "and provide replacement values just for those fields — a correction is "
+                "`meal_correction`: list EVERY changed field and ONLY the changed fields "
+                "in `changed_fields`, and provide replacement values just for those "
+                "fields — a correction is "
                 "never another meal, and a date-only correction does not repeat the calorie "
-                "estimate. When the user says a logged meal must not count, emit "
+                "estimate. For a correction such as «без масла», include `items` and every "
+                "recalculated energy or macronutrient field in `changed_fields`; do not "
+                "list unchanged fields. When the user says a logged meal must not count, emit "
                 "`meal_deletion` with no nutrient values. A daily report you calculate "
                 "from already-recorded meals is `day_summary` with totals plus "
                 "`summary_date` — it is a non-countable summary, NEVER a new meal."
+            ),
+            (
+                "When text explicitly states food quantity or composition, treat that "
+                "text as authoritative over ambiguous image inference. If the text and "
+                "image materially conflict, ask for clarification before recording. "
+                "For example, in «рис с яйцом» with explicit text saying one egg, keep "
+                "one egg even if the image alone could be interpreted as more. "
+                "Do not say food was recorded until a trusted nutrition append receipt "
+                "exists; an estimate or annotation alone is not a durable write."
             ),
             (
                 "`meal_date` is an ISO calendar date (`YYYY-MM-DD`) for date-only language: "
