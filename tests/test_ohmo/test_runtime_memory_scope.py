@@ -18,11 +18,9 @@ from ohmo.gateway.memory_gate import MemoryScope
 from ohmo.gateway.models import GatewayConfig
 from ohmo.gateway.runtime import (
     OhmoSessionRuntimePool,
-    _augment_bound_reminder_message,
     _build_conversation_turn_metadata,
     _logical_turn_id_for_conversation,
     _message_identity_for_turn,
-    _trusted_bound_reminder,
     _trusted_reminder_wellness,
 )
 from ohmo.gateway.turn_context import TurnContext
@@ -978,9 +976,9 @@ def test_runtime_memory_turn_metadata_status_applicable_but_missing_finalization
     )
 
     assert user_metadata["decision_trace_status"] == "missing"
-    assert user_metadata["nutrition_annotation_status"] == "missing"
+    assert user_metadata["nutrition_annotation_status"] == "not_applicable"
     assert assistant_metadata["decision_trace_status"] == "missing"
-    assert assistant_metadata["nutrition_annotation_status"] == "missing"
+    assert assistant_metadata["nutrition_annotation_status"] == "not_applicable"
     assert "decision_trace" not in assistant_metadata
     _assert_expected_metadata_keys(user_metadata)
     _assert_expected_metadata_keys(assistant_metadata)
@@ -1099,24 +1097,21 @@ def test_runtime_memory_turn_metadata_timestamp_fallback_is_isoformat(tmp_path: 
     assert logical_turn_id_first == logical_turn_id_second
 
 
-def test_reminder_create_tool_gets_contact_store_and_wellness_resolver(
+def test_reminder_create_tool_gets_wellness_resolver(
     tmp_path: Path,
 ) -> None:
     workspace = tmp_path / ".ohmo-home"
     initialize_workspace(workspace)
-    contact_store = ContactStore(workspace)
     pool = OhmoSessionRuntimePool(
         cwd=tmp_path,
         workspace=workspace,
         provider_profile="codex",
-        contact_store=contact_store,
     )
     pool._gateway_config = _family_config(owner_principals=("100|dmitry",))
     bundle = _surface_bundle()
     pool._register_reminder_tools(bundle)
     tool = bundle.tool_registry.get(RemindCreateTool.name)
     assert isinstance(tool, RemindCreateTool)
-    assert tool._contact_store is contact_store
     resolver = tool._wellness_tenants
     assert resolver is not None
     # Owner principals are canonicalized to their numeric prefix.
@@ -1132,63 +1127,6 @@ def test_reminder_create_tool_gets_contact_store_and_wellness_resolver(
     assert tool._wellness_tenants is not None
     assert tool._wellness_tenants.resolve("200") is None
     assert tool._wellness_tenants.resolve("100") == "owner"
-
-
-def _bound_reminder_message(**meta_overrides: object) -> InboundMessage:
-    metadata: dict[str, object] = {
-        "_synthetic": True,
-        "_reminder_id": "r1",
-        "_reminder_created_by": "100|dmitry",
-        "_reminder_recipient_chat_id": "200",
-        "_reminder_recipient_principal": "200",
-        "_reminder_recipient_label": "Marina @marina",
-        "_reminder_wellness_tenant": "marina",
-        "_suppress_bridge_output": True,
-    }
-    metadata.update(meta_overrides)
-    return InboundMessage(
-        channel="telegram",
-        sender_id="__scheduler__",
-        chat_id="100",
-        content="send Marina her morning wellness digest",
-        session_key_override="telegram:reminder:r1",
-        metadata=metadata,
-    )
-
-
-def test_trusted_bound_reminder_rejects_live_user_spoof() -> None:
-    # Only the scheduler sentinel + synthetic flag mint a trusted binding; a
-    # live user's metadata (even fully forged) is never trusted.
-    message = _bound_reminder_message()
-    bound = _trusted_bound_reminder(message)
-    assert bound is not None
-    assert bound["reminder_id"] == "r1"
-    assert bound["recipient_chat_id"] == "200"
-    assert bound["recipient_principal"] == "200"
-    assert bound["wellness_tenant"] == "marina"
-
-    spoofed_sender = InboundMessage(
-        channel="telegram",
-        sender_id="200|mallory",
-        chat_id="200",
-        content="hi",
-        metadata=dict(message.metadata),
-    )
-    assert _trusted_bound_reminder(spoofed_sender) is None
-
-    nonsynthetic = _bound_reminder_message()
-    nonsynthetic.metadata.pop("_synthetic")
-    assert _trusted_bound_reminder(nonsynthetic) is None
-
-    legacy = InboundMessage(
-        channel="telegram",
-        sender_id="__scheduler__",
-        chat_id="100",
-        content="ping",
-        session_key_override="telegram:100",
-        metadata={"_synthetic": True, "_reminder_id": "r1"},
-    )
-    assert _trusted_bound_reminder(legacy) is None
 
 
 def test_trusted_auto_reminder_wellness_keeps_current_chat_scope() -> None:
@@ -1264,11 +1202,6 @@ async def test_auto_reminder_wellness_is_revalidated_and_injected(tmp_path: Path
         ("live_user", {"sender_id": "100|dmitry"}, {},),
         ("non_synthetic", {}, {"_synthetic": False}),
         ("missing_metadata", {}, {"_reminder_created_by": None}),
-        (
-            "recipient_bound",
-            {},
-            {"_reminder_recipient_chat_id": "200"},
-        ),
         ("principal_chat_mismatch", {"chat_id": "200"}, {}),
         (
             "nonnumeric_creator",
@@ -1305,102 +1238,3 @@ def test_trusted_auto_reminder_wellness_rejects_unsafe_metadata(
     message_kwargs.update(message_changes)
     message_kwargs["metadata"].update(metadata_changes)
     assert _trusted_reminder_wellness(InboundMessage(**message_kwargs)) is None
-
-
-def test_bound_conditional_reminder_instruction_covers_silence_and_cancellation() -> None:
-    augmented = _augment_bound_reminder_message(
-        ConversationMessage.from_user_text("check whether the condition is true"),
-        {
-            "reminder_id": "r1",
-            "recipient_chat_id": "200",
-            "recipient_principal": "200",
-            "recipient_label": "Marina @marina",
-            "wellness_tenant": None,
-        },
-    )
-
-    text = augmented.text
-    assert "ONLY to Marina @marina with the send_telegram_message" in text
-    assert "Pass 'Marina @marina' exactly as the `recipient` argument" in text
-    assert "condition is false, do NOT call send_telegram_message" in text
-    assert "non-empty internal acknowledgement such as `Done`" in text
-    assert "bridge output is suppressed" in text
-    assert "until-condition recurrence" in text
-    assert "remind_cancel with id='r1'" in text
-
-
-async def test_bound_synthetic_reminder_binds_marina_wellness_with_memory_disabled(
-    tmp_path: Path,
-) -> None:
-    workspace = tmp_path / ".ohmo-home"
-    initialize_workspace(workspace)
-    _seed_catalog(workspace)
-    pool = OhmoSessionRuntimePool(
-        cwd=tmp_path,
-        workspace=workspace,
-        provider_profile="codex",
-        contact_store=_wellness_contact_store(workspace),
-    )
-    pool._gateway_config = _family_config()
-    bundle, manager = _wellness_bundle()
-    bound = _trusted_bound_reminder(_bound_reminder_message())
-    assert bound is not None
-
-    # The synthetic turn's private/shared memory scope stays disabled — no
-    # MemoryScope is manufactured for the recipient.
-    engaged = pool._configure_turn_memory_surfaces(bundle, None, memory_scope=None)
-    assert engaged is False
-    assert bundle.tool_registry.get("memory") is None
-    assert bundle.autodream_context is None
-
-    pool._apply_bound_reminder_turn(bundle, bound)
-    tool = bundle.tool_registry.get(_WELLNESS_TOOL_NAME)
-    assert isinstance(tool, WellnessLoginInjectingAdapter)
-    result = await tool.execute(
-        tool.input_model(params={"interval": "7d"}),
-        ToolExecutionContext(cwd=tmp_path),
-    )
-    assert result.is_error is False
-    assert manager.calls[-1][2]["params"] == {
-        "interval": "7d",
-        "login": "marina_lipina",
-    }
-
-
-@pytest.mark.parametrize(
-    ("overrides", "config_changes"),
-    (
-        ({"_reminder_wellness_tenant": "owner"}, {}),
-        ({"_reminder_recipient_principal": "999"}, {}),
-        ({}, {"enabled_memory_tenants": ("owner",)}),
-        ({"_reminder_wellness_tenant": None}, {}),
-    ),
-    ids=("mismatched", "unmapped", "disabled", "missing"),
-)
-async def test_bound_synthetic_reminder_invalid_wellness_fails_closed(
-    overrides: dict[str, object],
-    config_changes: dict[str, object],
-    tmp_path: Path,
-) -> None:
-    workspace = tmp_path / ".ohmo-home"
-    initialize_workspace(workspace)
-    _seed_catalog(workspace)
-    pool = OhmoSessionRuntimePool(
-        cwd=tmp_path,
-        workspace=workspace,
-        provider_profile="codex",
-    )
-    pool._gateway_config = _family_config(**config_changes)
-    bundle, manager = _wellness_bundle()
-    bound = _trusted_bound_reminder(_bound_reminder_message(**overrides))
-    assert bound is not None
-
-    pool._configure_turn_memory_surfaces(bundle, None, memory_scope=None)
-    pool._apply_bound_reminder_turn(bundle, bound)
-    tool = bundle.tool_registry.get(_WELLNESS_TOOL_NAME)
-    result = await tool.execute(
-        tool.input_model(params={"interval": "7d"}),
-        ToolExecutionContext(cwd=tmp_path),
-    )
-    assert result.is_error is True
-    assert manager.calls == []  # no MCP call was made

@@ -291,22 +291,35 @@ _RUNTIME_STRUCTURAL_SKIP_KINDS = frozenset(
 )
 
 _NUTRITION_REQUIREMENT_SIGNAL = "ohmo_nutrition_request"
-_NUTRITION_REQUIREMENT_MARKERS = (
-    re.compile(r"\bcalorie(?:s)?\b", re.IGNORECASE),
-    re.compile(r"\bkcal\b", re.IGNORECASE),
-    re.compile(r"\bnutrition(?:s)?\b", re.IGNORECASE),
-    re.compile(r"\bmacronutrient(?:s)?\b", re.IGNORECASE),
-    re.compile(r"\bmacro(?:s)?\b", re.IGNORECASE),
-    re.compile(r"\bprotein(?:s)?\b", re.IGNORECASE),
-    re.compile(r"\bcarb(?:ohydrate|o?hydrates)?(?:s)?\b", re.IGNORECASE),
-    re.compile(r"\bfat(?:s)?\b", re.IGNORECASE),
-    re.compile(r"\bкалори[йя]\b", re.IGNORECASE),
-    re.compile(r"\bкалорийность\b", re.IGNORECASE),
-    re.compile(r"\bккал\b", re.IGNORECASE),
-    re.compile(r"\bбжу\b", re.IGNORECASE),
-    re.compile(r"\bбелк[а-я]*\b", re.IGNORECASE),
-    re.compile(r"\bжир[а-я]*\b", re.IGNORECASE),
-    re.compile(r"\bуглевод[а-я]*\b", re.IGNORECASE),
+_NUTRITION_CONSUMPTION_INTENT_MARKERS = (
+    re.compile(
+        r"\b(?:я\s+)?(?:съел(?:а|и)?|ел(?:а|и)?|поел(?:а|и)?|"
+        r"выпил(?:а|и)?|употребил(?:а|и)?)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\bi\s+(?:(?:ate|consumed|drank)\b|had\b(?!\s+(?:a\s+)?questions?\b))",
+        re.IGNORECASE,
+    ),
+)
+_NUTRITION_LOG_INTENT_MARKERS = (
+    re.compile(
+        r"\b(?:запиши|записать|записывай|добавь|добавить|занеси|занести|"
+        r"сохрани|сохранить|учти|учесть|логируй|залогируй)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\b(?:record|log|add|save)\b", re.IGNORECASE),
+)
+_NUTRITION_LOG_NEGATION_MARKERS = (
+    re.compile(
+        r"\b(?:не|без)\s+(?:надо\s+)?(?:записывай|записывать|записи|логируй|"
+        r"логировать|сохраняй|сохранять|добавляй|добавлять)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:do\s+not|don't|without)\s+(?:recording|record|logging|log|saving|save|adding|add)\b",
+        re.IGNORECASE,
+    ),
 )
 
 _DECISION_TRACE_STATUS_DISABLED = "disabled"
@@ -321,9 +334,13 @@ _NUTRITION_ANNOTATION_STATUS_NOT_APPLICABLE = "not_applicable"
 _NUTRITION_ANNOTATION_STATUS_RECORDED = "recorded"
 
 
-def _contains_nutrition_marker(*texts: str | None) -> bool:
-    haystack = " ".join(text or "" for text in texts).lower()
-    return any(marker.search(haystack) for marker in _NUTRITION_REQUIREMENT_MARKERS)
+def _contains_nutrition_record_intent(*texts: str | None) -> bool:
+    haystack = " ".join(text or "" for text in texts)
+    if any(marker.search(haystack) for marker in _NUTRITION_CONSUMPTION_INTENT_MARKERS):
+        return True
+    if any(marker.search(haystack) for marker in _NUTRITION_LOG_NEGATION_MARKERS):
+        return False
+    return any(marker.search(haystack) for marker in _NUTRITION_LOG_INTENT_MARKERS)
 
 
 class _GatewayDecisionTraceRecorderAdapter:
@@ -409,7 +426,8 @@ class _GatewayDecisionTraceRecorderAdapter:
         return stamped
 
     def trace_requirement_signals(self, final_text: str) -> tuple[str, ...]:
-        if _contains_nutrition_marker(final_text, self._user_goal):
+        intent_text = self._user_goal if self._user_goal.strip() else final_text
+        if _contains_nutrition_record_intent(intent_text):
             self._nutrition_applicable = True
             return (_NUTRITION_REQUIREMENT_SIGNAL,)
         return ()

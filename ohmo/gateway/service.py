@@ -72,7 +72,6 @@ class OhmoGatewayService:
             create_feishu_group=self.create_group_for_user,
             publish_group_welcome=self.publish_group_welcome,
             contact_store=self._contact_store,
-            send_outbound=self._bus.publish_outbound,
             default_tz=self._config.default_tz,
             reminder_max_per_chat=self._config.reminder_max_per_chat,
         )

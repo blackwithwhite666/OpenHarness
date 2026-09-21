@@ -262,3 +262,41 @@ def test_ohmo_prompt_nutrition_contract_explicit_new_consumption_rule(
     assert "new, separate consumption" in prompt
     assert "keep it false" in prompt
     assert "is a duplicate, not another meal" in prompt
+
+
+def test_ohmo_prompt_wellness_and_nutrition_safety_contract(tmp_path: Path) -> None:
+    workspace = tmp_path / ".ohmo-home"
+    initialize_workspace(workspace)
+    prompt = build_ohmo_system_prompt(tmp_path, workspace=workspace)
+
+    assert 'raw_health_types=["HealthAutoExportMetric_weight_body_mass"]' in prompt
+    assert "basal and active energy must remain aggregate-only" in prompt
+    assert "Filter every displayed daily value" in prompt
+    assert "shown only as partial" in prompt
+    assert "never calculate an energy deficit, surplus" in prompt
+    assert "nutrition_status` is not `complete`" in prompt
+    assert "an empty nutrition list is never zero intake" in prompt
+    assert "conversation-only" in prompt
+    assert "read-only, advisory, hypothetical, and image-analysis-only" in prompt
+    assert "explicit consumed/log intent" in prompt
+    assert "text as authoritative over ambiguous image inference" in prompt
+    assert "ask for clarification before recording" in prompt
+    assert "trusted nutrition append receipt" in prompt
+
+
+def test_ohmo_prompt_covers_marina_wellness_regressions(tmp_path: Path) -> None:
+    workspace = tmp_path / ".ohmo-home"
+    initialize_workspace(workspace)
+    prompt = build_ohmo_system_prompt(tmp_path, workspace=workspace)
+
+    assert "oatmeal advice or an oatmeal calorie estimate" in prompt
+    assert "must not create a nutrition annotation" in prompt
+    assert "«рис с яйцом»" in prompt
+    assert "explicit text saying one egg" in prompt
+    assert "keep one egg" in prompt
+    assert "«без масла»" in prompt
+    assert "every recalculated energy or macronutrient field" in prompt
+    assert "never display it as `0 kcal`" in prompt
+    assert "there is no durable weight-write tool" in prompt
+    assert "trusted per-type Health completion checkpoint" in prompt
+    assert "never calculate an energy deficit, surplus" in prompt

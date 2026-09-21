@@ -191,53 +191,6 @@ async def test_structured_empty_todo_progress_reaches_both_telegram_modes(debug)
 
 
 @pytest.mark.asyncio
-async def test_suppressed_reminder_todo_progress_is_not_published():
-    class TodoRuntimePool:
-        async def stream_message(self, message, session_key):
-            yield SimpleNamespace(
-                kind="progress",
-                text="",
-                metadata={
-                    "_progress": True,
-                    "progress_event": {
-                        "kind": "todo",
-                        "todos": [],
-                        "changed": True,
-                    },
-                },
-            )
-
-        async def reset_session(self, session_key):  # pragma: no cover - unused here
-            pass
-
-    bus = MessageBus()
-    bridge = OhmoGatewayBridge(bus=bus, runtime_pool=TodoRuntimePool())
-    task = asyncio.create_task(bridge.run())
-    try:
-        await bus.publish_inbound(
-            InboundMessage(
-                channel="telegram",
-                sender_id="__scheduler__",
-                chat_id="42",
-                content="reminder",
-                metadata={
-                    "_synthetic": True,
-                    "_suppress_bridge_output": True,
-                    "_reminder_id": "r1",
-                    "_reminder_recipient_chat_id": "42",
-                },
-            )
-        )
-        await asyncio.sleep(0.05)
-        assert bus.outbound_size == 0
-    finally:
-        bridge.stop()
-        task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await task
-
-
-@pytest.mark.asyncio
 async def test_unlisted_telegram_chat_is_quiet_even_when_sender_is_dmitriy():
     bus = MessageBus()
     bridge = OhmoGatewayBridge(bus=bus, runtime_pool=_FakeRuntimePool())

@@ -444,7 +444,7 @@ def test_gateway_eval_recorder_nutrition_status_is_missing_when_applicable_witho
     recorder, store = _new_recorder(tmp_path)
     runtime_recorder = recorder.decision_trace_recorder
 
-    runtime_recorder.trace_requirement_signals("сколько калорий в ужине?")
+    runtime_recorder.trace_requirement_signals("я съела ужин, запиши его")
 
     runtime_recorder.record(
         TRACE_FINALIZATION,
@@ -461,12 +461,18 @@ def test_gateway_eval_recorder_nutrition_status_is_missing_when_applicable_witho
 @pytest.mark.parametrize(
     "text, expected_signal",
     [
-        ("посчитай калорийность", True),
-        ("сколько калорий", True),
-        ("Сколько ккал в этом супе", True),
-        ("Сколько белков и жиров в блюде", True),
-        ("Мне важно знать БЖУ этого блюда", True),
-        ("Мне нужен белок и жиры, пожалуйста", True),
+        ("посчитай калорийность", False),
+        ("сколько калорий", False),
+        ("Сколько ккал в этом супе", False),
+        ("Сколько белков и жиров в блюде", False),
+        ("Мне важно знать БЖУ этого блюда", False),
+        ("Мне нужен белок и жиры, пожалуйста", False),
+        ("Оцени калорийность овсянки, но не записывай её", False),
+        ("Estimate oatmeal calories without recording it", False),
+        ("я съела суп, запиши его", True),
+        ("I ate oatmeal and log it", True),
+        ("I had oatmeal", True),
+        ("I had a question", False),
         ("Я сейчас посмотрю фильм", False),
         ("Сколько белая рубашка стоит?", False),
     ],
@@ -491,6 +497,31 @@ def test_gateway_eval_recorder_trace_requirement_signals_prefers_user_goal_when_
     recorder, _ = _new_recorder(tmp_path, user_goal="Сколько калорий в обеде сегодня?")
     signals = recorder.decision_trace_recorder.trace_requirement_signals("можно краткий апдейт?")
 
+    assert signals == ()
+    assert recorder.nutrition_annotation_status == "not_applicable"
+
+
+def test_gateway_eval_recorder_estimate_goal_ignores_record_word_in_final_text(
+    tmp_path: Path,
+) -> None:
+    recorder, _ = _new_recorder(
+        tmp_path,
+        user_goal="Оцени калорийность овсянки, но не записывай её",
+    )
+    signals = recorder.decision_trace_recorder.trace_requirement_signals(
+        "Это только оценка, еда не записана."
+    )
+
+    assert signals == ()
+    assert recorder.nutrition_annotation_status == "not_applicable"
+
+
+def test_gateway_eval_recorder_explicit_record_goal_requires_annotation(
+    tmp_path: Path,
+) -> None:
+    recorder, _ = _new_recorder(tmp_path, user_goal="Запиши: я съела овсянку")
+    signals = recorder.decision_trace_recorder.trace_requirement_signals("Готово")
+
     assert signals == ("ohmo_nutrition_request",)
     assert recorder.nutrition_annotation_status == "missing"
 
@@ -504,10 +535,10 @@ def test_gateway_eval_recorder_nutrition_applicability_is_monotonic_within_turn(
     assert recorder.nutrition_annotation_status == "not_applicable"
 
     runtime_recorder.trace_requirement_signals("сколько калорий в ужине?")
-    assert recorder.nutrition_annotation_status == "missing"
+    assert recorder.nutrition_annotation_status == "not_applicable"
 
     runtime_recorder.trace_requirement_signals("я сейчас посмотрю фильм")
-    assert recorder.nutrition_annotation_status == "missing"
+    assert recorder.nutrition_annotation_status == "not_applicable"
 
 
 def test_gateway_eval_recorder_nutrition_applicability_can_be_marked_without_finalization(
@@ -520,6 +551,9 @@ def test_gateway_eval_recorder_nutrition_applicability_can_be_marked_without_fin
     assert runtime_recorder.trace_requirement_signals("подскажи, какой обед был, пожалуйста") == ()
 
     runtime_recorder.trace_requirement_signals("посчитай калорийность обеда")
+    assert recorder.nutrition_annotation_status == "not_applicable"
+
+    runtime_recorder.trace_requirement_signals("запиши, я съел обед")
     assert recorder.nutrition_annotation_status == "missing"
 
 

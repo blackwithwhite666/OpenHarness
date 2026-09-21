@@ -189,8 +189,8 @@ async def test_agentic_publishes_inbound() -> None:
     assert msg.session_key_override == "telegram:reminder:r1"
     assert msg.metadata["_synthetic"] is True
     assert msg.content == "ping-r1"
-    # The creator is carried so a tool fired from this synthetic turn can sign
-    # on the human's behalf instead of refusing (no identifiable sender).
+    # The creator is carried so the runtime can revalidate the authenticated
+    # wellness tenant for this synthetic turn.
     assert msg.metadata["_reminder_created_by"] == "42|valeria"
 
 
@@ -212,10 +212,13 @@ async def test_auto_wellness_agentic_keeps_current_chat_delivery() -> None:
     assert len(bus.inbound) == 1
     msg = bus.inbound[0]
     assert msg.session_key_override == "telegram:reminder:r1"
-    assert msg.metadata["_reminder_wellness_principal"] == "100|dmitry"
-    assert msg.metadata["_reminder_wellness_tenant"] == "owner"
-    assert "_reminder_recipient_chat_id" not in msg.metadata
-    assert "_suppress_bridge_output" not in msg.metadata
+    assert msg.metadata == {
+        "_synthetic": True,
+        "_reminder_id": "r1",
+        "_reminder_created_by": "100|dmitry",
+        "_reminder_wellness_principal": "100|dmitry",
+        "_reminder_wellness_tenant": "owner",
+    }
 
 
 async def test_due_agentic_reminders_same_chat_use_distinct_sessions() -> None:
@@ -233,20 +236,23 @@ async def test_due_agentic_reminders_same_chat_use_distinct_sessions() -> None:
     ]
 
 
-async def test_bound_agentic_uses_isolated_session_and_trusted_metadata() -> None:
-    # A recipient-bound agentic reminder runs in a reminder-specific isolated
-    # session (never the creator's or the recipient's chat session) and stamps
-    # the trusted binding + the bridge suppression marker.
+@pytest.mark.parametrize(
+    "legacy_recipient",
+    [
+        {"recipient_chat_id": "200"},
+        {"recipient_principal": "200"},
+        {"recipient_label": "Marina @marina"},
+    ],
+)
+async def test_due_legacy_recipient_reminder_pauses_without_publish(
+    caplog, legacy_recipient: dict[str, str]
+) -> None:
     store = ReminderStore()
     store.add(
         _reminder(
-            "r1",
+            "legacy",
             mode="agentic",
-            created_by="42|valeria",
-            recipient_chat_id="200",
-            recipient_principal="200",
-            recipient_label="Marina @marina",
-            wellness_tenant="marina",
+            **legacy_recipient,
         )
     )
     bus = FakeBus()
@@ -254,45 +260,13 @@ async def test_bound_agentic_uses_isolated_session_and_trusted_metadata() -> Non
 
     await sched.fire_due()
 
-    assert len(bus.outbound) == 0
-    assert len(bus.inbound) == 1
-    msg = bus.inbound[0]
-    assert msg.sender_id == "__scheduler__"
-    assert msg.session_key_override == "telegram:reminder:r1"
-    assert msg.session_key_override != "telegram:100"  # creator's chat session
-    assert msg.session_key_override != "telegram:200"  # recipient's chat session
-    md = msg.metadata
-    assert md["_synthetic"] is True
-    assert md["_reminder_id"] == "r1"
-    assert md["_reminder_created_by"] == "42|valeria"
-    assert md["_reminder_recipient_chat_id"] == "200"
-    assert md["_reminder_recipient_principal"] == "200"
-    assert md["_reminder_recipient_label"] == "Marina @marina"
-    assert md["_reminder_wellness_tenant"] == "marina"
-    assert md["_suppress_bridge_output"] is True
-
-
-async def test_bound_agentic_without_wellness_carries_no_tenant() -> None:
-    store = ReminderStore()
-    store.add(
-        _reminder(
-            "r1",
-            mode="agentic",
-            recipient_chat_id="200",
-            recipient_principal="200",
-            recipient_label="Marina @marina",
-            wellness_tenant=None,
-        )
-    )
-    bus = FakeBus()
-    sched = _make_scheduler(bus, store)
-
-    await sched.fire_due()
-
-    assert len(bus.inbound) == 1
-    md = bus.inbound[0].metadata
-    assert md["_reminder_wellness_tenant"] is None
-    assert md["_suppress_bridge_output"] is True
+    assert bus.inbound == []
+    assert bus.outbound == []
+    reminder = store.get("legacy")
+    assert reminder.status == "paused"
+    assert reminder.fire_count == 0
+    assert reminder.last_fired_at is None
+    assert "paused without delivery" in caplog.text
 
 
 async def test_catchup_once_fires_one_then_advances() -> None:

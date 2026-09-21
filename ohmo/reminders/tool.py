@@ -18,16 +18,14 @@ import asyncio
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Literal
 from uuid import uuid4
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from dateutil.rrule import rrulestr
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from openharness.tools.base import BaseTool, ToolExecutionContext, ToolResult
 
-from ohmo.contact_registry import ContactRecord, ContactStore
 from ohmo.gateway.turn_context import canonical_principal
 from ohmo.reminders.model import (
     Reminder,
@@ -71,6 +69,8 @@ class WellnessTenantResolver:
 
 
 class RemindCreateInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     summary: str = Field(
         description="Reminder text (static) or instruction for the agent (agentic).",
     )
@@ -95,30 +95,9 @@ class RemindCreateInput(BaseModel):
             "full agent turn with the summary as the goal (e.g. fetch + send weather)."
         ),
     )
-    delivery: Literal["auto", "explicit"] = Field(
-        default="auto",
-        description=(
-            "'auto' = use the normal reminder delivery behavior. 'explicit' = "
-            "run a conditionally silent agentic reminder for the current private "
-            "Telegram chat: the agent must explicitly call send_telegram_message "
-            "when the condition is true, while false checks remain silent. "
-            "Requires mode='agentic' and cannot be combined with a non-empty "
-            "recipient."
-        ),
-    )
     tz: str | None = Field(
         default=None,
         description="IANA timezone (e.g. Europe/Moscow); defaults to the chat's tz.",
-    )
-    recipient: str | None = Field(
-        default=None,
-        description=(
-            "Deliver to ONE specific known Telegram contact instead of this chat: "
-            "their exact @username, exact name, or numeric chat_id. Set ONLY when "
-            "the user explicitly named a DIFFERENT person as the recipient. "
-            "Requires mode='agentic'. Unknown or ambiguous names are refused — "
-            "never guess."
-        ),
     )
 
 
@@ -145,46 +124,6 @@ def _fmt_local(epoch: float, tz: str) -> str:
     return datetime.fromtimestamp(epoch, ZoneInfo(tz)).isoformat()
 
 
-@dataclass(frozen=True)
-class _RecipientBinding:
-    """Server-resolved fixed recipient (+ optional wellness subject)."""
-
-    chat_id: str
-    principal: str
-    label: str
-    wellness_tenant: str | None
-
-
-def _contact_label(contact: ContactRecord) -> str:
-    parts: list[str] = []
-    if contact.first_name:
-        parts.append(contact.first_name)
-    elif contact.display_name:
-        parts.append(contact.display_name)
-    if contact.username:
-        parts.append(f"@{contact.username}")
-    return " ".join(parts) or contact.chat_id
-
-
-def _current_sender_label(ctx: dict, sender_id: str, principal: str) -> str:
-    """Return a useful display label from trusted current-sender context."""
-    name = (
-        str(ctx.get("first_name") or "").strip()
-        or str(ctx.get("display_name") or "").strip()
-        or str(ctx.get("sender_display_name") or "").strip()
-    )
-    username = str(ctx.get("username") or "").strip().lstrip("@")
-    if not username and "|" in sender_id:
-        username = sender_id.partition("|")[2].strip().lstrip("@")
-    if name and username:
-        return f"{name} @{username}"
-    if name:
-        return name
-    if username:
-        return f"@{username}"
-    return principal
-
-
 def _is_private_telegram_self_chat(ctx: dict) -> bool:
     """Require a positive authenticated private self-chat signal."""
     if str(ctx.get("channel") or "").strip().lower() != "telegram":
@@ -208,13 +147,9 @@ class RemindCreateTool(BaseTool):
         "`rrule` (e.g. FREQ=DAILY, FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR); omit it for a "
         "one-shot. Use mode='static' to send the summary verbatim, or mode='agentic' "
         "to run a full agent action at fire time. Never pass chat_id — the delivery "
-        "target is taken from the current chat automatically. For a conditional "
-        "agentic reminder in the current private Telegram chat, set "
-        "delivery='explicit'; it uses fixed-recipient send_telegram_message delivery "
-        "when the condition is true and stays silent when it is false. When the user "
-        "explicitly names a different person to receive the reminder, pass "
-        "`recipient` (exact @username / exact name / numeric chat_id of a known "
-        "Telegram contact) with mode='agentic'."
+        "target is taken from the authenticated current chat automatically. Do not "
+        "pass recipient or delivery: those legacy recipient-bound creation fields "
+        "are rejected."
     )
     input_model = RemindCreateInput
 
@@ -225,14 +160,12 @@ class RemindCreateTool(BaseTool):
         *,
         default_tz: str,
         max_per_chat: int,
-        contact_store: ContactStore | None = None,
         wellness_tenants: WellnessTenantResolver | None = None,
     ) -> None:
         self._store = store
         self._lock = lock
         self._default_tz = default_tz
         self._max_per_chat = max_per_chat
-        self._contact_store = contact_store
         self._wellness_tenants = wellness_tenants
 
     def is_read_only(self, arguments: BaseModel) -> bool:
@@ -269,14 +202,7 @@ class RemindCreateTool(BaseTool):
             except (ValueError, TypeError) as exc:
                 return ToolResult(output=f"Invalid RRULE: {exc}", is_error=True)
 
-        binding = self._resolve_recipient_binding(arguments, ctx)
-        if isinstance(binding, ToolResult):
-            return binding
-        wellness_tenant = (
-            binding.wellness_tenant
-            if binding is not None
-            else self._resolve_current_chat_wellness(arguments, ctx)
-        )
+        wellness_tenant = self._resolve_current_chat_wellness(arguments, ctx)
 
         now = datetime.now(timezone.utc)
         async with self._lock:
@@ -316,9 +242,6 @@ class RemindCreateTool(BaseTool):
                 last_fired_at=None,
                 status="active",
                 fire_count=0,
-                recipient_chat_id=binding.chat_id if binding else None,
-                recipient_principal=binding.principal if binding else None,
-                recipient_label=binding.label if binding else None,
                 wellness_tenant=wellness_tenant,
             )
             self._store.add(reminder)
@@ -330,165 +253,13 @@ class RemindCreateTool(BaseTool):
             _now_local_line(tz),
             f"Reminder created (id={reminder.id}, mode={reminder.mode}, tz={tz}, {kind}).",
         ]
-        if binding is not None:
-            lines.append(f"Recipient: {binding.label} (fixed at creation).")
         lines.append(f"Next fire times:\n{fire_lines}")
         return ToolResult(output="\n".join(lines))
-
-    def _resolve_recipient_binding(
-        self,
-        arguments: RemindCreateInput,
-        ctx: dict,
-    ) -> _RecipientBinding | ToolResult:
-        """Resolve the model-named recipient and fixed delivery server-side.
-
-        Exact contact resolution only (never fuzzy auto-selection); unknown or
-        ambiguous contacts fail closed. Returns ``None`` for a current-chat reminder, a binding on
-        success, or a ToolResult error. Wellness scope is derived separately
-        from trusted gateway identity and never from model input.
-        """
-        if arguments.delivery == "explicit":
-            return self._resolve_explicit_current_chat_binding(arguments, ctx)
-
-        query = (arguments.recipient or "").strip()
-        if not query:
-            return None
-        if arguments.mode != "agentic":
-            return ToolResult(
-                output=(
-                    "A recipient-bound reminder must run a full agent turn: pass "
-                    "mode='agentic' together with `recipient`."
-                ),
-                is_error=True,
-            )
-        if str(ctx.get("channel") or "").strip().lower() != "telegram":
-            return ToolResult(
-                output="Recipient-bound reminders are only supported for Telegram.",
-                is_error=True,
-            )
-        if self._contact_store is None:
-            return ToolResult(
-                output="Recipient-bound reminders are not available in this deployment.",
-                is_error=True,
-            )
-
-        matches = self._contact_store.resolve(query, channel="telegram")
-        if not matches:
-            return ToolResult(
-                output=(
-                    f"Unknown recipient {query!r}. Only known Telegram contacts "
-                    "(people who have already written to the bot) can receive a "
-                    "reminder; never guess or invent one."
-                ),
-                is_error=True,
-            )
-        if len(matches) > 1:
-            lines = [f"Ambiguous recipient {query!r}; matches:"]
-            lines.extend(f"- {_contact_label(contact)}" for contact in matches)
-            lines.append("Ask the user which exact contact they meant.")
-            return ToolResult(output="\n".join(lines), is_error=True)
-
-        contact = matches[0]
-        principal = (contact.user_id or "").strip() or contact.chat_id.strip()
-        wellness_tenant = self._resolve_named_recipient_wellness(arguments, ctx, principal)
-        return _RecipientBinding(
-            chat_id=contact.chat_id,
-            principal=principal,
-            label=_contact_label(contact),
-            wellness_tenant=wellness_tenant,
-        )
-
-    def _resolve_explicit_current_chat_binding(
-        self,
-        arguments: RemindCreateInput,
-        ctx: dict,
-    ) -> _RecipientBinding | ToolResult:
-        """Bind explicit delivery to the authenticated current private sender.
-
-        This is the conditionally silent current-chat path. The target is
-        derived exclusively from trusted gateway context, then stored in the
-        same recipient fields used by named-recipient reminders so scheduler
-        isolation, bridge suppression, and fixed-recipient sending are reused.
-        """
-        if arguments.mode != "agentic":
-            return ToolResult(
-                output=(
-                    "Explicit reminder delivery must run a full agent turn: pass "
-                    "mode='agentic' together with delivery='explicit'."
-                ),
-                is_error=True,
-            )
-        if (arguments.recipient or "").strip():
-            return ToolResult(
-                output=(
-                    "delivery='explicit' targets only the current private Telegram "
-                    "chat and cannot be combined with a non-empty `recipient`. Use "
-                    "the normal recipient-bound reminder path for another person."
-                ),
-                is_error=True,
-            )
-        if str(ctx.get("channel") or "").strip().lower() != "telegram":
-            return ToolResult(
-                output="delivery='explicit' is only supported for private Telegram chats.",
-                is_error=True,
-            )
-        chat_type = str(ctx.get("chat_type") or "").strip().lower()
-        if ctx.get("is_group") is not False or chat_type in _GROUP_CHAT_TYPES:
-            return ToolResult(
-                output=(
-                    "delivery='explicit' requires a private Telegram chat; group "
-                    "chats cannot bind an explicit current-chat recipient."
-                ),
-                is_error=True,
-            )
-
-        sender_id = str(ctx.get("sender_id") or "").strip()
-        # Telegram sender IDs may append a mutable username after '|'; only the
-        # immutable numeric prefix is the authenticated recipient principal.
-        principal = canonical_principal("telegram", sender_id)
-        if not principal or not principal.isdigit():
-            return ToolResult(
-                output=(
-                    "delivery='explicit' requires a canonical numeric Telegram "
-                    "sender; the current sender is non-numeric or a scheduler "
-                    "sentinel."
-                ),
-                is_error=True,
-            )
-        chat_id = str(ctx.get("chat_id") or "").strip()
-        if chat_id != principal:
-            return ToolResult(
-                output=(
-                    "delivery='explicit' requires the sender's own private Telegram "
-                    f"chat (chat_id {chat_id!r} does not match sender principal "
-                    f"{principal!r})."
-                ),
-                is_error=True,
-            )
-        return _RecipientBinding(
-            chat_id=chat_id,
-            principal=principal,
-            label=_current_sender_label(ctx, sender_id, principal),
-            wellness_tenant=self._resolve_principal_wellness(principal),
-        )
 
     def _resolve_current_chat_wellness(self, arguments: RemindCreateInput, ctx: dict) -> str | None:
         if arguments.mode != "agentic" or not _is_private_telegram_self_chat(ctx):
             return None
         principal = canonical_principal("telegram", str(ctx.get("sender_id") or ""))
-        return self._resolve_principal_wellness(principal)
-
-    def _resolve_named_recipient_wellness(
-        self, arguments: RemindCreateInput, ctx: dict, principal: str
-    ) -> str | None:
-        if arguments.mode != "agentic":
-            return None
-        if str(ctx.get("channel") or "").strip().lower() != "telegram":
-            return None
-        if ctx.get("is_group") is not False:
-            return None
-        if str(ctx.get("chat_type") or "").strip().lower() in _GROUP_CHAT_TYPES:
-            return None
         return self._resolve_principal_wellness(principal)
 
     def _resolve_principal_wellness(self, principal: str) -> str | None:
@@ -536,9 +307,8 @@ class RemindListTool(BaseTool):
             kind = "recurring" if reminder.rrule else "one-shot"
             fire = _fmt_local(reminder.next_fire_at, reminder.tz)
             paused = " • ⏸ paused" if reminder.status == "paused" else ""
-            recipient = f" • → {reminder.recipient_label}" if reminder.recipient_label else ""
             lines.append(
-                f"- {reminder.id} • {fire} • {reminder.summary} • [{kind}]{paused}{recipient}"
+                f"- {reminder.id} • {fire} • {reminder.summary} • [{kind}]{paused}"
             )
         return ToolResult(output=_now_local_line(tz) + "\n" + "\n".join(lines))
 

@@ -10,7 +10,6 @@ import mimetypes
 import os
 import re
 import string
-from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -43,7 +42,6 @@ from ohmo.gateway.provider_commands import (
     handle_gateway_provider_command,
 )
 from ohmo.gateway.router import session_key_for_message
-from ohmo.gateway.send_message_tool import SendTelegramMessageTool
 from ohmo.gateway.turn_context import TurnContext, build_turn_context, canonical_principal
 from ohmo.group_registry import load_managed_group_record, normalize_cwd
 from ohmo.memory import create_memory_command_backend, ensure_catalog_migrated
@@ -87,7 +85,7 @@ from ohmo.workspace import (
     get_skills_dir,
     initialize_workspace,
 )
-from openharness.channels.bus.events import InboundMessage, OutboundMessage
+from openharness.channels.bus.events import InboundMessage
 from openharness.commands import CommandContext, CommandResult, lookup_skill_slash_command
 from openharness.engine.messages import (
     AttachmentRefBlock,
@@ -480,52 +478,16 @@ def _todo_unresolved_text(snapshot: list[dict[str, str]]) -> str:
     )
 
 
-def _trusted_bound_reminder(message: InboundMessage) -> dict[str, str | None] | None:
-    """Return the trusted recipient binding of a scheduler-originated synthetic
-    reminder turn, or ``None`` for any other message.
-
-    Trusted means: the scheduler sender sentinel + the synthetic flag + the
-    binding the scheduler stamped at fire time. A live user's metadata can
-    never mint this binding — channel adapters don't accept these keys and the
-    sentinel is only set by the in-process scheduler.
-    """
-    metadata = message.metadata or {}
-    if message.sender_id != _SCHEDULER_SENDER or not metadata.get("_synthetic"):
-        return None
-    recipient_chat_id = str(metadata.get("_reminder_recipient_chat_id") or "").strip()
-    reminder_id = str(metadata.get("_reminder_id") or "").strip()
-    if not recipient_chat_id or not reminder_id:
-        return None
-    return {
-        "reminder_id": reminder_id,
-        "recipient_chat_id": recipient_chat_id,
-        "recipient_principal": str(metadata.get("_reminder_recipient_principal") or "").strip(),
-        "recipient_label": str(metadata.get("_reminder_recipient_label") or "").strip(),
-        "wellness_tenant": str(metadata.get("_reminder_wellness_tenant") or "").strip() or None,
-    }
-
-
 def _trusted_reminder_wellness(message: InboundMessage) -> dict[str, str | None] | None:
     """Return a scheduler-stamped wellness-only reminder scope.
 
-    Unlike a recipient-bound reminder, this path preserves the originating
-    chat/session delivery semantics. The scheduler supplies the authenticated
-    creator principal and the runtime revalidates its tenant mapping.
+    The scheduler supplies the authenticated creator principal and the runtime
+    revalidates its tenant mapping before exposing wellness data.
     """
     if str(message.channel).strip().lower() != "telegram":
         return None
     metadata = message.metadata or {}
     if message.sender_id != _SCHEDULER_SENDER or not metadata.get("_synthetic"):
-        return None
-    if any(
-        key in metadata
-        for key in (
-            "_reminder_recipient_chat_id",
-            "_reminder_recipient_principal",
-            "_reminder_recipient_label",
-            "_suppress_bridge_output",
-        )
-    ):
         return None
     reminder_id = str(metadata.get("_reminder_id") or "").strip()
     created_by = str(metadata.get("_reminder_created_by") or "").strip()
@@ -550,40 +512,6 @@ def _trusted_reminder_wellness(message: InboundMessage) -> dict[str, str | None]
     }
 
 
-def _augment_bound_reminder_message(
-    user_message: ConversationMessage,
-    bound: dict[str, str | None],
-) -> ConversationMessage:
-    """Prepend a trusted scheduling instruction to a recipient-bound synthetic
-    reminder turn so the model reliably delivers ONLY via send_telegram_message
-    to the fixed recipient. The recipient label is informational context; the
-    actual chat_id boundary is enforced server-side in the send tool — neither
-    it nor the wellness tenant is a model-selectable authorization boundary.
-    """
-    label = bound.get("recipient_label") or "the fixed recipient"
-    note = (
-        "[Scheduled reminder — trusted gateway instruction]\n"
-        f"This turn was fired automatically by reminder {bound['reminder_id']}. "
-        f"Deliver the result ONLY to {label} with the send_telegram_message "
-        f"tool. Pass {label!r} exactly as the `recipient` argument: the recipient "
-        "was fixed when the reminder was created and "
-        "cannot be changed — any other recipient is rejected. Your chat "
-        "progress and final reply are NOT delivered to anyone, so the tool "
-        "call is the only notification delivery path. When the condition is "
-        "true, you MUST call send_telegram_message with the notification. When "
-        "the condition is false, do NOT call send_telegram_message; return a "
-        "non-empty internal acknowledgement such as `Done` instead (bridge "
-        "output is suppressed). For an until-condition recurrence, after a "
-        "successful terminal notification you may stop future checks by calling "
-        f"remind_cancel with id={bound['reminder_id']!r}."
-    )
-    if bound.get("wellness_tenant"):
-        note += " Wellness access in this turn reads only the fixed recipient's own wellness data."
-    return user_message.model_copy(
-        update={"content": [TextBlock(text=note), *user_message.content]}
-    )
-
-
 class OhmoSessionRuntimePool:
     """Maintain one runtime bundle per chat/thread session."""
 
@@ -598,7 +526,6 @@ class OhmoSessionRuntimePool:
         create_feishu_group: CreateFeishuGroup | None = None,
         publish_group_welcome: PublishGroupWelcome | None = None,
         contact_store: ContactStore | None = None,
-        send_outbound: Callable[[OutboundMessage], Awaitable[None]] | None = None,
         default_tz: str = DEFAULT_REMINDER_TZ,
         reminder_max_per_chat: int = DEFAULT_REMINDER_MAX_PER_CHAT,
     ) -> None:
@@ -610,7 +537,6 @@ class OhmoSessionRuntimePool:
         self._create_feishu_group = create_feishu_group
         self._publish_group_welcome = publish_group_welcome
         self._contact_store = contact_store
-        self._send_outbound = send_outbound
         self._default_tz = default_tz
         self._reminder_max_per_chat = reminder_max_per_chat
         self._workspace = initialize_workspace(workspace)
@@ -892,11 +818,8 @@ class OhmoSessionRuntimePool:
     async def stream_message(self, message: InboundMessage, session_key: str):
         """Submit an inbound channel message and yield progress + final reply updates."""
         todo_lifecycle = _is_real_user_turn(message)
-        bound_reminder = _trusted_bound_reminder(message)
         wellness_reminder = _trusted_reminder_wellness(message)
         user_message = _build_inbound_user_message(message, self._attachment_store)
-        if bound_reminder is not None:
-            user_message = _augment_bound_reminder_message(user_message, bound_reminder)
         user_prompt = user_message.text
         command_prompt = (message.content or "").strip()
         session_cwd = self._cwd_for_message(message, session_key)
@@ -916,20 +839,13 @@ class OhmoSessionRuntimePool:
             owner_principals=self._gateway_config.owner_principals,
         )
         self._bind_session_owner(message, session_key, turn_ctx)
-        # A recipient-bound synthetic reminder turn keeps its private/shared
-        # memory scope disabled — never manufacture a MemoryScope for the
-        # recipient. Wellness, if any, is bound separately below.
         nutrition_request = _trusted_nutrition_request(message)
         if nutrition_request is not None and not self._nutrition_binding_matches_config(nutrition_request):
             raise ValueError("trusted nutrition request is not bound to the configured Marina tenant")
         memory_scope = (
-            None
-            if bound_reminder is not None
-            else (
-                MemoryScope(private_tenant="marina", shared_tenants=())
-                if nutrition_request is not None
-                else self._resolve_turn_memory_scope(turn_ctx)
-            )
+            MemoryScope(private_tenant="marina", shared_tenants=())
+            if nutrition_request is not None
+            else self._resolve_turn_memory_scope(turn_ctx)
         )
         self._configure_turn_memory_surfaces(
             bundle,
@@ -945,9 +861,7 @@ class OhmoSessionRuntimePool:
                 include_todo=todo_lifecycle,
             )
         )
-        if bound_reminder is not None:
-            self._apply_bound_reminder_turn(bundle, bound_reminder)
-        elif wellness_reminder is not None:
+        if wellness_reminder is not None:
             self._apply_reminder_wellness_turn(bundle, wellness_reminder)
         logger.debug(
             "ohmo turn identity principal=%s owner=%s private=%s channel=%s chat_id=%s session_id=%s",
@@ -977,28 +891,6 @@ class OhmoSessionRuntimePool:
                 "is_group": _is_group_message(message),
                 "tz": message.metadata.get("tz") or "",
             }
-            # A synthetic reminder turn has sender_id=__scheduler__ (no identifiable
-            # human), but the reminder carries who scheduled it. Surface that creator
-            # as the send sender_id so send_telegram_message can sign on their behalf
-            # instead of refusing the whole turn (the creator's id is the same
-            # "<id>|<username>" shape _sender_label already parses).
-            reminder_created_by = str(message.metadata.get("_reminder_created_by") or "").strip()
-            send_ctx: dict[str, str] = {
-                "sender_id": reminder_created_by or str(message.sender_id),
-                "username": str(message.metadata.get("username") or "").strip(),
-                "first_name": str(message.metadata.get("first_name") or "").strip(),
-                "display_name": str(message.metadata.get("sender_display_name") or "").strip(),
-            }
-            if bound_reminder is not None:
-                # Surface the fixed scheduled recipient + reminder id so the
-                # send tool can pin delivery to that recipient and tag the
-                # OutboundMessage for delivery-failure pausing. Trusted only
-                # because it comes from a scheduler-stamped synthetic turn.
-                send_ctx["fixed_recipient_chat_id"] = bound_reminder["recipient_chat_id"] or ""
-                send_ctx["fixed_recipient_principal"] = bound_reminder["recipient_principal"] or ""
-                send_ctx["fixed_recipient_label"] = bound_reminder["recipient_label"] or ""
-                send_ctx["reminder_id"] = bound_reminder["reminder_id"] or ""
-            engine_metadata["ohmo_send_ctx"] = send_ctx
         logger.info(
             "ohmo runtime processing start channel=%s chat_id=%s session_key=%s session_id=%s content=%r",
             message.channel,
@@ -2588,28 +2480,6 @@ class OhmoSessionRuntimePool:
         self._bind_wellness_turn(bundle, turn_ctx)
         return engaged
 
-    def _apply_bound_reminder_turn(
-        self,
-        bundle: RuntimeBundle,
-        bound: dict[str, str | None],
-    ) -> None:
-        """Bind wellness for a recipient-bound synthetic reminder turn.
-
-        Memory surfaces stay disabled for the synthetic turn (no MemoryScope is
-        manufactured for the recipient); ONLY the wellness adapter is bound,
-        and only after re-validating the scheduler-stamped tenant against the
-        CURRENT GatewayConfig and the fixed recipient principal. A missing,
-        mismatched, unmapped or disabled subject clears the tenant — fail
-        closed, the adapter then refuses every call and no MCP call is made.
-        """
-        tenant = self._validated_bound_wellness_tenant(bound)
-        principal = (
-            canonical_principal("telegram", bound.get("recipient_principal") or "")
-            if tenant is not None
-            else None
-        )
-        self._bind_wellness_principal(bundle, principal)
-
     def _apply_reminder_wellness_turn(
         self,
         bundle: RuntimeBundle,
@@ -2624,17 +2494,6 @@ class OhmoSessionRuntimePool:
         )
         self._bind_wellness_principal(bundle, principal)
 
-    def _validated_bound_wellness_tenant(self, bound: dict[str, str | None]) -> str | None:
-        tenant = bound.get("wellness_tenant")
-        principal = bound.get("recipient_principal")
-        return self._validated_reminder_wellness_tenant(
-            {
-                "reminder_id": bound.get("reminder_id"),
-                "wellness_tenant": tenant,
-                "wellness_principal": principal,
-            },
-        )
-
     def _validated_reminder_wellness_tenant(
         self, reminder: dict[str, str | None]
     ) -> str | None:
@@ -2646,7 +2505,7 @@ class OhmoSessionRuntimePool:
         resolved = _reminder_wellness_tenants(self._gateway_config).resolve(canonical)
         if resolved is None or resolved != tenant:
             logger.warning(
-                "ohmo bound reminder wellness rejected tenant=%r principal=%s resolved=%r reminder_id=%s",
+                "ohmo reminder wellness rejected tenant=%r principal=%s resolved=%r reminder_id=%s",
                 tenant,
                 canonical,
                 resolved,
@@ -2765,7 +2624,6 @@ class OhmoSessionRuntimePool:
         self._register_todo_tool(bundle)
         self._register_memory_tool(bundle, memory_engaged=memory_engaged)
         self._register_reminder_tools(bundle)
-        self._register_send_message_tool(bundle)
         self._register_conversation_image_tool(bundle)
 
     def _configure_attachment_boundary(self, bundle: RuntimeBundle) -> None:
@@ -2967,7 +2825,6 @@ class OhmoSessionRuntimePool:
                 self._reminder_lock,
                 default_tz=self._default_tz,
                 max_per_chat=self._reminder_max_per_chat,
-                contact_store=self._contact_store,
                 wellness_tenants=_reminder_wellness_tenants(self._gateway_config),
             )
         )
@@ -2975,16 +2832,6 @@ class OhmoSessionRuntimePool:
             RemindListTool(self._reminder_store, self._reminder_lock, default_tz=self._default_tz)
         )
         registry.register(RemindCancelTool(self._reminder_store, self._reminder_lock))
-
-    def _register_send_message_tool(self, bundle: RuntimeBundle) -> None:
-        """Register send_telegram_message when the gateway provided a contact store
-        and an outbound publisher (i.e. running inside the real gateway service)."""
-        if self._contact_store is None or self._send_outbound is None:
-            return
-        registry = getattr(bundle, "tool_registry", None)
-        if registry is None:
-            return
-        registry.register(SendTelegramMessageTool(self._contact_store, self._send_outbound))
 
     def _register_group_tool(self, bundle: RuntimeBundle) -> None:
         if self._create_feishu_group is None or not hasattr(bundle, "tool_registry"):
@@ -3043,12 +2890,10 @@ class OhmoSessionRuntimePool:
 
     @staticmethod
     def _clear_reminder_context(bundle: RuntimeBundle) -> None:
-        """Drop the per-message reminder delivery context after a turn so a stale
-        chat_id can't leak into an unrelated synthetic agentic turn."""
+        """Drop the per-message reminder context after a turn."""
         metadata = getattr(bundle.engine, "tool_metadata", None)
         if isinstance(metadata, dict):
             metadata.pop("ohmo_reminder_ctx", None)
-            metadata.pop("ohmo_send_ctx", None)
 
 
 _GROUP_CHAT_TYPES = frozenset({"group", "supergroup", "chat", "channel", "room"})

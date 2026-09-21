@@ -100,9 +100,9 @@ class CronCreateTool(BaseTool):
                 output=(
                     "Agent-turn cron jobs are not available in an ohmo gateway "
                     "chat because cron output is not delivered as a chat reply. "
-                    "Use remind_create instead (delivery='explicit' for a "
-                    "conditionally silent current-chat reminder). Machine command "
-                    "cron jobs remain available through cron_create."
+                    "Use remind_create instead to create a reminder for the current "
+                    "chat. Machine command cron jobs remain available through "
+                    "cron_create."
                 ),
                 is_error=True,
             )
