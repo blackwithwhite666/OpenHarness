@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from ohmo.memory import add_memory_entry as add_ohmo_memory_entry
 from ohmo.prompts import build_ohmo_system_prompt
 from ohmo.workspace import (
@@ -193,6 +195,89 @@ def test_ohmo_prompt_nutrition_contract_contains_versioned_annotation_rules(tmp_
     )
 
 
+def test_ohmo_prompt_energy_days_reports_observed_facts_and_coverage(tmp_path: Path) -> None:
+    workspace = tmp_path / ".ohmo-home"
+    initialize_workspace(workspace)
+    prompt = build_ohmo_system_prompt(tmp_path, workspace=workspace)
+
+    for field in (
+        "energy_days",
+        "device_id",
+        "local_day",
+        "basal_sum",
+        "basal_unit",
+        "active_sum",
+        "active_unit",
+        "active_points",
+        "basal_minutes_with_samples",
+        "day_minutes",
+        "next_day_basal_observed",
+        "basal_conflicting_timestamps",
+        "active_conflicting_timestamps",
+    ):
+        assert f"`{field}`" in prompt
+    assert "basal X/Y" in prompt
+    assert "observed sums in their stated actual units" in prompt
+
+
+def test_ohmo_prompt_has_no_absolute_energy_ban_when_provisional_balance_is_allowed(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / ".ohmo-home"
+    initialize_workspace(workspace)
+    prompt = build_ohmo_system_prompt(tmp_path, workspace=workspace)
+
+    assert not (
+        "Until a trusted per-type Health completion checkpoint exists" in prompt
+        and "A preliminary observed energy balance is allowed" in prompt
+    )
+
+
+@pytest.mark.parametrize(
+    "required_rule",
+    [
+        "past local day",
+        "trusted `nutrition_status=complete` policy",
+        "basal_minutes_with_samples == day_minutes",
+        "`active_points > 0`",
+        "`next_day_basal_observed` is true",
+        "`basal_conflicting_timestamps` and `active_conflicting_timestamps` are 0",
+        "dividing by exactly 4.184",
+        "Unsupported or missing units fail the gate",
+        "Label the result `provisional` and `revisable`",
+    ],
+)
+def test_ohmo_prompt_energy_balance_requires_every_positive_gate(
+    tmp_path: Path, required_rule: str
+) -> None:
+    workspace = tmp_path / ".ohmo-home"
+    initialize_workspace(workspace)
+    prompt = build_ohmo_system_prompt(tmp_path, workspace=workspace)
+    assert required_rule in prompt
+
+
+@pytest.mark.parametrize(
+    "fail_closed_rule",
+    [
+        "If any energy gate fails",
+        "state that expenditure may be incomplete",
+        "Do not calculate or state a deficit, surplus, calorie target",
+        "A conflict in either energy type blocks balance",
+        "do not auto-correct, deduplicate, or choose a value",
+        "Next-day basal presence alone never proves completeness",
+        "belongs to the new local calendar day",
+        "may revise a day's observed sums",
+    ],
+)
+def test_ohmo_prompt_energy_balance_fails_closed_for_missing_or_late_facts(
+    tmp_path: Path, fail_closed_rule: str
+) -> None:
+    workspace = tmp_path / ".ohmo-home"
+    initialize_workspace(workspace)
+    prompt = build_ohmo_system_prompt(tmp_path, workspace=workspace)
+    assert fail_closed_rule in prompt
+
+
 def test_ohmo_prompt_nutrition_contract_distinguishes_corrections_and_summaries(
     tmp_path: Path,
 ) -> None:
@@ -272,8 +357,9 @@ def test_ohmo_prompt_wellness_and_nutrition_safety_contract(tmp_path: Path) -> N
     assert 'raw_health_types=["HealthAutoExportMetric_weight_body_mass"]' in prompt
     assert "basal and active energy must remain aggregate-only" in prompt
     assert "Filter every displayed daily value" in prompt
-    assert "shown only as partial" in prompt
-    assert "never calculate an energy deficit, surplus" in prompt
+    assert "Observed basal and active energy sums and coverage are factual" in prompt
+    assert "only when every energy gate below passes" in prompt
+    assert "otherwise never infer an energy deficit" in prompt
     assert "nutrition_status` is not `complete`" in prompt
     assert "an empty nutrition list is never zero intake" in prompt
     assert "conversation-only" in prompt
@@ -298,5 +384,5 @@ def test_ohmo_prompt_covers_marina_wellness_regressions(tmp_path: Path) -> None:
     assert "every recalculated energy or macronutrient field" in prompt
     assert "never display it as `0 kcal`" in prompt
     assert "there is no durable weight-write tool" in prompt
-    assert "trusted per-type Health completion checkpoint" in prompt
-    assert "never calculate an energy deficit, surplus" in prompt
+    assert "only when every energy gate below passes" in prompt
+    assert "otherwise never infer an energy deficit" in prompt

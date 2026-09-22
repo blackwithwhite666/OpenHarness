@@ -251,6 +251,53 @@ class _RecordingMcpManager:
         return self.tool_output
 
 
+def _energy_fixture() -> str:
+    return (Path(__file__).parents[1] / "fixtures" / "wellness_energy_days.json").read_text(
+        encoding="utf-8"
+    )
+
+
+def test_energy_fixture_covers_positive_and_negative_balance_gates() -> None:
+    payload = json.loads(_energy_fixture())
+    complete, incomplete, basal_conflict, unsupported_units = payload["energy_days"]
+
+    response_fields = {
+        "device_id",
+        "local_day",
+        "timezone",
+        "basal_sum",
+        "basal_unit",
+        "basal_points",
+        "basal_minutes_with_samples",
+        "day_minutes",
+        "active_sum",
+        "active_unit",
+        "active_points",
+        "next_day_basal_observed",
+        "basal_conflicting_timestamps",
+        "active_conflicting_timestamps",
+    }
+    assert all(set(day) == response_fields for day in payload["energy_days"])
+
+    assert payload["nutrition_status"] == "complete"
+    assert complete["basal_minutes_with_samples"] == complete["day_minutes"]
+    assert complete["active_points"] > 0
+    assert complete["next_day_basal_observed"] is True
+    assert complete["basal_conflicting_timestamps"] == 0
+    assert complete["active_conflicting_timestamps"] == 0
+    assert complete["basal_sum"] / 4.184 == pytest.approx(2000.0)
+    assert complete["active_sum"] / 4.184 == pytest.approx(100.0)
+
+    assert incomplete["basal_minutes_with_samples"] < incomplete["day_minutes"]
+    assert incomplete["active_points"] == 0
+    assert incomplete["next_day_basal_observed"] is False
+    assert incomplete["active_conflicting_timestamps"] == 1
+    assert basal_conflict["basal_conflicting_timestamps"] == 1
+    assert basal_conflict["active_conflicting_timestamps"] == 0
+    assert unsupported_units["basal_unit"] not in {"kJ", "kcal"}
+    assert unsupported_units["active_unit"] not in {"kJ", "kcal"}
+
+
 def _wellness_delegate(manager: _RecordingMcpManager) -> McpToolAdapter:
     return McpToolAdapter(
         manager,
@@ -348,6 +395,19 @@ class TestWellnessLoginInjectingAdapter:
         for field in ("user_id", "health_types", "participant_id"):
             assert field not in serialized
             assert field not in json.dumps(adapter.to_api_schema())
+
+    async def test_energy_days_response_is_factual_and_unmodified(self):
+        manager = _RecordingMcpManager(tool_output=_energy_fixture())
+        adapter = WellnessLoginInjectingAdapter(_wellness_delegate(manager))
+        adapter.set_trusted_principal("116870365", owner_turn=True)
+
+        result = await adapter.execute(
+            adapter.input_model(params={"start": "2026-09-20", "end": "2026-09-21"}),
+            ToolExecutionContext(cwd=Path(".")),
+        )
+
+        assert result.is_error is False
+        assert json.loads(result.output.split("\n\n", 1)[1]) == json.loads(_energy_fixture())
 
     async def test_current_schema_omitted_login_has_no_stale_extra(self):
         manager = _RecordingMcpManager()
