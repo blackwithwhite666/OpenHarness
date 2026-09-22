@@ -47,7 +47,6 @@
     "poll_interval_seconds": 10.0,
     "max_prompt_attempts": 3,
     "max_estimation_attempts": 5,
-    "retry_backoff_seconds": 5.0,
-    "require_owner_only_filesystem": true
+    "retry_backoff_seconds": 5.0
   }
 }

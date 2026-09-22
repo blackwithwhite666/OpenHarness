@@ -123,6 +123,29 @@ def test_enabled_nutrition_ingest_accepts_only_the_marina_binding(tmp_path) -> N
     assert config.tenant_honcho["marina"]["session"] == "marina-session"
 
 
+def test_enabled_nutrition_ingest_accepts_permissive_synchronized_tree(tmp_path) -> None:
+    root = tmp_path / "nutrition-assets"
+    root.mkdir()
+    root.chmod(0o755)
+    child = root / "photo.jpg"
+    child.write_bytes(b"photo")
+    child.chmod(0o644)
+
+    config = _enabled_config(root)
+    config.nutrition_ingest.validate_filesystem_runtime()
+
+
+@pytest.mark.parametrize("root_kind", ["missing", "file"])
+def test_enabled_nutrition_ingest_requires_directory_root(tmp_path, root_kind) -> None:
+    root = tmp_path / "nutrition-assets"
+    if root_kind == "file":
+        root.write_text("not a directory", encoding="utf-8")
+
+    config = _enabled_config(root)
+    with pytest.raises(ValueError, match="must be a directory"):
+        config.nutrition_ingest.validate_filesystem_runtime()
+
+
 @pytest.mark.parametrize("session", ["", "with spaces", "slash/name", "x" * 513])
 def test_tenant_honcho_session_must_be_a_bounded_identifier(session: str) -> None:
     with pytest.raises(ValueError, match="bounded Honcho identifier"):

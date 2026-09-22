@@ -296,7 +296,6 @@ def _nutrition_runtime_pool(
             chat_id="123",
             session_key="telegram:123",
             retry_backoff_seconds=0,
-            require_owner_only_filesystem=False,
         ),
     )
     pool = OhmoSessionRuntimePool(cwd=tmp_path, workspace=workspace, provider_profile="codex")
@@ -2849,7 +2848,6 @@ async def test_incident_shaped_timestamps_record_normal_stage_latencies(
         chat_id="123",
         session_key="telegram:123",
         retry_backoff_seconds=0,
-        require_owner_only_filesystem=False,
     )
     outbound: list = []
     metrics = NutritionMetrics()
@@ -2929,7 +2927,6 @@ async def test_status_returns_privacy_safe_aggregate_after_completion(
         chat_id="123",
         session_key="telegram:123",
         retry_backoff_seconds=0,
-        require_owner_only_filesystem=False,
     )
     outbound: list = []
     metrics = NutritionMetrics()
@@ -3020,7 +3017,6 @@ async def test_pending_confirmation_within_slo_does_not_alert(tmp_path: Path) ->
         chat_id="123",
         session_key="telegram:123",
         retry_backoff_seconds=0,
-        require_owner_only_filesystem=False,
     )
     outbound: list = []
     metrics = NutritionMetrics()
@@ -3064,7 +3060,6 @@ async def test_prompt_without_receipt_alerts_after_slo(tmp_path: Path) -> None:
         chat_id="123",
         session_key="telegram:123",
         retry_backoff_seconds=0,
-        require_owner_only_filesystem=False,
     )
     outbound: list = []
     clock = _Clock()
@@ -3098,7 +3093,6 @@ async def test_status_last_error_is_privacy_safe(tmp_path: Path) -> None:
         chat_id="123",
         session_key="telegram:123",
         retry_backoff_seconds=0,
-        require_owner_only_filesystem=False,
     )
     metrics = NutritionMetrics()
     clock = _Clock()
@@ -3151,7 +3145,6 @@ async def test_status_last_error_collapses_free_form_stage_to_unknown(
         chat_id="123",
         session_key="telegram:123",
         retry_backoff_seconds=0,
-        require_owner_only_filesystem=False,
     )
 
     def fail_publish(message):

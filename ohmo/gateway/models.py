@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import re
-import stat
 from pathlib import Path
 from typing import Literal
 
@@ -149,7 +148,6 @@ class NutritionIngestConfig(BaseModel):
     max_prompt_attempts: int = Field(default=3, ge=1, le=20)
     max_estimation_attempts: int = Field(default=5, ge=1, le=20)
     retry_backoff_seconds: float = Field(default=5.0, ge=0, le=3600)
-    require_owner_only_filesystem: bool = True
 
     @property
     def canonical_principal(self) -> str:
@@ -209,15 +207,6 @@ class NutritionIngestConfig(BaseModel):
         root = self.synchronized_root.expanduser().resolve()
         if not root.is_dir():
             raise ValueError("nutrition ingest synchronized_root must be a directory")
-        if self.require_owner_only_filesystem:
-            paths = [root, *root.rglob("*")]
-            for path in paths:
-                try:
-                    mode = path.stat().st_mode
-                except OSError as exc:
-                    raise ValueError("nutrition ingest filesystem is not readable") from exc
-                if stat.S_IMODE(mode) & 0o077:
-                    raise ValueError("nutrition ingest filesystem must be owner-only")
 
 
 class GatewayState(BaseModel):

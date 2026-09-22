@@ -13,8 +13,8 @@ accepted, and the consumer never runs Qwen or CLIP.
    deployment secret/config mechanism. Do not put tokens, private identifiers,
    usernames, replies, or paths in logs or documentation.
 2. Keep `nutrition_ingest.enabled=false` until all values are replaced and the
-   synchronized root exists, is owner-only, and contains only the expected
-   protocol tree. The principal, private chat id, and `telegram:<principal>`
+   synchronized root exists and contains only the expected protocol tree. The
+   principal, private chat id, and `telegram:<principal>`
    session key must be the same positive numeric Marina binding. The tenant is
    exactly `marina`; usernames are not authorization. The numeric
    `family_principals` key in the example is a synthetic shape-only placeholder,
@@ -50,25 +50,12 @@ git log -1 --oneline
 ```
 
 Only the reviewed deploy-branch change may be installed.
-Before starting or restarting the gateway, require the Dropbox daemon/service
-that creates synchronized files on the consumer host to run with a systemd
-drop-in setting `UMask=0077`. As a one-time prerequisite, harden the existing
-`nutrition-assets` tree to owner-only permissions and verify that no group or
-other permission bits remain, for example:
-
-```bash
-chmod -R go-rwx "$NUTRITION_ASSETS_ROOT"
-find "$NUTRITION_ASSETS_ROOT" -perm /go-rwx -print -quit
-```
-
-Setting the root mode once is insufficient: future synchronized children
-inherit the Dropbox daemon's umask.
-
 After deployment, verify the Dropbox selective sync for the synchronized
-`nutrition-assets` root, owner-only permissions, free space, and service
-readiness. Do not recursively print the tree. The scanner ignores temporary
+`nutrition-assets` root, free space, and service readiness. The gateway checks
+that the configured root exists and is a directory. It does not require
+owner-only modes on the synchronized tree. The scanner ignores temporary
 objects and accepts only a manifest whose named image has the exact declared
-size and SHA-256.
+size and SHA-256; containment, path, and Marina binding checks remain in force.
 
 Inspect aggregate status with the privacy-safe command:
 

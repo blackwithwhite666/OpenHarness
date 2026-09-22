@@ -3367,7 +3367,7 @@ def test_gateway_provider_command_survives_nutrition_child_mode_drift(tmp_path, 
     assert load_gateway_config(workspace).provider_profile == "codex"
 
 
-def test_gateway_service_rejects_nutrition_child_mode_drift(tmp_path, monkeypatch):
+def test_gateway_service_accepts_nutrition_child_mode_drift(tmp_path, monkeypatch):
     assets = tmp_path / "nutrition-assets"
     assets.mkdir(mode=0o700)
     workspace = initialize_workspace(tmp_path / ".ohmo-home")
@@ -3395,8 +3395,62 @@ def test_gateway_service_rejects_nutrition_child_mode_drift(tmp_path, monkeypatc
     (assets / "synchronized.json").chmod(0o644)
     monkeypatch.setattr("ohmo.gateway.service.load_gateway_config", lambda _workspace: config)
 
-    with pytest.raises(ValueError, match="filesystem must be owner-only"):
-        OhmoGatewayService(cwd=tmp_path, workspace=workspace)
+    OhmoGatewayService(cwd=tmp_path, workspace=workspace)
+
+
+def test_load_gateway_config_discards_retired_nutrition_filesystem_key(tmp_path):
+    assets = tmp_path / "nutrition-assets"
+    assets.mkdir(mode=0o755)
+    child = assets / "synchronized.json"
+    child.write_text("{}", encoding="utf-8")
+    child.chmod(0o644)
+    workspace = initialize_workspace(tmp_path / ".ohmo-home")
+    save_gateway_config(
+        GatewayConfig(
+            conversation_learning=True,
+            family_principals={"123": "marina"},
+            enabled_memory_tenants=("marina",),
+            honcho_base_url="https://honcho.test",
+            tenant_honcho={
+                "marina": {
+                    "workspace": "marina-workspace",
+                    "api_key": "marina-key",
+                    "observed_peer": "marina",
+                }
+            },
+            nutrition_ingest=NutritionIngestConfig(
+                enabled=True,
+                synchronized_root=assets,
+                principal="123",
+                chat_id="123",
+                session_key="telegram:123",
+            ),
+        ),
+        workspace,
+    )
+    raw = json.loads((workspace / "gateway.json").read_text(encoding="utf-8"))
+    raw["nutrition_ingest"]["require_owner_only_filesystem"] = True
+    (workspace / "gateway.json").write_text(
+        json.dumps(raw) + "\n",
+        encoding="utf-8",
+    )
+
+    config = load_gateway_config(workspace)
+
+    assert config.nutrition_ingest.enabled is True
+    assert "require_owner_only_filesystem" not in config.nutrition_ingest.model_dump()
+    OhmoGatewayService(cwd=tmp_path, workspace=workspace)
+
+
+def test_load_gateway_config_still_rejects_unknown_nutrition_key(tmp_path):
+    workspace = initialize_workspace(tmp_path / ".ohmo-home")
+    (workspace / "gateway.json").write_text(
+        json.dumps({"nutrition_ingest": {"enabled": False, "unknown_key": True}}) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="unknown_key"):
+        load_gateway_config(workspace)
 
 
 def test_gateway_model_command_updates_selected_gateway_profile(tmp_path, monkeypatch):
