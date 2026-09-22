@@ -211,7 +211,13 @@ def _recent_message(
 class _NutritionModelStream:
     """A model-only fake: emits one validated nutrition trace and final text."""
 
-    def __init__(self, *, protein_g: object = 30, answer: str | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        protein_g: object = 30,
+        answer: str | None = None,
+        explicit_new_consumption: bool = False,
+    ) -> None:
         self.api_client = object()
         self.decision_trace_recorder = None
         self.engine = self
@@ -222,6 +228,7 @@ class _NutritionModelStream:
         self.total_usage = UsageSnapshot()
         self.system_prompt = ""
         self.protein_g = protein_g
+        self.explicit_new_consumption = explicit_new_consumption
         self.answer = answer or "Записала съеденный приём пищи: 999 ккал."
 
     def set_decision_trace_recorder(self, recorder) -> None:
@@ -249,6 +256,7 @@ class _NutritionModelStream:
                         "protein_g": self.protein_g,
                         "fat_g": 20,
                         "carbohydrate_g": 45,
+                        "explicit_new_consumption": self.explicit_new_consumption,
                     }
                 },
             },
@@ -1949,6 +1957,401 @@ async def test_dropbox_phash_only_record_is_not_a_duplicate(tmp_path: Path) -> N
     ).poll_once()
     assert len(outbound) == 1
     assert outbound[0].metadata["_nutrition_candidate_id"] == candidate
+
+
+@pytest.mark.asyncio
+async def test_cross_ingress_phash_requires_trusted_dropbox_consumed_capture(
+    tmp_path: Path,
+) -> None:
+    data = _png((50, 100, 150))
+    descriptor = fingerprint_image_bytes(data)
+    assert descriptor is not None
+    candidate = _candidate(
+        tmp_path,
+        file_id="id:cross-ingress-phash",
+        rev="rev:cross-ingress-phash",
+        capture_time="2026-08-05T09:00:00+00:00",
+        data=data,
+        filename="photo.png",
+    )
+    fingerprints = [{"phash": descriptor["phash"], "phash_algorithm": PHASH_ALGORITHM}]
+    source = _RecentSource(
+        [
+            _recent_message(
+                fingerprints,
+                ingest_source="dropbox_camera",
+                created_at=datetime(2026, 8, 5, 9, 30, tzinfo=timezone.utc),
+            )
+        ]
+    )
+    source.messages[0].metadata.update(
+        {
+            "nutrition_capture_time": "2026-08-05T09:00:00+00:00",
+            "nutrition_capture_source": "exif",
+            "nutrition_consumed": True,
+        }
+    )
+    config = NutritionIngestConfig(
+        enabled=True,
+        synchronized_root=tmp_path,
+        principal="123",
+        chat_id="123",
+        session_key="telegram:123",
+    )
+    outbound = []
+    await NutritionIngestCoordinator(
+        config, publish_outbound=outbound.append, honcho_client=source, now=_Clock()
+    ).poll_once()
+    assert outbound == []
+    assert not (tmp_path / candidate).exists()
+
+
+@pytest.mark.asyncio
+async def test_multiple_phash_matches_persist_needs_resolution_without_prompt(
+    tmp_path: Path,
+) -> None:
+    data = _png((50, 100, 150))
+    descriptor = fingerprint_image_bytes(data)
+    assert descriptor is not None
+    candidate = _candidate(
+        tmp_path,
+        file_id="id:ambiguous-phash",
+        rev="rev:ambiguous-phash",
+        capture_time="2026-08-05T09:00:00+00:00",
+        data=data,
+        filename="photo.png",
+    )
+    fingerprint = {"phash": descriptor["phash"], "phash_algorithm": PHASH_ALGORITHM}
+    source = _RecentSource(
+        [
+            _recent_message([fingerprint], identifier="meal-1"),
+            _recent_message([fingerprint], identifier="meal-2"),
+        ]
+    )
+    config = NutritionIngestConfig(
+        enabled=True,
+        synchronized_root=tmp_path,
+        principal="123",
+        chat_id="123",
+        session_key="telegram:123",
+    )
+    outbound = []
+    await NutritionIngestCoordinator(
+        config, publish_outbound=outbound.append, honcho_client=source, now=_Clock()
+    ).poll_once()
+    assert outbound == []
+    sidecar = NutritionResultStore(tmp_path / candidate / "result.json").load()
+    assert sidecar is not None
+    assert sidecar.state == ResultState.needs_resolution
+    assert sidecar.consumption_status == "unknown"
+    assert sidecar.duplicate_match_message_ids == ["meal-1", "meal-2"]
+
+
+@pytest.mark.asyncio
+async def test_operator_resolves_ambiguous_phash_as_same_restart_safely(tmp_path: Path) -> None:
+    data = _png((50, 100, 150))
+    descriptor = fingerprint_image_bytes(data)
+    assert descriptor is not None
+    candidate = _candidate(
+        tmp_path,
+        file_id="id:ambiguous-same",
+        rev="rev:ambiguous-same",
+        capture_time="2026-08-05T09:00:00+00:00",
+        data=data,
+        filename="photo.png",
+    )
+    fingerprint = {"phash": descriptor["phash"], "phash_algorithm": PHASH_ALGORITHM}
+    source = _RecentSource(
+        [
+            _recent_message([fingerprint], identifier="meal-1"),
+            _recent_message([fingerprint], identifier="meal-2"),
+        ]
+    )
+    config = NutritionIngestConfig(
+        enabled=True,
+        synchronized_root=tmp_path,
+        principal="123",
+        chat_id="123",
+        session_key="telegram:123",
+    )
+    coordinator = NutritionIngestCoordinator(config, honcho_client=source, now=_Clock())
+    await coordinator.poll_once()
+
+    assert coordinator.resolve_duplicate(candidate, decision="same", matched_message_id="meal-2")
+    assert not (tmp_path / candidate).exists()
+    assert not coordinator.resolve_duplicate(
+        candidate, decision="same", matched_message_id="meal-2"
+    )
+
+
+@pytest.mark.asyncio
+async def test_operator_resolves_ambiguous_phash_as_new_before_restart_prompt(
+    tmp_path: Path,
+) -> None:
+    data = _png((50, 100, 150))
+    descriptor = fingerprint_image_bytes(data)
+    assert descriptor is not None
+    candidate = _candidate(
+        tmp_path,
+        file_id="id:ambiguous-new",
+        rev="rev:ambiguous-new",
+        capture_time="2026-08-05T09:00:00+00:00",
+        data=data,
+        filename="photo.png",
+    )
+    fingerprint = {"phash": descriptor["phash"], "phash_algorithm": PHASH_ALGORITHM}
+    source = _RecentSource(
+        [
+            _recent_message([fingerprint], identifier="meal-1"),
+            _recent_message([fingerprint], identifier="meal-2"),
+        ]
+    )
+    config = NutritionIngestConfig(
+        enabled=True,
+        synchronized_root=tmp_path,
+        principal="123",
+        chat_id="123",
+        session_key="telegram:123",
+    )
+    coordinator = NutritionIngestCoordinator(config, honcho_client=source, now=_Clock())
+    await coordinator.poll_once()
+    assert coordinator.resolve_duplicate(candidate, decision="new")
+    stored = NutritionResultStore(tmp_path / candidate / "result.json").load()
+    assert stored is not None
+    assert stored.state == ResultState.published
+    assert stored.duplicate_resolution == "new"
+    assert stored.explicit_new_consumption is True
+    assert not coordinator.resolve_duplicate(candidate, decision="new")
+
+    outbound = []
+    restarted = NutritionIngestCoordinator(
+        config, publish_outbound=outbound.append, honcho_client=source, now=_Clock()
+    )
+    await restarted.poll_once()
+    assert len(outbound) == 1
+    assert NutritionResultStore(tmp_path / candidate / "result.json").load().state == (
+        ResultState.prompt_sending
+    )
+
+
+@pytest.mark.asyncio
+async def test_explicit_new_resolution_reaches_validated_append_and_replays_idempotently(
+    tmp_path: Path,
+) -> None:
+    data = _png((50, 100, 150))
+    descriptor = fingerprint_image_bytes(data)
+    assert descriptor is not None
+    candidate = _candidate(
+        tmp_path,
+        file_id="id:explicit-new-append",
+        rev="rev:explicit-new-append",
+        capture_time="2026-08-05T09:00:00+00:00",
+        data=data,
+        filename="photo.png",
+    )
+    fingerprint = {"phash": descriptor["phash"], "phash_algorithm": PHASH_ALGORITHM}
+    source = _RecentSource(
+        [
+            _recent_message([fingerprint], identifier="meal-1"),
+            _recent_message([fingerprint], identifier="meal-2"),
+        ]
+    )
+    workspace = tmp_path / ".ohmo-home"
+    initialize_workspace(workspace)
+    honcho = _HonchoStore()
+    pool = _nutrition_runtime_pool(
+        tmp_path,
+        workspace,
+        honcho,
+        model_stream=_NutritionModelStream(explicit_new_consumption=True),
+    )
+    config = NutritionIngestConfig(
+        enabled=True,
+        synchronized_root=tmp_path,
+        principal="123",
+        chat_id="123",
+        session_key="telegram:123",
+        retry_backoff_seconds=0,
+    )
+    outbound = []
+    coordinator = NutritionIngestCoordinator(
+        config,
+        publish_outbound=outbound.append,
+        honcho_client=source,
+        runtime_pool=pool,
+        now=_Clock(),
+    )
+    await coordinator.poll_once()
+    assert coordinator.resolve_duplicate(candidate, decision="new")
+    await coordinator.poll_once()
+    prompt = outbound[0]
+    await coordinator.on_send_success(
+        prompt,
+        OutboundDeliveryReceipt(
+            "telegram", "123", (42,), prompt.metadata["_trusted_outbound_operation_id"]
+        ),
+    )
+    await coordinator.handle_inbound(
+        InboundMessage(
+            channel="telegram",
+            sender_id="123",
+            chat_id="123",
+            content="Да, я это съела",
+            session_key_override="telegram:123",
+            metadata=_nutrition_callback(prompt),
+        )
+    )
+    stored = NutritionResultStore(tmp_path / candidate / "result.json").load()
+    assert stored is not None
+    assert stored.state == ResultState.completed
+    assert stored.duplicate_resolution == "new"
+    assert len(honcho.messages) == 2
+    assistant = next(message for message in honcho.messages if message.metadata["role"] == "assistant")
+    assert assistant.metadata["nutrition_explicit_new_consumption"] is True
+    annotation = assistant.metadata["decision_trace"]["annotations"]["nutrition"]
+    assert annotation["explicit_new_consumption"] is True
+
+    await coordinator.poll_once()
+    assert len(honcho.messages) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("distance", "is_duplicate"),
+    [(4, True), (5, False)],
+)
+async def test_trusted_dropbox_phash_hamming_boundary(
+    tmp_path: Path, distance: int, is_duplicate: bool
+) -> None:
+    data = _png((50, 100, 150))
+    descriptor = fingerprint_image_bytes(data)
+    assert descriptor is not None
+    candidate = _candidate(
+        tmp_path,
+        file_id=f"id:hamming-{distance}",
+        rev=f"rev:hamming-{distance}",
+        capture_time="2026-08-05T09:00:00+00:00",
+        data=data,
+        filename="photo.png",
+    )
+    changed = int(descriptor["phash"], 16) ^ ((1 << distance) - 1)
+    source = _RecentSource(
+        [
+            _recent_message(
+                [{"phash": f"{changed:064x}", "phash_algorithm": PHASH_ALGORITHM}],
+                ingest_source="dropbox_camera",
+            )
+        ]
+    )
+    source.messages[0].metadata.update(
+        nutrition_capture_time="2026-08-05T09:00:00+00:00",
+        nutrition_capture_source="exif",
+        nutrition_consumed=True,
+    )
+    outbound = []
+    await NutritionIngestCoordinator(
+        NutritionIngestConfig(
+            enabled=True,
+            synchronized_root=tmp_path,
+            principal="123",
+            chat_id="123",
+            session_key="telegram:123",
+        ),
+        publish_outbound=outbound.append,
+        honcho_client=source,
+        now=_Clock(),
+    ).poll_once()
+    assert ((tmp_path / candidate).exists(), len(outbound)) == (
+        (True, 1) if not is_duplicate else (False, 0)
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("delta", "is_duplicate"),
+    [(timedelta(hours=2), True), (timedelta(hours=2, seconds=1), False)],
+)
+async def test_trusted_dropbox_phash_occurrence_boundary(
+    tmp_path: Path, delta: timedelta, is_duplicate: bool
+) -> None:
+    data = _png((50, 100, 150))
+    descriptor = fingerprint_image_bytes(data)
+    assert descriptor is not None
+    candidate = _candidate(
+        tmp_path,
+        file_id=f"id:time-{delta.total_seconds()}",
+        rev=f"rev:time-{delta.total_seconds()}",
+        capture_time="2026-08-05T08:00:00+00:00",
+        data=data,
+        filename="photo.png",
+    )
+    source = _RecentSource(
+        [
+            _recent_message(
+                [{"phash": descriptor["phash"], "phash_algorithm": PHASH_ALGORITHM}],
+                ingest_source="dropbox_camera",
+            )
+        ]
+    )
+    source.messages[0].metadata.update(
+        nutrition_capture_time=(datetime(2026, 8, 5, 8, tzinfo=timezone.utc) + delta).isoformat(),
+        nutrition_capture_source="exif",
+        nutrition_consumed=True,
+    )
+    outbound = []
+    await NutritionIngestCoordinator(
+        NutritionIngestConfig(
+            enabled=True,
+            synchronized_root=tmp_path,
+            principal="123",
+            chat_id="123",
+            session_key="telegram:123",
+        ),
+        publish_outbound=outbound.append,
+        honcho_client=source,
+        now=_Clock(),
+    ).poll_once()
+    assert ((tmp_path / candidate).exists(), len(outbound)) == (
+        (True, 1) if not is_duplicate else (False, 0)
+    )
+
+
+@pytest.mark.asyncio
+async def test_exact_sha_precedes_ambiguous_phash_matches(tmp_path: Path) -> None:
+    data = _png((50, 100, 150))
+    descriptor = fingerprint_image_bytes(data)
+    assert descriptor is not None
+    candidate = _candidate(
+        tmp_path,
+        file_id="id:sha-preference",
+        rev="rev:sha-preference",
+        capture_time="2026-08-05T09:00:00+00:00",
+        data=data,
+        filename="photo.png",
+    )
+    fingerprint = {"phash": descriptor["phash"], "phash_algorithm": PHASH_ALGORITHM}
+    source = _RecentSource(
+        [
+            _recent_message([fingerprint], identifier="phash-1"),
+            _recent_message([fingerprint], identifier="phash-2"),
+            _recent_message([{"sha256": hashlib.sha256(data).hexdigest()}], identifier="sha"),
+        ]
+    )
+    await NutritionIngestCoordinator(
+        NutritionIngestConfig(
+            enabled=True,
+            synchronized_root=tmp_path,
+            principal="123",
+            chat_id="123",
+            session_key="telegram:123",
+        ),
+        honcho_client=source,
+        now=_Clock(),
+    ).poll_once()
+    tombstone = SeenTombstoneV1.model_validate_json(
+        (tmp_path / "_seen" / f"{candidate}.json").read_text()
+    )
+    assert tombstone.matching_fingerprint_kind == "sha256"
 
 
 @pytest.mark.asyncio

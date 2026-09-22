@@ -192,6 +192,12 @@ def test_nutrition_status_and_replay_cli_output_is_privacy_safe(monkeypatch, cap
             assert candidate == "operator-selected"
             return True
 
+        def resolve_duplicate(self, candidate, *, decision, matched_message_id=None):
+            assert candidate == "operator-selected"
+            assert decision == "same"
+            assert matched_message_id == "honcho-message-2"
+            return True
+
     monkeypatch.setattr(cli, "load_gateway_config", lambda _workspace: GatewayConfig())
     monkeypatch.setattr(cli, "NutritionIngestCoordinator", StubCoordinator)
     cli.nutrition_status_cmd(None)
@@ -202,3 +208,9 @@ def test_nutrition_status_and_replay_cli_output_is_privacy_safe(monkeypatch, cap
     cli.nutrition_replay_cmd("operator-selected", None)
     replay = capsys.readouterr().out
     assert replay.strip() == '{"replayed": true}'
+
+    cli.nutrition_resolve_cmd(
+        "operator-selected", "same", "honcho-message-2", None
+    )
+    resolution = capsys.readouterr().out
+    assert resolution.strip() == '{"resolved": true}'

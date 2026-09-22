@@ -3,6 +3,7 @@
 from .models import (
     CandidateManifest,
     ManifestV1,
+    ManifestV2,
     NutritionManifest,
     NutritionResult,
     NutritionResultSidecar,
@@ -24,6 +25,7 @@ from .watcher import NutritionIngestWatcher
 __all__ = [
     "CandidateManifest",
     "ManifestV1",
+    "ManifestV2",
     "NutritionArtifactScanner",
     "NutritionCoordinatorError",
     "NutritionIngestConfig",

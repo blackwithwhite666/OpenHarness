@@ -26,6 +26,7 @@ def build_post_confirmation_prompt(
     *,
     candidate_id: str,
     exif: Mapping[str, object] | None = None,
+    explicit_new_consumption: bool = False,
     max_chars: int = 1800,
 ) -> str:
     """Build a model instruction after the user has confirmed consumption.
@@ -46,6 +47,12 @@ def build_post_confirmation_prompt(
     if timezone_status != "known":
         capture_time = f"{capture_time} (timezone {timezone_status}; do not assume UTC)"
 
+    explicit_new_instruction = (
+        "Set explicit_new_consumption=true in the schema-v2 annotation because an "
+        "operator explicitly resolved this as a distinct consumption. "
+        if explicit_new_consumption
+        else "Set explicit_new_consumption=false in the schema-v2 annotation. "
+    )
     prompt = (
         "[Trusted Dropbox meal estimation turn]\n"
         f"Candidate: {candidate_id}\n"
@@ -56,6 +63,7 @@ def build_post_confirmation_prompt(
         "consumption_status=consumed, finite non-negative calories, and finite "
         "non-negative protein_g, fat_g, and carbohydrate_g values. Populate all "
         "three macro fields; never leave them null. "
+        f"{explicit_new_instruction}"
         "Do not emit a correction, deletion, planned meal, or pre-confirmation record.\n"
         "Before estimating, inspect the visible pixels and verify that an edible "
         "consumable portion is visibly present. Reject packaging, labels, menus, "
