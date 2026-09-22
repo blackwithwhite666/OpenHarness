@@ -248,10 +248,11 @@ def build_ohmo_system_prompt(
                 "For wellness reports, request raw weight only with "
                 '`raw_health_types=["HealthAutoExportMetric_weight_body_mass"]`; basal '
                 "and active energy must remain aggregate-only. Filter every displayed "
-                "daily value to the participant's local calendar day. Until a trusted "
-                "per-type Health completion checkpoint exists, basal and active energy "
-                "may be shown only as partial; never calculate an energy deficit, surplus, "
-                "or derived calorie target. If `nutrition_status` is not `complete`, "
+                "daily value to the participant's local calendar day. Observed basal and "
+                "active energy sums and coverage are factual but do not prove export "
+                "completeness. Calculate a provisional observed balance only when every "
+                "energy gate below passes; otherwise never infer an energy deficit, "
+                "surplus, or derived calorie target. If `nutrition_status` is not `complete`, "
                 "treat nutrition as unavailable or incomplete: an empty nutrition list "
                 "is never zero intake (never display it as `0 kcal`), and daily intake "
                 "must never be reconstructed from conversation memory. A weight mentioned "
@@ -262,6 +263,48 @@ def build_ohmo_system_prompt(
                 "use a numeric participant selector, `user_id`, or legacy `health_types` "
                 "parameters. Family turns are pinned to the authenticated contact by the "
                 "gateway."
+            ),
+            (
+                "Energy report facts: when the response contains `energy_days`, report "
+                "each returned `device_id` and `local_day` separately, using the returned "
+                "`timezone`, `basal_sum`/`basal_unit`, `active_sum`/`active_unit`, "
+                "`active_points`, `basal_minutes_with_samples`/`day_minutes` as the "
+                "basal coverage X/Y, `next_day_basal_observed`, "
+                "`basal_conflicting_timestamps`, and `active_conflicting_timestamps`. "
+                "These are observed sums in their stated actual units, not estimates or "
+                "settled values. Keep the participant and device binding supplied by the "
+                "gateway; never identify a participant or device from memory."
+            ),
+            (
+                "A preliminary observed energy balance is allowed only for a past local "
+                "day when the existing trusted `nutrition_status=complete` policy passes, "
+                "basal coverage is exactly X/Y (`basal_minutes_with_samples == day_minutes`), "
+                "`active_points > 0`, `next_day_basal_observed` is true, and both "
+                "`basal_conflicting_timestamps` and `active_conflicting_timestamps` are 0. "
+                "If and only if both energy units are supported (`kJ` or `kcal`), convert "
+                "kJ to kcal by dividing by exactly 4.184 before comparing expenditure with "
+                "food calories; never treat kJ and kcal as equal. Unsupported or missing "
+                "units fail the gate. Label the result `provisional` and "
+                "`revisable`: it does not prove full vendor-export completeness and is not "
+                "settled or final. A negative balance may be called a preliminary observed "
+                "deficit and a positive one a preliminary observed surplus; any calorie "
+                "target remains provisional."
+            ),
+            (
+                "If any energy gate fails, report the observed facts, units, active point "
+                "count, next-day basal observation, both conflict counts, and basal X/Y; "
+                "state that expenditure may be incomplete. Do not calculate or state a "
+                "deficit, surplus, calorie target, eligibility, settled/final status, or "
+                "extrapolation. A conflict in either energy type blocks balance; surface "
+                "the conflict and do not auto-correct, deduplicate, or choose a value. "
+                "Next-day basal presence alone never proves completeness."
+            ),
+            (
+                "Interpret `local_day` in the returned timezone: a sample at local midnight "
+                "belongs to the new local calendar day, not the previous day. Use the "
+                "returned local-day buckets rather than UTC dates. A later response update "
+                "may revise a day's observed sums, point counts, coverage, or conflict "
+                "counts; present the latest facts as revisable and never call them settled."
             ),
             "# Nutrition finalization annotations",
             (
