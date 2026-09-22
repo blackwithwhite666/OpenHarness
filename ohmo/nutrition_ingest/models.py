@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any, Literal
@@ -18,6 +18,7 @@ class _StrictModel(BaseModel):
 
 
 _CANDIDATE_ID_PATTERN = re.compile(r"^dropbox-camera-v1-[0-9a-f]{64}$")
+CaptureTimeAuthority = Literal["exif", "filename"]
 
 
 def validate_candidate_id(value: str) -> str:
@@ -177,12 +178,89 @@ class ManifestV1(_StrictModel):
         return parse_manifest(manifest_path, configured_root)
 
 
-NutritionManifest = ManifestV1
-CandidateManifest = ManifestV1
+class ManifestV2(_StrictModel):
+    """Strict one-image manifest v2 with explicit capture-time provenance."""
+
+    schema_version: Literal[2]
+    candidate_id: str
+    event_id: str = Field(min_length=1)
+    producer_source: Literal["dropbox_camera"]
+    file_id: str = Field(min_length=1)
+    rev: str = Field(min_length=1)
+    source_path: str = Field(min_length=1)
+    server_modified: datetime
+    client_modified: datetime | None = None
+    discovery_time: datetime
+    original_filename: str = Field(min_length=1)
+    mime_type: str = Field(min_length=1)
+    original_size_bytes: int = Field(gt=0)
+    original_sha256: str
+    width: int = Field(gt=0)
+    height: int = Field(gt=0)
+    exif: ExifMetadata
+    normalized_capture_time: datetime
+    capture_time_authority: CaptureTimeAuthority
+    classifier_model: str = Field(min_length=1)
+    classifier_prompt_version: str = Field(min_length=1)
+    classifier_policy_version: str = Field(min_length=1)
+    classifier_dataset_version: str = Field(min_length=1)
+    classifier_output: ClassifierOutput
+    food_candidate: Literal[True]
+    ingest_source: Literal["dropbox_camera"]
+    confirmation_required: Literal[True]
+    consumption_status: Literal["unknown"]
+
+    @field_validator("candidate_id")
+    @classmethod
+    def _candidate_id_shape(cls, value: str) -> str:
+        return validate_candidate_id(value)
+
+    @field_validator("original_sha256")
+    @classmethod
+    def _sha256(cls, value: str) -> str:
+        if not re.fullmatch(r"[0-9a-f]{64}", value):
+            raise ValueError("original_sha256 must be lowercase SHA-256")
+        return value
+
+    @field_validator("server_modified", "client_modified", "discovery_time", "normalized_capture_time")
+    @classmethod
+    def _timezone_aware(cls, value: datetime | None) -> datetime | None:
+        if value is not None and (value.tzinfo is None or value.utcoffset() is None):
+            raise ValueError("manifest datetime must include a timezone offset")
+        return value
+
+    @model_validator(mode="after")
+    def _identity_and_capture(self) -> ManifestV2:
+        if self.candidate_id != candidate_id_for(self.file_id, self.rev):
+            raise ValueError("candidate_id does not match file_id and rev")
+        if self.classifier_output.schema_version != 1:
+            raise ValueError("unsupported classifier output version")
+        if self.capture_time_authority == "exif":
+            if self.exif.timezone_status == "ambiguous" or not self.exif.normalized_capture_time:
+                raise ValueError("EXIF capture authority is unavailable")
+            if datetime.fromisoformat(self.exif.normalized_capture_time) != self.normalized_capture_time:
+                raise ValueError("manifest capture time disagrees with EXIF")
+        elif self.exif.timezone_status != "ambiguous" and self.exif.normalized_capture_time:
+            try:
+                exif_capture = datetime.fromisoformat(self.exif.normalized_capture_time)
+            except ValueError:
+                pass
+            else:
+                if exif_capture.tzinfo is not None and exif_capture.utcoffset() is not None:
+                    raise ValueError("usable EXIF capture time must take priority over filename")
+        return self
+
+    @classmethod
+    def from_path(cls, manifest_path: str | Path, configured_root: str | Path) -> ManifestV2:
+        return parse_manifest(manifest_path, configured_root)  # type: ignore[return-value]
 
 
-def parse_manifest(manifest_path: str | Path, configured_root: str | Path) -> ManifestV1:
-    """Independently validate the complete on-disk v1 candidate contract."""
+NutritionManifest = ManifestV1 | ManifestV2
+CandidateManifest = NutritionManifest
+
+
+def parse_manifest(manifest_path: str | Path, configured_root: str | Path) -> NutritionManifest:
+    """Independently validate the complete on-disk v1 or v2 candidate contract."""
     path = Path(manifest_path).expanduser().resolve()
     root = Path(configured_root).expanduser().resolve()
     try:
@@ -192,7 +270,9 @@ def parse_manifest(manifest_path: str | Path, configured_root: str | Path) -> Ma
     if path.name != "manifest.json" or path.parent == root or path.parent.name.startswith("_"):
         raise ValueError("manifest is not a candidate protocol object")
     try:
-        manifest = ManifestV1.model_validate(json.loads(path.read_text(encoding="utf-8")))
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        model = ManifestV2 if payload.get("schema_version") == 2 else ManifestV1
+        manifest = model.model_validate(payload)
     except (OSError, json.JSONDecodeError) as exc:
         raise ValueError("manifest is unreadable") from exc
     if path.parent.name != manifest.candidate_id:
@@ -218,12 +298,34 @@ def parse_manifest(manifest_path: str | Path, configured_root: str | Path) -> Ma
     return manifest
 
 
+def authoritative_capture_time(manifest: NutritionManifest) -> datetime | None:
+    """Return only producer-selected capture time; v1 keeps its EXIF reader."""
+    if isinstance(manifest, ManifestV2):
+        return manifest.normalized_capture_time
+    try:
+        return normalized_capture_time_from_exif(manifest.exif)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def normalized_capture_time_from_exif(exif: ExifMetadata) -> datetime:
+    if exif.timezone_status == "ambiguous" or not exif.normalized_capture_time:
+        raise ValueError("authoritative EXIF capture time is unavailable")
+    value = datetime.fromisoformat(exif.normalized_capture_time)
+    if value.tzinfo is None or value.utcoffset() is None:
+        if exif.timezone_status != "missing" or exif.capture_timezone_offset is not None:
+            raise ValueError("authoritative EXIF capture time must be timezone-aware")
+        value = value.replace(tzinfo=timezone(timedelta(hours=3)))
+    return value
+
+
 class ResultState(str, Enum):
     discovered = "discovered"
     classified = "classified"
     published = "published"
     prompt_sending = "prompt_sending"
     delivery_unknown = "delivery_unknown"
+    needs_resolution = "needs_resolution"
     pending_confirmation = "pending_confirmation"
     confirmed = "confirmed"
     declined = "declined"
@@ -300,6 +402,9 @@ class NutritionResultSidecar(_StrictModel):
     seen_fingerprint_kind: SeenFingerprintKind | None = None
     seen_phash_algorithm: str | None = Field(default=None, max_length=64)
     non_food_reason: NonFoodReason | None = None
+    duplicate_match_message_ids: list[str] = Field(default_factory=list, max_length=32)
+    duplicate_resolution: Literal["same", "new"] | None = None
+    explicit_new_consumption: bool = False
 
     @field_validator("schema_version")
     @classmethod
@@ -379,6 +484,17 @@ class NutritionResultSidecar(_StrictModel):
                 raise ValueError("seen result must not have prompt or reply ids")
             if self.emitted_honcho_message_id is not None:
                 raise ValueError("seen result must not have an emitted meal id")
+        elif self.state == ResultState.needs_resolution:
+            if self.consumption_status != "unknown":
+                raise ValueError("unresolved duplicate requires unknown consumption status")
+            if self.prompt_message_id is not None or self.reply_message_id is not None:
+                raise ValueError("unresolved duplicate must not have prompt or reply ids")
+            if self.emitted_honcho_message_id is not None:
+                raise ValueError("unresolved duplicate must not have a meal id")
+            if len(self.duplicate_match_message_ids) < 2:
+                raise ValueError("unresolved duplicate requires bounded match evidence")
+            if self.duplicate_resolution is not None or self.explicit_new_consumption:
+                raise ValueError("unresolved duplicate must not have a chosen resolution")
         elif any(
             value is not None
             for value in (
@@ -403,6 +519,28 @@ class NutritionResultSidecar(_StrictModel):
                 raise ValueError("non-food results must use the non_food terminal state")
             else:
                 raise ValueError("completion requires consumed or not_consumed status")
+        if len(set(self.duplicate_match_message_ids)) != len(self.duplicate_match_message_ids):
+            raise ValueError("duplicate match evidence must be unique")
+        for message_id in self.duplicate_match_message_ids:
+            _validate_optional_audit_id(message_id)
+        if self.duplicate_resolution == "same":
+            if self.state != ResultState.seen:
+                raise ValueError("same duplicate resolution must terminate as seen")
+            if self.matched_honcho_message_id not in self.duplicate_match_message_ids:
+                raise ValueError("same duplicate resolution must select persisted evidence")
+            if self.explicit_new_consumption:
+                raise ValueError("same duplicate resolution cannot be explicit-new")
+        elif self.duplicate_resolution == "new":
+            if len(self.duplicate_match_message_ids) < 2:
+                raise ValueError("new duplicate resolution requires persisted match evidence")
+            if not self.explicit_new_consumption:
+                raise ValueError("new duplicate resolution requires explicit-new signal")
+            if self.state in {ResultState.needs_resolution, ResultState.seen}:
+                raise ValueError("new duplicate resolution must continue normal acceptance")
+        elif self.duplicate_match_message_ids and self.state != ResultState.needs_resolution:
+            raise ValueError("resolved duplicate evidence requires an explicit decision")
+        elif self.explicit_new_consumption:
+            raise ValueError("explicit-new requires an explicit duplicate resolution")
         return self
 
     def model_dump(self, *args: Any, **kwargs: Any) -> dict[str, Any]:

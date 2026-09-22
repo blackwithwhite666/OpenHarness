@@ -1221,6 +1221,28 @@ def nutrition_replay_cmd(
     print(json.dumps({"replayed": result}, sort_keys=True))
 
 
+@nutrition_app.command("resolve")
+def nutrition_resolve_cmd(
+    candidate: str = typer.Argument(..., help="Candidate id to resolve"),
+    decision: str = typer.Argument(..., help="Explicit duplicate decision: same or new"),
+    matched_message_id: str | None = typer.Option(
+        None,
+        "--matched-message-id",
+        help="Persisted Honcho match selected for a same decision",
+    ),
+    workspace: str | None = typer.Option(None, "--workspace", help=_WORKSPACE_HELP),
+) -> None:
+    """Resolve one persisted ambiguous pHash match as SAME or NEW."""
+    config = load_gateway_config(workspace)
+    coordinator = NutritionIngestCoordinator(config.nutrition_ingest)
+    result = coordinator.resolve_duplicate(
+        candidate,
+        decision=decision,
+        matched_message_id=matched_message_id,
+    )
+    print(json.dumps({"resolved": result}, sort_keys=True))
+
+
 @evals_app.command("embed")
 def evals_embed_cmd(
     workspace: str | None = typer.Option(None, "--workspace", help=_WORKSPACE_HELP),

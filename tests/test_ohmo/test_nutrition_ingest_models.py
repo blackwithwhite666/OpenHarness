@@ -8,6 +8,7 @@ from pydantic import ValidationError
 
 from ohmo.nutrition_ingest.models import (
     ManifestV1,
+    ManifestV2,
     NutritionResultSidecar,
     RecipientBinding,
     ResultState,
@@ -17,6 +18,36 @@ from ohmo.nutrition_ingest.models import (
 )
 
 FIXTURE = Path(__file__).parents[2] / "ohmo/nutrition_ingest/manifest_v1_fixture.json"
+V2_FIXTURE = Path(__file__).parents[2] / "ohmo/nutrition_ingest/manifest_v2_fixture.json"
+
+
+def test_producer_v2_fixture_is_strict_and_identity_stable() -> None:
+    payload = json.loads(V2_FIXTURE.read_text())
+    manifest = ManifestV2.model_validate(payload)
+    assert manifest.capture_time_authority == "exif"
+    assert manifest.candidate_id == candidate_id_for(manifest.file_id, manifest.rev)
+
+
+@pytest.mark.parametrize("field", ["normalized_capture_time", "capture_time_authority"])
+def test_v2_manifest_requires_capture_provenance(field: str) -> None:
+    payload = json.loads(V2_FIXTURE.read_text())
+    payload.pop(field)
+    with pytest.raises(ValidationError):
+        ManifestV2.model_validate(payload)
+
+
+def test_v2_manifest_rejects_capture_time_that_disagrees_with_exif() -> None:
+    payload = json.loads(V2_FIXTURE.read_text())
+    payload["normalized_capture_time"] = "2026-08-05T13:00:00+03:00"
+    with pytest.raises(ValidationError, match="disagrees"):
+        ManifestV2.model_validate(payload)
+
+
+def test_v2_manifest_rejects_filename_authority_when_aware_exif_is_usable() -> None:
+    payload = json.loads(V2_FIXTURE.read_text())
+    payload["capture_time_authority"] = "filename"
+    with pytest.raises(ValidationError, match="EXIF capture time must take priority"):
+        ManifestV2.model_validate(payload)
 
 
 def test_canonical_fixture_is_strict_and_identity_stable() -> None:

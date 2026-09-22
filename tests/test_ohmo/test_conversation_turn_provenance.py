@@ -195,3 +195,35 @@ def test_only_process_local_token_can_mark_a_synthetic_request() -> None:
     )
     message.sender_id = "__nutrition_ingest__"
     assert _trusted_nutrition_request(message)["client_op_id"].endswith(":meal-observation:v1")
+
+
+def test_trusted_nutrition_capture_provenance_is_gateway_owned() -> None:
+    candidate = "dropbox-camera-v1-" + "1" * 64
+    message = _message()
+    message.sender_id = "__nutrition_ingest__"
+    message.metadata.update(
+        {
+            "_nutrition_trusted": True,
+            "_nutrition_trust_token": COORDINATOR_TRUST_TOKEN,
+            "_nutrition_candidate_id": candidate,
+            "_nutrition_client_op_id": f"{candidate}:meal-observation:v1",
+            "_nutrition_phase": "estimation",
+            "_nutrition_principal": "100",
+            "_nutrition_tenant_id": "marina",
+            "_nutrition_chat_id": "100",
+            "_nutrition_session_key": "telegram:100",
+            "_nutrition_capture_time": "2026-08-05T09:00:00+00:00",
+            "_nutrition_capture_source": "exif",
+            "_nutrition_manifest_version": 2,
+            "_nutrition_explicit_new_consumption": True,
+        }
+    )
+    _, user, assistant = _build_conversation_turn_metadata(
+        turn_ctx=_turn_ctx(), message=message, scope=_scope()
+    )
+    for metadata in (user, assistant):
+        assert metadata["nutrition_capture_time"] == "2026-08-05T09:00:00+00:00"
+        assert metadata["nutrition_capture_source"] == "exif"
+        assert metadata["nutrition_manifest_version"] == 2
+        assert metadata["nutrition_consumed"] is True
+        assert metadata["nutrition_explicit_new_consumption"] is True

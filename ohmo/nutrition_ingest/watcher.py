@@ -8,7 +8,7 @@ from pathlib import Path
 import asyncio
 from collections.abc import Awaitable, Callable
 
-from .models import ManifestV1, parse_manifest
+from .models import NutritionManifest, parse_manifest
 
 
 @dataclass(frozen=True)
@@ -17,10 +17,10 @@ class ReadyNutritionArtifact:
     directory: Path
     manifest_path: Path
     image_path: Path
-    manifest: ManifestV1
+    manifest: NutritionManifest
 
     @property
-    def candidate(self) -> ManifestV1:
+    def candidate(self) -> NutritionManifest:
         return self.manifest
 
 
@@ -78,7 +78,7 @@ class NutritionArtifactScanner:
         return image_path
 
     @staticmethod
-    def _verify_image(image_path: Path, manifest: ManifestV1) -> None:
+    def _verify_image(image_path: Path, manifest: NutritionManifest) -> None:
         size = image_path.stat().st_size
         if size != manifest.original_size_bytes:
             raise ValueError("candidate image size does not match manifest")

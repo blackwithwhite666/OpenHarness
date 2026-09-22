@@ -80,6 +80,14 @@ class NutritionResultStore:
                 raise ValueError("confirmation operation id is immutable")
             if value.meal_observation_operation_id != current.meal_observation_operation_id:
                 raise ValueError("meal operation id is immutable")
+            if current.duplicate_match_message_ids and (
+                value.duplicate_match_message_ids != current.duplicate_match_message_ids
+            ):
+                raise ValueError("duplicate match evidence is immutable")
+            if current.duplicate_resolution is not None and (
+                value.duplicate_resolution != current.duplicate_resolution
+            ):
+                raise ValueError("duplicate resolution is immutable")
         elif value.state not in {ResultState.published, ResultState.discovered}:
             raise ValueError("a new sidecar must start at discovered or published")
 
@@ -143,6 +151,7 @@ class NutritionResultStore:
                 ResultState.retryable_error,
                 ResultState.skipped,
                 ResultState.seen,
+                ResultState.needs_resolution,
             },
             ResultState.prompt_sending: {
                 ResultState.pending_confirmation,
@@ -190,6 +199,7 @@ class NutritionResultStore:
                 ResultState.skipped,
                 ResultState.dead_letter,
                 ResultState.seen,
+                ResultState.needs_resolution,
             },
             ResultState.declined: {ResultState.completed},
             ResultState.non_food: set(),
@@ -202,6 +212,7 @@ class NutritionResultStore:
             },
             ResultState.completed: set(),
             ResultState.seen: set(),
+            ResultState.needs_resolution: {ResultState.published, ResultState.seen},
             ResultState.skipped: set(),
         }
         if current not in legal.get(previous, set()):

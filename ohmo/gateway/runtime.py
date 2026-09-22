@@ -57,8 +57,6 @@ from ohmo.memory_backend import (
 from ohmo.memory_judge import judge_enabled, judge_interval, run_memory_judge
 from ohmo.memory_store import MemoryStore
 from ohmo.memory_tool import OhmoMemoryTool
-from ohmo.nutrition_ingest.freshness import normalized_exif_capture_time
-from ohmo.nutrition_ingest.models import ExifMetadata
 from ohmo.nutrition_ingest.prompts import NO_VISIBLE_CONSUMABLE_PORTION_REJECTION
 from ohmo.nutrition_ingest.trust import COORDINATOR_TRUST_TOKEN
 from ohmo.prompt_seam import compose_runtime_prompt, prepare_turn
@@ -204,6 +202,18 @@ def _trusted_nutrition_request(message: InboundMessage) -> dict[str, str] | None
     candidate = metadata.get("_nutrition_candidate_id")
     operation = metadata.get("_nutrition_client_op_id")
     phase = metadata.get("_nutrition_phase")
+    capture_time = metadata.get("_nutrition_capture_time")
+    capture_source = metadata.get("_nutrition_capture_source")
+    manifest_version = metadata.get("_nutrition_manifest_version")
+    explicit_new_consumption = metadata.get("_nutrition_explicit_new_consumption", False)
+    if capture_time is None:
+        raw_exif = metadata.get("_nutrition_exif")
+        if isinstance(raw_exif, dict):
+            capture_time = raw_exif.get("normalized_capture_time")
+    if capture_time is None:
+        capture_time = _trusted_utc_iso(message.timestamp)
+    capture_source = capture_source or "exif"
+    manifest_version = manifest_version or 1
     principal = metadata.get("_nutrition_principal")
     tenant = metadata.get("_nutrition_tenant_id")
     chat_id = metadata.get("_nutrition_chat_id")
@@ -221,6 +231,14 @@ def _trusted_nutrition_request(message: InboundMessage) -> dict[str, str] | None
         return None
     if operation != f"{candidate}:meal-observation:v1":
         return None
+    if not isinstance(capture_time, str) or _trusted_utc_iso(capture_time) is None:
+        return None
+    if capture_source not in {"exif", "filename"}:
+        return None
+    if manifest_version not in {1, 2}:
+        return None
+    if not isinstance(explicit_new_consumption, bool):
+        return None
     return {
         "candidate_id": candidate,
         "client_op_id": operation,
@@ -228,6 +246,10 @@ def _trusted_nutrition_request(message: InboundMessage) -> dict[str, str] | None
         "principal": principal,
         "chat_id": chat_id,
         "session_key": session_key,
+        "capture_time": capture_time,
+        "capture_source": capture_source,
+        "manifest_version": str(manifest_version),
+        "explicit_new_consumption": str(explicit_new_consumption).lower(),
     }
 
 
@@ -413,6 +435,15 @@ def _build_conversation_turn_metadata(
                 "confirmation_required": True,
                 "candidate_id": trusted_nutrition["candidate_id"],
                 "nutrition_phase": trusted_nutrition["phase"],
+                "nutrition_capture_time": _trusted_utc_iso(
+                    trusted_nutrition["capture_time"]
+                ),
+                "nutrition_capture_source": trusted_nutrition["capture_source"],
+                "nutrition_manifest_version": int(trusted_nutrition["manifest_version"]),
+                "nutrition_consumed": True,
+                "nutrition_explicit_new_consumption": (
+                    trusted_nutrition["explicit_new_consumption"] == "true"
+                ),
             }
         )
     user_metadata = dict(base_metadata)
@@ -913,13 +944,10 @@ class OhmoSessionRuntimePool:
             else None
         )
         if recorder is not None and nutrition_request is not None:
-            raw_exif = message.metadata.get("_nutrition_exif")
-            if not isinstance(raw_exif, dict):
-                raise ValueError("trusted nutrition estimation has no validated EXIF")
-            exif = ExifMetadata.model_validate(raw_exif)
-            recorder.set_authoritative_nutrition_meal_at(
-                normalized_exif_capture_time(exif)
-            )
+            capture_time = datetime.fromisoformat(nutrition_request["capture_time"])
+            if capture_time.tzinfo is None or capture_time.utcoffset() is None:
+                raise ValueError("trusted nutrition estimation has no validated capture time")
+            recorder.set_authoritative_nutrition_meal_at(capture_time)
         episode_status = "completed"
         decision_trace_restore = _install_gateway_decision_trace_recorder(
             bundle.engine,
@@ -1529,6 +1557,8 @@ class OhmoSessionRuntimePool:
             if (
                 validated.record_type != "meal_observation"
                 or validated.consumption_status != "consumed"
+                or validated.explicit_new_consumption
+                != (trusted_nutrition["explicit_new_consumption"] == "true")
                 or all(
                     value is None
                     for value in (

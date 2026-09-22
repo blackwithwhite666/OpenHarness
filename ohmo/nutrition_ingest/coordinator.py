@@ -32,15 +32,17 @@ from openharness.channels.bus.events import (
     OutboundMessage,
 )
 
-from .freshness import FRESHNESS_WINDOW, exif_freshness_reason, normalized_exif_capture_time
+from .freshness import FRESHNESS_WINDOW, exif_freshness_reason
 from .metrics import NutritionMetrics
 from .models import (
+    ManifestV2,
     NutritionResultSidecar,
     RecipientBinding,
     ResultState,
     SeenTombstoneV1,
     StageAttempt,
     StateHistoryEntry,
+    authoritative_capture_time,
 )
 from .prompts import (
     NO_VISIBLE_CONSUMABLE_PORTION_REJECTION,
@@ -119,6 +121,8 @@ class _DuplicateMatch:
     message_id: str | None
     kind: str
     phash_algorithm: str | None = None
+    ambiguous: bool = False
+    message_ids: tuple[str, ...] = ()
 
 
 class NutritionCoordinatorError(RuntimeError):
@@ -377,10 +381,10 @@ class NutritionIngestCoordinator:
 
     def _is_expired(self, artifact: ReadyNutritionArtifact) -> bool:
         try:
-            capture_time = normalized_exif_capture_time(artifact.manifest.exif)
+            capture_time = authoritative_capture_time(artifact.manifest)
         except (TypeError, ValueError, OverflowError):
             return False
-        return capture_time < self._current_time() - FRESHNESS_WINDOW
+        return capture_time is not None and capture_time < self._current_time() - FRESHNESS_WINDOW
 
     def _candidate_fingerprint(self, artifact: ReadyNutritionArtifact) -> dict[str, str]:
         descriptor = fingerprint_image_file(artifact.image_path)
@@ -424,7 +428,9 @@ class NutritionIngestCoordinator:
         if self._tombstones is None:
             raise NutritionCoordinatorError("nutrition tombstone store is unavailable")
         fingerprint = self._candidate_fingerprint(artifact)
-        capture_time = normalized_exif_capture_time(artifact.manifest.exif)
+        capture_time = authoritative_capture_time(artifact.manifest)
+        if capture_time is None:
+            raise NutritionCoordinatorError("candidate has no trusted capture time")
         matched_id = None
         match_kind = None
         if sidecar is not None and sidecar.state == ResultState.seen:
@@ -503,6 +509,13 @@ class NutritionIngestCoordinator:
             os.close(descriptor)
 
     def _freshness_reason(self, artifact: ReadyNutritionArtifact) -> str | None:
+        if isinstance(artifact.manifest, ManifestV2):
+            capture_time = authoritative_capture_time(artifact.manifest)
+            if capture_time is None:
+                return "exif_invalid"
+            if capture_time < self._current_time() - FRESHNESS_WINDOW:
+                return "exif_stale"
+            return None
         return exif_freshness_reason(artifact.manifest.exif, self._current_time())
 
     def _reconcile_freshness(
@@ -582,21 +595,36 @@ class NutritionIngestCoordinator:
         if reason is not None:
             self._skip_candidate(store, store.load() or sidecar, reason)
             return
-        try:
-            match = await self._find_duplicate(artifact)
-        except Exception as exc:  # noqa: BLE001 - incomplete history must fail closed
-            if self.ordinary_turn_in_flight:
+        if sidecar.explicit_new_consumption:
+            match = None
+        else:
+            try:
+                match = await self._find_duplicate(artifact)
+            except Exception as exc:  # noqa: BLE001 - incomplete history must fail closed
+                if self.ordinary_turn_in_flight:
+                    return
+                self._record_failure(
+                    store,
+                    store.load() or sidecar,
+                    stage="dedup",
+                    error=exc,
+                )
                 return
-            self._record_failure(
-                store,
-                store.load() or sidecar,
-                stage="dedup",
-                error=exc,
-            )
-            return
         if self.ordinary_turn_in_flight:
             return
         if match is not None:
+            if match.ambiguous:
+                self._advance(
+                    store,
+                    store.load() or sidecar,
+                    ResultState.needs_resolution,
+                    consumption_status="unknown",
+                    prompt_message_id=None,
+                    reply_message_id=None,
+                    emitted_honcho_message_id=None,
+                    duplicate_match_message_ids=list(match.message_ids),
+                )
+                return
             seen = self._advance(
                 store,
                 store.load() or sidecar,
@@ -659,7 +687,11 @@ class NutritionIngestCoordinator:
             until=now,
         )
         candidate = self._candidate_fingerprint(artifact)
-        candidate_capture_time = normalized_exif_capture_time(artifact.manifest.exif)
+        candidate_capture_time = authoritative_capture_time(artifact.manifest)
+        if candidate_capture_time is None:
+            return None
+        phash_matches: list[_DuplicateMatch] = []
+        phash_occurrences: set[str] = set()
         for message in messages:
             if message.session_id != self._honcho_session:
                 raise NutritionCoordinatorError(
@@ -683,14 +715,17 @@ class NutritionIngestCoordinator:
                         message_id=self._safe_message_id(message.id),
                         kind="sha256",
                     )
-                # Dropbox confirmations use exact bytes only. Their processing
-                # timestamps are not capture timestamps, so a pHash-only match
-                # would create false positives. Ordinary Telegram user
-                # messages may use pHash, but only within the calibrated time
-                # gate around authoritative EXIF capture time.
-                if message.metadata.get("ingest_source") is not None:
-                    continue
-                if abs(candidate_capture_time - message.created_at) > timedelta(hours=2):
+                # Historical Dropbox records without gateway-validated capture
+                # provenance remain SHA-only. Ordinary Telegram receipt time,
+                # and trusted Dropbox capture time, are the occurrence gate for
+                # a same-algorithm pHash match.
+                message_is_dropbox = message.metadata.get("ingest_source") == "dropbox_camera"
+                occurrence_time = message.created_at
+                if message_is_dropbox:
+                    occurrence_time = self._trusted_dropbox_occurrence(message)
+                    if occurrence_time is None:
+                        continue
+                if abs(candidate_capture_time - occurrence_time) > timedelta(hours=2):
                     continue
                 phash = fingerprint.get("phash")
                 algorithm = fingerprint.get("phash_algorithm")
@@ -709,12 +744,63 @@ class NutritionIngestCoordinator:
                     and distance is not None
                     and distance <= PHASH_HAMMING_THRESHOLD
                 ):
-                    return _DuplicateMatch(
-                        message_id=self._safe_message_id(message.id),
-                        kind="phash",
-                        phash_algorithm=algorithm,
+                    occurrence_key = self._message_occurrence_key(message)
+                    if occurrence_key in phash_occurrences:
+                        continue
+                    phash_occurrences.add(occurrence_key)
+                    bounded_message_id = self._safe_message_id(message.id)
+                    if bounded_message_id is None:
+                        bounded_message_id = "sha256:" + hashlib.sha256(
+                            message.id.encode("utf-8", errors="replace")
+                        ).hexdigest()
+                    phash_matches.append(
+                        _DuplicateMatch(
+                            message_id=bounded_message_id,
+                            kind="phash",
+                            phash_algorithm=algorithm,
+                        )
                     )
+        if len(phash_matches) > 1:
+            return _DuplicateMatch(
+                message_id=None,
+                kind="phash",
+                phash_algorithm=PHASH_ALGORITHM,
+                ambiguous=True,
+                message_ids=tuple(
+                    match.message_id
+                    for match in phash_matches[:32]
+                    if match.message_id is not None
+                ),
+            )
+        if phash_matches:
+            return phash_matches[0]
         return None
+
+    @staticmethod
+    def _trusted_dropbox_occurrence(message: RecentMessageMetadata) -> datetime | None:
+        """Allow Dropbox pHash only after a gateway-validated consumed append."""
+        metadata = message.metadata
+        capture_time = metadata.get("nutrition_capture_time")
+        source = metadata.get("nutrition_capture_source")
+        if metadata.get("nutrition_consumed") is not True:
+            return None
+        if source not in {"exif", "filename"} or not isinstance(capture_time, str):
+            return None
+        try:
+            parsed = datetime.fromisoformat(capture_time)
+        except ValueError:
+            return None
+        return parsed if parsed.tzinfo is not None and parsed.utcoffset() is not None else None
+
+    @staticmethod
+    def _message_occurrence_key(message: RecentMessageMetadata) -> str:
+        operation = message.metadata.get("client_op_id")
+        if isinstance(operation, str) and operation:
+            for suffix in (":meal-user:v1", ":meal-observation:v1", ":user", ":assistant"):
+                if operation.endswith(suffix):
+                    return operation[: -len(suffix)]
+            return operation
+        return f"message:{message.id}"
 
     def _trusted_message_fingerprints(
         self, message: RecentMessageMetadata
@@ -1115,6 +1201,7 @@ class NutritionIngestCoordinator:
         prompt = build_post_confirmation_prompt(
             candidate_id=artifact.candidate_id,
             exif=metadata,
+            explicit_new_consumption=sidecar.explicit_new_consumption,
         )
         synthetic = InboundMessage(
             channel="telegram",
@@ -1135,6 +1222,14 @@ class NutritionIngestCoordinator:
                 "_nutrition_chat_id": str(self.config.chat_id),
                 "_nutrition_session_key": self.config.session_key,
                 "_nutrition_exif": metadata,
+                "_nutrition_capture_time": authoritative_capture_time(artifact.manifest).isoformat(),
+                "_nutrition_capture_source": (
+                    artifact.manifest.capture_time_authority
+                    if isinstance(artifact.manifest, ManifestV2)
+                    else "exif"
+                ),
+                "_nutrition_manifest_version": artifact.manifest.schema_version,
+                "_nutrition_explicit_new_consumption": sidecar.explicit_new_consumption,
             },
         )
         if self._estimate is not None:
@@ -1381,6 +1476,57 @@ class NutritionIngestCoordinator:
             target = ResultState.published
         try:
             self._advance(store, current, target)
+        except RuntimeError:
+            return False
+        return True
+
+    def resolve_duplicate(
+        self,
+        candidate_id: str,
+        *,
+        decision: str,
+        matched_message_id: str | None = None,
+    ) -> bool:
+        """Persist an operator's explicit SAME/NEW decision before side effects."""
+        if not self.enabled or decision not in {"same", "new"}:
+            return False
+        artifact = self._find_artifact(candidate_id)
+        if artifact is None:
+            return False
+        store = self._store(artifact)
+        current = store.load()
+        if current is None or current.state != ResultState.needs_resolution:
+            return False
+        if decision == "same":
+            if matched_message_id not in current.duplicate_match_message_ids:
+                return False
+            try:
+                resolved = self._advance(
+                    store,
+                    current,
+                    ResultState.seen,
+                    duplicate_resolution="same",
+                    seen_reason="duplicate_honcho",
+                    matched_honcho_message_id=matched_message_id,
+                    seen_fingerprint_kind="phash",
+                    seen_phash_algorithm=PHASH_ALGORITHM,
+                )
+            except RuntimeError:
+                return False
+            self._write_tombstone(artifact, resolved, terminal_reason="duplicate_honcho")
+            self._delete_candidate_directory(artifact)
+            self._metrics.duplicate_suppression("dedup")
+            return True
+        if matched_message_id is not None:
+            return False
+        try:
+            self._advance(
+                store,
+                current,
+                ResultState.published,
+                duplicate_resolution="new",
+                explicit_new_consumption=True,
+            )
         except RuntimeError:
             return False
         return True
