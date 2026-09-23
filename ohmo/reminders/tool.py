@@ -36,6 +36,7 @@ from ohmo.reminders.model import (
 from ohmo.reminders.store import ReminderStore
 
 _CTX_KEY = "ohmo_reminder_ctx"
+_SCHEDULER_SENDER = "__scheduler__"
 _MODES = ("static", "agentic")
 _GROUP_CHAT_TYPES = frozenset({"group", "supergroup", "chat", "channel", "room"})
 
@@ -120,6 +121,11 @@ def _missing_ctx() -> ToolResult:
     )
 
 
+def _scheduler_ctx(ctx: object) -> bool:
+    """Recognize the scheduler only from runtime-stamped tool metadata."""
+    return isinstance(ctx, Mapping) and ctx.get("sender_id") == _SCHEDULER_SENDER
+
+
 def _fmt_local(epoch: float, tz: str) -> str:
     return datetime.fromtimestamp(epoch, ZoneInfo(tz)).isoformat()
 
@@ -178,6 +184,10 @@ class RemindCreateTool(BaseTool):
         ctx = context.metadata.get(_CTX_KEY)
         if not ctx:
             return _missing_ctx()
+        if _scheduler_ctx(ctx):
+            return ToolResult(
+                output="Scheduled turns cannot create reminders.", is_error=True
+            )
 
         tz = arguments.tz or ctx.get("tz") or self._default_tz
         try:
@@ -336,6 +346,10 @@ class RemindCancelTool(BaseTool):
         ctx = context.metadata.get(_CTX_KEY)
         if not ctx:
             return _missing_ctx()
+        if _scheduler_ctx(ctx):
+            return ToolResult(
+                output="Scheduled turns cannot cancel reminders.", is_error=True
+            )
         reminder = self._store.get(arguments.id)
         if (
             reminder is None

@@ -82,6 +82,52 @@ async def test_create_persists_and_returns_fire_times(tmp_path: Path) -> None:
     assert store.count_active_for_chat("telegram", "100") == 1
 
 
+async def test_scheduler_context_cannot_create_or_cancel_but_can_list(
+    tmp_path: Path,
+) -> None:
+    store = ReminderStore()
+    lock = asyncio.Lock()
+    create = RemindCreateTool(
+        store, lock, default_tz="Europe/Moscow", max_per_chat=50
+    )
+    cancel = RemindCancelTool(store, lock)
+    list_tool = RemindListTool(store, lock, default_tz="Europe/Moscow")
+    human_context = _ctx(_reminder_ctx(), tmp_path)
+    created = await create.execute(
+        RemindCreateInput(summary="human-owned", dtstart=_future_iso()),
+        human_context,
+    )
+    assert not created.is_error
+    reminder_id = store.list_for_chat("telegram", "100")[0].id
+
+    scheduler_context = _ctx(
+        _reminder_ctx(sender_id="__scheduler__"), tmp_path
+    )
+    before = store.load()
+    rejected_create = await create.execute(
+        RemindCreateInput(summary="recursive", dtstart=_future_iso()),
+        scheduler_context,
+    )
+    assert rejected_create.is_error
+    assert store.load() == before
+
+    rejected_cancel = await cancel.execute(
+        RemindCancelInput(id=reminder_id), scheduler_context
+    )
+    assert rejected_cancel.is_error
+    assert store.load() == before
+    listed = await list_tool.execute(RemindListInput(), scheduler_context)
+    assert not listed.is_error
+    assert reminder_id in listed.output
+
+    # Human create and cancel semantics remain unchanged.
+    human_cancel = await cancel.execute(
+        RemindCancelInput(id=reminder_id), human_context
+    )
+    assert not human_cancel.is_error
+    assert store.get(reminder_id).status == "done"
+
+
 async def test_create_past_dtstart_oneshot_errors(tmp_path: Path) -> None:
     tool = RemindCreateTool(ReminderStore(), asyncio.Lock(), default_tz="Europe/Moscow", max_per_chat=50)
     past = (datetime.now(MSK) - timedelta(hours=1)).isoformat()

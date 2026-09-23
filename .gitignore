@@ -34,4 +34,7 @@ react_tui_smoke.txt
 # OS
 .DS_Store
 Thumbs.db
+
+# One-off operator scripts and local scratch data
+/tmp/
 uv.lock
