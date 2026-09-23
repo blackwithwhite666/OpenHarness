@@ -2,7 +2,9 @@
 
 import copy
 import json
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pytest
 from pydantic import BaseModel, ValidationError
@@ -236,8 +238,7 @@ async def test_list_mcp_resources_fences_server_supplied_descriptions():
 
     assert result.is_error is False
     assert result.output == (
-        f"{UNTRUSTED_BANNER}\n\n"
-        "demo:demo://readme server supplied description"
+        f"{UNTRUSTED_BANNER}\n\ndemo:demo://readme server supplied description"
     )
 
 
@@ -259,7 +260,10 @@ def _energy_fixture() -> str:
 
 def test_energy_fixture_covers_positive_and_negative_balance_gates() -> None:
     payload = json.loads(_energy_fixture())
-    complete, incomplete, basal_conflict, unsupported_units = payload["energy_days"]
+    resolved_correction, possible_replay, unresolved_key, legacy_synthetic = payload["energy_days"][
+        :4
+    ]
+    complete, incomplete, basal_conflict = payload["energy_days"][4:]
 
     response_fields = {
         "device_id",
@@ -276,8 +280,14 @@ def test_energy_fixture_covers_positive_and_negative_balance_gates() -> None:
         "next_day_basal_observed",
         "basal_conflicting_timestamps",
         "active_conflicting_timestamps",
+        "snapshot_revision",
+        "unresolved_key_count",
+        "possible_replay_count",
+        "legacy_synthetic_count",
     }
     assert all(set(day) == response_fields for day in payload["energy_days"])
+    assert all(day["basal_unit"] == day["active_unit"] == "kJ" for day in payload["energy_days"])
+    assert {day["snapshot_revision"] for day in payload["energy_days"]} == {5}
 
     assert payload["nutrition_status"] == "complete"
     assert complete["basal_minutes_with_samples"] == complete["day_minutes"]
@@ -290,12 +300,78 @@ def test_energy_fixture_covers_positive_and_negative_balance_gates() -> None:
 
     assert incomplete["basal_minutes_with_samples"] < incomplete["day_minutes"]
     assert incomplete["active_points"] == 0
-    assert incomplete["next_day_basal_observed"] is False
+    assert incomplete["next_day_basal_observed"] is True  # next fixture day has basal points
     assert incomplete["active_conflicting_timestamps"] == 1
+    assert incomplete["unresolved_key_count"] > 0
     assert basal_conflict["basal_conflicting_timestamps"] == 1
     assert basal_conflict["active_conflicting_timestamps"] == 0
-    assert unsupported_units["basal_unit"] not in {"kJ", "kcal"}
-    assert unsupported_units["active_unit"] not in {"kJ", "kcal"}
+    assert basal_conflict["unresolved_key_count"] > 0
+
+    assert resolved_correction["basal_conflicting_timestamps"] == 0
+    assert resolved_correction["active_conflicting_timestamps"] == 0
+    assert resolved_correction["unresolved_key_count"] == 0
+    assert resolved_correction["legacy_synthetic_count"] == 0
+    assert possible_replay["possible_replay_count"] > 0
+    assert possible_replay["unresolved_key_count"] == 0
+    assert possible_replay["legacy_synthetic_count"] == 0
+    assert unresolved_key["unresolved_key_count"] > 0
+    assert legacy_synthetic["legacy_synthetic_count"] > 0
+
+
+def test_energy_balance_offline_cases_fail_closed_on_missing_or_uncertain_facts() -> None:
+    """Exercise factual reportability cases without provider calls or meal data."""
+    payload = json.loads(_energy_fixture())
+    full_day = payload["energy_days"][4]
+    frozen_now = datetime(2026, 9, 22, 21, 0, tzinfo=ZoneInfo("UTC"))
+
+    def allowed(
+        response: dict, nutrition_status: str = "complete", *, now_utc: datetime = frozen_now
+    ) -> bool:
+        day = response["energy_days"][0]
+        return (
+            nutrition_status == "complete"
+            and full_day.keys() <= day.keys()
+            and now_utc.astimezone(ZoneInfo(day["timezone"])).date().isoformat() > day["local_day"]
+            and day["basal_minutes_with_samples"] == day["day_minutes"]
+            and day["active_points"] > 0
+            and day["next_day_basal_observed"] is True
+            and day["basal_conflicting_timestamps"] == 0
+            and day["active_conflicting_timestamps"] == 0
+            and day["unresolved_key_count"] == 0
+            and day["legacy_synthetic_count"] == 0
+            and day["basal_unit"] in {"kJ", "kcal"}
+            and day["active_unit"] in {"kJ", "kcal"}
+        )
+
+    def response_with(**changes: object) -> dict:
+        day = dict(full_day)
+        day.update(changes)
+        return {"energy_days": [day]}
+
+    assert allowed(response_with())  # full trusted day
+    assert allowed(dict(energy_days=[payload["energy_days"][0]]))  # resolved correction
+    assert allowed(dict(energy_days=[payload["energy_days"][1]]))  # A→B→A stays provisional
+    revised = response_with(snapshot_revision=6, basal_sum=9000.0)
+    assert revised["energy_days"][0]["basal_sum"] != full_day["basal_sum"]
+    assert allowed(revised)  # a later resolved correction revises sums without veto
+    assert not allowed(response_with(basal_minutes_with_samples=1439))  # incomplete basal
+    assert not allowed(response_with(active_points=0))
+    assert not allowed(response_with(next_day_basal_observed=False))
+    assert not allowed(dict(energy_days=[payload["energy_days"][2]]))  # same-request unresolved
+    assert not allowed(response_with(unresolved_key_count=1))  # uncertified legacy point
+    assert not allowed(dict(energy_days=[payload["energy_days"][3]]))  # certified max_value
+    assert not allowed(response_with(legacy_synthetic_count=1))
+    assert not allowed(response_with(basal_unit="J"))
+    assert not allowed(response_with(active_unit=None))
+    assert not allowed(response_with(), "stale")
+    before_midnight = datetime(2026, 9, 22, 20, 59, tzinfo=ZoneInfo("UTC"))
+    assert not allowed(response_with(local_day="2026-09-22"), now_utc=before_midnight)
+    assert allowed(response_with(local_day="2026-09-22"))  # same day becomes past at midnight
+    assert not allowed(response_with(local_day="2026-09-23"))  # current local day
+    for field in ("unresolved_key_count", "possible_replay_count", "legacy_synthetic_count"):
+        old_api = dict(full_day)
+        old_api.pop(field)
+        assert not allowed({"energy_days": [old_api]})
 
 
 def _wellness_delegate(manager: _RecordingMcpManager) -> McpToolAdapter:
@@ -440,9 +516,7 @@ class TestWellnessLoginInjectingAdapter:
     async def test_owner_rejects_invalid_selected_login_without_mcp_call(self):
         manager = _RecordingMcpManager()
         adapter = WellnessLoginInjectingAdapter(_wellness_delegate(manager))
-        adapter.set_trusted_principal(
-            "116870365", trusted_login="dmitry_owner", owner_turn=True
-        )
+        adapter.set_trusted_principal("116870365", trusted_login="dmitry_owner", owner_turn=True)
 
         result = await adapter.execute(
             adapter.input_model(params={"login": "Marina-Lipina", "interval": "7d"}),
@@ -456,9 +530,7 @@ class TestWellnessLoginInjectingAdapter:
     async def test_owner_omitted_login_uses_trusted_contact_username(self):
         manager = _RecordingMcpManager()
         adapter = WellnessLoginInjectingAdapter(_wellness_delegate(manager))
-        adapter.set_trusted_principal(
-            "116870365", trusted_login="Dmitry_Example", owner_turn=True
-        )
+        adapter.set_trusted_principal("116870365", trusted_login="Dmitry_Example", owner_turn=True)
 
         await adapter.execute(
             adapter.input_model(params={"interval": "7d"}),
@@ -482,9 +554,7 @@ class TestWellnessLoginInjectingAdapter:
     async def test_family_overrides_model_login_with_trusted_contact(self):
         manager = _RecordingMcpManager()
         adapter = WellnessLoginInjectingAdapter(_wellness_delegate(manager))
-        adapter.set_trusted_principal(
-            "200", trusted_login="Marina_Lipina", family_turn=True
-        )
+        adapter.set_trusted_principal("200", trusted_login="Marina_Lipina", family_turn=True)
 
         await adapter.execute(
             adapter.input_model(params={"login": "mallory", "interval": "7d"}),
@@ -510,9 +580,7 @@ class TestWellnessLoginInjectingAdapter:
     async def test_family_with_invalid_trusted_username_fails_closed(self):
         manager = _RecordingMcpManager()
         adapter = WellnessLoginInjectingAdapter(_wellness_delegate(manager))
-        adapter.set_trusted_principal(
-            "200", trusted_login="Marina-Lipina", family_turn=True
-        )
+        adapter.set_trusted_principal("200", trusted_login="Marina-Lipina", family_turn=True)
 
         result = await adapter.execute(
             adapter.input_model(params={"interval": "7d"}),
@@ -684,8 +752,12 @@ class TestInputModelFromSchema:
         m = Model(name="x", count=1, score=0.5, active=True, tags=["a"], meta={"k": "v"})
         dumped = m.model_dump(mode="json")
         assert dumped == {
-            "name": "x", "count": 1, "score": 0.5,
-            "active": True, "tags": ["a"], "meta": {"k": "v"},
+            "name": "x",
+            "count": 1,
+            "score": 0.5,
+            "active": True,
+            "tags": ["a"],
+            "meta": {"k": "v"},
         }
 
     def test_empty_schema_creates_valid_model(self):

@@ -214,10 +214,20 @@ def test_ohmo_prompt_energy_days_reports_observed_facts_and_coverage(tmp_path: P
         "next_day_basal_observed",
         "basal_conflicting_timestamps",
         "active_conflicting_timestamps",
+        "snapshot_revision",
+        "unresolved_key_count",
+        "possible_replay_count",
+        "legacy_synthetic_count",
     ):
         assert f"`{field}`" in prompt
     assert "basal X/Y" in prompt
-    assert "observed sums in their stated actual units" in prompt
+    assert "observed sums normalized to kJ (`basal_unit=active_unit=kJ`)" in prompt
+    assert "not raw submitted units" in prompt
+    assert "original submitted units in `sample.unit`/`original_unit` when known" in prompt
+    assert "an uncertified legacy point has no authoritative original unit" in prompt
+    assert "Keep basal and active energy aggregate-only by default" in prompt
+    assert "request raw HAE energy only when needed" in prompt
+    assert "1,000-sample cap" in prompt
 
 
 def test_ohmo_prompt_has_no_absolute_energy_ban_when_provisional_balance_is_allowed(
@@ -244,6 +254,11 @@ def test_ohmo_prompt_has_no_absolute_energy_ban_when_provisional_balance_is_allo
         "`basal_conflicting_timestamps` and `active_conflicting_timestamps` are 0",
         "dividing by exactly 4.184",
         "Unsupported or missing units fail the gate",
+        "missing fields (including uncertainty fields on an older API response) fail closed",
+        "Require `unresolved_key_count == 0` and `legacy_synthetic_count == 0`",
+        "A post-cutover resolved correction is not itself a conflict or veto",
+        "`possible_replay_count > 0` alone is not a veto",
+        "Never infer a raw legacy point's unit from `historical_block_unit`",
         "Label the result `provisional` and `revisable`",
     ],
 )
@@ -355,7 +370,8 @@ def test_ohmo_prompt_wellness_and_nutrition_safety_contract(tmp_path: Path) -> N
     prompt = build_ohmo_system_prompt(tmp_path, workspace=workspace)
 
     assert 'raw_health_types=["HealthAutoExportMetric_weight_body_mass"]' in prompt
-    assert "basal and active energy must remain aggregate-only" in prompt
+    assert "Keep basal and active energy aggregate-only by default" in prompt
+    assert "request raw HAE energy only when needed" in prompt
     assert "Filter every displayed daily value" in prompt
     assert "Observed basal and active energy sums and coverage are factual" in prompt
     assert "only when every energy gate below passes" in prompt
