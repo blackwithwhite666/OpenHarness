@@ -27,6 +27,25 @@ def test_load_skill_registry_includes_bundled(tmp_path: Path, monkeypatch):
     assert "Create, improve, and verify OpenHarness skills" in skill_creator.description
 
 
+def test_load_bundled_calory_skill_metadata_and_policy():
+    from openharness.skills.bundled import get_bundled_skills
+
+    skill = next(skill for skill in get_bundled_skills() if skill.name == "calory")
+
+    assert skill.source == "bundled"
+    assert "food" in skill.description
+    assert "calories" in skill.description
+    assert "weight" in skill.description
+    assert "health" in skill.description
+    assert "activity" in skill.description
+    assert all(trigger in skill.description for trigger in ("питание", "калории", "вес"))
+    assert "get_wellness_data" in skill.content
+    assert '"schema_version": 2' in skill.content
+    assert "meal_correction" in skill.content
+    assert "explicit_new_consumption" in skill.content
+    assert "model-authored values" in skill.content
+
+
 def _write_skill(root: Path, name: str, body: str | None = None) -> Path:
     skill_dir = root / name
     skill_dir.mkdir(parents=True, exist_ok=True)
@@ -40,7 +59,9 @@ def test_load_skill_registry_includes_user_skills(tmp_path: Path, monkeypatch):
     skills_dir = get_user_skills_dir()
     deploy_dir = skills_dir / "deploy"
     deploy_dir.mkdir(parents=True)
-    (deploy_dir / "SKILL.md").write_text("# Deploy\nDeployment workflow guidance\n", encoding="utf-8")
+    (deploy_dir / "SKILL.md").write_text(
+        "# Deploy\nDeployment workflow guidance\n", encoding="utf-8"
+    )
 
     registry = load_skill_registry()
     deploy = registry.get("Deploy")
@@ -164,7 +185,9 @@ def test_project_skill_discovery_walks_up_to_git_root(tmp_path: Path, monkeypatc
 def test_project_skill_nearer_cwd_overrides_parent_and_user(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("OPENHARNESS_CONFIG_DIR", str(tmp_path / "config"))
     monkeypatch.setattr(Path, "home", lambda: tmp_path / "home")
-    _write_skill(tmp_path / "home" / ".claude" / "skills", "deploy", "# user deploy\nuser version\n")
+    _write_skill(
+        tmp_path / "home" / ".claude" / "skills", "deploy", "# user deploy\nuser version\n"
+    )
     repo = tmp_path / "repo"
     cwd = repo / "services" / "api"
     cwd.mkdir(parents=True)
