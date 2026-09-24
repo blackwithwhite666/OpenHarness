@@ -14,6 +14,12 @@ from ohmo.workspace import (
 from openharness.config.settings import Settings
 from openharness.memory import add_memory_entry as add_project_memory_entry
 from openharness.prompts import build_runtime_system_prompt
+from openharness.skills.bundled import get_bundled_skills
+
+
+def _calory_skill_body() -> str:
+    skill = next(skill for skill in get_bundled_skills() if skill.name == "calory")
+    return skill.content.split("---", 2)[2].lstrip()
 
 
 def test_ohmo_prompt_includes_persona_and_memory(tmp_path: Path):
@@ -167,10 +173,25 @@ def test_ohmo_prompt_explains_file_attachment(tmp_path: Path):
     assert "Dropbox" in prompt  # explicitly steers away from the wrong fallback
 
 
-def test_ohmo_prompt_nutrition_contract_contains_versioned_annotation_rules(tmp_path: Path) -> None:
+def test_ohmo_prompt_routes_calory_questions_without_loading_policy(tmp_path: Path) -> None:
     workspace = tmp_path / ".ohmo-home"
     initialize_workspace(workspace)
     prompt = build_ohmo_system_prompt(tmp_path, workspace=workspace)
+
+    assert "# Calory skill" in prompt
+    assert "food, calories, weight" in prompt
+    assert "participant health, nutrition, or activity" in prompt
+    assert "питание, калории, вес" in prompt
+    assert "invoke the `calory` skill first and follow its instructions" in prompt
+    assert "energy_kcal_best" not in prompt
+    assert "meal_correction" not in prompt
+    assert "HealthAutoExportMetric_basal_energy_burned" not in prompt
+
+
+def test_ohmo_prompt_nutrition_contract_contains_versioned_annotation_rules(tmp_path: Path) -> None:
+    workspace = tmp_path / ".ohmo-home"
+    initialize_workspace(workspace)
+    prompt = _calory_skill_body()
 
     assert "annotations.nutrition" in prompt
     assert '"schema_version": 2' in prompt
@@ -198,7 +219,7 @@ def test_ohmo_prompt_nutrition_contract_contains_versioned_annotation_rules(tmp_
 def test_ohmo_prompt_energy_days_reports_observed_facts_and_coverage(tmp_path: Path) -> None:
     workspace = tmp_path / ".ohmo-home"
     initialize_workspace(workspace)
-    prompt = build_ohmo_system_prompt(tmp_path, workspace=workspace)
+    prompt = _calory_skill_body()
 
     for field in (
         "energy_days",
@@ -235,7 +256,7 @@ def test_ohmo_prompt_has_no_absolute_energy_ban_when_provisional_balance_is_allo
 ) -> None:
     workspace = tmp_path / ".ohmo-home"
     initialize_workspace(workspace)
-    prompt = build_ohmo_system_prompt(tmp_path, workspace=workspace)
+    prompt = _calory_skill_body()
 
     assert not (
         "Until a trusted per-type Health completion checkpoint exists" in prompt
@@ -267,7 +288,7 @@ def test_ohmo_prompt_energy_balance_requires_every_positive_gate(
 ) -> None:
     workspace = tmp_path / ".ohmo-home"
     initialize_workspace(workspace)
-    prompt = build_ohmo_system_prompt(tmp_path, workspace=workspace)
+    prompt = _calory_skill_body()
     assert required_rule in prompt
 
 
@@ -289,7 +310,7 @@ def test_ohmo_prompt_energy_balance_fails_closed_for_missing_or_late_facts(
 ) -> None:
     workspace = tmp_path / ".ohmo-home"
     initialize_workspace(workspace)
-    prompt = build_ohmo_system_prompt(tmp_path, workspace=workspace)
+    prompt = _calory_skill_body()
     assert fail_closed_rule in prompt
 
 
@@ -299,7 +320,7 @@ def test_ohmo_prompt_nutrition_contract_distinguishes_corrections_and_summaries(
     """A daily report is a non-countable summary and a user correction is not a new meal."""
     workspace = tmp_path / ".ohmo-home"
     initialize_workspace(workspace)
-    prompt = build_ohmo_system_prompt(tmp_path, workspace=workspace)
+    prompt = _calory_skill_body()
 
     assert "`meal_observation`, `meal_correction`" in prompt
     assert "`meal_deletion`, `day_summary`" in prompt
@@ -355,7 +376,7 @@ def test_ohmo_prompt_nutrition_contract_explicit_new_consumption_rule(
     """The structured same-photo-but-new-consumption signal is conservative."""
     workspace = tmp_path / ".ohmo-home"
     initialize_workspace(workspace)
-    prompt = build_ohmo_system_prompt(tmp_path, workspace=workspace)
+    prompt = _calory_skill_body()
 
     assert "`explicit_new_consumption`" in prompt
     assert "ONLY when the user explicitly states" in prompt
@@ -367,7 +388,7 @@ def test_ohmo_prompt_nutrition_contract_explicit_new_consumption_rule(
 def test_ohmo_prompt_wellness_and_nutrition_safety_contract(tmp_path: Path) -> None:
     workspace = tmp_path / ".ohmo-home"
     initialize_workspace(workspace)
-    prompt = build_ohmo_system_prompt(tmp_path, workspace=workspace)
+    prompt = _calory_skill_body()
 
     assert 'raw_health_types=["HealthAutoExportMetric_weight_body_mass"]' in prompt
     assert "Keep basal and active energy aggregate-only by default" in prompt
@@ -389,7 +410,7 @@ def test_ohmo_prompt_wellness_and_nutrition_safety_contract(tmp_path: Path) -> N
 def test_ohmo_prompt_covers_marina_wellness_regressions(tmp_path: Path) -> None:
     workspace = tmp_path / ".ohmo-home"
     initialize_workspace(workspace)
-    prompt = build_ohmo_system_prompt(tmp_path, workspace=workspace)
+    prompt = _calory_skill_body()
 
     assert "oatmeal advice or an oatmeal calorie estimate" in prompt
     assert "must not create a nutrition annotation" in prompt
