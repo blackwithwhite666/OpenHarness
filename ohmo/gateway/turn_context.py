@@ -28,6 +28,7 @@ class TurnContext:
     chat_id: str
     session_id: str
     is_forwarded: bool = False
+    camera_authorized: bool = False
 
 
 def canonical_principal(channel: str, sender_id: str) -> str:

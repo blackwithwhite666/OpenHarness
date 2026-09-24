@@ -10,7 +10,7 @@ import mimetypes
 import os
 import re
 import string
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timezone
 from pathlib import Path
 
@@ -23,6 +23,7 @@ from ohmo.evals.nutrition_trace import (
     build_nutrition_display_summary,
 )
 from ohmo.gateway.attachment_fingerprints import compute_attachment_fingerprints
+from ohmo.gateway.camera import CAMERA_AUTHORITY
 from ohmo.gateway.config import load_gateway_config
 from ohmo.gateway.group_tool import (
     CreateFeishuGroup,
@@ -806,6 +807,8 @@ class OhmoSessionRuntimePool:
         turn_ctx: TurnContext,
     ) -> str | None:
         """Record a principal only when normal gateway routing proves the binding."""
+        if turn_ctx.camera_authorized and message.sender_id == "__camera__":
+            return self._session_owner_principals.get(turn_ctx.session_id)
         candidate = None
         if (
             message.session_key_override is None
@@ -869,13 +872,30 @@ class OhmoSessionRuntimePool:
             session_id=bundle.session_id,
             owner_principals=self._gateway_config.owner_principals,
         )
+        camera_authorized = (
+            message.metadata.get("_camera_authority") is CAMERA_AUTHORITY
+            and message.channel == "telegram"
+            and str(message.chat_id) == self._gateway_config.camera_ingress.chat_id
+            and session_key == self._gateway_config.camera_ingress.session_key
+            and self._gateway_config.camera_ingress.enabled
+            and message.sender_id.split("|", 1)[0] in {
+                "__camera__", self._gateway_config.camera_ingress.principal
+            }
+        )
+        if camera_authorized:
+            turn_ctx = replace(turn_ctx, camera_authorized=True)
+        if (
+            camera_authorized
+            or message.metadata.get("_camera_unbound") is CAMERA_AUTHORITY
+        ) and not _evals_capture_enabled(self._gateway_config):
+            raise ValueError("Camera turn requires nutrition finalization validation")
         self._bind_session_owner(message, session_key, turn_ctx)
         nutrition_request = _trusted_nutrition_request(message)
         if nutrition_request is not None and not self._nutrition_binding_matches_config(nutrition_request):
             raise ValueError("trusted nutrition request is not bound to the configured Marina tenant")
         memory_scope = (
             MemoryScope(private_tenant="marina", shared_tenants=())
-            if nutrition_request is not None
+            if nutrition_request is not None or (camera_authorized and message.sender_id == "__camera__")
             else self._resolve_turn_memory_scope(turn_ctx)
         )
         self._configure_turn_memory_surfaces(
@@ -943,6 +963,11 @@ class OhmoSessionRuntimePool:
             if _evals_capture_enabled(self._gateway_config)
             else None
         )
+        if recorder is not None and (
+            (camera_authorized and message.metadata.get("_camera_answer") != "yes")
+            or message.metadata.get("_camera_unbound") is CAMERA_AUTHORITY
+        ):
+            recorder.forbid_nutrition_record()
         if recorder is not None and nutrition_request is not None:
             capture_time = datetime.fromisoformat(nutrition_request["capture_time"])
             if capture_time.tzinfo is None or capture_time.utcoffset() is None:
@@ -1489,6 +1514,16 @@ class OhmoSessionRuntimePool:
                 user_text=message.content or user_prompt,
                 assistant_text=reply,
             )
+            camera_ingress = getattr(self, "_camera_ingress", None)
+            if camera_ingress is not None and turn_ctx.camera_authorized:
+                camera_ingress.complete(
+                    message,
+                    recorded=bool(
+                        append_receipt is not None
+                        and recorder is not None
+                        and recorder.validated_nutrition_envelope is not None
+                    ),
+                )
             display_summary = None
             if trusted_nutrition is not None:
                 annotation = recorder.validated_nutrition_envelope if recorder is not None else None
@@ -1542,6 +1577,11 @@ class OhmoSessionRuntimePool:
         user_text: str,
         assistant_text: str,
     ) -> ConversationAppendReceipt | None:
+        # A Camera analysis turn is model-visible but is not Marina speaking.
+        # Never append it under Honcho's observed Marina peer, even though its
+        # read audience is the server-stamped Marina tenant.
+        if turn_ctx.camera_authorized and turn_ctx.principal == "__camera__":
+            return None
         trusted_nutrition = _trusted_nutrition_request(message)
         if trusted_nutrition is not None:
             if not self._nutrition_binding_matches_config(trusted_nutrition):
@@ -1569,6 +1609,23 @@ class OhmoSessionRuntimePool:
                 )
             ):
                 raise ValueError("trusted nutrition estimation must be a consumed meal observation")
+        camera_bound_answer = (
+            turn_ctx.camera_authorized
+            and turn_ctx.principal == self._gateway_config.camera_ingress.principal
+            and message.metadata.get("_camera_answer") in {"yes", "no"}
+            and message.metadata.get("_camera_authority") is CAMERA_AUTHORITY
+        )
+        camera_yes = camera_bound_answer and message.metadata.get("_camera_answer") == "yes"
+        if camera_yes:
+            annotation = recorder.validated_nutrition_envelope if recorder is not None else None
+            if annotation is not None:
+                validated = NutritionAnnotationV2.model_validate(annotation)
+                if (
+                    validated.record_type != "meal_observation"
+                    or validated.consumption_status != "consumed"
+                    or "image" not in validated.basis
+                ):
+                    raise ValueError("Camera meal finalization requires a consumed image observation")
         if self._gateway_config.conversation_learning is not True:
             if trusted_nutrition is not None:
                 raise ValueError("trusted nutrition ingestion requires conversation learning")
@@ -1589,12 +1646,19 @@ class OhmoSessionRuntimePool:
             scope=scope,
             recorder=recorder,
         )
+        if camera_bound_answer:
+            for metadata in (user_metadata, assistant_metadata):
+                metadata["camera_candidate_id"] = message.metadata["_camera_candidate_id"]
+                metadata["camera_answer_bound"] = message.metadata["_camera_answer"]
+                metadata["camera_reply_to_native_message_id"] = str(
+                    message.metadata["reply_to_message_id"]
+                )
         return await shadow_backend.append_exchange(
             user_text,
             assistant_text,
             user_metadata=user_metadata,
             assistant_metadata=assistant_metadata,
-            durable=trusted_nutrition is not None,
+            durable=trusted_nutrition is not None or camera_bound_answer,
             trusted_nutrition=trusted_nutrition is not None,
         )
 
@@ -2362,6 +2426,13 @@ class OhmoSessionRuntimePool:
         scope: MemoryScope,
     ) -> bool:
         """Apply the legacy owner gate or require an exact resolved family scope."""
+        if (
+            turn_ctx is not None
+            and turn_ctx.camera_authorized
+            and turn_ctx.principal == "__camera__"
+            and scope == MemoryScope(private_tenant="marina", shared_tenants=())
+        ):
+            return True
         if scope.private_tenant == "owner":
             return self._memory_gate_decision(turn_ctx).allowed
         return self._resolve_turn_memory_scope(turn_ctx) == scope

@@ -282,6 +282,10 @@ class GatewayEvalRecorder:
         """Stamp the trusted Dropbox capture time before trace validation."""
         self._runtime_recorder.set_authoritative_nutrition_meal_at(meal_at)
 
+    def forbid_nutrition_record(self) -> None:
+        """Prevent a Camera classification or unbound reply from creating a meal."""
+        self._runtime_recorder.forbid_nutrition_record()
+
 
 _RUNTIME_STRUCTURAL_SKIP_KINDS = frozenset(
     {
@@ -358,6 +362,10 @@ class _GatewayDecisionTraceRecorderAdapter:
         self._saw_invalid_finalization = False
         self._nutrition_applicable = False
         self._authoritative_nutrition_meal_at: datetime | None = None
+        self._nutrition_record_forbidden = False
+
+    def forbid_nutrition_record(self) -> None:
+        self._nutrition_record_forbidden = True
 
     def set_authoritative_nutrition_meal_at(self, meal_at: datetime | None) -> None:
         if meal_at is not None and (meal_at.tzinfo is None or meal_at.utcoffset() is None):
@@ -374,6 +382,14 @@ class _GatewayDecisionTraceRecorderAdapter:
         is_error: bool = False,
     ) -> EvalEvent | None:
         if kind == TRACE_FINALIZATION:
+            annotations = payload.get("annotations")
+            if (
+                self._nutrition_record_forbidden
+                and isinstance(annotations, Mapping)
+                and "nutrition" in annotations
+            ):
+                self._saw_invalid_finalization = True
+                raise DecisionTraceValidationError("Camera meal requires a bound explicit Marina answer")
             payload = self._stamp_authoritative_nutrition_meal_at(payload)
             try:
                 payload = validate_trace_finalization_annotations(payload)
