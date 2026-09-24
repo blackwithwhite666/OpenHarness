@@ -58,6 +58,48 @@ def _channel(bot: ReceiptBot) -> TelegramChannel:
 
 
 @pytest.mark.asyncio
+async def test_camera_photo_requires_native_photo_receipt_without_text_fallback(tmp_path) -> None:
+    image = tmp_path / "camera.jpg"
+    image.write_bytes(b"offline-fake-image")
+    bot = ReceiptBot(fail_photo=True)
+    channel = _channel(bot)
+    channel.polling_started = True
+    with pytest.raises(RuntimeError, match="photo failed"):
+        await channel.send_camera_photo(chat_id="123", image_path=str(image), caption="Camera")
+    assert [name for name, _ in bot.calls] == ["send_photo"]
+
+
+@pytest.mark.asyncio
+async def test_camera_photo_rejects_text_shaped_receipt(tmp_path) -> None:
+    image = tmp_path / "camera.jpg"
+    image.write_bytes(b"offline-fake-image")
+    bot = ReceiptBot()
+    channel = _channel(bot)
+    channel.polling_started = True
+    with pytest.raises(RuntimeError, match="native photo receipt"):
+        await channel.send_camera_photo(chat_id="123", image_path=str(image), caption="Camera")
+    assert [name for name, _ in bot.calls] == ["send_photo"]
+
+
+@pytest.mark.asyncio
+async def test_camera_photo_accepts_only_photo_shaped_message(tmp_path) -> None:
+    image = tmp_path / "camera.jpg"
+    image.write_bytes(b"offline-fake-image")
+    bot = ReceiptBot()
+
+    async def native_photo(**kwargs):
+        bot.calls.append(("send_photo", kwargs))
+        return SimpleNamespace(message_id=77, chat_id=123, photo=[object()])
+
+    bot.send_photo = native_photo
+    channel = _channel(bot)
+    channel.polling_started = True
+    receipt = await channel.send_camera_photo(chat_id="123", image_path=str(image), caption="Camera")
+    assert receipt.native_message_ids == (77,)
+    assert len(bot.calls) == 1
+
+
+@pytest.mark.asyncio
 async def test_one_photo_prompt_returns_native_photo_id_and_trusted_operation(tmp_path) -> None:
     image = tmp_path / "food.jpg"
     image.write_bytes(b"image")

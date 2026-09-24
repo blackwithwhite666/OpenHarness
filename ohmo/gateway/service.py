@@ -18,6 +18,7 @@ if sys.platform == "win32":
 
 from ohmo.contact_registry import ContactStore
 from ohmo.gateway.bridge import OhmoGatewayBridge
+from ohmo.gateway.camera import CameraIngress, serve_camera_http
 from ohmo.gateway.config import build_channel_manager_config, load_gateway_config
 from ohmo.gateway.models import GatewayState
 from ohmo.gateway.runtime import OhmoSessionRuntimePool
@@ -65,6 +66,15 @@ class OhmoGatewayService:
             on_send_failure=self._on_outbound_send_failure,
             on_send_success=self._on_outbound_send_success,
         )
+        self._camera_ingress = (
+            CameraIngress(
+                self._config.camera_ingress,
+                workspace=root,
+                bus=self._bus,
+                telegram=self._manager.get_channel("telegram"),
+            )
+            if self._config.camera_ingress.listen_port else None
+        )
         self._runtime_pool = OhmoSessionRuntimePool(
             cwd=self._cwd,
             workspace=self._workspace,
@@ -75,6 +85,7 @@ class OhmoGatewayService:
             default_tz=self._config.default_tz,
             reminder_max_per_chat=self._config.reminder_max_per_chat,
         )
+        self._runtime_pool._camera_ingress = self._camera_ingress
         self._stop_event: asyncio.Event | None = None
         self._restart_requested = False
         self._reminder_scheduler = ReminderScheduler(
@@ -119,6 +130,7 @@ class OhmoGatewayService:
             contact_store=self._contact_store,
             debug_progress_chats=self._config.debug_progress_chats,
             nutrition_coordinator=self._nutrition_coordinator,
+            camera_ingress=self._camera_ingress,
         )
 
     @property
@@ -206,6 +218,8 @@ class OhmoGatewayService:
         messages carry ``_reminder_id`` in metadata — when one of those fails to
         send, hand it to the scheduler so a blocked target pauses the reminder
         (per the locked design) instead of re-firing every occurrence forever."""
+        if getattr(self, "_camera_ingress", None) is not None:
+            self._camera_ingress.note_assistant_failure(msg)
         reminder_id = (msg.metadata or {}).get("_reminder_id")
         if not reminder_id:
             await self._nutrition_coordinator.on_send_failure(msg, error)
@@ -215,6 +229,8 @@ class OhmoGatewayService:
 
     async def _on_outbound_send_success(self, msg, receipt) -> None:
         await self._nutrition_coordinator.on_send_success(msg, receipt)
+        if getattr(self, "_camera_ingress", None) is not None:
+            self._camera_ingress.note_assistant_receipt(msg, receipt)
 
     def _exec_restart(self) -> None:
         root = str(get_workspace_root(self._workspace))
@@ -315,6 +331,22 @@ class OhmoGatewayService:
             path.unlink(missing_ok=True)
 
     async def run_foreground(self) -> int:
+        camera_server = None
+        if getattr(self, "_camera_ingress", None) is not None:
+            camera_server = await asyncio.start_server(
+                lambda reader, writer: serve_camera_http(self._camera_ingress, reader, writer),
+                host=self._config.camera_ingress.listen_host,
+                port=self._config.camera_ingress.listen_port,
+                limit=8192,
+                start_serving=False,
+            )
+            try:
+                self._camera_ingress.mark_restart_unknown()
+                await camera_server.start_serving()
+            except Exception:
+                camera_server.close()
+                await camera_server.wait_closed()
+                raise
         self.pid_file.write_text(str(os.getpid()), encoding="utf-8")
         self.write_state(running=True)
         bridge_task = asyncio.create_task(self._bridge.run(), name="ohmo-gateway-bridge")
@@ -360,6 +392,11 @@ class OhmoGatewayService:
             self.write_state(running=False, last_error=str(exc))
             raise
         finally:
+            if camera_server is not None:
+                camera_server.close()
+                await camera_server.wait_closed()
+            if getattr(self, "_camera_ingress", None) is not None:
+                await self._camera_ingress.close()
             self._bridge.stop()
             bridge_task.cancel()
             manager_task.cancel()

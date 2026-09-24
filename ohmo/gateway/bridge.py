@@ -13,6 +13,7 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 from ohmo.contact_registry import ContactStore
+from ohmo.gateway.camera import CAMERA_AUTHORITY, CameraIngress
 from ohmo.gateway.config import load_gateway_config, save_gateway_config
 from ohmo.gateway.router import session_key_for_message
 from ohmo.gateway.runtime import OhmoSessionRuntimePool
@@ -143,6 +144,7 @@ class OhmoGatewayBridge:
         contact_store: ContactStore | None = None,
         debug_progress_chats: list[str] | None = None,
         nutrition_coordinator: NutritionIngestCoordinator | None = None,
+        camera_ingress: CameraIngress | None = None,
     ) -> None:
         self._bus = bus
         self._runtime_pool = runtime_pool
@@ -164,6 +166,7 @@ class OhmoGatewayBridge:
         # allowlist opts into detailed progress; /debug and /quiet mutate it.
         self._debug_chats: set[str] = {str(c) for c in (debug_progress_chats or [])}
         self._nutrition_coordinator = nutrition_coordinator
+        self._camera_ingress = camera_ingress
 
     async def run(self) -> None:
         self._running = True
@@ -190,6 +193,9 @@ class OhmoGatewayBridge:
                 )
                 continue
 
+            if self._camera_ingress is not None and message.sender_id != "__camera__":
+                self._camera_ingress.process_real_inbound(message)
+
             if self._nutrition_coordinator is not None and await self._nutrition_coordinator.handle_inbound(message):
                 continue
 
@@ -206,7 +212,12 @@ class OhmoGatewayBridge:
 
             stripped = message.content.strip()
             group_args = _parse_group_command(message.content)
-            is_synthetic = bool(message.metadata.get("_synthetic")) or message.sender_id == "__scheduler__"
+            is_synthetic = (
+                bool(message.metadata.get("_synthetic"))
+                or message.sender_id == "__scheduler__"
+                or message.metadata.get("_camera_authority") is CAMERA_AUTHORITY
+                or message.metadata.get("_camera_unbound") is CAMERA_AUTHORITY
+            )
             is_special = (
                 stripped in ("/stop", "/restart", "/new", "/clear", "/debug", "/quiet", "/verbose")
                 or group_args is not None
@@ -247,6 +258,16 @@ class OhmoGatewayBridge:
                         continue
                     message = prepared
                     session_key = session_key_for_message(message)
+                if (
+                    message.sender_id == "__camera__"
+                    and message.metadata.get("_camera_authority") is CAMERA_AUTHORITY
+                ):
+                    # A Camera photo may arrive while Marina's ordinary turn is
+                    # running. Never cancel that turn just to analyze a photo.
+                    active = self._session_tasks.get(session_key)
+                    if active is not None and not active.done():
+                        with contextlib.suppress(asyncio.CancelledError, Exception):
+                            await asyncio.shield(active)
                 await self._dispatch(message, session_key)
                 await self._flush_due()
                 continue
@@ -632,7 +653,10 @@ class OhmoGatewayBridge:
         chat_id = str(message.chat_id)
         collapse = (
             message.channel == "telegram"
-            and chat_id not in self._debug_chats
+            and (
+                chat_id not in self._debug_chats
+                or message.metadata.get("_camera_authority") is CAMERA_AUTHORITY
+            )
         )
         try:
             reply = ""
@@ -771,6 +795,14 @@ class OhmoGatewayBridge:
         # left untouched: carrying message_id there would route it to the draft
         # API, which this non-business bot can't use.
         final_meta = {**inbound_meta, **final_metadata, "_session_key": session_key}
+        if message.metadata.get("_camera_authority") is CAMERA_AUTHORITY:
+            final_meta["_camera_candidate_id"] = message.metadata["_camera_candidate_id"]
+            final_meta["_camera_authority"] = CAMERA_AUTHORITY
+            final_meta["_camera_final"] = CAMERA_AUTHORITY
+            final_meta.pop("_camera_turn_id", None)
+            turn_id = message.metadata.get("_camera_turn_id")
+            if isinstance(turn_id, str):
+                final_meta["_camera_turn_id"] = turn_id
         if message.channel == "telegram" and "message_id" in message.metadata:
             final_meta["message_id"] = message.metadata["message_id"]
         await self._bus.publish_outbound(

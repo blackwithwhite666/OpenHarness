@@ -1139,6 +1139,34 @@ class TelegramChannel(BaseChannel):
             outbound_operation_id=self._outbound_operation_id(msg),
         )
 
+    async def send_camera_photo(
+        self, *, chat_id: str, image_path: str, caption: str
+    ) -> OutboundDeliveryReceipt:
+        """Return only a native photo receipt; never use the generic text fallback.
+
+        This direct channel operation is intentionally separate from ``send``:
+        ``_send_single_media`` can turn a photo failure into a text receipt.
+        """
+        if self._app is None or not self.polling_started:
+            raise RuntimeError("Telegram Camera channel is unavailable")
+        with open(image_path, "rb") as photo:
+            sent = await self._app.bot.send_photo(chat_id=int(chat_id), photo=photo, caption=caption)
+        message_id = getattr(sent, "message_id", None)
+        native_photo = getattr(sent, "photo", None)
+        if (
+            not isinstance(message_id, int)
+            or isinstance(message_id, bool)
+            or message_id <= 0
+            or not native_photo
+            or str(getattr(sent, "chat_id", chat_id)) != str(chat_id)
+        ):
+            raise RuntimeError("Telegram Camera send returned no native photo receipt")
+        return OutboundDeliveryReceipt(
+            channel=self.name,
+            chat_id=str(chat_id),
+            native_message_ids=(message_id,),
+        )
+
     async def _send_photo_prompt(
         self,
         *,
@@ -2163,6 +2191,8 @@ class TelegramChannel(BaseChannel):
         # Surface the replied-to message so a bare follow-up ("а тут?") carries
         # its antecedent into the agent prompt instead of arriving context-free.
         reply_prefix, reply_meta = _reply_context(getattr(message, "reply_to_message", None))
+        if reply_meta:
+            reply_meta["_telegram_raw_text"] = str(message.text or message.caption or "")
         if reply_prefix:
             content = f"{reply_prefix}\n{content}"
 
