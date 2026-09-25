@@ -182,6 +182,10 @@
       "type": "string",
       "minLength": 1
     },
+    "classifier_route_attestation_json": {
+      "type": ["string", "null"],
+      "maxLength": 10000
+    },
     "classifier_output": {
       "type": "object",
       "additionalProperties": false,

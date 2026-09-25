@@ -1,4 +1,4 @@
-"""Best-effort, Camera-specific ingress into Marina's ordinary gateway session.
+"""Best-effort Camera API ingress into the configured gateway session.
 
 The journal is an attempt tombstone, not a durable outbox.  In particular a
 restart never resumes a send whose result may have been lost.
@@ -21,7 +21,7 @@ from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
-from ohmo.nutrition_ingest.models import ClassifierOutput, ManifestV2, validate_candidate_id
+from ohmo.camera_protocol.models import ClassifierOutput, ManifestV2, validate_candidate_id
 from openharness.channels.bus.events import InboundMessage, OutboundDeliveryReceipt, OutboundMessage
 
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
@@ -35,6 +35,9 @@ _YES = frozenset(
     {"да, я это съела", "я это съела", "я съела это", "я съела", "я это ел", "я это съел"}
 )
 _NO = frozenset({"нет, не ела", "нет, не ел", "это не еда"})
+_DEEPSEEK_MODEL = "deepseek/deepseek-v4.1-flash"
+_DEEPSEEK_ENDPOINT = "deepinfra/fp8"
+_DEEPSEEK_RELEASE = "deepseek-camera-production-v1"
 CAMERA_AUTHORITY = object()
 
 
@@ -168,6 +171,8 @@ def _published_positive(sidecar_bytes: bytes, manifest: ManifestV2) -> None:
     if (
         decision.get("candidate_id") != manifest.candidate_id
         or decision.get("is_food_like") is not True
+        or decision.get("classifier_route_attestation_json")
+        != manifest.classifier_route_attestation_json
         or any(
             decision.get(key) != classifier_fields[key]
             for key in ("model", "prompt_version", "policy_version")
@@ -175,11 +180,12 @@ def _published_positive(sidecar_bytes: bytes, manifest: ManifestV2) -> None:
         or ClassifierOutput.model_validate(decision.get("output")) != manifest.classifier_output
     ):
         raise ValueError("producer classifier decision differs from manifest")
+    _validate_deepseek_route_attestation(manifest)
     clip_fields = ("model_id", "model_revision", "preprocessing_version", "threshold")
     if (
         clip.get("candidate_id") != manifest.candidate_id
         or clip.get("outcome") != "pass"
-        or clip.get("forward_to_qwen") is not True
+        or clip.get("forward_to_classifier") is not True
         or any(clip.get(key) != clip_release.get(key) for key in clip_fields)
         or not isinstance(clip_release.get("model_id"), str)
         or not clip_release["model_id"]
@@ -200,6 +206,80 @@ def _published_positive(sidecar_bytes: bytes, manifest: ManifestV2) -> None:
         or score < threshold
     ):
         raise ValueError("producer CLIP pass is invalid")
+
+
+def _validate_deepseek_route_attestation(manifest: ManifestV2) -> None:
+    """Require the selected DeepSeek model, endpoint, and privacy policy."""
+    if (
+        manifest.classifier_model != _DEEPSEEK_MODEL
+        or manifest.classifier_policy_version != _DEEPSEEK_RELEASE
+    ):
+        raise ValueError("camera classifier is not the active DeepSeek release")
+    raw = manifest.classifier_route_attestation_json
+    if not isinstance(raw, str) or not raw:
+        raise ValueError("DeepSeek route attestation is absent")
+
+    def unique_object(pairs: list[tuple[str, object]]) -> dict:
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate DeepSeek route attestation key")
+            result[key] = value
+        return result
+
+    route = json.loads(raw, object_pairs_hook=unique_object)
+    if not isinstance(route, dict):
+        raise ValueError("DeepSeek route attestation is malformed")
+    expected = {
+        "requested_model": _DEEPSEEK_MODEL,
+        "requested_provider_only": [_DEEPSEEK_ENDPOINT],
+        "requested_zdr": True,
+        "requested_data_collection": "deny",
+        "requested_allow_fallbacks": False,
+        "requested_response_cache_header": "false",
+        "prepared_provider_only": [_DEEPSEEK_ENDPOINT],
+        "prepared_zdr": True,
+        "prepared_data_collection": "deny",
+        "prepared_allow_fallbacks": False,
+        "prepared_provider_policy_source": "prepared_outbound_request_body",
+        "prepared_response_cache_header": "false",
+        "prepared_response_cache_header_source": "prepared_outbound_request_headers",
+        "catalog_endpoint": _DEEPSEEK_ENDPOINT,
+        "catalog_zdr": True,
+        "response_model": _DEEPSEEK_MODEL,
+        "response_provider": "deepinfra",
+        "response_endpoint": None,
+        "response_endpoint_source": "unverified",
+    }
+    if any(route.get(key) != value for key, value in expected.items()):
+        raise ValueError("DeepSeek route or privacy policy differs")
+    cache_status = route.get("response_cache_status")
+    if cache_status == "HIT" or cache_status not in {None, "MISS"}:
+        raise ValueError("DeepSeek response cache was not a fresh model call")
+    cache_source = "absent" if cache_status is None else "response_header"
+    if route.get("response_cache_status_source") != cache_source:
+        raise ValueError("DeepSeek cache evidence is malformed")
+    for key in (
+        "candidate_identity_sha256",
+        "catalog_sha256",
+        "catalog_terms_sha256",
+        "request_identity_sha256",
+        "response_id_sha256",
+        "response_identity_sha256",
+    ):
+        value = route.get(key)
+        if not isinstance(value, str) or _SHA256.fullmatch(value) is None:
+            raise ValueError("DeepSeek route evidence digest is malformed")
+    for key in ("catalog_observed_at", "requested_at", "response_received_at"):
+        value = route.get(key)
+        if not isinstance(value, str):
+            raise ValueError("DeepSeek route evidence timestamp is absent")
+        try:
+            parsed = datetime.fromisoformat(value)
+        except ValueError as exc:
+            raise ValueError("DeepSeek route evidence timestamp is malformed") from exc
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            raise ValueError("DeepSeek route evidence timestamp has no timezone")
 
 
 class CameraIngress:
@@ -449,7 +529,7 @@ class CameraIngress:
             receipt: OutboundDeliveryReceipt = await self._telegram.send_camera_photo(
                 chat_id=self.config.chat_id,
                 image_path=attempt["snapshot"],
-                caption="Фото из Camera. Ответьте на это фото: «Я это съела» или «Нет, не ела».",
+                caption="Фото из Camera. Ответьте на это фото: «Я это съел(а)» или «Нет, не ел(а)».",
             )
             if (
                 receipt.channel != "telegram"
@@ -469,8 +549,8 @@ class CameraIngress:
                     sender_id="__camera__",
                     chat_id=self.config.chat_id,
                     content=(
-                        "Проанализируй снимок Camera и спроси Марину, ела ли она это. "
-                        "Это только анализ: не записывай приём пищи без её явного ответа."
+                        "Проанализируй снимок Camera и спроси пользователя, ел(а) ли он(а) это. "
+                        "Это только анализ: не записывай приём пищи без явного ответа пользователя."
                     ),
                     media=[attempt["snapshot"]],
                     metadata={

@@ -12,20 +12,58 @@ import pytest
 
 from ohmo.gateway.camera import CAMERA_AUTHORITY, CameraIngress, serve_camera_http
 from ohmo.gateway.bridge import OhmoGatewayBridge
-from ohmo.gateway.models import CameraIngressConfig, GatewayConfig, NutritionIngestConfig
+from ohmo.gateway.models import CameraIngressConfig, GatewayConfig
 from ohmo.gateway.runtime import GatewayStreamUpdate, OhmoSessionRuntimePool
 from ohmo.gateway.service import OhmoGatewayService
 from ohmo.gateway.turn_context import TurnContext
 from ohmo.gateway.memory_gate import MemoryScope
 from ohmo.evals import get_eval_store
 from ohmo.evals.recorder import GatewayEvalRecorder
-from ohmo.nutrition_ingest.models import candidate_id_for
+from ohmo.camera_protocol.models import candidate_id_for
 from openharness.channels.bus.events import InboundMessage, OutboundDeliveryReceipt, OutboundMessage
 from openharness.channels.bus.queue import MessageBus
 from openharness.evals import DecisionTraceValidationError, TRACE_FINALIZATION
 
 
-FIXTURE = Path(__file__).parents[2] / "ohmo/nutrition_ingest/manifest_v2_fixture.json"
+FIXTURE = Path(__file__).parents[2] / "ohmo/camera_protocol/manifest_v2_fixture.json"
+
+
+def _deepseek_route_json() -> str:
+    return json.dumps(
+        {
+            "candidate_identity_sha256": "1" * 64,
+            "requested_model": "deepseek/deepseek-v4.1-flash",
+            "requested_provider_only": ["deepinfra/fp8"],
+            "requested_zdr": True,
+            "requested_data_collection": "deny",
+            "requested_allow_fallbacks": False,
+            "requested_response_cache_header": "false",
+            "prepared_provider_only": ["deepinfra/fp8"],
+            "prepared_zdr": True,
+            "prepared_data_collection": "deny",
+            "prepared_allow_fallbacks": False,
+            "prepared_provider_policy_source": "prepared_outbound_request_body",
+            "prepared_response_cache_header": "false",
+            "prepared_response_cache_header_source": "prepared_outbound_request_headers",
+            "catalog_observed_at": "2026-09-25T00:00:00+00:00",
+            "catalog_endpoint": "deepinfra/fp8",
+            "catalog_zdr": True,
+            "catalog_sha256": "2" * 64,
+            "catalog_terms_sha256": "3" * 64,
+            "requested_at": "2026-09-25T00:00:01+00:00",
+            "response_received_at": "2026-09-25T00:00:02+00:00",
+            "response_model": "deepseek/deepseek-v4.1-flash",
+            "response_provider": "deepinfra",
+            "response_endpoint": None,
+            "response_endpoint_source": "unverified",
+            "response_cache_status": "MISS",
+            "response_cache_status_source": "response_header",
+            "request_identity_sha256": "4" * 64,
+            "response_id_sha256": "5" * 64,
+            "response_identity_sha256": "6" * 64,
+        },
+        separators=(",", ":"),
+    )
 
 
 class FakeTelegram:
@@ -53,6 +91,9 @@ def _candidate(root: Path, *, index: int = 0) -> dict:
     payload["rev"] = f"rev-{index}"
     payload["candidate_id"] = candidate_id_for(payload["file_id"], payload["rev"])
     payload["event_id"] = f"{payload['candidate_id']}:manifest:v1"
+    payload["classifier_model"] = "deepseek/deepseek-v4.1-flash"
+    payload["classifier_policy_version"] = "deepseek-camera-production-v1"
+    payload["classifier_route_attestation_json"] = _deepseek_route_json()
     image = b"fake-offline-image" + str(index).encode()
     payload["original_size_bytes"] = len(image)
     payload["original_sha256"] = hashlib.sha256(image).hexdigest()
@@ -85,6 +126,7 @@ def _ingress(tmp_path: Path, telegram: FakeTelegram | None = None):
         bearer_token_file=token,
         synchronized_root=root,
         principal="123",
+        tenant_id="marina",
         chat_id="123",
         session_key="telegram:123",
     )
@@ -119,6 +161,7 @@ def _producer_sidecar(root: Path, request: dict) -> Path:
             "model": release["model"],
             "prompt_version": release["prompt_version"],
             "policy_version": release["policy_version"],
+            "classifier_route_attestation_json": manifest["classifier_route_attestation_json"],
             "output": manifest["classifier_output"],
             "is_food_like": True,
         },
@@ -128,7 +171,7 @@ def _producer_sidecar(root: Path, request: dict) -> Path:
             **clip_release,
             "candidate_id": request["candidate_id"],
             "outcome": "pass",
-            "forward_to_qwen": True,
+            "forward_to_classifier": True,
             "score": clip_release["threshold"],
         },
     }
@@ -257,7 +300,9 @@ async def test_unrecognized_or_unbound_real_text_is_nutrition_forbidden(tmp_path
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("mutation", ["missing", "negative", "wrong_release", "wrong_clip"])
+@pytest.mark.parametrize(
+    "mutation", ["missing", "negative", "wrong_release", "wrong_clip", "wrong_route"]
+)
 async def test_producer_publication_evidence_required_before_send(
     tmp_path: Path, mutation: str
 ) -> None:
@@ -272,6 +317,14 @@ async def test_producer_publication_evidence_required_before_send(
             sidecar["state"] = "negative"
         elif mutation == "wrong_release":
             sidecar["release"]["model"] = "other-model"
+        elif mutation == "wrong_route":
+            manifest_path = root / request["candidate_id"] / "manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            route = json.loads(manifest["classifier_route_attestation_json"])
+            route["requested_zdr"] = False
+            manifest["classifier_route_attestation_json"] = json.dumps(route)
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            request["manifest_sha256"] = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
         else:
             sidecar["clip_decision"]["model_revision"] = "b" * 40
         path.write_text(json.dumps(sidecar), encoding="utf-8")
@@ -504,14 +557,7 @@ async def test_second_candidate_waits_for_first_final_native_receipt(tmp_path: P
         },
     )
 
-    class NutritionCallbacks:
-        async def on_send_success(self, message, receipt):
-            pass
-
-        async def on_send_failure(self, message, error):
-            pass
-
-    service = SimpleNamespace(_camera_ingress=ingress, _nutrition_coordinator=NutritionCallbacks())
+    service = SimpleNamespace(_camera_ingress=ingress)
     receipt = OutboundDeliveryReceipt(channel="telegram", chat_id="123", native_message_ids=(101,))
     await OhmoGatewayService._on_outbound_send_success(service, progress, receipt)
     assert (await ingress.admit("Bearer " + "s" * 40, second))[0] == 409
@@ -562,14 +608,7 @@ async def test_stale_camera_prompt_receipt_cannot_release_answer_turn(tmp_path: 
     assert answer.metadata["_camera_answer"] == "yes"
     ingress.complete(answer, recorded=True)
 
-    class NutritionCallbacks:
-        async def on_send_success(self, message, receipt):
-            pass
-
-        async def on_send_failure(self, message, error):
-            pass
-
-    service = SimpleNamespace(_camera_ingress=ingress, _nutrition_coordinator=NutritionCallbacks())
+    service = SimpleNamespace(_camera_ingress=ingress)
     receipt = OutboundDeliveryReceipt(channel="telegram", chat_id="123", native_message_ids=(101,))
     wrong_candidate = OutboundMessage(
         channel="telegram",
@@ -635,14 +674,7 @@ async def test_final_send_failure_or_unknown_remains_unresolved(
         },
     )
 
-    class NutritionCallbacks:
-        async def on_send_success(self, message, receipt):
-            pass
-
-        async def on_send_failure(self, message, error):
-            pass
-
-    service = SimpleNamespace(_camera_ingress=ingress, _nutrition_coordinator=NutritionCallbacks())
+    service = SimpleNamespace(_camera_ingress=ingress)
     if outcome == "crash":
         await ingress.close()
         ingress = CameraIngress(
@@ -789,7 +821,7 @@ async def test_native_photo_reply_binds_and_manual_photo_is_untouched(tmp_path: 
     await ingress.close()
 
 
-def test_disabled_config_and_legacy_exclusion(tmp_path: Path) -> None:
+def test_disabled_config_and_generic_tenant_binding(tmp_path: Path) -> None:
     assert GatewayConfig().camera_ingress.enabled is False
     disabled = CameraIngress(
         CameraIngressConfig(enabled=False),
@@ -804,31 +836,33 @@ def test_disabled_config_and_legacy_exclusion(tmp_path: Path) -> None:
         bearer_token_file=tmp_path / "token",
         synchronized_root=tmp_path,
         principal="123",
+        tenant_id="family",
         chat_id="123",
         session_key="telegram:123",
     )
-    with pytest.raises(ValueError, match="legacy nutrition publisher"):
-        GatewayConfig(
-            enabled_channels=["telegram"],
-            conversation_learning=True,
-            memory_backend="shadow",
-            family_principals={"123": "marina"},
-            enabled_memory_tenants=("marina",),
-            camera_ingress=config,
-            nutrition_ingest=NutritionIngestConfig(
-                enabled=True,
-                synchronized_root=tmp_path,
-                principal="123",
-                chat_id="123",
-                session_key="telegram:123",
-            ),
-            honcho_base_url="https://honcho.test",
-            tenant_honcho={"marina": {"workspace": "w", "api_key": "a", "observed_peer": "p"}},
-        )
+    validated = GatewayConfig(
+        enabled_channels=["telegram"],
+        conversation_learning=True,
+        evals_capture=True,
+        memory_backend="shadow",
+        family_principals={"123": "family"},
+        enabled_memory_tenants=("family",),
+        camera_ingress=config,
+        honcho_base_url="https://honcho.test",
+        tenant_honcho={"family": {"workspace": "w", "api_key": "a", "observed_peer": "p"}},
+    )
+    assert validated.camera_ingress.tenant_id == "family"
 
 
 def test_camera_synthetic_does_not_bind_session_owner(tmp_path: Path) -> None:
     pool = object.__new__(OhmoSessionRuntimePool)
+    pool._gateway_config = SimpleNamespace(
+        camera_ingress=SimpleNamespace(tenant_id="family"),
+        owner_principals=(),
+        family_principals={"123": "family"},
+        enabled_memory_tenants=("family",),
+        shared_tenants=(),
+    )
     pool._session_owner_principals = {}
     turn = TurnContext(
         principal="__camera__",
@@ -864,9 +898,9 @@ def test_camera_synthetic_does_not_bind_session_owner(tmp_path: Path) -> None:
         session_id="session",
     )
     assert pool._bind_session_owner(real, "telegram:123", real_turn) == "123"
-    assert pool._honcho_turn_allowed(turn, MemoryScope(private_tenant="marina", shared_tenants=()))
+    assert pool._honcho_turn_allowed(turn, MemoryScope(private_tenant="family", shared_tenants=()))
     assert not pool._honcho_turn_allowed(
-        turn, MemoryScope(private_tenant="owner", shared_tenants=())
+        turn, MemoryScope(private_tenant="other", shared_tenants=())
     )
 
 
@@ -1022,6 +1056,7 @@ async def test_bound_answer_uses_validated_durable_honcho_path_only(tmp_path: Pa
             bearer_token_file=tmp_path / "token",
             synchronized_root=tmp_path,
             principal="123",
+            tenant_id="marina",
             chat_id="123",
             session_key="telegram:123",
         ),

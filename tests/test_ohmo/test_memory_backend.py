@@ -6,7 +6,11 @@ from pathlib import Path
 
 import pytest
 
-from ohmo.memory_backend import ConversationAppendReceipt, NutritionReconciliationError, ShadowMemoryBackend
+from ohmo.memory_backend import (
+    ConversationAppendReceipt,
+    ConversationReconciliationError,
+    ShadowMemoryBackend,
+)
 from ohmo.memory_service.honcho_client import Message
 
 
@@ -44,17 +48,12 @@ class _Honcho:
 
 def _metadata(candidate: str) -> tuple[dict, dict]:
     common = {
-        "_nutrition_trusted": True,
-        "tenant_id": "marina",
+        "tenant_id": "family",
         "source_principal": "telegram:123",
-        "ingest_source": "dropbox_camera",
-        "confirmation_required": True,
-        "candidate_id": candidate,
-        "nutrition_phase": "estimation",
     }
     return (
-        {**common, "client_op_id": f"{candidate}:meal-user:v1"},
-        {**common, "client_op_id": f"{candidate}:meal-observation:v1"},
+        {**common, "client_op_id": f"{candidate}:user"},
+        {**common, "client_op_id": f"{candidate}:assistant"},
     )
 
 
@@ -71,7 +70,6 @@ async def test_durable_exchange_returns_receipt_and_reconciles_retry() -> None:
         user_metadata=user_metadata,
         assistant_metadata=assistant_metadata,
         durable=True,
-        trusted_nutrition=True,
     )
     second = await backend.append_exchange(
         "photo",
@@ -79,7 +77,6 @@ async def test_durable_exchange_returns_receipt_and_reconciles_retry() -> None:
         user_metadata=user_metadata,
         assistant_metadata=assistant_metadata,
         durable=True,
-        trusted_nutrition=True,
     )
 
     assert isinstance(first, ConversationAppendReceipt)
@@ -113,14 +110,13 @@ async def test_durable_exchange_rejects_missing_malformed_and_duplicate_operatio
     honcho = _Honcho()
     backend = ShadowMemoryBackend(_Base(), honcho, conversation_learning=True)
 
-    with pytest.raises(NutritionReconciliationError, match="operation"):
+    with pytest.raises(ConversationReconciliationError, match="client_op_id"):
         await backend.append_exchange(
             "photo",
             "estimate",
             user_metadata=user_metadata,
             assistant_metadata={**assistant_metadata, "client_op_id": ""},
             durable=True,
-            trusted_nutrition=True,
         )
 
     honcho.messages.extend(
@@ -137,37 +133,35 @@ async def test_durable_exchange_rejects_missing_malformed_and_duplicate_operatio
             )
         ]
     )
-    with pytest.raises(NutritionReconciliationError, match="malformed"):
+    with pytest.raises(ConversationReconciliationError, match="malformed"):
         await backend.append_exchange(
             "photo",
             "estimate",
             user_metadata=user_metadata,
             assistant_metadata=assistant_metadata,
             durable=True,
-            trusted_nutrition=True,
         )
 
     duplicate_honcho = _Honcho()
     duplicate_message = Message(
-            id="duplicate",
-            content="estimate",
-            peer_id="ohmo",
-            session_id="ohmo",
-            metadata={"client_op_id": assistant_metadata["client_op_id"], "role": "assistant"},
-            created_at=dt.datetime.now(dt.timezone.utc),
-            workspace_id="workspace",
-            token_count=1,
-        )
+        id="duplicate",
+        content="estimate",
+        peer_id="ohmo",
+        session_id="ohmo",
+        metadata={"client_op_id": assistant_metadata["client_op_id"], "role": "assistant"},
+        created_at=dt.datetime.now(dt.timezone.utc),
+        workspace_id="workspace",
+        token_count=1,
+    )
     duplicate_honcho.messages.extend([duplicate_message, duplicate_message])
     duplicate_backend = ShadowMemoryBackend(_Base(), duplicate_honcho, conversation_learning=True)
-    with pytest.raises(NutritionReconciliationError, match="ambiguous"):
+    with pytest.raises(ConversationReconciliationError, match="ambiguous"):
         await duplicate_backend.append_exchange(
             "photo",
             "estimate",
             user_metadata=user_metadata,
             assistant_metadata=assistant_metadata,
             durable=True,
-            trusted_nutrition=True,
         )
 
 
@@ -183,7 +177,9 @@ class _TimeoutHoncho(_Honcho):
 
 
 @pytest.mark.asyncio
-async def test_durable_exchange_reconciles_timeout_after_commit_and_rejects_without_commit() -> None:
+async def test_durable_exchange_reconciles_timeout_after_commit_and_rejects_without_commit() -> (
+    None
+):
     candidate = "dropbox-camera-v1-" + "d" * 64
     user_metadata, assistant_metadata = _metadata(candidate)
     committed = _TimeoutHoncho(commit=True)
@@ -194,7 +190,6 @@ async def test_durable_exchange_reconciles_timeout_after_commit_and_rejects_with
         user_metadata=user_metadata,
         assistant_metadata=assistant_metadata,
         durable=True,
-        trusted_nutrition=True,
     )
     assert isinstance(receipt, ConversationAppendReceipt)
     assert len(committed.messages) == 2
@@ -208,5 +203,4 @@ async def test_durable_exchange_reconciles_timeout_after_commit_and_rejects_with
             user_metadata=user_metadata,
             assistant_metadata=assistant_metadata,
             durable=True,
-            trusted_nutrition=True,
         )

@@ -46,8 +46,11 @@ from ohmo.evals import get_eval_store
 from ohmo.gateway.bridge import OhmoGatewayBridge, _format_gateway_error
 from ohmo.gateway.config import load_gateway_config, save_gateway_config
 from ohmo.gateway.group_tool import OhmoCreateFeishuGroupInput, OhmoCreateFeishuGroupTool
-from ohmo.gateway.models import GatewayConfig, GatewayState, NutritionIngestConfig
-from ohmo.gateway.provider_commands import handle_gateway_model_command, handle_gateway_provider_command
+from ohmo.gateway.models import GatewayConfig, GatewayState
+from ohmo.gateway.provider_commands import (
+    handle_gateway_model_command,
+    handle_gateway_provider_command,
+)
 from ohmo.gateway.runtime import (
     OhmoSessionRuntimePool,
     _build_inbound_user_message,
@@ -57,13 +60,16 @@ from ohmo.gateway.runtime import (
     _sanitize_group_command_metadata,
     _sanitize_group_command_prompts,
 )
-from ohmo.nutrition_ingest.trust import COORDINATOR_TRUST_TOKEN
-from ohmo.gateway.service import OhmoGatewayService, gateway_status, start_gateway_process, stop_gateway_process
+from ohmo.gateway.service import (
+    OhmoGatewayService,
+    gateway_status,
+    start_gateway_process,
+    stop_gateway_process,
+)
 from ohmo.group_registry import load_managed_group_record, save_managed_group_record
 from ohmo.memory import add_memory_entry as add_ohmo_memory_entry
 from ohmo.memory import list_memory_files as list_ohmo_memory_files
 from ohmo.gateway.router import session_key_for_message
-from ohmo.nutrition_ingest.coordinator import NutritionIngestCoordinator
 from ohmo.session_storage import save_session_snapshot
 from ohmo.workspace import (
     get_gateway_interrupted_requests_path,
@@ -71,144 +77,6 @@ from ohmo.workspace import (
     get_skills_dir,
     initialize_workspace,
 )
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("nutrition_enabled", [False, True])
-async def test_gateway_foreground_starts_and_cancels_nutrition_coordinator(
-    tmp_path: Path, nutrition_enabled: bool, monkeypatch
-) -> None:
-    """The service lifecycle runs the coordinator in both real configuration modes."""
-
-    service = object.__new__(OhmoGatewayService)
-    service._restart_requested = False
-    service._stop_event = None
-    coordinator = NutritionIngestCoordinator(
-        NutritionIngestConfig(
-            enabled=nutrition_enabled,
-            synchronized_root=tmp_path,
-            principal="123" if nutrition_enabled else "",
-            chat_id="123" if nutrition_enabled else "",
-            session_key="telegram:123" if nutrition_enabled else "",
-        )
-    )
-    service._nutrition_coordinator = coordinator
-    honcho_closed: list[bool] = []
-
-    async def close_honcho() -> None:
-        honcho_closed.append(True)
-
-    service._nutrition_honcho_client = SimpleNamespace(aclose=close_honcho)
-    original_stop = coordinator.stop
-    coordinator_started: list[bool] = []
-    coordinator_stopped: list[bool] = []
-
-    async def coordinator_run() -> None:
-        coordinator_started.append(coordinator.enabled)
-        assert coordinator.enabled is nutrition_enabled
-        assert await coordinator.poll_once() == []
-        await asyncio.Event().wait()
-
-    service._nutrition_coordinator.run = coordinator_run
-    service._nutrition_coordinator.stop = lambda: (
-        coordinator_stopped.append(coordinator.enabled),
-        original_stop(),
-    )[0]
-    monkeypatch.setattr(
-        OhmoGatewayService,
-        "pid_file",
-        property(lambda _service: tmp_path / "gateway.pid"),
-    )
-    service.write_state = lambda **_: None
-    service._bridge = SimpleNamespace(
-        run=lambda: _wait_and_stop(service),
-        stop=lambda: None,
-    )
-    service._manager = SimpleNamespace(
-        start_all=lambda: asyncio.sleep(0),
-        stop_all=lambda: asyncio.sleep(0),
-    )
-    service._reminder_scheduler = SimpleNamespace(run=lambda: asyncio.Event().wait())
-    service._runtime_pool = SimpleNamespace(aclose=lambda: asyncio.sleep(0))
-    service._publish_pending_restart_notice = lambda: asyncio.sleep(0)
-    service._publish_interrupted_requests_notice = lambda: asyncio.sleep(0)
-
-    async def _wait_and_stop(current_service) -> None:
-        while current_service._stop_event is None:
-            await asyncio.sleep(0)
-        current_service._stop_event.set()
-
-    await service.run_foreground()
-    assert coordinator_started == [nutrition_enabled]
-    assert coordinator_stopped == [nutrition_enabled]
-    assert honcho_closed == [True]
-
-
-def test_gateway_lifecycle_passes_the_shared_honcho_binding_to_nutrition(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    import ohmo.gateway.service as service_module
-
-    assets = tmp_path / "nutrition-assets"
-    assets.mkdir(mode=0o700)
-    workspace = tmp_path / "workspace"
-    config = GatewayConfig(
-        honcho_base_url="https://honcho.test",
-        conversation_learning=True,
-        family_principals={"123": "marina"},
-        enabled_memory_tenants=("marina",),
-        tenant_honcho={
-            "marina": {
-                "workspace": "marina-workspace",
-                "api_key": "marina-key",
-                "session": "marina-session",
-                "observed_peer": "marina-peer",
-            }
-        },
-        nutrition_ingest=NutritionIngestConfig(
-            enabled=True,
-            synchronized_root=assets,
-            principal="123",
-            chat_id="123",
-            session_key="telegram:123",
-        ),
-    )
-    captured: dict[str, object] = {}
-
-    class FakeHonchoClient:
-        def __init__(self, base_url: str, api_key: str, honcho_workspace: str) -> None:
-            captured["client"] = (base_url, api_key, honcho_workspace)
-
-    class FakeRuntimePool:
-        def __init__(self, **_kwargs: object) -> None:
-            self._reminder_store = object()
-            self._reminder_lock = asyncio.Lock()
-
-    def coordinator_factory(_config, **kwargs):
-        captured["coordinator"] = kwargs
-        return SimpleNamespace()
-
-    monkeypatch.setattr(service_module, "load_gateway_config", lambda _workspace: config)
-    monkeypatch.setattr(service_module, "HonchoClient", FakeHonchoClient)
-    monkeypatch.setattr(service_module, "OhmoSessionRuntimePool", FakeRuntimePool)
-    monkeypatch.setattr(service_module, "ReminderScheduler", lambda **_kwargs: object())
-    monkeypatch.setattr(service_module, "NutritionIngestCoordinator", coordinator_factory)
-    monkeypatch.setattr(service_module, "OhmoGatewayBridge", lambda **_kwargs: object())
-    monkeypatch.setattr(service_module, "ChannelManager", lambda *_args, **_kwargs: object())
-    monkeypatch.chdir(tmp_path)
-
-    service_module.OhmoGatewayService(cwd=tmp_path, workspace=workspace)
-
-    assert captured["client"] == (
-        "https://honcho.test",
-        "marina-key",
-        "marina-workspace",
-    )
-    coordinator = captured["coordinator"]
-    assert isinstance(coordinator, dict)
-    assert coordinator["honcho_session"] == "marina-session"
-    assert coordinator["observed_peer"] == "marina-peer"
 
 
 def _single_eval_episode(workspace: Path):
@@ -478,7 +346,9 @@ async def test_runtime_pool_uses_managed_group_cwd_binding(tmp_path, monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_runtime_pool_restores_messages_for_group_sender_scoped_session_key(tmp_path, monkeypatch):
+async def test_runtime_pool_restores_messages_for_group_sender_scoped_session_key(
+    tmp_path, monkeypatch
+):
     workspace = tmp_path / ".ohmo-home"
     initialize_workspace(workspace)
     save_session_snapshot(
@@ -588,7 +458,9 @@ async def test_runtime_pool_splits_per_turn_assistant_updates_from_final(tmp_pat
     monkeypatch.setattr("ohmo.gateway.runtime.start_runtime", fake_start_runtime)
 
     pool = OhmoSessionRuntimePool(cwd=tmp_path, workspace=workspace, provider_profile="codex")
-    message = InboundMessage(channel="telegram", sender_id="u1", chat_id="c1", content="купе в Тамбов")
+    message = InboundMessage(
+        channel="telegram", sender_id="u1", chat_id="c1", content="купе в Тамбов"
+    )
     updates = [u async for u in pool.stream_message(message, "telegram:c1")]
 
     assistant_updates = [
@@ -624,7 +496,9 @@ async def test_runtime_pool_stream_message_emits_progress_and_tool_hint(tmp_path
                 return None
 
             async def submit_message(self, content):
-                yield ToolExecutionStarted(tool_name="web_fetch", tool_input={"url": "https://example.com"})
+                yield ToolExecutionStarted(
+                    tool_name="web_fetch", tool_input={"url": "https://example.com"}
+                )
                 yield AssistantTextDelta(text="done")
 
         return SimpleNamespace(
@@ -799,9 +673,7 @@ async def test_runtime_pool_wires_trace_tool_to_gateway_eval_episode(
         engine = QueryEngine(
             api_client=api_client,
             tool_registry=registry,
-            permission_checker=PermissionChecker(
-                PermissionSettings(mode=PermissionMode.FULL_AUTO)
-            ),
+            permission_checker=PermissionChecker(PermissionSettings(mode=PermissionMode.FULL_AUTO)),
             cwd=tmp_path,
             model="gpt-5.4",
             system_prompt="system",
@@ -848,9 +720,7 @@ async def test_runtime_pool_wires_trace_tool_to_gateway_eval_episode(
     assert trace_event.payload["decision"] == "verify gateway trace recorder wiring"
 
     trace_tool_completed_events = [
-        event
-        for event in events
-        if event.kind == "tool_completed" and event.tool_name == "trace"
+        event for event in events if event.kind == "tool_completed" and event.tool_name == "trace"
     ]
     assert len(trace_tool_completed_events) == 2
     generic_trace_tool_completed, legacy_trace_tool_completed = trace_tool_completed_events
@@ -1012,9 +882,7 @@ async def test_runtime_pool_records_eval_episode_for_command_only_final(tmp_path
             cwd=str(tmp_path),
             session_id="sess-eval-command",
             current_settings=lambda: SimpleNamespace(model="gpt-5.4"),
-            commands=SimpleNamespace(
-                lookup=lambda raw: (command, "") if raw == "/hello" else None
-            ),
+            commands=SimpleNamespace(lookup=lambda raw: (command, "") if raw == "/hello" else None),
         )
 
     async def fake_start_runtime(bundle):
@@ -1049,7 +917,9 @@ async def test_runtime_pool_records_eval_episode_for_command_only_final(tmp_path
 
 
 @pytest.mark.asyncio
-async def test_runtime_pool_stream_message_formats_auto_compact_status_for_feishu(tmp_path, monkeypatch):
+async def test_runtime_pool_stream_message_formats_auto_compact_status_for_feishu(
+    tmp_path, monkeypatch
+):
     workspace = tmp_path / ".ohmo-home"
     initialize_workspace(workspace)
 
@@ -1104,7 +974,9 @@ async def test_runtime_pool_stream_message_formats_compact_retry_for_feishu(tmp_
                 return None
 
             async def submit_message(self, content):
-                yield CompactProgressEvent(phase="compact_retry", trigger="auto", attempt=2, message="retrying")
+                yield CompactProgressEvent(
+                    phase="compact_retry", trigger="auto", attempt=2, message="retrying"
+                )
                 yield AssistantTextDelta(text="done")
 
         return SimpleNamespace(
@@ -1130,7 +1002,9 @@ async def test_runtime_pool_stream_message_formats_compact_retry_for_feishu(tmp_
 
 
 @pytest.mark.asyncio
-async def test_runtime_pool_stream_message_formats_compact_hooks_start_for_feishu(tmp_path, monkeypatch):
+async def test_runtime_pool_stream_message_formats_compact_hooks_start_for_feishu(
+    tmp_path, monkeypatch
+):
     workspace = tmp_path / ".ohmo-home"
     initialize_workspace(workspace)
 
@@ -1169,7 +1043,9 @@ async def test_runtime_pool_stream_message_formats_compact_hooks_start_for_feish
 
 
 @pytest.mark.asyncio
-async def test_runtime_pool_stream_message_uses_english_progress_for_english_input(tmp_path, monkeypatch):
+async def test_runtime_pool_stream_message_uses_english_progress_for_english_input(
+    tmp_path, monkeypatch
+):
     workspace = tmp_path / ".ohmo-home"
     initialize_workspace(workspace)
 
@@ -1182,7 +1058,9 @@ async def test_runtime_pool_stream_message_uses_english_progress_for_english_inp
                 return None
 
             async def submit_message(self, content):
-                yield ToolExecutionStarted(tool_name="web_fetch", tool_input={"url": "https://example.com"})
+                yield ToolExecutionStarted(
+                    tool_name="web_fetch", tool_input={"url": "https://example.com"}
+                )
                 yield AssistantTextDelta(text="done")
 
         return SimpleNamespace(
@@ -1199,12 +1077,20 @@ async def test_runtime_pool_stream_message_uses_english_progress_for_english_inp
     monkeypatch.setattr("ohmo.gateway.runtime.start_runtime", fake_start_runtime)
 
     pool = OhmoSessionRuntimePool(cwd=tmp_path, workspace=workspace, provider_profile="codex")
-    message = InboundMessage(channel="feishu", sender_id="u1", chat_id="c1", content="can you check this")
+    message = InboundMessage(
+        channel="feishu", sender_id="u1", chat_id="c1", content="can you check this"
+    )
     updates = [u async for u in pool.stream_message(message, "feishu:c1")]
 
     assert updates[0].kind == "progress"
     assert updates[0].text.startswith(("🤔", "🧠", "✨", "🔎", "🪄", "🧩", "📝"))
-    assert "Thinking" in updates[0].text or "Working" in updates[0].text or "Looking" in updates[0].text or "Following" in updates[0].text or "Pulling" in updates[0].text
+    assert (
+        "Thinking" in updates[0].text
+        or "Working" in updates[0].text
+        or "Looking" in updates[0].text
+        or "Following" in updates[0].text
+        or "Pulling" in updates[0].text
+    )
     assert updates[1].kind == "tool_hint"
     assert updates[1].text.startswith("🛠️ Web fetch")
 
@@ -1354,8 +1240,7 @@ async def test_runtime_pool_tool_start_carries_bounded_model_purpose(tmp_path, m
     )
 
     started = next(
-        u for u in updates
-        if (u.metadata or {}).get("progress_event", {}).get("phase") == "started"
+        u for u in updates if (u.metadata or {}).get("progress_event", {}).get("phase") == "started"
     )
     event = started.metadata["progress_event"]
     purpose = event["purpose"]
@@ -1365,7 +1250,8 @@ async def test_runtime_pool_tool_start_carries_bounded_model_purpose(tmp_path, m
     assert purpose.endswith("…")  # the over-long narration was truncated
     # Completion carries no purpose of its own — correlation is by call id.
     completed = next(
-        u for u in updates
+        u
+        for u in updates
         if (u.metadata or {}).get("progress_event", {}).get("phase") == "completed"
     )
     assert "purpose" not in completed.metadata["progress_event"]
@@ -1415,8 +1301,7 @@ async def test_runtime_pool_tool_start_without_narration_has_no_purpose(tmp_path
     )
 
     started = next(
-        u for u in updates
-        if (u.metadata or {}).get("progress_event", {}).get("phase") == "started"
+        u for u in updates if (u.metadata or {}).get("progress_event", {}).get("phase") == "started"
     )
     assert "purpose" not in started.metadata["progress_event"]
 
@@ -1461,7 +1346,9 @@ async def test_runtime_pool_blocks_local_only_commands_from_remote_messages(tmp_
     monkeypatch.setattr("ohmo.gateway.runtime.start_runtime", fake_start_runtime)
 
     pool = OhmoSessionRuntimePool(cwd=tmp_path, workspace=workspace, provider_profile="codex")
-    message = InboundMessage(channel="feishu", sender_id="u1", chat_id="c1", content="/permissions full_auto")
+    message = InboundMessage(
+        channel="feishu", sender_id="u1", chat_id="c1", content="/permissions full_auto"
+    )
     updates = [u async for u in pool.stream_message(message, "feishu:c1")]
 
     assert handler_called is False
@@ -1509,7 +1396,9 @@ async def test_runtime_pool_blocks_bridge_spawn_from_remote_messages(tmp_path, m
     monkeypatch.setattr("ohmo.gateway.runtime.start_runtime", fake_start_runtime)
 
     pool = OhmoSessionRuntimePool(cwd=tmp_path, workspace=workspace, provider_profile="codex")
-    message = InboundMessage(channel="feishu", sender_id="u1", chat_id="c1", content="/bridge spawn id")
+    message = InboundMessage(
+        channel="feishu", sender_id="u1", chat_id="c1", content="/bridge spawn id"
+    )
     updates = [u async for u in pool.stream_message(message, "feishu:c1")]
 
     assert handler_called is False
@@ -1518,14 +1407,18 @@ async def test_runtime_pool_blocks_bridge_spawn_from_remote_messages(tmp_path, m
 
 
 @pytest.mark.asyncio
-async def test_runtime_pool_blocks_registered_bridge_spawn_without_shelling_out(tmp_path, monkeypatch):
+async def test_runtime_pool_blocks_registered_bridge_spawn_without_shelling_out(
+    tmp_path, monkeypatch
+):
     workspace = tmp_path / ".ohmo-home"
     initialize_workspace(workspace)
     marker = tmp_path / "remote-bridge-marker.txt"
     payload = f"/bridge spawn printf REMOTE_BRIDGE_EXEC > {marker}"
     registry = create_default_command_registry()
     command, _ = registry.lookup(payload)
-    existing_bridge_sessions = {session.session_id for session in get_bridge_manager().list_sessions()}
+    existing_bridge_sessions = {
+        session.session_id for session in get_bridge_manager().list_sessions()
+    }
 
     assert command is not None
     assert command.name == "bridge"
@@ -1560,13 +1453,16 @@ async def test_runtime_pool_blocks_registered_bridge_spawn_without_shelling_out(
 
     assert updates[-1].kind == "final"
     assert updates[-1].text == "/bridge is only available in the local OpenHarness UI."
-    assert {session.session_id for session in get_bridge_manager().list_sessions()} == existing_bridge_sessions
+    assert {
+        session.session_id for session in get_bridge_manager().list_sessions()
+    } == existing_bridge_sessions
     assert marker.exists() is False
 
 
-
 @pytest.mark.asyncio
-async def test_runtime_pool_blocks_registered_config_show_without_leaking_secrets(tmp_path, monkeypatch):
+async def test_runtime_pool_blocks_registered_config_show_without_leaking_secrets(
+    tmp_path, monkeypatch
+):
     workspace = tmp_path / ".ohmo-home"
     initialize_workspace(workspace)
     registry = create_default_command_registry()
@@ -1620,7 +1516,9 @@ async def test_runtime_pool_blocks_registered_config_show_without_leaking_secret
     monkeypatch.setattr("ohmo.gateway.runtime.start_runtime", fake_start_runtime)
 
     pool = OhmoSessionRuntimePool(cwd=tmp_path, workspace=workspace, provider_profile="codex")
-    message = InboundMessage(channel="slack", sender_id="U_ATTACKER", chat_id="C_SHARED", content="/config show")
+    message = InboundMessage(
+        channel="slack", sender_id="U_ATTACKER", chat_id="C_SHARED", content="/config show"
+    )
     updates = [u async for u in pool.stream_message(message, "slack:C_SHARED:U_ATTACKER")]
 
     assert updates[-1].kind == "final"
@@ -1678,7 +1576,9 @@ async def test_runtime_pool_memory_command_uses_ohmo_personal_memory(tmp_path, m
 
     assert updates[-1].text == "Added memory entry profile.md"
     assert [path.name for path in list_ohmo_memory_files(workspace)] == ["profile.md"]
-    assert "prefers concise answers" in (workspace / "memory" / "profile.md").read_text(encoding="utf-8")
+    assert "prefers concise answers" in (workspace / "memory" / "profile.md").read_text(
+        encoding="utf-8"
+    )
     assert list_project_memory_files(tmp_path) == []
 
 
@@ -1779,7 +1679,9 @@ async def test_runtime_pool_allows_opted_in_remote_admin_commands(tmp_path, monk
 
     with caplog.at_level(logging.WARNING):
         pool = OhmoSessionRuntimePool(cwd=tmp_path, workspace=workspace, provider_profile="codex")
-        message = InboundMessage(channel="feishu", sender_id="u1", chat_id="c1", content="/permissions full_auto")
+        message = InboundMessage(
+            channel="feishu", sender_id="u1", chat_id="c1", content="/permissions full_auto"
+        )
         updates = [u async for u in pool.stream_message(message, "feishu:c1")]
 
     assert handler_called is True
@@ -1816,9 +1718,7 @@ async def test_runtime_pool_includes_media_paths_in_prompt(tmp_path, monkeypatch
 
             async def submit_message(self, content):
                 captured["content"] = content
-                captured["tools_during_submit"] = {
-                    tool.name for tool in registry.list_tools()
-                }
+                captured["tools_during_submit"] = {tool.name for tool in registry.list_tools()}
                 self.messages.append(
                     content.model_copy(
                         update={
@@ -1841,9 +1741,7 @@ async def test_runtime_pool_includes_media_paths_in_prompt(tmp_path, monkeypatch
         )
 
     async def fake_start_runtime(bundle):
-        captured["tools_at_start"] = {
-            tool.name for tool in bundle.tool_registry.list_tools()
-        }
+        captured["tools_at_start"] = {tool.name for tool in bundle.tool_registry.list_tools()}
         return None
 
     monkeypatch.setattr("ohmo.gateway.runtime.build_runtime", fake_build_runtime)
@@ -1880,7 +1778,9 @@ async def test_runtime_pool_includes_media_paths_in_prompt(tmp_path, monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_runtime_pool_retries_with_attachment_summary_when_model_rejects_images(tmp_path, monkeypatch):
+async def test_runtime_pool_retries_with_attachment_summary_when_model_rejects_images(
+    tmp_path, monkeypatch
+):
     workspace = tmp_path / ".ohmo-home"
     initialize_workspace(workspace)
     image_path = tmp_path / "example.png"
@@ -1948,9 +1848,7 @@ async def test_runtime_pool_retries_with_attachment_summary_when_model_rejects_i
     assert any(update.metadata.get("_image_fallback") for update in updates)
     retry_messages = captured["retry_messages"]
     assert all(
-        not isinstance(block, ImageBlock)
-        for item in retry_messages
-        for block in item.content
+        not isinstance(block, ImageBlock) for item in retry_messages for block in item.content
     )
     text = "".join(
         block.text
@@ -1979,7 +1877,7 @@ def test_runtime_pool_includes_group_speaker_context():
     assert "请帮我看一下" in text
 
 
-def test_inbound_event_id_uses_channel_message_id_and_trusted_nutrition_candidate() -> None:
+def test_inbound_event_id_uses_channel_message_id() -> None:
     ordinary = InboundMessage(
         channel="telegram",
         sender_id="42",
@@ -1987,29 +1885,8 @@ def test_inbound_event_id_uses_channel_message_id_and_trusted_nutrition_candidat
         content="hello",
         metadata={"message_id": 123},
     )
-    candidate = "dropbox-camera-v1-" + "a" * 64
-    nutrition = InboundMessage(
-        channel="telegram",
-        sender_id="__nutrition_ingest__",
-        chat_id="42",
-        content="estimate",
-        session_key_override="telegram:42",
-        metadata={
-            "_nutrition_trusted": True,
-            "_nutrition_trust_token": COORDINATOR_TRUST_TOKEN,
-            "_nutrition_candidate_id": candidate,
-            "_nutrition_client_op_id": f"{candidate}:meal-observation:v1",
-            "_nutrition_phase": "estimation",
-            "_nutrition_principal": "42",
-            "_nutrition_tenant_id": "marina",
-            "_nutrition_chat_id": "42",
-            "_nutrition_session_key": "telegram:42",
-        },
-    )
-
     assert _event_id_for_inbound_message(ordinary) == _event_id_for_inbound_message(ordinary)
     assert _event_id_for_inbound_message(ordinary).startswith("ohmo-event-")
-    assert _event_id_for_inbound_message(nutrition) == f"ohmo-nutrition-{candidate}"
 
 
 @pytest.mark.asyncio
@@ -2018,8 +1895,16 @@ async def test_gateway_bridge_publishes_progress_updates():
 
     class FakeRuntimePool:
         async def stream_message(self, message, session_key):
-            yield SimpleNamespace(kind="progress", text="🤔 想一想…", metadata={"_progress": True, "_session_key": session_key})
-            yield SimpleNamespace(kind="tool_hint", text="🛠️ 正在使用 web_fetch: https://example.com", metadata={"_progress": True, "_tool_hint": True, "_session_key": session_key})
+            yield SimpleNamespace(
+                kind="progress",
+                text="🤔 想一想…",
+                metadata={"_progress": True, "_session_key": session_key},
+            )
+            yield SimpleNamespace(
+                kind="tool_hint",
+                text="🛠️ 正在使用 web_fetch: https://example.com",
+                metadata={"_progress": True, "_tool_hint": True, "_session_key": session_key},
+            )
             yield SimpleNamespace(kind="final", text="Done", metadata={"_session_key": session_key})
 
     bridge = OhmoGatewayBridge(bus=bus, runtime_pool=FakeRuntimePool())
@@ -2464,7 +2349,9 @@ async def test_gateway_bridge_ignores_unmentioned_unmanaged_feishu_group(tmp_pat
     class FakeRuntimePool:
         async def stream_message(self, message, session_key):
             calls.append(message)
-            yield SimpleNamespace(kind="final", text="should not happen", metadata={"_session_key": session_key})
+            yield SimpleNamespace(
+                kind="final", text="should not happen", metadata={"_session_key": session_key}
+            )
 
     bridge = OhmoGatewayBridge(
         bus=bus,
@@ -2495,7 +2382,9 @@ async def test_gateway_bridge_ignores_unmentioned_unmanaged_feishu_group(tmp_pat
 
 
 @pytest.mark.asyncio
-async def test_gateway_bridge_runs_synthetic_reminder_in_feishu_group_under_mention_policy(tmp_path):
+async def test_gateway_bridge_runs_synthetic_reminder_in_feishu_group_under_mention_policy(
+    tmp_path,
+):
     # A scheduler-originated agentic reminder publishes a synthetic InboundMessage
     # into a Feishu group. Even under a mention/managed group_policy (and with no
     # mentions_bot flag) it must still run an agent turn — the synthetic message
@@ -2507,7 +2396,9 @@ async def test_gateway_bridge_runs_synthetic_reminder_in_feishu_group_under_ment
     class FakeRuntimePool:
         async def stream_message(self, message, session_key):
             calls.append(message)
-            yield SimpleNamespace(kind="final", text="reminder ran", metadata={"_session_key": session_key})
+            yield SimpleNamespace(
+                kind="final", text="reminder ran", metadata={"_session_key": session_key}
+            )
 
     bridge = OhmoGatewayBridge(
         bus=bus,
@@ -2551,7 +2442,9 @@ async def test_gateway_bridge_processes_managed_feishu_group_without_mention(tmp
 
     class FakeRuntimePool:
         async def stream_message(self, message, session_key):
-            yield SimpleNamespace(kind="final", text="managed done", metadata={"_session_key": session_key})
+            yield SimpleNamespace(
+                kind="final", text="managed done", metadata={"_session_key": session_key}
+            )
 
     bridge = OhmoGatewayBridge(
         bus=bus,
@@ -2586,7 +2479,9 @@ async def test_gateway_bridge_processes_mentioned_unmanaged_feishu_group(tmp_pat
 
     class FakeRuntimePool:
         async def stream_message(self, message, session_key):
-            yield SimpleNamespace(kind="final", text="mentioned done", metadata={"_session_key": session_key})
+            yield SimpleNamespace(
+                kind="final", text="mentioned done", metadata={"_session_key": session_key}
+            )
 
     bridge = OhmoGatewayBridge(
         bus=bus,
@@ -2630,7 +2525,9 @@ async def test_gateway_bridge_mention_policy_overrides_managed_feishu_group(tmp_
     class FakeRuntimePool:
         async def stream_message(self, message, session_key):
             calls.append(message)
-            yield SimpleNamespace(kind="final", text="should not happen", metadata={"_session_key": session_key})
+            yield SimpleNamespace(
+                kind="final", text="should not happen", metadata={"_session_key": session_key}
+            )
 
     bridge = OhmoGatewayBridge(
         bus=bus,
@@ -2666,7 +2563,11 @@ async def test_gateway_bridge_logs_inbound_and_final(caplog):
 
     class FakeRuntimePool:
         async def stream_message(self, message, session_key):
-            yield SimpleNamespace(kind="progress", text="🤔 想一想…", metadata={"_progress": True, "_session_key": session_key})
+            yield SimpleNamespace(
+                kind="progress",
+                text="🤔 想一想…",
+                metadata={"_progress": True, "_session_key": session_key},
+            )
             yield SimpleNamespace(kind="final", text="Done", metadata={"_session_key": session_key})
 
     bridge = OhmoGatewayBridge(bus=bus, runtime_pool=FakeRuntimePool())
@@ -2674,7 +2575,9 @@ async def test_gateway_bridge_logs_inbound_and_final(caplog):
     caplog.set_level(logging.INFO)
     try:
         await bus.publish_inbound(
-            InboundMessage(channel="feishu", sender_id="u1", chat_id="c1", content="please translate this")
+            InboundMessage(
+                channel="feishu", sender_id="u1", chat_id="c1", content="please translate this"
+            )
         )
         await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
         await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
@@ -2700,9 +2603,15 @@ async def test_gateway_bridge_stop_command_cancels_current_session():
     class FakeRuntimePool:
         async def stream_message(self, message, session_key):
             try:
-                yield SimpleNamespace(kind="progress", text="🤔 想一想…", metadata={"_progress": True, "_session_key": session_key})
+                yield SimpleNamespace(
+                    kind="progress",
+                    text="🤔 想一想…",
+                    metadata={"_progress": True, "_session_key": session_key},
+                )
                 await release.wait()
-                yield SimpleNamespace(kind="final", text="Done", metadata={"_session_key": session_key})
+                yield SimpleNamespace(
+                    kind="final", text="Done", metadata={"_session_key": session_key}
+                )
             except asyncio.CancelledError:
                 cancelled.set()
                 raise
@@ -2744,7 +2653,9 @@ async def test_gateway_bridge_restart_command_requests_gateway_restart():
         restart_payloads.append((message.channel, message.chat_id, session_key))
         restarted.set()
 
-    bridge = OhmoGatewayBridge(bus=bus, runtime_pool=FakeRuntimePool(), restart_gateway=fake_restart)
+    bridge = OhmoGatewayBridge(
+        bus=bus, runtime_pool=FakeRuntimePool(), restart_gateway=fake_restart
+    )
     task = asyncio.create_task(bridge.run())
     try:
         await bus.publish_inbound(
@@ -2759,8 +2670,7 @@ async def test_gateway_bridge_restart_command_requests_gateway_restart():
             await task
 
     assert restarting.content == (
-        "🔄 正在重启 gateway，马上回来。\n"
-        "Restarting the gateway now. I'll be back in a moment."
+        "🔄 正在重启 gateway，马上回来。\nRestarting the gateway now. I'll be back in a moment."
     )
     assert restart_payloads == [("feishu", "c1", "feishu:c1")]
 
@@ -2854,7 +2764,9 @@ async def test_ohmo_create_feishu_group_tool_creates_and_binds_metadata(tmp_path
     assert welcomes[0][0] == "oc_project_group"
     assert welcomes[0][2] == "ou_user"
     assert "已绑定工作目录" in welcomes[0][1]
-    record = load_managed_group_record(workspace=tmp_path, channel="feishu", chat_id="oc_project_group")
+    record = load_managed_group_record(
+        workspace=tmp_path, channel="feishu", chat_id="oc_project_group"
+    )
     assert record is not None
     assert record["owner_open_id"] == "ou_user"
     assert record["name"] == "HKUDS/OpenHarness"
@@ -3085,7 +2997,10 @@ async def test_gateway_service_publishes_pending_restart_notice(tmp_path, monkey
     await OhmoGatewayService._publish_pending_restart_notice(service)
 
     outbound = await asyncio.wait_for(service._bus.consume_outbound(), timeout=1.0)
-    assert outbound.content == "✅ gateway 已经重新连上，可以继续了。\nGateway is back online. We can continue."
+    assert (
+        outbound.content
+        == "✅ gateway 已经重新连上，可以继续了。\nGateway is back online. We can continue."
+    )
     assert outbound.chat_id == "chat-1"
     assert not notice_path.exists()
 
@@ -3134,9 +3049,7 @@ async def test_gateway_bridge_persists_interrupted_requests_on_stop(tmp_path):
 async def test_gateway_bridge_persist_skips_when_nothing_in_flight(tmp_path):
     workspace = tmp_path / ".ohmo-home"
     initialize_workspace(workspace)
-    bridge = OhmoGatewayBridge(
-        bus=MessageBus(), runtime_pool=object(), workspace=workspace
-    )
+    bridge = OhmoGatewayBridge(bus=MessageBus(), runtime_pool=object(), workspace=workspace)
     bridge.stop()
     assert not get_gateway_interrupted_requests_path(workspace).exists()
 
@@ -3188,14 +3101,20 @@ async def test_gateway_bridge_new_message_interrupts_same_session():
         async def stream_message(self, message, session_key):
             if message.content == "first":
                 try:
-                    yield SimpleNamespace(kind="progress", text="🤔 想一想…", metadata={"_progress": True, "_session_key": session_key})
+                    yield SimpleNamespace(
+                        kind="progress",
+                        text="🤔 想一想…",
+                        metadata={"_progress": True, "_session_key": session_key},
+                    )
                     await asyncio.Event().wait()
                 except asyncio.CancelledError:
                     first_cancelled.set()
                     raise
             else:
                 second_started.set()
-                yield SimpleNamespace(kind="final", text="second-done", metadata={"_session_key": session_key})
+                yield SimpleNamespace(
+                    kind="final", text="second-done", metadata={"_session_key": session_key}
+                )
 
     bridge = OhmoGatewayBridge(bus=bus, runtime_pool=FakeRuntimePool())
     task = asyncio.create_task(bridge.run())
@@ -3235,7 +3154,9 @@ async def test_runtime_pool_logs_session_lifecycle(tmp_path, monkeypatch, caplog
                 return None
 
             async def submit_message(self, content):
-                yield ToolExecutionStarted(tool_name="web_fetch", tool_input={"url": "https://example.com"})
+                yield ToolExecutionStarted(
+                    tool_name="web_fetch", tool_input={"url": "https://example.com"}
+                )
                 yield AssistantTextDelta(text="done")
 
         return SimpleNamespace(
@@ -3304,9 +3225,7 @@ def test_gateway_provider_command_uses_ohmo_gateway_profile(tmp_path, monkeypatc
     assert load_gateway_config(workspace).provider_profile == "codex"
 
 
-def test_gateway_provider_command_survives_nutrition_child_mode_drift(tmp_path, monkeypatch):
-    assets = tmp_path / "nutrition-assets"
-    assets.mkdir(mode=0o700)
+def test_gateway_provider_command_survives_child_mode_drift(tmp_path, monkeypatch):
     workspace = initialize_workspace(tmp_path / ".ohmo-home")
     save_gateway_config(
         GatewayConfig(
@@ -3322,18 +3241,9 @@ def test_gateway_provider_command_survives_nutrition_child_mode_drift(tmp_path, 
                     "observed_peer": "marina",
                 }
             },
-            nutrition_ingest=NutritionIngestConfig(
-                enabled=True,
-                synchronized_root=assets,
-                principal="123",
-                chat_id="123",
-                session_key="telegram:123",
-            ),
         ),
         workspace,
     )
-    (assets / "synchronized.json").write_text("{}", encoding="utf-8")
-    (assets / "synchronized.json").chmod(0o644)
 
     statuses = {
         "codex": {
@@ -3367,9 +3277,7 @@ def test_gateway_provider_command_survives_nutrition_child_mode_drift(tmp_path, 
     assert load_gateway_config(workspace).provider_profile == "codex"
 
 
-def test_gateway_service_accepts_nutrition_child_mode_drift(tmp_path, monkeypatch):
-    assets = tmp_path / "nutrition-assets"
-    assets.mkdir(mode=0o700)
+def test_gateway_service_accepts_child_mode_drift(tmp_path, monkeypatch):
     workspace = initialize_workspace(tmp_path / ".ohmo-home")
     config = GatewayConfig(
         conversation_learning=True,
@@ -3383,69 +3291,16 @@ def test_gateway_service_accepts_nutrition_child_mode_drift(tmp_path, monkeypatc
                 "observed_peer": "marina",
             }
         },
-        nutrition_ingest=NutritionIngestConfig(
-            enabled=True,
-            synchronized_root=assets,
-            principal="123",
-            chat_id="123",
-            session_key="telegram:123",
-        ),
     )
-    (assets / "synchronized.json").write_text("{}", encoding="utf-8")
-    (assets / "synchronized.json").chmod(0o644)
     monkeypatch.setattr("ohmo.gateway.service.load_gateway_config", lambda _workspace: config)
 
     OhmoGatewayService(cwd=tmp_path, workspace=workspace)
 
 
-def test_load_gateway_config_discards_retired_nutrition_filesystem_key(tmp_path):
-    assets = tmp_path / "nutrition-assets"
-    assets.mkdir(mode=0o755)
-    child = assets / "synchronized.json"
-    child.write_text("{}", encoding="utf-8")
-    child.chmod(0o644)
-    workspace = initialize_workspace(tmp_path / ".ohmo-home")
-    save_gateway_config(
-        GatewayConfig(
-            conversation_learning=True,
-            family_principals={"123": "marina"},
-            enabled_memory_tenants=("marina",),
-            honcho_base_url="https://honcho.test",
-            tenant_honcho={
-                "marina": {
-                    "workspace": "marina-workspace",
-                    "api_key": "marina-key",
-                    "observed_peer": "marina",
-                }
-            },
-            nutrition_ingest=NutritionIngestConfig(
-                enabled=True,
-                synchronized_root=assets,
-                principal="123",
-                chat_id="123",
-                session_key="telegram:123",
-            ),
-        ),
-        workspace,
-    )
-    raw = json.loads((workspace / "gateway.json").read_text(encoding="utf-8"))
-    raw["nutrition_ingest"]["require_owner_only_filesystem"] = True
-    (workspace / "gateway.json").write_text(
-        json.dumps(raw) + "\n",
-        encoding="utf-8",
-    )
-
-    config = load_gateway_config(workspace)
-
-    assert config.nutrition_ingest.enabled is True
-    assert "require_owner_only_filesystem" not in config.nutrition_ingest.model_dump()
-    OhmoGatewayService(cwd=tmp_path, workspace=workspace)
-
-
-def test_load_gateway_config_still_rejects_unknown_nutrition_key(tmp_path):
+def test_load_gateway_config_rejects_unknown_camera_ingress_key(tmp_path):
     workspace = initialize_workspace(tmp_path / ".ohmo-home")
     (workspace / "gateway.json").write_text(
-        json.dumps({"nutrition_ingest": {"enabled": False, "unknown_key": True}}) + "\n",
+        json.dumps({"camera_ingress": {"unknown_key": True}}) + "\n",
         encoding="utf-8",
     )
 
@@ -3476,7 +3331,9 @@ def test_gateway_model_command_updates_selected_gateway_profile(tmp_path, monkey
         def update_profile(self, name, **kwargs):
             nonlocal profile
             updates.append((name, kwargs))
-            profile = profile.model_copy(update={key: value for key, value in kwargs.items() if value is not None})
+            profile = profile.model_copy(
+                update={key: value for key, value in kwargs.items() if value is not None}
+            )
 
     monkeypatch.setattr("ohmo.gateway.provider_commands.load_settings", lambda: object())
     monkeypatch.setattr("ohmo.gateway.provider_commands.AuthManager", FakeAuthManager)
@@ -3528,7 +3385,11 @@ def test_runtime_pool_only_exposes_group_tool_for_group_command_turn(tmp_path):
             sender_id="u1",
             chat_id="u1",
             content="create",
-            metadata={"_ohmo_group_command": True, "_ohmo_group_raw_request": "创建项目群", "chat_type": "p2p"},
+            metadata={
+                "_ohmo_group_command": True,
+                "_ohmo_group_raw_request": "创建项目群",
+                "chat_type": "p2p",
+            },
         ),
         "feishu:u1",
     )
@@ -3542,16 +3403,18 @@ def test_runtime_pool_only_exposes_group_tool_for_group_command_turn(tmp_path):
 
 
 def test_runtime_pool_sanitizes_internal_group_prompt_history():
-    messages = _sanitize_group_command_prompts([
-        ConversationMessage.from_user_text(
-            "The user invoked `/group` from a Feishu private chat.\n"
-            "Your task is to create a dedicated Feishu group for this request.\n\n"
-            "Use the `ohmo_create_feishu_group` tool exactly once.\n\n"
-            "User /group request:\n"
-            "帮我创建一个群聊专门处理novix-monorepo的问题，绑定cwd在~/novix-monorepo"
-        ),
-        ConversationMessage.from_user_text("你现在使用的是什么模型"),
-    ])
+    messages = _sanitize_group_command_prompts(
+        [
+            ConversationMessage.from_user_text(
+                "The user invoked `/group` from a Feishu private chat.\n"
+                "Your task is to create a dedicated Feishu group for this request.\n\n"
+                "Use the `ohmo_create_feishu_group` tool exactly once.\n\n"
+                "User /group request:\n"
+                "帮我创建一个群聊专门处理novix-monorepo的问题，绑定cwd在~/novix-monorepo"
+            ),
+            ConversationMessage.from_user_text("你现在使用的是什么模型"),
+        ]
+    )
 
     first_text = messages[0].text
     assert "Use the `ohmo_create_feishu_group` tool exactly once" not in first_text
@@ -3581,7 +3444,9 @@ def test_runtime_pool_sanitizes_internal_group_prompt_metadata():
     )
 
     focus = metadata["task_focus_state"]
-    rendered = "\n".join([focus["goal"], *focus["recent_goals"], focus["next_step"], *metadata["recent_work_log"]])
+    rendered = "\n".join(
+        [focus["goal"], *focus["recent_goals"], focus["next_step"], *metadata["recent_work_log"]]
+    )
     assert "Use the `ohmo_create_feishu_group` tool exactly once" not in rendered
     assert "[Handled /group request]" in rendered
     assert "你现在使用的是什么模型" in rendered
@@ -3661,8 +3526,12 @@ async def test_runtime_pool_provider_command_refresh_uses_gateway_profile(tmp_pa
     monkeypatch.setattr("ohmo.gateway.runtime.start_runtime", fake_start_runtime)
     monkeypatch.setattr("ohmo.gateway.runtime.close_runtime", fake_close_runtime)
 
-    pool = OhmoSessionRuntimePool(cwd=tmp_path, workspace=workspace, provider_profile="kimi-anthropic")
-    message = InboundMessage(channel="feishu", sender_id="u1", chat_id="c1", content="/provider codex")
+    pool = OhmoSessionRuntimePool(
+        cwd=tmp_path, workspace=workspace, provider_profile="kimi-anthropic"
+    )
+    message = InboundMessage(
+        channel="feishu", sender_id="u1", chat_id="c1", content="/provider codex"
+    )
     updates = [u async for u in pool.stream_message(message, "feishu:c1")]
 
     assert updates[-1].text.startswith("ohmo gateway provider_profile set to codex")
@@ -3808,7 +3677,9 @@ async def test_runtime_pool_lazily_refreshes_other_cached_bundles_after_gateway_
 
 
 @pytest.mark.asyncio
-async def test_runtime_pool_stream_message_handles_slash_command_and_refresh_runtime(tmp_path, monkeypatch):
+async def test_runtime_pool_stream_message_handles_slash_command_and_refresh_runtime(
+    tmp_path, monkeypatch
+):
     workspace = tmp_path / ".ohmo-home"
     initialize_workspace(workspace)
     build_calls: list[dict[str, object]] = []
@@ -3838,7 +3709,9 @@ async def test_runtime_pool_stream_message_handles_slash_command_and_refresh_run
             engine=engine,
             session_id="sess123",
             current_settings=lambda: SimpleNamespace(model="gpt-5.4"),
-            commands=SimpleNamespace(lookup=lambda raw: (FakeCommand(), "") if raw == "/plan" else None),
+            commands=SimpleNamespace(
+                lookup=lambda raw: (FakeCommand(), "") if raw == "/plan" else None
+            ),
             hook_summary=lambda: "",
             mcp_summary=lambda: "",
             plugin_summary=lambda: "",
@@ -3868,7 +3741,9 @@ async def test_runtime_pool_stream_message_handles_slash_command_and_refresh_run
     assert [u.text for u in updates] == ["Permission mode set to plan"]
     assert len(build_calls) == 2
     assert close_calls == ["sess123"]
-    assert build_calls[1]["restore_messages"] == [ConversationMessage.from_user_text("before").model_dump(mode="json")]
+    assert build_calls[1]["restore_messages"] == [
+        ConversationMessage.from_user_text("before").model_dump(mode="json")
+    ]
 
 
 @pytest.mark.asyncio
@@ -3883,7 +3758,9 @@ async def test_runtime_pool_refresh_runtime_drops_dangling_tool_use_tail(tmp_pat
                 ConversationMessage.from_user_text("before"),
                 ConversationMessage(
                     role="assistant",
-                    content=[ToolUseBlock(id="write_file:234", name="write_file", input={"path": "x"})],
+                    content=[
+                        ToolUseBlock(id="write_file:234", name="write_file", input={"path": "x"})
+                    ],
                 ),
             ]
             self.total_usage = UsageSnapshot()
@@ -3908,7 +3785,9 @@ async def test_runtime_pool_refresh_runtime_drops_dangling_tool_use_tail(tmp_pat
             engine=FakeEngine(),
             session_id="sess123",
             current_settings=lambda: SimpleNamespace(model="gpt-5.4"),
-            commands=SimpleNamespace(lookup=lambda raw: (FakeCommand(), "") if raw == "/provider github" else None),
+            commands=SimpleNamespace(
+                lookup=lambda raw: (FakeCommand(), "") if raw == "/provider github" else None
+            ),
             hook_summary=lambda: "",
             mcp_summary=lambda: "",
             plugin_summary=lambda: "",
@@ -3934,15 +3813,21 @@ async def test_runtime_pool_refresh_runtime_drops_dangling_tool_use_tail(tmp_pat
     monkeypatch.setattr("ohmo.gateway.runtime.close_runtime", fake_close_runtime)
 
     pool = OhmoSessionRuntimePool(cwd=tmp_path, workspace=workspace, provider_profile="codex")
-    message = InboundMessage(channel="feishu", sender_id="u1", chat_id="c1", content="/provider github")
+    message = InboundMessage(
+        channel="feishu", sender_id="u1", chat_id="c1", content="/provider github"
+    )
     _ = [u async for u in pool.stream_message(message, "feishu:c1")]
 
     assert len(build_calls) == 2
-    assert build_calls[1]["restore_messages"] == [ConversationMessage.from_user_text("before").model_dump(mode="json")]
+    assert build_calls[1]["restore_messages"] == [
+        ConversationMessage.from_user_text("before").model_dump(mode="json")
+    ]
 
 
 @pytest.mark.asyncio
-async def test_runtime_pool_stream_message_handles_plugin_command_submit_prompt(tmp_path, monkeypatch):
+async def test_runtime_pool_stream_message_handles_plugin_command_submit_prompt(
+    tmp_path, monkeypatch
+):
     workspace = tmp_path / ".ohmo-home"
     initialize_workspace(workspace)
     submitted: list[object] = []
@@ -3972,7 +3857,9 @@ async def test_runtime_pool_stream_message_handles_plugin_command_submit_prompt(
             engine=FakeEngine(),
             session_id="sess123",
             current_settings=lambda: SimpleNamespace(model="gpt-5.4"),
-            commands=SimpleNamespace(lookup=lambda raw: (FakeCommand(), "hello") if raw == "/plugin-cmd hello" else None),
+            commands=SimpleNamespace(
+                lookup=lambda raw: (FakeCommand(), "hello") if raw == "/plugin-cmd hello" else None
+            ),
             hook_summary=lambda: "",
             mcp_summary=lambda: "",
             plugin_summary=lambda: "",
@@ -3992,7 +3879,9 @@ async def test_runtime_pool_stream_message_handles_plugin_command_submit_prompt(
     monkeypatch.setattr("ohmo.gateway.runtime.start_runtime", fake_start_runtime)
 
     pool = OhmoSessionRuntimePool(cwd=tmp_path, workspace=workspace, provider_profile="codex")
-    message = InboundMessage(channel="feishu", sender_id="u1", chat_id="c1", content="/plugin-cmd hello")
+    message = InboundMessage(
+        channel="feishu", sender_id="u1", chat_id="c1", content="/plugin-cmd hello"
+    )
     updates = [u async for u in pool.stream_message(message, "feishu:c1")]
 
     assert submitted == ["plugin expanded prompt"]
@@ -4000,7 +3889,9 @@ async def test_runtime_pool_stream_message_handles_plugin_command_submit_prompt(
 
 
 @pytest.mark.asyncio
-async def test_runtime_pool_parses_group_slash_command_before_speaker_context(tmp_path, monkeypatch):
+async def test_runtime_pool_parses_group_slash_command_before_speaker_context(
+    tmp_path, monkeypatch
+):
     workspace = tmp_path / ".ohmo-home"
     initialize_workspace(workspace)
 
@@ -4113,7 +4004,9 @@ async def test_runtime_pool_stream_message_handles_ohmo_skill_slash_command(tmp_
     monkeypatch.setattr("ohmo.gateway.runtime.start_runtime", fake_start_runtime)
 
     pool = OhmoSessionRuntimePool(cwd=tmp_path, workspace=workspace, provider_profile="codex")
-    message = InboundMessage(channel="feishu", sender_id="u1", chat_id="c1", content="/quick-note hello")
+    message = InboundMessage(
+        channel="feishu", sender_id="u1", chat_id="c1", content="/quick-note hello"
+    )
     updates = [u async for u in pool.stream_message(message, "feishu:c1")]
 
     assert len(submitted) == 1
@@ -4153,8 +4046,8 @@ async def test_reset_session_pops_bundle_and_clears_pointer(tmp_path, monkeypatc
     had = await pool.reset_session("telegram:7")
 
     assert had is True
-    assert closed["bundle"] is sentinel               # bundle closed in-task
-    assert "telegram:7" not in pool._bundles          # dropped from memory
+    assert closed["bundle"] is sentinel  # bundle closed in-task
+    assert "telegram:7" not in pool._bundles  # dropped from memory
     assert pool._session_backend.load_latest_for_session_key("telegram:7") is None  # pointer gone
     # NB: /new no longer wipes a shared TODO.md — lists are per-session_id, so the
     # next message's fresh session_id starts a clean list (old file kept on disk).
@@ -4190,7 +4083,7 @@ async def test_gateway_bridge_new_command_resets_session():
         with contextlib.suppress(asyncio.CancelledError):
             await task
 
-    assert pool.reset_calls            # /new actually invoked reset_session...
+    assert pool.reset_calls  # /new actually invoked reset_session...
     assert "сброшен" in reply.content.lower()  # ...and confirmed, not run through the model
 
 
@@ -4204,8 +4097,8 @@ def test_extract_attachments_strips_markers_and_keeps_existing_files(tmp_path):
 
     clean, media = _extract_attachments(text)
 
-    assert media == [str(existing)]          # only the existing file is attached
-    assert "[[attach" not in clean           # every marker stripped (incl. the missing one)
+    assert media == [str(existing)]  # only the existing file is attached
+    assert "[[attach" not in clean  # every marker stripped (incl. the missing one)
     assert "Готово" in clean and "хвост" in clean
 
 
@@ -4241,7 +4134,7 @@ def test_extract_attachments_dedupes_same_file(tmp_path):
     f = tmp_path / "a.html"
     f.write_text("x")
     clean, media = _extract_attachments(f"[[attach:{f}]] [[attach:  {f} ]]")
-    assert media == [str(f)]                 # same path referenced twice -> one attachment
+    assert media == [str(f)]  # same path referenced twice -> one attachment
     assert clean == ""
 
 
@@ -4251,7 +4144,7 @@ def test_extract_ask_parses_question_and_options():
     clean, question, options = _extract_ask(
         "Прикинул варианты.\n[[ask: Куда едем? | Питер | Москва | Дома]]"
     )
-    assert clean == "Прикинул варианты."          # marker stripped from visible text
+    assert clean == "Прикинул варианты."  # marker stripped from visible text
     assert question == "Куда едем?"
     assert options == ["Питер", "Москва", "Дома"]
 
@@ -4337,6 +4230,7 @@ def test_speaker_context_group_still_labeled_as_group():
 
 
 # --- merged from origin/main: media/autopilot/tasks/slack/logging tests ---
+
 
 @pytest.mark.asyncio
 async def test_slack_thread_messages_use_sender_scoped_router_keys(monkeypatch):
@@ -4426,7 +4320,9 @@ async def test_slack_thread_messages_use_sender_scoped_router_keys(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_runtime_pool_summary_does_not_restore_other_slack_thread_sender(tmp_path, monkeypatch):
+async def test_runtime_pool_summary_does_not_restore_other_slack_thread_sender(
+    tmp_path, monkeypatch
+):
     workspace = tmp_path / ".ohmo-home"
     initialize_workspace(workspace)
     alice_message = InboundMessage(
@@ -4464,7 +4360,10 @@ async def test_runtime_pool_summary_does_not_restore_other_slack_thread_sender(t
     )
 
     async def fake_build_runtime(**kwargs):
-        restored = [ConversationMessage.model_validate(item) for item in (kwargs.get("restore_messages") or [])]
+        restored = [
+            ConversationMessage.model_validate(item)
+            for item in (kwargs.get("restore_messages") or [])
+        ]
 
         class FakeEngine:
             def __init__(self):
@@ -4585,7 +4484,9 @@ async def test_runtime_pool_blocks_registered_resume_without_listing_or_loading_
         assert alice_secret not in updates[-1].text
 
 
-def test_start_gateway_process_uses_child_log_file_handler_without_console_duplication(tmp_path, monkeypatch):
+def test_start_gateway_process_uses_child_log_file_handler_without_console_duplication(
+    tmp_path, monkeypatch
+):
     workspace = tmp_path / ".ohmo-home"
     initialize_workspace(workspace)
     captured: dict[str, object] = {}
@@ -4684,7 +4585,9 @@ async def test_runtime_pool_blocks_registered_diff_full_without_leaking_workspac
 
 @pytest.mark.asyncio
 @pytest.mark.asyncio
-async def test_runtime_pool_stream_message_emits_media_for_generated_tool_paths(tmp_path, monkeypatch):
+async def test_runtime_pool_stream_message_emits_media_for_generated_tool_paths(
+    tmp_path, monkeypatch
+):
     workspace = tmp_path / ".ohmo-home"
     initialize_workspace(workspace)
     image_path = tmp_path / "generated.png"
@@ -4821,7 +4724,9 @@ async def test_runtime_pool_does_not_duplicate_final_reply_image_media(tmp_path,
 
 
 @pytest.mark.asyncio
-async def test_runtime_pool_blocks_registered_commit_without_running_git_hooks(tmp_path, monkeypatch):
+async def test_runtime_pool_blocks_registered_commit_without_running_git_hooks(
+    tmp_path, monkeypatch
+):
     workspace = tmp_path / ".ohmo-home"
     initialize_workspace(workspace)
     repo = tmp_path / "repo"
@@ -4843,7 +4748,9 @@ async def test_runtime_pool_blocks_registered_commit_without_running_git_hooks(t
     )
     tracked = repo / "tracked.txt"
     tracked.write_text("before\n", encoding="utf-8")
-    subprocess.run(["git", "add", "tracked.txt"], cwd=repo, check=True, capture_output=True, text=True)
+    subprocess.run(
+        ["git", "add", "tracked.txt"], cwd=repo, check=True, capture_output=True, text=True
+    )
     subprocess.run(
         ["git", "commit", "-m", "initial"],
         cwd=repo,
@@ -4967,7 +4874,9 @@ async def test_runtime_pool_blocks_registered_tasks_run_without_shelling_out(tmp
 
 
 @pytest.mark.asyncio
-async def test_runtime_pool_blocks_project_context_commands_without_writing_files(tmp_path, monkeypatch):
+async def test_runtime_pool_blocks_project_context_commands_without_writing_files(
+    tmp_path, monkeypatch
+):
     workspace = tmp_path / ".ohmo-home"
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -5021,10 +4930,18 @@ async def test_runtime_pool_blocks_project_context_commands_without_writing_file
     pool = OhmoSessionRuntimePool(cwd=repo, workspace=workspace, provider_profile="codex")
 
     for payload, expected_denial in (
-        ("/issue set Remote supplied issue :: REMOTE_ISSUE_CONTEXT_POISON", "/issue is only available in the local OpenHarness UI."),
-        ("/pr_comments add src/app.py:1 :: REMOTE_PR_COMMENT_POISON", "/pr_comments is only available in the local OpenHarness UI."),
+        (
+            "/issue set Remote supplied issue :: REMOTE_ISSUE_CONTEXT_POISON",
+            "/issue is only available in the local OpenHarness UI.",
+        ),
+        (
+            "/pr_comments add src/app.py:1 :: REMOTE_PR_COMMENT_POISON",
+            "/pr_comments is only available in the local OpenHarness UI.",
+        ),
     ):
-        message = InboundMessage(channel="slack", sender_id="U_ATTACKER", chat_id="C_SHARED", content=payload)
+        message = InboundMessage(
+            channel="slack", sender_id="U_ATTACKER", chat_id="C_SHARED", content=payload
+        )
         updates = [u async for u in pool.stream_message(message, "slack:C_SHARED:U_ATTACKER")]
         assert updates[-1].kind == "final"
         assert updates[-1].text == expected_denial
@@ -5049,7 +4966,9 @@ async def test_gateway_bridge_publishes_media_updates():
     bridge = OhmoGatewayBridge(bus=bus, runtime_pool=FakeRuntimePool())
     task = asyncio.create_task(bridge.run())
     try:
-        await bus.publish_inbound(InboundMessage(channel="feishu", sender_id="u1", chat_id="c1", content="draw"))
+        await bus.publish_inbound(
+            InboundMessage(channel="feishu", sender_id="u1", chat_id="c1", content="draw")
+        )
         outbound = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
     finally:
         bridge.stop()
@@ -5079,7 +4998,9 @@ async def test_gateway_bridge_publishes_final_media_updates():
     bridge = OhmoGatewayBridge(bus=bus, runtime_pool=FakeRuntimePool())
     task = asyncio.create_task(bridge.run())
     try:
-        await bus.publish_inbound(InboundMessage(channel="feishu", sender_id="u1", chat_id="c1", content="draw"))
+        await bus.publish_inbound(
+            InboundMessage(channel="feishu", sender_id="u1", chat_id="c1", content="draw")
+        )
         outbound = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
     finally:
         bridge.stop()
@@ -5094,7 +5015,9 @@ async def test_gateway_bridge_publishes_final_media_updates():
 
 
 @pytest.mark.asyncio
-async def test_runtime_pool_blocks_registered_autopilot_run_next_from_remote_messages(tmp_path, monkeypatch):
+async def test_runtime_pool_blocks_registered_autopilot_run_next_from_remote_messages(
+    tmp_path, monkeypatch
+):
     workspace = tmp_path / ".ohmo-home"
     initialize_workspace(workspace)
     RepoAutopilotStore(tmp_path).enqueue_card(
@@ -5153,7 +5076,9 @@ async def test_runtime_pool_blocks_registered_autopilot_run_next_from_remote_mes
     monkeypatch.setattr("ohmo.gateway.runtime.start_runtime", fake_start_runtime)
 
     pool = OhmoSessionRuntimePool(cwd=tmp_path, workspace=workspace, provider_profile="codex")
-    message = InboundMessage(channel="slack", sender_id="u1", chat_id="c1", content="/autopilot run-next")
+    message = InboundMessage(
+        channel="slack", sender_id="u1", chat_id="c1", content="/autopilot run-next"
+    )
     updates = [u async for u in pool.stream_message(message, "slack:c1:u1")]
 
     assert updates[-1].text == "/autopilot is only available in the local OpenHarness UI."

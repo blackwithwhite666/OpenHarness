@@ -89,8 +89,8 @@ class ConversationAppendReceipt:
         return self.assistant_message_id
 
 
-class NutritionReconciliationError(RuntimeError):
-    """Honcho contained no unambiguous trusted result for a retry."""
+class ConversationReconciliationError(RuntimeError):
+    """Honcho contained no unambiguous result for a durable retry."""
 
 
 def resolve_tenant_honcho_binding(
@@ -255,9 +255,7 @@ class CatalogMemoryBackend(MemoryBackend):
         self._tenant_id = tenant_id.strip()
         if not self._tenant_id:
             raise ValueError("a catalog memory tenant id is required")
-        self._shared_tenant_id = (
-            shared_tenant_id.strip() if shared_tenant_id is not None else None
-        )
+        self._shared_tenant_id = shared_tenant_id.strip() if shared_tenant_id is not None else None
         if self._shared_tenant_id == "":
             raise ValueError("a shared catalog memory tenant id cannot be empty")
         if self._shared_tenant_id == self._tenant_id:
@@ -417,11 +415,7 @@ class CatalogMemoryBackend(MemoryBackend):
             await self._best_effort_embed(record)
 
     async def _best_effort_embed(self, record: CatalogRecord) -> None:
-        if (
-            self._embedder is None
-            or not self._embedding_model
-            or record.archive_status != "active"
-        ):
+        if self._embedder is None or not self._embedding_model or record.archive_status != "active":
             return
         try:
             vectors = await self._embed_texts([_embedding_text(record)])
@@ -559,8 +553,7 @@ class CatalogMemoryBackend(MemoryBackend):
             index_lines = [
                 "# Memory Index",
                 *(
-                    f"- [{record.title}]({record.slug}.md)"
-                    f"{' [shared]' if shared else ''}"
+                    f"- [{record.title}]({record.slug}.md){' [shared]' if shared else ''}"
                     for record, shared in labeled_records
                 ),
             ][:200]
@@ -591,9 +584,7 @@ class CatalogMemoryBackend(MemoryBackend):
                 body = content[:_MEMORY_ENTRY_RENDER_CHARS]
 
             if shown > 0 and used + len(body) > render_budget:
-                remaining = sum(
-                    1 for item, _ in labeled_records[index:] if item.content.strip()
-                )
+                remaining = sum(1 for item, _ in labeled_records[index:] if item.content.strip())
                 if remaining:
                     lines.append("")
                     lines.append(
@@ -848,11 +839,7 @@ class ShadowMemoryBackend(MemoryBackend):
             self._pending.add(task)
             task.add_done_callback(self._pending.discard)
 
-        prefix = (
-            f"{_DERIVED_RECALL_HEADING}\n"
-            f"{_DERIVED_RECALL_PROVENANCE}\n"
-            f"{UNTRUSTED_BANNER}"
-        )
+        prefix = f"{_DERIVED_RECALL_HEADING}\n{_DERIVED_RECALL_PROVENANCE}\n{UNTRUSTED_BANNER}"
         if len(prefix) >= budget:
             return None
 
@@ -902,32 +889,20 @@ class ShadowMemoryBackend(MemoryBackend):
         user_metadata: Mapping[str, object],
         assistant_metadata: Mapping[str, object],
         durable: bool = False,
-        trusted_nutrition: bool = False,
-        nutrition: bool | None = None,
     ) -> ConversationAppendReceipt | None:
-        if nutrition is not None:
-            trusted_nutrition = trusted_nutrition or nutrition
         honcho_client = self._honcho_client
         if not self._conversation_learning or honcho_client is None:
             await self._base.append_turn("user", user_text)
             await self._base.append_turn("assistant", assistant_text)
-            if durable or trusted_nutrition:
-                raise NutritionReconciliationError("durable nutrition ingestion is unavailable")
+            if durable:
+                raise ConversationReconciliationError("durable conversation storage is unavailable")
             return None
 
         user_metadata_mapping = dict(user_metadata)
         assistant_metadata_mapping = dict(assistant_metadata)
         user_metadata_mapping["role"] = "user"
         assistant_metadata_mapping["role"] = "assistant"
-        is_trusted_nutrition = trusted_nutrition or bool(
-            assistant_metadata_mapping.get("_nutrition_trusted")
-        )
-        if is_trusted_nutrition:
-            _validate_trusted_nutrition_metadata(
-                user_metadata_mapping,
-                assistant_metadata_mapping,
-            )
-        if durable or is_trusted_nutrition:
+        if durable:
             return await self._append_exchange_durable(
                 honcho_client,
                 user_text=user_text,
@@ -968,7 +943,7 @@ class ShadowMemoryBackend(MemoryBackend):
             )
             if existing_assistant is not None:
                 if existing_user is None:
-                    raise NutritionReconciliationError(
+                    raise ConversationReconciliationError(
                         "assistant operation exists without its paired user message"
                     )
                 return ConversationAppendReceipt(
@@ -981,7 +956,11 @@ class ShadowMemoryBackend(MemoryBackend):
             messages: list[dict[str, object]] = []
             if existing_user is None:
                 messages.append(
-                    {"content": user_text, "peer_id": self._observed, "metadata": dict(user_metadata)}
+                    {
+                        "content": user_text,
+                        "peer_id": self._observed,
+                        "metadata": dict(user_metadata),
+                    }
                 )
             messages.append(
                 {
@@ -1013,12 +992,12 @@ class ShadowMemoryBackend(MemoryBackend):
 
             expected_count = len(messages)
             if len(created) != expected_count:
-                raise NutritionReconciliationError("Honcho returned an incomplete message batch")
+                raise ConversationReconciliationError("Honcho returned an incomplete message batch")
             by_role = {str(item.metadata.get("role")): item for item in created}
             user_message = existing_user or by_role.get("user")
             assistant_message = by_role.get("assistant")
             if user_message is None or assistant_message is None:
-                raise NutritionReconciliationError("Honcho response omitted a paired message")
+                raise ConversationReconciliationError("Honcho response omitted a paired message")
             return ConversationAppendReceipt(
                 user_message_id=user_message.id,
                 assistant_message_id=assistant_message.id,
@@ -1033,13 +1012,9 @@ class ShadowMemoryBackend(MemoryBackend):
         *,
         expected_role: str,
     ):
-        matches = await honcho_client.find_messages_by_client_op_id(
-            self._session, client_op_id
-        )
+        matches = await honcho_client.find_messages_by_client_op_id(self._session, client_op_id)
         if len(matches) > 1:
-            raise NutritionReconciliationError(
-                f"ambiguous Honcho operation {client_op_id!r}"
-            )
+            raise ConversationReconciliationError(f"ambiguous Honcho operation {client_op_id!r}")
         if not matches:
             return None
         message = matches[0]
@@ -1047,9 +1022,7 @@ class ShadowMemoryBackend(MemoryBackend):
             message.metadata.get("client_op_id") != client_op_id
             or message.metadata.get("role") != expected_role
         ):
-            raise NutritionReconciliationError(
-                f"malformed Honcho operation {client_op_id!r}"
-            )
+            raise ConversationReconciliationError(f"malformed Honcho operation {client_op_id!r}")
         return message
 
     async def await_pending(self) -> None:
@@ -1120,9 +1093,7 @@ class ShadowMemoryBackend(MemoryBackend):
             catalog_latency_ms = (perf_counter() - started) * 1_000
             record = build_shadow_record(
                 query=query,
-                catalog_hits=[
-                    (hit.name, hit.rank, hit.snippet) for hit in catalog_hits
-                ],
+                catalog_hits=[(hit.name, hit.rank, hit.snippet) for hit in catalog_hits],
                 honcho_hits=honcho_hits,  # type: ignore[arg-type]
                 catalog_latency_ms=catalog_latency_ms,
                 honcho_latency_ms=honcho_latency_ms,
@@ -1195,56 +1166,11 @@ def _embedding_text(record: CatalogRecord) -> str:
     return f"{record.title}\n{record.content}"
 
 
-_TRUSTED_NUTRITION_KEYS = frozenset(
-    {
-        "_nutrition_trusted",
-        "ingest_source",
-        "confirmation_required",
-        "candidate_id",
-        "nutrition_phase",
-        "client_op_id",
-    }
-)
-
-
 def _required_client_op_id(metadata: Mapping[str, object], role: str) -> str:
     value = metadata.get("client_op_id")
     if not isinstance(value, str) or not value.strip():
-        raise NutritionReconciliationError(f"{role} client_op_id is required")
+        raise ConversationReconciliationError(f"{role} client_op_id is required")
     return value.strip()
-
-
-def _validate_trusted_nutrition_metadata(
-    user_metadata: Mapping[str, object],
-    assistant_metadata: Mapping[str, object],
-) -> None:
-    if user_metadata.get("_nutrition_trusted") is not True:
-        raise NutritionReconciliationError("nutrition provenance is not coordinator-trusted")
-    if assistant_metadata.get("_nutrition_trusted") is not True:
-        raise NutritionReconciliationError("nutrition assistant provenance is not coordinator-trusted")
-    if user_metadata.get("ingest_source") != "dropbox_camera" or assistant_metadata.get(
-        "ingest_source"
-    ) != "dropbox_camera":
-        raise NutritionReconciliationError("unsupported nutrition ingest source")
-    if user_metadata.get("tenant_id") != "marina" or assistant_metadata.get("tenant_id") != "marina":
-        raise NutritionReconciliationError("nutrition provenance is not Marina-bound")
-    principal = user_metadata.get("source_principal")
-    if not isinstance(principal, str) or not principal.startswith("telegram:"):
-        raise NutritionReconciliationError("nutrition provenance has no Telegram principal")
-    if user_metadata.get("confirmation_required") is not True or assistant_metadata.get(
-        "confirmation_required"
-    ) is not True:
-        raise NutritionReconciliationError("nutrition confirmation is required")
-    candidate = user_metadata.get("candidate_id")
-    if not isinstance(candidate, str) or candidate != assistant_metadata.get("candidate_id"):
-        raise NutritionReconciliationError("nutrition candidate identity mismatch")
-    phase = user_metadata.get("nutrition_phase")
-    if phase != "estimation" or assistant_metadata.get("nutrition_phase") != phase:
-        raise NutritionReconciliationError("nutrition phase must be estimation")
-    if assistant_metadata.get("client_op_id") != f"{candidate}:meal-observation:v1":
-        raise NutritionReconciliationError("nutrition assistant operation is not candidate-bound")
-    if user_metadata.get("client_op_id") == assistant_metadata.get("client_op_id"):
-        raise NutritionReconciliationError("paired nutrition operation ids must differ")
 
 
 def _embedding_is_current(

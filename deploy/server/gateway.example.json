@@ -36,17 +36,15 @@
       "observed_peer": "${MARINA_HONCHO_OBSERVED_PEER}"
     }
   },
-  "nutrition_ingest": {
-    "enabled": false,
-    "synchronized_root": "${NUTRITION_ASSETS_ROOT}",
-    "principal": "${MARINA_TELEGRAM_PRINCIPAL}",
-    "chat_id": "${MARINA_TELEGRAM_PRIVATE_CHAT_ID}",
-    "session_key": "telegram:${MARINA_TELEGRAM_PRINCIPAL}",
-    "tenant_id": "marina",
-    "locale": "ru",
-    "poll_interval_seconds": 10.0,
-    "max_prompt_attempts": 3,
-    "max_estimation_attempts": 5,
-    "retry_backoff_seconds": 5.0
+  "camera_ingress": {
+    "enabled": true,
+    "listen_host": "10.8.0.8",
+    "listen_port": 18751,
+    "bearer_token_file": "${CAMERA_API_TOKEN_FILE}",
+    "synchronized_root": "${CAMERA_SHARED_DROPBOX_ROOT}",
+    "principal": "${CAMERA_TELEGRAM_PRINCIPAL}",
+    "tenant_id": "${CAMERA_TENANT_ID}",
+    "chat_id": "${CAMERA_TELEGRAM_PRIVATE_CHAT_ID}",
+    "session_key": "telegram:${CAMERA_TELEGRAM_PRINCIPAL}"
   }
 }

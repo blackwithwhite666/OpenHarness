@@ -22,9 +22,6 @@ from ohmo.gateway.camera import CameraIngress, serve_camera_http
 from ohmo.gateway.config import build_channel_manager_config, load_gateway_config
 from ohmo.gateway.models import GatewayState
 from ohmo.gateway.runtime import OhmoSessionRuntimePool
-from ohmo.memory_backend import resolve_tenant_honcho_binding
-from ohmo.memory_service.honcho_client import HonchoClient
-from ohmo.nutrition_ingest.coordinator import NutritionIngestCoordinator
 from ohmo.reminders.scheduler import ReminderScheduler
 from ohmo.workspace import (
     get_gateway_interrupted_requests_path,
@@ -52,7 +49,6 @@ class OhmoGatewayService:
         root = initialize_workspace(self._workspace)
         os.environ["OHMO_WORKSPACE"] = str(root)
         self._config = load_gateway_config(self._workspace)
-        self._config.nutrition_ingest.validate_filesystem_runtime()
         if self._config.allow_remote_admin_commands and self._config.allowed_remote_admin_commands:
             logger.warning(
                 "ohmo gateway remote administrative commands enabled commands=%s",
@@ -73,7 +69,8 @@ class OhmoGatewayService:
                 bus=self._bus,
                 telegram=self._manager.get_channel("telegram"),
             )
-            if self._config.camera_ingress.listen_port else None
+            if self._config.camera_ingress.listen_port
+            else None
         )
         self._runtime_pool = OhmoSessionRuntimePool(
             cwd=self._cwd,
@@ -94,42 +91,21 @@ class OhmoGatewayService:
             lock=self._runtime_pool._reminder_lock,
             catchup=self._config.reminder_catchup,
         )
-        self._nutrition_honcho_client: HonchoClient | None = None
-        nutrition_honcho_session = "ohmo"
-        nutrition_observed_peer = "marina"
-        if self._config.nutrition_ingest.enabled:
-            binding = resolve_tenant_honcho_binding(self._config, "marina")
-            if binding is None:
-                raise ValueError("nutrition ingest Marina Honcho binding is unavailable")
-            self._nutrition_honcho_client = HonchoClient(
-                binding.base_url,
-                binding.api_key,
-                binding.workspace,
-            )
-            nutrition_honcho_session = binding.session
-            nutrition_observed_peer = binding.observed_peer
-        self._nutrition_coordinator = NutritionIngestCoordinator(
-            self._config.nutrition_ingest,
-            publish_outbound=self._bus.publish_outbound,
-            runtime_pool=self._runtime_pool,
-            honcho_client=self._nutrition_honcho_client,
-            honcho_session=nutrition_honcho_session,
-            observed_peer=nutrition_observed_peer,
-        )
         self._bridge = OhmoGatewayBridge(
             bus=self._bus,
             runtime_pool=self._runtime_pool,
             restart_gateway=self.request_restart,
             workspace=root,
             feishu_group_policy=str(
-                self._config.channel_configs.get("feishu", {}).get("group_policy", "managed_or_mention")
+                self._config.channel_configs.get("feishu", {}).get(
+                    "group_policy", "managed_or_mention"
+                )
             ),
             message_coalesce_window=self._config.message_coalesce_window,
             message_coalesce_media_window=self._config.message_coalesce_media_window,
             message_coalesce_max=self._config.message_coalesce_max,
             contact_store=self._contact_store,
             debug_progress_chats=self._config.debug_progress_chats,
-            nutrition_coordinator=self._nutrition_coordinator,
             camera_ingress=self._camera_ingress,
         )
 
@@ -206,7 +182,10 @@ class OhmoGatewayService:
                 channel="feishu",
                 chat_id=chat_id,
                 content=content,
-                metadata={"chat_type": "group", "_session_key": f"feishu:{chat_id}:{owner_open_id}"},
+                metadata={
+                    "chat_type": "group",
+                    "_session_key": f"feishu:{chat_id}:{owner_open_id}",
+                },
             )
         )
 
@@ -221,14 +200,10 @@ class OhmoGatewayService:
         if getattr(self, "_camera_ingress", None) is not None:
             self._camera_ingress.note_assistant_failure(msg)
         reminder_id = (msg.metadata or {}).get("_reminder_id")
-        if not reminder_id:
-            await self._nutrition_coordinator.on_send_failure(msg, error)
-            return
-        await self._reminder_scheduler.handle_delivery_failure(str(reminder_id), error)
-        await self._nutrition_coordinator.on_send_failure(msg, error)
+        if reminder_id:
+            await self._reminder_scheduler.handle_delivery_failure(str(reminder_id), error)
 
     async def _on_outbound_send_success(self, msg, receipt) -> None:
-        await self._nutrition_coordinator.on_send_success(msg, receipt)
         if getattr(self, "_camera_ingress", None) is not None:
             self._camera_ingress.note_assistant_receipt(msg, receipt)
 
@@ -258,7 +233,11 @@ class OhmoGatewayService:
             chat_id = payload.get("chat_id")
             content = payload.get("content")
             session_key = payload.get("session_key")
-            if not isinstance(channel, str) or not isinstance(chat_id, str) or not isinstance(content, str):
+            if (
+                not isinstance(channel, str)
+                or not isinstance(chat_id, str)
+                or not isinstance(content, str)
+            ):
                 return
             await asyncio.sleep(2.0)
             await self._bus.publish_outbound(
@@ -324,9 +303,7 @@ class OhmoGatewayService:
                     )
                 )
                 published += 1
-            logger.info(
-                "ohmo gateway published %d interrupted-request notice(s)", published
-            )
+            logger.info("ohmo gateway published %d interrupted-request notice(s)", published)
         finally:
             path.unlink(missing_ok=True)
 
@@ -362,10 +339,6 @@ class OhmoGatewayService:
         scheduler_task = asyncio.create_task(
             self._reminder_scheduler.run(),
             name="ohmo-gateway-reminder-scheduler",
-        )
-        nutrition_task = asyncio.create_task(
-            self._nutrition_coordinator.run(),
-            name="ohmo-gateway-nutrition-ingest",
         )
         stop_event = asyncio.Event()
         self._stop_event = stop_event
@@ -420,14 +393,6 @@ class OhmoGatewayService:
                 scheduler_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await scheduler_task
-            self._nutrition_coordinator.stop()
-            if not nutrition_task.done():
-                nutrition_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await nutrition_task
-            nutrition_honcho_client = getattr(self, "_nutrition_honcho_client", None)
-            if nutrition_honcho_client is not None:
-                await nutrition_honcho_client.aclose()
             await self._runtime_pool.aclose()
             await self._manager.stop_all()
             self.write_state(running=False)
@@ -438,7 +403,9 @@ class OhmoGatewayService:
         return 0
 
 
-def start_gateway_process(cwd: str | Path | None = None, workspace: str | Path | None = None) -> int:
+def start_gateway_process(
+    cwd: str | Path | None = None, workspace: str | Path | None = None
+) -> int:
     """Start the gateway as a detached subprocess."""
     service = OhmoGatewayService(cwd, workspace)
     service.log_file.parent.mkdir(parents=True, exist_ok=True)
@@ -456,7 +423,9 @@ def start_gateway_process(cwd: str | Path | None = None, workspace: str | Path |
         "env": env,
     }
     if sys.platform == "win32":
-        popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS  # type: ignore[attr-defined]
+        popen_kwargs["creationflags"] = (
+            subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
+        )  # type: ignore[attr-defined]
         popen_kwargs["stdin"] = subprocess.DEVNULL
     else:
         popen_kwargs["start_new_session"] = True
@@ -509,10 +478,17 @@ def _iter_workspace_gateway_pids(workspace: str | Path | None = None) -> list[in
     if sys.platform == "win32":
         try:
             result = subprocess.run(
-                ["wmic", "process", "where",
-                 f"commandline like '%-m ohmo gateway run%' and commandline like '%--workspace {root}%'",
-                 "get", "processid"],
-                capture_output=True, text=True, check=True,
+                [
+                    "wmic",
+                    "process",
+                    "where",
+                    f"commandline like '%-m ohmo gateway run%' and commandline like '%--workspace {root}%'",
+                    "get",
+                    "processid",
+                ],
+                capture_output=True,
+                text=True,
+                check=True,
             )
         except Exception:
             return []
@@ -564,7 +540,9 @@ def _iter_workspace_gateway_pids(workspace: str | Path | None = None) -> list[in
         return pids
 
 
-def stop_gateway_process(cwd: str | Path | None = None, workspace: str | Path | None = None) -> bool:
+def stop_gateway_process(
+    cwd: str | Path | None = None, workspace: str | Path | None = None
+) -> bool:
     """Stop the background gateway process if present."""
     service = OhmoGatewayService(cwd, workspace)
     pids: list[int] = []
@@ -598,7 +576,9 @@ def stop_gateway_process(cwd: str | Path | None = None, workspace: str | Path | 
     return True
 
 
-def gateway_status(cwd: str | Path | None = None, workspace: str | Path | None = None) -> GatewayState:
+def gateway_status(
+    cwd: str | Path | None = None, workspace: str | Path | None = None
+) -> GatewayState:
     """Load the last known gateway state."""
     service = OhmoGatewayService(cwd, workspace)
     live_pid: int | None = None

@@ -43,7 +43,6 @@ from ohmo.gateway.service import (
     start_gateway_process,
     stop_gateway_process,
 )
-from ohmo.nutrition_ingest.coordinator import NutritionIngestCoordinator
 from ohmo.evals import (
     SUPPORTED_EVAL_AGENT_RUNNER_NAMES,
     SUPPORTED_EVAL_EXECUTOR_NAMES,
@@ -105,7 +104,6 @@ memory_app = typer.Typer(name="memory", help="Manage .ohmo memory")
 soul_app = typer.Typer(name="soul", help="Inspect or edit soul.md")
 user_app = typer.Typer(name="user", help="Inspect or edit user.md")
 gateway_app = typer.Typer(name="gateway", help="Run the ohmo gateway")
-nutrition_app = typer.Typer(name="nutrition-ingest", help="Inspect Dropbox nutrition ingestion")
 evals_app = typer.Typer(name="evals", help="Build ohmo eval/data-flywheel artifacts")
 evals_cases_app = typer.Typer(name="cases", help="Inspect metadata-only eval cases")
 evals_baseline_app = typer.Typer(name="baseline", help="Manage ohmo eval baselines")
@@ -114,23 +112,17 @@ app.add_typer(memory_app)
 app.add_typer(soul_app)
 app.add_typer(user_app)
 app.add_typer(gateway_app)
-app.add_typer(nutrition_app)
 app.add_typer(evals_app)
 evals_app.add_typer(evals_cases_app)
 evals_app.add_typer(evals_baseline_app)
 
 _INTERACTIVE_CHANNELS = ("telegram", "slack", "discord", "feishu")
 _WORKSPACE_HELP = "Path to the ohmo workspace (defaults to ~/.ohmo)"
-_EVAL_EXECUTOR_HELP = (
-    "Eval executor to use: " + ", ".join(SUPPORTED_EVAL_EXECUTOR_NAMES)
+_EVAL_EXECUTOR_HELP = "Eval executor to use: " + ", ".join(SUPPORTED_EVAL_EXECUTOR_NAMES)
+_EVAL_AGENT_RUNNER_HELP = "Agent runner to use inside the executor: " + ", ".join(
+    SUPPORTED_EVAL_AGENT_RUNNER_NAMES
 )
-_EVAL_AGENT_RUNNER_HELP = (
-    "Agent runner to use inside the executor: "
-    + ", ".join(SUPPORTED_EVAL_AGENT_RUNNER_NAMES)
-)
-_FIXTURE_MATCH_HELP = (
-    "Replay fixture matching mode: " + ", ".join(SUPPORTED_FIXTURE_MATCH_MODES)
-)
+_FIXTURE_MATCH_HELP = "Replay fixture matching mode: " + ", ".join(SUPPORTED_FIXTURE_MATCH_MODES)
 
 
 def _print_json_summary(payload: dict[str, object]) -> None:
@@ -431,8 +423,12 @@ def _prompt_provider_profile(workspace: str | Path) -> str:
                 ]
                 if missing:
                     title.extend([("", "  "), ("fg:#d3869b", missing.strip())])
-            choices.append(questionary.Choice(title=title, value=name, checked=(name == default_value)))
-        result = questionary.select("Choose provider profile for ohmo:", choices=choices, default=default_value).ask()
+            choices.append(
+                questionary.Choice(title=title, value=name, checked=(name == default_value))
+            )
+        result = questionary.select(
+            "Choose provider profile for ohmo:", choices=choices, default=default_value
+        ).ask()
         if result is None:
             raise typer.Abort()
         return str(result)
@@ -512,7 +508,9 @@ def _prompt_channels(existing: GatewayConfig) -> tuple[list[str], dict[str, dict
             )
             config["gateway_url"] = _text_prompt(
                 "Discord gateway URL",
-                default=str(prior.get("gateway_url", "wss://gateway.discord.gg/?v=10&encoding=json")),
+                default=str(
+                    prior.get("gateway_url", "wss://gateway.discord.gg/?v=10&encoding=json")
+                ),
             )
             config["intents"] = int(
                 _text_prompt(
@@ -575,7 +573,9 @@ def _prompt_channels(existing: GatewayConfig) -> tuple[list[str], dict[str, dict
                 "Feishu bot mention names (comma separated)",
                 default=prior_bot_names_default,
             )
-            config["bot_names"] = [item.strip() for item in bot_names_raw.split(",") if item.strip()]
+            config["bot_names"] = [
+                item.strip() for item in bot_names_raw.split(",") if item.strip()
+            ]
             config["bot_open_id"] = _text_prompt(
                 "Feishu bot open_id for exact mention detection (optional)",
                 default=str(prior.get("bot_open_id", "")),
@@ -609,9 +609,7 @@ def _run_gateway_config_wizard(workspace: str | Path) -> GatewayConfig:
             default=default_allowlist,
         )
         allowed_remote_admin_commands = [
-            item.strip().lstrip("/")
-            for item in allowlist_raw.split(",")
-            if item.strip()
+            item.strip().lstrip("/") for item in allowlist_raw.split(",") if item.strip()
         ]
     config = existing.model_copy(
         update={
@@ -636,7 +634,8 @@ def _print_gateway_config_summary(config: GatewayConfig) -> None:
             + f" | provider_profile={config.provider_profile}"
         )
         deny_all_channels = [
-            name for name in config.enabled_channels
+            name
+            for name in config.enabled_channels
             if not list(config.channel_configs.get(name, {}).get("allow_from", []))
         ]
         if deny_all_channels:
@@ -706,7 +705,9 @@ def _build_gateway_logging_handlers(
 @app.callback(invoke_without_command=True)
 def main(
     ctx: typer.Context,
-    print_mode: str | None = typer.Option(None, "--print", "-p", help="Run a single prompt and exit"),
+    print_mode: str | None = typer.Option(
+        None, "--print", "-p", help="Run a single prompt and exit"
+    ),
     model: str | None = typer.Option(None, "--model", help="Model override for this session"),
     profile: str | None = typer.Option(None, "--profile", help="Provider profile to use"),
     workspace: str | None = typer.Option(None, "--workspace", help=_WORKSPACE_HELP),
@@ -714,7 +715,9 @@ def main(
     cwd: str = typer.Option(str(Path.cwd()), "--cwd", help="Working directory"),
     backend_only: bool = typer.Option(False, "--backend-only", hidden=True),
     resume: str | None = typer.Option(None, "--resume", help="Resume an ohmo session by id"),
-    continue_session: bool = typer.Option(False, "--continue", help="Continue the latest ohmo session"),
+    continue_session: bool = typer.Option(
+        False, "--continue", help="Continue the latest ohmo session"
+    ),
 ) -> None:
     """Launch the ohmo app or invoke a subcommand."""
     if ctx.invoked_subcommand is not None:
@@ -784,7 +787,11 @@ def main(
 
 @app.command("init")
 def init_cmd(
-    cwd: str = typer.Option(str(Path.cwd()), "--cwd", help="Project working directory (reserved for future project overrides)"),
+    cwd: str = typer.Option(
+        str(Path.cwd()),
+        "--cwd",
+        help="Project working directory (reserved for future project overrides)",
+    ),
     workspace: str | None = typer.Option(None, "--workspace", help=_WORKSPACE_HELP),
     interactive: bool = typer.Option(
         True,
@@ -859,7 +866,9 @@ def _parse_memory_names(raw: str) -> list[str]:
     return [item.strip() for item in raw.split(",") if item.strip()]
 
 
-def _resolve_existing_memory_names(store: MemoryStore, names: list[str]) -> tuple[list[str], list[str]]:
+def _resolve_existing_memory_names(
+    store: MemoryStore, names: list[str]
+) -> tuple[list[str], list[str]]:
     resolved: list[str] = []
     missing: list[str] = []
     seen: set[str] = set()
@@ -919,7 +928,9 @@ def _format_consolidation_delta(delta: int | None) -> str:
 
 
 @memory_app.command("list")
-def memory_list_cmd(workspace: str | None = typer.Option(None, "--workspace", help=_WORKSPACE_HELP)) -> None:
+def memory_list_cmd(
+    workspace: str | None = typer.Option(None, "--workspace", help=_WORKSPACE_HELP),
+) -> None:
     store = MemoryStore(workspace)
     print("name | title | size")
     for entry in store.list():
@@ -954,7 +965,9 @@ def memory_remove_cmd(
 
 
 @memory_app.command("proposals")
-def memory_proposals_cmd(workspace: str | None = typer.Option(None, "--workspace", help=_WORKSPACE_HELP)) -> None:
+def memory_proposals_cmd(
+    workspace: str | None = typer.Option(None, "--workspace", help=_WORKSPACE_HELP),
+) -> None:
     store = MemoryStore(workspace)
     proposals = load_removal_proposals(store)
     if not proposals:
@@ -972,9 +985,15 @@ def memory_proposals_cmd(workspace: str | None = typer.Option(None, "--workspace
 @memory_app.command("prune")
 def memory_prune_cmd(
     workspace: str | None = typer.Option(None, "--workspace", help=_WORKSPACE_HELP),
-    apply_names: str | None = typer.Option(None, "--apply", help="Comma-separated memory entries to remove"),
-    all_proposed: bool = typer.Option(False, "--all-proposed", help="Remove every pending proposal"),
-    dismiss_names: str | None = typer.Option(None, "--dismiss", help="Comma-separated proposals to dismiss"),
+    apply_names: str | None = typer.Option(
+        None, "--apply", help="Comma-separated memory entries to remove"
+    ),
+    all_proposed: bool = typer.Option(
+        False, "--all-proposed", help="Remove every pending proposal"
+    ),
+    dismiss_names: str | None = typer.Option(
+        None, "--dismiss", help="Comma-separated proposals to dismiss"
+    ),
 ) -> None:
     mode_count = sum([apply_names is not None, all_proposed, dismiss_names is not None])
     if mode_count != 1:
@@ -1040,8 +1059,12 @@ def memory_prune_cmd(
 def memory_consolidate_cmd(
     workspace: str | None = typer.Option(None, "--workspace", help=_WORKSPACE_HELP),
     rounds: int = typer.Option(3, "--rounds", min=1, help="Maximum consolidation rounds to run"),
-    dry_run: bool = typer.Option(False, "--dry-run", help="Print proposed merges without applying them"),
-    model: str | None = typer.Option(None, "--model", help="Model override for the consolidation judge"),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Print proposed merges without applying them"
+    ),
+    model: str | None = typer.Option(
+        None, "--model", help="Model override for the consolidation judge"
+    ),
     profile: str | None = typer.Option(None, "--profile", help="Provider profile override"),
 ) -> None:
     """Run a manual lossless memory consolidation pass."""
@@ -1121,7 +1144,9 @@ def _show_or_edit(path: Path, set_text: str | None) -> None:
 
 
 @soul_app.command("show")
-def soul_show_cmd(workspace: str | None = typer.Option(None, "--workspace", help=_WORKSPACE_HELP)) -> None:
+def soul_show_cmd(
+    workspace: str | None = typer.Option(None, "--workspace", help=_WORKSPACE_HELP),
+) -> None:
     _show_or_edit(get_soul_path(workspace), None)
 
 
@@ -1134,7 +1159,9 @@ def soul_edit_cmd(
 
 
 @user_app.command("show")
-def user_show_cmd(workspace: str | None = typer.Option(None, "--workspace", help=_WORKSPACE_HELP)) -> None:
+def user_show_cmd(
+    workspace: str | None = typer.Option(None, "--workspace", help=_WORKSPACE_HELP),
+) -> None:
     _show_or_edit(get_user_path(workspace), None)
 
 
@@ -1196,51 +1223,6 @@ def gateway_status_cmd(
 ) -> None:
     state = gateway_status(cwd, workspace)
     print(state.model_dump_json(indent=2))
-
-
-@nutrition_app.command("status")
-def nutrition_status_cmd(
-    workspace: str | None = typer.Option(None, "--workspace", help=_WORKSPACE_HELP),
-) -> None:
-    """Print privacy-safe nutrition ingest state."""
-    config = load_gateway_config(workspace)
-    coordinator = NutritionIngestCoordinator(config.nutrition_ingest)
-    status = coordinator.status()
-    print(json.dumps(status, sort_keys=True))
-
-
-@nutrition_app.command("replay")
-def nutrition_replay_cmd(
-    candidate: str = typer.Argument(..., help="Candidate id to replay"),
-    workspace: str | None = typer.Option(None, "--workspace", help=_WORKSPACE_HELP),
-) -> None:
-    """Explicitly replay an operator-selected ambiguous delivery."""
-    config = load_gateway_config(workspace)
-    coordinator = NutritionIngestCoordinator(config.nutrition_ingest)
-    result = coordinator.request_replay(candidate)
-    print(json.dumps({"replayed": result}, sort_keys=True))
-
-
-@nutrition_app.command("resolve")
-def nutrition_resolve_cmd(
-    candidate: str = typer.Argument(..., help="Candidate id to resolve"),
-    decision: str = typer.Argument(..., help="Explicit duplicate decision: same or new"),
-    matched_message_id: str | None = typer.Option(
-        None,
-        "--matched-message-id",
-        help="Persisted Honcho match selected for a same decision",
-    ),
-    workspace: str | None = typer.Option(None, "--workspace", help=_WORKSPACE_HELP),
-) -> None:
-    """Resolve one persisted ambiguous pHash match as SAME or NEW."""
-    config = load_gateway_config(workspace)
-    coordinator = NutritionIngestCoordinator(config.nutrition_ingest)
-    result = coordinator.resolve_duplicate(
-        candidate,
-        decision=decision,
-        matched_message_id=matched_message_id,
-    )
-    print(json.dumps({"resolved": result}, sort_keys=True))
 
 
 @evals_app.command("embed")
@@ -1396,8 +1378,10 @@ def evals_cases_list_cmd(
     print("Draft eval cases:")
     for item in result.shown:
         cap_list = getattr(item, "capability_path", None) or []
-        caps = ",".join(cap_list) if cap_list else (
-            ",".join(item.tool_names) if item.tool_names else "-"
+        caps = (
+            ",".join(cap_list)
+            if cap_list
+            else (",".join(item.tool_names) if item.tool_names else "-")
         )
         print(
             f"- {item.case_id} {item.case_kind} "
@@ -1494,10 +1478,7 @@ def evals_review_cmd(
             print("Approved cases:")
             for approved_case_id in validation.approved_case_ids:
                 print(f"- {approved_case_id}")
-        print(
-            "Promote approved with: "
-            f"ohmo evals promote --manifest {validate_manifest_filename}"
-        )
+        print(f"Promote approved with: ohmo evals promote --manifest {validate_manifest_filename}")
         return
 
     try:
@@ -1566,8 +1547,10 @@ def evals_review_cmd(
     print("Draft eval cases:")
     for item in result.shown:
         cap_list = getattr(item, "capability_path", None) or []
-        caps = ",".join(cap_list) if cap_list else (
-            ",".join(item.tool_names) if item.tool_names else "-"
+        caps = (
+            ",".join(cap_list)
+            if cap_list
+            else (",".join(item.tool_names) if item.tool_names else "-")
         )
         print(
             f"- {item.case_id} {item.case_kind} "
@@ -1722,9 +1705,7 @@ def _cli_explicit(ctx: typer.Context, name: str) -> bool:
     return getattr(source, "name", "") == "COMMANDLINE"
 
 
-def _preset_overrides_from_cli(
-    ctx: typer.Context, values: dict[str, object]
-) -> dict[str, object]:
+def _preset_overrides_from_cli(ctx: typer.Context, values: dict[str, object]) -> dict[str, object]:
     """Collect the preset fields an explicit CLI flag overrode (ResolvedRun keys)."""
     field_by_param = {
         "pack_filename": "pack_filename",
@@ -2070,9 +2051,7 @@ def evals_run_cmd(
         if preset is None:
             print("--spec requires --preset NAME", file=sys.stderr)
             raise typer.Exit(1)
-        spec_path = (
-            Path(spec).expanduser() if spec else default_spec_path(workspace_root)
-        )
+        spec_path = Path(spec).expanduser() if spec else default_spec_path(workspace_root)
         if spec_path is None:
             print(
                 "--preset needs an eval spec; none found at "
@@ -2155,8 +2134,7 @@ def evals_run_cmd(
 
     if gate and gate_thresholds is None:
         print(
-            "--gate needs a preset that defines gate thresholds "
-            "(hit_floor / passed_baseline)",
+            "--gate needs a preset that defines gate thresholds (hit_floor / passed_baseline)",
             file=sys.stderr,
         )
         raise typer.Exit(1)
@@ -2165,9 +2143,7 @@ def evals_run_cmd(
     # --system-prompt was given.
     if system_prompt is None and system_prompt_file is not None:
         try:
-            system_prompt = Path(system_prompt_file).expanduser().read_text(
-                encoding="utf-8"
-            )
+            system_prompt = Path(system_prompt_file).expanduser().read_text(encoding="utf-8")
         except OSError as exc:
             print(f"cannot read --system-prompt-file: {exc}", file=sys.stderr)
             raise typer.Exit(1)
@@ -2199,10 +2175,7 @@ def evals_run_cmd(
                 f"replay_tools_only={str(check.replay_tools_only).lower()}"
             )
             if check.model:
-                print(
-                    "Query engine "
-                    f"profile={check.provider_profile or '-'} model={check.model}"
-                )
+                print(f"Query engine profile={check.provider_profile or '-'} model={check.model}")
             return
         run_kwargs = {
             "workspace": workspace_root,
@@ -2342,9 +2315,7 @@ def _meta_report_traces_dir(
         return Path(traces_dir).expanduser().resolve()
     metadata = getattr(report, "metadata", {}) or {}
     run_id = str(
-        metadata.get("execution_id")
-        or metadata.get("report_id")
-        or getattr(report, "report_id")
+        metadata.get("execution_id") or metadata.get("report_id") or getattr(report, "report_id")
     )
     return (workspace_root / "evals" / "traces" / run_id).resolve()
 
@@ -2500,9 +2471,7 @@ def evals_meta_report_cmd(
             report = read_faithful_session_report(report_path)
             if check_value in {"constraints", "constraints_held"}:
                 selected_cases = [
-                    case
-                    for case in report.cases
-                    if case.checks.get("constraints_held") is False
+                    case for case in report.cases if case.checks.get("constraints_held") is False
                 ]
                 attributor = None
                 judge_config = None
@@ -2524,14 +2493,10 @@ def evals_meta_report_cmd(
                 payload = attribute_faithful_constraints_report(
                     report,
                     attributor=attributor,
-                    api_client=judge_config.api_client
-                    if judge_config is not None
-                    else None,
+                    api_client=judge_config.api_client if judge_config is not None else None,
                     model=judge_config.model if judge_config is not None else (model or ""),
                     store=get_eval_store(workspace_root),
-                    trace_root=Path(traces_dir).expanduser().resolve()
-                    if traces_dir
-                    else None,
+                    trace_root=Path(traces_dir).expanduser().resolve() if traces_dir else None,
                     app="ohmo",
                 )
                 attributions = payload["attributions"]
@@ -2550,11 +2515,10 @@ def evals_meta_report_cmd(
                 print(f"counts: {json.dumps(summary['counts'], sort_keys=True, ensure_ascii=True)}")
                 print(f"harness_debt_pct: {summary['harness_debt_pct']}")
                 print(f"model_signal_pct: {summary['model_signal_pct']}")
+                print(f"constraint_harness_debt_pct: {summary['constraint_harness_debt_pct']}")
                 print(
-                    "constraint_harness_debt_pct: "
-                    f"{summary['constraint_harness_debt_pct']}"
+                    f"subtypes: {json.dumps(summary['subtypes'], sort_keys=True, ensure_ascii=True)}"
                 )
-                print(f"subtypes: {json.dumps(summary['subtypes'], sort_keys=True, ensure_ascii=True)}")
                 output_path = (
                     Path(output).expanduser()
                     if output
@@ -2562,8 +2526,7 @@ def evals_meta_report_cmd(
                 )
                 atomic_write_text(
                     output_path,
-                    json.dumps(payload, ensure_ascii=False, indent=2, default=str)
-                    + "\n",
+                    json.dumps(payload, ensure_ascii=False, indent=2, default=str) + "\n",
                 )
                 print(f"Wrote meta-report JSON: {output_path}")
                 return
@@ -2607,7 +2570,9 @@ def evals_meta_report_cmd(
                 print(f"harness_debt_pct: {summary['harness_debt_pct']}")
                 print(f"model_signal_pct: {summary['model_signal_pct']}")
                 print(f"intent_harness_debt_pct: {summary['intent_harness_debt_pct']}")
-                print(f"subtypes: {json.dumps(summary['subtypes'], sort_keys=True, ensure_ascii=True)}")
+                print(
+                    f"subtypes: {json.dumps(summary['subtypes'], sort_keys=True, ensure_ascii=True)}"
+                )
                 output_path = (
                     Path(output).expanduser()
                     if output
@@ -2615,8 +2580,7 @@ def evals_meta_report_cmd(
                 )
                 atomic_write_text(
                     output_path,
-                    json.dumps(payload, ensure_ascii=False, indent=2, default=str)
-                    + "\n",
+                    json.dumps(payload, ensure_ascii=False, indent=2, default=str) + "\n",
                 )
                 print(f"Wrote meta-report JSON: {output_path}")
                 return
@@ -2654,9 +2618,7 @@ def evals_meta_report_cmd(
                 attributor=attributor,
                 api_client=judge_config.api_client if judge_config is not None else None,
                 model=judge_config.model if judge_config is not None else (model or ""),
-                trace_root=Path(traces_dir).expanduser().resolve()
-                if traces_dir
-                else None,
+                trace_root=Path(traces_dir).expanduser().resolve() if traces_dir else None,
             )
             attributions = payload["attributions"]
             summary = payload["summary"]
@@ -2672,9 +2634,7 @@ def evals_meta_report_cmd(
             print(f"counts: {json.dumps(summary['counts'], sort_keys=True, ensure_ascii=True)}")
             print(f"harness_debt_pct: {summary['harness_debt_pct']}")
             print(f"model_signal_pct: {summary['model_signal_pct']}")
-            print(
-                f"grounding_harness_debt_pct: {summary['grounding_harness_debt_pct']}"
-            )
+            print(f"grounding_harness_debt_pct: {summary['grounding_harness_debt_pct']}")
             print(f"subtypes: {json.dumps(summary['subtypes'], sort_keys=True, ensure_ascii=True)}")
             output_path = (
                 Path(output).expanduser()

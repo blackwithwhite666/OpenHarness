@@ -26,18 +26,13 @@ def _normalize_progress_config(raw_text: str) -> dict[str, Any]:
     are accepted only long enough to migrate ``verbose_progress_chats``; they
     never make an unlisted chat verbose.  Invalid or contradictory legacy
     values discard the legacy debug entries rather than risking a noisy
-    default. The retired ``nutrition_ingest.require_owner_only_filesystem``
-    key is also removed before strict model validation.
+    default.
     """
     import json
 
     raw = json.loads(raw_text)
     if not isinstance(raw, dict):
         return raw
-
-    nutrition_ingest = raw.get("nutrition_ingest")
-    if isinstance(nutrition_ingest, dict):
-        nutrition_ingest.pop("require_owner_only_filesystem", None)
 
     def _chat_list(value: object) -> list[str] | None:
         if not isinstance(value, list):

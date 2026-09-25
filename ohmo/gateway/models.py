@@ -58,7 +58,6 @@ class GatewayConfig(BaseModel):
     honcho_api_key: str | None = None
     honcho_workspace: str | None = None
     tenant_honcho: dict[str, dict[str, str]] = Field(default_factory=dict)
-    nutrition_ingest: "NutritionIngestConfig" = Field(default_factory=lambda: NutritionIngestConfig())
     camera_ingress: "CameraIngressConfig" = Field(default_factory=lambda: CameraIngressConfig())
 
     @model_validator(mode="after")
@@ -80,16 +79,15 @@ class GatewayConfig(BaseModel):
             raise ValueError("knowledge_base_root must be an absolute path")
         for principal, project_slugs in self.principal_knowledge_projects.items():
             if _PROFILE_PRINCIPAL_RE.fullmatch(principal) is None:
-                raise ValueError("principal_knowledge_projects keys must be bounded canonical numeric ids")
+                raise ValueError(
+                    "principal_knowledge_projects keys must be bounded canonical numeric ids"
+                )
             if not project_slugs or len(project_slugs) > _MAX_PROFILE_PROJECTS_PER_PRINCIPAL:
                 raise ValueError("each principal must have a bounded non-empty project list")
             if len(set(project_slugs)) != len(project_slugs):
                 raise ValueError("principal knowledge project slugs must not repeat")
             for slug in project_slugs:
-                if (
-                    len(slug) > _MAX_PROJECT_SLUG_LENGTH
-                    or _PROJECT_SLUG_RE.fullmatch(slug) is None
-                ):
+                if len(slug) > _MAX_PROJECT_SLUG_LENGTH or _PROJECT_SLUG_RE.fullmatch(slug) is None:
                     raise ValueError("knowledge project slugs must be lowercase kebab-case")
 
         for tenant_id in (*self.shared_tenants, *self.enabled_memory_tenants):
@@ -102,14 +100,10 @@ class GatewayConfig(BaseModel):
             for field_name in ("workspace", "api_key"):
                 value = binding.get(field_name)
                 if not isinstance(value, str) or not value.strip():
-                    raise ValueError(
-                        f"tenant_honcho[{tenant_id!r}].{field_name} is required"
-                    )
+                    raise ValueError(f"tenant_honcho[{tenant_id!r}].{field_name} is required")
             observed_peer = binding.get("observed_peer", tenant_id)
             if not isinstance(observed_peer, str) or not observed_peer.strip():
-                raise ValueError(
-                    f"tenant_honcho[{tenant_id!r}].observed_peer must not be empty"
-                )
+                raise ValueError(f"tenant_honcho[{tenant_id!r}].observed_peer must not be empty")
             session = binding.get("session", "ohmo")
             if not isinstance(session, str) or _HONCHO_SESSION_RE.fullmatch(session) is None:
                 raise ValueError(
@@ -129,13 +123,12 @@ class GatewayConfig(BaseModel):
         if overlap:
             raise ValueError("numeric principals cannot map to both owner and family tenants")
 
-        self.nutrition_ingest.validate_runtime(self)
         self.camera_ingress.validate_runtime(self)
         return self
 
 
 class CameraIngressConfig(BaseModel):
-    """Disabled-by-default, server-owned Camera ingress binding."""
+    """Server-owned Camera ingress binding."""
 
     model_config = ConfigDict(extra="forbid", validate_assignment=True)
 
@@ -145,6 +138,7 @@ class CameraIngressConfig(BaseModel):
     bearer_token_file: Path | None = None
     synchronized_root: Path | None = None
     principal: str = ""
+    tenant_id: str = ""
     chat_id: str = ""
     session_key: str = ""
 
@@ -159,103 +153,31 @@ class CameraIngressConfig(BaseModel):
             raise ValueError("camera ingress requires an absolute synchronized root")
         if not _NUMERIC_PRINCIPAL_RE.fullmatch(self.principal):
             raise ValueError("camera ingress principal must be canonical numeric")
-        if self.chat_id != self.principal or self.session_key != f"telegram:{self.principal}":
-            raise ValueError("camera ingress must use Marina's ordinary private chat")
-        if gateway.family_principals.get(self.principal) != "marina":
-            raise ValueError("camera ingress principal is not bound to Marina")
-        if "marina" not in gateway.enabled_memory_tenants or not gateway.conversation_learning:
-            raise ValueError("camera ingress requires Marina conversation learning")
+        if (
+            self.chat_id != self.principal
+            or self.session_key != f"telegram:{self.principal}"
+            or not self.tenant_id
+        ):
+            raise ValueError("camera ingress must use its configured private Telegram binding")
+        if gateway.family_principals.get(self.principal) != self.tenant_id:
+            raise ValueError("camera ingress principal and tenant binding disagree")
+        if (
+            self.tenant_id not in gateway.enabled_memory_tenants
+            or not gateway.conversation_learning
+        ):
+            raise ValueError("camera ingress requires conversation learning for its tenant")
         if not gateway.evals_capture:
             raise ValueError("camera ingress requires nutrition finalization validation")
         if gateway.memory_backend != "shadow" or not gateway.honcho_base_url:
-            raise ValueError("camera ingress requires Marina Honcho shadow memory")
-        binding = gateway.tenant_honcho.get("marina")
+            raise ValueError("camera ingress requires Honcho shadow memory")
+        binding = gateway.tenant_honcho.get(self.tenant_id)
         if not binding or not all(
             isinstance(binding.get(key), str) and binding.get(key, "").strip()
             for key in ("workspace", "api_key", "observed_peer")
         ):
-            raise ValueError("camera ingress requires a complete Marina Honcho binding")
+            raise ValueError("camera ingress requires a complete tenant Honcho binding")
         if "telegram" not in gateway.enabled_channels:
             raise ValueError("camera ingress requires Telegram")
-        if gateway.nutrition_ingest.enabled:
-            raise ValueError("camera ingress and legacy nutrition publisher cannot both be enabled")
-
-
-class NutritionIngestConfig(BaseModel):
-    """Fail-closed, Marina-only Dropbox confirmation configuration."""
-
-    model_config = ConfigDict(extra="forbid", validate_assignment=True)
-
-    enabled: bool = False
-    synchronized_root: Path | None = None
-    principal: str = ""
-    chat_id: str = ""
-    session_key: str = ""
-    tenant_id: Literal["marina"] = "marina"
-    locale: Literal["ru"] = "ru"
-    poll_interval_seconds: float = Field(default=10.0, gt=0, le=3600)
-    max_prompt_attempts: int = Field(default=3, ge=1, le=20)
-    max_estimation_attempts: int = Field(default=5, ge=1, le=20)
-    retry_backoff_seconds: float = Field(default=5.0, ge=0, le=3600)
-
-    @property
-    def canonical_principal(self) -> str:
-        return self.principal
-
-    @property
-    def private_chat_id(self) -> str:
-        return self.chat_id
-
-    @property
-    def exact_session_key(self) -> str:
-        return self.session_key
-
-    @property
-    def root(self) -> Path | None:
-        return self.synchronized_root
-
-    @model_validator(mode="after")
-    def validate_enabled_binding(self) -> "NutritionIngestConfig":
-        if not self.enabled:
-            return self
-        if not re.fullmatch(r"[1-9][0-9]*", self.principal):
-            raise ValueError("nutrition_ingest principal must be canonical numeric")
-        if not re.fullmatch(r"[1-9][0-9]*", self.chat_id):
-            raise ValueError("nutrition_ingest private chat id must be a positive numeric id")
-        if self.chat_id != self.principal:
-            raise ValueError("nutrition_ingest chat_id must equal the principal")
-        if self.session_key != f"telegram:{self.principal}":
-            raise ValueError("nutrition_ingest session_key must match the private Telegram chat")
-        if self.synchronized_root is None:
-            raise ValueError("nutrition_ingest synchronized_root is required")
-        return self
-
-    def validate_runtime(self, gateway: GatewayConfig) -> None:
-        """Validate cross-config invariants during every gateway config validation."""
-        if not self.enabled:
-            return
-        if gateway.conversation_learning is not True:
-            raise ValueError("nutrition ingest requires conversation learning")
-        if gateway.family_principals.get(self.principal) != "marina":
-            raise ValueError("nutrition ingest principal is not bound to marina")
-        if self.tenant_id not in gateway.enabled_memory_tenants:
-            raise ValueError("nutrition ingest Marina tenant is not enabled")
-        if not isinstance(gateway.honcho_base_url, str) or not gateway.honcho_base_url.strip():
-            raise ValueError("nutrition ingest requires the Honcho base URL")
-        binding = gateway.tenant_honcho.get("marina")
-        if not binding or not all(
-            isinstance(binding.get(key), str) and binding.get(key, "").strip()
-            for key in ("workspace", "api_key", "observed_peer")
-        ):
-            raise ValueError("tenant_honcho marina binding is incomplete")
-
-    def validate_filesystem_runtime(self) -> None:
-        """Validate filesystem invariants at service startup."""
-        if not self.enabled:
-            return
-        root = self.synchronized_root.expanduser().resolve()
-        if not root.is_dir():
-            raise ValueError("nutrition ingest synchronized_root must be a directory")
 
 
 class GatewayState(BaseModel):

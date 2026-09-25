@@ -18,7 +18,6 @@ from ohmo.gateway.config import load_gateway_config, save_gateway_config
 from ohmo.gateway.router import session_key_for_message
 from ohmo.gateway.runtime import OhmoSessionRuntimePool
 from ohmo.group_registry import load_managed_group_record
-from ohmo.nutrition_ingest.coordinator import NutritionIngestCoordinator
 from ohmo.workspace import get_gateway_interrupted_requests_path
 from openharness.channels.bus.events import InboundMessage, OutboundMessage
 from openharness.channels.bus.queue import MessageBus
@@ -143,7 +142,6 @@ class OhmoGatewayBridge:
         message_coalesce_max: int = 20,
         contact_store: ContactStore | None = None,
         debug_progress_chats: list[str] | None = None,
-        nutrition_coordinator: NutritionIngestCoordinator | None = None,
         camera_ingress: CameraIngress | None = None,
     ) -> None:
         self._bus = bus
@@ -165,7 +163,6 @@ class OhmoGatewayBridge:
         # Telegram progress is quiet by default.  Only this exact chat-ID
         # allowlist opts into detailed progress; /debug and /quiet mutate it.
         self._debug_chats: set[str] = {str(c) for c in (debug_progress_chats or [])}
-        self._nutrition_coordinator = nutrition_coordinator
         self._camera_ingress = camera_ingress
 
     async def run(self) -> None:
@@ -196,9 +193,6 @@ class OhmoGatewayBridge:
             if self._camera_ingress is not None and message.sender_id != "__camera__":
                 self._camera_ingress.process_real_inbound(message)
 
-            if self._nutrition_coordinator is not None and await self._nutrition_coordinator.handle_inbound(message):
-                continue
-
             session_key = session_key_for_message(message)
             logger.info(
                 "ohmo inbound received channel=%s chat_id=%s sender_id=%s session_key=%s content=%r",
@@ -226,7 +220,13 @@ class OhmoGatewayBridge:
 
             if is_special:
                 is_control = stripped in (
-                    "/stop", "/restart", "/new", "/clear", "/debug", "/quiet", "/verbose"
+                    "/stop",
+                    "/restart",
+                    "/new",
+                    "/clear",
+                    "/debug",
+                    "/quiet",
+                    "/verbose",
                 )
                 # Dispatch any buffered plain messages first (arrival order, no
                 # loss), THEN handle the special message verbatim. Control
@@ -253,7 +253,9 @@ class OhmoGatewayBridge:
                     )
                     continue
                 if group_args is not None:
-                    prepared = await self._prepare_group_prompt_message(message, session_key, group_args)
+                    prepared = await self._prepare_group_prompt_message(
+                        message, session_key, group_args
+                    )
                     if prepared is None:
                         continue
                     message = prepared
@@ -262,8 +264,8 @@ class OhmoGatewayBridge:
                     message.sender_id == "__camera__"
                     and message.metadata.get("_camera_authority") is CAMERA_AUTHORITY
                 ):
-                    # A Camera photo may arrive while Marina's ordinary turn is
-                    # running. Never cancel that turn just to analyze a photo.
+                    # A Camera photo may arrive while the configured account's
+                    # ordinary turn is running. Do not cancel it just to analyze a photo.
                     active = self._session_tasks.get(session_key)
                     if active is not None and not active.done():
                         with contextlib.suppress(asyncio.CancelledError, Exception):
@@ -316,9 +318,7 @@ class OhmoGatewayBridge:
                 username=(str(md["username"]) if md.get("username") else None),
                 first_name=(str(md["first_name"]) if md.get("first_name") else None),
                 display_name=(
-                    str(md["sender_display_name"])
-                    if md.get("sender_display_name")
-                    else None
+                    str(md["sender_display_name"]) if md.get("sender_display_name") else None
                 ),
             )
         except Exception:
@@ -335,30 +335,19 @@ class OhmoGatewayBridge:
             reason="replaced by a newer user message",
             notify=self._build_interrupt_notice(message, session_key),
         )
-        if self._nutrition_coordinator is not None:
-            self._nutrition_coordinator.on_ordinary_turn_start(message)
         task = asyncio.create_task(
             self._process_message(message, session_key),
             name=f"ohmo-session:{session_key}",
         )
         self._session_tasks[session_key] = task
         self._inflight[session_key] = message
-        task.add_done_callback(
-            lambda finished, key=session_key, started_message=message: self._cleanup_task(
-                key, finished, started_message
-            )
-        )
+        task.add_done_callback(lambda finished, key=session_key: self._cleanup_task(key, finished))
 
     def _is_quiet_telegram(self, message: InboundMessage) -> bool:
         """Whether this chat uses compact (quiet) progress on Telegram."""
-        return (
-            message.channel == "telegram"
-            and str(message.chat_id) not in self._debug_chats
-        )
+        return message.channel == "telegram" and str(message.chat_id) not in self._debug_chats
 
-    def _build_interrupt_notice(
-        self, message: InboundMessage, session_key: str
-    ) -> OutboundMessage:
+    def _build_interrupt_notice(self, message: InboundMessage, session_key: str) -> OutboundMessage:
         """Build the cancellation notice for the previous task.
 
         In quiet Telegram mode: a structured ``cancelled`` collapse event so
@@ -506,9 +495,7 @@ class OhmoGatewayBridge:
                 )
             )
         else:
-            await self._publish_command_reply(
-                message, session_key, "⏹️ Остановил текущую задачу."
-            )
+            await self._publish_command_reply(message, session_key, "⏹️ Остановил текущую задачу.")
 
     async def _handle_new(self, message, session_key: str) -> None:
         """/new (alias /clear): cancel the in-flight turn and HARD-reset the
@@ -641,9 +628,7 @@ class OhmoGatewayBridge:
     async def _process_message(self, message, session_key: str) -> None:
         # Preserve thread metadata only for shared chats. Feishu p2p replies
         # should stay as normal private messages, not topic replies.
-        inbound_meta = {
-            k: message.metadata[k] for k in ("thread_id",) if k in message.metadata
-        }
+        inbound_meta = {k: message.metadata[k] for k in ("thread_id",) if k in message.metadata}
         chat_type = str(message.metadata.get("chat_type") or "").lower()
         if chat_type == "group" or inbound_meta.get("thread_id"):
             if "message_id" in message.metadata:
@@ -651,12 +636,9 @@ class OhmoGatewayBridge:
         # Collapse this turn's progress into one live status message? Read the
         # exact Telegram chat-ID per-turn so a prior /quiet or /debug is in effect.
         chat_id = str(message.chat_id)
-        collapse = (
-            message.channel == "telegram"
-            and (
-                chat_id not in self._debug_chats
-                or message.metadata.get("_camera_authority") is CAMERA_AUTHORITY
-            )
+        collapse = message.channel == "telegram" and (
+            chat_id not in self._debug_chats
+            or message.metadata.get("_camera_authority") is CAMERA_AUTHORITY
         )
         try:
             reply = ""
@@ -667,12 +649,20 @@ class OhmoGatewayBridge:
             async for update in self._runtime_pool.stream_message(message, session_key):
                 if update.kind == "final":
                     reply = update.text
-                    final_media = list(getattr(update, "media", None) or (update.metadata or {}).get("_media") or [])
+                    final_media = list(
+                        getattr(update, "media", None)
+                        or (update.metadata or {}).get("_media")
+                        or []
+                    )
                     final_metadata = dict(update.metadata or {})
                     final_metadata.pop("_collapse", None)
                     continue
                 ephemeral_assistant_update = collapse and update.kind == "assistant_update"
-                if update.kind == "assistant_update" and update.text.strip() and not ephemeral_assistant_update:
+                if (
+                    update.kind == "assistant_update"
+                    and update.text.strip()
+                    and not ephemeral_assistant_update
+                ):
                     delivered_assistant_updates.add(update.text.strip())
                 if update.kind == "error":
                     stream_error = True
@@ -709,7 +699,11 @@ class OhmoGatewayBridge:
                         channel=message.channel,
                         chat_id=message.chat_id,
                         content=update.text,
-                        media=list(getattr(update, "media", None) or (update.metadata or {}).get("_media") or []),
+                        media=list(
+                            getattr(update, "media", None)
+                            or (update.metadata or {}).get("_media")
+                            or []
+                        ),
                         metadata=update_meta,
                     )
                 )
@@ -820,15 +814,11 @@ class OhmoGatewayBridge:
         self,
         session_key: str,
         task: asyncio.Task[None],
-        started_message: InboundMessage | None = None,
     ) -> None:
         current = self._session_tasks.get(session_key)
-        message = started_message or self._inflight.get(session_key)
         if current is task:
             self._session_tasks.pop(session_key, None)
             self._inflight.pop(session_key, None)
-        if message is not None and self._nutrition_coordinator is not None:
-            self._nutrition_coordinator.on_ordinary_turn_finish(message)
         self._session_cancel_reasons.pop(session_key, None)
 
     def _should_process_message(self, message: InboundMessage) -> bool:
@@ -858,11 +848,14 @@ class OhmoGatewayBridge:
 
     def _is_managed_feishu_group(self, chat_id: str) -> bool:
         try:
-            return load_managed_group_record(
-                workspace=self._workspace,
-                channel="feishu",
-                chat_id=chat_id,
-            ) is not None
+            return (
+                load_managed_group_record(
+                    workspace=self._workspace,
+                    channel="feishu",
+                    chat_id=chat_id,
+                )
+                is not None
+            )
         except Exception:
             logger.exception("failed to load ohmo managed group metadata chat_id=%s", chat_id)
             return False

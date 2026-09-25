@@ -279,9 +279,7 @@ def _compact_tool_purpose(event: dict[str, object]) -> str:
             continue
         words = normalized.split()
         if len(words) > _COMPACT_PURPOSE_MAX_WORDS:
-            normalized = (
-                " ".join(words[:_COMPACT_PURPOSE_MAX_WORDS]).rstrip("….,;:") + "…"
-            )
+            normalized = " ".join(words[:_COMPACT_PURPOSE_MAX_WORDS]).rstrip("….,;:") + "…"
         return normalized[:_COMPACT_TOOL_LABEL_MAX]
     return ""
 
@@ -375,9 +373,7 @@ def _telegram_message_provenance(message) -> dict[str, object]:
         "received_at": _utc_iso(getattr(message, "date", None)),
         "is_forwarded": forward_origin is not None,
         "source_message_at": (
-            _utc_iso(getattr(forward_origin, "date", None))
-            if forward_origin is not None
-            else None
+            _utc_iso(getattr(forward_origin, "date", None)) if forward_origin is not None else None
         ),
     }
 
@@ -421,9 +417,7 @@ def _merge_media_group_provenance(
         metadata.get("received_at"),
         provenance.get("received_at"),
     )
-    metadata["is_forwarded"] = bool(
-        metadata.get("is_forwarded") or provenance.get("is_forwarded")
-    )
+    metadata["is_forwarded"] = bool(metadata.get("is_forwarded") or provenance.get("is_forwarded"))
     metadata["source_message_at"] = _earliest_utc_iso(
         metadata.get("source_message_at"),
         provenance.get("source_message_at"),
@@ -691,11 +685,12 @@ def _markdown_to_telegram_html(text: str) -> str:
 
     # 1. Extract and protect code blocks (preserve content from other processing)
     code_blocks: list[str] = []
+
     def save_code_block(m: re.Match) -> str:
         code_blocks.append(m.group(1))
         return f"\x00CB{len(code_blocks) - 1}\x00"
 
-    text = re.sub(r'```[\w]*\n?([\s\S]*?)```', save_code_block, text)
+    text = re.sub(r"```[\w]*\n?([\s\S]*?)```", save_code_block, text)
 
     # 1b. Markdown tables -> aligned monospace block (protected like a code block)
     def save_table(aligned: str) -> str:
@@ -706,36 +701,37 @@ def _markdown_to_telegram_html(text: str) -> str:
 
     # 2. Extract and protect inline code
     inline_codes: list[str] = []
+
     def save_inline_code(m: re.Match) -> str:
         inline_codes.append(m.group(1))
         return f"\x00IC{len(inline_codes) - 1}\x00"
 
-    text = re.sub(r'`([^`]+)`', save_inline_code, text)
+    text = re.sub(r"`([^`]+)`", save_inline_code, text)
 
     # 3. Headers # Title -> just the title text
-    text = re.sub(r'^#{1,6}\s+(.+)$', r'\1', text, flags=re.MULTILINE)
+    text = re.sub(r"^#{1,6}\s+(.+)$", r"\1", text, flags=re.MULTILINE)
 
     # 4. Blockquotes > text -> just the text (before HTML escaping)
-    text = re.sub(r'^>\s*(.*)$', r'\1', text, flags=re.MULTILINE)
+    text = re.sub(r"^>\s*(.*)$", r"\1", text, flags=re.MULTILINE)
 
     # 5. Escape HTML special characters
     text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
     # 6. Links [text](url) - must be before bold/italic to handle nested cases
-    text = re.sub(r'\[([^\]]+)\]\(([^)]+)\)', r'<a href="\2">\1</a>', text)
+    text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r'<a href="\2">\1</a>', text)
 
     # 7. Bold **text** or __text__
-    text = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', text)
-    text = re.sub(r'__(.+?)__', r'<b>\1</b>', text)
+    text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
+    text = re.sub(r"__(.+?)__", r"<b>\1</b>", text)
 
     # 8. Italic _text_ (avoid matching inside words like some_var_name)
-    text = re.sub(r'(?<![a-zA-Z0-9])_([^_]+)_(?![a-zA-Z0-9])', r'<i>\1</i>', text)
+    text = re.sub(r"(?<![a-zA-Z0-9])_([^_]+)_(?![a-zA-Z0-9])", r"<i>\1</i>", text)
 
     # 9. Strikethrough ~~text~~
-    text = re.sub(r'~~(.+?)~~', r'<s>\1</s>', text)
+    text = re.sub(r"~~(.+?)~~", r"<s>\1</s>", text)
 
     # 10. Bullet lists - item -> • item
-    text = re.sub(r'^[-*]\s+', '• ', text, flags=re.MULTILINE)
+    text = re.sub(r"^[-*]\s+", "• ", text, flags=re.MULTILINE)
 
     # 11. Restore inline code with HTML tags
     for i, code in enumerate(inline_codes):
@@ -832,8 +828,12 @@ class TelegramChannel(BaseChannel):
         silence_telegram_token_url_loggers()
 
         # Build the application with larger connection pool to avoid pool-timeout on long runs
-        req = HTTPXRequest(connection_pool_size=16, pool_timeout=5.0, connect_timeout=30.0, read_timeout=30.0)
-        builder = Application.builder().token(self.config.token).request(req).get_updates_request(req)
+        req = HTTPXRequest(
+            connection_pool_size=16, pool_timeout=5.0, connect_timeout=30.0, read_timeout=30.0
+        )
+        builder = (
+            Application.builder().token(self.config.token).request(req).get_updates_request(req)
+        )
         if self.config.proxy:
             builder = builder.proxy(self.config.proxy).get_updates_proxy(self.config.proxy)
         self._app = builder.build()
@@ -867,7 +867,7 @@ class TelegramChannel(BaseChannel):
                     | filters.VENUE
                 )
                 & ~filters.COMMAND,
-                self._on_message
+                self._on_message,
             )
         )
 
@@ -942,9 +942,7 @@ class TelegramChannel(BaseChannel):
             self._app = None
 
     @staticmethod
-    def _build_keyboard(
-        buttons: list[str], callback_data_prefix: str | None = None
-    ) -> InlineKeyboardMarkup | None:
+    def _build_keyboard(buttons: list[str]) -> InlineKeyboardMarkup | None:
         """One vertical inline button per ``[[ask: …]]`` option. The callback
         carries the index; the chosen label is recovered from the keyboard on
         tap (so no option text has to be squeezed into 64-byte callback_data)."""
@@ -956,11 +954,7 @@ class TelegramChannel(BaseChannel):
                 [
                     InlineKeyboardButton(
                         text=opt[:60],
-                        callback_data=(
-                            f"{callback_data_prefix}{i}"
-                            if callback_data_prefix is not None
-                            else f"ask:{i}"
-                        ),
+                        callback_data=f"ask:{i}",
                     )
                 ]
                 for i, opt in enumerate(options)
@@ -1007,7 +1001,7 @@ class TelegramChannel(BaseChannel):
 
     @staticmethod
     def _chunked(paths: list[str], size: int) -> list[list[str]]:
-        return [paths[i:i + size] for i in range(0, len(paths), size)]
+        return [paths[i : i + size] for i in range(0, len(paths), size)]
 
     @classmethod
     def _build_input_media(cls, bucket: str, media_path: str, media_file):
@@ -1069,7 +1063,9 @@ class TelegramChannel(BaseChannel):
                         native_message_ids.append(message_id)
                 return None
             except Exception as fallback_error:
-                logger.error("Failed to send media failure notice for %s: %s", media_path, fallback_error)
+                logger.error(
+                    "Failed to send media failure notice for %s: %s", media_path, fallback_error
+                )
                 raise fallback_error from e
 
     async def _send_media_group_batch(
@@ -1150,7 +1146,9 @@ class TelegramChannel(BaseChannel):
         if self._app is None or not self.polling_started:
             raise RuntimeError("Telegram Camera channel is unavailable")
         with open(image_path, "rb") as photo:
-            sent = await self._app.bot.send_photo(chat_id=int(chat_id), photo=photo, caption=caption)
+            sent = await self._app.bot.send_photo(
+                chat_id=int(chat_id), photo=photo, caption=caption
+            )
         message_id = getattr(sent, "message_id", None)
         native_photo = getattr(sent, "photo", None)
         if (
@@ -1340,18 +1338,14 @@ class TelegramChannel(BaseChannel):
             reply_to_message_id = msg.metadata.get("message_id")
             if reply_to_message_id:
                 reply_params = ReplyParameters(
-                    message_id=reply_to_message_id,
-                    allow_sending_without_reply=True
+                    message_id=reply_to_message_id, allow_sending_without_reply=True
                 )
 
         reply_params_for_next_send = reply_params
 
         # Send media files
         media_paths = list(msg.media or [])
-        callback_data_prefix = msg.metadata.get("_nutrition_callback_prefix")
-        if not isinstance(callback_data_prefix, str):
-            callback_data_prefix = None
-        keyboard = self._build_keyboard(msg.buttons, callback_data_prefix)
+        keyboard = self._build_keyboard(msg.buttons)
         if (
             len(media_paths) == 1
             and self._get_media_type(media_paths[0]) == "photo"
@@ -1408,10 +1402,7 @@ class TelegramChannel(BaseChannel):
                     html = _markdown_to_telegram_html(chunk)
                     if is_progress and draft_id:
                         await self._app.bot.send_message_draft(
-                            chat_id=chat_id,
-                            draft_id=draft_id,
-                            text=html,
-                            parse_mode="HTML"
+                            chat_id=chat_id, draft_id=draft_id, text=html, parse_mode="HTML"
                         )
                     else:
                         sent = await self._app.bot.send_message(
@@ -1436,9 +1427,7 @@ class TelegramChannel(BaseChannel):
                     try:
                         if is_progress and draft_id:
                             await self._app.bot.send_message_draft(
-                                chat_id=chat_id,
-                                draft_id=draft_id,
-                                text=chunk
+                                chat_id=chat_id, draft_id=draft_id, text=chunk
                             )
                         else:
                             sent = await self._app.bot.send_message(
@@ -1464,8 +1453,7 @@ class TelegramChannel(BaseChannel):
         header = status.header or _COMPACT_HEADERS_RU[0]
         blocks = [f"{_SPINNER_FRAMES[status.spinner_idx]} {header}"]
         rows = [
-            _compact_tool_row(label, state)
-            for label, state, _terminal in status.tool_rows.values()
+            _compact_tool_row(label, state) for label, state, _terminal in status.tool_rows.values()
         ]
         if rows:
             blocks.append("\n".join(rows))
@@ -1525,9 +1513,7 @@ class TelegramChannel(BaseChannel):
                 status.todo_text = todo_text
             text = self._render_status(status)
             try:
-                sent = await self._app.bot.send_message(
-                    chat_id=chat_id, text=text, parse_mode=None
-                )
+                sent = await self._app.bot.send_message(chat_id=chat_id, text=text, parse_mode=None)
             except Exception as e:  # noqa: BLE001 — never let progress break a turn
                 logger.warning("compact status create failed chat=%s: %s", chat_key, e)
                 return
@@ -1548,11 +1534,7 @@ class TelegramChannel(BaseChannel):
         elif todo_event is not None:
             changed = status.todo_text != todo_text
             status.todo_text = todo_text
-            if (
-                status.todo_text is None
-                and not status.tool_rows
-                and not status.inference_active
-            ):
+            if status.todo_text is None and not status.tool_rows and not status.inference_active:
                 await self._clear_compact_status(chat_key)
                 return
         # Content-only events only keep the turn alive: quiet mode renders no
@@ -1602,9 +1584,7 @@ class TelegramChannel(BaseChannel):
         # must propagate: the cancelled notice is durable, and swallowing the
         # error would silently claim the user was notified. The dispatcher
         # applies bounded RetryAfter retry or the failure hook.
-        await self._app.bot.send_message(
-            chat_id=chat_id, text=notice, parse_mode=None
-        )
+        await self._app.bot.send_message(chat_id=chat_id, text=notice, parse_mode=None)
 
     def _next_compact_header(self, chat_key: str) -> str:
         """Pick the stable header for a chat's next turn (never an instant repeat)."""
@@ -1706,9 +1686,7 @@ class TelegramChannel(BaseChannel):
                 name=f"telegram-todo-panel:{chat_key}",
             )
 
-    async def _write_todo_panel(
-        self, chat_key: str, chat_id: int, state: _TodoPanel
-    ) -> None:
+    async def _write_todo_panel(self, chat_key: str, chat_id: int, state: _TodoPanel) -> None:
         """Single writer: latest desired state wins, with no duplicate sends."""
         while self._todo_writers_enabled and self._todo_panels.get(chat_key) is state:
             # Let a burst of synchronous producers settle before the first
@@ -1722,17 +1700,21 @@ class TelegramChannel(BaseChannel):
                 if desired is None:
                     if state.message_id is not None:
                         message_id = state.message_id
-                        await self._app.bot.delete_message(
-                            chat_id=chat_id, message_id=message_id
-                        )
-                        if not self._todo_writers_enabled or self._todo_panels.get(chat_key) is not state:
+                        await self._app.bot.delete_message(chat_id=chat_id, message_id=message_id)
+                        if (
+                            not self._todo_writers_enabled
+                            or self._todo_panels.get(chat_key) is not state
+                        ):
                             return
                         state.message_id = None
                 elif state.message_id is None:
                     sent = await self._app.bot.send_message(
                         chat_id=chat_id, text=desired, parse_mode=None
                     )
-                    if not self._todo_writers_enabled or self._todo_panels.get(chat_key) is not state:
+                    if (
+                        not self._todo_writers_enabled
+                        or self._todo_panels.get(chat_key) is not state
+                    ):
                         return
                     state.message_id = sent.message_id
                 else:
@@ -1754,7 +1736,10 @@ class TelegramChannel(BaseChannel):
                 elif state.message_id is not None and _todo_panel_lost(error):
                     # The next pass recreates exactly one panel from the
                     # latest desired snapshot.
-                    if not self._todo_writers_enabled or self._todo_panels.get(chat_key) is not state:
+                    if (
+                        not self._todo_writers_enabled
+                        or self._todo_panels.get(chat_key) is not state
+                    ):
                         return
                     state.message_id = None
                     continue
@@ -1920,7 +1905,7 @@ class TelegramChannel(BaseChannel):
         data = query.data or ""
         message = query.message
         user = update.effective_user
-        if not data.startswith(("ask:", "nutrition:")) or message is None or user is None:
+        if not data.startswith("ask:") or message is None or user is None:
             return
         try:
             idx = int(data.rsplit(":", 1)[1])
@@ -2003,7 +1988,9 @@ class TelegramChannel(BaseChannel):
         )
         logger.info(
             "telegram last-location update chat_id=%s coord=%s source=%s (silent, no turn)",
-            message.chat_id, _fmt_coord(loc.latitude, loc.longitude), source,
+            message.chat_id,
+            _fmt_coord(loc.latitude, loc.longitude),
+            source,
         )
         return True
 
@@ -2069,11 +2056,12 @@ class TelegramChannel(BaseChannel):
             file_path = None
             try:
                 file = await self._app.bot.get_file(media_file.file_id)
-                ext = self._get_extension(media_type, getattr(media_file, 'mime_type', None))
+                ext = self._get_extension(media_type, getattr(media_file, "mime_type", None))
 
                 # Save to workspace/media/ under a collision-free name so a burst
                 # of voices does not overwrite each other (see _media_filename).
                 from openharness.channels.impl.base import resolve_channel_media_dir
+
                 media_dir = resolve_channel_media_dir(self.name)
 
                 file_path = media_dir / _media_filename(media_file, ext)
@@ -2123,8 +2111,7 @@ class TelegramChannel(BaseChannel):
                     except Exception as exc:  # noqa: BLE001 - ASR boundary is fail-closed
                         transcription_error = _provider_failure(exc)
                         logger.warning(
-                            "Voice transcription failed media_type=%s error_class=%s "
-                            "retryable=%s",
+                            "Voice transcription failed media_type=%s error_class=%s retryable=%s",
                             media_type,
                             _safe_transcription_error_class(transcription_error),
                             transcription_error.retryable,
@@ -2210,12 +2197,16 @@ class TelegramChannel(BaseChannel):
             key = f"{str_chat_id}:{media_group_id}"
             if key not in self._media_group_buffers:
                 self._media_group_buffers[key] = {
-                    "sender_id": sender_id, "chat_id": str_chat_id,
-                    "contents": [], "media": [],
+                    "sender_id": sender_id,
+                    "chat_id": str_chat_id,
+                    "contents": [],
+                    "media": [],
                     "timestamp": getattr(message, "date", None),
                     "metadata": {
-                        "message_id": message.message_id, "user_id": user.id,
-                        "username": user.username, "first_name": user.first_name,
+                        "message_id": message.message_id,
+                        "user_id": user.id,
+                        "username": user.username,
+                        "first_name": user.first_name,
                         "is_group": message.chat.type != "private",
                         **provenance,
                         **reply_meta,
@@ -2264,8 +2255,10 @@ class TelegramChannel(BaseChannel):
                 return
             content = "\n".join(buf["contents"]) or "[empty message]"
             await self._handle_message(
-                sender_id=buf["sender_id"], chat_id=buf["chat_id"],
-                content=content, media=list(dict.fromkeys(buf["media"])),
+                sender_id=buf["sender_id"],
+                chat_id=buf["chat_id"],
+                content=content,
+                media=list(dict.fromkeys(buf["media"])),
                 metadata=buf["metadata"],
                 timestamp=buf.get("timestamp"),
             )
@@ -2304,8 +2297,12 @@ class TelegramChannel(BaseChannel):
         """Get file extension based on media type."""
         if mime_type:
             ext_map = {
-                "image/jpeg": ".jpg", "image/png": ".png", "image/gif": ".gif",
-                "audio/ogg": ".ogg", "audio/mpeg": ".mp3", "audio/mp4": ".m4a",
+                "image/jpeg": ".jpg",
+                "image/png": ".png",
+                "image/gif": ".gif",
+                "audio/ogg": ".ogg",
+                "audio/mpeg": ".mp3",
+                "audio/mp4": ".m4a",
             }
             if mime_type in ext_map:
                 return ext_map[mime_type]

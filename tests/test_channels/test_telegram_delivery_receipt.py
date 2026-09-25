@@ -94,7 +94,9 @@ async def test_camera_photo_accepts_only_photo_shaped_message(tmp_path) -> None:
     bot.send_photo = native_photo
     channel = _channel(bot)
     channel.polling_started = True
-    receipt = await channel.send_camera_photo(chat_id="123", image_path=str(image), caption="Camera")
+    receipt = await channel.send_camera_photo(
+        chat_id="123", image_path=str(image), caption="Camera"
+    )
     assert receipt.native_message_ids == (77,)
     assert len(bot.calls) == 1
 
@@ -115,7 +117,6 @@ async def test_one_photo_prompt_returns_native_photo_id_and_trusted_operation(tm
             metadata={
                 "operation_id": "model-fabricated",
                 "_trusted_outbound_operation_id": "candidate:confirm:v1",
-                "_nutrition_callback_prefix": "nutrition:bound-candidate:",
             },
         )
     )
@@ -129,9 +130,9 @@ async def test_one_photo_prompt_returns_native_photo_id_and_trusted_operation(tm
     flat = [button for row in bot.calls[0][1]["reply_markup"].inline_keyboard for button in row]
     assert [button.text for button in flat] == ["Да, я это съела", "Нет, не ела", "Это не еда"]
     assert [button.callback_data for button in flat] == [
-        "nutrition:bound-candidate:0",
-        "nutrition:bound-candidate:1",
-        "nutrition:bound-candidate:2",
+        "ask:0",
+        "ask:1",
+        "ask:2",
     ]
 
 
@@ -200,7 +201,11 @@ async def test_bad_request_failures_propagate(tmp_path, bot: ReceiptBot) -> None
     with pytest.raises(BadRequest):
         await _channel(bot).send(
             OutboundMessage(
-                channel="telegram", chat_id="123", content="text", media=[str(image)], buttons=["Да"]
+                channel="telegram",
+                chat_id="123",
+                content="text",
+                media=[str(image)],
+                buttons=["Да"],
             )
         )
 
@@ -218,7 +223,7 @@ async def test_photo_caption_callback_uses_caption_api_and_forwards_native_id() 
     edited = []
 
     class Query:
-        data = "nutrition:bound-candidate:2"
+        data = "ask:2"
         message = SimpleNamespace(
             caption="Вы это съели?\nДата: 05.08.2026 12:00 (по EXIF фото)",
             caption_html="Вы это съели?\nДата: 05.08.2026 12:00 (по EXIF фото)",
@@ -228,21 +233,9 @@ async def test_photo_caption_callback_uses_caption_api_and_forwards_native_id() 
             chat=SimpleNamespace(type="private"),
             reply_markup=InlineKeyboardMarkup(
                 [
-                    [
-                        InlineKeyboardButton(
-                            "Да, я это съела", callback_data="nutrition:bound-candidate:0"
-                        )
-                    ],
-                    [
-                        InlineKeyboardButton(
-                            "Нет, не ела", callback_data="nutrition:bound-candidate:1"
-                        )
-                    ],
-                    [
-                        InlineKeyboardButton(
-                            "Это не еда", callback_data="nutrition:bound-candidate:2"
-                        )
-                    ],
+                    [InlineKeyboardButton("Да, я это съела", callback_data="ask:0")],
+                    [InlineKeyboardButton("Нет, не ела", callback_data="ask:1")],
+                    [InlineKeyboardButton("Это не еда", callback_data="ask:2")],
                 ]
             ),
         )
@@ -264,7 +257,7 @@ async def test_photo_caption_callback_uses_caption_api_and_forwards_native_id() 
     assert captured[0].content == "Это не еда"
     assert captured[0].metadata["message_id"] == 55
     assert captured[0].metadata["native_message_id"] == 55
-    assert captured[0].metadata["callback_data"] == "nutrition:bound-candidate:2"
+    assert captured[0].metadata["callback_data"] == "ask:2"
     assert captured[0].chat_id == "123"
 
 
@@ -304,9 +297,7 @@ async def test_retry_after_on_html_send_propagates_without_plain_fallback() -> N
 
     with pytest.raises(RetryAfter):
         await ch.send(
-            OutboundMessage(
-                channel="telegram", chat_id="42", content="**important final**"
-            )
+            OutboundMessage(channel="telegram", chat_id="42", content="**important final**")
         )
     assert len(bot.calls) == 1
     assert bot.calls[0][1].get("parse_mode") == "HTML"
@@ -321,9 +312,7 @@ async def test_bad_request_format_error_still_falls_back_to_plain() -> None:
     ch = _channel(bot)
 
     receipt = await ch.send(
-        OutboundMessage(
-            channel="telegram", chat_id="42", content="**important final**"
-        )
+        OutboundMessage(channel="telegram", chat_id="42", content="**important final**")
     )
     assert receipt is not None
     assert len(bot.calls) == 2
@@ -339,11 +328,7 @@ async def test_non_formatting_bad_request_propagates_without_plain_fallback() ->
     ch = _channel(bot)
 
     with pytest.raises(BadRequest):
-        await ch.send(
-            OutboundMessage(
-                channel="telegram", chat_id="42", content="**final**"
-            )
-        )
+        await ch.send(OutboundMessage(channel="telegram", chat_id="42", content="**final**"))
     assert len(bot.calls) == 1
 
 
