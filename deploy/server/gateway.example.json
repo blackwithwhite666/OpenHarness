@@ -41,7 +41,6 @@
     "listen_host": "10.8.0.8",
     "listen_port": 18751,
     "bearer_token_file": "${CAMERA_API_TOKEN_FILE}",
-    "synchronized_root": "${CAMERA_SHARED_DROPBOX_ROOT}",
     "principal": "${CAMERA_TELEGRAM_PRINCIPAL}",
     "tenant_id": "${CAMERA_TENANT_ID}",
     "chat_id": "${CAMERA_TELEGRAM_PRIVATE_CHAT_ID}",

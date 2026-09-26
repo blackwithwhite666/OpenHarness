@@ -14,7 +14,10 @@ import math
 import os
 import re
 import stat
-from datetime import datetime
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+from email import policy
+from email.parser import BytesParser
 from http import HTTPStatus
 from pathlib import Path
 from uuid import uuid4
@@ -28,9 +31,12 @@ _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _MAX_MANIFEST = 64 * 1024
 _MAX_SIDECAR = 1024 * 1024
 _MAX_IMAGE = 10 * 1024 * 1024
-_MAX_HTTP_BODY = 4096
+_MAX_REQUEST = 4096
+_MAX_HTTP_BODY = 12 * 1024 * 1024
 _MAX_ATTEMPTS = 10000
 _MAX_JOURNAL = 8 * 1024 * 1024
+_SESSION_TTL_SECONDS = 24 * 60 * 60
+_SESSION_ID = re.compile(r"[0-9a-f]{32}\Z")
 _YES = frozenset(
     {"да, я это съела", "я это съела", "я съела это", "я съела", "я это ел", "я это съел"}
 )
@@ -42,7 +48,7 @@ CAMERA_AUTHORITY = object()
 
 
 class CameraCandidateRequest(BaseModel):
-    """The frozen v1 allowlist; no producer-authored destination or prompt."""
+    """The frozen Camera request allowlist; no producer-authored destination or prompt."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -52,11 +58,21 @@ class CameraCandidateRequest(BaseModel):
     image_sha256: str
     capture_time: datetime
     capture_time_authority: str
+    session_id: str
+    epoch: str
+    seq: int = Field(gt=0, le=2**63 - 1)
 
     @field_validator("candidate_id")
     @classmethod
     def _candidate(cls, value: str) -> str:
         return validate_candidate_id(value)
+
+    @field_validator("session_id", "epoch")
+    @classmethod
+    def _session_identity(cls, value: str) -> str:
+        if _SESSION_ID.fullmatch(value) is None:
+            raise ValueError("invalid Camera session identity")
+        return value
 
     @field_validator("manifest_sha256", "image_sha256")
     @classmethod
@@ -85,6 +101,92 @@ class CameraCandidateRequest(BaseModel):
         if value not in {"exif", "filename"}:
             raise ValueError("invalid capture time authority")
         return value
+
+
+@dataclass(frozen=True)
+class CameraCandidateUpload:
+    """Candidate metadata, producer evidence, and image carried by one HTTP request."""
+
+    request: object
+    manifest_bytes: bytes
+    producer_sidecar_bytes: bytes
+    image_bytes: bytes
+    image_filename: str
+    image_content_type: str
+
+
+def _unique_json(pairs: list[tuple[str, object]]) -> dict:
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON key")
+        result[key] = value
+    return result
+
+
+def _parse_camera_upload(content_type: str, body: bytes) -> CameraCandidateUpload:
+    """Parse one bounded multipart upload with exactly the four Camera fields."""
+    envelope = BytesParser(policy=policy.default).parsebytes(
+        f"Content-Type: {content_type}\r\nMIME-Version: 1.0\r\n\r\n".encode("ascii") + body
+    )
+    if (
+        envelope.defects
+        or envelope.get_content_type() != "multipart/form-data"
+        or not envelope.get_boundary()
+        or envelope.preamble
+        or envelope.epilogue
+        or not envelope.is_multipart()
+    ):
+        raise ValueError("invalid Camera multipart envelope")
+
+    parts: dict[str, object] = {}
+    for part in envelope.iter_parts():
+        if part.defects or part.is_multipart() or part.get_content_disposition() != "form-data":
+            raise ValueError("invalid Camera multipart part")
+        name = part.get_param("name", header="content-disposition")
+        if name not in {"request", "manifest", "producer", "image"} or name in parts:
+            raise ValueError("unexpected Camera multipart field")
+        transfer_encoding = part.get("Content-Transfer-Encoding")
+        if transfer_encoding not in {None, "7bit", "8bit", "binary"}:
+            raise ValueError("encoded Camera multipart fields are not accepted")
+        filename = part.get_filename()
+        content_type_for_part = part.get_content_type()
+        if name == "image":
+            if not isinstance(filename, str) or not filename or len(filename) > 255:
+                raise ValueError("Camera image filename is invalid")
+        elif filename is not None or content_type_for_part != "application/json":
+            raise ValueError("Camera metadata fields must be JSON without filenames")
+        payload = part.get_payload(decode=True)
+        if not isinstance(payload, bytes):
+            raise ValueError("Camera multipart field has no byte payload")
+        parts[name] = (payload, filename, content_type_for_part)
+    if set(parts) != {"request", "manifest", "producer", "image"}:
+        raise ValueError("Camera multipart fields are incomplete")
+
+    request_bytes, _, _ = parts["request"]
+    manifest_bytes, _, _ = parts["manifest"]
+    producer_bytes, _, _ = parts["producer"]
+    image_bytes, image_filename, image_content_type = parts["image"]
+    if not 0 < len(request_bytes) <= _MAX_REQUEST:
+        raise ValueError("Camera request metadata size is invalid")
+    if not 0 < len(manifest_bytes) <= _MAX_MANIFEST:
+        raise ValueError("Camera manifest size is invalid")
+    if not 0 < len(producer_bytes) <= _MAX_SIDECAR:
+        raise ValueError("Camera producer evidence size is invalid")
+    if not 0 < len(image_bytes) <= _MAX_IMAGE:
+        raise ValueError("Camera image size is invalid")
+    try:
+        request_payload = json.loads(request_bytes, object_pairs_hook=_unique_json)
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise ValueError("Camera request metadata is invalid") from exc
+    return CameraCandidateUpload(
+        request=request_payload,
+        manifest_bytes=manifest_bytes,
+        producer_sidecar_bytes=producer_bytes,
+        image_bytes=image_bytes,
+        image_filename=image_filename,
+        image_content_type=image_content_type,
+    )
 
 
 def _read_regular(path: str | Path, maximum: int, *, dir_fd: int | None = None) -> bytes:
@@ -293,24 +395,55 @@ class CameraIngress:
         self._state_dir = workspace / "camera_ingress"
         self._state_path = self._state_dir / "attempts.json"
         self._lock = asyncio.Lock()
-        self._attempts: dict[str, dict] = self._load_attempts()
+        self._attempts, previous_session = self._load_attempts()
+        self._session = self._new_session(
+            session_id=previous_session.get("session_id") if previous_session else None
+        )
         self._tasks: set[asyncio.Task] = set()
 
-    def _load_attempts(self) -> dict[str, dict]:
+    @staticmethod
+    def _new_session(*, session_id: str | None = None) -> dict:
+        now = datetime.now(UTC)
+        return {
+            "session_id": session_id or uuid4().hex,
+            "epoch": uuid4().hex,
+            "committed_seq": 0,
+            "expires_at": (now + timedelta(seconds=_SESSION_TTL_SECONDS)).isoformat(),
+            "last_ack": None,
+        }
+
+    def _load_attempts(self) -> tuple[dict[str, dict], dict | None]:
         try:
             state_fd = self._open_state_dir(create=False)
         except FileNotFoundError:
-            return {}
+            return {}, None
         try:
             try:
                 payload = json.loads(_read_regular("attempts.json", _MAX_JOURNAL, dir_fd=state_fd))
             except FileNotFoundError:
-                return {}
+                return {}, None
         finally:
             os.close(state_fd)
-        if not isinstance(payload, dict) or len(payload) > _MAX_ATTEMPTS:
+        session = None
+        if isinstance(payload, dict) and payload.get("schema_version") == 2:
+            if set(payload) != {"schema_version", "attempts", "session"}:
+                raise ValueError("camera attempt journal is invalid")
+            attempts = payload["attempts"]
+            session = payload["session"]
+            if (
+                not isinstance(session, dict)
+                or _SESSION_ID.fullmatch(session.get("session_id", "")) is None
+                or _SESSION_ID.fullmatch(session.get("epoch", "")) is None
+                or not isinstance(session.get("committed_seq"), int)
+                or session["committed_seq"] < 0
+            ):
+                raise ValueError("camera session journal is invalid")
+        else:
+            # Read the previous candidate-keyed journal during the protocol upgrade.
+            attempts = payload
+        if not isinstance(attempts, dict) or len(attempts) > _MAX_ATTEMPTS:
             raise ValueError("camera attempt journal is invalid")
-        for key, value in payload.items():
+        for key, value in attempts.items():
             validate_candidate_id(key)
             if not isinstance(value, dict) or value.get("state") not in {
                 "admitted",
@@ -321,7 +454,7 @@ class CameraIngress:
                 "delivery_unknown",
             }:
                 raise ValueError("camera attempt journal is invalid")
-        return payload
+        return attempts, session
 
     def _open_state_dir(self, *, create: bool) -> int:
         workspace_fd = os.open(self._workspace, _directory_flags())
@@ -338,7 +471,16 @@ class CameraIngress:
                 temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=state_fd
             )
             with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-                json.dump(self._attempts, stream, separators=(",", ":"), sort_keys=True)
+                json.dump(
+                    {
+                        "schema_version": 2,
+                        "attempts": self._attempts,
+                        "session": self._session,
+                    },
+                    stream,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
                 stream.write("\n")
                 stream.flush()
                 os.fsync(stream.fileno())
@@ -376,37 +518,64 @@ class CameraIngress:
             raise ValueError("camera bearer credential is invalid")
         return token
 
-    def _evidence(self, request: CameraCandidateRequest) -> tuple[bytes, str]:
-        root = self.config.synchronized_root
-        if root is None or not root.is_dir():
-            raise ValueError("camera root is unavailable")
-        root_fd = os.open(root, _directory_flags())
-        try:
-            candidate_fd = _child_directory(root_fd, request.candidate_id)
-            try:
-                producer_fd = _child_directory(root_fd, "_producer")
-                try:
-                    sidecar_bytes = _read_regular(
-                        f"{request.candidate_id}.json", _MAX_SIDECAR, dir_fd=producer_fd
-                    )
-                finally:
-                    os.close(producer_fd)
-                return self._evidence_from_directory(candidate_fd, request, sidecar_bytes)
-            finally:
-                os.close(candidate_fd)
-        finally:
-            os.close(root_fd)
+    def _refresh_expired_session(self) -> bool:
+        expires_at = datetime.fromisoformat(self._session["expires_at"])
+        if datetime.now(UTC) < expires_at:
+            return False
+        self._session = self._new_session(session_id=self._session["session_id"])
+        return True
 
-    def _evidence_from_directory(
-        self, candidate_fd: int, request: CameraCandidateRequest, sidecar_bytes: bytes
-    ) -> tuple[bytes, str]:
+    async def lease(self, authorization: str | None) -> tuple[int, dict]:
+        """Return the current producer lease, rotating its epoch on expiration."""
+        if not self.config.enabled:
+            return self._error(403, "camera_disabled")
         try:
-            os.stat("result.json", dir_fd=candidate_fd, follow_symlinks=False)
-        except FileNotFoundError:
-            pass
-        else:
-            raise ValueError("candidate is already owned by the legacy coordinator")
-        manifest_bytes = _read_regular("manifest.json", _MAX_MANIFEST, dir_fd=candidate_fd)
+            expected = self._token()
+        except (OSError, ValueError):
+            return self._error(503, "pre_admission_unavailable")
+        prefix = "Bearer "
+        if (
+            not isinstance(authorization, str)
+            or not authorization.startswith(prefix)
+            or not hmac.compare_digest(authorization[len(prefix) :].encode(), expected)
+        ):
+            return self._error(401, "unauthorized")
+        async with self._lock:
+            try:
+                self._refresh_expired_session()
+                self._save_attempts()
+            except (OSError, ValueError):
+                return self._error(503, "pre_admission_unavailable")
+            return 200, {
+                "session_id": self._session["session_id"],
+                "epoch": self._session["epoch"],
+                "committed_seq": self._session["committed_seq"],
+                "expires_at": self._session["expires_at"],
+            }
+
+    def _commit_sequence(
+        self, request: CameraCandidateRequest, status: int, response: dict
+    ) -> tuple[int, dict]:
+        acknowledged = {
+            **response,
+            "session_id": request.session_id,
+            "epoch": request.epoch,
+            "ack_seq": request.seq,
+        }
+        self._session["committed_seq"] = request.seq
+        self._session["last_ack"] = {
+            "seq": request.seq,
+            "status": status,
+            "body": acknowledged,
+        }
+        self._save_attempts()
+        return status, acknowledged
+
+    @staticmethod
+    def _validate_upload(
+        request: CameraCandidateRequest, upload: CameraCandidateUpload
+    ) -> tuple[bytes, str]:
+        manifest_bytes = upload.manifest_bytes
         if hashlib.sha256(manifest_bytes).hexdigest() != request.manifest_sha256:
             raise ValueError("candidate manifest digest differs")
         manifest = ManifestV2.model_validate_json(manifest_bytes)
@@ -419,14 +588,22 @@ class CameraIngress:
             or manifest.capture_time_authority != request.capture_time_authority
         ):
             raise ValueError("candidate manifest differs from request")
-        _published_positive(sidecar_bytes, manifest)
-        image_name = Path(manifest.original_filename)
-        if image_name.name != manifest.original_filename or image_name.suffix.lower() not in {
-            ".jpg",
-            ".jpeg",
-            ".png",
-            ".webp",
-        }:
+        _published_positive(upload.producer_sidecar_bytes, manifest)
+        image_name = upload.image_filename
+        suffix = Path(image_name).suffix.lower()
+        if (
+            Path(image_name).name != image_name
+            or "/" in image_name
+            or "\\" in image_name
+            or image_name != manifest.original_filename
+            or suffix
+            not in {
+                ".jpg",
+                ".jpeg",
+                ".png",
+                ".webp",
+            }
+        ):
             raise ValueError("candidate image name is invalid")
         mime_for_suffix = {
             ".jpg": "image/jpeg",
@@ -434,17 +611,21 @@ class CameraIngress:
             ".png": "image/png",
             ".webp": "image/webp",
         }
-        if manifest.mime_type != mime_for_suffix[image_name.suffix.lower()]:
-            raise ValueError("candidate image MIME type differs from filename")
-        image_bytes = _read_regular(f"original{image_name.suffix}", _MAX_IMAGE, dir_fd=candidate_fd)
         if (
-            len(image_bytes) != manifest.original_size_bytes
+            manifest.mime_type != mime_for_suffix[suffix]
+            or upload.image_content_type != manifest.mime_type
+        ):
+            raise ValueError("candidate image MIME type differs from filename")
+        image_bytes = upload.image_bytes
+        if (
+            not 0 < len(image_bytes) <= _MAX_IMAGE
+            or len(image_bytes) != manifest.original_size_bytes
             or hashlib.sha256(image_bytes).hexdigest() != request.image_sha256
         ):
             raise ValueError("candidate image digest differs")
-        return image_bytes, image_name.suffix.lower()
+        return image_bytes, suffix
 
-    async def admit(self, authorization: str | None, payload: object) -> tuple[int, dict]:
+    async def admit(self, authorization: str | None, upload: object) -> tuple[int, dict]:
         if not self.config.enabled:
             return self._error(403, "camera_disabled")
         try:
@@ -459,12 +640,60 @@ class CameraIngress:
         ):
             return self._error(401, "unauthorized")
         try:
-            request = CameraCandidateRequest.model_validate(payload)
+            request_payload = (
+                upload.request if isinstance(upload, CameraCandidateUpload) else upload
+            )
+            request = CameraCandidateRequest.model_validate(request_payload)
         except ValidationError:
             return self._error(400, "invalid_request")
         async with self._lock:
-            if request.candidate_id in self._attempts:
-                return self._error(409, "candidate_already_attempted")
+            if self._refresh_expired_session():
+                try:
+                    self._save_attempts()
+                except OSError:
+                    return self._error(503, "pre_admission_unavailable")
+                return self._error(409, "session_expired")
+            if (
+                request.session_id != self._session["session_id"]
+                or request.epoch != self._session["epoch"]
+            ):
+                return self._error(409, "session_expired")
+            committed_seq = self._session["committed_seq"]
+            if request.seq <= committed_seq:
+                last_ack = self._session["last_ack"]
+                if isinstance(last_ack, dict) and last_ack.get("seq") == request.seq:
+                    return last_ack["status"], last_ack["body"]
+                return 200, {
+                    "status": "duplicate",
+                    "session_id": self._session["session_id"],
+                    "epoch": self._session["epoch"],
+                    "ack_seq": committed_seq,
+                }
+            if request.seq > committed_seq + 1:
+                return 409, {
+                    "error": {"code": "expected_seq"},
+                    "expected_seq": committed_seq + 1,
+                }
+            previous_attempt = self._attempts.get(request.candidate_id)
+            if previous_attempt is not None:
+                admission_id = previous_attempt.get("admission_id")
+                if isinstance(admission_id, str) and admission_id:
+                    response = {
+                        "status": "admitted",
+                        "candidate_id": request.candidate_id,
+                        "admission_id": admission_id,
+                        "delivery_semantics": "in_process_only",
+                    }
+                    try:
+                        return self._commit_sequence(request, 202, response)
+                    except OSError:
+                        return self._error(503, "pre_admission_unavailable")
+                try:
+                    return self._commit_sequence(
+                        request, 409, self._error(409, "candidate_already_attempted")[1]
+                    )
+                except OSError:
+                    return self._error(503, "pre_admission_unavailable")
             if len(self._attempts) >= _MAX_ATTEMPTS:
                 return self._error(503, "pre_admission_unavailable")
             if any(item["state"] != "completed" for item in self._attempts.values()):
@@ -472,9 +701,15 @@ class CameraIngress:
             if not self._telegram or not getattr(self._telegram, "polling_started", False):
                 return self._error(503, "pre_admission_unavailable")
             try:
-                image_bytes, suffix = self._evidence(request)
+                if not isinstance(upload, CameraCandidateUpload):
+                    raise ValueError("Camera image and producer evidence were not uploaded")
+                image_bytes, suffix = self._validate_upload(request, upload)
             except (OSError, ValueError, TypeError, ValidationError):
-                return self._error(422, "candidate_evidence_mismatch")
+                status, response = self._error(422, "candidate_evidence_mismatch")
+                try:
+                    return self._commit_sequence(request, status, response)
+                except OSError:
+                    return self._error(503, "pre_admission_unavailable")
             admission_id = f"cam1-{uuid4().hex}"
             try:
                 state_fd = self._open_state_dir(create=True)
@@ -504,7 +739,16 @@ class CameraIngress:
                     "reply_ids": [],
                     "final_turn_id": None,
                 }
-                self._save_attempts()
+                status, response = self._commit_sequence(
+                    request,
+                    202,
+                    {
+                        "status": "admitted",
+                        "candidate_id": request.candidate_id,
+                        "admission_id": admission_id,
+                        "delivery_semantics": "in_process_only",
+                    },
+                )
             except OSError:
                 # A journal fsync can fail after replace. Retain any in-memory
                 # tombstone rather than risking a second send in this process.
@@ -512,12 +756,7 @@ class CameraIngress:
             task = asyncio.create_task(self._deliver(request.candidate_id), name=admission_id)
             self._tasks.add(task)
             task.add_done_callback(self._tasks.discard)
-            return 202, {
-                "status": "admitted",
-                "candidate_id": request.candidate_id,
-                "admission_id": admission_id,
-                "delivery_semantics": "in_process_only",
-            }
+            return status, response
 
     @staticmethod
     def _error(status: int, code: str) -> tuple[int, dict]:
@@ -745,7 +984,14 @@ async def serve_camera_http(
             if key in fields:
                 raise ValueError("duplicate header")
             fields[key] = value.strip()
-        if method == "POST" and path == "/internal/v1/camera/candidates" and version == "HTTP/1.1":
+        if method == "POST" and path == "/internal/v1/camera/session" and version == "HTTP/1.1":
+            if fields.get("transfer-encoding") or fields.get("content-length") != "0":
+                status, response = ingress._error(400, "invalid_request")
+            else:
+                status, response = await ingress.lease(fields.get("authorization"))
+        elif (
+            method == "POST" and path == "/internal/v1/camera/candidates" and version == "HTTP/1.1"
+        ):
             if not ingress.config.enabled:
                 status, response = ingress._error(403, "camera_disabled")
             elif not fields.get("authorization", "").startswith("Bearer "):
@@ -754,24 +1000,21 @@ async def serve_camera_http(
                 status, response = ingress._error(400, "invalid_request")
             else:
                 length = int(fields["content-length"])
-                if not 0 < length <= _MAX_HTTP_BODY:
+                content_type = fields.get("content-type", "")
+                if (
+                    not 0 < length <= _MAX_HTTP_BODY
+                    or not content_type
+                    or not content_type.isascii()
+                ):
                     status, response = ingress._error(400, "invalid_request")
                 else:
-                    body = await asyncio.wait_for(reader.readexactly(length), timeout=5)
-
-                    def unique_object(pairs: list[tuple[str, object]]) -> dict:
-                        result = {}
-                        for key, value in pairs:
-                            if key in result:
-                                raise ValueError("duplicate JSON key")
-                            result[key] = value
-                        return result
-
+                    body = await asyncio.wait_for(reader.readexactly(length), timeout=30)
                     try:
-                        payload = json.loads(body, object_pairs_hook=unique_object)
-                    except (UnicodeDecodeError, ValueError):
-                        payload = None
-                    status, response = await ingress.admit(fields.get("authorization"), payload)
+                        upload = _parse_camera_upload(content_type, body)
+                    except (UnicodeDecodeError, ValueError, TypeError):
+                        status, response = ingress._error(400, "invalid_request")
+                    else:
+                        status, response = await ingress.admit(fields.get("authorization"), upload)
     except (
         asyncio.IncompleteReadError,
         asyncio.LimitOverrunError,

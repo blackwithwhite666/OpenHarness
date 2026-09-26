@@ -136,7 +136,6 @@ class CameraIngressConfig(BaseModel):
     listen_host: Literal["127.0.0.1", "::1", "10.8.0.8"] = "127.0.0.1"
     listen_port: int = Field(default=0, ge=0, le=65535)
     bearer_token_file: Path | None = None
-    synchronized_root: Path | None = None
     principal: str = ""
     tenant_id: str = ""
     chat_id: str = ""
@@ -149,8 +148,6 @@ class CameraIngressConfig(BaseModel):
             raise ValueError("camera ingress requires a private listener port")
         if self.bearer_token_file is None or not self.bearer_token_file.is_absolute():
             raise ValueError("camera ingress requires an absolute bearer token file")
-        if self.synchronized_root is None or not self.synchronized_root.is_absolute():
-            raise ValueError("camera ingress requires an absolute synchronized root")
         if not _NUMERIC_PRINCIPAL_RE.fullmatch(self.principal):
             raise ValueError("camera ingress principal must be canonical numeric")
         if (

@@ -5,12 +5,18 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from ohmo.gateway.camera import CAMERA_AUTHORITY, CameraIngress, serve_camera_http
+from ohmo.gateway.camera import (
+    CAMERA_AUTHORITY,
+    CameraCandidateUpload,
+    CameraIngress,
+    serve_camera_http,
+)
 from ohmo.gateway.bridge import OhmoGatewayBridge
 from ohmo.gateway.models import CameraIngressConfig, GatewayConfig
 from ohmo.gateway.runtime import GatewayStreamUpdate, OhmoSessionRuntimePool
@@ -124,7 +130,6 @@ def _ingress(tmp_path: Path, telegram: FakeTelegram | None = None):
         enabled=True,
         listen_port=8765,
         bearer_token_file=token,
-        synchronized_root=root,
         principal="123",
         tenant_id="marina",
         chat_id="123",
@@ -133,6 +138,70 @@ def _ingress(tmp_path: Path, telegram: FakeTelegram | None = None):
     bus = MessageBus()
     channel = telegram or FakeTelegram()
     return CameraIngress(config, workspace=tmp_path, bus=bus, telegram=channel), root, bus, channel
+
+
+def _upload(root: Path, request: dict) -> CameraCandidateUpload:
+    candidate_dir = root / request["candidate_id"]
+    manifest_bytes = (candidate_dir / "manifest.json").read_bytes()
+    manifest = json.loads(manifest_bytes)
+    return CameraCandidateUpload(
+        request=request,
+        manifest_bytes=manifest_bytes,
+        producer_sidecar_bytes=(
+            root / "_producer" / f"{request['candidate_id']}.json"
+        ).read_bytes(),
+        image_bytes=(candidate_dir / "original.jpg").read_bytes(),
+        image_filename=manifest["original_filename"],
+        image_content_type=manifest["mime_type"],
+    )
+
+
+async def _leased_upload(
+    ingress: CameraIngress, root: Path, authorization: str | None, request: dict
+) -> CameraCandidateUpload:
+    status, lease = await ingress.lease(authorization)
+    if status != 200:
+        raise AssertionError(f"test lease failed: {status} {lease}")
+    payload = {
+        **request,
+        "session_id": lease["session_id"],
+        "epoch": lease["epoch"],
+        "seq": lease["committed_seq"] + 1,
+    }
+    return _upload(root, payload)
+
+
+async def _admit(ingress: CameraIngress, root: Path, authorization: str | None, request: dict):
+    status, lease = await ingress.lease(authorization)
+    if status != 200:
+        return status, lease
+    payload = {
+        **request,
+        "session_id": lease["session_id"],
+        "epoch": lease["epoch"],
+        "seq": lease["committed_seq"] + 1,
+    }
+    return await ingress.admit(authorization, _upload(root, payload))
+
+
+def _multipart(upload: CameraCandidateUpload) -> tuple[str, bytes]:
+    boundary = "camera-test-boundary"
+    fields = [
+        ("request", None, "application/json", json.dumps(upload.request).encode()),
+        ("manifest", None, "application/json", upload.manifest_bytes),
+        ("producer", None, "application/json", upload.producer_sidecar_bytes),
+        ("image", upload.image_filename, upload.image_content_type, upload.image_bytes),
+    ]
+    body = bytearray()
+    for name, filename, content_type, value in fields:
+        body.extend(f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"'.encode())
+        if filename is not None:
+            body.extend(f'; filename="{filename}"'.encode())
+        body.extend(f"\r\nContent-Type: {content_type}\r\n\r\n".encode())
+        body.extend(value)
+        body.extend(b"\r\n")
+    body.extend(f"--{boundary}--\r\n".encode())
+    return f"multipart/form-data; boundary={boundary}", bytes(body)
 
 
 def _producer_sidecar(root: Path, request: dict) -> Path:
@@ -186,13 +255,16 @@ def _producer_sidecar(root: Path, request: dict) -> Path:
 async def test_admission_photo_receipt_precedes_one_ordinary_synthetic_turn(tmp_path: Path) -> None:
     ingress, root, bus, channel = _ingress(tmp_path)
     request = _candidate(root)
-    status, body = await ingress.admit("Bearer " + "s" * 40, request)
+    status, body = await _admit(ingress, root, "Bearer " + "s" * 40, request)
     assert status == 202
     assert body == {
         "status": "admitted",
         "candidate_id": request["candidate_id"],
         "admission_id": body["admission_id"],
         "delivery_semantics": "in_process_only",
+        "session_id": body["session_id"],
+        "epoch": body["epoch"],
+        "ack_seq": 1,
     }
     assert bus.inbound_size == 0  # 202 is admission, not a delivery claim.
     event = await asyncio.wait_for(bus.consume_inbound(), timeout=1)
@@ -213,30 +285,33 @@ async def test_auth_allowlist_and_evidence_fail_closed_before_send(tmp_path: Pat
     for bad in (None, "Bearer wrong", "Basic " + "s" * 40):
         assert (await ingress.admit(bad, request))[0] == 401
     for field in ("chat_id", "session_key", "sender_id", "path", "prompt", "trusted", "consumed"):
-        assert (await ingress.admit("Bearer " + "s" * 40, {**request, field: "forged"}))[0] == 400
-    assert (await ingress.admit("Bearer " + "s" * 40, {**request, "image_sha256": "0" * 64}))[
-        0
-    ] == 422
-    assert (await ingress.admit("Bearer " + "s" * 40, {**request, "manifest_sha256": "0" * 64}))[
-        0
-    ] == 422
+        assert (await _admit(ingress, root, "Bearer " + "s" * 40, {**request, field: "forged"}))[
+            0
+        ] == 400
     assert (
-        await ingress.admit(
-            "Bearer " + "s" * 40, {**request, "capture_time": "2026-08-05T01:00:00Z"}
+        await _admit(ingress, root, "Bearer " + "s" * 40, {**request, "image_sha256": "0" * 64})
+    )[0] == 422
+    assert (
+        await _admit(ingress, root, "Bearer " + "s" * 40, {**request, "manifest_sha256": "0" * 64})
+    )[0] == 422
+    assert (
+        await _admit(
+            ingress,
+            root,
+            "Bearer " + "s" * 40,
+            {**request, "capture_time": "2026-08-05T01:00:00Z"},
         )
     )[0] == 422
     assert channel.calls == [] and bus.inbound_size == 0 and not ingress._attempts
 
 
 @pytest.mark.asyncio
-async def test_candidate_symlink_and_non_regular_image_are_rejected(tmp_path: Path) -> None:
+async def test_uploaded_image_filename_cannot_escape_candidate_name(tmp_path: Path) -> None:
     ingress, root, bus, channel = _ingress(tmp_path)
     request = _candidate(root)
-    directory = root / request["candidate_id"]
-    image = directory / "original.jpg"
-    image.unlink()
-    image.symlink_to(tmp_path / "not-a-candidate.jpg")
-    assert (await ingress.admit("Bearer " + "s" * 40, request))[0] == 422
+    upload = await _leased_upload(ingress, root, "Bearer " + "s" * 40, request)
+    upload = replace(upload, image_filename="../outside.jpg")
+    assert (await ingress.admit("Bearer " + "s" * 40, upload))[0] == 422
     assert channel.calls == [] and bus.inbound_size == 0
 
 
@@ -250,17 +325,88 @@ async def test_candidate_manifest_mime_mismatch_is_rejected(tmp_path: Path) -> N
     raw = json.dumps(manifest, separators=(",", ":")).encode()
     path.write_bytes(raw)
     request["manifest_sha256"] = hashlib.sha256(raw).hexdigest()
-    assert (await ingress.admit("Bearer " + "s" * 40, request))[0] == 422
+    assert (await _admit(ingress, root, "Bearer " + "s" * 40, request))[0] == 422
     assert channel.calls == [] and bus.inbound_size == 0
 
 
 @pytest.mark.asyncio
-async def test_existing_legacy_result_sidecar_blocks_camera_admission(tmp_path: Path) -> None:
+async def test_direct_upload_does_not_depend_on_dropbox_artifact_sync(tmp_path: Path) -> None:
     ingress, root, bus, channel = _ingress(tmp_path)
     request = _candidate(root)
-    (root / request["candidate_id"] / "result.json").write_text("{}", encoding="utf-8")
-    assert (await ingress.admit("Bearer " + "s" * 40, request))[0] == 422
-    assert channel.calls == [] and bus.inbound_size == 0
+    upload = await _leased_upload(ingress, root, "Bearer " + "s" * 40, request)
+    (root / request["candidate_id"] / "manifest.json").unlink()
+    (root / request["candidate_id"] / "original.jpg").unlink()
+    (root / "_producer" / f"{request['candidate_id']}.json").unlink()
+    assert (await ingress.admit("Bearer " + "s" * 40, upload))[0] == 202
+    await asyncio.wait_for(bus.consume_inbound(), timeout=1)
+    assert len(channel.calls) == 1
+    await ingress.close()
+
+
+@pytest.mark.asyncio
+async def test_same_sequence_replays_cached_admission_without_second_send(tmp_path: Path) -> None:
+    ingress, root, bus, channel = _ingress(tmp_path)
+    request = _candidate(root)
+    upload = await _leased_upload(ingress, root, "Bearer " + "s" * 40, request)
+    first = await ingress.admit("Bearer " + "s" * 40, upload)
+    duplicate = await ingress.admit("Bearer " + "s" * 40, upload)
+    assert first == duplicate
+    assert first[0] == 202 and first[1]["ack_seq"] == 1
+    await asyncio.wait_for(bus.consume_inbound(), timeout=1)
+    assert len(channel.calls) == 1
+    await ingress.close()
+
+
+@pytest.mark.asyncio
+async def test_sequence_gap_returns_expected_seq_without_consuming_it(tmp_path: Path) -> None:
+    ingress, root, bus, _ = _ingress(tmp_path)
+    request = _candidate(root)
+    upload = await _leased_upload(ingress, root, "Bearer " + "s" * 40, request)
+    out_of_order = replace(upload, request={**upload.request, "seq": 2})
+    status, body = await ingress.admit("Bearer " + "s" * 40, out_of_order)
+    assert status == 409
+    assert body == {"error": {"code": "expected_seq"}, "expected_seq": 1}
+    assert ingress._session["committed_seq"] == 0
+    assert (await ingress.admit("Bearer " + "s" * 40, upload))[0] == 202
+    await asyncio.wait_for(bus.consume_inbound(), timeout=1)
+    await ingress.close()
+
+
+@pytest.mark.asyncio
+async def test_final_evidence_rejection_commits_sequence_and_is_cached(tmp_path: Path) -> None:
+    ingress, root, bus, channel = _ingress(tmp_path)
+    request = _candidate(root)
+    upload = await _leased_upload(ingress, root, "Bearer " + "s" * 40, request)
+    invalid = replace(upload, image_bytes=b"tampered")
+    first = await ingress.admit("Bearer " + "s" * 40, invalid)
+    duplicate = await ingress.admit("Bearer " + "s" * 40, invalid)
+    assert first == duplicate
+    assert first[0] == 422 and first[1]["ack_seq"] == 1
+    next_request = _candidate(root, index=1)
+    accepted = await _admit(ingress, root, "Bearer " + "s" * 40, next_request)
+    assert accepted[0] == 202 and accepted[1]["ack_seq"] == 2
+    assert len(channel.calls) == 0
+    await asyncio.wait_for(bus.consume_inbound(), timeout=1)
+    await ingress.close()
+
+
+@pytest.mark.asyncio
+async def test_expired_lease_rotates_epoch_and_rejects_old_request(tmp_path: Path) -> None:
+    ingress, root, bus, _ = _ingress(tmp_path)
+    request = _candidate(root)
+    old_upload = await _leased_upload(ingress, root, "Bearer " + "s" * 40, request)
+    old_epoch = old_upload.request["epoch"]
+    ingress._session["expires_at"] = "2000-01-01T00:00:00+00:00"
+    status, lease = await ingress.lease("Bearer " + "s" * 40)
+    assert status == 200
+    assert lease["epoch"] != old_epoch and lease["committed_seq"] == 0
+    assert (await ingress.admit("Bearer " + "s" * 40, old_upload))[1]["error"][
+        "code"
+    ] == "session_expired"
+    fresh_upload = await _leased_upload(ingress, root, "Bearer " + "s" * 40, request)
+    assert (await ingress.admit("Bearer " + "s" * 40, fresh_upload))[0] == 202
+    await asyncio.wait_for(bus.consume_inbound(), timeout=1)
+    await ingress.close()
 
 
 def test_camera_listener_accepts_only_loopback_or_selected_vpn_address() -> None:
@@ -277,7 +423,7 @@ def test_camera_listener_accepts_only_loopback_or_selected_vpn_address() -> None
 async def test_unrecognized_or_unbound_real_text_is_nutrition_forbidden(tmp_path: Path) -> None:
     ingress, root, bus, _ = _ingress(tmp_path)
     request = _candidate(root)
-    assert (await ingress.admit("Bearer " + "s" * 40, request))[0] == 202
+    assert (await _admit(ingress, root, "Bearer " + "s" * 40, request))[0] == 202
     await asyncio.wait_for(bus.consume_inbound(), timeout=1)
     for text, target in (
         ("да", 77),
@@ -310,7 +456,10 @@ async def test_producer_publication_evidence_required_before_send(
     request = _candidate(root)
     path = _producer_sidecar(root, request)
     if mutation == "missing":
+        upload = await _leased_upload(ingress, root, "Bearer " + "s" * 40, request)
         path.unlink()
+        upload = replace(upload, producer_sidecar_bytes=b"")
+        result = await ingress.admit("Bearer " + "s" * 40, upload)
     else:
         sidecar = json.loads(path.read_text(encoding="utf-8"))
         if mutation == "negative":
@@ -328,7 +477,8 @@ async def test_producer_publication_evidence_required_before_send(
         else:
             sidecar["clip_decision"]["model_revision"] = "b" * 40
         path.write_text(json.dumps(sidecar), encoding="utf-8")
-    assert (await ingress.admit("Bearer " + "s" * 40, request))[0] == 422
+        result = await _admit(ingress, root, "Bearer " + "s" * 40, request)
+    assert result[0] == 422
     assert channel.calls == [] and bus.inbound_size == 0
 
 
@@ -344,7 +494,7 @@ async def test_noncanonical_producer_manifest_event_is_not_published_evidence(
     raw = json.dumps(payload, separators=(",", ":")).encode()
     path.write_bytes(raw)
     request["manifest_sha256"] = hashlib.sha256(raw).hexdigest()
-    assert (await ingress.admit("Bearer " + "s" * 40, request))[0] == 422
+    assert (await _admit(ingress, root, "Bearer " + "s" * 40, request))[0] == 422
     assert channel.calls == [] and bus.inbound_size == 0
 
 
@@ -363,7 +513,7 @@ async def test_symlinked_write_directory_fails_before_admission(
     else:
         state.mkdir()
         (state / "snapshots").symlink_to(outside, target_is_directory=True)
-    assert (await ingress.admit("Bearer " + "s" * 40, request))[0] == 503
+    assert (await _admit(ingress, root, "Bearer " + "s" * 40, request))[0] == 503
     assert list(outside.iterdir()) == []
     assert channel.calls == [] and bus.inbound_size == 0
 
@@ -373,18 +523,20 @@ async def test_duplicate_second_candidate_and_restart_never_resend(tmp_path: Pat
     ingress, root, bus, channel = _ingress(tmp_path)
     first = _candidate(root)
     second = _candidate(root, index=1)
-    assert (await ingress.admit("Bearer " + "s" * 40, first))[0] == 202
-    assert (await ingress.admit("Bearer " + "s" * 40, first))[1]["error"][
-        "code"
-    ] == "candidate_already_attempted"
-    assert (await ingress.admit("Bearer " + "s" * 40, second))[1]["error"][
+    status, admitted = await _admit(ingress, root, "Bearer " + "s" * 40, first)
+    assert status == 202
+    duplicate_status, duplicate = await _admit(ingress, root, "Bearer " + "s" * 40, first)
+    assert duplicate_status == 202
+    assert duplicate["admission_id"] == admitted["admission_id"]
+    assert duplicate["ack_seq"] == 2
+    assert (await _admit(ingress, root, "Bearer " + "s" * 40, second))[1]["error"][
         "code"
     ] == "unresolved_candidate"
     await asyncio.wait_for(bus.consume_inbound(), timeout=1)
     await ingress.close()
     reopened = CameraIngress(ingress.config, workspace=tmp_path, bus=MessageBus(), telegram=channel)
     reopened.mark_restart_unknown()
-    assert (await reopened.admit("Bearer " + "s" * 40, first))[0] == 409
+    assert (await _admit(reopened, root, "Bearer " + "s" * 40, first))[0] == 202
     assert reopened._attempts[first["candidate_id"]]["state"] == "delivery_unknown"
     assert len(channel.calls) == 1
     stale = InboundMessage(
@@ -406,12 +558,14 @@ async def test_duplicate_second_candidate_and_restart_never_resend(tmp_path: Pat
 async def test_crash_after_202_leaves_tombstone_without_auto_retry(tmp_path: Path) -> None:
     ingress, root, bus, channel = _ingress(tmp_path)
     request = _candidate(root)
-    assert (await ingress.admit("Bearer " + "s" * 40, request))[0] == 202
+    assert (await _admit(ingress, root, "Bearer " + "s" * 40, request))[0] == 202
     await ingress.close()  # cancel before the scheduled worker executes
     assert bus.inbound_size == 0
     restarted = CameraIngress(ingress.config, workspace=tmp_path, bus=bus, telegram=channel)
     restarted.mark_restart_unknown()
-    assert (await restarted.admit("Bearer " + "s" * 40, request))[0] == 409
+    status, duplicate = await _admit(restarted, root, "Bearer " + "s" * 40, request)
+    assert status == 202 and duplicate["ack_seq"] == 1
+    assert duplicate["admission_id"] == ingress._attempts[request["candidate_id"]]["admission_id"]
     assert channel.calls == []
 
 
@@ -424,7 +578,7 @@ async def test_failed_photo_or_fallback_text_never_dispatches_or_retries(
         tmp_path, FakeTelegram(fail=fail, text_receipt=text_receipt)
     )
     request = _candidate(root)
-    assert (await ingress.admit("Bearer " + "s" * 40, request))[0] == 202
+    assert (await _admit(ingress, root, "Bearer " + "s" * 40, request))[0] == 202
     await asyncio.sleep(0)
     assert bus.inbound_size == 0
     assert len(channel.calls) == 1
@@ -436,7 +590,7 @@ async def test_failed_photo_or_fallback_text_never_dispatches_or_retries(
 async def test_explicit_real_reply_target_not_bare_yes_stale_or_other_user(tmp_path: Path) -> None:
     ingress, root, bus, _ = _ingress(tmp_path)
     request = _candidate(root)
-    assert (await ingress.admit("Bearer " + "s" * 40, request))[0] == 202
+    assert (await _admit(ingress, root, "Bearer " + "s" * 40, request))[0] == 202
     await asyncio.wait_for(bus.consume_inbound(), timeout=1)
 
     def incoming(text: str, *, target: int | None = None, sender: str = "123") -> InboundMessage:
@@ -511,7 +665,7 @@ async def test_explicit_real_reply_target_not_bare_yes_stale_or_other_user(tmp_p
     ingress.process_real_inbound(stale_bare)
     assert stale_bare.metadata["_camera_unbound"] is CAMERA_AUTHORITY
     second = _candidate(root, index=1)
-    assert (await ingress.admit("Bearer " + "s" * 40, second))[0] == 202
+    assert (await _admit(ingress, root, "Bearer " + "s" * 40, second))[0] == 202
     await asyncio.wait_for(bus.consume_inbound(), timeout=1)
     await ingress.close()
 
@@ -521,7 +675,7 @@ async def test_second_candidate_waits_for_first_final_native_receipt(tmp_path: P
     ingress, root, bus, channel = _ingress(tmp_path)
     first = _candidate(root)
     second = _candidate(root, index=1)
-    assert (await ingress.admit("Bearer " + "s" * 40, first))[0] == 202
+    assert (await _admit(ingress, root, "Bearer " + "s" * 40, first))[0] == 202
     await asyncio.wait_for(bus.consume_inbound(), timeout=1)
     answer = InboundMessage(
         channel="telegram",
@@ -533,7 +687,7 @@ async def test_second_candidate_waits_for_first_final_native_receipt(tmp_path: P
     ingress.process_real_inbound(answer)
     assert answer.metadata["_camera_answer"] == "yes"
     ingress.complete(answer, recorded=True)  # runtime has not queued/sent final yet
-    assert (await ingress.admit("Bearer " + "s" * 40, second))[1]["error"][
+    assert (await _admit(ingress, root, "Bearer " + "s" * 40, second))[1]["error"][
         "code"
     ] == "unresolved_candidate"
     progress = OutboundMessage(
@@ -560,7 +714,7 @@ async def test_second_candidate_waits_for_first_final_native_receipt(tmp_path: P
     service = SimpleNamespace(_camera_ingress=ingress)
     receipt = OutboundDeliveryReceipt(channel="telegram", chat_id="123", native_message_ids=(101,))
     await OhmoGatewayService._on_outbound_send_success(service, progress, receipt)
-    assert (await ingress.admit("Bearer " + "s" * 40, second))[0] == 409
+    assert (await _admit(ingress, root, "Bearer " + "s" * 40, second))[0] == 409
     duplicate = InboundMessage(
         channel="telegram",
         sender_id="123",
@@ -573,7 +727,7 @@ async def test_second_candidate_waits_for_first_final_native_receipt(tmp_path: P
     assert duplicate.metadata.get("_camera_answer") is None
     await OhmoGatewayService._on_outbound_send_success(service, final, receipt)
     assert ingress._attempts[first["candidate_id"]]["state"] == "completed"
-    assert (await ingress.admit("Bearer " + "s" * 40, second))[0] == 202
+    assert (await _admit(ingress, root, "Bearer " + "s" * 40, second))[0] == 202
     await ingress.close()
 
 
@@ -582,7 +736,7 @@ async def test_stale_camera_prompt_receipt_cannot_release_answer_turn(tmp_path: 
     ingress, root, bus, _ = _ingress(tmp_path)
     first = _candidate(root)
     second = _candidate(root, index=1)
-    assert (await ingress.admit("Bearer " + "s" * 40, first))[0] == 202
+    assert (await _admit(ingress, root, "Bearer " + "s" * 40, first))[0] == 202
     await asyncio.wait_for(bus.consume_inbound(), timeout=1)
 
     # The model's initial Camera prompt is a final send too, but it belongs to
@@ -650,7 +804,7 @@ async def test_final_send_failure_or_unknown_remains_unresolved(
     ingress, root, bus, channel = _ingress(tmp_path)
     first = _candidate(root)
     second = _candidate(root, index=1)
-    assert (await ingress.admit("Bearer " + "s" * 40, first))[0] == 202
+    assert (await _admit(ingress, root, "Bearer " + "s" * 40, first))[0] == 202
     await asyncio.wait_for(bus.consume_inbound(), timeout=1)
     answer = InboundMessage(
         channel="telegram",
@@ -693,7 +847,7 @@ async def test_final_send_failure_or_unknown_remains_unresolved(
         )
         await OhmoGatewayService._on_outbound_send_success(service, final, receipt)
     assert ingress._attempts[first["candidate_id"]]["state"] != "completed"
-    assert (await ingress.admit("Bearer " + "s" * 40, second))[0] == 409
+    assert (await _admit(ingress, root, "Bearer " + "s" * 40, second))[0] == 409
     assert len(channel.calls) == 1
     await ingress.close()
 
@@ -776,7 +930,7 @@ async def test_camera_debug_progress_cannot_replace_required_final_receipt() -> 
 async def test_native_photo_reply_binds_and_manual_photo_is_untouched(tmp_path: Path) -> None:
     ingress, root, bus, _ = _ingress(tmp_path)
     request = _candidate(root)
-    assert (await ingress.admit("Bearer " + "s" * 40, request))[0] == 202
+    assert (await _admit(ingress, root, "Bearer " + "s" * 40, request))[0] == 202
     await asyncio.wait_for(bus.consume_inbound(), timeout=1)
     manual = InboundMessage(
         channel="telegram",
@@ -834,7 +988,6 @@ def test_disabled_config_and_generic_tenant_binding(tmp_path: Path) -> None:
         enabled=True,
         listen_port=8765,
         bearer_token_file=tmp_path / "token",
-        synchronized_root=tmp_path,
         principal="123",
         tenant_id="family",
         chat_id="123",
@@ -941,13 +1094,15 @@ class _LostResponseWriter(_Writer):
 async def test_http_exact_route_and_error_shape(tmp_path: Path) -> None:
     ingress, root, _, channel = _ingress(tmp_path)
     request = _candidate(root)
-    body = json.dumps(request).encode()
+    upload = await _leased_upload(ingress, root, "Bearer " + "s" * 40, request)
+    content_type, body = _multipart(upload)
     reader = asyncio.StreamReader()
     reader.feed_data(
         b"POST /internal/v1/camera/candidates HTTP/1.1\r\n"
         + b"Authorization: Bearer "
         + b"s" * 40
         + b"\r\n"
+        + f"Content-Type: {content_type}\r\n".encode()
         + f"Content-Length: {len(body)}\r\n\r\n".encode()
         + body
     )
@@ -955,9 +1110,9 @@ async def test_http_exact_route_and_error_shape(tmp_path: Path) -> None:
     writer = _Writer()
     await serve_camera_http(ingress, reader, writer)
     assert writer.data.startswith(b"HTTP/1.1 202 ")
-    assert (
-        json.loads(writer.data.split(b"\r\n\r\n", 1)[1])["delivery_semantics"] == "in_process_only"
-    )
+    response = json.loads(writer.data.split(b"\r\n\r\n", 1)[1])
+    assert response["delivery_semantics"] == "in_process_only"
+    assert response["ack_seq"] == 1
     await ingress.close()
     assert len(channel.calls) <= 1
 
@@ -966,20 +1121,23 @@ async def test_http_exact_route_and_error_shape(tmp_path: Path) -> None:
 async def test_lost_http_response_after_admission_never_causes_resend(tmp_path: Path) -> None:
     ingress, root, bus, channel = _ingress(tmp_path)
     request = _candidate(root)
-    body = json.dumps(request).encode()
+    upload = await _leased_upload(ingress, root, "Bearer " + "s" * 40, request)
+    content_type, body = _multipart(upload)
     reader = asyncio.StreamReader()
     reader.feed_data(
         b"POST /internal/v1/camera/candidates HTTP/1.1\r\n"
         + b"Authorization: Bearer "
         + b"s" * 40
         + b"\r\n"
+        + f"Content-Type: {content_type}\r\n".encode()
         + f"Content-Length: {len(body)}\r\n\r\n".encode()
         + body
     )
     reader.feed_eof()
     with pytest.raises(ConnectionError, match="response lost"):
         await serve_camera_http(ingress, reader, _LostResponseWriter())
-    assert (await ingress.admit("Bearer " + "s" * 40, request))[0] == 409
+    status, replay_body = await ingress.admit("Bearer " + "s" * 40, upload)
+    assert status == 202 and replay_body["ack_seq"] == 1
     await asyncio.wait_for(bus.consume_inbound(), timeout=1)
     assert len(channel.calls) == 1
     await ingress.close()
@@ -1054,7 +1212,6 @@ async def test_bound_answer_uses_validated_durable_honcho_path_only(tmp_path: Pa
             enabled=True,
             listen_port=8765,
             bearer_token_file=tmp_path / "token",
-            synchronized_root=tmp_path,
             principal="123",
             tenant_id="marina",
             chat_id="123",
