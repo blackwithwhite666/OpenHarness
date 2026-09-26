@@ -10,6 +10,7 @@ PID_FILE="${OHMO_GATEWAY_PID_FILE:-$WORKSPACE/gateway.pid}"
 MAX_WAIT="${OHMO_GATEWAY_STOP_MAX_WAIT:-60}"
 INTERVAL="${OHMO_GATEWAY_STOP_INTERVAL:-1}"
 START_DELAY="${OHMO_GATEWAY_START_DELAY:-3}"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
 export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=${XDG_RUNTIME_DIR}/bus}"
@@ -75,6 +76,7 @@ wait_for_workspace_gateway_exit() {
   done
 }
 
+python3 "$SCRIPT_DIR/migrate_camera_gateway_config.py" --config "$WORKSPACE/gateway.json"
 systemctl --user stop "$UNIT"
 validate_pid_file
 ohmo gateway stop --workspace "$WORKSPACE"

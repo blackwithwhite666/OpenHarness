@@ -25,11 +25,18 @@ def _run_restart_helper(
     stop_detached: bool = False,
     stop_requires_poll: bool = False,
     identity: str = "gateway",
+    retired_camera_config: bool = False,
 ) -> subprocess.CompletedProcess[str]:
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     workspace = tmp_path / ".ohmo"
     workspace.mkdir()
+    if retired_camera_config:
+        (workspace / "gateway.json").write_text(
+            '{"camera_ingress":{"enabled":true,'
+            '"synchronized_root":"/home/user/Dropbox/nutrition-assets"}}\n',
+            encoding="utf-8",
+        )
     pid = os.getpid()
     if pid_file:
         (workspace / "gateway.pid").write_text(f"{pid}\n", encoding="utf-8")
@@ -42,6 +49,10 @@ def _run_restart_helper(
         """#!/usr/bin/env bash
 set -eu
 printf 'systemctl %s\\n' "$*" >> "$OHMO_FAKE_LOG"
+if [[ "$1 $2" == "--user stop" && "$OHMO_FAKE_EXPECT_MIGRATED" == "1" ]] \
+  && grep -q 'synchronized_root' "$OHMO_GATEWAY_WORKSPACE/gateway.json"; then
+  exit 1
+fi
 if [[ "$1 $2" == "--user stop" && "$OHMO_FAKE_SYSTEMD_STOPS" == "1" ]]; then
   printf '0' > "$OHMO_FAKE_STATE"
   rm -f "$OHMO_FAKE_PID_FILE"
@@ -99,6 +110,7 @@ fi
         "OHMO_FAKE_STOP_DETACHED": "1" if stop_detached else "0",
         "OHMO_FAKE_STOP_REQUIRES_POLL": "1" if stop_requires_poll else "0",
         "OHMO_FAKE_IDENTITY": identity,
+        "OHMO_FAKE_EXPECT_MIGRATED": "1" if retired_camera_config else "0",
         "OHMO_GATEWAY_WORKSPACE": str(workspace),
         "OHMO_GATEWAY_STOP_MAX_WAIT": "1" if stop_requires_poll else "0",
         "OHMO_GATEWAY_STOP_INTERVAL": "0",
@@ -147,13 +159,26 @@ def test_restart_helper_starts_cleanly_when_no_gateway_process_exists(tmp_path: 
     ]
 
 
+def test_restart_helper_removes_retired_camera_config_before_stopping_gateway(tmp_path: Path):
+    result = _run_restart_helper(tmp_path, retired_camera_config=True)
+
+    assert result.returncode == 0, result.stderr
+    config = (tmp_path / ".ohmo" / "gateway.json").read_text(encoding="utf-8")
+    assert "synchronized_root" not in config
+    assert result.calls[0] == "systemctl --user stop ohmo-gateway.service"
+    assert result.calls[-2:] == [
+        "systemctl --user start ohmo-gateway.service",
+        "systemctl --user is-active ohmo-gateway.service",
+    ]
+
+
 def test_restart_helper_stops_and_waits_for_detached_workspace_gateway(tmp_path: Path):
     result = _run_restart_helper(tmp_path, live=True, pid_file=True, stop_detached=True)
 
     assert result.returncode == 0, result.stderr
-    assert result.calls.index(f"ohmo gateway stop --workspace {tmp_path / '.ohmo'}") < result.calls.index(
-        "systemctl --user start ohmo-gateway.service"
-    )
+    assert result.calls.index(
+        f"ohmo gateway stop --workspace {tmp_path / '.ohmo'}"
+    ) < result.calls.index("systemctl --user start ohmo-gateway.service")
 
 
 def test_restart_helper_polls_after_detached_stop_before_starting_unit(tmp_path: Path):
