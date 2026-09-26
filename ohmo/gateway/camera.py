@@ -10,6 +10,7 @@ import asyncio
 import hashlib
 import hmac
 import json
+import logging
 import math
 import os
 import re
@@ -41,10 +42,67 @@ _YES = frozenset(
     {"да, я это съела", "я это съела", "я съела это", "я съела", "я это ел", "я это съел"}
 )
 _NO = frozenset({"нет, не ела", "нет, не ел", "это не еда"})
+_PENDING_TTL_SECONDS = 6 * 60 * 60
+_ANSWER_EXPLICIT_NO_RE = re.compile(
+    r"\b(?:не\s+(?:ел|ела|ели|пил|пила|выпил|выпила|употреблял|употребляла)\b"
+    r"|ничего\s+не\s+(?:ел|ела|пил|пила)\b"
+    r"|это\s+не\s+еда\b)",
+    re.IGNORECASE,
+)
+_ANSWER_ANCHORED_NO_RE = re.compile(r"^(?:нет|no)\b", re.IGNORECASE)
+_ANSWER_CONSUMPTION_RE = re.compile(
+    r"\b(?:я\s+)?(?:съел(?:а|и)?|ел(?:а|и)?|поел(?:а|и)?|выпил(?:а|и)?|употребил(?:а|и)?)\b",
+    re.IGNORECASE,
+)
+_ANSWER_ANCHORED_YES_RE = re.compile(
+    r"^(?:да|ага|угу|конечно|естественно|yes|yeah)\b", re.IGNORECASE
+)
+_ANSWER_ANCHORED_SCOPE_RE = re.compile(r"^(?:только|лишь)\b", re.IGNORECASE)
 _DEEPSEEK_MODEL = "deepseek/deepseek-v4.1-flash"
 _DEEPSEEK_ENDPOINT = "deepinfra/fp8"
 _DEEPSEEK_RELEASE = "deepseek-camera-production-v1"
 CAMERA_AUTHORITY = object()
+
+
+def _classify_answer(text: object, *, anchored: bool) -> str | None:
+    """Classify an explicit user answer to a Camera question.
+
+    Returns "yes", "no", or None (ambiguous, must stay unbound). Bare,
+    non-anchored text binds only through explicit consumption or negation
+    language; bare affirmations and scope-only answers stay ambiguous
+    outside a native reply or a first-party ask button.
+    """
+    answer = text.strip().casefold() if isinstance(text, str) else ""
+    if not answer:
+        return None
+    if answer in _YES:
+        return "yes"
+    if answer in _NO:
+        return "no"
+    if _ANSWER_EXPLICIT_NO_RE.search(answer):
+        return "no"
+    if _ANSWER_CONSUMPTION_RE.search(answer):
+        return "yes"
+    if anchored:
+        if _ANSWER_ANCHORED_NO_RE.search(answer):
+            return "no"
+        if _ANSWER_ANCHORED_YES_RE.search(answer) or _ANSWER_ANCHORED_SCOPE_RE.search(answer):
+            return "yes"
+    return None
+
+
+def _attempt_age_seconds(attempt: dict, now: datetime) -> float:
+    """Age of an attempt since admission; unparsable stamps never expire."""
+    admitted_at = attempt.get("admitted_at")
+    if not isinstance(admitted_at, str):
+        return 0.0
+    try:
+        stamp = datetime.fromisoformat(admitted_at)
+    except ValueError:
+        return 0.0
+    if stamp.tzinfo is None or stamp.utcoffset() is None:
+        return 0.0
+    return (now - stamp).total_seconds()
 
 
 class CameraCandidateRequest(BaseModel):
@@ -400,6 +458,7 @@ class CameraIngress:
             session_id=previous_session.get("session_id") if previous_session else None
         )
         self._tasks: set[asyncio.Task] = set()
+        self._sweep_expired_attempts()
         self._remove_completed_snapshots()
 
     @staticmethod
@@ -455,6 +514,12 @@ class CameraIngress:
                 "delivery_unknown",
             }:
                 raise ValueError("camera attempt journal is invalid")
+        now_iso = datetime.now(UTC).isoformat()
+        for value in attempts.values():
+            if not isinstance(value.get("admitted_at"), str):
+                # Legacy in-flight entries adopt this process's start as their
+                # admission time, so the pending TTL has a bounded runway.
+                value["admitted_at"] = now_iso
         return attempts, session
 
     def _open_state_dir(self, *, create: bool) -> int:
@@ -494,45 +559,73 @@ class CameraIngress:
                 pass
             os.close(state_fd)
 
+    _TTL_SWEEPABLE_STATES = frozenset({"photo_sent", "answering", "final_queued"})
+
+    def _sweep_expired_attempts(self) -> None:
+        """Drop answer-gate attempts older than the TTL with their snapshots.
+
+        One ignored photo must not gate the whole chat forever: after the TTL
+        the camera flow degrades to ordinary text turns instead of marking
+        every inbound message unbound. ``admitted`` and ``delivery_unknown``
+        tombstones are never swept: they are the at-most-once admission
+        markers for sends whose outcome is unknown.
+        """
+        now = datetime.now(UTC)
+        expired = [
+            key
+            for key, value in self._attempts.items()
+            if value.get("state") in self._TTL_SWEEPABLE_STATES
+            and _attempt_age_seconds(value, now) >= _PENDING_TTL_SECONDS
+        ]
+        if not expired:
+            return
+        for key in expired:
+            self._remove_snapshot_files(self._attempts.pop(key))
+        try:
+            self._save_attempts()
+        except OSError:
+            logging.getLogger(__name__).warning(
+                "failed to persist Camera attempt expiry", exc_info=True
+            )
+
+    def _remove_snapshot_files(self, attempt: dict) -> None:
+        snapshot = attempt.get("snapshot")
+        admission_id = attempt.get("admission_id")
+        if not isinstance(snapshot, str) or not isinstance(admission_id, str):
+            return
+        name = Path(snapshot)
+        if name.parent != self._state_dir / "snapshots" or name.name not in {
+            f"{admission_id}.jpg",
+            f"{admission_id}.jpeg",
+            f"{admission_id}.png",
+            f"{admission_id}.webp",
+        }:
+            return
+        try:
+            state_fd = self._open_state_dir(create=False)
+            try:
+                snapshots_fd = _child_directory(state_fd, "snapshots", create=False)
+                try:
+                    try:
+                        os.unlink(name.name, dir_fd=snapshots_fd)
+                        os.fsync(snapshots_fd)
+                    except FileNotFoundError:
+                        pass
+                finally:
+                    os.close(snapshots_fd)
+            finally:
+                os.close(state_fd)
+        except FileNotFoundError:
+            return
+        except OSError:
+            logging.getLogger(__name__).warning("failed to remove Camera snapshot", exc_info=True)
+
     def _remove_completed_snapshots(self) -> None:
         """Drop local image copies once the user flow has a confirmed outcome."""
-        for attempt in self._attempts.values():
+        for attempt in list(self._attempts.values()):
             if attempt.get("state") != "completed":
                 continue
-            snapshot = attempt.get("snapshot")
-            admission_id = attempt.get("admission_id")
-            if not isinstance(snapshot, str) or not isinstance(admission_id, str):
-                continue
-            name = Path(snapshot)
-            if name.parent != self._state_dir / "snapshots" or name.name not in {
-                f"{admission_id}.jpg",
-                f"{admission_id}.jpeg",
-                f"{admission_id}.png",
-                f"{admission_id}.webp",
-            }:
-                continue
-            try:
-                state_fd = self._open_state_dir(create=False)
-                try:
-                    snapshots_fd = _child_directory(state_fd, "snapshots", create=False)
-                    try:
-                        try:
-                            os.unlink(name.name, dir_fd=snapshots_fd)
-                            os.fsync(snapshots_fd)
-                        except FileNotFoundError:
-                            pass
-                    finally:
-                        os.close(snapshots_fd)
-                finally:
-                    os.close(state_fd)
-            except FileNotFoundError:
-                continue
-            except OSError:
-                import logging
-
-                logging.getLogger(__name__).warning(
-                    "failed to remove completed Camera snapshot", exc_info=True
-                )
+            self._remove_snapshot_files(attempt)
 
     def mark_restart_unknown(self) -> None:
         """Never resume an in-flight photo or answer after process restart."""
@@ -778,6 +871,7 @@ class CameraIngress:
                     "photo_id": None,
                     "reply_ids": [],
                     "final_turn_id": None,
+                    "admitted_at": datetime.now(UTC).isoformat(),
                 }
                 status, response = self._commit_sequence(
                     request,
@@ -857,6 +951,7 @@ class CameraIngress:
         ):
             return
         metadata = message.metadata
+        self._sweep_expired_attempts()
         target = (
             metadata.get("native_message_id")
             if metadata.get("callback_query")
@@ -900,29 +995,42 @@ class CameraIngress:
         if attempt["state"] != "photo_sent":
             metadata["_camera_unbound"] = CAMERA_AUTHORITY
             return
-        if metadata.get("callback_query"):
-            metadata["_camera_unbound"] = CAMERA_AUTHORITY
-            return  # Camera has no callback buttons; stale/foreign callbacks confer nothing.
-        if str(target) not in {str(attempt["photo_id"]), *map(str, attempt["reply_ids"])}:
+        anchored_ids = {str(attempt["photo_id"]), *map(str, attempt["reply_ids"])}
+        if target is not None and str(target) not in anchored_ids:
+            # A reply to some other message answers nothing about this photo.
             metadata["_camera_unbound"] = CAMERA_AUTHORITY
             return
-        raw_answer = metadata.get("_telegram_raw_text")
-        answer = raw_answer.strip().casefold() if isinstance(raw_answer, str) else ""
-        if answer in _YES or answer in _NO:
-            attempt["state"] = "answering"
-            try:
-                self._save_attempts()
-            except OSError:
+        if metadata.get("callback_query"):
+            # The agent's own [[ask:]] keyboard hangs on this operation's
+            # photo or question message; a tap there is a first-party answer.
+            # Any other callback (stale, foreign keyboard) confers nothing.
+            callback_data = metadata.get("callback_data")
+            if not (isinstance(callback_data, str) and callback_data.startswith("ask:")):
                 metadata["_camera_unbound"] = CAMERA_AUTHORITY
                 return
-            metadata["_camera_authority"] = CAMERA_AUTHORITY
-            metadata["_camera_candidate_id"] = candidate_id
-            metadata["_camera_answer"] = "yes" if answer in _YES else "no"
-            metadata["_camera_turn_id"] = uuid4().hex
-            if answer in _YES:
-                message.media.append(attempt["snapshot"])
+            classified = _classify_answer(raw_text, anchored=True)
+        elif target is not None:
+            classified = _classify_answer(raw_text, anchored=True)
+        else:
+            # Bare text without a reply binds only through explicit
+            # consumption or negation language, never a bare affirmation.
+            classified = _classify_answer(raw_text, anchored=False)
+        if classified is None:
+            metadata["_camera_unbound"] = CAMERA_AUTHORITY
             return
-        metadata["_camera_unbound"] = CAMERA_AUTHORITY
+        attempt["state"] = "answering"
+        try:
+            self._save_attempts()
+        except OSError:
+            metadata["_camera_unbound"] = CAMERA_AUTHORITY
+            return
+        metadata["_camera_authority"] = CAMERA_AUTHORITY
+        metadata["_camera_candidate_id"] = candidate_id
+        metadata["_camera_answer"] = classified
+        metadata["_camera_turn_id"] = uuid4().hex
+        if classified == "yes":
+            message.media.append(attempt["snapshot"])
+        return
 
     def note_assistant_receipt(
         self, message: OutboundMessage, receipt: OutboundDeliveryReceipt | None

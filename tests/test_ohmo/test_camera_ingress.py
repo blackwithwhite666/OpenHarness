@@ -6,12 +6,14 @@ import asyncio
 import hashlib
 import json
 from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from ohmo.gateway.camera import (
+    _PENDING_TTL_SECONDS,
     CAMERA_AUTHORITY,
     CameraCandidateUpload,
     CameraIngress,
@@ -442,9 +444,11 @@ async def test_unrecognized_or_unbound_real_text_is_nutrition_forbidden(tmp_path
     assert (await _admit(ingress, root, "Bearer " + "s" * 40, request))[0] == 202
     await asyncio.wait_for(bus.consume_inbound(), timeout=1)
     for text, target in (
-        ("да", 77),
-        ("да, съела полпорции", 77),
-        ("я съела всё", None),
+        # Explicit answers (anchored or bare consumption language) bind and
+        # are covered by the binding tests; these must stay nutrition-forbidden.
+        ("посмотри ещё раз", 77),
+        ("не знаю", None),
+        ("только сливы", None),  # scope-only binds only when anchored
         ("Как погода?", None),
         ("Обычный разговор", 999),
     ):
@@ -625,7 +629,9 @@ async def test_explicit_real_reply_target_not_bare_yes_stale_or_other_user(tmp_p
 
     for message in (
         incoming("да"),
-        incoming("да, я это съела"),
+        # A bare explicit consumption statement binds now (operator-approved
+        # camera answer binding); see test_bare_explicit_answer_binds below.
+        incoming("посмотри ещё раз"),
         incoming("да, я это съела", target=999),
         incoming("да, я это съела", target=77, sender="456"),
     ):
@@ -694,6 +700,215 @@ async def test_explicit_real_reply_target_not_bare_yes_stale_or_other_user(tmp_p
     second = _candidate(root, index=1)
     assert (await _admit(ingress, root, "Bearer " + "s" * 40, second))[0] == 202
     await asyncio.wait_for(bus.consume_inbound(), timeout=1)
+    await ingress.close()
+
+
+@pytest.mark.asyncio
+async def test_bare_explicit_answer_binds_and_ambiguous_stays_unbound(tmp_path: Path) -> None:
+    ingress, root, bus, _ = _ingress(tmp_path)
+    request = _candidate(root)
+    assert (await _admit(ingress, root, "Bearer " + "s" * 40, request))[0] == 202
+    snapshot = Path(ingress._attempts[request["candidate_id"]]["snapshot"])
+    assert snapshot.exists()
+    await asyncio.wait_for(bus.consume_inbound(), timeout=1)
+
+    def incoming(text: str) -> InboundMessage:
+        return InboundMessage(
+            channel="telegram",
+            sender_id="123",
+            chat_id="123",
+            content=text,
+            metadata={"is_group": False, "_telegram_raw_text": text},
+        )
+
+    ambiguous = incoming("посмотри ещё раз")
+    ingress.process_real_inbound(ambiguous)
+    assert ambiguous.metadata.get("_camera_answer") is None
+    assert ambiguous.metadata["_camera_unbound"] is CAMERA_AUTHORITY
+
+    bare_affirmation = incoming("да")
+    ingress.process_real_inbound(bare_affirmation)
+    assert bare_affirmation.metadata.get("_camera_answer") is None
+    assert bare_affirmation.metadata["_camera_unbound"] is CAMERA_AUTHORITY
+
+    bare_scope = incoming("Только сливы")
+    ingress.process_real_inbound(bare_scope)
+    assert bare_scope.metadata.get("_camera_answer") is None  # scope binds only anchored
+    assert bare_scope.metadata["_camera_unbound"] is CAMERA_AUTHORITY
+
+    bare_consumption = incoming("Я съела 4")
+    ingress.process_real_inbound(bare_consumption)
+    assert bare_consumption.metadata["_camera_answer"] == "yes"
+    assert bare_consumption.metadata["_camera_authority"] is CAMERA_AUTHORITY
+    assert bare_consumption.metadata["_camera_turn_id"]
+    assert len(bare_consumption.media) == 1
+    assert ingress._attempts[request["candidate_id"]]["state"] == "answering"
+
+    ingress.complete(bare_consumption, recorded=True)
+    assert ingress._attempts[request["candidate_id"]]["state"] == "final_queued"
+    ingress.note_assistant_receipt(
+        OutboundMessage(
+            channel="telegram",
+            chat_id="123",
+            content="Записано",
+            metadata={
+                "_camera_candidate_id": request["candidate_id"],
+                "_camera_authority": CAMERA_AUTHORITY,
+                "_camera_final": CAMERA_AUTHORITY,
+                "_camera_turn_id": bare_consumption.metadata["_camera_turn_id"],
+            },
+        ),
+        OutboundDeliveryReceipt(channel="telegram", chat_id="123", native_message_ids=(89,)),
+    )
+    assert ingress._attempts[request["candidate_id"]]["state"] == "completed"
+
+    second = _candidate(root, index=1)
+    assert (await _admit(ingress, root, "Bearer " + "s" * 40, second))[0] == 202
+    await asyncio.wait_for(bus.consume_inbound(), timeout=1)
+    bare_negation = incoming("Я это не ела")
+    ingress.process_real_inbound(bare_negation)
+    assert bare_negation.metadata["_camera_answer"] == "no"
+    assert len(bare_negation.media) == 0
+    assert ingress._attempts[second["candidate_id"]]["state"] == "answering"
+    await ingress.close()
+
+
+@pytest.mark.asyncio
+async def test_ask_callback_answer_binds_and_foreign_callback_rejected(
+    tmp_path: Path,
+) -> None:
+    ingress, root, bus, _ = _ingress(tmp_path)
+    request = _candidate(root)
+    assert (await _admit(ingress, root, "Bearer " + "s" * 40, request))[0] == 202
+    snapshot = Path(ingress._attempts[request["candidate_id"]]["snapshot"])
+    assert snapshot.exists()
+    await asyncio.wait_for(bus.consume_inbound(), timeout=1)
+    ingress.note_assistant_receipt(
+        OutboundMessage(
+            channel="telegram",
+            chat_id="123",
+            content="Вы это ели?",
+            metadata={
+                "_camera_candidate_id": request["candidate_id"],
+                "_camera_authority": CAMERA_AUTHORITY,
+            },
+        ),
+        OutboundDeliveryReceipt(channel="telegram", chat_id="123", native_message_ids=(88,)),
+    )
+
+    def callback(label: str, *, target: int, data: str = "ask:1") -> InboundMessage:
+        return InboundMessage(
+            channel="telegram",
+            sender_id="123",
+            chat_id="123",
+            content=label,
+            metadata={
+                "is_group": False,
+                "callback_query": True,
+                "native_message_id": target,
+                "callback_data": data,
+            },
+        )
+
+    foreign_target = callback("Да, всё на фото", target=999)
+    ingress.process_real_inbound(foreign_target)
+    assert foreign_target.metadata["_camera_unbound"] is CAMERA_AUTHORITY
+
+    foreign_data = callback("Да", target=77, data="menu:2")
+    ingress.process_real_inbound(foreign_data)
+    assert foreign_data.metadata["_camera_unbound"] is CAMERA_AUTHORITY
+
+    affirmation = callback("Да, всё на фото", target=88)
+    ingress.process_real_inbound(affirmation)
+    assert affirmation.metadata["_camera_answer"] == "yes"
+    assert affirmation.metadata["_camera_authority"] is CAMERA_AUTHORITY
+    assert len(affirmation.media) == 1
+    assert ingress._attempts[request["candidate_id"]]["state"] == "answering"
+
+    ingress.complete(affirmation, recorded=True)
+    ingress.note_assistant_receipt(
+        OutboundMessage(
+            channel="telegram",
+            chat_id="123",
+            content="Записано",
+            metadata={
+                "_camera_candidate_id": request["candidate_id"],
+                "_camera_authority": CAMERA_AUTHORITY,
+                "_camera_final": CAMERA_AUTHORITY,
+                "_camera_turn_id": affirmation.metadata["_camera_turn_id"],
+            },
+        ),
+        OutboundDeliveryReceipt(channel="telegram", chat_id="123", native_message_ids=(89,)),
+    )
+    assert ingress._attempts[request["candidate_id"]]["state"] == "completed"
+
+    second = _candidate(root, index=1)
+    assert (await _admit(ingress, root, "Bearer " + "s" * 40, second))[0] == 202
+    await asyncio.wait_for(bus.consume_inbound(), timeout=1)
+    ingress.note_assistant_receipt(
+        OutboundMessage(
+            channel="telegram",
+            chat_id="123",
+            content="Вы это ели?",
+            metadata={
+                "_camera_candidate_id": second["candidate_id"],
+                "_camera_authority": CAMERA_AUTHORITY,
+            },
+        ),
+        OutboundDeliveryReceipt(channel="telegram", chat_id="123", native_message_ids=(90,)),
+    )
+    scope = callback("Только сливы", target=90, data="ask:1")
+    ingress.process_real_inbound(scope)
+    assert scope.metadata["_camera_answer"] == "yes"  # anchored scope-only binds
+    assert len(scope.media) == 1
+    await ingress.close()
+
+
+@pytest.mark.asyncio
+async def test_pending_ttl_sweeps_stale_answer_gate(tmp_path: Path) -> None:
+    ingress, root, bus, _ = _ingress(tmp_path)
+    request = _candidate(root)
+    assert (await _admit(ingress, root, "Bearer " + "s" * 40, request))[0] == 202
+    snapshot = Path(ingress._attempts[request["candidate_id"]]["snapshot"])
+    assert snapshot.exists()
+    await asyncio.wait_for(bus.consume_inbound(), timeout=1)
+    candidate_id = request["candidate_id"]
+    assert ingress._attempts[candidate_id]["state"] == "photo_sent"
+    assert isinstance(ingress._attempts[candidate_id].get("admitted_at"), str)
+
+    aged = datetime.now(UTC) - timedelta(seconds=_PENDING_TTL_SECONDS + 60)
+    ingress._attempts[candidate_id]["admitted_at"] = aged.isoformat()
+    gate = InboundMessage(
+        channel="telegram",
+        sender_id="123",
+        chat_id="123",
+        content="что нового",
+        metadata={"is_group": False, "_telegram_raw_text": "что нового"},
+    )
+    ingress.process_real_inbound(gate)
+    assert candidate_id not in ingress._attempts
+    assert not snapshot.exists()
+    assert gate.metadata.get("_camera_unbound") is None
+    assert gate.metadata.get("_camera_authority") is None
+
+    fresh = CameraIngress(ingress.config, workspace=tmp_path, bus=MessageBus(), telegram=None)
+    assert candidate_id not in fresh._attempts
+
+    # At-most-once tombstones survive the TTL.
+    tomb = _candidate(root, index=1)
+    assert (await _admit(ingress, root, "Bearer " + "s" * 40, tomb))[0] == 202
+    await asyncio.wait_for(bus.consume_inbound(), timeout=1)
+    ingress._attempts[tomb["candidate_id"]]["state"] = "delivery_unknown"
+    ingress._attempts[tomb["candidate_id"]]["admitted_at"] = aged.isoformat()
+    ingress._sweep_expired_attempts()
+    assert tomb["candidate_id"] in ingress._attempts
+
+    # A legacy journal entry without admitted_at is backfilled, not swept.
+    ingress._attempts[tomb["candidate_id"]].pop("admitted_at")
+    ingress._save_attempts()
+    reloaded = CameraIngress(ingress.config, workspace=tmp_path, bus=MessageBus(), telegram=None)
+    assert tomb["candidate_id"] in reloaded._attempts
+    assert isinstance(reloaded._attempts[tomb["candidate_id"]].get("admitted_at"), str)
     await ingress.close()
 
 
