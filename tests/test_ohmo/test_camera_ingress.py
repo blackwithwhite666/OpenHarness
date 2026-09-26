@@ -559,10 +559,13 @@ async def test_crash_after_202_leaves_tombstone_without_auto_retry(tmp_path: Pat
     ingress, root, bus, channel = _ingress(tmp_path)
     request = _candidate(root)
     assert (await _admit(ingress, root, "Bearer " + "s" * 40, request))[0] == 202
+    snapshot = Path(ingress._attempts[request["candidate_id"]]["snapshot"])
+    assert snapshot.exists()
     await ingress.close()  # cancel before the scheduled worker executes
     assert bus.inbound_size == 0
     restarted = CameraIngress(ingress.config, workspace=tmp_path, bus=bus, telegram=channel)
     restarted.mark_restart_unknown()
+    assert snapshot.exists()  # unresolved attempts retain their image for diagnosis/recovery
     status, duplicate = await _admit(restarted, root, "Bearer " + "s" * 40, request)
     assert status == 202 and duplicate["ack_seq"] == 1
     assert duplicate["admission_id"] == ingress._attempts[request["candidate_id"]]["admission_id"]
@@ -591,6 +594,8 @@ async def test_explicit_real_reply_target_not_bare_yes_stale_or_other_user(tmp_p
     ingress, root, bus, _ = _ingress(tmp_path)
     request = _candidate(root)
     assert (await _admit(ingress, root, "Bearer " + "s" * 40, request))[0] == 202
+    snapshot = Path(ingress._attempts[request["candidate_id"]]["snapshot"])
+    assert snapshot.exists()
     await asyncio.wait_for(bus.consume_inbound(), timeout=1)
 
     def incoming(text: str, *, target: int | None = None, sender: str = "123") -> InboundMessage:
@@ -654,6 +659,12 @@ async def test_explicit_real_reply_target_not_bare_yes_stale_or_other_user(tmp_p
         OutboundDeliveryReceipt(channel="telegram", chat_id="123", native_message_ids=(89,)),
     )
     assert ingress._attempts[request["candidate_id"]]["state"] == "completed"
+    assert not snapshot.exists()
+    # A crash after persisting the terminal state but before unlinking is
+    # repaired when the ingress starts again.
+    snapshot.write_bytes(b"stale completed image")
+    CameraIngress(ingress.config, workspace=tmp_path, bus=MessageBus(), telegram=None)
+    assert not snapshot.exists()
     stale_reply = incoming("Я это съела", target=77)
     ingress.process_real_inbound(stale_reply)
     assert stale_reply.metadata["_camera_unbound"] is CAMERA_AUTHORITY

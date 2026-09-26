@@ -400,6 +400,7 @@ class CameraIngress:
             session_id=previous_session.get("session_id") if previous_session else None
         )
         self._tasks: set[asyncio.Task] = set()
+        self._remove_completed_snapshots()
 
     @staticmethod
     def _new_session(*, session_id: str | None = None) -> dict:
@@ -492,6 +493,46 @@ class CameraIngress:
             except FileNotFoundError:
                 pass
             os.close(state_fd)
+
+    def _remove_completed_snapshots(self) -> None:
+        """Drop local image copies once the user flow has a confirmed outcome."""
+        for attempt in self._attempts.values():
+            if attempt.get("state") != "completed":
+                continue
+            snapshot = attempt.get("snapshot")
+            admission_id = attempt.get("admission_id")
+            if not isinstance(snapshot, str) or not isinstance(admission_id, str):
+                continue
+            name = Path(snapshot)
+            if name.parent != self._state_dir / "snapshots" or name.name not in {
+                f"{admission_id}.jpg",
+                f"{admission_id}.jpeg",
+                f"{admission_id}.png",
+                f"{admission_id}.webp",
+            }:
+                continue
+            try:
+                state_fd = self._open_state_dir(create=False)
+                try:
+                    snapshots_fd = _child_directory(state_fd, "snapshots", create=False)
+                    try:
+                        try:
+                            os.unlink(name.name, dir_fd=snapshots_fd)
+                            os.fsync(snapshots_fd)
+                        except FileNotFoundError:
+                            pass
+                    finally:
+                        os.close(snapshots_fd)
+                finally:
+                    os.close(state_fd)
+            except FileNotFoundError:
+                continue
+            except OSError:
+                import logging
+
+                logging.getLogger(__name__).warning(
+                    "failed to remove completed Camera snapshot", exc_info=True
+                )
 
     def mark_restart_unknown(self) -> None:
         """Never resume an in-flight photo or answer after process restart."""
@@ -922,6 +963,8 @@ class CameraIngress:
         if final and attempt["state"] == "final_queued":
             attempt["state"] = "completed"
         self._save_attempts()
+        if final and attempt["state"] == "completed":
+            self._remove_completed_snapshots()
 
     def note_assistant_failure(self, message: OutboundMessage) -> None:
         if message.metadata.get("_camera_final") is not CAMERA_AUTHORITY:
