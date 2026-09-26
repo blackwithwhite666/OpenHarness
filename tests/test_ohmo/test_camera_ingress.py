@@ -344,6 +344,22 @@ async def test_direct_upload_does_not_depend_on_dropbox_artifact_sync(tmp_path: 
 
 
 @pytest.mark.asyncio
+async def test_json_candidate_payload_is_not_an_admission_contract(
+    tmp_path: Path,
+) -> None:
+    ingress, root, _, channel = _ingress(tmp_path)
+    request = _candidate(root)
+    upload = await _leased_upload(ingress, root, "Bearer " + "s" * 40, request)
+
+    status, body = await ingress.admit("Bearer " + "s" * 40, upload.request)
+
+    assert (status, body) == (400, {"error": {"code": "invalid_request"}})
+    assert ingress._session["committed_seq"] == 0
+    assert channel.calls == []
+    await ingress.close()
+
+
+@pytest.mark.asyncio
 async def test_same_sequence_replays_cached_admission_without_second_send(tmp_path: Path) -> None:
     ingress, root, bus, channel = _ingress(tmp_path)
     request = _candidate(root)
@@ -1147,8 +1163,23 @@ async def test_lost_http_response_after_admission_never_causes_resend(tmp_path: 
     reader.feed_eof()
     with pytest.raises(ConnectionError, match="response lost"):
         await serve_camera_http(ingress, reader, _LostResponseWriter())
-    status, replay_body = await ingress.admit("Bearer " + "s" * 40, upload)
-    assert status == 202 and replay_body["ack_seq"] == 1
+
+    retry_reader = asyncio.StreamReader()
+    retry_reader.feed_data(
+        b"POST /internal/v1/camera/candidates HTTP/1.1\r\n"
+        + b"Authorization: Bearer "
+        + b"s" * 40
+        + b"\r\n"
+        + f"Content-Type: {content_type}\r\n".encode()
+        + f"Content-Length: {len(body)}\r\n\r\n".encode()
+        + body
+    )
+    retry_reader.feed_eof()
+    retry_writer = _Writer()
+    await serve_camera_http(ingress, retry_reader, retry_writer)
+    assert retry_writer.data.startswith(b"HTTP/1.1 202 ")
+    replay_body = json.loads(retry_writer.data.split(b"\r\n\r\n", 1)[1])
+    assert replay_body["ack_seq"] == 1
     await asyncio.wait_for(bus.consume_inbound(), timeout=1)
     assert len(channel.calls) == 1
     await ingress.close()

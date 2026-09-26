@@ -680,11 +680,10 @@ class CameraIngress:
             or not hmac.compare_digest(authorization[len(prefix) :].encode(), expected)
         ):
             return self._error(401, "unauthorized")
+        if not isinstance(upload, CameraCandidateUpload):
+            return self._error(400, "invalid_request")
         try:
-            request_payload = (
-                upload.request if isinstance(upload, CameraCandidateUpload) else upload
-            )
-            request = CameraCandidateRequest.model_validate(request_payload)
+            request = CameraCandidateRequest.model_validate(upload.request)
         except ValidationError:
             return self._error(400, "invalid_request")
         async with self._lock:
