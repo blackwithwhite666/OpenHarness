@@ -70,6 +70,9 @@ from openharness.untrusted import UNTRUSTED_BANNER
         ("anthropic/claude-sonnet-4-6", True),
         ("openai/gpt-4o", True),
         ("openai/gpt-4", False),
+        ("openai/gpt-6-sol", False),
+        ("openai/gpt-6-luna", True),
+        ("gpt-6-luna", True),
     ],
 )
 def test_is_model_multimodal(model: str, expected: bool) -> None:

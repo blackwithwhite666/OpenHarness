@@ -472,6 +472,45 @@ class CameraIngress:
             "last_ack": None,
         }
 
+    @staticmethod
+    def _attempt_capture_time(attempt: dict) -> datetime | None:
+        raw = attempt.get("capture_time")
+        if (
+            not isinstance(raw, str)
+            or len(raw) > 64
+            or attempt.get("capture_time_authority") not in {"exif", "filename"}
+        ):
+            return None
+        try:
+            instant = datetime.fromisoformat(raw)
+        except ValueError:
+            return None
+        return instant if instant.tzinfo is not None and instant.utcoffset() is not None else None
+
+    def trusted_capture_time_for_answer(self, message: InboundMessage) -> datetime | None:
+        """Resolve capture evidence only for this ingress-bound owner answer turn."""
+        metadata = message.metadata
+        if (
+            not self.config.enabled
+            or message.channel != "telegram"
+            or str(message.chat_id) != self.config.chat_id
+            or message.sender_id.split("|", 1)[0] != self.config.principal
+            or metadata.get("_camera_authority") is not CAMERA_AUTHORITY
+            or metadata.get("_camera_answer") != "yes"
+        ):
+            return None
+        candidate_id = metadata.get("_camera_candidate_id")
+        attempt = self._attempts.get(candidate_id) if isinstance(candidate_id, str) else None
+        if (
+            attempt is None
+            or attempt.get("state") != "answering"
+            or not isinstance(metadata.get("_camera_turn_id"), str)
+            or not metadata["_camera_turn_id"]
+            or metadata["_camera_turn_id"] != attempt.get("answer_turn_id")
+        ):
+            return None
+        return self._attempt_capture_time(attempt)
+
     def _load_attempts(self) -> tuple[dict[str, dict], dict | None]:
         try:
             state_fd = self._open_state_dir(create=False)
@@ -514,6 +553,11 @@ class CameraIngress:
                 "delivery_unknown",
             }:
                 raise ValueError("camera attempt journal is invalid")
+            # Older tombstones have no capture evidence. Keep them, but never
+            # infer a meal time from admission or reply arrival.
+            if "capture_time" in value or "capture_time_authority" in value:
+                if self._attempt_capture_time(value) is None:
+                    raise ValueError("camera attempt journal capture time is invalid")
         now_iso = datetime.now(UTC).isoformat()
         for value in attempts.values():
             if not isinstance(value.get("admitted_at"), str):
@@ -872,6 +916,8 @@ class CameraIngress:
                     "reply_ids": [],
                     "final_turn_id": None,
                     "admitted_at": datetime.now(UTC).isoformat(),
+                    "capture_time": request.capture_time.isoformat(),
+                    "capture_time_authority": request.capture_time_authority,
                 }
                 status, response = self._commit_sequence(
                     request,
@@ -1019,6 +1065,7 @@ class CameraIngress:
             metadata["_camera_unbound"] = CAMERA_AUTHORITY
             return
         attempt["state"] = "answering"
+        attempt["answer_turn_id"] = uuid4().hex
         try:
             self._save_attempts()
         except OSError:
@@ -1027,7 +1074,7 @@ class CameraIngress:
         metadata["_camera_authority"] = CAMERA_AUTHORITY
         metadata["_camera_candidate_id"] = candidate_id
         metadata["_camera_answer"] = classified
-        metadata["_camera_turn_id"] = uuid4().hex
+        metadata["_camera_turn_id"] = attempt["answer_turn_id"]
         if classified == "yes":
             message.media.append(attempt["snapshot"])
         return

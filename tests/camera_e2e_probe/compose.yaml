@@ -1,0 +1,57 @@
+# Official Honcho source must be checked out at 0d85a34917418485b9eb387eacda608bcf2de426.
+# Run with: docker compose -p camera-e2e-probe-20260929 -f tests/camera_e2e_probe/compose.yaml up -d --build --wait
+services:
+  database:
+    image: pgvector/pgvector:pg15
+    environment:
+      POSTGRES_DB: postgres
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: camera_probe_local
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ${CAMERA_HONCHO_SOURCE:?set CAMERA_HONCHO_SOURCE to the pinned Honcho checkout}/database/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U postgres -d postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  redis:
+    image: redis:8.2
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: [CMD, redis-cli, ping]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  api:
+    build:
+      context: ${CAMERA_HONCHO_SOURCE:?set CAMERA_HONCHO_SOURCE to the pinned Honcho checkout}
+      dockerfile: Dockerfile
+    entrypoint: [sh, docker/entrypoint.sh]
+    environment:
+      DB_CONNECTION_URI: postgresql+psycopg://postgres:camera_probe_local@database:5432/postgres
+      CACHE_URL: redis://redis:6379/0?suppress=true
+      CACHE_ENABLED: "true"
+      DERIVER_ENABLED: "false"
+      EMBED_MESSAGES: "false"
+    depends_on:
+      database:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1::8000"
+    healthcheck:
+      test: [CMD, /app/.venv/bin/python, -c, "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=2).read()"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 20s
+
+volumes:
+  pgdata:
+  redisdata:

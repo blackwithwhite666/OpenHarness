@@ -389,7 +389,9 @@ class _GatewayDecisionTraceRecorderAdapter:
                 and "nutrition" in annotations
             ):
                 self._saw_invalid_finalization = True
-                raise DecisionTraceValidationError("Camera meal requires a bound explicit Marina answer")
+                raise DecisionTraceValidationError(
+                    "Camera meal requires a bound explicit owner answer"
+                )
             payload = self._stamp_authoritative_nutrition_meal_at(payload)
             try:
                 payload = validate_trace_finalization_annotations(payload)
@@ -429,6 +431,7 @@ class _GatewayDecisionTraceRecorderAdapter:
         stamped_annotations = dict(stamped.get("annotations") or {})
         stamped_nutrition = dict(stamped_annotations.get("nutrition") or {})
         stamped_nutrition["meal_at"] = meal_at.isoformat()
+        stamped_nutrition.pop("meal_date", None)
         for field_name in ("assumptions", "warnings"):
             values = stamped_nutrition.get(field_name)
             if isinstance(values, list):

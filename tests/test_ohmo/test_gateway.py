@@ -297,6 +297,50 @@ async def test_runtime_pool_restores_messages_for_private_legacy_session_key(tmp
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("effort", [None, "none"])
+async def test_runtime_pool_passes_optional_effort_on_create_and_refresh(
+    tmp_path, monkeypatch, effort
+):
+    workspace = tmp_path / ".ohmo-home"
+    initialize_workspace(workspace)
+    calls: list[dict[str, object]] = []
+
+    async def fake_build_runtime(**kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(
+            cwd=kwargs["cwd"],
+            engine=SimpleNamespace(set_system_prompt=lambda prompt: None, messages=[]),
+            session_id="session",
+        )
+
+    async def no_op(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr("ohmo.gateway.runtime.build_runtime", fake_build_runtime)
+    monkeypatch.setattr("ohmo.gateway.runtime.start_runtime", no_op)
+    monkeypatch.setattr("ohmo.gateway.runtime.close_runtime", no_op)
+    monkeypatch.setattr(OhmoSessionRuntimePool, "_runtime_system_prompt", no_op)
+    monkeypatch.setattr(OhmoSessionRuntimePool, "_configure_attachment_boundary", lambda *args: None)
+    monkeypatch.setattr(OhmoSessionRuntimePool, "_register_gateway_tools", lambda *args, **kwargs: None)
+    monkeypatch.setattr(OhmoSessionRuntimePool, "_configure_turn_memory_surfaces", lambda *args, **kwargs: None)
+
+    pool = OhmoSessionRuntimePool(
+        cwd=tmp_path,
+        workspace=workspace,
+        provider_profile="openrouter",
+        model="openai/gpt-6-luna",
+        max_turns=4,
+        effort=effort,
+    )
+    await pool.get_bundle("telegram:probe")
+    pool._gateway_config_generation += 1
+    await pool.get_bundle("telegram:probe")
+
+    assert [call["effort"] for call in calls] == [effort, effort]
+    assert [call["max_turns"] for call in calls] == [4, 4]
+
+
+@pytest.mark.asyncio
 async def test_runtime_pool_uses_managed_group_cwd_binding(tmp_path, monkeypatch):
     workspace = tmp_path / ".ohmo-home"
     project = tmp_path / "OpenHarness-new"

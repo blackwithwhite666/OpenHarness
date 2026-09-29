@@ -440,6 +440,7 @@ class OhmoSessionRuntimePool:
         provider_profile: str,
         model: str | None = None,
         max_turns: int | None = None,
+        effort: str | None = None,
         create_feishu_group: CreateFeishuGroup | None = None,
         publish_group_welcome: PublishGroupWelcome | None = None,
         contact_store: ContactStore | None = None,
@@ -451,6 +452,7 @@ class OhmoSessionRuntimePool:
         self._provider_profile = provider_profile
         self._model = model
         self._max_turns = max_turns
+        self._effort = effort
         self._create_feishu_group = create_feishu_group
         self._publish_group_welcome = publish_group_welcome
         self._contact_store = contact_store
@@ -575,6 +577,7 @@ class OhmoSessionRuntimePool:
             cwd=session_cwd,
             model=self._model,
             max_turns=self._max_turns,
+            effort=self._effort,
             system_prompt=build_ohmo_system_prompt(
                 session_cwd,
                 workspace=self._workspace,
@@ -713,6 +716,48 @@ class OhmoSessionRuntimePool:
                 self._session_owner_principals[session_id] = None
         return self._session_owner_principals[session_id]
 
+    def _trusted_camera_answer_time(
+        self, message: InboundMessage, *, session_key: str, turn_ctx: TurnContext
+    ) -> datetime | None:
+        camera = self._gateway_config.camera_ingress
+        if (
+            not camera.enabled
+            or not turn_ctx.camera_authorized
+            or turn_ctx.principal != camera.principal
+            or canonical_principal(message.channel, message.sender_id) != camera.principal
+            or message.metadata.get("_camera_answer") != "yes"
+            or message.metadata.get("_camera_authority") is not CAMERA_AUTHORITY
+            or message.channel != "telegram"
+            or str(message.chat_id) != camera.chat_id
+            or session_key != camera.session_key
+            or not message.media
+        ):
+            return None
+        ingress = getattr(self, "_camera_ingress", None)
+        return ingress.trusted_capture_time_for_answer(message) if ingress is not None else None
+
+    @staticmethod
+    def _with_camera_answer_context(prompt: str, capture_time: datetime | None) -> str:
+        if capture_time is None:
+            return prompt
+        return (
+            prompt + "\n\n# Verified Camera answer for this turn\n"
+            "The gateway bound the current owner's affirmative consumption answer to the "
+            "attached Camera photo and verified its capture time. The earlier Camera "
+            "analysis-only instruction applied to the earlier photo turn; this is the "
+            "owner's confirmed-consumption turn. Use the current user's stated food and "
+            "quantity over ambiguous image inference. Before answering, call `trace` "
+            "with a valid `trace_finalization` payload and `annotations.nutrition` using "
+            "the calory skill's schema v2: `schema_version` 2, `record_type` `meal_observation`, "
+            "`consumption_status` `consumed`, and `basis` including `image`. Estimate "
+            "at least one total energy kcal field from the food and quantity; do not "
+            "invent a fixed calorie value. "
+            "Set `meal_at` and `meal_date` to null in the model payload: the gateway "
+            "stamps the authoritative capture time into the validated annotation. "
+            "Use a valid, unique `trace_event_id` for the finalization. Only claim the "
+            "meal was recorded after a trusted durable append receipt."
+        )
+
     async def stream_message(self, message: InboundMessage, session_key: str):
         """Submit an inbound channel message and yield progress + final reply updates."""
         todo_lifecycle = _is_real_user_turn(message)
@@ -765,13 +810,19 @@ class OhmoSessionRuntimePool:
             turn_ctx,
             memory_scope=memory_scope,
         )
+        camera_meal_at = self._trusted_camera_answer_time(
+            message, session_key=session_key, turn_ctx=turn_ctx
+        )
         bundle.engine.set_system_prompt(
-            await self._runtime_system_prompt(
-                bundle,
-                user_prompt,
-                turn_ctx=turn_ctx,
-                memory_scope=memory_scope,
-                include_todo=todo_lifecycle,
+            self._with_camera_answer_context(
+                await self._runtime_system_prompt(
+                    bundle,
+                    user_prompt,
+                    turn_ctx=turn_ctx,
+                    memory_scope=memory_scope,
+                    include_todo=todo_lifecycle,
+                ),
+                camera_meal_at,
             )
         )
         if wellness_reminder is not None:
@@ -823,8 +874,15 @@ class OhmoSessionRuntimePool:
             if _evals_capture_enabled(self._gateway_config)
             else None
         )
+        if recorder is not None and camera_meal_at is not None:
+            recorder.set_authoritative_nutrition_meal_at(camera_meal_at)
         if recorder is not None and (
             (camera_authorized and message.metadata.get("_camera_answer") != "yes")
+            or (
+                camera_authorized
+                and message.metadata.get("_camera_answer") == "yes"
+                and camera_meal_at is None
+            )
             or message.metadata.get("_camera_unbound") is CAMERA_AUTHORITY
         ):
             recorder.forbid_nutrition_record()
@@ -962,6 +1020,7 @@ class OhmoSessionRuntimePool:
                     memory_scope=memory_scope,
                     recorder=recorder,
                     todo_lifecycle=todo_lifecycle,
+                    camera_meal_at=camera_meal_at,
                 )
             ):
                 yield update
@@ -1168,6 +1227,7 @@ class OhmoSessionRuntimePool:
         memory_scope: MemoryScope | None,
         recorder: GatewayEvalRecorder | None = None,
         todo_lifecycle: bool = True,
+        camera_meal_at: datetime | None = None,
     ):
         todo_error = getattr(bundle, "_todo_runtime_error", None)
         if todo_lifecycle and isinstance(todo_error, TodoRuntimeStateError):
@@ -1178,12 +1238,15 @@ class OhmoSessionRuntimePool:
             )
             return
         bundle.engine.set_system_prompt(
-            await self._runtime_system_prompt(
-                bundle,
-                user_prompt,
-                turn_ctx=turn_ctx,
-                memory_scope=memory_scope,
-                include_todo=todo_lifecycle,
+            self._with_camera_answer_context(
+                await self._runtime_system_prompt(
+                    bundle,
+                    user_prompt,
+                    turn_ctx=turn_ctx,
+                    memory_scope=memory_scope,
+                    include_todo=todo_lifecycle,
+                ),
+                camera_meal_at,
             )
         )
         todo_error = getattr(bundle, "_todo_runtime_error", None)
@@ -1410,6 +1473,14 @@ class OhmoSessionRuntimePool:
         )
         camera_yes = camera_bound_answer and message.metadata.get("_camera_answer") == "yes"
         if camera_yes:
+            camera_ingress = getattr(self, "_camera_ingress", None)
+            trusted_meal_at = (
+                camera_ingress.trusted_capture_time_for_answer(message)
+                if camera_ingress is not None
+                else None
+            )
+            if trusted_meal_at is None:
+                raise ValueError("Camera consumed meal requires trusted capture time")
             annotation = recorder.validated_nutrition_envelope if recorder is not None else None
             if annotation is None:
                 raise ValueError("Camera confirmation requires a validated meal observation")
@@ -1420,6 +1491,10 @@ class OhmoSessionRuntimePool:
                 or "image" not in validated.basis
             ):
                 raise ValueError("Camera meal finalization requires a consumed image observation")
+            if validated.meal_at != trusted_meal_at or validated.meal_date is not None:
+                raise ValueError(
+                    "Camera consumed meal requires authoritative meal_at without meal_date"
+                )
         if self._gateway_config.conversation_learning is not True:
             return
         scope = self._coerce_memory_scope(turn_ctx, memory_scope)
@@ -1738,6 +1813,7 @@ class OhmoSessionRuntimePool:
             cwd=bundle_cwd,
             model=self._model,
             max_turns=self._max_turns,
+            effort=self._effort,
             system_prompt=build_ohmo_system_prompt(
                 bundle_cwd,
                 workspace=self._workspace,
