@@ -17,7 +17,7 @@ import re
 import stat
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from email import policy
 from email.parser import BytesParser
 from http import HTTPStatus
@@ -490,7 +490,7 @@ class CameraIngress:
 
     @staticmethod
     def _new_session(*, session_id: str | None = None) -> dict:
-        now = datetime.now(UTC)
+        now = datetime.now(timezone.utc)
         return {
             "session_id": session_id or uuid4().hex,
             "epoch": uuid4().hex,
@@ -878,7 +878,7 @@ class CameraIngress:
             if "capture_time" in value or "capture_time_authority" in value:
                 if self._attempt_capture_time(value) is None:
                     raise ValueError("camera attempt journal capture time is invalid")
-        now_iso = datetime.now(UTC).isoformat()
+        now_iso = datetime.now(timezone.utc).isoformat()
         self._journal_migrated = False
         for value in attempts.values():
             if not isinstance(value.get("admitted_at"), str):
@@ -953,7 +953,7 @@ class CameraIngress:
         tombstones are never swept: they are the at-most-once admission
         markers for sends whose outcome is unknown.
         """
-        now = datetime.now(UTC)
+        now = datetime.now(timezone.utc)
         expired = [
             value
             for value in self._attempts.values()
@@ -1042,7 +1042,7 @@ class CameraIngress:
 
     def _refresh_expired_session(self) -> bool:
         expires_at = datetime.fromisoformat(self._session["expires_at"])
-        if datetime.now(UTC) < expires_at:
+        if datetime.now(timezone.utc) < expires_at:
             return False
         self._session = self._new_session(session_id=self._session["session_id"])
         return True
@@ -1266,7 +1266,7 @@ class CameraIngress:
                     "photo_delivery_confirmed": False,
                     "reply_ids": [],
                     "final_turn_id": None,
-                    "admitted_at": datetime.now(UTC).isoformat(),
+                    "admitted_at": datetime.now(timezone.utc).isoformat(),
                     "attention_active": True,
                     "capture_time": request.capture_time.isoformat(),
                     "capture_time_authority": request.capture_time_authority,

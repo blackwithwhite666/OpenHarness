@@ -10,7 +10,7 @@ import asyncio
 import os
 import sys
 import tempfile
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import uuid4
 
@@ -40,7 +40,7 @@ async def main() -> None:
     workspace = f"camera-storage-{run_id}"
     session = "nutrition"
     source_message_id = f"synthetic-source-{run_id}"
-    now = datetime.now(UTC)
+    now = datetime.now(timezone.utc)
     day = now.date().isoformat()
     scratch_parent = ROOT / "tmp" / "camera-e2e" / "storage-runs"
     scratch_parent.mkdir(parents=True, exist_ok=True)

@@ -6,7 +6,7 @@ import asyncio
 import hashlib
 import json
 from dataclasses import replace
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -1193,7 +1193,7 @@ async def test_pending_ttl_sweeps_stale_answer_gate(tmp_path: Path) -> None:
     assert ingress._attempts[candidate_id]["state"] == "photo_sent"
     assert isinstance(ingress._attempts[candidate_id].get("admitted_at"), str)
 
-    aged = datetime.now(UTC) - timedelta(seconds=_PENDING_TTL_SECONDS + 60)
+    aged = datetime.now(timezone.utc) - timedelta(seconds=_PENDING_TTL_SECONDS + 60)
     ingress._attempts[candidate_id]["admitted_at"] = aged.isoformat()
     gate = InboundMessage(
         channel="telegram",

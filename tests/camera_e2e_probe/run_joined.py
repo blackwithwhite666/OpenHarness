@@ -14,7 +14,7 @@ import os
 import sys
 from collections import Counter
 from contextlib import nullcontext
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import httpx
@@ -73,7 +73,7 @@ async def verify_finalizer_event(
             session,
             expected_peer_id="ohmo",
             since=started - timedelta(minutes=1),
-            until=datetime.now(UTC) + timedelta(minutes=1),
+            until=datetime.now(timezone.utc) + timedelta(minutes=1),
         )
     event = select_finalizer_event(messages, candidate_id, answer_message_id)
     trace = event.metadata.get("decision_trace")
@@ -366,7 +366,7 @@ async def main() -> None:
                             )
                         if answer.session_key != inbound.session_key:
                             raise AssertionError("owner answer escaped the Camera session")
-                        started = datetime.now(UTC)
+                        started = datetime.now(timezone.utc)
                         await model_turn(answer)
                         await verify_finalizer_event(
                             url=honcho_url,
