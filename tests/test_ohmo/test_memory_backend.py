@@ -81,7 +81,21 @@ async def test_durable_exchange_returns_receipt_and_reconciles_retry() -> None:
 
     assert isinstance(first, ConversationAppendReceipt)
     assert second == first
+    assert first.assistant_metadata == honcho.messages[1].metadata
     assert len(honcho.messages) == 2
+    reconciled = await backend.reconcile_durable_exchange(
+        first.user_client_op_id, first.assistant_client_op_id
+    )
+    assert reconciled == first
+    assert len(honcho.messages) == 2
+
+
+@pytest.mark.asyncio
+async def test_durable_exchange_reconciliation_absent_does_not_append() -> None:
+    honcho = _Honcho()
+    backend = ShadowMemoryBackend(_Base(), honcho, conversation_learning=True)
+    assert await backend.reconcile_durable_exchange("missing:user", "missing:assistant") is None
+    assert honcho.messages == []
 
 
 @pytest.mark.asyncio

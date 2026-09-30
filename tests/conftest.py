@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import os
+import socket
 
+import pytest
 import pytest_asyncio
 
 from openharness.tasks.manager import shutdown_task_manager
@@ -19,6 +21,28 @@ from openharness.tasks.manager import shutdown_task_manager
 # ``generator raised StopIteration`` / ``Event loop is closed`` on some async tests).
 # The few tests that exercise the hook opt back in with their own ``monkeypatch.setenv``.
 os.environ["OHMO_MEMORY_AUTOINDEX"] = "0"
+
+
+def _probe_asyncio_self_pipe() -> None:
+    """Fail early when sandbox policy prevents asyncio's local wakeup writes."""
+    try:
+        receiver, sender = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+        with receiver, sender:
+            receiver.settimeout(0.5)
+            sender.settimeout(0.5)
+            sender.sendall(b"x")
+            if receiver.recv(1) != b"x":
+                raise OSError("socketpair probe did not deliver its byte")
+    except OSError as exc:
+        raise pytest.UsageError(
+            "pytest cannot run here: asyncio self-pipe AF_UNIX socketpair send/receive "
+            "is unavailable; use an operator-authorized test execution environment"
+        ) from exc
+
+
+def pytest_sessionstart(session: pytest.Session) -> None:
+    if not getattr(session.config.option, "collectonly", False):
+        _probe_asyncio_self_pipe()
 
 
 @pytest_asyncio.fixture(autouse=True)

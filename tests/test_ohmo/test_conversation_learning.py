@@ -209,13 +209,25 @@ async def test_owner_private_isolated_turn_ingests_without_delaying_reply(
     async def collect_updates() -> list[object]:
         return [update async for update in pool.stream_message(message, "feishu:owner-chat")]
 
-    updates = await asyncio.wait_for(collect_updates(), timeout=0.2)
+    updates_task = asyncio.create_task(collect_updates())
+    try:
+        await asyncio.wait_for(honcho.started.wait(), timeout=10)
+        assert not honcho.release.is_set()
+        updates = await asyncio.wait_for(asyncio.shield(updates_task), timeout=10)
+        assert updates[-1].kind == "final"
+        assert updates[-1].text == "Assistant response."
+        assert not honcho.release.is_set()
+    finally:
+        honcho.release.set()
+        try:
+            if not updates_task.done():
+                await asyncio.wait_for(asyncio.shield(updates_task), timeout=10)
+        except asyncio.TimeoutError:
+            updates_task.cancel()
+        finally:
+            await asyncio.gather(updates_task, return_exceptions=True)
+            await asyncio.wait_for(backend.await_pending(), timeout=10)
 
-    assert updates[-1].kind == "final"
-    assert updates[-1].text == "Assistant response."
-    await asyncio.wait_for(honcho.started.wait(), timeout=0.2)
-    honcho.release.set()
-    await backend.await_pending()
     assert len(honcho.messages) == 1
     [session, messages] = honcho.messages[0]
     assert session == "ohmo"

@@ -559,8 +559,17 @@ def validate_trace_finalization_annotations(
             )
         model = _nutrition_annotation_model(annotation)
         try:
-            validated_annotations[key] = model.model_validate(annotation).model_dump(
+            validated = model.model_validate(annotation)
+            # A correction is a sparse patch: fields omitted from its mask must
+            # stay absent when a validated trace is serialized and revalidated.
+            # Keep explicitly supplied nulls so a masked field can be cleared.
+            sparse_correction = (
+                isinstance(validated, NutritionAnnotationV2)
+                and validated.record_type == RECORD_TYPE_MEAL_CORRECTION
+            )
+            validated_annotations[key] = validated.model_dump(
                 mode="json",
+                exclude_unset=sparse_correction,
             )
         except ValidationError as exc:
             validation_error = exc.errors()[0] if exc.errors() else None

@@ -79,6 +79,7 @@ class ConversationAppendReceipt:
     assistant_message_id: str
     user_client_op_id: str
     assistant_client_op_id: str
+    assistant_metadata: Mapping[str, object] | None = None
 
     @property
     def user_id(self) -> str:
@@ -923,6 +924,34 @@ class ShadowMemoryBackend(MemoryBackend):
         task.add_done_callback(self._pending.discard)
         return None
 
+    async def reconcile_durable_exchange(
+        self, user_client_op_id: str, assistant_client_op_id: str
+    ) -> ConversationAppendReceipt | None:
+        """Read one exact committed exchange without re-running its model turn."""
+        honcho_client = self._honcho_client
+        if not self._conversation_learning or honcho_client is None:
+            raise ConversationReconciliationError("durable conversation storage is unavailable")
+        async with self._ingest_lock:
+            assistant = await self._find_unique_operation(
+                honcho_client, assistant_client_op_id, expected_role="assistant"
+            )
+            user = await self._find_unique_operation(
+                honcho_client, user_client_op_id, expected_role="user"
+            )
+            if assistant is None and user is None:
+                return None
+            if assistant is None or user is None:
+                raise ConversationReconciliationError(
+                    "durable operation exists without its paired exchange"
+                )
+            return ConversationAppendReceipt(
+                user_message_id=user.id,
+                assistant_message_id=assistant.id,
+                user_client_op_id=user_client_op_id,
+                assistant_client_op_id=assistant_client_op_id,
+                assistant_metadata=dict(assistant.metadata),
+            )
+
     async def _append_exchange_durable(
         self,
         honcho_client: HonchoClient,
@@ -951,6 +980,7 @@ class ShadowMemoryBackend(MemoryBackend):
                     assistant_message_id=existing_assistant.id,
                     user_client_op_id=user_op,
                     assistant_client_op_id=assistant_op,
+                    assistant_metadata=dict(existing_assistant.metadata),
                 )
 
             messages: list[dict[str, object]] = []
@@ -988,6 +1018,7 @@ class ShadowMemoryBackend(MemoryBackend):
                     assistant_message_id=created_assistant.id,
                     user_client_op_id=user_op,
                     assistant_client_op_id=assistant_op,
+                    assistant_metadata=dict(created_assistant.metadata),
                 )
 
             expected_count = len(messages)
@@ -1003,6 +1034,7 @@ class ShadowMemoryBackend(MemoryBackend):
                 assistant_message_id=assistant_message.id,
                 user_client_op_id=user_op,
                 assistant_client_op_id=assistant_op,
+                assistant_metadata=dict(assistant_message.metadata),
             )
 
     async def _find_unique_operation(

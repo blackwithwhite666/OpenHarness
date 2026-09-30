@@ -626,6 +626,31 @@ class TestReasoningEffortBody:
         assert fake_sdk.chat.completions.last_kwargs is not None
         assert fake_sdk.chat.completions.last_kwargs["reasoning_effort"] == "medium"
 
+    def test_openrouter_luna_tools_and_native_image_use_no_reasoning(self):
+        request = ApiMessageRequest(
+            model="openai/gpt-6-luna",
+            effort="none",
+            messages=[
+                ConversationMessage(
+                    role="user",
+                    content=[
+                        TextBlock(text="Describe this."),
+                        ImageBlock(media_type="image/jpeg", data="YWJj", source_path="/tmp/x.jpg"),
+                    ],
+                )
+            ],
+            tools=[{"name": "read_file", "description": "Read", "input_schema": {"type": "object"}}],
+        )
+
+        body = _build_openai_body(request, supports_reasoning_effort=True)
+        assert body["model"] == "openai/gpt-6-luna"
+        assert body["reasoning_effort"] == "none"
+        assert body["tools"][0]["function"]["name"] == "read_file"
+        assert body["messages"][0]["content"] == [
+            {"type": "text", "text": "Describe this."},
+            {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,YWJj"}},
+        ]
+
     @pytest.mark.asyncio
     async def test_default_client_never_streams_reasoning_effort(self):
         client = OpenAICompatibleClient(api_key="test-key")

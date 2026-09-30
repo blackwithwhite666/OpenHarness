@@ -85,10 +85,10 @@ def test_v2_date_only_correction_does_not_repeat_calories() -> None:
     assert nutrition["record_type"] == "meal_correction"
     assert nutrition["changed_fields"] == ["meal_date"]
     assert nutrition["meal_date"] == "2026-08-01"
-    assert nutrition["meal_at"] is None
-    assert nutrition["energy_kcal_min"] is None
-    assert nutrition["energy_kcal_max"] is None
-    assert nutrition["energy_kcal_best"] is None
+    assert "meal_at" not in nutrition
+    assert "energy_kcal_min" not in nutrition
+    assert "energy_kcal_max" not in nutrition
+    assert "energy_kcal_best" not in nutrition
 
 
 def test_v2_correction_with_nutrient_patch() -> None:
@@ -104,6 +104,53 @@ def test_v2_correction_with_nutrient_patch() -> None:
     nutrition = validated["annotations"]["nutrition"]
     assert nutrition["energy_kcal_best"] == 300
     assert nutrition["meal_date"] == "2026-07-31"
+
+
+def test_v2_minimal_correction_normalization_is_sparse_and_idempotent() -> None:
+    payload = _v2_payload(
+        record_type="meal_correction",
+        consumption_status="not_consumed",
+        changed_fields=["consumption_status"],
+    )
+
+    once = validate_trace_finalization_annotations(payload)
+    twice = validate_trace_finalization_annotations(once)
+    nutrition = once["annotations"]["nutrition"]
+
+    assert twice == once
+    assert nutrition == {
+        "schema_version": NUTRITION_TRACE_SCHEMA_VERSION_V2,
+        "record_type": "meal_correction",
+        "consumption_status": "not_consumed",
+        "changed_fields": ["consumption_status"],
+    }
+
+
+def test_v2_sparse_correction_keeps_masked_null_and_rejects_unmasked_values() -> None:
+    cleared = validate_trace_finalization_annotations(
+        _v2_payload(
+            record_type="meal_correction",
+            changed_fields=["meal_date"],
+            meal_date=None,
+        )
+    )["annotations"]["nutrition"]
+    assert "meal_date" in cleared and cleared["meal_date"] is None
+    assert "energy_kcal_best" not in cleared
+
+    with pytest.raises(DecisionTraceValidationError, match="replacement values must be listed"):
+        validate_trace_finalization_annotations(
+            _v2_payload(
+                record_type="meal_correction",
+                changed_fields=["consumption_status"],
+                consumption_status="not_consumed",
+                energy_kcal_best=321,
+            )
+        )
+
+    tampered = dict(cleared)
+    tampered["energy_kcal_best"] = 321
+    with pytest.raises(DecisionTraceValidationError, match="replacement values must be listed"):
+        validate_trace_finalization_annotations(_payload_with_nutrition(**tampered))
 
 
 def test_v2_meal_deletion_carries_no_nutrients() -> None:

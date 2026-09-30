@@ -701,6 +701,33 @@ async def test_query_engine_passes_native_images_without_fallback_tool_schema(
 
 
 @pytest.mark.asyncio
+async def test_openrouter_luna_receives_native_image_without_vision_fallback(
+    tmp_path: Path,
+) -> None:
+    client = RecordingApiClient()
+    engine = QueryEngine(
+        api_client=client,
+        tool_registry=create_default_tool_registry(),
+        permission_checker=PermissionChecker(PermissionSettings(mode=PermissionMode.FULL_AUTO)),
+        cwd=tmp_path,
+        model="openai/gpt-6-luna",
+        image_provider="openrouter",
+        system_prompt="system",
+    )
+    prompt = ConversationMessage(
+        role="user",
+        content=[ImageBlock(media_type="image/png", data="YWJj")],
+    )
+
+    events = [event async for event in engine.submit_message(prompt)]
+
+    assert isinstance(events[-1], AssistantTurnComplete)
+    assert len(client.requests) == 1
+    assert any(isinstance(block, ImageBlock) for block in client.requests[0].messages[0].content)
+    assert not any(isinstance(event, StatusEvent) for event in events)
+
+
+@pytest.mark.asyncio
 async def test_query_engine_converts_images_internally_for_text_only_runtime(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
