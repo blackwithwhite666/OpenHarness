@@ -1928,9 +1928,14 @@ def test_camera_recorder_replaces_model_date_without_changing_generic_turn(tmp_p
 
     generic = GatewayEvalRecorder(store=get_eval_store(tmp_path), episode_id="person")
     unchanged = record_payload(generic, payload)
-    assert datetime.fromisoformat(unchanged["meal_at"]) == datetime.fromisoformat(
-        "2026-09-29T12:00:00+00:00"
-    )
+    unchanged_meal_at = unchanged["meal_at"]
+    if unchanged_meal_at.endswith("Z"):
+        unchanged_meal_at = unchanged_meal_at[:-1] + "+00:00"
+    parsed_meal_at = datetime.fromisoformat(unchanged_meal_at)
+    expected_meal_at = datetime.fromisoformat("2026-09-29T12:00:00+00:00")
+    assert parsed_meal_at.tzinfo is not None
+    assert parsed_meal_at.utcoffset() == timedelta(0)
+    assert parsed_meal_at == expected_meal_at
     assert unchanged["meal_date"] == "2026-09-29"
 
 
