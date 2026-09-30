@@ -438,6 +438,28 @@ def test_gateway_eval_recorder_finalization_status_records_invalid_then_later_va
     assert recorded.payload["annotations"]["nutrition"]["energy_kcal_min"] == 10.0
 
 
+def test_gateway_recorder_accepts_and_persists_sparse_v2_correction(tmp_path: Path) -> None:
+    recorder, store = _new_recorder(tmp_path)
+    payload = _finalization_payload(
+        {
+            "nutrition": {
+                "schema_version": 2,
+                "record_type": "meal_correction",
+                "consumption_status": "not_consumed",
+                "changed_fields": ["consumption_status"],
+            }
+        }
+    )
+
+    recorder.decision_trace_recorder.record(TRACE_FINALIZATION, payload)
+
+    [recorded] = list(store.iter_events("ep-recorder"))
+    assert recorded.payload["annotations"]["nutrition"] == payload["annotations"]["nutrition"]
+    envelope = recorder.decision_trace_envelope
+    assert envelope is not None
+    assert envelope["annotations"]["nutrition"] == payload["annotations"]["nutrition"]
+
+
 def test_gateway_eval_recorder_nutrition_status_is_missing_when_applicable_without_nutrition(
     tmp_path: Path,
 ) -> None:
