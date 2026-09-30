@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -175,6 +176,10 @@ def _assert_expected_metadata_keys(metadata: dict[str, object], *, recorder: boo
         assert set(metadata.keys()) == expected | {"decision_trace"}
     else:
         assert set(metadata.keys()) == expected
+    # Provenance is attached at the authorized append boundary, not by this
+    # side-effect-free metadata formatter.
+    assert "ingest_source" not in metadata
+    assert "confirmation_required" not in metadata
 
 
 def _assert_metadata_fields(
@@ -568,6 +573,100 @@ async def test_owner_and_marina_honcho_recall_and_ingest_are_isolated(
     assert marina_exchange[1]["content"] == "marina assistant turn"
     assert marina_exchange[1]["peer_id"] == "ohmo"
     assert marina_exchange[1]["metadata"]["role"] == "assistant"
+
+
+@pytest.mark.asyncio
+async def test_authorized_family_private_append_gets_gateway_person_provenance() -> None:
+    from ohmo.gateway.camera import CAMERA_AUTHORITY
+
+    pool = object.__new__(OhmoSessionRuntimePool)
+    pool._gateway_config = _family_config(conversation_learning=True)
+    pool._session_owner_principals = {"session-200": "200"}
+    turn_ctx = _context("200", owner=False)
+    scope = pool._resolve_turn_memory_scope(turn_ctx)
+    assert scope == MemoryScope("marina", ("family-shared",))
+    calls: list[dict[str, object]] = []
+
+    async def append_exchange(*args, **kwargs):
+        del args
+        calls.append(kwargs)
+        return None
+
+    pool._shadow_backend_for_scope = lambda resolved: SimpleNamespace(
+        append_exchange=append_exchange
+    )
+    message = InboundMessage(
+        channel="telegram", sender_id="200", chat_id="200", content="I ate soup",
+        metadata={"message_id": 95, "is_group": False, "ingest_source": "spoofed"},
+    )
+    await pool._append_conversation_turn(
+        turn_ctx=turn_ctx, memory_scope=scope, message=message,
+        user_text=message.content, assistant_text="Noted",
+    )
+    assert len(calls) == 1
+    assert calls[0]["assistant_metadata"]["source_principal"] == "telegram:200"
+    assert calls[0]["assistant_metadata"]["ingest_source"] == "telegram"
+    assert calls[0]["assistant_metadata"]["confirmation_required"] is False
+    assert calls[0]["user_metadata"]["ingest_source"] == "telegram"
+    assert calls[0]["assistant_metadata"]["tenant_id"] == "marina"
+
+    rejected = (
+        _context("999", owner=False),
+        TurnContext(
+            principal="200", is_owner=False, is_private=False, channel="telegram",
+            chat_id="200", session_id="session-200",
+        ),
+        TurnContext(
+            principal="200", is_owner=False, is_private=True, channel="telegram",
+            chat_id="200", session_id="wrong-session",
+        ),
+    )
+    for index, rejected_ctx in enumerate(rejected):
+        before = len(calls)
+        rejected_scope = pool._resolve_turn_memory_scope(rejected_ctx)
+        await pool._append_conversation_turn(
+            turn_ctx=rejected_ctx, memory_scope=rejected_scope, message=message,
+            user_text=message.content, assistant_text="Noted",
+        )
+        assert len(calls) == before, f"rejected case {index} unexpectedly appended"
+
+    forwarded_ctx = replace(turn_ctx, is_forwarded=True)
+    forwarded_message = InboundMessage(
+        channel="telegram", sender_id="200|source", chat_id="200",
+        content="Forwarded privately", metadata={
+            **message.metadata, "is_forwarded": True,
+            "source_message_at": "2026-01-02T10:00:00+03:00",
+        },
+    )
+    await pool._append_conversation_turn(
+        turn_ctx=forwarded_ctx, memory_scope=scope, message=forwarded_message,
+        user_text=forwarded_message.content, assistant_text="Noted",
+    )
+    assert len(calls) == 2
+    forwarded_metadata = calls[-1]["assistant_metadata"]
+    assert forwarded_metadata["is_forwarded"] is True
+    assert forwarded_metadata["source_message_at"] == "2026-01-02T07:00:00+00:00"
+    assert "ingest_source" not in forwarded_metadata
+    assert "confirmation_required" not in forwarded_metadata
+
+    camera_ctx = TurnContext(
+        principal="200", is_owner=False, is_private=True, channel="telegram",
+        chat_id="200", session_id="session-200", camera_authorized=True,
+    )
+    camera_message = InboundMessage(
+        channel="telegram", sender_id="200", chat_id="200", content="Camera observation",
+        metadata={"_camera_authority": CAMERA_AUTHORITY, "ingest_source": "telegram"},
+    )
+    await pool._append_conversation_turn(
+        turn_ctx=camera_ctx,
+        memory_scope=pool._resolve_turn_memory_scope(camera_ctx),
+        message=camera_message,
+        user_text=camera_message.content,
+        assistant_text="What happened?",
+    )
+    assert len(calls) == 3
+    assert calls[-1]["assistant_metadata"]["ingest_source"] == "dropbox_camera"
+    assert calls[-1]["assistant_metadata"]["confirmation_required"] is True
 
 
 @pytest.mark.parametrize(

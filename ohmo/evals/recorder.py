@@ -286,6 +286,10 @@ class GatewayEvalRecorder:
         """Prevent a Camera classification or unbound reply from creating a meal."""
         self._runtime_recorder.forbid_nutrition_record()
 
+    def forbid_explicit_new_consumption(self) -> None:
+        """Prevent producer echoes from overriding Camera replay identity."""
+        self._runtime_recorder.forbid_explicit_new_consumption()
+
 
 _RUNTIME_STRUCTURAL_SKIP_KINDS = frozenset(
     {
@@ -363,9 +367,13 @@ class _GatewayDecisionTraceRecorderAdapter:
         self._nutrition_applicable = False
         self._authoritative_nutrition_meal_at: datetime | None = None
         self._nutrition_record_forbidden = False
+        self._explicit_new_consumption_forbidden = False
 
     def forbid_nutrition_record(self) -> None:
         self._nutrition_record_forbidden = True
+
+    def forbid_explicit_new_consumption(self) -> None:
+        self._explicit_new_consumption_forbidden = True
 
     def set_authoritative_nutrition_meal_at(self, meal_at: datetime | None) -> None:
         if meal_at is not None and (meal_at.tzinfo is None or meal_at.utcoffset() is None):
@@ -392,6 +400,13 @@ class _GatewayDecisionTraceRecorderAdapter:
                 raise DecisionTraceValidationError(
                     "Camera meal requires a bound explicit owner answer"
                 )
+            if self._explicit_new_consumption_forbidden and isinstance(annotations, Mapping):
+                nutrition = annotations.get("nutrition")
+                if isinstance(nutrition, Mapping) and nutrition.get("explicit_new_consumption") is True:
+                    self._saw_invalid_finalization = True
+                    raise DecisionTraceValidationError(
+                        "Camera producer observation cannot declare explicit new consumption"
+                    )
             payload = self._stamp_authoritative_nutrition_meal_at(payload)
             try:
                 payload = validate_trace_finalization_annotations(payload)

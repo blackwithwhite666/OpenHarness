@@ -10,6 +10,7 @@ import mimetypes
 import os
 import re
 import string
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -48,6 +49,7 @@ from ohmo.memory import create_memory_command_backend, ensure_catalog_migrated
 from ohmo.memory_backend import (
     CatalogMemoryBackend,
     ConversationAppendReceipt,
+    ConversationReconciliationError,
     FileMemoryBackend,
     MemoryBackend,
     ShadowMemoryBackend,
@@ -308,9 +310,13 @@ def _build_conversation_turn_metadata(
     scope: MemoryScope,
     recorder: GatewayEvalRecorder | None = None,
 ) -> tuple[str, dict[str, object], dict[str, object]]:
-    logical_turn_id = _logical_turn_id_for_conversation(
-        turn_ctx=turn_ctx,
-        message=message,
+    retained_camera_turn = message.metadata.get("_camera_turn_id")
+    logical_turn_id = (
+        retained_camera_turn
+        if message.metadata.get("_camera_authority") is CAMERA_AUTHORITY
+        and isinstance(retained_camera_turn, str)
+        and retained_camera_turn
+        else _logical_turn_id_for_conversation(turn_ctx=turn_ctx, message=message)
     )
     message_metadata = message.metadata or {}
     source_principal = (
@@ -344,6 +350,12 @@ def _build_conversation_turn_metadata(
         ),
         "attachment_fingerprints": compute_attachment_fingerprints(message.media),
     }
+    if (
+        turn_ctx.camera_authorized
+        and message.metadata.get("_camera_authority") is CAMERA_AUTHORITY
+        and message.sender_id != "__camera__"
+    ):
+        base_metadata.update(ingest_source="dropbox_camera", confirmation_required=True)
     user_metadata = dict(base_metadata)
     assistant_metadata = dict(base_metadata)
     # Never accept operation/provenance fields from channel metadata. The
@@ -758,6 +770,49 @@ class OhmoSessionRuntimePool:
             "meal was recorded after a trusted durable append receipt."
         )
 
+    @staticmethod
+    def _with_camera_correction_context(prompt: str) -> str:
+        return (
+            prompt + "\n\n# Verified Camera meal denial\n"
+            "The authenticated owner explicitly denied consumption of the exact previously "
+            "committed Camera meal. Finalize only a schema-v2 `meal_correction` whose "
+            "`consumption_status` is `not_consumed` and whose `changed_fields` includes "
+            "`consumption_status`. Do not create another meal or infer a different target; "
+            "the gateway supplies the previously committed source and event target."
+        )
+
+    @classmethod
+    def _with_camera_turn_context(
+        cls, prompt: str, message: InboundMessage, capture_time: datetime | None
+    ) -> str:
+        prompt = cls._with_camera_answer_context(prompt, capture_time)
+        if (
+            message.metadata.get("_camera_authority") is CAMERA_AUTHORITY
+            and message.metadata.get("_camera_answer") == "no"
+            and message.metadata.get("_camera_correction") is CAMERA_AUTHORITY
+        ):
+            prompt = cls._with_camera_correction_context(prompt)
+        return prompt
+
+    @staticmethod
+    def _camera_final_delivery_metadata(message: InboundMessage) -> dict[str, object]:
+        metadata = message.metadata
+        if (
+            metadata.get("_camera_authority") is not CAMERA_AUTHORITY
+            or metadata.get("_camera_answer") not in {"yes", "no"}
+            or not isinstance(metadata.get("_camera_candidate_id"), str)
+        ):
+            return {}
+        result: dict[str, object] = {
+            "_camera_authority": CAMERA_AUTHORITY,
+            "_camera_candidate_id": metadata["_camera_candidate_id"],
+            "_camera_turn_id": metadata.get("_camera_turn_id"),
+            "_camera_final": CAMERA_AUTHORITY,
+        }
+        if metadata.get("_camera_correction") is CAMERA_AUTHORITY:
+            result["_camera_correction"] = CAMERA_AUTHORITY
+        return result
+
     async def stream_message(self, message: InboundMessage, session_key: str):
         """Submit an inbound channel message and yield progress + final reply updates."""
         todo_lifecycle = _is_real_user_turn(message)
@@ -810,21 +865,145 @@ class OhmoSessionRuntimePool:
             turn_ctx,
             memory_scope=memory_scope,
         )
+        if camera_authorized and (
+            message.metadata.get("_camera_legacy_reconcile") is True
+            or message.metadata.get("_camera_reconcile_then_correction") is CAMERA_AUTHORITY
+        ):
+            candidate_id = message.metadata.get("_camera_candidate_id")
+            original_turn = message.metadata.get("_camera_original_turn_id") or message.metadata.get(
+                "_camera_turn_id"
+            )
+            backend = self._shadow_backend_for_scope(memory_scope)
+            try:
+                if backend is None or not isinstance(original_turn, str):
+                    raise ConversationReconciliationError("legacy Camera receipt is unavailable")
+                receipt = await backend.reconcile_durable_exchange(
+                    f"{original_turn}:user", f"{original_turn}:assistant"
+                )
+                if receipt is None:
+                    raise ConversationReconciliationError(
+                        "legacy Camera operation has no observed committed exchange"
+                    )
+                if message.metadata.get("_camera_legacy_reconcile") is True:
+                    self._camera_ingress.recover_legacy_committed_meal(
+                        candidate_id, original_turn, receipt
+                    )
+                else:
+                    original_message = replace(
+                        message,
+                        metadata={
+                            **message.metadata,
+                            "_camera_answer": "yes",
+                            "_camera_turn_id": original_turn,
+                        },
+                    )
+                    self._camera_ingress.record_committed_meal(
+                        original_message, receipt, None
+                    )
+                self._camera_ingress.authorize_recovered_camera_denial(
+                    message, candidate_id, original_turn
+                )
+            except (ConversationReconciliationError, ValueError, TypeError):
+                if isinstance(candidate_id, str) and isinstance(original_turn, str):
+                    self._camera_ingress.mark_finalizer_unknown(candidate_id, original_turn)
+                logger.warning("legacy Camera commit remains unresolved candidate=%s", candidate_id)
+                yield GatewayStreamUpdate(
+                    kind="error",
+                    text="I couldn't verify the original Camera meal, so no correction was recorded.",
+                    metadata={"_session_key": session_key},
+                )
+                return
+        if camera_authorized and message.metadata.get("_camera_reconcile_only") is True:
+            candidate_id = message.metadata.get("_camera_candidate_id")
+            turn_id = message.metadata.get("_camera_turn_id")
+            backend = self._shadow_backend_for_scope(memory_scope)
+            try:
+                if backend is None or not isinstance(turn_id, str):
+                    raise ConversationReconciliationError("Camera durable receipt is unavailable")
+                receipt = await backend.reconcile_durable_exchange(
+                    f"{turn_id}:user", f"{turn_id}:assistant"
+                )
+                if receipt is None:
+                    raise ConversationReconciliationError(
+                        "Camera operation has no observed committed exchange"
+                    )
+                if message.metadata.get("_camera_correction") is CAMERA_AUTHORITY:
+                    trace = receipt.assistant_metadata.get("decision_trace") if receipt.assistant_metadata else None
+                    annotations = trace.get("annotations") if isinstance(trace, Mapping) else None
+                    nutrition = annotations.get("nutrition") if isinstance(annotations, Mapping) else None
+                    validated = NutritionAnnotationV2.model_validate(nutrition)
+                    if (
+                        validated.record_type != "meal_correction"
+                        or validated.consumption_status != "not_consumed"
+                        or "consumption_status" not in validated.changed_fields
+                    ):
+                        raise ConversationReconciliationError(
+                            "Camera correction metadata does not match its retained operation"
+                        )
+                    self._camera_ingress.record_committed_correction(
+                        message, receipt, nutrition
+                    )
+                    text = "Исправление записано, баланс обновляется."
+                elif message.metadata.get("_camera_answer") == "yes":
+                    trace = receipt.assistant_metadata.get("decision_trace") if receipt.assistant_metadata else None
+                    annotations = trace.get("annotations") if isinstance(trace, Mapping) else None
+                    nutrition = annotations.get("nutrition") if isinstance(annotations, Mapping) else None
+                    validated = NutritionAnnotationV2.model_validate(nutrition)
+                    trusted_time = self._camera_ingress.trusted_capture_time_for_answer(message)
+                    if (
+                        validated.record_type != "meal_observation"
+                        or validated.consumption_status != "consumed"
+                        or "image" not in validated.basis
+                        or validated.explicit_new_consumption
+                        or trusted_time is None
+                        or validated.meal_at != trusted_time
+                        or validated.meal_date is not None
+                    ):
+                        raise ConversationReconciliationError(
+                            "Camera committed metadata does not match its retained operation"
+                        )
+                    self._camera_ingress.record_committed_meal(
+                        message, receipt, validated.model_dump(mode="json")
+                    )
+                    self._camera_ingress.mark_reconciled_meal_ready(candidate_id, turn_id)
+                    self._camera_ingress.complete(message, recorded=True)
+                    text = "Записано, баланс обновляется."
+                else:
+                    raise ConversationReconciliationError(
+                        "Camera denial receipt is known; no meal was appended"
+                    )
+                yield GatewayStreamUpdate(
+                    kind="final", text=text,
+                    metadata={
+                        "_session_key": session_key,
+                        "camera_reconciled": candidate_id,
+                        **self._camera_final_delivery_metadata(message),
+                    },
+                )
+            except (ConversationReconciliationError, ValueError, TypeError):
+                if isinstance(candidate_id, str) and isinstance(turn_id, str):
+                    self._camera_ingress.mark_finalizer_unknown(candidate_id, turn_id)
+                logger.warning("Camera durable operation remains unresolved candidate=%s", candidate_id)
+                yield GatewayStreamUpdate(
+                    kind="error",
+                    text="I couldn't verify whether this Camera meal was recorded. It was not retried.",
+                    metadata={"_session_key": session_key},
+                )
+            return
         camera_meal_at = self._trusted_camera_answer_time(
             message, session_key=session_key, turn_ctx=turn_ctx
         )
-        bundle.engine.set_system_prompt(
-            self._with_camera_answer_context(
-                await self._runtime_system_prompt(
+        system_prompt = await self._runtime_system_prompt(
                     bundle,
                     user_prompt,
                     turn_ctx=turn_ctx,
                     memory_scope=memory_scope,
                     include_todo=todo_lifecycle,
-                ),
-                camera_meal_at,
-            )
+                )
+        system_prompt = self._with_camera_turn_context(
+            system_prompt, message, camera_meal_at
         )
+        bundle.engine.set_system_prompt(system_prompt)
         if wellness_reminder is not None:
             self._apply_reminder_wellness_turn(bundle, wellness_reminder)
         logger.debug(
@@ -884,8 +1063,13 @@ class OhmoSessionRuntimePool:
                 and camera_meal_at is None
             )
             or message.metadata.get("_camera_unbound") is CAMERA_AUTHORITY
-        ):
+        ) and message.metadata.get("_camera_correction") is not CAMERA_AUTHORITY:
             recorder.forbid_nutrition_record()
+        if recorder is not None and camera_authorized and (
+            message.sender_id == "__camera__"
+            or message.metadata.get("_camera_answer") == "yes"
+        ):
+            recorder.forbid_explicit_new_consumption()
         episode_status = "completed"
         decision_trace_restore = _install_gateway_decision_trace_recorder(
             bundle.engine,
@@ -956,6 +1140,7 @@ class OhmoSessionRuntimePool:
                             memory_scope=memory_scope,
                             recorder=recorder,
                             todo_lifecycle=todo_lifecycle,
+                            camera_meal_at=camera_meal_at,
                         )
                     ):
                         yield update
@@ -985,6 +1170,7 @@ class OhmoSessionRuntimePool:
                             memory_scope=memory_scope,
                             recorder=recorder,
                             todo_lifecycle=todo_lifecycle,
+                            camera_meal_at=camera_meal_at,
                         )
                     ):
                         yield update
@@ -1004,6 +1190,7 @@ class OhmoSessionRuntimePool:
                         memory_scope=memory_scope,
                         recorder=recorder,
                         todo_lifecycle=todo_lifecycle,
+                        camera_meal_at=camera_meal_at,
                     )
                 ):
                     yield update
@@ -1056,6 +1243,7 @@ class OhmoSessionRuntimePool:
         memory_scope: MemoryScope | None,
         recorder: GatewayEvalRecorder | None = None,
         todo_lifecycle: bool = True,
+        camera_meal_at: datetime | None = None,
     ):
         if result.refresh_runtime:
             bundle = await self._refresh_bundle(
@@ -1099,6 +1287,7 @@ class OhmoSessionRuntimePool:
                     memory_scope=memory_scope,
                     recorder=recorder,
                     todo_lifecycle=todo_lifecycle,
+                    camera_meal_at=camera_meal_at,
                 ):
                     yield update
             finally:
@@ -1110,14 +1299,15 @@ class OhmoSessionRuntimePool:
             settings = bundle.current_settings()
             if bundle.enforce_max_turns:
                 bundle.engine.set_max_turns(settings.max_turns)
+            continue_prompt = await self._runtime_system_prompt(
+                bundle,
+                _last_user_text(bundle.engine.messages),
+                turn_ctx=turn_ctx,
+                memory_scope=memory_scope,
+                include_todo=todo_lifecycle,
+            )
             bundle.engine.set_system_prompt(
-                await self._runtime_system_prompt(
-                    bundle,
-                    _last_user_text(bundle.engine.messages),
-                    turn_ctx=turn_ctx,
-                    memory_scope=memory_scope,
-                    include_todo=todo_lifecycle,
-                )
+                self._with_camera_turn_context(continue_prompt, message, camera_meal_at)
             )
             todo_error = getattr(bundle, "_todo_runtime_error", None)
             if todo_lifecycle and isinstance(todo_error, TodoRuntimeStateError):
@@ -1183,6 +1373,7 @@ class OhmoSessionRuntimePool:
                     emitted_media=set(),
                     recorder=recorder,
                     state=guard_state,
+                    camera_meal_at=camera_meal_at,
                 ):
                     yield update
             await self._save_snapshot(bundle, session_key, user_prompt)
@@ -1237,17 +1428,15 @@ class OhmoSessionRuntimePool:
                 metadata={"_session_key": session_key},
             )
             return
+        system_prompt = await self._runtime_system_prompt(
+            bundle,
+            user_prompt,
+            turn_ctx=turn_ctx,
+            memory_scope=memory_scope,
+            include_todo=todo_lifecycle,
+        )
         bundle.engine.set_system_prompt(
-            self._with_camera_answer_context(
-                await self._runtime_system_prompt(
-                    bundle,
-                    user_prompt,
-                    turn_ctx=turn_ctx,
-                    memory_scope=memory_scope,
-                    include_todo=todo_lifecycle,
-                ),
-                camera_meal_at,
-            )
+            self._with_camera_turn_context(system_prompt, message, camera_meal_at)
         )
         todo_error = getattr(bundle, "_todo_runtime_error", None)
         if todo_lifecycle and isinstance(todo_error, TodoRuntimeStateError):
@@ -1385,6 +1574,7 @@ class OhmoSessionRuntimePool:
                 emitted_media=emitted_media,
                 recorder=recorder,
                 state=guard_state,
+                camera_meal_at=camera_meal_at,
             ):
                 yield update
 
@@ -1430,7 +1620,10 @@ class OhmoSessionRuntimePool:
                 _content_snippet(reply),
             )
             final_media = _extract_final_reply_media(reply, emitted_media)
-            metadata: dict[str, object] = {"_session_key": session_key}
+            metadata: dict[str, object] = {
+                "_session_key": session_key,
+                **self._camera_final_delivery_metadata(message),
+            }
             if final_media:
                 metadata.update({"_media": final_media, "_final_media_fallback": True})
             yield GatewayStreamUpdate(
@@ -1472,6 +1665,11 @@ class OhmoSessionRuntimePool:
             and message.metadata.get("_camera_authority") is CAMERA_AUTHORITY
         )
         camera_yes = camera_bound_answer and message.metadata.get("_camera_answer") == "yes"
+        camera_correction = (
+            message.metadata.get("_camera_authority") is CAMERA_AUTHORITY
+            and message.metadata.get("_camera_correction") is CAMERA_AUTHORITY
+            and message.metadata.get("_camera_answer") == "no"
+        )
         if camera_yes:
             camera_ingress = getattr(self, "_camera_ingress", None)
             trusted_meal_at = (
@@ -1495,6 +1693,23 @@ class OhmoSessionRuntimePool:
                 raise ValueError(
                     "Camera consumed meal requires authoritative meal_at without meal_date"
                 )
+            if validated.explicit_new_consumption:
+                raise ValueError("Camera consumption cannot override exact-image replay identity")
+        if camera_correction:
+            ingress = getattr(self, "_camera_ingress", None)
+            candidate_id = message.metadata.get("_camera_candidate_id")
+            attempt = ingress._attempts.get(candidate_id) if ingress is not None else None
+            target = attempt.get("camera_commit") if attempt is not None else None
+            annotation = recorder.validated_nutrition_envelope if recorder is not None else None
+            if not isinstance(target, dict) or annotation is None:
+                raise ValueError("Camera denial requires a retained committed meal target")
+            validated = NutritionAnnotationV2.model_validate(annotation)
+            if (
+                validated.record_type != "meal_correction"
+                or validated.consumption_status != "not_consumed"
+                or "consumption_status" not in validated.changed_fields
+            ):
+                raise ValueError("Camera denial requires a validated not_consumed correction")
         if self._gateway_config.conversation_learning is not True:
             return
         scope = self._coerce_memory_scope(turn_ctx, memory_scope)
@@ -1502,6 +1717,26 @@ class OhmoSessionRuntimePool:
             return
         if not self._honcho_turn_allowed(turn_ctx, scope):
             return
+        if camera_correction:
+            ingress = getattr(self, "_camera_ingress", None)
+            camera_config = self._gateway_config.camera_ingress
+            if (
+                ingress is None
+                or not turn_ctx.camera_authorized
+                or not turn_ctx.is_private
+                or turn_ctx.is_forwarded
+                or turn_ctx.channel != "telegram"
+                or str(turn_ctx.principal).split("|", 1)[0] != camera_config.principal
+                or str(turn_ctx.chat_id) != camera_config.chat_id
+                or scope.private_tenant != camera_config.tenant_id
+            ):
+                raise ValueError("Camera correction is not authorized in the current memory scope")
+            ingress.validate_correction_binding(
+                message,
+                principal=camera_config.principal,
+                chat_id=camera_config.chat_id,
+                tenant_id=scope.private_tenant,
+            )
         shadow_backend = self._shadow_backend_for_scope(scope)
         if shadow_backend is None:
             return
@@ -1511,20 +1746,49 @@ class OhmoSessionRuntimePool:
             scope=scope,
             recorder=recorder,
         )
+        if (
+            message.channel == "telegram"
+            and turn_ctx.is_private
+            and not turn_ctx.is_forwarded
+            and not turn_ctx.camera_authorized
+            and message.sender_id != "__camera__"
+        ):
+            # Provenance is generated only after the actual memory resolver
+            # authorized this private owner/family append.
+            for metadata in (user_metadata, assistant_metadata):
+                metadata.update(ingest_source="telegram", confirmation_required=False)
         if camera_bound_answer:
             for metadata in (user_metadata, assistant_metadata):
                 metadata["camera_candidate_id"] = message.metadata["_camera_candidate_id"]
                 metadata["camera_answer_bound"] = message.metadata["_camera_answer"]
-                metadata["camera_reply_to_native_message_id"] = str(
-                    message.metadata["reply_to_message_id"]
-                )
-        return await shadow_backend.append_exchange(
+                metadata["camera_route"] = message.metadata.get("_camera_route", "context")
+                metadata["camera_operation_id"] = message.metadata["_camera_candidate_id"]
+                native_binding = message.metadata.get("_camera_native_binding")
+                if isinstance(native_binding, str):
+                    metadata["camera_reply_to_native_message_id"] = native_binding
+        if camera_correction:
+            attempt = self._camera_ingress._attempts[message.metadata["_camera_candidate_id"]]
+            original = attempt["camera_commit"]
+            for metadata in (user_metadata, assistant_metadata):
+                metadata["camera_original_event_id"] = original["event_id"]
+                metadata["reply_to_source_message_id"] = original["source_message_id"]
+                metadata["camera_correction_bound"] = True
+        receipt = await shadow_backend.append_exchange(
             user_text,
             assistant_text,
             user_metadata=user_metadata,
             assistant_metadata=assistant_metadata,
             durable=camera_bound_answer,
         )
+        if camera_yes:
+            self._camera_ingress.record_committed_meal(
+                message, receipt, validated.model_dump(mode="json")
+            )
+        elif camera_correction:
+            self._camera_ingress.record_committed_correction(
+                message, receipt, annotation
+            )
+        return receipt
 
     async def _convert_stream_event(
         self,
@@ -1954,6 +2218,7 @@ class OhmoSessionRuntimePool:
         emitted_media: set[str],
         recorder: GatewayEvalRecorder | None,
         state: dict[str, str | None],
+        camera_meal_at: datetime | None = None,
     ):
         """Reconcile unresolved interactive work before accepting a model final."""
         try:
@@ -2000,14 +2265,15 @@ class OhmoSessionRuntimePool:
                 "user or external input is actually required. Never mark work completed merely "
                 "to satisfy this check. Then provide the concise final answer."
             )
+            system_prompt = await self._runtime_system_prompt(
+                bundle,
+                user_prompt,
+                turn_ctx=turn_ctx,
+                memory_scope=memory_scope,
+                include_todo=True,
+            )
             bundle.engine.set_system_prompt(
-                await self._runtime_system_prompt(
-                    bundle,
-                    user_prompt,
-                    turn_ctx=turn_ctx,
-                    memory_scope=memory_scope,
-                    include_todo=True,
-                )
+                self._with_camera_turn_context(system_prompt, message, camera_meal_at)
             )
             todo_error = getattr(bundle, "_todo_runtime_error", None)
             if isinstance(todo_error, TodoRuntimeStateError):

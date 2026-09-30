@@ -15,6 +15,7 @@ import math
 import os
 import re
 import stat
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from email import policy
@@ -42,7 +43,7 @@ _YES = frozenset(
     {"да, я это съела", "я это съела", "я съела это", "я съела", "я это ел", "я это съел"}
 )
 _NO = frozenset({"нет, не ела", "нет, не ел", "это не еда"})
-_PENDING_TTL_SECONDS = 6 * 60 * 60
+_PENDING_TTL_SECONDS = 30 * 60
 _ANSWER_EXPLICIT_NO_RE = re.compile(
     r"\b(?:не\s+(?:ел|ела|ели|пил|пила|выпил|выпила|употреблял|употребляла)\b"
     r"|ничего\s+не\s+(?:ел|ела|пил|пила)\b"
@@ -103,6 +104,30 @@ def _attempt_age_seconds(attempt: dict, now: datetime) -> float:
     if stamp.tzinfo is None or stamp.utcoffset() is None:
         return 0.0
     return (now - stamp).total_seconds()
+
+
+def _validate_camera_correction_annotation(value: Mapping[str, object]):
+    """Validate a correction while ignoring only unmasked schema defaults."""
+    from ohmo.evals.nutrition_trace import NutritionAnnotationV2
+
+    changed = value.get("changed_fields")
+    if not isinstance(changed, list) or not all(isinstance(field, str) for field in changed):
+        raise ValueError("Camera correction is missing its validated field mask")
+    defaults = NutritionAnnotationV2.model_construct(record_type="meal_correction").model_dump(
+        mode="json"
+    )
+    correctable = {
+        "basis", "consumption_status", "meal_at", "meal_date", "is_estimate",
+        "energy_kcal_min", "energy_kcal_max", "energy_kcal_best", "protein_g",
+        "fat_g", "carbohydrate_g", "items", "confidence", "assumptions", "warnings",
+    }
+    normalized = dict(value)
+    for field in correctable - set(changed):
+        if field in normalized:
+            if normalized[field] != defaults[field]:
+                raise ValueError("Camera correction contains an unmasked replacement value")
+            normalized.pop(field)
+    return NutritionAnnotationV2.model_validate(normalized)
 
 
 class CameraCandidateRequest(BaseModel):
@@ -457,6 +482,8 @@ class CameraIngress:
         self._session = self._new_session(
             session_id=previous_session.get("session_id") if previous_session else None
         )
+        if getattr(self, "_journal_migrated", False):
+            self._save_attempts()
         self._tasks: set[asyncio.Task] = set()
         self._sweep_expired_attempts()
         self._remove_completed_snapshots()
@@ -503,13 +530,306 @@ class CameraIngress:
         attempt = self._attempts.get(candidate_id) if isinstance(candidate_id, str) else None
         if (
             attempt is None
-            or attempt.get("state") != "answering"
+            or attempt.get("state") not in {"answering", "final_queued", "delivery_unknown"}
+            or (
+                attempt.get("state") == "delivery_unknown"
+                and attempt.get("photo_delivery_confirmed") is not True
+            )
             or not isinstance(metadata.get("_camera_turn_id"), str)
             or not metadata["_camera_turn_id"]
             or metadata["_camera_turn_id"] != attempt.get("answer_turn_id")
         ):
             return None
         return self._attempt_capture_time(attempt)
+
+    def record_committed_meal(
+        self,
+        message: InboundMessage,
+        receipt: object,
+        expected_nutrition: Mapping[str, object] | None,
+        *,
+        legacy_reconciliation: bool = False,
+    ) -> dict:
+        """Persist target identities only from a validated durable append receipt."""
+        metadata = getattr(receipt, "assistant_metadata", None)
+        candidate_id = message.metadata.get("_camera_candidate_id")
+        turn_id = message.metadata.get("_camera_turn_id")
+        attempt = self._attempts.get(candidate_id) if isinstance(candidate_id, str) else None
+        assistant_id = getattr(receipt, "assistant_message_id", None)
+        assistant_op = getattr(receipt, "assistant_client_op_id", None)
+        if (
+            not isinstance(metadata, Mapping)
+            or attempt is None
+            or (
+                attempt.get("state") not in {"answering", "final_queued", "delivery_unknown"}
+                and not (legacy_reconciliation and attempt.get("state") == "completed")
+            )
+            or (
+                attempt.get("state") == "delivery_unknown"
+                and attempt.get("photo_delivery_confirmed") is not True
+            )
+            or turn_id not in {attempt.get("answer_turn_id"), attempt.get("final_turn_id")}
+            or not isinstance(assistant_id, str) or not assistant_id
+            or not isinstance(assistant_op, str) or not assistant_op
+            or getattr(receipt, "user_client_op_id", None) != f"{turn_id}:user"
+            or assistant_op != f"{turn_id}:assistant"
+            or metadata.get("role") != "assistant"
+            or metadata.get("client_op_id") != assistant_op
+            or metadata.get("logical_turn_id") != turn_id
+            or metadata.get("tenant_id") != self.config.tenant_id
+            or metadata.get("source_principal") != f"telegram:{self.config.principal}"
+            or metadata.get("camera_candidate_id") != candidate_id
+            or (not legacy_reconciliation and metadata.get("camera_operation_id") != candidate_id)
+            or metadata.get("camera_answer_bound") != "yes"
+            or (not legacy_reconciliation and metadata.get("ingest_source") != "dropbox_camera")
+            or (not legacy_reconciliation and metadata.get("confirmation_required") is not True)
+            or not isinstance(metadata.get("source_message_id"), str)
+            or not metadata["source_message_id"]
+        ):
+            raise ValueError("Camera commit receipt does not prove the bound owner operation")
+        trace = metadata.get("decision_trace")
+        annotations = trace.get("annotations") if isinstance(trace, Mapping) else None
+        nutrition = annotations.get("nutrition") if isinstance(annotations, Mapping) else None
+        if (
+            not isinstance(nutrition, Mapping)
+            or nutrition.get("record_type") != "meal_observation"
+            or nutrition.get("consumption_status") != "consumed"
+            or "image" not in nutrition.get("basis", [])
+        ):
+            raise ValueError("Camera commit receipt does not contain a consumed image event")
+        from ohmo.evals.nutrition_trace import NutritionAnnotationV2
+
+        observed_annotation = NutritionAnnotationV2.model_validate(nutrition)
+        if expected_nutrition is not None:
+            expected_annotation = NutritionAnnotationV2.model_validate(expected_nutrition)
+        else:
+            expected_annotation = observed_annotation
+        if observed_annotation.model_dump(mode="json") != expected_annotation.model_dump(mode="json"):
+            raise ValueError("Camera commit receipt nutrition differs from the validated finalizer")
+        if (
+            observed_annotation.meal_at != self._attempt_capture_time(attempt)
+            or observed_annotation.meal_date is not None
+            or observed_annotation.explicit_new_consumption
+        ):
+            raise ValueError("Camera commit receipt lacks trusted replay and capture semantics")
+        commit = {
+            "event_id": assistant_id,
+            "source_message_id": metadata["source_message_id"],
+            "client_op_id": assistant_op,
+            "candidate_id": candidate_id,
+            "tenant_id": self.config.tenant_id,
+            "principal": self.config.principal,
+            "meal_at": nutrition.get("meal_at"),
+            "record_type": nutrition.get("record_type"),
+            "consumption_status": nutrition.get("consumption_status"),
+        }
+        previous_commit = attempt.get("camera_commit")
+        if isinstance(previous_commit, dict) and previous_commit != commit:
+            raise ValueError("Camera operation has conflicting durable commit evidence")
+        attempt["camera_commit"] = commit
+        attempt["finalizer_status"] = "committed"
+        self._save_attempts()
+        return commit
+
+    def mark_finalizer_unknown(self, candidate_id: str, turn_id: str) -> None:
+        attempt = self._attempts.get(candidate_id)
+        if (
+            attempt is not None
+            and turn_id in {attempt.get("answer_turn_id"), attempt.get("final_turn_id")}
+            and attempt.get("finalizer_status") != "committed"
+        ):
+            attempt["finalizer_status"] = "unknown"
+            self._save_attempts()
+
+    def authorize_recovered_camera_denial(
+        self, message: InboundMessage, candidate_id: str, original_turn: str
+    ) -> str:
+        """Bind a current authenticated denial only after the old meal is proven."""
+        attempt = self._attempts.get(candidate_id)
+        correction_turn = attempt.get("camera_correction_turn_id") if attempt else None
+        if (
+            attempt is None
+            or not isinstance(attempt.get("camera_commit"), dict)
+            or attempt.get("camera_correction") != "reconciling_original"
+            or original_turn not in {attempt.get("answer_turn_id"), attempt.get("final_turn_id")}
+            or message.channel != "telegram"
+            or str(message.chat_id) != self.config.chat_id
+            or message.sender_id.split("|", 1)[0] != self.config.principal
+            or message.metadata.get("_camera_answer") != "no"
+            or not isinstance(correction_turn, str)
+            or not correction_turn
+        ):
+            raise ValueError("Camera denial is not bound to a recovered owner operation")
+        attempt["camera_correction"] = "answering"
+        message.metadata.pop("_camera_legacy_reconcile", None)
+        message.metadata.pop("_camera_reconcile_then_correction", None)
+        message.metadata["_camera_correction"] = CAMERA_AUTHORITY
+        message.metadata["_camera_turn_id"] = correction_turn
+        self._save_attempts()
+        return correction_turn
+
+    def mark_reconciled_meal_ready(self, candidate_id: str, turn_id: str) -> None:
+        attempt = self._attempts.get(candidate_id)
+        if (
+            attempt is None
+            or not isinstance(attempt.get("camera_commit"), dict)
+            or turn_id not in {attempt.get("answer_turn_id"), attempt.get("final_turn_id")}
+        ):
+            raise ValueError("Camera commit is not bound to the retained finalizer")
+        attempt["finalizer_status"] = "committed"
+        attempt["attention_active"] = False
+        if attempt.get("state") == "answering":
+            attempt["final_turn_id"] = turn_id
+            attempt["state"] = "final_queued"
+        self._save_attempts()
+
+    def recover_legacy_committed_meal(self, candidate_id: str, turn_id: str, receipt: object) -> dict:
+        attempt = self._attempts.get(candidate_id)
+        if (
+            attempt is None or attempt.get("state") != "completed"
+            or turn_id not in {attempt.get("answer_turn_id"), attempt.get("final_turn_id")}
+        ):
+            raise ValueError("legacy Camera operation has no retained stable turn identity")
+        message = InboundMessage(
+            channel="telegram", sender_id=self.config.principal, chat_id=self.config.chat_id,
+            content="", metadata={
+                "_camera_authority": CAMERA_AUTHORITY,
+                "_camera_candidate_id": candidate_id,
+                "_camera_answer": "yes",
+                "_camera_turn_id": turn_id,
+            },
+        )
+        return self.record_committed_meal(
+            message, receipt, None, legacy_reconciliation=True
+        )
+
+    def record_committed_correction(
+        self,
+        message: InboundMessage,
+        receipt: object,
+        expected_nutrition: Mapping[str, object] | None = None,
+    ) -> dict:
+        original = self.validate_correction_binding(
+            message,
+            principal=self.config.principal,
+            chat_id=getattr(self.config, "chat_id", message.chat_id),
+            tenant_id=self.config.tenant_id,
+        )
+        metadata = getattr(receipt, "assistant_metadata", None)
+        candidate_id = message.metadata.get("_camera_candidate_id")
+        turn_id = message.metadata.get("_camera_turn_id")
+        attempt = self._attempts.get(candidate_id) if isinstance(candidate_id, str) else None
+        assistant_id = getattr(receipt, "assistant_message_id", None)
+        assistant_op = getattr(receipt, "assistant_client_op_id", None)
+        if (
+            not isinstance(metadata, Mapping)
+            or not isinstance(original, dict)
+            or attempt.get("camera_correction") != "answering"
+            or attempt.get("camera_correction_turn_id") != turn_id
+            or not isinstance(assistant_id, str) or not assistant_id
+            or not isinstance(assistant_op, str) or not assistant_op
+            or getattr(receipt, "user_client_op_id", None) != f"{turn_id}:user"
+            or assistant_op != f"{turn_id}:assistant"
+            or metadata.get("role") != "assistant"
+            or metadata.get("client_op_id") != assistant_op
+            or metadata.get("logical_turn_id") != turn_id
+            or metadata.get("tenant_id") != original.get("tenant_id")
+            or metadata.get("source_principal") != f"telegram:{original.get('principal')}"
+            or metadata.get("camera_candidate_id") != candidate_id
+            or metadata.get("camera_operation_id") != candidate_id
+            or metadata.get("camera_answer_bound") != "no"
+            or metadata.get("camera_correction_bound") is not True
+            or metadata.get("camera_original_event_id") != original.get("event_id")
+            or metadata.get("ingest_source") != "dropbox_camera"
+            or metadata.get("confirmation_required") is not True
+            or metadata.get("reply_to_source_message_id") != original.get("source_message_id")
+        ):
+            raise ValueError("Camera correction receipt does not match its committed target")
+        trace = metadata.get("decision_trace")
+        annotations = trace.get("annotations") if isinstance(trace, Mapping) else None
+        nutrition = annotations.get("nutrition") if isinstance(annotations, Mapping) else None
+        if (
+            not isinstance(nutrition, Mapping)
+            or nutrition.get("record_type") != "meal_correction"
+            or nutrition.get("consumption_status") != "not_consumed"
+            or "consumption_status" not in nutrition.get("changed_fields", [])
+        ):
+            raise ValueError("Camera correction receipt is not a validated denial patch")
+        observed_annotation = _validate_camera_correction_annotation(nutrition)
+        if expected_nutrition is not None:
+            expected_annotation = _validate_camera_correction_annotation(expected_nutrition)
+            expected_changes = list(expected_annotation.changed_fields)
+            if (
+                observed_annotation.schema_version != expected_annotation.schema_version
+                or observed_annotation.record_type != expected_annotation.record_type
+                or observed_annotation.consumption_status != expected_annotation.consumption_status
+                or list(observed_annotation.changed_fields) != expected_changes
+                or any(
+                    getattr(observed_annotation, field_name)
+                    != getattr(expected_annotation, field_name)
+                    for field_name in expected_changes
+                )
+            ):
+                raise ValueError("Camera correction receipt differs from the validated correction")
+        correction = {
+            "event_id": assistant_id,
+            "source_message_id": metadata.get("source_message_id"),
+            "client_op_id": assistant_op,
+            "target_event_id": original["event_id"],
+            "target_source_message_id": original["source_message_id"],
+        }
+        previous_correction = attempt.get("camera_correction_commit")
+        if isinstance(previous_correction, dict) and previous_correction != correction:
+            raise ValueError("Camera operation has conflicting correction commit evidence")
+        attempt["camera_correction_commit"] = correction
+        attempt["camera_correction"] = "final_queued"
+        attempt["camera_correction_final_turn_id"] = turn_id
+        self._save_attempts()
+        return correction
+
+    def validate_correction_binding(
+        self,
+        message: InboundMessage,
+        *,
+        principal: str,
+        chat_id: str,
+        tenant_id: str,
+    ) -> dict:
+        """Check the retained correction target against the current trusted scope."""
+        metadata = message.metadata
+        candidate_id = metadata.get("_camera_candidate_id")
+        attempt = self._attempts.get(candidate_id) if isinstance(candidate_id, str) else None
+        original = attempt.get("camera_commit") if attempt is not None else None
+        turn_id = metadata.get("_camera_turn_id")
+        if (
+            not isinstance(original, dict)
+            or metadata.get("_camera_authority") is not CAMERA_AUTHORITY
+            or metadata.get("_camera_correction") is not CAMERA_AUTHORITY
+            or metadata.get("_camera_answer") != "no"
+            or attempt.get("state") not in {"answering", "final_queued", "completed", "delivery_unknown"}
+            or attempt.get("camera_correction") != "answering"
+            or attempt.get("camera_correction_turn_id") != turn_id
+            or not isinstance(turn_id, str)
+            or not turn_id
+            or message.channel != "telegram"
+            or str(message.chat_id) != str(chat_id)
+            or message.sender_id.split("|", 1)[0] != str(principal)
+            or original.get("candidate_id") != candidate_id
+            or not isinstance(original.get("event_id"), str)
+            or not original.get("event_id")
+            or not isinstance(original.get("source_message_id"), str)
+            or not original.get("source_message_id")
+            or not isinstance(original.get("client_op_id"), str)
+            or not original.get("client_op_id")
+            or original.get("client_op_id") not in {
+                f"{attempt.get('answer_turn_id')}:assistant",
+                f"{attempt.get('final_turn_id')}:assistant",
+            }
+            or original.get("principal") != str(principal)
+            or original.get("tenant_id") != str(tenant_id)
+        ):
+            raise ValueError("Camera correction is not bound to the current committed target")
+        return original
 
     def _load_attempts(self) -> tuple[dict[str, dict], dict | None]:
         try:
@@ -559,11 +879,30 @@ class CameraIngress:
                 if self._attempt_capture_time(value) is None:
                     raise ValueError("camera attempt journal capture time is invalid")
         now_iso = datetime.now(UTC).isoformat()
+        self._journal_migrated = False
         for value in attempts.values():
             if not isinstance(value.get("admitted_at"), str):
                 # Legacy in-flight entries adopt this process's start as their
                 # admission time, so the pending TTL has a bounded runway.
                 value["admitted_at"] = now_iso
+                self._journal_migrated = True
+            # Safe in-place conversion for journals written before attention
+            # was separated from retained operation identity.
+            if "attention_active" not in value:
+                value["attention_active"] = value.get("state") not in {
+                    "completed", "delivery_unknown"
+                }
+                self._journal_migrated = True
+            if "photo_delivery_confirmed" not in value:
+                photo_id = value.get("photo_id")
+                value["photo_delivery_confirmed"] = (
+                    isinstance(photo_id, int) and not isinstance(photo_id, bool) and photo_id > 0
+                )
+                self._journal_migrated = True
+            if type(value.get("attention_active")) is not bool or type(
+                value.get("photo_delivery_confirmed")
+            ) is not bool:
+                raise ValueError("camera attempt journal state is invalid")
         return attempts, session
 
     def _open_state_dir(self, *, create: bool) -> int:
@@ -606,7 +945,7 @@ class CameraIngress:
     _TTL_SWEEPABLE_STATES = frozenset({"photo_sent", "answering", "final_queued"})
 
     def _sweep_expired_attempts(self) -> None:
-        """Drop answer-gate attempts older than the TTL with their snapshots.
+        """Release attention after the TTL while retaining addressable operations.
 
         One ignored photo must not gate the whole chat forever: after the TTL
         the camera flow degrades to ordinary text turns instead of marking
@@ -616,15 +955,16 @@ class CameraIngress:
         """
         now = datetime.now(UTC)
         expired = [
-            key
-            for key, value in self._attempts.items()
-            if value.get("state") in self._TTL_SWEEPABLE_STATES
+            value
+            for value in self._attempts.values()
+            if value.get("attention_active", True)
+            and value.get("state") in self._TTL_SWEEPABLE_STATES
             and _attempt_age_seconds(value, now) >= _PENDING_TTL_SECONDS
         ]
         if not expired:
             return
-        for key in expired:
-            self._remove_snapshot_files(self._attempts.pop(key))
+        for value in expired:
+            value["attention_active"] = False
         try:
             self._save_attempts()
         except OSError:
@@ -672,12 +1012,16 @@ class CameraIngress:
             self._remove_snapshot_files(attempt)
 
     def mark_restart_unknown(self) -> None:
-        """Never resume an in-flight photo or answer after process restart."""
+        """Mark uncertain sends unknown; retain confirmed native photo receipts."""
         changed = False
         for attempt in self._attempts.values():
-            if attempt["state"] not in {"completed", "delivery_unknown"}:
+            if attempt["state"] == "admitted":
                 attempt["state"] = "delivery_unknown"
                 changed = True
+            elif attempt["state"] in {"answering", "final_queued"}:
+                if attempt.get("finalizer_status") != "committed":
+                    attempt["finalizer_status"] = "unknown"
+                    changed = True
         if changed:
             self._save_attempts()
 
@@ -873,7 +1217,13 @@ class CameraIngress:
                     return self._error(503, "pre_admission_unavailable")
             if len(self._attempts) >= _MAX_ATTEMPTS:
                 return self._error(503, "pre_admission_unavailable")
-            if any(item["state"] != "completed" for item in self._attempts.values()):
+            self._sweep_expired_attempts()
+            if any(
+                item.get("attention_active", True)
+                or item.get("state") == "admitted"
+                or (item.get("state") == "delivery_unknown" and not item.get("photo_delivery_confirmed"))
+                for item in self._attempts.values()
+            ):
                 return self._error(409, "unresolved_candidate")
             if not self._telegram or not getattr(self._telegram, "polling_started", False):
                 return self._error(503, "pre_admission_unavailable")
@@ -913,9 +1263,11 @@ class CameraIngress:
                     "admission_id": admission_id,
                     "snapshot": str(snapshot),
                     "photo_id": None,
+                    "photo_delivery_confirmed": False,
                     "reply_ids": [],
                     "final_turn_id": None,
                     "admitted_at": datetime.now(UTC).isoformat(),
+                    "attention_active": True,
                     "capture_time": request.capture_time.isoformat(),
                     "capture_time_authority": request.capture_time_authority,
                 }
@@ -960,6 +1312,7 @@ class CameraIngress:
             ):
                 raise ValueError("native Camera photo receipt is invalid")
             attempt["photo_id"] = receipt.native_message_ids[0]
+            attempt["photo_delivery_confirmed"] = True
             attempt["state"] = "photo_sent"
             self._save_attempts()
             await self._bus.publish_inbound(
@@ -1004,6 +1357,173 @@ class CameraIngress:
             else metadata.get("reply_to_message_id")
         )
         raw_text = metadata.get("_telegram_raw_text", message.content)
+        callback = bool(metadata.get("callback_query"))
+        target_matches = [
+            (key, value) for key, value in self._attempts.items()
+            if target is not None and str(target) in {
+                str(value.get("photo_id")), *map(str, value.get("reply_ids", []))
+            }
+        ]
+        if message.media:
+            # Incoming user media always keeps its ordinary intake path unless
+            # it explicitly replies to a Camera prompt, which is not an answer.
+            if target_matches:
+                metadata["_camera_unbound"] = CAMERA_AUTHORITY
+            return
+        if callback and not (
+            target is not None
+            and isinstance(metadata.get("callback_data"), str)
+            and metadata["callback_data"].startswith("ask:")
+        ):
+            if target_matches:
+                metadata["_camera_unbound"] = CAMERA_AUTHORITY
+            return
+        if target is not None and not target_matches:
+            # Preserve ordinary Telegram replies. Only a target retained by
+            # this Camera journal can carry Camera authority or fail closed.
+            return
+        if len(target_matches) > 1:
+            metadata["_camera_unbound"] = CAMERA_AUTHORITY
+            return
+
+        intent = _classify_answer(raw_text, anchored=target is not None)
+
+        def bind_denial(candidate_id: str, attempt: dict, route: str) -> bool:
+            state = attempt.get("state")
+            has_commit = isinstance(attempt.get("camera_commit"), dict)
+            has_turn = any(
+                isinstance(attempt.get(name), str) and attempt[name]
+                for name in ("answer_turn_id", "final_turn_id")
+            )
+            if state not in {"completed", "delivery_unknown", "answering", "final_queued"}:
+                return False
+            if not (has_commit or has_turn):
+                return False
+            correction_state = attempt.get("camera_correction")
+            original_turn = attempt.get("answer_turn_id") or attempt.get("final_turn_id")
+            if has_commit and correction_state is None:
+                correction_turn = attempt.get("camera_correction_turn_id")
+                if not isinstance(correction_turn, str) or not correction_turn:
+                    correction_turn = uuid4().hex
+                    attempt["camera_correction_turn_id"] = correction_turn
+                attempt["camera_correction"] = "answering"
+                self._save_attempts()
+                metadata.update(
+                    _camera_authority=CAMERA_AUTHORITY,
+                    _camera_candidate_id=candidate_id,
+                    _camera_answer="no",
+                    _camera_correction=CAMERA_AUTHORITY,
+                    _camera_turn_id=correction_turn,
+                    _camera_route=route,
+                )
+            elif has_commit and correction_state == "answering":
+                correction_turn = attempt.get("camera_correction_turn_id")
+                if not isinstance(correction_turn, str) or not correction_turn:
+                    metadata["_camera_unbound"] = CAMERA_AUTHORITY
+                    return True
+                metadata.update(
+                    _camera_authority=CAMERA_AUTHORITY,
+                    _camera_candidate_id=candidate_id,
+                    _camera_answer="no",
+                    _camera_correction=CAMERA_AUTHORITY,
+                    _camera_turn_id=correction_turn,
+                    _camera_route=route,
+                    _camera_reconcile_only=True,
+                )
+            elif (
+                not has_commit
+                and state in {"answering", "final_queued", "delivery_unknown"}
+                and attempt.get("answer_kind") == "yes"
+                and isinstance(original_turn, str)
+            ):
+                correction_turn = attempt.get("camera_correction_turn_id")
+                if not isinstance(correction_turn, str) or not correction_turn:
+                    correction_turn = uuid4().hex
+                    attempt["camera_correction_turn_id"] = correction_turn
+                attempt["camera_correction"] = "reconciling_original"
+                self._save_attempts()
+                metadata.update(
+                    _camera_authority=CAMERA_AUTHORITY,
+                    _camera_candidate_id=candidate_id,
+                    _camera_answer="no",
+                    _camera_turn_id=original_turn,
+                    _camera_original_turn_id=original_turn,
+                    _camera_correction_turn_id=correction_turn,
+                    _camera_reconcile_then_correction=CAMERA_AUTHORITY,
+                    _camera_route=route,
+                )
+            elif (
+                not has_commit
+                and state == "completed"
+                and attempt.get("answer_kind") == "yes"
+                and isinstance(original_turn, str)
+            ):
+                correction_turn = attempt.get("camera_correction_turn_id")
+                if not isinstance(correction_turn, str) or not correction_turn:
+                    correction_turn = uuid4().hex
+                    attempt["camera_correction_turn_id"] = correction_turn
+                attempt["camera_correction"] = "reconciling_original"
+                self._save_attempts()
+                metadata.update(
+                    _camera_authority=CAMERA_AUTHORITY,
+                    _camera_candidate_id=candidate_id,
+                    _camera_answer="no",
+                    _camera_turn_id=original_turn,
+                    _camera_correction_turn_id=correction_turn,
+                    _camera_legacy_reconcile=True,
+                    _camera_route=route,
+                )
+            else:
+                metadata["_camera_unbound"] = CAMERA_AUTHORITY
+                return True
+            if target is not None:
+                metadata["_camera_native_binding"] = str(target)
+            return True
+
+        if intent == "no":
+            if target_matches:
+                candidate_id, attempt = target_matches[0]
+                if bind_denial(candidate_id, attempt, "callback" if callback else "reply"):
+                    return
+            elif target is None:
+                contextual_candidates = [
+                    (key, value) for key, value in self._attempts.items()
+                    if value.get("state") in {
+                        "photo_sent", "answering", "final_queued", "completed", "delivery_unknown"
+                    }
+                    and (
+                        value.get("state") in {"photo_sent", "answering", "final_queued"}
+                        or isinstance(value.get("camera_commit"), dict)
+                        or isinstance(value.get("answer_turn_id"), str)
+                        or isinstance(value.get("final_turn_id"), str)
+                    )
+                ]
+                if len(contextual_candidates) > 1:
+                    metadata["_camera_unbound"] = CAMERA_AUTHORITY
+                    return
+                if len(contextual_candidates) == 1:
+                    candidate_id, attempt = contextual_candidates[0]
+                    if attempt.get("state") == "photo_sent":
+                        pass  # The original first-answer path below handles this.
+                    elif bind_denial(candidate_id, attempt, "context"):
+                        return
+        if intent != "no" and target_matches:
+            _, attempt = target_matches[0]
+            if (
+                attempt.get("state") in {"completed", "delivery_unknown"}
+                and (
+                    isinstance(attempt.get("camera_commit"), dict)
+                    or isinstance(attempt.get("answer_turn_id"), str)
+                    or isinstance(attempt.get("final_turn_id"), str)
+                )
+            ) or (
+                attempt.get("state") in {"answering", "final_queued"}
+                and intent != attempt.get("answer_kind")
+            ):
+                # A thank-you, repeated yes, or unrelated callback is never a
+                # denial authorization for a retained Camera meal.
+                metadata["_camera_unbound"] = CAMERA_AUTHORITY
+                return
         if (
             self._attempts
             and not message.media
@@ -1014,24 +1534,74 @@ class CameraIngress:
         ):
             metadata["_camera_unbound"] = CAMERA_AUTHORITY
             return
-        for attempt in self._attempts.values():
+        addressable = [
+            (key, value) for key, value in self._attempts.items()
+            if value["state"] in {"photo_sent", "answering", "final_queued"}
+        ]
+        matches = [
+            (key, value) for key, value in addressable
+            if target is not None and str(target) in {
+                str(value.get("photo_id")), *map(str, value.get("reply_ids", []))
+            }
+        ]
+        if target is not None and not matches and any(
+            str(target) in {str(value.get("photo_id")), *map(str, value.get("reply_ids", []))}
+            and not (
+                value.get("state") == "completed"
+                and (
+                    isinstance(value.get("camera_commit"), dict)
+                    or isinstance(value.get("answer_turn_id"), str)
+                    or isinstance(value.get("final_turn_id"), str)
+                )
+            )
+            for value in self._attempts.values()
+        ):
+            metadata["_camera_unbound"] = CAMERA_AUTHORITY
+            return
+        if target is not None and matches:
+            if len(matches) != 1:
+                metadata["_camera_unbound"] = CAMERA_AUTHORITY
+                return
+            pending = matches
+        else:
+            if len(addressable) == 1:
+                # A single retained operation remains context-addressable after
+                # its attention timer has expired.
+                if (
+                    not addressable[0][1].get("attention_active", True)
+                    and _classify_answer(raw_text, anchored=False) is None
+                ):
+                    return
+                pending = addressable
+            elif len(addressable) > 1:
+                if _classify_answer(raw_text, anchored=False) is not None:
+                    metadata["_camera_unbound"] = CAMERA_AUTHORITY
+                return
+            else:
+                return
+        candidate_id, attempt = pending[0]
+        if attempt["state"] in {"answering", "final_queued"}:
+            answer_kind = attempt.get("answer_kind")
+            turn_id = attempt.get("answer_turn_id")
+            current_intent = _classify_answer(raw_text, anchored=target is not None)
             if (
-                target is not None
-                and attempt["state"] != "photo_sent"
-                and str(target)
-                in {
-                    str(attempt["photo_id"]),
-                    *map(str, attempt["reply_ids"]),
-                }
+                answer_kind not in {"yes", "no"}
+                or not isinstance(turn_id, str)
+                or current_intent != answer_kind
             ):
                 metadata["_camera_unbound"] = CAMERA_AUTHORITY
                 return
-        pending = [
-            (key, value) for key, value in self._attempts.items() if value["state"] != "completed"
-        ]
-        if len(pending) != 1:
+            metadata["_camera_authority"] = CAMERA_AUTHORITY
+            metadata["_camera_candidate_id"] = candidate_id
+            metadata["_camera_answer"] = answer_kind
+            metadata["_camera_turn_id"] = turn_id
+            metadata["_camera_route"] = "callback" if metadata.get("callback_query") else ("reply" if target is not None else "context")
+            metadata["_camera_reconcile_only"] = True
+            if target is not None:
+                metadata["_camera_native_binding"] = str(target)
+            if answer_kind == "yes":
+                message.media.append(attempt["snapshot"])
             return
-        candidate_id, attempt = pending[0]
         if message.media:
             # A new, unrelated manual photo keeps its ordinary path. A photo
             # replied to this Camera operation must not bypass its answer gate.
@@ -1065,7 +1635,10 @@ class CameraIngress:
             metadata["_camera_unbound"] = CAMERA_AUTHORITY
             return
         attempt["state"] = "answering"
+        attempt["attention_active"] = False
         attempt["answer_turn_id"] = uuid4().hex
+        attempt["answer_kind"] = classified
+        attempt["finalizer_status"] = "pending"
         try:
             self._save_attempts()
         except OSError:
@@ -1075,6 +1648,12 @@ class CameraIngress:
         metadata["_camera_candidate_id"] = candidate_id
         metadata["_camera_answer"] = classified
         metadata["_camera_turn_id"] = attempt["answer_turn_id"]
+        metadata["_camera_route"] = (
+            "callback" if metadata.get("callback_query") else
+            "reply" if target is not None else "context"
+        )
+        if target is not None:
+            metadata["_camera_native_binding"] = str(target)
         if classified == "yes":
             message.media.append(attempt["snapshot"])
         return
@@ -1089,7 +1668,11 @@ class CameraIngress:
             return
         attempt = self._attempts[candidate_id]
         turn_id = message.metadata.get("_camera_turn_id")
-        expected_turn_id = attempt.get("final_turn_id")
+        is_correction = message.metadata.get("_camera_correction") is CAMERA_AUTHORITY
+        expected_turn_id = (
+            attempt.get("camera_correction_final_turn_id")
+            if is_correction else attempt.get("final_turn_id")
+        )
         final = (
             message.metadata.get("_camera_final") is CAMERA_AUTHORITY
             and isinstance(turn_id, str)
@@ -1107,15 +1690,24 @@ class CameraIngress:
             )
         )
         if not valid_receipt:
-            if final and attempt["state"] == "final_queued":
+            if final and is_correction:
+                attempt["camera_correction"] = "delivery_unknown"
+                self._save_attempts()
+            elif final and attempt["state"] == "final_queued":
                 attempt["state"] = "delivery_unknown"
                 self._save_attempts()
             return
         for native_id in receipt.native_message_ids:
             if native_id not in attempt["reply_ids"]:
                 attempt["reply_ids"].append(native_id)
-        if final and attempt["state"] == "final_queued":
+        if final and is_correction:
+            attempt["camera_correction"] = "completed"
+            if attempt["state"] in {"final_queued", "delivery_unknown"}:
+                attempt["state"] = "completed"
+                attempt["attention_active"] = False
+        elif final and attempt["state"] in {"final_queued", "delivery_unknown"}:
             attempt["state"] = "completed"
+            attempt["attention_active"] = False
         self._save_attempts()
         if final and attempt["state"] == "completed":
             self._remove_completed_snapshots()
@@ -1127,6 +1719,15 @@ class CameraIngress:
             return
         candidate_id = message.metadata.get("_camera_candidate_id")
         attempt = self._attempts.get(candidate_id) if isinstance(candidate_id, str) else None
+        if (
+            attempt is not None
+            and message.metadata.get("_camera_correction") is CAMERA_AUTHORITY
+            and message.metadata.get("_camera_turn_id")
+            == attempt.get("camera_correction_final_turn_id")
+        ):
+            attempt["camera_correction"] = "delivery_unknown"
+            self._save_attempts()
+            return
         if (
             attempt is not None
             and attempt["state"] == "final_queued"
@@ -1146,12 +1747,35 @@ class CameraIngress:
             attempt = self._attempts.get(candidate_id) if isinstance(candidate_id, str) else None
             if (
                 attempt is not None
+                and message.metadata.get("_camera_correction") is CAMERA_AUTHORITY
+                and attempt.get("camera_correction") == "answering"
+                and isinstance(turn_id, str)
+                and turn_id
+            ):
+                if recorded:
+                    attempt["camera_correction"] = "final_queued"
+                    attempt["camera_correction_final_turn_id"] = turn_id
+                    self._save_attempts()
+            elif (
+                attempt is not None
                 and attempt["state"] == "answering"
                 and isinstance(turn_id, str)
                 and turn_id
             ):
                 attempt["final_turn_id"] = turn_id
                 attempt["state"] = "final_queued"
+                attempt["attention_active"] = False
+                self._save_attempts()
+            if (
+                attempt is not None
+                and message.metadata.get("_camera_correction") is CAMERA_AUTHORITY
+                and attempt.get("camera_correction") == "answering"
+                and isinstance(turn_id, str)
+                and turn_id
+                and recorded
+            ):
+                attempt["camera_correction"] = "final_queued"
+                attempt["camera_correction_final_turn_id"] = turn_id
                 self._save_attempts()
 
     async def close(self) -> None:
