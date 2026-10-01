@@ -3831,6 +3831,79 @@ async def test_reference_source_keeps_historical_request_ack_across_restart(tmp_
 
 
 @pytest.mark.asyncio
+async def test_reference_source_restart_validates_nonlast_candidate_binding(tmp_path: Path) -> None:
+    ingress, root, bus, channel = _ingress(tmp_path)
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    first_index = 940
+    first_candidate_id = candidate_id_for(f"id:fake-{first_index}", f"rev-{first_index}")
+    second_index = next(
+        index
+        for index in range(941, 1000)
+        if candidate_id_for(f"id:fake-{index}", f"rev-{index}") > first_candidate_id
+    )
+    first = _candidate(root, index=first_index, capture_time=now - timedelta(minutes=2))
+    first_status, _ = await _admit(ingress, root, "Bearer " + "s" * 40, first)
+    assert first_status == 202
+    await asyncio.wait_for(bus.consume_inbound(), timeout=1)
+    first_image = (root / first["candidate_id"] / "original.jpg").read_bytes()
+    second = _candidate(root, index=second_index, capture_time=now - timedelta(minutes=1))
+    second_dir = root / second["candidate_id"]
+    second_manifest = json.loads((second_dir / "manifest.json").read_text(encoding="utf-8"))
+    (second_dir / "original.jpg").write_bytes(first_image)
+    second_manifest["original_size_bytes"] = len(first_image)
+    second_manifest["original_sha256"] = hashlib.sha256(first_image).hexdigest()
+    manifest_bytes = json.dumps(second_manifest, separators=(",", ":")).encode()
+    (second_dir / "manifest.json").write_bytes(manifest_bytes)
+    second["image_sha256"] = second_manifest["original_sha256"]
+    second["manifest_sha256"] = hashlib.sha256(manifest_bytes).hexdigest()
+    _producer_sidecar(root, second)
+    duplicate_status, duplicate = await _admit(
+        ingress, root, "Bearer " + "s" * 40, second
+    )
+    assert duplicate_status == 200
+    assert duplicate["status"] == "duplicate"
+    assert duplicate["duplicate_of"] == first["candidate_id"]
+
+    first_id = first["candidate_id"]
+    second_id = second["candidate_id"]
+    persisted_attempts = json.loads(ingress._state_path.read_text(encoding="utf-8"))["attempts"]
+    assert list(persisted_attempts)[-1] == second_id
+    assert first_id < second_id
+    source_attempt = ingress._attempts[first_id]
+    original_capture = source_attempt["capture_time"]
+    original_digest = source_attempt["image_sha256"]
+    original_photo_id = source_attempt["photo_id"]
+    original_snapshot = Path(source_attempt["snapshot"])
+    original_snapshot.unlink()
+
+    def utc(value: str) -> datetime:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(timezone.utc)
+
+    status, source_receipt, _ = await _reference_source_request(ingress, root, first)
+    assert status == 200 and source_receipt["status"] == "source_reestablished"
+    assert source_attempt["reference_source"]["candidate_id"] == first_id
+    assert utc(source_attempt["reference_source"]["capture_time"]) == utc(original_capture)
+    assert source_attempt["reference_source"]["image_sha256"] == original_digest
+    restored_image = Path(source_attempt["reference_source"]["snapshot"])
+    assert restored_image.exists() and restored_image.read_bytes() == first_image
+    await ingress.close()
+
+    reopened = CameraIngress(ingress.config, workspace=tmp_path, bus=MessageBus(), telegram=channel)
+    restored = reopened._attempts[first_id]
+    assert restored["reference_source"]["candidate_id"] == first_id
+    assert utc(restored["reference_source"]["capture_time"]) == utc(original_capture)
+    assert restored["reference_source"]["image_sha256"] == original_digest
+    restored_image = Path(restored["reference_source"]["snapshot"])
+    assert restored_image.exists() and restored_image.read_bytes() == first_image
+    assert restored["photo_id"] == original_photo_id
+    assert restored["capture_time"] == original_capture
+    assert second_id in reopened._attempts
+    assert reopened._attempts[second_id]["state"] == "duplicate"
+    assert len(channel.calls) == 1 and reopened._bus.inbound_size == 0
+    await reopened.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "failure", ["stage", "journal", "journal-after-write", "publish", "verify"]
 )
