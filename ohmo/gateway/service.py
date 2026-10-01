@@ -56,6 +56,33 @@ class OhmoGatewayService:
             )
         self._bus = MessageBus()
         self._contact_store = ContactStore(root)
+        camera_recent_attachments = None
+        camera_binding = None
+        camera = self._config.camera_ingress
+        if camera.enabled:
+            # Bind the dedup history read only to this configured private tenant.
+            from ohmo.memory_backend import resolve_tenant_honcho_binding
+            from ohmo.memory_service.honcho_client import HonchoClient
+
+            camera_binding = resolve_tenant_honcho_binding(self._config, camera.tenant_id)
+            if camera_binding is not None:
+                async def _list_camera_recent_attachments(*, since, until, binding=camera_binding):
+                    camera_honcho = HonchoClient(
+                        binding.base_url, binding.api_key, binding.workspace
+                    )
+                    try:
+                        return await camera_honcho.list_recent_message_metadata(
+                            binding.session,
+                            expected_peer_id=binding.observed_peer,
+                            since=since,
+                            until=until,
+                            page_size=100,
+                            max_pages=100,
+                        )
+                    finally:
+                        await camera_honcho.aclose()
+
+                camera_recent_attachments = _list_camera_recent_attachments
         self._manager = ChannelManager(
             build_channel_manager_config(self._config),
             self._bus,
@@ -68,6 +95,10 @@ class OhmoGatewayService:
                 workspace=root,
                 bus=self._bus,
                 telegram=self._manager.get_channel("telegram"),
+                recent_attachments=camera_recent_attachments,
+                recent_session=camera_binding.session if camera_recent_attachments is not None else None,
+                recent_peer=camera_binding.observed_peer if camera_recent_attachments is not None else None,
+                history_required=self._config.camera_ingress.enabled,
             )
             if self._config.camera_ingress.listen_port
             else None
@@ -83,6 +114,10 @@ class OhmoGatewayService:
             reminder_max_per_chat=self._config.reminder_max_per_chat,
         )
         self._runtime_pool._camera_ingress = self._camera_ingress
+        if self._camera_ingress is not None:
+            self._camera_ingress._retained_attachments = (
+                self._runtime_pool.camera_retained_attachment_history
+            )
         self._stop_event: asyncio.Event | None = None
         self._restart_requested = False
         self._reminder_scheduler = ReminderScheduler(

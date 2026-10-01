@@ -50,6 +50,9 @@ class AttachmentRefBlock(BaseModel):
     media_type: str
     byte_size: int = Field(ge=0)
     label: str = Field(default="image", max_length=MAX_ATTACHMENT_LABEL_LENGTH)
+    # Gateway-owned provenance for an attachment as it appeared in one user
+    # turn. This stays out of provider payloads and is retained in Ohmo snapshots.
+    source_provenance: dict[str, Any] | None = Field(default=None, exclude=True)
 
     @field_validator("media_type")
     @classmethod

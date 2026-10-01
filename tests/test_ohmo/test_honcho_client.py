@@ -523,6 +523,39 @@ async def test_recent_message_metadata_paginates_and_keeps_inclusive_window() ->
 
 
 @pytest.mark.asyncio
+async def test_recent_message_metadata_completes_beyond_default_thousand_message_window() -> None:
+    requests: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        page = int(request.url.params["page"])
+        size = int(request.url.params["size"])
+        requests.append(page)
+        total = 1001
+        start = (page - 1) * size
+        stop = min(start + size, total)
+        created = "2026-08-04T10:00:00Z"
+        items = [_recent_message(f"history-{i}", created) for i in range(start, stop)]
+        return httpx.Response(200, json={
+            "items": items, "total": total, "page": page, "size": size,
+            "pages": (total + size - 1) // size,
+        })
+
+    async with HonchoClient(
+        "https://honcho.test", "workspace-jwt", "workspace-one",
+        transport=httpx.MockTransport(handler),
+    ) as client:
+        found = await client.list_recent_message_metadata(
+            "session-one", expected_peer_id="marina-peer",
+            since=dt.datetime(2026, 8, 1, tzinfo=dt.timezone.utc),
+            until=dt.datetime(2026, 8, 8, tzinfo=dt.timezone.utc),
+            page_size=100, max_pages=100,
+        )
+
+    assert len(found) == 1001
+    assert len(requests) == 11 and requests == list(range(1, 12))
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "response",
     [

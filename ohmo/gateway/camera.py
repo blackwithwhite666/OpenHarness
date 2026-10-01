@@ -22,11 +22,23 @@ from email import policy
 from email.parser import BytesParser
 from http import HTTPStatus
 from pathlib import Path
+from typing import Literal
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
-from ohmo.camera_protocol.models import ClassifierOutput, ManifestV2, validate_candidate_id
+from ohmo.camera_protocol.models import (
+    ClassifierOutput,
+    ManifestV2,
+    candidate_id_for,
+    validate_candidate_id,
+)
+from ohmo.gateway.attachment_fingerprints import (
+    PHASH_ALGORITHM,
+    PHASH_HAMMING_THRESHOLD,
+    fingerprint_image_bytes,
+    phash_hamming_distance,
+)
 from openharness.channels.bus.events import InboundMessage, OutboundDeliveryReceipt, OutboundMessage
 
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
@@ -37,6 +49,9 @@ _MAX_REQUEST = 4096
 _MAX_HTTP_BODY = 12 * 1024 * 1024
 _MAX_ATTEMPTS = 10000
 _MAX_JOURNAL = 8 * 1024 * 1024
+_MAX_HISTORY_FINGERPRINTS = 100_000
+_DEDUP_WINDOW = timedelta(days=7)
+_REFERENCE_WINDOW = timedelta(minutes=5)
 _SESSION_TTL_SECONDS = 24 * 60 * 60
 _SESSION_ID = re.compile(r"[0-9a-f]{32}\Z")
 _YES = frozenset(
@@ -63,6 +78,7 @@ _DEEPSEEK_MODEL = "deepseek/deepseek-v4.1-flash"
 _DEEPSEEK_ENDPOINT = "deepinfra/fp8"
 _DEEPSEEK_RELEASE = "deepseek-camera-production-v1"
 CAMERA_AUTHORITY = object()
+logger = logging.getLogger(__name__)
 
 
 def _classify_answer(text: object, *, anchored: bool) -> str | None:
@@ -186,6 +202,122 @@ class CameraCandidateRequest(BaseModel):
         return value
 
 
+class CameraReferencesRequest(BaseModel):
+    """Strict query for the configured owner's recent confirmed Camera photos."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    candidate_id: str
+    capture_time: datetime
+
+    @field_validator("candidate_id")
+    @classmethod
+    def _candidate(cls, value: str) -> str:
+        return validate_candidate_id(value)
+
+    @field_validator("capture_time", mode="before")
+    @classmethod
+    def _capture_time_wire(cls, value: object) -> object:
+        if not isinstance(value, str) or len(value) > 64:
+            raise ValueError("capture_time must be a bounded ISO-8601 string")
+        return value
+
+    @field_validator("capture_time")
+    @classmethod
+    def _capture_time(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("capture_time must be timezone-aware")
+        return value
+
+
+class CameraReferencesRequestV2(CameraReferencesRequest):
+    schema_version: Literal[2]
+
+
+class CameraReferenceSourceRequest(BaseModel):
+    """Current immutable source evidence for an existing native Camera photo."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal[1]
+    candidate_id: str
+    source_revision: str = Field(min_length=1, max_length=256)
+    manifest_sha256: str
+    image_sha256: str
+    capture_time: datetime
+    capture_time_authority: Literal["exif", "filename"]
+
+    @field_validator("candidate_id")
+    @classmethod
+    def _candidate(cls, value: str) -> str:
+        return validate_candidate_id(value)
+
+    @field_validator("manifest_sha256", "image_sha256")
+    @classmethod
+    def _digest(cls, value: str) -> str:
+        if _SHA256.fullmatch(value) is None:
+            raise ValueError("invalid SHA-256")
+        return value
+
+    @field_validator("capture_time", mode="before")
+    @classmethod
+    def _capture_time_wire(cls, value: object) -> object:
+        if not isinstance(value, str) or len(value) > 64:
+            raise ValueError("capture_time must be a bounded ISO-8601 string")
+        return value
+
+    @field_validator("capture_time")
+    @classmethod
+    def _capture_time(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("capture_time must be timezone-aware")
+        return value
+
+
+class CameraReferenceScope(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    principal: str
+    chat_id: str
+    tenant_id: str
+    session_key: str
+
+
+class CameraReferenceSourceObservation(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal[1]
+    source_evidence_authority: Literal["current_immutable_original_revision"]
+    reestablished_at: datetime
+    scope: CameraReferenceScope
+    candidate_id: str
+    file_id: str = Field(min_length=1, max_length=256)
+    source_revision: str = Field(min_length=1, max_length=256)
+    image_sha256: str
+    capture_time: datetime
+    capture_time_authority: Literal["exif", "filename"]
+    snapshot: str | None
+
+    @field_validator("candidate_id")
+    @classmethod
+    def _candidate(cls, value: str) -> str:
+        return validate_candidate_id(value)
+
+    @field_validator("image_sha256")
+    @classmethod
+    def _digest(cls, value: str) -> str:
+        if _SHA256.fullmatch(value) is None:
+            raise ValueError("invalid SHA-256")
+        return value
+
+    @field_validator("capture_time", "reestablished_at")
+    @classmethod
+    def _aware_times(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("reference source timestamp must be timezone-aware")
+        return value
+
+
 @dataclass(frozen=True)
 class CameraCandidateUpload:
     """Candidate metadata, producer evidence, and image carried by one HTTP request."""
@@ -196,6 +328,152 @@ class CameraCandidateUpload:
     image_bytes: bytes
     image_filename: str
     image_content_type: str
+
+
+@dataclass(frozen=True)
+class RetainedAttachmentEvidence:
+    """One bounded attachment observation from a trusted retained session."""
+
+    id: str
+    peer_id: str
+    session_id: str
+    metadata: Mapping[str, object]
+    created_at: datetime
+
+
+class IncompleteAttachmentHistory(ValueError):
+    """A bounded source exposed a known partial album that another source may complete."""
+
+
+def _fingerprints_match(
+    fingerprints: object, candidate: Mapping[str, object]
+) -> bool:
+    """Validate bounded descriptors and compare exact SHA or supported pHash."""
+    if not isinstance(fingerprints, list) or len(fingerprints) > _MAX_HISTORY_FINGERPRINTS:
+        raise ValueError("attachment history fingerprints are malformed")
+    matched = False
+    for fingerprint in fingerprints:
+        if (
+            not isinstance(fingerprint, Mapping)
+            or not isinstance(fingerprint.get("sha256"), str)
+            or _SHA256.fullmatch(fingerprint["sha256"]) is None
+        ):
+            raise ValueError("attachment history fingerprint is malformed")
+        if "phash" in fingerprint and (
+            fingerprint.get("phash_algorithm") != PHASH_ALGORITHM
+            or not isinstance(fingerprint.get("phash"), str)
+            or re.fullmatch(r"[0-9a-f]{64}", fingerprint["phash"]) is None
+        ):
+            raise ValueError("attachment history pHash version is malformed")
+        if "phash_algorithm" in fingerprint and "phash" not in fingerprint:
+            raise ValueError("attachment history pHash is incomplete")
+        if fingerprint["sha256"] == candidate["sha256"]:
+            matched = True
+        old_phash = fingerprint.get("phash")
+        candidate_phash = candidate.get("phash")
+        distance = (
+            phash_hamming_distance(old_phash, candidate_phash)
+            if isinstance(old_phash, str) and isinstance(candidate_phash, str)
+            else None
+        )
+        if (
+            fingerprint.get("phash_algorithm") == PHASH_ALGORITHM
+            and distance is not None
+            and distance <= PHASH_HAMMING_THRESHOLD
+        ):
+            matched = True
+    return matched
+
+
+def _find_recent_attachment_duplicate(
+    history: object,
+    candidate: Mapping[str, object],
+    *,
+    since: datetime,
+    until: datetime,
+    principal: str,
+    expected_session: str | None,
+    expected_peer: str | None,
+    session_key: str,
+    chat_id: str,
+    local_snapshot: bool = False,
+) -> str | None:
+    """Validate one complete bounded owner history and return its stable target."""
+    if not isinstance(history, list):
+        raise ValueError("attachment history is incomplete")
+    first_match: str | None = None
+    history_incomplete = False
+    for item in history:
+        metadata = getattr(item, "metadata", None)
+        created = getattr(item, "created_at", None)
+        session_id = getattr(item, "session_id", None)
+        peer_id = getattr(item, "peer_id", None)
+        target_id = getattr(item, "id", None)
+        if (
+            not isinstance(metadata, Mapping)
+            or not isinstance(created, datetime)
+            or created.tzinfo is None
+            or created.utcoffset() is None
+            or not isinstance(target_id, str)
+            or not target_id
+            or len(target_id) > 256
+        ):
+            raise ValueError("attachment history item is invalid")
+        if not since <= created.astimezone(timezone.utc) <= until:
+            raise ValueError("attachment history escaped its time bounds")
+        if local_snapshot:
+            if (
+                not isinstance(session_id, str)
+                or peer_id != principal
+                or metadata.get("source_snapshot_session_id") != session_id
+                or metadata.get("source_session_key") != session_key
+                or metadata.get("source_chat_id") != chat_id
+                or metadata.get("timestamp_authority") not in {
+                    "inbound_event_timestamp",
+                    "owner_local_object_mtime_observed_retention",
+                }
+                or metadata.get("target_authority") not in {
+                    "native_event_id",
+                    "owner_local_observed_retention_ref_group",
+                }
+                or (target_id.startswith("retained:")
+                    and metadata.get("target_authority")
+                    != "owner_local_observed_retention_ref_group")
+                or metadata.get("source_channel") != "telegram"
+                or metadata.get("received_at")
+                != created.astimezone(timezone.utc).isoformat()
+            ):
+                raise ValueError("retained attachment snapshot provenance is invalid")
+        elif session_id != expected_session or peer_id != expected_peer:
+            raise ValueError("attachment history escaped its owner/session bounds")
+        if metadata.get("role") != "user":
+            continue
+        if metadata.get("source_principal") != principal:
+            continue
+        fingerprints = metadata.get("attachment_fingerprints", [])
+        image_count = metadata.get("source_image_attachment_count")
+        if image_count is not None and (
+            not isinstance(image_count, int)
+            or isinstance(image_count, bool)
+            or not 0 <= image_count <= _MAX_HISTORY_FINGERPRINTS
+            or not isinstance(fingerprints, list)
+            or image_count < len(fingerprints)
+        ):
+            raise ValueError("attachment history image count is malformed")
+        if image_count is not None and image_count > len(fingerprints):
+            history_incomplete = True
+        if fingerprints == []:
+            continue
+        if metadata.get("is_forwarded") is True or metadata.get("is_group") is True:
+            continue
+        if metadata.get("is_forwarded") is not False or metadata.get("is_group") is not False:
+            raise ValueError("attachment history is missing private-source provenance")
+        matched = _fingerprints_match(fingerprints, candidate)
+        if first_match is None and matched:
+            first_match = target_id
+    if first_match is None and history_incomplete:
+        raise IncompleteAttachmentHistory("attachment history is missing image fingerprints")
+    return first_match
 
 
 def _unique_json(pairs: list[tuple[str, object]]) -> dict:
@@ -470,10 +748,21 @@ def _validate_deepseek_route_attestation(manifest: ManifestV2) -> None:
 class CameraIngress:
     """One-owner in-process admission with restart-safe attempt tombstones."""
 
-    def __init__(self, config, *, workspace: Path, bus, telegram) -> None:
+    def __init__(
+        self, config, *, workspace: Path, bus, telegram, recent_attachments=None,
+        recent_session: str | None = None, recent_peer: str | None = None,
+        retained_attachments=None, history_required: bool = False,
+        retained_history_required: bool = False,
+    ) -> None:
         self.config = config
         self._bus = bus
         self._telegram = telegram
+        self._recent_attachments = recent_attachments
+        self._recent_session = recent_session
+        self._recent_peer = recent_peer
+        self._retained_attachments = retained_attachments
+        self._retained_history_required = retained_history_required
+        self._history_required = history_required
         self._workspace = workspace
         self._state_dir = workspace / "camera_ingress"
         self._state_path = self._state_dir / "attempts.json"
@@ -482,6 +771,7 @@ class CameraIngress:
         self._session = self._new_session(
             session_id=previous_session.get("session_id") if previous_session else None
         )
+        self._reference_source_pending_commit: set[str] = set()
         if getattr(self, "_journal_migrated", False):
             self._save_attempts()
         self._tasks: set[asyncio.Task] = set()
@@ -513,6 +803,494 @@ class CameraIngress:
         except ValueError:
             return None
         return instant if instant.tzinfo is not None and instant.utcoffset() is not None else None
+
+    async def camera_references(
+        self, authorization: str | None, request: CameraReferencesRequest
+    ) -> tuple[int, dict]:
+        """Read confirmed, snapshot-verified Camera references without journal writes."""
+        if not isinstance(authorization, str) or not authorization.startswith("Bearer "):
+            return self._error(401, "unauthorized")
+        try:
+            expected = self._token()
+        except (OSError, ValueError):
+            return self._error(503, "pre_admission_unavailable")
+        if not hmac.compare_digest(authorization[7:].encode(), expected):
+            return self._error(401, "unauthorized")
+        if not self.config.enabled:
+            return self._error(403, "camera_disabled")
+        async with self._lock:
+            return self._camera_references_locked(request)
+
+    def _camera_references_locked(self, request: CameraReferencesRequest) -> tuple[int, dict]:
+        if isinstance(request, CameraReferencesRequestV2):
+            return self._camera_references_v2_locked(request)
+        now = datetime.now(timezone.utc)
+        query_time = request.capture_time.astimezone(timezone.utc)
+        if query_time < now - _DEDUP_WINDOW or query_time > now:
+            return self._error(422, "capture_out_of_window")
+        lower = max(query_time - _REFERENCE_WINDOW, now - _DEDUP_WINDOW)
+        references: list[dict] = []
+        pending: list[str] = []
+        # Reads under the admission lock so the returned projection is one stable
+        # view relative to concurrent Camera state transitions. Nothing is saved.
+        for candidate_id, attempt in self._attempts.items():
+            if candidate_id == request.candidate_id:
+                continue
+            if attempt.get("state") in {"duplicate", "retired"}:
+                continue
+            captured = self._attempt_capture_time(attempt)
+            if captured is None:
+                if attempt.get("state") in {
+                    "admitted", "photo_sent", "answering", "final_queued", "completed",
+                    "delivery_unknown",
+                }:
+                    return self._error(503, "reference_evidence_unavailable")
+                continue
+            captured = captured.astimezone(timezone.utc)
+            if not lower <= captured <= query_time:
+                continue
+            if attempt.get("photo_delivery_confirmed") is not True:
+                pending.append(candidate_id)
+                continue
+            photo_id = attempt.get("photo_id")
+            image_sha = attempt.get("image_sha256")
+            snapshot = attempt.get("snapshot")
+            admission_id = attempt.get("admission_id")
+            if (
+                type(photo_id) is not int or photo_id <= 0
+                or not isinstance(image_sha, str) or _SHA256.fullmatch(image_sha) is None
+                or not isinstance(snapshot, str) or not isinstance(admission_id, str)
+            ):
+                return self._error(503, "reference_evidence_unavailable")
+            path = Path(snapshot)
+            if (
+                path.parent != self._state_dir / "snapshots"
+                or path.name not in {
+                    f"{admission_id}.jpg", f"{admission_id}.jpeg",
+                    f"{admission_id}.png", f"{admission_id}.webp",
+                }
+            ):
+                return self._error(503, "reference_evidence_unavailable")
+            try:
+                image = _read_regular(path, _MAX_IMAGE)
+            except (OSError, ValueError):
+                return self._error(503, "reference_evidence_unavailable")
+            if not hmac.compare_digest(hashlib.sha256(image).hexdigest(), image_sha):
+                return self._error(503, "reference_evidence_unavailable")
+            references.append({
+                "candidate_id": candidate_id,
+                "image_sha256": image_sha,
+                "capture_time": captured.isoformat(),
+                "capture_time_authority": attempt["capture_time_authority"],
+                "native_photo_message_id": photo_id,
+            })
+        references.sort(key=lambda item: (item["capture_time"], item["candidate_id"]), reverse=True)
+        pending.sort()
+        return 200, {
+            "schema_version": 1,
+            "scope": {
+                "principal": self.config.principal,
+                "chat_id": self.config.chat_id,
+                "tenant_id": self.config.tenant_id,
+                "session_key": self.config.session_key,
+            },
+            "selection_policy": "confirmed-camera-five-minute-v1",
+            "references": references,
+            "pending_candidate_ids": pending,
+        }
+
+    def _reference_scope(self) -> CameraReferenceScope:
+        return CameraReferenceScope(
+            principal=self.config.principal,
+            chat_id=self.config.chat_id,
+            tenant_id=self.config.tenant_id,
+            session_key=self.config.session_key,
+        )
+
+    def _reference_source_record(
+        self, candidate_id: str, attempt: dict
+    ) -> CameraReferenceSourceObservation | None:
+        raw = attempt.get("reference_source")
+        if raw is None:
+            return None
+        try:
+            source = CameraReferenceSourceObservation.model_validate(raw)
+        except ValidationError as error:
+            raise ValueError("Camera current reference source is invalid") from error
+        if (
+            source.candidate_id != candidate_id
+            or source.scope != self._reference_scope()
+            or source.image_sha256 != attempt.get("image_sha256", source.image_sha256)
+            or (
+                self._attempt_capture_time(attempt) is not None
+                and source.capture_time.astimezone(timezone.utc)
+                != self._attempt_capture_time(attempt).astimezone(timezone.utc)
+            )
+            or (
+                attempt.get("capture_time_authority") is not None
+                and source.capture_time_authority != attempt.get("capture_time_authority")
+            )
+        ):
+            raise ValueError("Camera current reference source contradicts its journal")
+        return source
+
+    @staticmethod
+    def _safe_snapshot_name(attempt: dict, suffix: str) -> str:
+        admission_id = attempt.get("admission_id")
+        if (
+            not isinstance(admission_id, str)
+            or re.fullmatch(r"cam1-[0-9a-f]{32}", admission_id) is None
+            or suffix not in {".jpg", ".jpeg", ".png", ".webp"}
+        ):
+            raise ValueError("Camera managed snapshot identity is invalid")
+        return f"{admission_id}{suffix}"
+
+    def _camera_references_v2_locked(
+        self, request: CameraReferencesRequestV2
+    ) -> tuple[int, dict]:
+        now = datetime.now(timezone.utc)
+        query_time = request.capture_time.astimezone(timezone.utc)
+        if query_time < now - _DEDUP_WINDOW or query_time > now:
+            return self._error(422, "capture_out_of_window")
+        lower = max(query_time - _REFERENCE_WINDOW, now - _DEDUP_WINDOW)
+        references: list[dict] = []
+        reestablished: list[dict] = []
+        pending: list[str] = []
+        unresolved: list[str] = []
+        for candidate_id, attempt in self._attempts.items():
+            if candidate_id == request.candidate_id or attempt.get("state") in {"duplicate", "retired"}:
+                continue
+            try:
+                source = self._reference_source_record(candidate_id, attempt)
+            except ValueError:
+                unresolved.append(candidate_id)
+                continue
+            captured = self._attempt_capture_time(attempt)
+            if captured is not None:
+                captured = captured.astimezone(timezone.utc)
+                if source is not None and captured != source.capture_time.astimezone(timezone.utc):
+                    unresolved.append(candidate_id)
+                    continue
+            elif source is not None:
+                captured = source.capture_time.astimezone(timezone.utc)
+            if captured is None:
+                unresolved.append(candidate_id)
+                continue
+            if not lower <= captured <= query_time:
+                continue
+            if candidate_id in self._reference_source_pending_commit:
+                unresolved.append(candidate_id)
+                continue
+            if attempt.get("photo_delivery_confirmed") is not True:
+                pending.append(candidate_id)
+                continue
+            photo_id = attempt.get("photo_id")
+            if type(photo_id) is not int or photo_id <= 0:
+                unresolved.append(candidate_id)
+                continue
+            if source is not None:
+                snapshot = source.snapshot
+                image_sha = source.image_sha256
+                authority = source.capture_time_authority
+            else:
+                snapshot = attempt.get("snapshot")
+                image_sha = attempt.get("image_sha256")
+                authority = attempt.get("capture_time_authority")
+            if (
+                not isinstance(snapshot, str)
+                or not isinstance(image_sha, str)
+                or _SHA256.fullmatch(image_sha) is None
+                or authority not in {"exif", "filename"}
+            ):
+                unresolved.append(candidate_id)
+                continue
+            path = Path(snapshot)
+            try:
+                suffix = path.suffix.lower()
+                expected_name = self._safe_snapshot_name(attempt, suffix)
+                if path.parent != self._state_dir / "snapshots" or path.name != expected_name:
+                    raise ValueError("managed snapshot path differs")
+                image = _read_regular(path, _MAX_IMAGE)
+            except (OSError, ValueError):
+                unresolved.append(candidate_id)
+                continue
+            if not hmac.compare_digest(hashlib.sha256(image).hexdigest(), image_sha):
+                unresolved.append(candidate_id)
+                continue
+            item = {
+                "candidate_id": candidate_id,
+                "image_sha256": image_sha,
+                "capture_time": captured.isoformat(),
+                "capture_time_authority": authority,
+                "native_photo_message_id": photo_id,
+            }
+            if source is None:
+                references.append(item)
+            else:
+                item["source_evidence_authority"] = source.source_evidence_authority
+                item["reestablished_at"] = source.reestablished_at.astimezone(timezone.utc).isoformat()
+                reestablished.append(item)
+        references.sort(
+            key=lambda item: (item["capture_time"], item["candidate_id"]), reverse=True
+        )
+        reestablished.sort(
+            key=lambda item: (item["capture_time"], item["candidate_id"]), reverse=True
+        )
+        pending.sort()
+        unresolved.sort()
+        return 200, {
+            "schema_version": 2,
+            "scope": self._reference_scope().model_dump(mode="json"),
+            "selection_policy": "confirmed-camera-five-minute-v1",
+            "references": references,
+            "reestablished_references": reestablished,
+            "pending_candidate_ids": pending,
+            "unresolved_candidate_ids": unresolved,
+            "coverage": "incomplete" if unresolved else "complete",
+        }
+
+    async def reference_source(
+        self, authorization: str | None, upload: object
+    ) -> tuple[int, dict]:
+        if not isinstance(authorization, str) or not authorization.startswith("Bearer "):
+            return self._error(401, "unauthorized")
+        try:
+            expected = self._token()
+        except (OSError, ValueError):
+            return self._error(503, "pre_admission_unavailable")
+        if not hmac.compare_digest(authorization[7:].encode(), expected):
+            return self._error(401, "unauthorized")
+        if not self.config.enabled:
+            return self._error(403, "camera_disabled")
+        if not isinstance(upload, CameraCandidateUpload):
+            return self._error(400, "invalid_request")
+        try:
+            request = CameraReferenceSourceRequest.model_validate(upload.request)
+            image_bytes, suffix, manifest = self._validate_source_artifacts(request, upload)
+        except (ValidationError, OSError, ValueError, TypeError):
+            return self._error(422, "reference_source_mismatch")
+        source_time = request.capture_time.astimezone(timezone.utc)
+        now = datetime.now(timezone.utc)
+        if source_time > now:
+            return self._error(422, "reference_source_time_invalid")
+        retain_image = source_time >= now - _DEDUP_WINDOW
+        async with self._lock:
+            attempt = self._attempts.get(request.candidate_id)
+            if attempt is None:
+                return self._error(503, "reference_source_unresolved")
+            if (
+                attempt.get("photo_delivery_confirmed") is not True
+                or type(attempt.get("photo_id")) is not int
+                or attempt["photo_id"] <= 0
+            ):
+                return self._error(503, "reference_source_unresolved")
+            if attempt.get("state") in {"duplicate", "retired"}:
+                return self._error(503, "reference_source_unresolved")
+            conflicts = self._reference_source_conflicts(attempt, request, manifest)
+            if conflicts:
+                return self._error(409, "reference_source_conflict")
+            admission_id = attempt.get("admission_id")
+            if not isinstance(admission_id, str) or re.fullmatch(r"cam1-[0-9a-f]{32}", admission_id) is None:
+                return self._error(503, "reference_source_unresolved")
+            snapshot = (
+                str(self._state_dir / "snapshots" / self._safe_snapshot_name(attempt, suffix))
+                if retain_image else None
+            )
+            try:
+                previous = self._reference_source_record(request.candidate_id, attempt)
+            except ValueError:
+                return self._error(503, "reference_source_unresolved")
+            if previous is not None and (
+                previous.file_id != manifest.file_id
+                or previous.source_revision != manifest.rev
+                or previous.image_sha256 != request.image_sha256
+                or previous.capture_time.astimezone(timezone.utc) != source_time
+                or previous.capture_time_authority != request.capture_time_authority
+            ):
+                return self._error(409, "reference_source_conflict")
+            if previous is not None and previous.snapshot != snapshot:
+                # Retention is a projection of current policy, not part of the
+                # immutable source identity. Preserve the exact prior observation
+                # when an idempotent durability retry crosses the retention edge.
+                if retain_image or previous.snapshot is None:
+                    return self._error(409, "reference_source_conflict")
+                snapshot = previous.snapshot
+            temp_name = None
+            if retain_image:
+                try:
+                    temp_name = self._stage_reference_source_image(
+                        snapshot, image_bytes, request.image_sha256
+                    )
+                except (OSError, ValueError):
+                    return self._error(503, "reference_source_persistence_failed")
+            if previous is None:
+                observation = CameraReferenceSourceObservation(
+                    schema_version=1,
+                    source_evidence_authority="current_immutable_original_revision",
+                    reestablished_at=now,
+                    scope=self._reference_scope(),
+                    candidate_id=request.candidate_id,
+                    file_id=manifest.file_id,
+                    source_revision=manifest.rev,
+                    image_sha256=request.image_sha256,
+                    capture_time=request.capture_time,
+                    capture_time_authority=request.capture_time_authority,
+                    snapshot=snapshot,
+                )
+                attempt["reference_source"] = observation.model_dump(mode="json")
+                try:
+                    self._save_attempts()
+                except OSError:
+                    # Atomic replacement can have reached disk before a later
+                    # fsync failed. Preserve the exact current observation only
+                    # when a bounded reread proves it was written.
+                    try:
+                        durable = json.loads(_read_regular(self._state_path, _MAX_JOURNAL))
+                        stored = durable.get("attempts", {}).get(request.candidate_id, {}).get(
+                            "reference_source"
+                        )
+                    except (OSError, ValueError, TypeError, AttributeError):
+                        stored = None
+                    if stored != observation.model_dump(mode="json"):
+                        attempt.pop("reference_source", None)
+                    else:
+                        self._reference_source_pending_commit.add(request.candidate_id)
+                    return self._error(503, "reference_source_persistence_failed")
+            else:
+                observation = previous
+                if request.candidate_id in self._reference_source_pending_commit:
+                    try:
+                        self._save_attempts()
+                    except OSError:
+                        return self._error(503, "reference_source_persistence_failed")
+                    self._reference_source_pending_commit.discard(request.candidate_id)
+            if retain_image:
+                try:
+                    self._publish_reference_source_image(
+                        snapshot, request.image_sha256, temp_name
+                    )
+                except (OSError, ValueError):
+                    return self._error(503, "reference_source_persistence_failed")
+            return 200, {
+                "status": "source_reestablished",
+                "candidate_id": request.candidate_id,
+                "source_evidence_authority": observation.source_evidence_authority,
+                "reestablished_at": observation.reestablished_at.astimezone(timezone.utc).isoformat(),
+            }
+
+    def _reference_source_conflicts(
+        self, attempt: dict, request: CameraReferenceSourceRequest, manifest: ManifestV2
+    ) -> bool:
+        if attempt.get("image_sha256") not in {None, request.image_sha256}:
+            return True
+        capture = self._attempt_capture_time(attempt)
+        if capture is not None and (
+            capture.astimezone(timezone.utc) != request.capture_time.astimezone(timezone.utc)
+            or attempt.get("capture_time_authority") != request.capture_time_authority
+        ):
+            return True
+        request_identity = attempt.get("request_identity")
+        if isinstance(request_identity, dict):
+            try:
+                original = CameraCandidateRequest.model_validate(request_identity)
+            except ValidationError:
+                return True
+            if (
+                original.candidate_id != request.candidate_id
+                or original.source_revision != request.source_revision
+                or original.manifest_sha256 != request.manifest_sha256
+                or original.image_sha256 != request.image_sha256
+                or original.capture_time.astimezone(timezone.utc)
+                != request.capture_time.astimezone(timezone.utc)
+                or original.capture_time_authority != request.capture_time_authority
+            ):
+                return True
+        recovery = attempt.get("legacy_base_recovery")
+        if isinstance(recovery, dict):
+            observed = recovery.get("snapshot_sha256_observed")
+            if isinstance(observed, str) and observed != request.image_sha256:
+                return True
+        retained_revision = attempt.get("source_revision")
+        if isinstance(retained_revision, str) and retained_revision != manifest.rev:
+            return True
+        retained_manifest = attempt.get("manifest_sha256")
+        if isinstance(retained_manifest, str) and retained_manifest != request.manifest_sha256:
+            return True
+        return False
+
+    def _stage_reference_source_image(
+        self, snapshot: str, image: bytes, image_sha256: str
+    ) -> str | None:
+        target = Path(snapshot)
+        if target.parent != self._state_dir / "snapshots":
+            raise ValueError("reference snapshot path is outside managed storage")
+        temp_name = f".{target.name}.{image_sha256}.source-tmp"
+        state_fd = self._open_state_dir(create=True)
+        try:
+            snapshots_fd = _child_directory(state_fd, "snapshots", create=True)
+            try:
+                target_ok = False
+                try:
+                    retained = _read_regular(target.name, _MAX_IMAGE, dir_fd=snapshots_fd)
+                    target_ok = hmac.compare_digest(hashlib.sha256(retained).hexdigest(), image_sha256)
+                except FileNotFoundError:
+                    pass
+                except (OSError, ValueError):
+                    pass
+                if target_ok:
+                    return None
+                staged = None
+                try:
+                    staged = _read_regular(temp_name, _MAX_IMAGE, dir_fd=snapshots_fd)
+                except FileNotFoundError:
+                    pass
+                except (OSError, ValueError):
+                    try:
+                        os.unlink(temp_name, dir_fd=snapshots_fd)
+                    except FileNotFoundError:
+                        pass
+                if staged is None or not hmac.compare_digest(
+                    hashlib.sha256(staged).hexdigest(), image_sha256
+                ):
+                    try:
+                        os.unlink(temp_name, dir_fd=snapshots_fd)
+                    except FileNotFoundError:
+                        pass
+                    descriptor = os.open(
+                        temp_name,
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                        0o600,
+                        dir_fd=snapshots_fd,
+                    )
+                    with os.fdopen(descriptor, "wb") as stream:
+                        stream.write(image)
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                    os.fsync(snapshots_fd)
+                return temp_name
+            finally:
+                os.close(snapshots_fd)
+        finally:
+            os.close(state_fd)
+
+    def _publish_reference_source_image(
+        self, snapshot: str, image_sha256: str, temp_name: str | None
+    ) -> None:
+        target = Path(snapshot)
+        state_fd = self._open_state_dir(create=True)
+        try:
+            snapshots_fd = _child_directory(state_fd, "snapshots", create=True)
+            try:
+                if temp_name is not None:
+                    os.replace(temp_name, target.name, src_dir_fd=snapshots_fd, dst_dir_fd=snapshots_fd)
+                    os.fsync(snapshots_fd)
+                verified = _read_regular(target.name, _MAX_IMAGE, dir_fd=snapshots_fd)
+                if not hmac.compare_digest(hashlib.sha256(verified).hexdigest(), image_sha256):
+                    raise ValueError("published reference original failed verification")
+            finally:
+                os.close(snapshots_fd)
+        finally:
+            os.close(state_fd)
 
     def trusted_capture_time_for_answer(self, message: InboundMessage) -> datetime | None:
         """Resolve capture evidence only for this ingress-bound owner answer turn."""
@@ -862,10 +1640,13 @@ class CameraIngress:
             attempts = payload
         if not isinstance(attempts, dict) or len(attempts) > _MAX_ATTEMPTS:
             raise ValueError("camera attempt journal is invalid")
+        self._journal_migrated = False
         for key, value in attempts.items():
             validate_candidate_id(key)
             if not isinstance(value, dict) or value.get("state") not in {
                 "admitted",
+                "duplicate",
+                "retired",
                 "photo_sent",
                 "answering",
                 "final_queued",
@@ -878,10 +1659,27 @@ class CameraIngress:
             if "capture_time" in value or "capture_time_authority" in value:
                 if self._attempt_capture_time(value) is None:
                     raise ValueError("camera attempt journal capture time is invalid")
+            if "image_sha256" in value and (
+                not isinstance(value["image_sha256"], str)
+                or _SHA256.fullmatch(value["image_sha256"]) is None
+            ):
+                raise ValueError("camera attempt journal image digest is invalid")
+            if value.get("phash_algorithm") is not None and (
+                value.get("phash_algorithm") != PHASH_ALGORITHM
+                or not isinstance(value.get("image_phash"), str)
+                or re.fullmatch(r"[0-9a-f]{64}", value["image_phash"]) is None
+            ):
+                raise ValueError("camera attempt journal pHash is invalid")
         now_iso = datetime.now(timezone.utc).isoformat()
-        self._journal_migrated = False
-        for value in attempts.values():
-            if not isinstance(value.get("admitted_at"), str):
+        for candidate_id, value in attempts.items():
+            if value.get("state") == "retired":
+                try:
+                    retired_time = datetime.fromisoformat(value["retired_at"])
+                except (KeyError, TypeError, ValueError) as error:
+                    raise ValueError("Camera retired record timestamp is invalid") from error
+                if retired_time.tzinfo is None or retired_time.utcoffset() is None:
+                    raise ValueError("Camera retired record timestamp has no timezone")
+            elif not isinstance(value.get("admitted_at"), str):
                 # Legacy in-flight entries adopt this process's start as their
                 # admission time, so the pending TTL has a bounded runway.
                 value["admitted_at"] = now_iso
@@ -903,6 +1701,223 @@ class CameraIngress:
                 value.get("photo_delivery_confirmed")
             ) is not bool:
                 raise ValueError("camera attempt journal state is invalid")
+            request_identity = value.get("request_identity")
+            request_ack = value.get("request_ack")
+            if request_identity is not None:
+                try:
+                    bound_request = CameraCandidateRequest.model_validate(request_identity)
+                except ValidationError as error:
+                    raise ValueError("camera attempt request identity is invalid") from error
+                if bound_request.candidate_id != candidate_id:
+                    raise ValueError("camera attempt request identity has the wrong candidate")
+                if request_ack is not None and (
+                    not isinstance(request_ack, dict)
+                    or type(request_ack.get("status")) is not int
+                    or not isinstance(request_ack.get("body"), dict)
+                    or request_ack["body"].get("candidate_id") != bound_request.candidate_id
+                    or request_ack["body"].get("session_id") != bound_request.session_id
+                    or request_ack["body"].get("epoch") != bound_request.epoch
+                    or request_ack["body"].get("ack_seq") != bound_request.seq
+                ):
+                    raise ValueError("camera attempt request ACK is invalid")
+            elif request_ack is not None:
+                raise ValueError("camera attempt ACK has no request identity")
+            if value.get("reference_source") is not None:
+                try:
+                    source = CameraReferenceSourceObservation.model_validate(
+                        value["reference_source"]
+                    )
+                except ValidationError as error:
+                    raise ValueError("Camera current reference source is invalid") from error
+                if (
+                    source.candidate_id != key
+                    or candidate_id_for(source.file_id, source.source_revision) != key
+                    or value.get("photo_delivery_confirmed") is not True
+                    or type(value.get("photo_id")) is not int
+                    or value["photo_id"] <= 0
+                ):
+                    raise ValueError("Camera current reference source is not receipt-bound")
+                retained_capture = self._attempt_capture_time(value)
+                if retained_capture is not None and (
+                    retained_capture.astimezone(timezone.utc)
+                    != source.capture_time.astimezone(timezone.utc)
+                    or value.get("capture_time_authority") != source.capture_time_authority
+                ):
+                    raise ValueError("Camera current reference source contradicts capture evidence")
+                if value.get("image_sha256") not in {None, source.image_sha256}:
+                    raise ValueError("Camera current reference source contradicts image evidence")
+                if request_identity is not None:
+                    if (
+                        bound_request.source_revision != source.source_revision
+                        or (
+                            value.get("manifest_sha256") is not None
+                            and bound_request.manifest_sha256 != value.get("manifest_sha256")
+                        )
+                        or bound_request.image_sha256 != source.image_sha256
+                        or bound_request.capture_time.astimezone(timezone.utc)
+                        != source.capture_time.astimezone(timezone.utc)
+                        or bound_request.capture_time_authority != source.capture_time_authority
+                    ):
+                        raise ValueError("Camera current reference source contradicts request evidence")
+                if source.snapshot is not None:
+                    snapshot_path = Path(source.snapshot)
+                    expected_name = self._safe_snapshot_name(value, snapshot_path.suffix.lower())
+                    if (
+                        snapshot_path.parent != self._state_dir / "snapshots"
+                        or snapshot_path.name != expected_name
+                    ):
+                        raise ValueError("Camera current reference snapshot path is invalid")
+            if value.get("state") == "retired" and (
+                request_identity is None
+                or not isinstance(request_ack, dict)
+                or request_ack.get("status") != 200
+                or not isinstance(request_ack.get("body"), dict)
+                or request_ack.get("body", {}).get("status") != "retired"
+            ):
+                raise ValueError("Camera retired record is incomplete")
+            if value["photo_delivery_confirmed"] is True and "image_sha256" not in value:
+                snapshot = value.get("snapshot")
+                admission_id = value.get("admission_id")
+                if isinstance(snapshot, str) and isinstance(admission_id, str):
+                    path = Path(snapshot)
+                    try:
+                        if (
+                            path.parent == self._state_dir / "snapshots"
+                            and path.name in {
+                                f"{admission_id}.jpg",
+                                f"{admission_id}.jpeg",
+                                f"{admission_id}.png",
+                                f"{admission_id}.webp",
+                            }
+                        ):
+                            retained_bytes = _read_regular(path, _MAX_IMAGE)
+                            fingerprint = fingerprint_image_bytes(retained_bytes)
+                            value["image_sha256"] = hashlib.sha256(retained_bytes).hexdigest()
+                            value["image_phash"] = (
+                                fingerprint.get("phash") if fingerprint is not None else None
+                            )
+                            value["phash_algorithm"] = (
+                                fingerprint.get("phash_algorithm") if fingerprint is not None else None
+                            )
+                            self._journal_migrated = True
+                    except (OSError, ValueError):
+                        pass
+        # The exact pre-gen5 schema kept the last producer ACK only in the
+        # session journal and omitted request/artifact hashes from attempts.
+        # Preserve a narrowly provable admitted ACK before __init__ rotates
+        # the lease epoch.  The snapshot digest is explicitly observed now;
+        # it is not represented as a historical journal field.
+        if isinstance(session, dict):
+            last_ack = session.get("last_ack")
+            body = last_ack.get("body") if isinstance(last_ack, dict) else None
+            if (
+                isinstance(last_ack, dict)
+                and last_ack.get("status") == 202
+                and isinstance(body, dict)
+                and body.get("status") == "admitted"
+                and isinstance(body.get("candidate_id"), str)
+                and isinstance(body.get("admission_id"), str)
+                and body.get("session_id") == session.get("session_id")
+                and body.get("epoch") == session.get("epoch")
+                and body.get("ack_seq") == last_ack.get("seq")
+                and last_ack.get("seq") == session.get("committed_seq")
+                and isinstance(last_ack.get("seq"), int)
+                and not isinstance(last_ack.get("seq"), bool)
+                and last_ack["seq"] > 0
+            ):
+                candidate_id = body["candidate_id"]
+                attempt = attempts.get(candidate_id)
+                if (
+                    isinstance(attempt, dict)
+                    and attempt.get("request_identity") is None
+                    and attempt.get("state") in {
+                        "admitted", "photo_sent", "answering", "final_queued",
+                        "completed", "delivery_unknown",
+                    }
+                    and attempt.get("admission_id") == body["admission_id"]
+                    and attempt.get("capture_time_authority") in {"exif", "filename"}
+                    and self._attempt_capture_time(attempt) is not None
+                ):
+                    snapshot = attempt.get("snapshot")
+                    admission_id = attempt.get("admission_id")
+                    if isinstance(snapshot, str) and isinstance(admission_id, str):
+                        path = Path(snapshot)
+                        if (
+                            path.parent == self._state_dir / "snapshots"
+                            and path.name in {
+                                f"{admission_id}.jpg", f"{admission_id}.jpeg",
+                                f"{admission_id}.png", f"{admission_id}.webp",
+                            }
+                        ):
+                            try:
+                                image = _read_regular(path, _MAX_IMAGE)
+                                attempt["legacy_base_recovery"] = {
+                                    "proof": "base_session_ack_and_verified_managed_snapshot",
+                                    "snapshot_sha256_observed": hashlib.sha256(image).hexdigest(),
+                                    "ack_status": last_ack["status"],
+                                    "ack_body": body,
+                                    "session_id": session["session_id"],
+                                    "epoch": session["epoch"],
+                                    "seq": last_ack["seq"],
+                                }
+                                self._journal_migrated = True
+                            except (OSError, ValueError):
+                                pass
+        for candidate_id, attempt in attempts.items():
+            recovery = attempt.get("legacy_base_recovery")
+            identity_proof = attempt.get("request_identity_proof")
+            if recovery is None:
+                if identity_proof is not None:
+                    raise ValueError("Camera legacy recovery proof is incomplete")
+                continue
+            if (
+                not isinstance(recovery, dict)
+                or recovery.get("proof") != "base_session_ack_and_verified_managed_snapshot"
+                or not isinstance(recovery.get("snapshot_sha256_observed"), str)
+                or _SHA256.fullmatch(recovery["snapshot_sha256_observed"]) is None
+                or recovery.get("ack_status") != 202
+                or not isinstance(recovery.get("ack_body"), dict)
+                or recovery["ack_body"].get("status") != "admitted"
+                or recovery["ack_body"].get("candidate_id") != candidate_id
+                or recovery["ack_body"].get("admission_id") != attempt.get("admission_id")
+                or recovery["ack_body"].get("session_id") != recovery.get("session_id")
+                or recovery["ack_body"].get("epoch") != recovery.get("epoch")
+                or recovery["ack_body"].get("ack_seq") != recovery.get("seq")
+                or not isinstance(recovery.get("session_id"), str)
+                or not isinstance(recovery.get("epoch"), str)
+                or _SESSION_ID.fullmatch(recovery.get("session_id", "")) is None
+                or _SESSION_ID.fullmatch(recovery.get("epoch", "")) is None
+                or not isinstance(recovery.get("seq"), int)
+                or isinstance(recovery.get("seq"), bool)
+                or recovery["seq"] < 1
+            ):
+                raise ValueError("Camera legacy recovery evidence is invalid")
+            if identity_proof is None:
+                if attempt.get("request_identity") is not None or attempt.get("request_ack") is not None:
+                    raise ValueError("Camera legacy recovery request binding is incomplete")
+                continue
+            if identity_proof != "legacy_ack_snapshot_sha_and_observed_recovery_input":
+                raise ValueError("Camera legacy recovery request proof is invalid")
+            if not isinstance(attempt.get("request_identity"), dict):
+                raise ValueError("Camera legacy recovery request identity is absent")
+            bound_request = CameraCandidateRequest.model_validate(attempt["request_identity"])
+            ack = attempt.get("request_ack")
+            capture = self._attempt_capture_time(attempt)
+            if (
+                bound_request.candidate_id != candidate_id
+                or bound_request.session_id != recovery["session_id"]
+                or bound_request.epoch != recovery["epoch"]
+                or bound_request.seq != recovery["seq"]
+                or capture is None
+                or bound_request.capture_time.astimezone(timezone.utc)
+                != capture.astimezone(timezone.utc)
+                or bound_request.capture_time_authority != attempt.get("capture_time_authority")
+                or bound_request.image_sha256 != recovery["snapshot_sha256_observed"]
+                or not isinstance(ack, dict)
+                or ack.get("status") != recovery["ack_status"]
+                or ack.get("body") != recovery["ack_body"]
+            ):
+                raise ValueError("Camera legacy recovery request binding is invalid")
         return attempts, session
 
     def _open_state_dir(self, *, create: bool) -> int:
@@ -973,28 +1988,38 @@ class CameraIngress:
             )
 
     def _remove_snapshot_files(self, attempt: dict) -> None:
-        snapshot = attempt.get("snapshot")
         admission_id = attempt.get("admission_id")
-        if not isinstance(snapshot, str) or not isinstance(admission_id, str):
+        if not isinstance(admission_id, str):
             return
-        name = Path(snapshot)
-        if name.parent != self._state_dir / "snapshots" or name.name not in {
-            f"{admission_id}.jpg",
-            f"{admission_id}.jpeg",
-            f"{admission_id}.png",
-            f"{admission_id}.webp",
-        }:
+        snapshots = [attempt.get("snapshot")]
+        raw_source = attempt.get("reference_source")
+        if isinstance(raw_source, dict):
+            snapshots.append(raw_source.get("snapshot"))
+        valid_names = set()
+        for snapshot in snapshots:
+            if not isinstance(snapshot, str):
+                continue
+            name = Path(snapshot)
+            if name.parent == self._state_dir / "snapshots" and name.name in {
+                f"{admission_id}.jpg",
+                f"{admission_id}.jpeg",
+                f"{admission_id}.png",
+                f"{admission_id}.webp",
+            }:
+                valid_names.add(name.name)
+        if not valid_names:
             return
         try:
             state_fd = self._open_state_dir(create=False)
             try:
                 snapshots_fd = _child_directory(state_fd, "snapshots", create=False)
                 try:
-                    try:
-                        os.unlink(name.name, dir_fd=snapshots_fd)
-                        os.fsync(snapshots_fd)
-                    except FileNotFoundError:
-                        pass
+                    for name in valid_names:
+                        try:
+                            os.unlink(name, dir_fd=snapshots_fd)
+                            os.fsync(snapshots_fd)
+                        except FileNotFoundError:
+                            pass
                 finally:
                     os.close(snapshots_fd)
             finally:
@@ -1005,10 +2030,31 @@ class CameraIngress:
             logging.getLogger(__name__).warning("failed to remove Camera snapshot", exc_info=True)
 
     def _remove_completed_snapshots(self) -> None:
-        """Drop local image copies once the user flow has a confirmed outcome."""
+        """Prune completed originals only after their reference window expires.
+
+        Confirmed Camera photos remain canonical repeat-suppression references
+        for seven days from trusted source capture. Delivery-unknown attempts
+        are not completed and retain their originals through the existing
+        state handling; this cleanup does not broaden their lifetime policy.
+        """
+        now = datetime.now(timezone.utc)
+        oldest_reference = now - _DEDUP_WINDOW
         for attempt in list(self._attempts.values()):
             if attempt.get("state") != "completed":
                 continue
+            captured = self._attempt_capture_time(attempt)
+            raw_source = attempt.get("reference_source")
+            if captured is None and isinstance(raw_source, dict):
+                try:
+                    source = CameraReferenceSourceObservation.model_validate(raw_source)
+                except ValidationError:
+                    source = None
+                if source is not None and source.scope == self._reference_scope():
+                    captured = source.capture_time
+            if captured is not None:
+                captured = captured.astimezone(timezone.utc)
+                if oldest_reference <= captured <= now:
+                    continue
             self._remove_snapshot_files(attempt)
 
     def mark_restart_unknown(self) -> None:
@@ -1076,7 +2122,14 @@ class CameraIngress:
             }
 
     def _commit_sequence(
-        self, request: CameraCandidateRequest, status: int, response: dict
+        self,
+        request: CameraCandidateRequest,
+        status: int,
+        response: dict,
+        *,
+        attempt: dict | None = None,
+        advance: bool = True,
+        update_last_ack: bool | None = None,
     ) -> tuple[int, dict]:
         acknowledged = {
             **response,
@@ -1084,32 +2137,63 @@ class CameraIngress:
             "epoch": request.epoch,
             "ack_seq": request.seq,
         }
-        self._session["committed_seq"] = request.seq
-        self._session["last_ack"] = {
-            "seq": request.seq,
-            "status": status,
-            "body": acknowledged,
-        }
+        request_identity = self._request_identity(request)
+        if update_last_ack is None:
+            update_last_ack = advance
+        if advance:
+            self._session["committed_seq"] = request.seq
+        if update_last_ack:
+            self._session["last_ack"] = {
+                "seq": request.seq,
+                "candidate_id": request.candidate_id,
+                "request_identity": request_identity,
+                "status": status,
+                "body": acknowledged,
+            }
+        if attempt is not None:
+            attempt["request_identity"] = request_identity
+            attempt["request_ack"] = {"status": status, "body": acknowledged}
         self._save_attempts()
         return status, acknowledged
 
     @staticmethod
-    def _validate_upload(
-        request: CameraCandidateRequest, upload: CameraCandidateUpload
-    ) -> tuple[bytes, str]:
+    def _request_identity(request: CameraCandidateRequest) -> dict[str, object]:
+        """Exact candidate artifact and original lease/sequence identity."""
+        return request.model_dump(mode="json")
+
+    @classmethod
+    def _request_matches_attempt(
+        cls, attempt: dict, request: CameraCandidateRequest
+    ) -> bool:
+        return attempt.get("request_identity") == cls._request_identity(request)
+
+    @staticmethod
+    def _validate_source_artifacts(request: object, upload: CameraCandidateUpload):
+        """Validate the immutable publication artifacts shared by both routes."""
         manifest_bytes = upload.manifest_bytes
         if hashlib.sha256(manifest_bytes).hexdigest() != request.manifest_sha256:
             raise ValueError("candidate manifest digest differs")
         manifest = ManifestV2.model_validate_json(manifest_bytes)
+        if manifest.normalized_capture_time is None:
+            raise ValueError("candidate manifest capture time is absent")
+        manifest_capture_time = manifest.normalized_capture_time
+        if (
+            manifest_capture_time.tzinfo is None
+            or manifest_capture_time.utcoffset() is None
+            or manifest_capture_time.astimezone(timezone.utc)
+            != request.capture_time.astimezone(timezone.utc)
+        ):
+            raise ValueError("candidate manifest capture time differs from request")
         if (
             manifest.candidate_id != request.candidate_id
-            or manifest.event_id != f"{request.candidate_id}:manifest:v1"
+            or candidate_id_for(manifest.file_id, manifest.rev) != request.candidate_id
             or manifest.rev != request.source_revision
             or manifest.original_sha256 != request.image_sha256
-            or manifest.normalized_capture_time != request.capture_time
             or manifest.capture_time_authority != request.capture_time_authority
         ):
             raise ValueError("candidate manifest differs from request")
+        if manifest.event_id != f"{request.candidate_id}:manifest:v1":
+            raise ValueError("candidate manifest event identity differs")
         _published_positive(upload.producer_sidecar_bytes, manifest)
         image_name = upload.image_filename
         suffix = Path(image_name).suffix.lower()
@@ -1145,7 +2229,14 @@ class CameraIngress:
             or hashlib.sha256(image_bytes).hexdigest() != request.image_sha256
         ):
             raise ValueError("candidate image digest differs")
-        return image_bytes, suffix
+        return image_bytes, suffix, manifest
+
+    @classmethod
+    def _validate_upload(
+        cls, request: CameraCandidateRequest, upload: CameraCandidateUpload
+    ) -> tuple[bytes, str]:
+        image, suffix, _manifest = cls._validate_source_artifacts(request, upload)
+        return image, suffix
 
     async def admit(self, authorization: str | None, upload: object) -> tuple[int, dict]:
         if not self.config.enabled:
@@ -1182,10 +2273,33 @@ class CameraIngress:
             committed_seq = self._session["committed_seq"]
             if request.seq <= committed_seq:
                 last_ack = self._session["last_ack"]
-                if isinstance(last_ack, dict) and last_ack.get("seq") == request.seq:
+                if (
+                    isinstance(last_ack, dict)
+                    and last_ack.get("seq") == request.seq
+                    and last_ack.get("candidate_id") == request.candidate_id
+                    and last_ack.get("request_identity") == self._request_identity(request)
+                ):
+                    try:
+                        self._validate_upload(request, upload)
+                    except (OSError, ValueError, TypeError, ValidationError):
+                        cached_body = last_ack.get("body")
+                        if (
+                            last_ack.get("status") == 422
+                            and isinstance(cached_body, dict)
+                            and isinstance(cached_body.get("error"), dict)
+                            and cached_body["error"].get("code") == "candidate_evidence_mismatch"
+                        ):
+                            return last_ack["status"], cached_body
+                        return self._error(422, "candidate_evidence_mismatch")
+                    try:
+                        # A prior write may have failed after mutating memory;
+                        # persist the exact ACK before repeating it.
+                        self._save_attempts()
+                    except OSError:
+                        return self._error(503, "pre_admission_unavailable")
                     return last_ack["status"], last_ack["body"]
                 return 200, {
-                    "status": "duplicate",
+                    "status": "stale_sequence",
                     "session_id": self._session["session_id"],
                     "epoch": self._session["epoch"],
                     "ack_seq": committed_seq,
@@ -1197,6 +2311,28 @@ class CameraIngress:
                 }
             previous_attempt = self._attempts.get(request.candidate_id)
             if previous_attempt is not None:
+                if previous_attempt.get("state") == "retired":
+                    return self._error(409, "candidate_retired")
+                if not self._request_matches_attempt(previous_attempt, request):
+                    return self._error(409, "candidate_request_mismatch")
+                try:
+                    self._validate_upload(request, upload)
+                except (OSError, ValueError, TypeError, ValidationError):
+                    return self._error(422, "candidate_evidence_mismatch")
+                stored_ack = previous_attempt.get("request_ack")
+                if isinstance(stored_ack, dict) and isinstance(stored_ack.get("body"), dict):
+                    return stored_ack["status"], stored_ack["body"]
+                if previous_attempt.get("state") == "duplicate":
+                    response = {
+                        "status": "duplicate",
+                        "candidate_id": request.candidate_id,
+                        "reason": previous_attempt.get("duplicate_reason"),
+                        "duplicate_of": previous_attempt.get("duplicate_of"),
+                    }
+                    try:
+                        return self._commit_sequence(request, 200, response, attempt=previous_attempt)
+                    except OSError:
+                        return self._error(503, "pre_admission_unavailable")
                 admission_id = previous_attempt.get("admission_id")
                 if isinstance(admission_id, str) and admission_id:
                     response = {
@@ -1206,7 +2342,7 @@ class CameraIngress:
                         "delivery_semantics": "in_process_only",
                     }
                     try:
-                        return self._commit_sequence(request, 202, response)
+                        return self._commit_sequence(request, 202, response, attempt=previous_attempt)
                     except OSError:
                         return self._error(503, "pre_admission_unavailable")
                 try:
@@ -1218,6 +2354,190 @@ class CameraIngress:
             if len(self._attempts) >= _MAX_ATTEMPTS:
                 return self._error(503, "pre_admission_unavailable")
             self._sweep_expired_attempts()
+            try:
+                image_bytes, suffix = self._validate_upload(request, upload)
+            except (OSError, ValueError, TypeError, ValidationError):
+                status, response = self._error(422, "candidate_evidence_mismatch")
+                try:
+                    return self._commit_sequence(request, status, response)
+                except OSError:
+                    return self._error(503, "pre_admission_unavailable")
+            capture_time = request.capture_time.astimezone(timezone.utc)
+            now = datetime.now(timezone.utc)
+            if capture_time < now - _DEDUP_WINDOW or capture_time > now + timedelta(minutes=5):
+                status, response = self._error(422, "candidate_capture_time_out_of_window")
+                try:
+                    return self._commit_sequence(request, status, response)
+                except OSError:
+                    return self._error(503, "pre_admission_unavailable")
+            descriptor = fingerprint_image_bytes(image_bytes)
+            if descriptor is None:
+                descriptor = {"sha256": hashlib.sha256(image_bytes).hexdigest()}
+            duplicate_of = None
+            reason = None
+            for prior_id, prior in self._attempts.items():
+                prior_time = self._attempt_capture_time(prior)
+                try:
+                    prior_source = self._reference_source_record(prior_id, prior)
+                except ValueError:
+                    return self._error(503, "duplicate_evidence_unavailable")
+                if prior_time is None and prior_source is not None:
+                    prior_time = prior_source.capture_time
+                if prior_time is None:
+                    if prior_id in self._reference_source_pending_commit:
+                        return self._error(503, "duplicate_evidence_unavailable")
+                    continue
+                if prior.get("photo_delivery_confirmed") is not True:
+                    continue
+                if abs((capture_time - prior_time.astimezone(timezone.utc)).total_seconds()) > _DEDUP_WINDOW.total_seconds():
+                    continue
+                source_outside_current_retention = (
+                    prior_source is not None
+                    and prior_source.capture_time.astimezone(timezone.utc)
+                    < now - _DEDUP_WINDOW
+                )
+                if (
+                    prior_id in self._reference_source_pending_commit
+                    and not source_outside_current_retention
+                ):
+                    return self._error(503, "duplicate_evidence_unavailable")
+                prior_sha = prior.get("image_sha256")
+                if not isinstance(prior_sha, str) and prior_source is not None:
+                    prior_sha = prior_source.image_sha256
+                prior_phash = prior.get("image_phash")
+                prior_algorithm = prior.get("phash_algorithm")
+                if not isinstance(prior_sha, str):
+                    # Legacy journal evidence may retain one exact snapshot path;
+                    # follow only that journal reference, never scan the filesystem.
+                    snapshot = prior.get("snapshot")
+                    admission_id = prior.get("admission_id")
+                    if isinstance(snapshot, str) and isinstance(admission_id, str):
+                        path = Path(snapshot)
+                        try:
+                            if (
+                                path.parent == self._state_dir / "snapshots"
+                                and path.name in {f"{admission_id}.jpg", f"{admission_id}.jpeg", f"{admission_id}.png", f"{admission_id}.webp"}
+                            ):
+                                retained = _read_regular(path, _MAX_IMAGE)
+                                legacy = fingerprint_image_bytes(retained)
+                                prior_sha = hashlib.sha256(retained).hexdigest()
+                                if legacy is not None:
+                                    prior_phash = legacy.get("phash")
+                                    prior_algorithm = legacy.get("phash_algorithm")
+                        except (OSError, ValueError):
+                            pass
+                if prior_sha == descriptor["sha256"]:
+                    duplicate_of, reason = prior_id, "image_already_delivered"
+                    break
+                old_phash = prior_phash
+                if (
+                    prior_algorithm == PHASH_ALGORITHM
+                    and isinstance(old_phash, str)
+                    and isinstance(descriptor.get("phash"), str)
+                    and phash_hamming_distance(old_phash, descriptor["phash"])
+                    is not None
+                    and phash_hamming_distance(old_phash, descriptor["phash"])
+                    <= PHASH_HAMMING_THRESHOLD
+                ):
+                    duplicate_of, reason = prior_id, "image_already_delivered"
+                    break
+            if duplicate_of is None and self._recent_attachments is not None:
+                remote_history_incomplete = False
+                try:
+                    history = await self._recent_attachments(
+                        since=capture_time - _DEDUP_WINDOW,
+                        until=min(now, capture_time + _DEDUP_WINDOW),
+                    )
+                    duplicate_of = _find_recent_attachment_duplicate(
+                        history,
+                        descriptor,
+                        since=capture_time - _DEDUP_WINDOW,
+                        until=min(now, capture_time + _DEDUP_WINDOW),
+                        principal=f"telegram:{self.config.principal}",
+                        expected_session=self._recent_session,
+                        expected_peer=self._recent_peer,
+                        session_key=self.config.session_key,
+                        chat_id=self.config.chat_id,
+                    )
+                    if duplicate_of is not None:
+                        reason = "human_photo_already_seen"
+                except IncompleteAttachmentHistory:
+                    # Honcho's bounded metadata projection can omit the tail of
+                    # a larger album. Only the exact configured local snapshot
+                    # may complete that known partial source.
+                    remote_history_incomplete = True
+                except Exception:
+                    logger.exception("Camera duplicate history unavailable; candidate not sent")
+                    return self._error(503, "duplicate_evidence_unavailable")
+            if duplicate_of is None and self._retained_attachments is not None:
+                try:
+                    local_history = await self._retained_attachments(
+                        since=capture_time - _DEDUP_WINDOW,
+                        until=min(now, capture_time + _DEDUP_WINDOW),
+                    )
+                    local_duplicate = _find_recent_attachment_duplicate(
+                        local_history,
+                        descriptor,
+                        since=capture_time - _DEDUP_WINDOW,
+                        until=min(now, capture_time + _DEDUP_WINDOW),
+                        principal=f"telegram:{self.config.principal}",
+                        expected_session=None,
+                        expected_peer=None,
+                        session_key=self.config.session_key,
+                        chat_id=self.config.chat_id,
+                        local_snapshot=True,
+                    )
+                    if local_duplicate is not None:
+                        duplicate_of, reason = local_duplicate, "human_photo_already_seen"
+                except Exception:
+                    logger.exception("Camera retained attachment history unavailable; candidate not sent")
+                    return self._error(503, "duplicate_evidence_unavailable")
+            if (
+                duplicate_of is None
+                and self._recent_attachments is not None
+                and remote_history_incomplete
+            ):
+                return self._error(503, "duplicate_evidence_unavailable")
+            if (
+                duplicate_of is None
+                and self._retained_history_required
+                and self._retained_attachments is None
+            ):
+                return self._error(503, "duplicate_evidence_unavailable")
+            if (
+                duplicate_of is None
+                and self._history_required
+                and self._recent_attachments is None
+                and self._retained_attachments is None
+            ):
+                return self._error(503, "duplicate_evidence_unavailable")
+            if duplicate_of is not None:
+                if not duplicate_of or len(duplicate_of) > 256:
+                    return self._error(503, "duplicate_evidence_invalid")
+                terminal = {
+                    "state": "duplicate",
+                    "admitted_at": now.isoformat(),
+                    "attention_active": False,
+                    "photo_delivery_confirmed": False,
+                    "capture_time": request.capture_time.isoformat(),
+                    "capture_time_authority": request.capture_time_authority,
+                    "image_sha256": descriptor["sha256"],
+                    "image_phash": descriptor.get("phash"),
+                    "phash_algorithm": descriptor.get("phash_algorithm"),
+                    "duplicate_of": duplicate_of,
+                    "duplicate_reason": reason,
+                }
+                self._attempts[request.candidate_id] = terminal
+                response = {
+                    "status": "duplicate",
+                    "candidate_id": request.candidate_id,
+                    "reason": reason,
+                    "duplicate_of": duplicate_of,
+                }
+                try:
+                    return self._commit_sequence(request, 200, response, attempt=terminal)
+                except OSError:
+                    return self._error(503, "pre_admission_unavailable")
             if any(
                 item.get("attention_active", True)
                 or item.get("state") == "admitted"
@@ -1244,7 +2564,7 @@ class CameraIngress:
                     snapshot_fd = _child_directory(state_fd, "snapshots", create=True)
                     try:
                         snapshot = self._state_dir / "snapshots" / f"{admission_id}{suffix}"
-                        descriptor = os.open(
+                        snapshot_descriptor = os.open(
                             snapshot.name,
                             os.O_WRONLY | os.O_CREAT | os.O_EXCL,
                             0o600,
@@ -1254,11 +2574,11 @@ class CameraIngress:
                         os.close(snapshot_fd)
                 finally:
                     os.close(state_fd)
-                with os.fdopen(descriptor, "wb") as stream:
+                with os.fdopen(snapshot_descriptor, "wb") as stream:
                     stream.write(image_bytes)
                     stream.flush()
                     os.fsync(stream.fileno())
-                self._attempts[request.candidate_id] = {
+                attempt = {
                     "state": "admitted",
                     "admission_id": admission_id,
                     "snapshot": str(snapshot),
@@ -1270,7 +2590,11 @@ class CameraIngress:
                     "attention_active": True,
                     "capture_time": request.capture_time.isoformat(),
                     "capture_time_authority": request.capture_time_authority,
+                    "image_sha256": descriptor["sha256"],
+                    "image_phash": descriptor.get("phash"),
+                    "phash_algorithm": descriptor.get("phash_algorithm"),
                 }
+                self._attempts[request.candidate_id] = attempt
                 status, response = self._commit_sequence(
                     request,
                     202,
@@ -1280,6 +2604,7 @@ class CameraIngress:
                         "admission_id": admission_id,
                         "delivery_semantics": "in_process_only",
                     },
+                    attempt=attempt,
                 )
             except OSError:
                 # A journal fsync can fail after replace. Retain any in-memory
@@ -1289,6 +2614,245 @@ class CameraIngress:
             self._tasks.add(task)
             task.add_done_callback(self._tasks.discard)
             return status, response
+
+    async def reconcile(
+        self,
+        authorization: str | None,
+        upload: object,
+        *,
+        purpose: str = "retire_ineligible",
+    ) -> tuple[int, dict]:
+        """Replay exact outcomes or retire an ineligible request, without delivery."""
+        if not isinstance(purpose, str) or purpose not in {
+            "existing_outcome_only", "retire_ineligible"
+        }:
+            return self._error(400, "invalid_request")
+        if not self.config.enabled:
+            return self._error(403, "camera_disabled")
+        try:
+            expected = self._token()
+        except (OSError, ValueError):
+            return self._error(503, "pre_admission_unavailable")
+        prefix = "Bearer "
+        if (
+            not isinstance(authorization, str)
+            or not authorization.startswith(prefix)
+            or not hmac.compare_digest(authorization[len(prefix) :].encode(), expected)
+        ):
+            return self._error(401, "unauthorized")
+        if not isinstance(upload, CameraCandidateUpload):
+            return self._error(400, "invalid_request")
+        try:
+            request = CameraCandidateRequest.model_validate(upload.request)
+        except ValidationError:
+            return self._error(400, "invalid_request")
+
+        async with self._lock:
+            if purpose == "existing_outcome_only":
+                # This operation is a journal lookup, so it must not refresh a
+                # lease or require a write before returning an already durable
+                # outcome. Artifact validation remains inside the admission lock.
+                return self._lookup_existing_outcome(request, upload)
+
+            if self._refresh_expired_session():
+                try:
+                    self._save_attempts()
+                except OSError:
+                    return self._error(503, "pre_admission_unavailable")
+            try:
+                # Artifact evidence is exact and validated even when the
+                # capture is now stale or the request epoch has rotated.
+                self._validate_upload(request, upload)
+            except (OSError, ValueError, TypeError, ValidationError):
+                return self._error(422, "candidate_evidence_mismatch")
+
+            identity = self._request_identity(request)
+            previous = self._attempts.get(request.candidate_id)
+            if previous is not None:
+                legacy = previous.get("legacy_base_recovery")
+                if (
+                    previous.get("request_identity") is None
+                    and isinstance(legacy, dict)
+                    and legacy.get("proof") == "base_session_ack_and_verified_managed_snapshot"
+                ):
+                    capture = self._attempt_capture_time(previous)
+                    try:
+                        _, _ = self._validate_upload(request, upload)
+                    except (OSError, ValueError, TypeError, ValidationError):
+                        return self._error(422, "candidate_evidence_mismatch")
+                    if (
+                        request.session_id != legacy.get("session_id")
+                        or request.epoch != legacy.get("epoch")
+                        or request.seq != legacy.get("seq")
+                        or capture is None
+                        or request.capture_time.astimezone(timezone.utc)
+                        != capture.astimezone(timezone.utc)
+                        or request.capture_time_authority
+                        != previous.get("capture_time_authority")
+                        or request.image_sha256 != legacy.get("snapshot_sha256_observed")
+                    ):
+                        return self._error(409, "candidate_request_mismatch")
+                    ack = {
+                        "status": legacy["ack_status"],
+                        "body": dict(legacy["ack_body"]),
+                    }
+                    # Manifest SHA/revision were not persisted by the base.
+                    # Store this submission as observed recovery input, without
+                    # asserting it was the original historical digest.
+                    previous["request_identity"] = identity
+                    previous["request_ack"] = ack
+                    previous["request_identity_proof"] = (
+                        "legacy_ack_snapshot_sha_and_observed_recovery_input"
+                    )
+                    try:
+                        self._save_attempts()
+                    except OSError:
+                        return self._error(503, "pre_admission_unavailable")
+                    return ack["status"], ack["body"]
+                if previous.get("request_identity") != identity:
+                    return self._error(409, "candidate_request_mismatch")
+                ack = previous.get("request_ack")
+                if not isinstance(ack, dict) or not isinstance(ack.get("body"), dict):
+                    return self._error(409, "candidate_ack_unavailable")
+                if previous.get("request_identity_proof") != (
+                    "legacy_ack_snapshot_sha_and_observed_recovery_input"
+                ) and request.session_id != self._session["session_id"]:
+                    return self._error(409, "session_expired")
+                try:
+                    self._save_attempts()
+                except OSError:
+                    return self._error(503, "pre_admission_unavailable")
+                return ack["status"], ack["body"]
+
+            if request.session_id != self._session["session_id"]:
+                return self._error(409, "session_expired")
+
+            if len(self._attempts) >= _MAX_ATTEMPTS:
+                return self._error(503, "pre_admission_unavailable")
+
+            # A previous sequence ACK without a candidate journal record can
+            # be retired only if its exact request identity owns that sequence.
+            same_epoch = request.epoch == self._session["epoch"]
+            advance = False
+            update_last_ack = None
+            if same_epoch:
+                committed = self._session["committed_seq"]
+                if request.seq == committed + 1:
+                    advance = True
+                elif (
+                    request.seq == committed
+                    and isinstance(self._session.get("last_ack"), dict)
+                    and self._session["last_ack"].get("candidate_id") == request.candidate_id
+                    and self._session["last_ack"].get("request_identity") == identity
+                ):
+                    update_last_ack = True
+                else:
+                    return self._error(409, "conflicting_sequence_owner")
+
+            for candidate_id, attempt in self._attempts.items():
+                owner = attempt.get("request_identity")
+                if (
+                    candidate_id != request.candidate_id
+                    and isinstance(owner, dict)
+                    and owner.get("session_id") == request.session_id
+                    and owner.get("epoch") == request.epoch
+                    and owner.get("seq") == request.seq
+                ):
+                    return self._error(409, "conflicting_sequence_owner")
+
+            retired = {
+                "state": "retired",
+                "retired_at": datetime.now(timezone.utc).isoformat(),
+                "attention_active": False,
+                "photo_delivery_confirmed": False,
+                "capture_time": request.capture_time.isoformat(),
+                "capture_time_authority": request.capture_time_authority,
+                "image_sha256": request.image_sha256,
+                "source_revision": request.source_revision,
+                "manifest_sha256": request.manifest_sha256,
+            }
+            self._attempts[request.candidate_id] = retired
+            response = {
+                "status": "retired",
+                "candidate_id": request.candidate_id,
+                "reason": "candidate_no_longer_eligible",
+            }
+            try:
+                return self._commit_sequence(
+                    request,
+                    200,
+                    response,
+                    attempt=retired,
+                    advance=advance,
+                    update_last_ack=update_last_ack,
+                )
+            except OSError:
+                return self._error(503, "pre_admission_unavailable")
+
+    def _lookup_existing_outcome(
+        self, request: CameraCandidateRequest, upload: CameraCandidateUpload
+    ) -> tuple[int, dict]:
+        """Return only an exact durable ACK, without changing journal state."""
+        try:
+            self._validate_upload(request, upload)
+        except (OSError, ValueError, TypeError, ValidationError):
+            return self._error(422, "candidate_evidence_mismatch")
+
+        previous = self._attempts.get(request.candidate_id)
+        if previous is None:
+            return self._error(503, "unknown_original_outcome")
+
+        identity = self._request_identity(request)
+        legacy = previous.get("legacy_base_recovery")
+        if previous.get("request_identity") is None:
+            if (
+                not isinstance(legacy, dict)
+                or legacy.get("proof") != "base_session_ack_and_verified_managed_snapshot"
+            ):
+                return self._error(503, "unknown_original_outcome")
+            capture = self._attempt_capture_time(previous)
+            if (
+                request.session_id != legacy.get("session_id")
+                or request.epoch != legacy.get("epoch")
+                or request.seq != legacy.get("seq")
+                or capture is None
+                or request.capture_time.astimezone(timezone.utc)
+                != capture.astimezone(timezone.utc)
+                or request.capture_time_authority != previous.get("capture_time_authority")
+            ):
+                return self._error(409, "candidate_request_mismatch")
+            if request.image_sha256 != legacy.get("snapshot_sha256_observed"):
+                # A legacy ACK does not include a durable image digest. If the
+                # managed snapshot cannot prove today's claimed SHA, the old
+                # request outcome is unknown; do not turn missing proof into a
+                # definitive request-mismatch response.
+                return self._error(503, "unknown_original_outcome")
+            status = legacy.get("ack_status")
+            body = legacy.get("ack_body")
+            if (
+                type(status) is not int
+                or not isinstance(body, dict)
+                or body.get("candidate_id") != request.candidate_id
+                or body.get("session_id") != request.session_id
+                or body.get("epoch") != request.epoch
+                or body.get("ack_seq") != request.seq
+            ):
+                return self._error(503, "unknown_original_outcome")
+            # The base did not retain manifest/revision identity. The snapshot
+            # and original ACK prove only the fields checked above; do not save
+            # today's manifest as if it were historical evidence.
+            return status, dict(body)
+
+        if previous.get("request_identity") != identity:
+            return self._error(503, "unknown_original_outcome")
+        ack = previous.get("request_ack")
+        if (
+            not isinstance(ack, dict)
+            or type(ack.get("status")) is not int
+            or not isinstance(ack.get("body"), dict)
+        ):
+            return self._error(503, "unknown_original_outcome")
+        return ack["status"], ack["body"]
 
     @staticmethod
     def _error(status: int, code: str) -> tuple[int, dict]:
@@ -1810,11 +3374,105 @@ async def serve_camera_http(
                 status, response = ingress._error(400, "invalid_request")
             else:
                 status, response = await ingress.lease(fields.get("authorization"))
-        elif (
-            method == "POST" and path == "/internal/v1/camera/candidates" and version == "HTTP/1.1"
-        ):
-            if not ingress.config.enabled:
+        elif method == "POST" and path == "/internal/v1/camera/references" and version == "HTTP/1.1":
+            allowed_headers = {
+                "authorization", "content-length", "content-type", "connection",
+                "host", "accept", "accept-encoding", "user-agent",
+            }
+            if any(key not in allowed_headers for key in fields):
+                status, response = ingress._error(400, "invalid_request")
+            elif not fields.get("authorization", "").startswith("Bearer "):
+                status, response = ingress._error(401, "unauthorized")
+            elif not ingress.config.enabled:
                 status, response = ingress._error(403, "camera_disabled")
+            elif (
+                fields.get("transfer-encoding")
+                or not fields.get("content-length", "").isdigit()
+                or fields.get("content-type", "").lower() != "application/json"
+            ):
+                status, response = ingress._error(400, "invalid_request")
+            else:
+                length = int(fields["content-length"])
+                if not 0 < length <= _MAX_REQUEST:
+                    status, response = ingress._error(400, "invalid_request")
+                else:
+                    body = await asyncio.wait_for(reader.readexactly(length), timeout=10)
+                    try:
+                        payload = json.loads(body, object_pairs_hook=_unique_json)
+                        if isinstance(payload, dict) and "schema_version" in payload:
+                            request = CameraReferencesRequestV2.model_validate(payload)
+                        else:
+                            request = CameraReferencesRequest.model_validate(payload)
+                    except (UnicodeDecodeError, ValueError, TypeError, ValidationError):
+                        status, response = ingress._error(400, "invalid_request")
+                    else:
+                        status, response = await ingress.camera_references(
+                            fields.get("authorization"), request
+                        )
+        elif (
+            method == "POST"
+            and path == "/internal/v1/camera/reference-source"
+            and version == "HTTP/1.1"
+        ):
+            allowed_headers = {
+                "authorization", "content-length", "content-type", "connection",
+                "host", "accept", "accept-encoding", "user-agent",
+            }
+            if any(key not in allowed_headers for key in fields):
+                status, response = ingress._error(400, "invalid_request")
+            elif not fields.get("authorization", "").startswith("Bearer "):
+                status, response = ingress._error(401, "unauthorized")
+            elif not ingress.config.enabled:
+                status, response = ingress._error(403, "camera_disabled")
+            elif fields.get("transfer-encoding") or not fields.get("content-length", "").isdigit():
+                status, response = ingress._error(400, "invalid_request")
+            else:
+                length = int(fields["content-length"])
+                content_type = fields.get("content-type", "")
+                if (
+                    not 0 < length <= _MAX_HTTP_BODY
+                    or not content_type
+                    or not content_type.isascii()
+                ):
+                    status, response = ingress._error(400, "invalid_request")
+                else:
+                    body = await asyncio.wait_for(reader.readexactly(length), timeout=30)
+                    try:
+                        upload = _parse_camera_upload(content_type, body)
+                    except (UnicodeDecodeError, ValueError, TypeError):
+                        status, response = ingress._error(400, "invalid_request")
+                    else:
+                        status, response = await ingress.reference_source(
+                            fields.get("authorization"), upload
+                        )
+        elif (
+            method == "POST"
+            and path in {
+                "/internal/v1/camera/candidates",
+                "/internal/v1/camera/reconcile",
+            }
+            and version == "HTTP/1.1"
+        ):
+            reconcile_route = path == "/internal/v1/camera/reconcile"
+            reconcile_purpose = fields.get("x-camera-reconcile-purpose")
+            invalid_reconcile_header = False
+            if reconcile_route:
+                if reconcile_purpose is None:
+                    reconcile_purpose = "retire_ineligible"
+                if reconcile_purpose not in {"existing_outcome_only", "retire_ineligible"}:
+                    status, response = ingress._error(400, "invalid_request")
+                    reconcile_purpose = None
+                    invalid_reconcile_header = True
+            elif reconcile_purpose is not None:
+                status, response = ingress._error(400, "invalid_request")
+                invalid_reconcile_header = True
+            if not ingress.config.enabled:
+                if invalid_reconcile_header:
+                    pass
+                else:
+                    status, response = ingress._error(403, "camera_disabled")
+            elif invalid_reconcile_header:
+                pass
             elif not fields.get("authorization", "").startswith("Bearer "):
                 status, response = ingress._error(401, "unauthorized")
             elif fields.get("transfer-encoding") or not fields.get("content-length", "").isdigit():
@@ -1835,7 +3493,15 @@ async def serve_camera_http(
                     except (UnicodeDecodeError, ValueError, TypeError):
                         status, response = ingress._error(400, "invalid_request")
                     else:
-                        status, response = await ingress.admit(fields.get("authorization"), upload)
+                        if reconcile_route:
+                            status, response = await ingress.reconcile(
+                                fields.get("authorization"), upload,
+                                purpose=reconcile_purpose,
+                            )
+                        else:
+                            status, response = await ingress.admit(
+                                fields.get("authorization"), upload
+                            )
     except (
         asyncio.IncompleteReadError,
         asyncio.LimitOverrunError,
