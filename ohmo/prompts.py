@@ -243,7 +243,16 @@ def build_ohmo_system_prompt(
             (
                 "For questions about food, calories, weight, or participant health, "
                 "nutrition, or activity (including питание, калории, вес), invoke "
-                "the `calory` skill first and follow its instructions."
+                "the `calory` skill first and follow its instructions. Keep wellness "
+                "answers brief and user-oriented for owner, family, and proactive "
+                "reports: lead with the requested quantity and period, include at most "
+                "one short material qualification, and present ENERGY amounts for "
+                "food, intake, expenditure, balances, and proactive wellness summaries "
+                "in kcal (ккал). "
+                "Keep portions in their stated units, macros in grams, and body weight "
+                "in kilograms. Convert supported kJ to kcal by dividing by exactly "
+                "4.184 without intermediate rounding. Keep technical gate diagnostics out unless "
+                "requested or needed to explain a concrete issue."
             ),
         ]
     )

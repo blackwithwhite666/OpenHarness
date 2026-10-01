@@ -11,6 +11,7 @@ from types import SimpleNamespace
 import pytest
 
 from ohmo.gateway.runtime import OhmoSessionRuntimePool
+from ohmo.gateway.turn_context import build_turn_context
 from ohmo.todo_store import TodoStore
 from ohmo.todo_write_tool import OhmoTodoWriteTool, OhmoTodoWriteToolInput
 from openharness.channels.bus.events import InboundMessage
@@ -315,7 +316,7 @@ async def test_pending_plan_reconciles_once_and_publishes_only_accepted_final(tm
             session_key="telegram:chat",
             user_prompt=message.content,
             user_message=message.content,
-            turn_ctx=SimpleNamespace(),
+            turn_ctx=build_turn_context(message, session_id=bundle.session_id),
             memory_scope=None,
         )
     ]
@@ -340,7 +341,7 @@ async def test_successful_reconciliation_saves_accepted_history_once(tmp_path: P
             session_key="telegram:chat",
             user_prompt=message.content,
             user_message=message.content,
-            turn_ctx=SimpleNamespace(),
+            turn_ctx=build_turn_context(message, session_id=bundle.session_id),
             memory_scope=None,
         )
     ]
@@ -364,7 +365,7 @@ async def test_pending_plan_reconciliation_is_bounded_and_actionable(tmp_path: P
             session_key="telegram:chat",
             user_prompt=message.content,
             user_message=message.content,
-            turn_ctx=SimpleNamespace(),
+            turn_ctx=build_turn_context(message, session_id=bundle.session_id),
             memory_scope=None,
         )
     ]
@@ -393,7 +394,7 @@ async def test_reconciliation_provider_or_tool_error_does_not_fake_completion(
             session_key="telegram:chat",
             user_prompt=message.content,
             user_message=message.content,
-            turn_ctx=SimpleNamespace(),
+            turn_ctx=build_turn_context(message, session_id=bundle.session_id),
             memory_scope=None,
         )
     ]
@@ -420,7 +421,7 @@ async def test_completed_cleanup_waits_for_final_yield_resume_and_aclose_keeps_p
         session_key="telegram:chat",
         user_prompt=message.content,
         user_message=message.content,
-        turn_ctx=SimpleNamespace(),
+        turn_ctx=build_turn_context(message, session_id=bundle.session_id),
         memory_scope=None,
     )
     while True:
@@ -447,7 +448,7 @@ async def test_fully_consumed_successful_final_archives_completed_plan(tmp_path:
             session_key="telegram:chat",
             user_prompt=message.content,
             user_message=message.content,
-            turn_ctx=SimpleNamespace(),
+            turn_ctx=build_turn_context(message, session_id=bundle.session_id),
             memory_scope=None,
         )
     ]
@@ -479,7 +480,7 @@ async def test_blocked_final_keeps_panel_state_and_emits_no_cleanup_event(tmp_pa
             session_key="telegram:chat",
             user_prompt=message.content,
             user_message=message.content,
-            turn_ctx=SimpleNamespace(),
+            turn_ctx=build_turn_context(message, session_id=bundle.session_id),
             memory_scope=None,
         )
     ]
@@ -511,7 +512,7 @@ async def test_cleanup_failure_is_logged_once_and_keeps_recoverable_plan(tmp_pat
                 session_key="telegram:chat",
                 user_prompt=message.content,
                 user_message=message.content,
-                turn_ctx=SimpleNamespace(),
+                turn_ctx=build_turn_context(message, session_id=bundle.session_id),
                 memory_scope=None,
             )
         ]
@@ -598,7 +599,7 @@ async def test_max_turns_does_not_fake_completion_or_clean_unresolved_plan(tmp_p
             session_key="telegram:chat",
             user_prompt=message.content,
             user_message=message.content,
-            turn_ctx=SimpleNamespace(),
+            turn_ctx=build_turn_context(message, session_id=bundle.session_id),
             memory_scope=None,
         )
     ]
@@ -623,7 +624,7 @@ async def test_partial_provider_error_never_publishes_or_cleans_plan(tmp_path: P
             session_key="telegram:chat",
             user_prompt=message.content,
             user_message=message.content,
-            turn_ctx=SimpleNamespace(),
+            turn_ctx=build_turn_context(message, session_id=bundle.session_id),
             memory_scope=None,
         )
     ]
@@ -660,7 +661,7 @@ async def test_partial_continue_max_turns_never_publishes_or_cleans_plan(
             session_key="telegram:chat",
             user_prompt=message.content,
             result=result,
-            turn_ctx=SimpleNamespace(),
+            turn_ctx=build_turn_context(message, session_id=bundle.session_id),
             memory_scope=None,
             todo_lifecycle=True,
         )
@@ -686,7 +687,7 @@ async def test_reconciliation_keeps_tool_trace_without_repeating_work(tmp_path: 
             session_key="telegram:chat",
             user_prompt=message.content,
             user_message=message.content,
-            turn_ctx=SimpleNamespace(),
+            turn_ctx=build_turn_context(message, session_id=bundle.session_id),
             memory_scope=None,
         )
     ]
@@ -742,7 +743,7 @@ async def test_continue_pending_model_final_is_guarded(tmp_path: Path):
             session_key="telegram:chat",
             user_prompt=message.content,
             result=result,
-            turn_ctx=SimpleNamespace(),
+            turn_ctx=build_turn_context(message, session_id=bundle.session_id),
             memory_scope=None,
             todo_lifecycle=True,
         )
@@ -807,7 +808,7 @@ async def test_todo_prompt_read_failure_logs_once_and_blocks_model_turn(tmp_path
                 session_key="telegram:chat",
                 user_prompt=message.content,
                 user_message=message.content,
-                turn_ctx=SimpleNamespace(),
+                turn_ctx=build_turn_context(message, session_id=bundle.session_id),
                 memory_scope=None,
             )
         ]
@@ -839,7 +840,7 @@ async def test_resolved_without_final_has_actionable_missing_final_error(tmp_pat
             session_key="telegram:chat",
             user_prompt=message.content,
             user_message=message.content,
-            turn_ctx=SimpleNamespace(),
+            turn_ctx=build_turn_context(message, session_id=bundle.session_id),
             memory_scope=None,
         )
     ]
