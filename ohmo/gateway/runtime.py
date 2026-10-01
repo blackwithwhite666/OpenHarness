@@ -23,7 +23,7 @@ from ohmo.evals.nutrition_trace import (
     NutritionAnnotationV2,
 )
 from ohmo.gateway.attachment_fingerprints import compute_attachment_fingerprints
-from ohmo.gateway.camera import CAMERA_AUTHORITY
+from ohmo.gateway.camera import CAMERA_AUTHORITY, RetainedAttachmentEvidence
 from ohmo.gateway.config import load_gateway_config
 from ohmo.gateway.group_tool import (
     CreateFeishuGroup,
@@ -43,7 +43,12 @@ from ohmo.gateway.provider_commands import (
     handle_gateway_provider_command,
 )
 from ohmo.gateway.router import session_key_for_message
-from ohmo.gateway.turn_context import TurnContext, build_turn_context, canonical_principal
+from ohmo.gateway.turn_context import (
+    TurnContext,
+    build_turn_context,
+    canonical_principal,
+    is_private_message,
+)
 from ohmo.group_registry import load_managed_group_record, normalize_cwd
 from ohmo.memory import create_memory_command_backend, ensure_catalog_migrated
 from ohmo.memory_backend import (
@@ -70,6 +75,7 @@ from ohmo.reminders.tool import (
 )
 from ohmo.session_storage import (
     OhmoSessionBackend,
+    _snapshot_message_dict,
     clear_session_work_dir,
     get_session_work_dir,
     reap_stale_work_dirs,
@@ -332,6 +338,10 @@ def _build_conversation_turn_metadata(
         if recorder is not None
         else _CONVERSATION_TRACE_DISABLED_STATUS
     )
+    attachment_fingerprints = compute_attachment_fingerprints(message.media)
+    source_image_attachment_count = sum(
+        1 for media_path in message.media or [] if _is_image_attachment(media_path)
+    )
     base_metadata: dict[str, object] = {
         "tenant_id": scope.private_tenant,
         "source_principal": source_principal,
@@ -343,12 +353,14 @@ def _build_conversation_turn_metadata(
         "decision_trace_episode_id": recorder.episode_id if recorder is not None else None,
         "received_at": _trusted_utc_iso(message.timestamp),
         "is_forwarded": turn_ctx.is_forwarded,
+        "is_group": not turn_ctx.is_private,
         "source_message_at": _trusted_utc_iso(message_metadata.get("source_message_at")),
         "source_message_id": _normalize_source_message_ref(message_metadata.get("message_id")),
         "reply_to_source_message_id": _normalize_source_message_ref(
             message_metadata.get("reply_to_message_id")
         ),
-        "attachment_fingerprints": compute_attachment_fingerprints(message.media),
+        "attachment_fingerprints": attachment_fingerprints,
+        "source_image_attachment_count": source_image_attachment_count,
     }
     if (
         turn_ctx.camera_authorized
@@ -649,6 +661,189 @@ class OhmoSessionRuntimePool:
         self._bundles[session_key] = bundle
         return bundle
 
+    async def camera_retained_attachment_history(
+        self, *, since: datetime, until: datetime
+    ) -> list[RetainedAttachmentEvidence]:
+        """Read attachment refs from the one configured private session snapshot."""
+        config = self._gateway_config.camera_ingress
+        if (
+            not config.enabled
+            or not config.session_key
+            or not config.principal
+            or not config.chat_id
+            or since.tzinfo is None
+            or until.tzinfo is None
+            or since > until
+        ):
+            raise ValueError("Camera retained-history scope is invalid")
+        attachment_snapshot = getattr(
+            self._session_backend, "load_camera_attachment_snapshot", None
+        )
+        if attachment_snapshot is None:
+            raise ValueError("complete retained attachment snapshot traversal is unavailable")
+        snapshot = attachment_snapshot(config.session_key)
+        if snapshot is None:
+            raise ValueError("retained private attachment history is unavailable")
+        snapshot_session_id = snapshot["session_id"]
+        evidence: list[RetainedAttachmentEvidence] = []
+        verified_objects: dict[str, tuple[int, str, dict[str, object]]] = {}
+        for message_index, raw in enumerate(snapshot["messages"]):
+            message = ConversationMessage.model_validate(raw)
+            if message.role != "user":
+                continue
+            refs = [block for block in message.content if isinstance(block, AttachmentRefBlock)]
+            inline_images = [block for block in message.content if isinstance(block, ImageBlock)]
+            if inline_images:
+                raise ValueError("retained user image lacks a durable attachment reference")
+            if not refs:
+                continue
+            message_fingerprints: list[dict[str, object]] = []
+            message_time: datetime | None = None
+            source: dict[str, object] | None = None
+            timestamp_authority: str | None = None
+            for ref in refs:
+                provenance = ref.source_provenance
+                legacy_timestamp = provenance is None
+                if provenance is None:
+                    # Legacy snapshots lack per-message source provenance. Scope
+                    # this narrow fallback to the exact configured private owner
+                    # session; object mtime is observation evidence only, never
+                    # a receipt or consumption timestamp.
+                    if (
+                        config.session_key != f"telegram:{config.principal}"
+                        or config.chat_id != config.principal
+                    ):
+                        raise ValueError("legacy attachment has no verifiable owner-local session")
+                    received = None
+                    authority = "owner_local_object_mtime_observed_retention"
+                else:
+                    if not isinstance(provenance, dict) or provenance.get("schema_version") != 1:
+                        raise ValueError("retained attachment timestamp provenance is invalid")
+                    if provenance.get("principal") != f"telegram:{config.principal}":
+                        continue
+                    if (
+                        provenance.get("channel") != "telegram"
+                        or provenance.get("chat_id") != config.chat_id
+                    ):
+                        continue
+                    if provenance.get("session_key") != config.session_key:
+                        raise ValueError("retained attachment belongs to a different session key")
+                    if provenance.get("gateway_session_id") != snapshot_session_id:
+                        raise ValueError("retained attachment belongs to a different snapshot session")
+                    if provenance.get("is_group") is True or provenance.get("is_forwarded") is True:
+                        continue
+                    if provenance.get("is_group") is not False or provenance.get("is_forwarded") is not False:
+                        raise ValueError("retained attachment private-source provenance is incomplete")
+                    if provenance.get("timestamp_authority") != "inbound_event_timestamp":
+                        raise ValueError("retained attachment timestamp authority is invalid")
+                    received_at = provenance.get("received_at")
+                    if not isinstance(received_at, str) or len(received_at) > 64:
+                        raise ValueError("retained attachment timestamp is missing")
+                    try:
+                        received = datetime.fromisoformat(received_at)
+                    except ValueError as error:
+                        raise ValueError("retained attachment timestamp is malformed") from error
+                    if received.tzinfo is None or received.utcoffset() is None:
+                        raise ValueError("retained attachment timestamp is not timezone-aware")
+                    received = received.astimezone(timezone.utc)
+                    authority = "inbound_event_timestamp"
+                    if not since <= received <= until:
+                        continue
+                if legacy_timestamp:
+                    received = self._attachment_store.observed_object_mtime(
+                        ref.attachment_id, max_bytes=10 * 1024 * 1024
+                    )
+                    if not since <= received <= until:
+                        continue
+                if not 0 < ref.byte_size <= 10 * 1024 * 1024:
+                    raise ValueError("retained attachment exceeds its byte bound")
+                cached = verified_objects.get(ref.attachment_id)
+                if cached is None:
+                    stored = self._attachment_store.load_image(
+                        ref.attachment_id, max_bytes=10 * 1024 * 1024
+                    )
+                    if (
+                        stored.ref.byte_size != ref.byte_size
+                        or stored.ref.media_type != ref.media_type
+                        or hashlib.sha256(stored.data).hexdigest() != ref.attachment_id
+                    ):
+                        raise ValueError("retained attachment ref does not match stored bytes")
+                    if legacy_timestamp and stored.observed_retention_at != received:
+                        raise ValueError("legacy attachment changed during observed-mtime validation")
+                    from ohmo.gateway.attachment_fingerprints import fingerprint_image_bytes
+
+                    descriptor = fingerprint_image_bytes(stored.data)
+                    fingerprint: dict[str, object] = {"sha256": ref.attachment_id}
+                    if descriptor is not None and isinstance(descriptor.get("phash"), str):
+                        fingerprint["phash"] = descriptor["phash"]
+                        fingerprint["phash_algorithm"] = descriptor["phash_algorithm"]
+                    verified_objects[ref.attachment_id] = (
+                        stored.ref.byte_size, stored.ref.media_type, fingerprint
+                    )
+                else:
+                    cached_size, cached_media, fingerprint = cached
+                    if cached_size != ref.byte_size or cached_media != ref.media_type:
+                        raise ValueError("repeated retained attachment ref conflicts with stored object")
+                message_fingerprints.append(fingerprint)
+                message_time = received
+                source = provenance if isinstance(provenance, dict) else {}
+                timestamp_authority = authority
+            if not message_fingerprints:
+                continue
+            assert message_time is not None and source is not None
+            target = message.event_id or (
+                source.get("source_message_id") if isinstance(source, dict) else None
+            )
+            target_authority = "native_event_id"
+            if not isinstance(target, str) or not target or len(target) > 256:
+                # Old private snapshots can retain a user photo with no native
+                # Telegram event id and no gateway provenance. Bind only a
+                # local duplicate target to this exact configured owner/session,
+                # snapshot, serialized message position, and verified ref group.
+                # This is observed-retention identity, never source authentication
+                # or evidence of the original message/album identity.
+                if any(ref.source_provenance is not None for ref in refs):
+                    raise ValueError("retained attachment has no stable source identity")
+                identity = {
+                    "scope": "legacy_retained_ref_group_v1",
+                    "principal": f"telegram:{config.principal}",
+                    "session_key": config.session_key,
+                    "snapshot_session_id": snapshot_session_id,
+                    "snapshot_identity": snapshot["snapshot_identity"],
+                    "message_index": message_index,
+                    "attachment_ids": [ref.attachment_id for ref in refs],
+                }
+                target = "retained:" + hashlib.sha256(
+                    json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
+                ).hexdigest()
+                target_authority = "owner_local_observed_retention_ref_group"
+            if not isinstance(target, str) or not target or len(target) > 256:
+                raise ValueError("retained attachment has no stable source identity")
+            metadata: dict[str, object] = {
+                "role": "user",
+                "source_principal": f"telegram:{config.principal}",
+                "is_group": False,
+                "is_forwarded": False,
+                "attachment_fingerprints": message_fingerprints,
+                "source_snapshot_session_id": snapshot_session_id,
+                "source_session_key": config.session_key,
+                "source_chat_id": config.chat_id,
+                "source_channel": "telegram",
+                "timestamp_authority": timestamp_authority,
+                "target_authority": target_authority,
+                "received_at": message_time.isoformat(),
+            }
+            evidence.append(
+                RetainedAttachmentEvidence(
+                    id=target,
+                    peer_id=f"telegram:{config.principal}",
+                    session_id=snapshot_session_id,
+                    metadata=metadata,
+                    created_at=message_time,
+                )
+            )
+        return evidence
+
     async def reset_session(self, session_key: str) -> bool:
         """Hard-reset a session for /new: drop the in-memory bundle and the
         persisted per-session-key 'latest' pointer, so the next message starts a
@@ -817,7 +1012,9 @@ class OhmoSessionRuntimePool:
         """Submit an inbound channel message and yield progress + final reply updates."""
         todo_lifecycle = _is_real_user_turn(message)
         wellness_reminder = _trusted_reminder_wellness(message)
-        user_message = _build_inbound_user_message(message, self._attachment_store)
+        user_message = _build_inbound_user_message(
+            message, self._attachment_store, session_key=session_key
+        )
         user_prompt = user_message.text
         command_prompt = (message.content or "").strip()
         session_cwd = self._cwd_for_message(message, session_key)
@@ -831,6 +1028,21 @@ class OhmoSessionRuntimePool:
             cwd=session_cwd,
             include_todo=todo_lifecycle,
         )
+        # Bind durable media refs to this exact configured gateway session.
+        if isinstance(user_message, ConversationMessage):
+            user_message.content = [
+                block.model_copy(
+                    update={
+                        "source_provenance": {
+                            **block.source_provenance,
+                            "gateway_session_id": bundle.session_id,
+                        }
+                    }
+                )
+                if isinstance(block, AttachmentRefBlock) and block.source_provenance is not None
+                else block
+                for block in user_message.content
+            ]
         turn_ctx = build_turn_context(
             message,
             session_id=bundle.session_id,
@@ -2088,7 +2300,7 @@ class OhmoSessionRuntimePool:
             session_backend=self._session_backend,
             enforce_max_turns=True,  # cap each prompt at settings.max_turns by default (was unlimited)
             restore_messages=[
-                message.model_dump(mode="json")
+                _snapshot_message_dict(message)
                 for message in _sanitize_group_command_prompts(snapshot)
             ],
             restore_tool_metadata=_sanitize_group_command_metadata(
@@ -3162,7 +3374,7 @@ def _sanitize_snapshot_messages(raw_messages: object) -> list[dict[str, object]]
                 "ohmo runtime skipped invalid restored message while sanitizing snapshot"
             )
     return [
-        message.model_dump(mode="json") for message in _sanitize_group_command_prompts(messages)
+        _snapshot_message_dict(message) for message in _sanitize_group_command_prompts(messages)
     ]
 
 
@@ -3585,6 +3797,8 @@ def _format_channel_progress(
 def _build_inbound_user_message(
     message: InboundMessage,
     attachment_store: AttachmentStore | None = None,
+    *,
+    session_key: str | None = None,
 ) -> ConversationMessage:
     """Convert an inbound channel message into user content blocks."""
     content: list[TextBlock | ImageBlock | AttachmentRefBlock] = []
@@ -3600,13 +3814,32 @@ def _build_inbound_user_message(
         prefix = "\n\n" if base else ""
         content.append(TextBlock(text=prefix + attachment_notes))
 
+    source_timestamp = _trusted_utc_iso(message.timestamp)
+    source_provenance: dict[str, object] = {
+        "schema_version": 1,
+        "channel": str(message.channel),
+        "principal": (
+            f"{str(message.channel).strip().lower()}:"
+            f"{canonical_principal(message.channel, str(message.sender_id))}"
+        ),
+        "chat_id": str(message.chat_id),
+        "session_key": session_key or message.session_key,
+        "received_at": source_timestamp,
+        "timestamp_authority": "inbound_event_timestamp" if source_timestamp else None,
+        "is_group": not is_private_message(message),
+        "is_forwarded": build_turn_context(message, session_id="").is_forwarded,
+        "source_message_id": _normalize_source_message_ref(
+            (message.metadata or {}).get("message_id")
+        ),
+    }
     for media_path in message.media:
         if not _is_image_attachment(media_path):
             continue
         try:
             image = ImageBlock.from_path(media_path)
             if attachment_store is not None:
-                content.append(attachment_store.ingest_image_block(image))
+                ref = attachment_store.ingest_image_block(image)
+                content.append(ref.model_copy(update={"source_provenance": source_provenance}))
             content.append(image)
         except Exception:
             logger.exception("ohmo runtime failed to encode image attachment path=%s", media_path)

@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import hashlib
+import os
 import shutil
+import stat
 import time
 from pathlib import Path
 from typing import Any
@@ -12,6 +14,7 @@ from uuid import uuid4
 
 from openharness.api.usage import UsageSnapshot
 from openharness.engine.messages import ConversationMessage, sanitize_conversation_messages
+from openharness.engine.messages import AttachmentRefBlock
 from openharness.services.session_backend import SessionBackend
 from openharness.services.session_storage import (
     _persistable_tool_metadata,
@@ -21,6 +24,15 @@ from openharness.utils.fs import atomic_write_text
 
 from ohmo.attachment_store import AttachmentStore
 from ohmo.workspace import get_sessions_dir, get_work_dir
+
+
+def _snapshot_message_dict(message: ConversationMessage) -> dict[str, Any]:
+    """Serialize a conversation message, retaining gateway-only ref provenance."""
+    result = message.model_dump(mode="json")
+    for index, block in enumerate(message.content):
+        if isinstance(block, AttachmentRefBlock) and block.source_provenance is not None:
+            result["content"][index]["source_provenance"] = block.source_provenance
+    return result
 
 
 def get_session_dir(workspace: str | Path | None = None) -> Path:
@@ -126,7 +138,7 @@ def save_session_snapshot(
         "cwd": str(Path(cwd).resolve()),
         "model": model,
         "system_prompt": system_prompt,
-        "messages": [message.model_dump(mode="json") for message in messages],
+        "messages": [_snapshot_message_dict(message) for message in messages],
         "usage": usage.model_dump(),
         "tool_metadata": _persistable_tool_metadata(tool_metadata),
         "created_at": now,
@@ -147,17 +159,21 @@ def _externalize_snapshot_payload(
     payload: dict[str, Any],
     workspace: str | Path | None,
 ) -> dict[str, Any]:
-    sanitized = _sanitize_snapshot_payload(payload)
-    raw_messages = sanitized.get("messages", [])
+    # The generic engine serializer intentionally drops gateway-private fields.
+    # Validate/sanitize the public message structure here, then use the Ohmo
+    # snapshot serializer so attachment provenance survives a normal read.
+    raw_messages = payload.get("messages", [])
     if not isinstance(raw_messages, list):
-        return sanitized
-    store = AttachmentStore(workspace)
-    messages = store.externalize_messages(
+        return _sanitize_snapshot_payload(payload)
+    sanitized = _sanitize_snapshot_payload({**payload, "messages": []})
+    messages = sanitize_conversation_messages(
         [ConversationMessage.model_validate(item) for item in raw_messages]
     )
+    store = AttachmentStore(workspace)
+    messages = store.externalize_messages(messages)
     store.assert_externalized(messages)
     sanitized = dict(sanitized)
-    sanitized["messages"] = [message.model_dump(mode="json") for message in messages]
+    sanitized["messages"] = [_snapshot_message_dict(message) for message in messages]
     sanitized["message_count"] = len(messages)
     return sanitized
 
@@ -178,6 +194,221 @@ def load_latest_for_session_key(workspace: str | Path | None, session_key: str) 
             json.loads(path.read_text(encoding="utf-8")), workspace
         )
     return None
+
+
+def load_bounded_latest_for_session_key(
+    workspace: str | Path | None,
+    session_key: str,
+    *,
+    max_bytes: int = 64 * 1024 * 1024,
+    max_messages: int | None = None,
+) -> dict[str, Any] | None:
+    """Read only the exact session-key snapshot under explicit size limits."""
+    if not session_key or len(session_key) > 512 or not 1 <= max_bytes <= 64 * 1024 * 1024:
+        raise ValueError("invalid bounded snapshot query")
+    if max_messages is not None and not 1 <= max_messages <= 10000:
+        raise ValueError("invalid snapshot message bound")
+    path = get_sessions_dir(workspace) / f"latest-{_session_key_token(session_key)}.json"
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except FileNotFoundError:
+        return None
+    try:
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode) or not 0 < before.st_size <= max_bytes:
+            raise ValueError("session snapshot is not a bounded regular file")
+        data = bytearray()
+        while len(data) <= max_bytes:
+            chunk = os.read(fd, min(65536, max_bytes + 1 - len(data)))
+            if not chunk:
+                break
+            data.extend(chunk)
+        after = os.fstat(fd)
+        if (
+            len(data) != before.st_size
+            or len(data) > max_bytes
+            or (before.st_dev, before.st_ino, before.st_mtime_ns, before.st_size)
+            != (after.st_dev, after.st_ino, after.st_mtime_ns, after.st_size)
+        ):
+            raise ValueError("session snapshot changed during read")
+    finally:
+        os.close(fd)
+    try:
+        payload = json.loads(data)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise ValueError("session snapshot JSON is invalid") from exc
+    if (
+        not isinstance(payload, dict)
+        or payload.get("app") != "ohmo"
+        or payload.get("session_key") != session_key
+        or not isinstance(payload.get("session_id"), str)
+        or not payload["session_id"]
+        or not isinstance(payload.get("messages"), list)
+        or (max_messages is not None and len(payload["messages"]) > max_messages)
+    ):
+        raise ValueError("session snapshot identity or message bounds are invalid")
+    return payload
+
+
+class _SnapshotJSONReader:
+    """Incrementally decode JSON values from a stable snapshot file."""
+
+    def __init__(self, stream):
+        self.stream = stream
+        self.buffer = ""
+        self.position = 0
+        self.decoder = json.JSONDecoder(object_pairs_hook=_unique_json_pairs)
+        self.eof = False
+
+    def _fill(self) -> None:
+        # A larger fixed chunk prevents repeatedly rescanning a long JSON text
+        # token while still bounding the traversal reader's scratch buffer.
+        chunk = self.stream.read(4 * 1024 * 1024)
+        if chunk:
+            self.buffer = self.buffer[self.position:] + chunk
+            self.position = 0
+        else:
+            self.eof = True
+
+    def whitespace(self) -> None:
+        while True:
+            while self.position < len(self.buffer) and self.buffer[self.position].isspace():
+                self.position += 1
+            if self.position < len(self.buffer) or self.eof:
+                return
+            self._fill()
+
+    def punctuation(self, expected: str) -> None:
+        self.whitespace()
+        if self.position >= len(self.buffer) or self.buffer[self.position] != expected:
+            raise ValueError("session snapshot JSON is invalid")
+        self.position += 1
+
+    def value(self):
+        self.whitespace()
+        while True:
+            try:
+                value, end = self.decoder.raw_decode(self.buffer, self.position)
+                self.position = end
+                return value
+            except json.JSONDecodeError as exc:
+                if self.eof:
+                    raise ValueError("session snapshot JSON is invalid") from exc
+                self._fill()
+
+    def messages(self) -> list[dict[str, Any]]:
+        self.punctuation("[")
+        selected: list[dict[str, Any]] = []
+        self.whitespace()
+        if self.position < len(self.buffer) and self.buffer[self.position] == "]":
+            self.position += 1
+            return selected
+        while True:
+            value = self.value()
+            if not isinstance(value, dict):
+                raise ValueError("session snapshot message is invalid")
+            content = value.get("content")
+            if isinstance(content, list) and any(
+                isinstance(block, dict)
+                and block.get("type") in {"attachment_ref", "image"}
+                for block in content
+            ):
+                selected.append(value)
+            self.whitespace()
+            if self.position < len(self.buffer) and self.buffer[self.position] == ",":
+                self.position += 1
+                continue
+            self.punctuation("]")
+            return selected
+
+
+def _unique_json_pairs(pairs: list[tuple[str, object]]) -> dict:
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate session snapshot JSON key")
+        result[key] = value
+    return result
+
+
+def load_camera_attachment_snapshot(
+    workspace: str | Path | None, session_key: str
+) -> dict[str, Any] | None:
+    """Read the exact configured snapshot, retaining only attachment messages.
+
+    Ordinary dialogue is traversed and discarded one message at a time; there
+    is no all-time text or snapshot-byte ceiling. JSON tail and stable-file
+    identity are checked before returning a complete projection.
+    """
+    if not session_key or len(session_key) > 512:
+        raise ValueError("invalid camera snapshot query")
+    path = get_sessions_dir(workspace) / f"latest-{_session_key_token(session_key)}.json"
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except FileNotFoundError:
+        return None
+    try:
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode) or before.st_size <= 0:
+            raise ValueError("session snapshot is not a regular file")
+        with os.fdopen(fd, "r", encoding="utf-8") as stream:
+            fd = -1
+            reader = _SnapshotJSONReader(stream)
+            reader.punctuation("{")
+            fields: dict[str, Any] = {}
+            messages = None
+            reader.whitespace()
+            while reader.position < len(reader.buffer) and reader.buffer[reader.position] != "}":
+                key = reader.value()
+                if not isinstance(key, str) or key in fields:
+                    raise ValueError("session snapshot top-level key is invalid")
+                reader.punctuation(":")
+                value = reader.messages() if key == "messages" else reader.value()
+                fields[key] = value if key != "messages" else True
+                if key == "messages":
+                    messages = value
+                reader.whitespace()
+                if reader.position < len(reader.buffer) and reader.buffer[reader.position] == ",":
+                    reader.position += 1
+                    continue
+                reader.punctuation("}")
+                break
+            reader.whitespace()
+            if reader.position < len(reader.buffer) or not reader.eof:
+                # Force EOF so trailing bytes are never mistaken for completion.
+                while not reader.eof:
+                    reader._fill()
+                reader.whitespace()
+            if reader.position != len(reader.buffer) or messages is None:
+                raise ValueError("session snapshot has an invalid trailing JSON value")
+            after = os.fstat(stream.fileno())
+            current_path = os.stat(path, follow_symlinks=False)
+        if (
+            (before.st_dev, before.st_ino, before.st_mtime_ns, before.st_ctime_ns, before.st_size)
+            != (after.st_dev, after.st_ino, after.st_mtime_ns, after.st_ctime_ns, after.st_size)
+            or (before.st_dev, before.st_ino)
+            != (current_path.st_dev, current_path.st_ino)
+        ):
+            raise ValueError("session snapshot changed during traversal")
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    if (
+        fields.get("app") != "ohmo"
+        or fields.get("session_key") != session_key
+        or not isinstance(fields.get("session_id"), str)
+        or not fields["session_id"]
+    ):
+        raise ValueError("session snapshot identity is invalid")
+    snapshot_identity = hashlib.sha256(
+        f"{before.st_dev}:{before.st_ino}:{before.st_mtime_ns}:{before.st_ctime_ns}:{before.st_size}".encode()
+    ).hexdigest()
+    return {
+        "session_id": fields["session_id"],
+        "session_key": session_key,
+        "snapshot_identity": snapshot_identity,
+        "messages": messages,
+    }
 
 
 def list_snapshots(workspace: str | Path | None = None, limit: int = 20) -> list[dict[str, Any]]:
@@ -281,6 +512,12 @@ class OhmoSessionBackend(SessionBackend):
 
     def load_latest_for_session_key(self, session_key: str) -> dict[str, Any] | None:
         return load_latest_for_session_key(self._workspace, session_key)
+
+    def load_bounded_latest_for_session_key(self, session_key: str) -> dict[str, Any] | None:
+        return load_bounded_latest_for_session_key(self._workspace, session_key)
+
+    def load_camera_attachment_snapshot(self, session_key: str) -> dict[str, Any] | None:
+        return load_camera_attachment_snapshot(self._workspace, session_key)
 
     def clear_session_key(self, session_key: str) -> None:
         clear_session_key(self._workspace, session_key)

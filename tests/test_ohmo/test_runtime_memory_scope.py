@@ -167,10 +167,12 @@ def _assert_expected_metadata_keys(metadata: dict[str, object], *, recorder: boo
         "decision_trace_episode_id",
         "received_at",
         "is_forwarded",
+        "is_group",
         "source_message_at",
         "source_message_id",
         "reply_to_source_message_id",
         "attachment_fingerprints",
+        "source_image_attachment_count",
     }
     if recorder:
         assert set(metadata.keys()) == expected | {"decision_trace"}
@@ -200,6 +202,10 @@ def _assert_metadata_fields(
     assert metadata["decision_trace_episode_id"] == expected_decision_trace_episode_id
     assert metadata["received_at"] == "2026-01-02T03:04:05+00:00"
     assert metadata["is_forwarded"] is turn_ctx.is_forwarded
+    assert type(metadata["is_group"]) is bool
+    assert metadata["is_group"] is (not turn_ctx.is_private)
+    assert type(metadata["source_image_attachment_count"]) is int
+    assert metadata["source_image_attachment_count"] >= 0
     assert metadata["source_message_at"] is None
     assert metadata["client_op_id"].startswith(metadata["logical_turn_id"] + ":")
 
@@ -1001,6 +1007,35 @@ def test_runtime_memory_turn_metadata_normalizes_forward_provenance() -> None:
     )
     assert invalid_user_metadata["source_message_at"] is None
     assert invalid_assistant_metadata["source_message_at"] is None
+
+
+def test_runtime_memory_metadata_tracks_private_group_and_image_attachments() -> None:
+    scope = MemoryScope("owner", ())
+    message = replace(
+        _message(),
+        media=["/tmp/photo.jpg", "/tmp/voice.ogg", "/tmp/second.webp"],
+    )
+    private = _context("100", owner=True)
+    group = TurnContext(
+        principal="200",
+        is_owner=False,
+        is_private=False,
+        channel="telegram",
+        chat_id="-200",
+        session_id="session-group",
+    )
+
+    for turn_ctx, expected_group in ((private, False), (group, True)):
+        _, user_metadata, assistant_metadata = _metadata(
+            turn_ctx=turn_ctx,
+            scope=scope,
+            message=message,
+            recorder=None,
+        )
+        for metadata in (user_metadata, assistant_metadata):
+            assert metadata["is_group"] is expected_group
+            assert type(metadata["source_image_attachment_count"]) is int
+            assert metadata["source_image_attachment_count"] == 2
 
 
 def test_runtime_memory_turn_metadata_status_recorded_with_nutrition(tmp_path: Path) -> None:

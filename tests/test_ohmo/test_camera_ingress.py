@@ -13,8 +13,10 @@ from unittest.mock import patch
 
 import pytest
 
+import ohmo.gateway.camera as camera_module
 from ohmo.gateway.camera import (
     _PENDING_TTL_SECONDS,
+    _find_recent_attachment_duplicate,
     CAMERA_AUTHORITY,
     CameraCandidateUpload,
     CameraIngress,
@@ -22,16 +24,23 @@ from ohmo.gateway.camera import (
 )
 from ohmo.gateway.bridge import OhmoGatewayBridge
 from ohmo.gateway.models import CameraIngressConfig, GatewayConfig
-from ohmo.gateway.runtime import GatewayStreamUpdate, OhmoSessionRuntimePool
+from ohmo.gateway.runtime import (
+    GatewayStreamUpdate,
+    OhmoSessionRuntimePool,
+    _build_inbound_user_message,
+)
 from ohmo.gateway.service import OhmoGatewayService
 from ohmo.gateway.turn_context import TurnContext
 from ohmo.gateway.memory_gate import MemoryScope
 from ohmo.memory_backend import ConversationAppendReceipt
+from ohmo.session_storage import OhmoSessionBackend
 from ohmo.evals import get_eval_store
 from ohmo.evals.recorder import GatewayEvalRecorder
 from ohmo.camera_protocol.models import candidate_id_for
 from openharness.channels.bus.events import InboundMessage, OutboundDeliveryReceipt, OutboundMessage
 from openharness.channels.bus.queue import MessageBus
+from openharness.api.usage import UsageSnapshot
+from openharness.engine.messages import AttachmentRefBlock, ConversationMessage, TextBlock
 from openharness.evals import DecisionTraceValidationError, TRACE_FINALIZATION
 
 
@@ -95,8 +104,14 @@ class FakeTelegram:
         )
 
 
-def _candidate(root: Path, *, index: int = 0) -> dict:
+def _candidate(
+    root: Path, *, index: int = 0, capture_time: datetime | None = None
+) -> dict:
     payload = json.loads(FIXTURE.read_text(encoding="utf-8"))
+    payload["normalized_capture_time"] = (
+        capture_time or datetime.now(timezone.utc)
+    ).replace(microsecond=0).isoformat()
+    payload["exif"]["normalized_capture_time"] = payload["normalized_capture_time"]
     payload["file_id"] = f"id:fake-{index}"
     payload["rev"] = f"rev-{index}"
     payload["candidate_id"] = candidate_id_for(payload["file_id"], payload["rev"])
@@ -448,6 +463,30 @@ async def test_same_sequence_replays_cached_admission_without_second_send(tmp_pa
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("tamper", ["image", "manifest", "producer"])
+async def test_cached_admission_replay_revalidates_all_multipart_parts(
+    tmp_path: Path, tamper: str
+) -> None:
+    ingress, root, bus, channel = _ingress(tmp_path)
+    request = _candidate(root)
+    upload = await _leased_upload(ingress, root, "Bearer " + "s" * 40, request)
+    original = await ingress.admit("Bearer " + "s" * 40, upload)
+    changed = {
+        "image": replace(upload, image_bytes=upload.image_bytes + b"x"),
+        "manifest": replace(upload, manifest_bytes=upload.manifest_bytes + b" "),
+        "producer": replace(upload, producer_sidecar_bytes=b"{}"),
+    }[tamper]
+    assert await ingress.admit("Bearer " + "s" * 40, changed) == (
+        422, {"error": {"code": "candidate_evidence_mismatch"}}
+    )
+    assert ingress._session["committed_seq"] == 1
+    assert original[0] == 202
+    await asyncio.wait_for(bus.consume_inbound(), timeout=1)
+    assert len(channel.calls) == 1
+    await ingress.close()
+
+
+@pytest.mark.asyncio
 async def test_sequence_gap_returns_expected_seq_without_consuming_it(tmp_path: Path) -> None:
     ingress, root, bus, _ = _ingress(tmp_path)
     request = _candidate(root)
@@ -541,6 +580,138 @@ async def test_unrecognized_or_unbound_real_text_is_nutrition_forbidden(tmp_path
 
 
 @pytest.mark.asyncio
+async def test_legacy_serialized_owner_photo_suppresses_with_observed_object_mtime(
+    tmp_path: Path,
+) -> None:
+    from types import SimpleNamespace
+
+    ingress, root, bus, channel = _ingress(tmp_path)
+    request = _candidate(root)
+    image_bytes = (root / request["candidate_id"] / "original.jpg").read_bytes()
+    backend = OhmoSessionBackend(tmp_path)
+    capture = datetime.fromisoformat(request["capture_time"]).astimezone(timezone.utc)
+    ref = backend.attachment_store.ingest_bytes(image_bytes, media_type="image/jpeg")
+    # Reproduce the retained legacy shape exactly: native event id and newly
+    # added private source provenance are both absent.
+    legacy_message = ConversationMessage(role="user", content=[ref])
+    backend.save_snapshot(
+        cwd=tmp_path, model="local-test", system_prompt="",
+        messages=[legacy_message, ConversationMessage(
+            role="user", event_id="text-confirmation", content=[TextBlock(text="yes")]
+        )],
+        usage=UsageSnapshot(), session_id="legacy-session-id",
+        session_key=ingress.config.session_key,
+    )
+    snapshot_path = tmp_path / "sessions" / (
+        "latest-" + hashlib.sha1(ingress.config.session_key.encode()).hexdigest()[:12] + ".json"
+    )
+    legacy_payload = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    legacy_payload["messages"][0].pop("event_id", None)
+    snapshot_path.write_text(json.dumps(legacy_payload), encoding="utf-8")
+    raw = backend.load_bounded_latest_for_session_key(ingress.config.session_key)
+    assert raw is not None
+    assert "event_id" not in raw["messages"][0]
+    assert "source_provenance" not in raw["messages"][0]["content"][0]
+    pool = object.__new__(OhmoSessionRuntimePool)
+    pool._gateway_config = SimpleNamespace(camera_ingress=ingress.config)
+    pool._session_backend = backend
+    pool._attachment_store = backend.attachment_store
+
+    async def honcho_text_only(*, since, until):
+        return [SimpleNamespace(
+            id="later-text-only", peer_id="owner-peer", session_id="honcho-session",
+            created_at=capture,
+            metadata={"role": "user", "source_principal": "telegram:123",
+                      "attachment_fingerprints": []},
+        )]
+
+    ingress._recent_attachments = honcho_text_only
+    ingress._recent_session = "honcho-session"
+    ingress._recent_peer = "owner-peer"
+    ingress._retained_attachments = pool.camera_retained_attachment_history
+    evidence = await pool.camera_retained_attachment_history(
+        since=capture - timedelta(days=7), until=capture + timedelta(days=7)
+    )
+    assert evidence[0].metadata["timestamp_authority"] == (
+        "owner_local_object_mtime_observed_retention"
+    )
+    status, response = await _admit(ingress, root, "Bearer " + "s" * 40, request)
+    assert status == 200 and response["status"] == "duplicate"
+    assert response["candidate_id"] == request["candidate_id"]
+    assert response["duplicate_of"].startswith("retained:")
+    assert channel.calls == [] and bus.inbound_size == 0
+    await ingress.close()
+
+
+@pytest.mark.asyncio
+async def test_legacy_retained_photo_mtime_outside_window_is_not_a_match(tmp_path: Path) -> None:
+    from types import SimpleNamespace
+    import os
+
+    request = _candidate(tmp_path / "artifacts")
+    image = (tmp_path / "artifacts" / request["candidate_id"] / "original.jpg").read_bytes()
+    capture = datetime.fromisoformat(request["capture_time"]).astimezone(timezone.utc)
+    backend = OhmoSessionBackend(tmp_path)
+    ref = backend.attachment_store.ingest_bytes(image, media_type="image/jpeg")
+    object_path, _ = backend.attachment_store._paths(ref.attachment_id)
+    old_time = (capture - timedelta(days=8)).timestamp()
+    os.utime(object_path, (old_time, old_time))
+    backend.save_snapshot(
+        cwd=tmp_path, model="local-test", system_prompt="",
+        messages=[ConversationMessage(role="user", event_id="old-photo", content=[ref])],
+        usage=UsageSnapshot(), session_id="legacy-session-id", session_key="telegram:123",
+    )
+    config = CameraIngressConfig(
+        enabled=True, listen_port=8765, bearer_token_file=tmp_path / "token",
+        principal="123", tenant_id="marina", chat_id="123", session_key="telegram:123",
+    )
+    pool = object.__new__(OhmoSessionRuntimePool)
+    pool._gateway_config = SimpleNamespace(camera_ingress=config)
+    pool._session_backend = backend
+    pool._attachment_store = backend.attachment_store
+    assert await pool.camera_retained_attachment_history(
+        since=capture - timedelta(days=7), until=capture + timedelta(days=7)
+    ) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mutation", ["missing", "tampered", "wrong_session"])
+async def test_legacy_retained_photo_missing_or_wrong_scope_fails_closed(
+    tmp_path: Path, mutation: str
+) -> None:
+    from types import SimpleNamespace
+
+    request = _candidate(tmp_path / "artifacts")
+    image = (tmp_path / "artifacts" / request["candidate_id"] / "original.jpg").read_bytes()
+    backend = OhmoSessionBackend(tmp_path)
+    ref = backend.attachment_store.ingest_bytes(image, media_type="image/jpeg")
+    object_path, _ = backend.attachment_store._paths(ref.attachment_id)
+    key = "telegram:999" if mutation == "wrong_session" else "telegram:123"
+    backend.save_snapshot(
+        cwd=tmp_path, model="local-test", system_prompt="",
+        messages=[ConversationMessage(role="user", event_id="legacy-photo", content=[ref])],
+        usage=UsageSnapshot(), session_id="legacy-session-id", session_key=key,
+    )
+    if mutation == "missing":
+        object_path.unlink()
+    elif mutation == "tampered":
+        object_path.write_bytes(b"tampered")
+    config = CameraIngressConfig(
+        enabled=True, listen_port=8765, bearer_token_file=tmp_path / "token",
+        principal="123", tenant_id="marina", chat_id="123", session_key="telegram:123",
+    )
+    pool = object.__new__(OhmoSessionRuntimePool)
+    pool._gateway_config = SimpleNamespace(camera_ingress=config)
+    pool._session_backend = backend
+    pool._attachment_store = backend.attachment_store
+    with pytest.raises((ValueError, FileNotFoundError)):
+        await pool.camera_retained_attachment_history(
+            since=datetime.now(timezone.utc) - timedelta(days=7),
+            until=datetime.now(timezone.utc),
+        )
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "mutation", ["missing", "negative", "wrong_release", "wrong_clip", "wrong_route"]
 )
@@ -618,12 +789,19 @@ async def test_duplicate_second_candidate_and_restart_never_resend(tmp_path: Pat
     ingress, root, bus, channel = _ingress(tmp_path)
     first = _candidate(root)
     second = _candidate(root, index=1)
-    status, admitted = await _admit(ingress, root, "Bearer " + "s" * 40, first)
+    lease_status, lease = await ingress.lease("Bearer " + "s" * 40)
+    assert lease_status == 200
+    first_upload = _upload(root, {
+        **first, "session_id": lease["session_id"], "epoch": lease["epoch"], "seq": 1
+    })
+    status, admitted = await ingress.admit("Bearer " + "s" * 40, first_upload)
     assert status == 202
-    duplicate_status, duplicate = await _admit(ingress, root, "Bearer " + "s" * 40, first)
+    duplicate_status, duplicate = await ingress.admit(
+        "Bearer " + "s" * 40, first_upload
+    )
     assert duplicate_status == 202
     assert duplicate["admission_id"] == admitted["admission_id"]
-    assert duplicate["ack_seq"] == 2
+    assert duplicate["ack_seq"] == 1
     assert (await _admit(ingress, root, "Bearer " + "s" * 40, second))[1]["error"][
         "code"
     ] == "unresolved_candidate"
@@ -633,7 +811,9 @@ async def test_duplicate_second_candidate_and_restart_never_resend(tmp_path: Pat
     assert reopened._attempts[first["candidate_id"]]["capture_time"] == first["capture_time"]
     assert reopened._attempts[first["candidate_id"]]["capture_time_authority"] == "exif"
     reopened.mark_restart_unknown()
-    assert (await _admit(reopened, root, "Bearer " + "s" * 40, first))[0] == 202
+    recovered = await reopened.reconcile("Bearer " + "s" * 40, first_upload)
+    assert recovered[0] == 202
+    assert recovered[1]["candidate_id"] == first["candidate_id"]
     assert reopened._attempts[first["candidate_id"]]["state"] == "photo_sent"
     assert reopened._attempts[first["candidate_id"]]["photo_delivery_confirmed"] is True
     assert len(channel.calls) == 1
@@ -654,11 +834,1197 @@ async def test_duplicate_second_candidate_and_restart_never_resend(tmp_path: Pat
 
 
 @pytest.mark.asyncio
-async def test_crash_after_202_leaves_tombstone_without_auto_retry(tmp_path: Path) -> None:
+async def test_exact_delivered_image_returns_durable_explicit_duplicate(tmp_path: Path) -> None:
+    ingress, root, bus, channel = _ingress(tmp_path)
+    first = _candidate(root, index=0)
+    second = _candidate(root, index=1)
+    second_dir = root / second["candidate_id"]
+    second_manifest = json.loads((second_dir / "manifest.json").read_text())
+    first_bytes = (root / first["candidate_id"] / "original.jpg").read_bytes()
+    (second_dir / "original.jpg").write_bytes(first_bytes)
+    second_manifest["original_size_bytes"] = len(first_bytes)
+    second_manifest["original_sha256"] = hashlib.sha256(first_bytes).hexdigest()
+    manifest_bytes = json.dumps(second_manifest, separators=(",", ":")).encode()
+    (second_dir / "manifest.json").write_bytes(manifest_bytes)
+    second["image_sha256"] = second_manifest["original_sha256"]
+    second["manifest_sha256"] = hashlib.sha256(manifest_bytes).hexdigest()
+    _producer_sidecar(root, second)
+
+    assert (await _admit(ingress, root, "Bearer " + "s" * 40, first))[0] == 202
+    await asyncio.wait_for(bus.consume_inbound(), timeout=1)
+    first_record = ingress._attempts[first["candidate_id"]]
+    assert first_record["photo_delivery_confirmed"] is True
+    status, response = await _admit(ingress, root, "Bearer " + "s" * 40, second)
+    assert status == 200
+    assert response == {
+        "status": "duplicate",
+        "candidate_id": second["candidate_id"],
+        "session_id": ingress._session["session_id"],
+        "epoch": ingress._session["epoch"],
+        "ack_seq": 2,
+        "reason": "image_already_delivered",
+        "duplicate_of": first["candidate_id"],
+    }
+    assert ingress._attempts[second["candidate_id"]]["state"] == "duplicate"
+    assert len(channel.calls) == 1
+    replay = await ingress.admit(
+        "Bearer " + "s" * 40,
+        _upload(root, {
+            **second,
+            "session_id": ingress._session["session_id"],
+            "epoch": ingress._session["epoch"],
+            "seq": 2,
+        }),
+    )
+    assert replay == (status, response)
+    reconciled = await ingress.reconcile("Bearer " + "s" * 40, _upload(root, {
+        **second,
+        "session_id": ingress._session["session_id"],
+        "epoch": ingress._session["epoch"],
+        "seq": 2,
+    }))
+    assert reconciled == (status, response)
+    await ingress.close()
+    restarted = CameraIngress(ingress.config, workspace=tmp_path, bus=MessageBus(), telegram=channel)
+    assert restarted._attempts[second["candidate_id"]]["state"] == "duplicate"
+    await restarted.close()
+
+
+@pytest.mark.asyncio
+async def test_human_attachment_metadata_duplicate_is_owner_bound(tmp_path: Path) -> None:
+    async def history(*, since, until):
+        from types import SimpleNamespace
+        return [SimpleNamespace(
+            id="owner-message-1", created_at=since,
+            session_id="private-session", peer_id="owner-peer",
+            metadata={"role": "user", "source_principal": "telegram:123",
+                      "is_forwarded": False, "is_group": False,
+                      "attachment_fingerprints": [{"sha256": image_hash}]},
+        )]
+
+    ingress, root, bus, channel = _ingress(tmp_path)
+    request = _candidate(root)
+    image_hash = request["image_sha256"]
+    ingress._recent_attachments = history
+    ingress._recent_session = "private-session"
+    ingress._recent_peer = "owner-peer"
+    status, response = await _admit(ingress, root, "Bearer " + "s" * 40, request)
+    assert status == 200 and response["reason"] == "human_photo_already_seen"
+    assert response["duplicate_of"] == "owner-message-1"
+    assert channel.calls == [] and bus.inbound_size == 0
+    await ingress.close()
+
+
+@pytest.mark.asyncio
+async def test_other_principal_attachment_cannot_suppress_camera_candidate(tmp_path: Path) -> None:
+    image_hash = "0" * 64
+
+    async def history(*, since, until):
+        from types import SimpleNamespace
+        return [SimpleNamespace(
+            id="other-owner-message", created_at=since,
+            session_id="private-session", peer_id="owner-peer",
+            metadata={"role": "user", "source_principal": "telegram:999",
+                      "is_forwarded": False, "is_group": False,
+                      "attachment_fingerprints": [{"sha256": image_hash}]},
+        )]
+
+    ingress, root, bus, channel = _ingress(tmp_path)
+    request = _candidate(root)
+    ingress._recent_attachments = history
+    ingress._recent_session = "private-session"
+    ingress._recent_peer = "owner-peer"
+    status, response = await _admit(ingress, root, "Bearer " + "s" * 40, request)
+    assert status == 202 and response["status"] == "admitted"
+    await asyncio.wait_for(bus.consume_inbound(), timeout=1)
+    assert len(channel.calls) == 1
+    await ingress.close()
+
+
+@pytest.mark.asyncio
+async def test_human_attachment_recompression_matches_only_versioned_phash(
+    tmp_path: Path,
+) -> None:
+    from types import SimpleNamespace
+
+    async def history(*, since, until):
+        return [SimpleNamespace(
+            id="owner-recompressed-photo", created_at=since,
+            session_id="private-session", peer_id="owner-peer",
+            metadata={
+                "role": "user", "source_principal": "telegram:123",
+                "is_forwarded": False, "is_group": False,
+                "attachment_fingerprints": [{
+                    "sha256": "f" * 64,
+                    "phash_algorithm": "dct-phash-16x16-v1",
+                    "phash": "0" * 62 + "03",
+                }],
+            },
+        )]
+
+    ingress, root, bus, channel = _ingress(tmp_path)
+    request = _candidate(root)
+    ingress._recent_attachments = history
+    ingress._recent_session = "private-session"
+    ingress._recent_peer = "owner-peer"
+    with patch(
+        "ohmo.gateway.camera.fingerprint_image_bytes",
+        return_value={
+            "sha256": request["image_sha256"],
+            "phash": "0" * 64,
+            "phash_algorithm": "dct-phash-16x16-v1",
+        },
+    ):
+        status, response = await _admit(ingress, root, "Bearer " + "s" * 40, request)
+    assert status == 200 and response["reason"] == "human_photo_already_seen"
+    assert response["duplicate_of"] == "owner-recompressed-photo"
+    assert channel.calls == [] and bus.inbound_size == 0
+    await ingress.close()
+
+
+@pytest.mark.asyncio
+async def test_retained_private_session_photo_suppresses_when_honcho_has_text_only(
+    tmp_path: Path,
+) -> None:
+    from types import SimpleNamespace
+
+    ingress, root, bus, channel = _ingress(tmp_path)
+    request = _candidate(root)
+    backend = OhmoSessionBackend(tmp_path)
+    received_at = datetime.fromisoformat(request["capture_time"]).astimezone(timezone.utc)
+    sid = "retained-private-session"
+    media_path = root / request["candidate_id"] / "original.jpg"
+    human_photo = InboundMessage(
+        channel="telegram",
+        sender_id="123",
+        chat_id="123",
+        content="",
+        timestamp=received_at,
+        media=[str(media_path)],
+        metadata={"is_group": False, "message_id": "native-owner-photo-id"},
+    )
+    retained_user_message = _build_inbound_user_message(
+        human_photo, backend.attachment_store, session_key=ingress.config.session_key
+    )
+    retained_user_message.content = [
+        block.model_copy(update={
+            "source_provenance": {
+                **block.source_provenance,
+                "gateway_session_id": sid,
+            }
+        })
+        if isinstance(block, AttachmentRefBlock) and block.source_provenance is not None
+        else block
+        for block in retained_user_message.content
+    ]
+    retained_event_id = retained_user_message.event_id
+    backend.save_snapshot(
+        cwd=tmp_path,
+        model="local-test",
+        system_prompt="",
+        messages=[
+            retained_user_message,
+            ConversationMessage(role="user", event_id="later-text-event",
+                                 content=[TextBlock(text="yes, I ate it")]),
+        ],
+        usage=UsageSnapshot(),
+        session_id=sid,
+        session_key=ingress.config.session_key,
+    )
+    pool = object.__new__(OhmoSessionRuntimePool)
+    pool._gateway_config = SimpleNamespace(camera_ingress=ingress.config)
+    pool._session_backend = backend
+    pool._attachment_store = backend.attachment_store
+
+    async def honcho_text_only(*, since, until):
+        return [SimpleNamespace(
+            id="later-honcho-message", peer_id="owner-peer", session_id="honcho-session",
+            created_at=received_at,
+            metadata={"role": "user", "source_principal": "telegram:123",
+                      "attachment_fingerprints": []},
+        )]
+
+    ingress._recent_attachments = honcho_text_only
+    ingress._recent_session = "honcho-session"
+    ingress._recent_peer = "owner-peer"
+    ingress._retained_attachments = pool.camera_retained_attachment_history
+    retained = await pool.camera_retained_attachment_history(
+        since=received_at - timedelta(days=7), until=received_at + timedelta(days=7)
+    )
+    assert len(retained) == 1
+    assert retained[0].metadata["attachment_fingerprints"][0]["sha256"] == request["image_sha256"]
+    status, response = await _admit(ingress, root, "Bearer " + "s" * 40, request)
+    assert status == 200
+    assert response["status"] == "duplicate"
+    assert response["candidate_id"] == request["candidate_id"]
+    assert response["reason"] == "human_photo_already_seen"
+    assert response["duplicate_of"] == retained_event_id
+    assert channel.calls == [] and bus.inbound_size == 0
+    await ingress.close()
+
+
+@pytest.mark.asyncio
+async def test_private_attachment_provenance_survives_load_get_bundle_refresh_and_save(
+    tmp_path: Path,
+) -> None:
+    from openharness.engine.messages import serialize_content_block
+
+    ingress, root, _, _ = _ingress(tmp_path)
+    backend = OhmoSessionBackend(tmp_path)
+    request = _candidate(root)
+    image_path = root / request["candidate_id"] / "original.jpg"
+    event_time = datetime.now(timezone.utc) - timedelta(days=2)
+    inbound_specs = [
+        ("123", "123", {"message_id": "owner-original", "is_group": False}),
+        ("123", "123", {"message_id": "owner-forwarded", "is_group": False, "is_forwarded": True}),
+        ("123", "123", {"message_id": "owner-group", "is_group": True}),
+        ("456", "456", {"message_id": "foreign-owner", "is_group": False}),
+    ]
+    messages = []
+    for sender, chat, metadata in inbound_specs:
+        inbound = InboundMessage(
+            channel="telegram", sender_id=sender, chat_id=chat, content="",
+            timestamp=event_time, media=[str(image_path)], metadata=metadata,
+        )
+        message = _build_inbound_user_message(
+            inbound, backend.attachment_store, session_key=ingress.config.session_key
+        )
+        message.content = [
+            block.model_copy(update={"source_provenance": {
+                **block.source_provenance, "gateway_session_id": "provenance-session",
+            }}) if isinstance(block, AttachmentRefBlock) else block
+            for block in message.content
+        ]
+        messages.append(message)
+    backend.save_snapshot(
+        cwd=tmp_path, model="offline", system_prompt="", messages=messages,
+        usage=UsageSnapshot(), session_id="provenance-session",
+        session_key=ingress.config.session_key,
+    )
+
+    class Engine:
+        def __init__(self, restore_messages):
+            self.messages = [ConversationMessage.model_validate(item) for item in restore_messages]
+            self.tool_metadata = {}
+            self.total_usage = UsageSnapshot()
+            self.system_prompt = "offline"
+        def set_system_prompt(self, value): self.system_prompt = value
+        def set_cache_key(self, value): self.cache_key = value
+
+    built_messages = []
+    async def build_runtime(**kwargs):
+        built_messages.append(kwargs["restore_messages"])
+        engine = Engine(kwargs["restore_messages"] or [])
+        return SimpleNamespace(
+            engine=engine, cwd=kwargs["cwd"], session_id="provenance-session",
+            current_settings=lambda: SimpleNamespace(model="offline"),
+        )
+    async def no_op(*args, **kwargs): return None
+    async def system_prompt(*args, **kwargs): return "offline"
+
+    pool = object.__new__(OhmoSessionRuntimePool)
+    pool._cwd = tmp_path
+    pool._workspace = tmp_path
+    pool._model = "offline"
+    pool._max_turns = 1
+    pool._effort = None
+    pool._provider_profile = None
+    pool._gateway_config = SimpleNamespace(camera_ingress=ingress.config, memory_backend="file")
+    pool._session_backend = backend
+    pool._attachment_store = backend.attachment_store
+    pool._gateway_config_generation = 1
+    pool._bundles = {}
+    pool._resolve_turn_memory_scope = lambda turn_ctx: None
+    pool._coerce_memory_scope = lambda turn_ctx, memory_scope: None
+    pool._configure_attachment_boundary = lambda bundle: None
+    pool._register_gateway_tools = lambda *args, **kwargs: None
+    pool._configure_turn_memory_surfaces = lambda *args, **kwargs: None
+    pool._runtime_system_prompt = system_prompt
+    pool._autodream_context = lambda: None
+
+    with patch("ohmo.gateway.runtime.build_runtime", new=build_runtime), \
+         patch("ohmo.gateway.runtime.start_runtime", new=no_op), \
+         patch("ohmo.gateway.runtime.close_runtime", new=no_op), \
+         patch("ohmo.gateway.runtime.build_ohmo_system_prompt", return_value="offline"), \
+         patch("ohmo.gateway.runtime.create_memory_command_backend", return_value=None), \
+         patch("ohmo.gateway.runtime.get_skills_dir", return_value=tmp_path), \
+         patch("ohmo.gateway.runtime.get_plugins_dir", return_value=tmp_path):
+        ordinary_load = backend.load_latest_for_session_key(ingress.config.session_key)
+        loaded_ref = next(
+            block for block in ordinary_load["messages"][0]["content"]
+            if block["type"] == "attachment_ref"
+        )
+        provenance = loaded_ref["source_provenance"]
+        assert provenance["received_at"] == event_time.isoformat()
+        assert provenance["timestamp_authority"] == "inbound_event_timestamp"
+        assert provenance["principal"] == "telegram:123"
+        assert provenance["is_forwarded"] is False and provenance["is_group"] is False
+        source_ref = next(block for block in messages[0].content if isinstance(block, AttachmentRefBlock))
+        assert "source_provenance" not in serialize_content_block(source_ref)
+
+        bundle = await pool.get_bundle(ingress.config.session_key)
+        restored = next(block for block in bundle.engine.messages[0].content if isinstance(block, AttachmentRefBlock))
+        assert restored.source_provenance == provenance
+        bundle.engine.messages.append(
+            ConversationMessage(role="user", event_id="later-text", content=[TextBlock(text="ordinary")])
+        )
+        await pool._save_snapshot(bundle, ingress.config.session_key, "ordinary")
+
+        pool._gateway_config_generation = 2
+        refreshed = await pool.get_bundle(ingress.config.session_key)
+        refreshed_ref = next(block for block in refreshed.engine.messages[0].content if isinstance(block, AttachmentRefBlock))
+        assert refreshed_ref.source_provenance == provenance
+        assert len(built_messages) == 2
+        await pool._save_snapshot(refreshed, ingress.config.session_key, "ordinary")
+
+    now = datetime.now(timezone.utc)
+    retained = await pool.camera_retained_attachment_history(
+        since=now - timedelta(days=7), until=now
+    )
+    assert len(retained) == 1
+    assert retained[0].id == messages[0].event_id
+    assert retained[0].metadata["received_at"] == event_time.isoformat()
+    assert retained[0].metadata["timestamp_authority"] == "inbound_event_timestamp"
+
+    # Invalid new provenance never degrades into the legacy mtime assumption.
+    bad_message = messages[0].model_copy(deep=True)
+    bad_index = next(i for i, block in enumerate(bad_message.content) if isinstance(block, AttachmentRefBlock))
+    bad_ref = bad_message.content[bad_index]
+    bad_message.content[bad_index] = bad_ref.model_copy(update={
+        "source_provenance": {**bad_ref.source_provenance, "timestamp_authority": "unknown"}
+    })
+    backend.save_snapshot(
+        cwd=tmp_path, model="offline", system_prompt="", messages=[bad_message],
+        usage=UsageSnapshot(), session_id="provenance-session",
+        session_key=ingress.config.session_key,
+    )
+    with pytest.raises(ValueError, match="timestamp authority"):
+        await pool.camera_retained_attachment_history(
+            since=now - timedelta(days=7), until=now
+        )
+    await ingress.close()
+
+
+def test_history_match_is_not_returned_before_tail_validation() -> None:
+    now = datetime.now(timezone.utc)
+    match = SimpleNamespace(
+        id="first-match", peer_id="peer", session_id="session", created_at=now,
+        metadata={"role": "user", "source_principal": "telegram:123",
+                  "is_group": False, "is_forwarded": False,
+                  "attachment_fingerprints": [{"sha256": "a" * 64}]},
+    )
+    malformed = SimpleNamespace(metadata=None)
+    kwargs = dict(
+        candidate={"sha256": "a" * 64}, since=now - timedelta(days=7), until=now,
+        principal="telegram:123", expected_session="session", expected_peer="peer",
+        session_key="telegram:123", chat_id="123",
+    )
+    assert _find_recent_attachment_duplicate([match, match], **kwargs) == "first-match"
+    with pytest.raises(ValueError, match="attachment history item is invalid"):
+        _find_recent_attachment_duplicate([match, malformed], **kwargs)
+    with pytest.raises(ValueError, match="attachment history item is invalid"):
+        _find_recent_attachment_duplicate([malformed, match], **kwargs)
+    malformed_tail = SimpleNamespace(
+        id="bad-fingerprint-tail", peer_id="peer", session_id="session", created_at=now,
+        metadata={"role": "user", "source_principal": "telegram:123",
+                 "is_group": False, "is_forwarded": False,
+                 "attachment_fingerprints": [{"sha256": "not-a-sha"}]},
+    )
+    with pytest.raises(ValueError, match="fingerprint is malformed"):
+        _find_recent_attachment_duplicate([match, malformed_tail], **kwargs)
+
+
+@pytest.mark.asyncio
+async def test_partial_honcho_album_uses_complete_configured_snapshot(tmp_path: Path) -> None:
+    ingress, root, bus, channel = _ingress(tmp_path)
+    request = _candidate(root)
+    upload = await _leased_upload(ingress, root, "Bearer " + "s" * 40, request)
+    backend = OhmoSessionBackend(tmp_path)
+    received = datetime.fromisoformat(request["capture_time"]).astimezone(timezone.utc)
+    inbound = InboundMessage(
+        channel="telegram", sender_id="123", chat_id="123", content="",
+        timestamp=received, media=[str(root / request["candidate_id"] / "original.jpg")],
+        metadata={"is_group": False, "message_id": "human-photo"},
+    )
+    message = _build_inbound_user_message(
+        inbound, backend.attachment_store, session_key=ingress.config.session_key
+    )
+    sid = "partial-album-session"
+    message.content = [
+        block.model_copy(update={"source_provenance": {
+            **block.source_provenance, "gateway_session_id": sid,
+        }}) if isinstance(block, AttachmentRefBlock) else block
+        for block in message.content
+    ]
+    backend.save_snapshot(
+        cwd=tmp_path, model="offline", system_prompt="", messages=[message],
+        usage=UsageSnapshot(), session_id=sid, session_key=ingress.config.session_key,
+    )
+    pool = object.__new__(OhmoSessionRuntimePool)
+    pool._gateway_config = SimpleNamespace(camera_ingress=ingress.config)
+    pool._session_backend = backend
+    pool._attachment_store = backend.attachment_store
+    partial = SimpleNamespace(
+        id="honcho-album", peer_id="owner-peer", session_id="honcho-session",
+        created_at=received,
+        metadata={"role": "user", "source_principal": "telegram:123",
+                  "is_group": False, "is_forwarded": False,
+                  "source_image_attachment_count": 9,
+                  "attachment_fingerprints": [{"sha256": "f" * 64}] * 8},
+    )
+
+    async def honcho_partial(*, since, until):
+        return [partial]
+
+    ingress._recent_attachments = honcho_partial
+    ingress._recent_session = "honcho-session"
+    ingress._recent_peer = "owner-peer"
+    ingress._retained_attachments = pool.camera_retained_attachment_history
+    status, body = await ingress.admit("Bearer " + "s" * 40, upload)
+    assert status == 200 and body["status"] == "duplicate"
+    assert body["reason"] == "human_photo_already_seen"
+    assert body["duplicate_of"] == message.event_id
+    assert channel.calls == [] and bus.inbound_size == 0
+    await ingress.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("has_unrelated_local", [False, True])
+async def test_partial_honcho_unmatched_local_history_does_not_admit(
+    tmp_path: Path, has_unrelated_local: bool
+) -> None:
+    ingress, root, bus, channel = _ingress(tmp_path)
+    request = _candidate(root)
+    upload = await _leased_upload(ingress, root, "Bearer " + "s" * 40, request)
+    received = datetime.fromisoformat(request["capture_time"]).astimezone(timezone.utc)
+    local_history = []
+    if has_unrelated_local:
+        local_history = [SimpleNamespace(
+            id="unrelated", peer_id="telegram:123", session_id="snapshot-session",
+            created_at=received,
+            metadata={"role": "user", "source_principal": "telegram:123",
+                      "is_group": False, "is_forwarded": False,
+                      "source_snapshot_session_id": "snapshot-session",
+                      "source_session_key": "telegram:123", "source_chat_id": "123",
+                      "source_channel": "telegram",
+                      "timestamp_authority": "owner_local_object_mtime_observed_retention",
+                      "target_authority": "owner_local_observed_retention_ref_group",
+                      "received_at": received.isoformat(),
+                      "attachment_fingerprints": [{"sha256": "f" * 64}]},
+        )]
+    partial = SimpleNamespace(
+        id="honcho-partial", peer_id="owner-peer", session_id="honcho-session",
+        created_at=received,
+        metadata={"role": "user", "source_principal": "telegram:123",
+                  "is_group": False, "is_forwarded": False,
+                  "source_image_attachment_count": 2,
+                  "attachment_fingerprints": [{"sha256": "f" * 64}]},
+    )
+
+    async def honcho_partial(*, since, until):
+        return [partial]
+
+    async def local(*, since, until):
+        return local_history
+
+    ingress._recent_attachments = honcho_partial
+    ingress._recent_session = "honcho-session"
+    ingress._recent_peer = "owner-peer"
+    ingress._retained_attachments = local
+    before = ingress._session["committed_seq"]
+    status, body = await ingress.admit("Bearer " + "s" * 40, upload)
+    assert status == 503 and body["error"]["code"] == "duplicate_evidence_unavailable"
+    assert ingress._session["committed_seq"] == before
+    assert channel.calls == [] and bus.inbound_size == 0
+    await ingress.close()
+
+
+@pytest.mark.asyncio
+async def test_retained_history_traverses_large_complete_snapshot_without_old_limits(
+    tmp_path: Path,
+) -> None:
+    from ohmo.gateway.runtime import OhmoSessionRuntimePool
+
+    ingress, root, bus, channel = _ingress(tmp_path)
+    backend = OhmoSessionBackend(tmp_path)
+    # Text and attachment refs beyond the former whole-file/reference ceilings
+    # are fully traversed, while only the compact attachment projection stays.
+    object_bytes = b"x" * (10 * 1024 * 1024)
+    ref = backend.attachment_store.ingest_bytes(object_bytes, media_type="image/jpeg")
+    messages = [
+        ConversationMessage(role="user", event_id=f"old-text-{i}", content=[TextBlock(text="ordinary")])
+        for i in range(5001)
+    ]
+    messages.extend([
+        ConversationMessage(role="user", event_id="large-text", content=[TextBlock(text="z" * (65 * 1024 * 1024))]),
+        ConversationMessage(role="user", event_id="large-album", content=[ref] * 8193),
+    ])
+    backend.save_snapshot(
+        cwd=tmp_path, model="offline", system_prompt="", messages=messages,
+        usage=UsageSnapshot(), session_id="large-private-session",
+        session_key=ingress.config.session_key,
+    )
+    snapshot_path = tmp_path / "sessions" / (
+        "latest-" + hashlib.sha1(ingress.config.session_key.encode()).hexdigest()[:12] + ".json"
+    )
+    assert snapshot_path.stat().st_size > 64 * 1024 * 1024
+
+    pool = object.__new__(OhmoSessionRuntimePool)
+    pool._gateway_config = SimpleNamespace(camera_ingress=ingress.config)
+    pool._session_backend = backend
+    pool._attachment_store = backend.attachment_store
+    now = datetime.now(timezone.utc)
+    evidence = await pool.camera_retained_attachment_history(
+        since=now - timedelta(days=7), until=now + timedelta(minutes=1)
+    )
+    album = next(item for item in evidence if item.id == "large-album")
+    assert len(album.metadata["attachment_fingerprints"]) == 8193
+    ingress._retained_attachments = pool.camera_retained_attachment_history
+    request = _candidate(root)
+    upload = await _leased_upload(ingress, root, "Bearer " + "s" * 40, request)
+    status, body = await ingress.admit("Bearer " + "s" * 40, upload)
+    assert status == 202 and body["candidate_id"] == request["candidate_id"]
+    await asyncio.wait_for(bus.consume_inbound(), timeout=1)
+    assert len(channel.calls) == 1
+    await ingress.close()
+
+
+def test_camera_snapshot_projection_rejects_malformed_tail_and_source_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import ohmo.session_storage as storage
+
+    backend = OhmoSessionBackend(tmp_path)
+    key = "telegram:123"
+    backend.save_snapshot(
+        cwd=tmp_path, model="offline", system_prompt="", messages=[
+            ConversationMessage(role="user", event_id="text", content=[TextBlock(text="ok")])
+        ], usage=UsageSnapshot(), session_id="snapshot-stable", session_key=key,
+    )
+    path = tmp_path / "sessions" / (
+        "latest-" + hashlib.sha1(key.encode()).hexdigest()[:12] + ".json"
+    )
+    path.write_text(path.read_text(encoding="utf-8") + " trailing", encoding="utf-8")
+    with pytest.raises(ValueError, match="trailing|invalid"):
+        backend.load_camera_attachment_snapshot(key)
+
+    backend.save_snapshot(
+        cwd=tmp_path, model="offline", system_prompt="", messages=[
+            ConversationMessage(role="user", event_id="text", content=[TextBlock(text="ok")])
+        ], usage=UsageSnapshot(), session_id="snapshot-stable", session_key=key,
+    )
+    original = storage._SnapshotJSONReader.messages
+
+    def mutate_after_messages(reader):
+        result = original(reader)
+        path.write_text(path.read_text(encoding="utf-8") + " ", encoding="utf-8")
+        return result
+
+    monkeypatch.setattr(storage._SnapshotJSONReader, "messages", mutate_after_messages)
+    with pytest.raises(ValueError, match="changed during traversal|trailing|invalid"):
+        backend.load_camera_attachment_snapshot(key)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fail_after_replace", [False, True])
+@pytest.mark.parametrize("delivery", ["unknown", "confirmed"])
+async def test_actual_base_journal_ack_recovers_only_with_verified_snapshot_and_survives_restart(
+    tmp_path: Path, fail_after_replace: bool, delivery: str
+) -> None:
+    import subprocess
+    import sys
+    import types
+
+    ingress, root, bus, channel = _ingress(
+        tmp_path, FakeTelegram(fail=delivery == "unknown")
+    )
+    module = types.ModuleType("camera_exact_base_for_recovery_test")
+    sys.modules[module.__name__] = module
+    source = subprocess.check_output(
+        ["git", "show", "020e80427a30a1cac019b7f43b3538c8f32cf53e:ohmo/gateway/camera.py"],
+        cwd=Path(__file__).parents[2],
+    )
+    exec(compile(source, "<exact-base-camera>", "exec"), module.__dict__)
+    old = module.CameraIngress(ingress.config, workspace=tmp_path, bus=bus, telegram=channel)
+    request = _candidate(root)
+    upload = await _leased_upload(old, root, "Bearer " + "s" * 40, request)
+    old_ack = await old.admit("Bearer " + "s" * 40, module.CameraCandidateUpload(**upload.__dict__))
+    assert old_ack[0] == 202
+    if delivery == "unknown":
+        await asyncio.gather(*list(old._tasks))
+        assert old._attempts[request["candidate_id"]]["state"] == "delivery_unknown"
+    else:
+        await asyncio.wait_for(bus.consume_inbound(), timeout=1)
+        assert old._attempts[request["candidate_id"]]["state"] == "photo_sent"
+    await old.close()
+    base_journal = json.loads(old._state_path.read_bytes())
+    base_attempt = base_journal["attempts"][request["candidate_id"]]
+    assert "request_identity" not in base_attempt and "request_ack" not in base_attempt
+    assert "image_sha256" not in base_attempt
+    assert base_journal["session"]["last_ack"]["body"] == old_ack[1]
+
+    upgraded = CameraIngress(ingress.config, workspace=tmp_path, bus=bus, telegram=channel)
+    recovery = upgraded._attempts[request["candidate_id"]]["legacy_base_recovery"]
+    assert recovery["proof"] == "base_session_ack_and_verified_managed_snapshot"
+    assert "manifest_sha256" not in recovery
+    legacy_journal_before_lookup = upgraded._state_path.read_bytes()
+    assert await upgraded.reconcile(
+        "Bearer " + "s" * 40, upload, purpose="existing_outcome_only"
+    ) == old_ack
+    assert upgraded._state_path.read_bytes() == legacy_journal_before_lookup
+    assert upgraded._attempts[request["candidate_id"]].get("request_identity") is None
+    assert upgraded._attempts[request["candidate_id"]].get("request_ack") is None
+    assert "request_identity_proof" not in upgraded._attempts[request["candidate_id"]]
+    wrong_seq = replace(upload, request={**upload.request, "seq": upload.request["seq"] + 1})
+    assert await upgraded.reconcile(
+        "Bearer " + "s" * 40, wrong_seq, purpose="existing_outcome_only"
+    ) == (409, {"error": {"code": "candidate_request_mismatch"}})
+    assert upgraded._state_path.read_bytes() == legacy_journal_before_lookup
+    assert await upgraded.reconcile("Bearer " + "s" * 40, wrong_seq) == (
+        409, {"error": {"code": "candidate_request_mismatch"}}
+    )
+    assert await upgraded.reconcile(
+        "Bearer " + "s" * 40, replace(upload, image_bytes=upload.image_bytes + b"x")
+    ) == (422, {"error": {"code": "candidate_evidence_mismatch"}})
+    assert await upgraded.reconcile(
+        "Bearer " + "s" * 40, replace(upload, producer_sidecar_bytes=b"{}")
+    ) == (422, {"error": {"code": "candidate_evidence_mismatch"}})
+    save = upgraded._save_attempts
+    if fail_after_replace:
+        def fail_after():
+            save()
+            raise OSError("simulated lost ACK after durable replace")
+        upgraded._save_attempts = fail_after
+    else:
+        upgraded._save_attempts = lambda: (_ for _ in ()).throw(OSError("before replace"))
+    assert await upgraded.reconcile("Bearer " + "s" * 40, upload) == (
+        503, {"error": {"code": "pre_admission_unavailable"}}
+    )
+    upgraded._save_attempts = save
+    await upgraded.close()
+
+    restarted = CameraIngress(ingress.config, workspace=tmp_path, bus=bus, telegram=channel)
+    assert await restarted.reconcile("Bearer " + "s" * 40, upload) == old_ack
+    assert restarted._session["committed_seq"] == 0
+    assert restarted._session["epoch"] != upload.request["epoch"]
+    recovered_attempt = restarted._attempts[request["candidate_id"]]
+    assert recovered_attempt["state"] == ("delivery_unknown" if delivery == "unknown" else "photo_sent")
+    assert recovered_attempt["photo_delivery_confirmed"] is (delivery == "confirmed")
+    assert len(channel.calls) == 1
+    await restarted.close()
+    await ingress.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("snapshot_state", ["missing", "tampered"])
+async def test_actual_base_ack_without_verified_snapshot_remains_unresolved(
+    tmp_path: Path, snapshot_state: str
+) -> None:
+    import subprocess
+    import sys
+    import types
+
+    ingress, root, bus, channel = _ingress(tmp_path, FakeTelegram(fail=True))
+    module = types.ModuleType("camera_exact_base_without_snapshot_proof")
+    sys.modules[module.__name__] = module
+    source = subprocess.check_output(
+        ["git", "show", "020e80427a30a1cac019b7f43b3538c8f32cf53e:ohmo/gateway/camera.py"],
+        cwd=Path(__file__).parents[2],
+    )
+    exec(compile(source, "<exact-base-camera>", "exec"), module.__dict__)
+    old = module.CameraIngress(ingress.config, workspace=tmp_path, bus=bus, telegram=channel)
+    request = _candidate(root)
+    upload = await _leased_upload(old, root, "Bearer " + "s" * 40, request)
+    assert (await old.admit("Bearer " + "s" * 40, module.CameraCandidateUpload(**upload.__dict__)))[0] == 202
+    await asyncio.gather(*list(old._tasks))
+    attempt = old._attempts[request["candidate_id"]]
+    path = Path(attempt["snapshot"])
+    if snapshot_state == "missing":
+        path.unlink()
+    else:
+        path.write_bytes(b"tampered")
+    await old.close()
+    upgraded = CameraIngress(ingress.config, workspace=tmp_path, bus=bus, telegram=channel)
+    if snapshot_state == "missing":
+        assert "legacy_base_recovery" not in upgraded._attempts[request["candidate_id"]]
+    else:
+        assert upgraded._attempts[request["candidate_id"]]["legacy_base_recovery"][
+            "snapshot_sha256_observed"
+        ] != request["image_sha256"]
+    unresolved_journal = upgraded._state_path.read_bytes()
+    assert await upgraded.reconcile(
+        "Bearer " + "s" * 40, upload, purpose="existing_outcome_only"
+    ) == (503, {"error": {"code": "unknown_original_outcome"}})
+    assert upgraded._state_path.read_bytes() == unresolved_journal
+    assert await upgraded.reconcile("Bearer " + "s" * 40, upload) == (
+        409, {"error": {"code": "candidate_request_mismatch"}}
+    )
+    assert upgraded._session["committed_seq"] == 0
+    assert upgraded._attempts[request["candidate_id"]]["state"] == "delivery_unknown"
+    assert len(channel.calls) == 1
+    await upgraded.close()
+    await ingress.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("case", "expected"),
+    [
+        ("wrong_owner", "empty"),
+        ("out_of_window", "empty"),
+        ("missing_timestamp", "error"),
+        ("wrong_snapshot", "error"),
+        ("assistant", "empty"),
+        ("forwarded", "empty"),
+    ],
+)
+async def test_retained_attachment_provenance_rejects_untrusted_sources(
+    tmp_path: Path, case: str, expected: str
+) -> None:
+    request = _candidate(tmp_path / "artifacts")
+    image_bytes = (tmp_path / "artifacts" / request["candidate_id"] / "original.jpg").read_bytes()
+    config = CameraIngressConfig(
+        enabled=True,
+        listen_port=8765,
+        bearer_token_file=tmp_path / "unused-token",
+        principal="123",
+        tenant_id="marina",
+        chat_id="123",
+        session_key="telegram:123",
+    )
+    backend = OhmoSessionBackend(tmp_path)
+    ref = backend.attachment_store.ingest_bytes(image_bytes, media_type="image/jpeg")
+    capture = datetime.fromisoformat(request["capture_time"]).astimezone(timezone.utc)
+    sid = "snapshot-session"
+    provenance: dict[str, object] = {
+        "schema_version": 1,
+        "channel": "telegram",
+        "principal": "telegram:123",
+        "chat_id": "123",
+        "session_key": config.session_key,
+        "gateway_session_id": sid,
+        "received_at": capture.isoformat(),
+        "timestamp_authority": "inbound_event_timestamp",
+        "is_group": False,
+        "is_forwarded": False,
+        "source_message_id": "source-message",
+    }
+    role = "user"
+    if case == "wrong_owner":
+        provenance["principal"] = "telegram:999"
+    elif case == "out_of_window":
+        provenance["received_at"] = (capture - timedelta(days=8)).isoformat()
+    elif case == "missing_timestamp":
+        provenance["timestamp_authority"] = None
+    elif case == "wrong_snapshot":
+        provenance["gateway_session_id"] = "different-session"
+    elif case == "assistant":
+        role = "assistant"
+    elif case == "forwarded":
+        provenance["is_forwarded"] = True
+    ref = ref.model_copy(update={"source_provenance": provenance})
+    backend.save_snapshot(
+        cwd=tmp_path,
+        model="local-test",
+        system_prompt="",
+        messages=[ConversationMessage(role=role, event_id="source-event", content=[ref])],
+        usage=UsageSnapshot(),
+        session_id=sid,
+        session_key=config.session_key,
+    )
+    pool = object.__new__(OhmoSessionRuntimePool)
+    pool._gateway_config = SimpleNamespace(camera_ingress=config)
+    pool._session_backend = backend
+    pool._attachment_store = backend.attachment_store
+    if expected == "error":
+        with pytest.raises(ValueError):
+            await pool.camera_retained_attachment_history(
+                since=capture - timedelta(days=7), until=capture + timedelta(days=7)
+            )
+    else:
+        evidence = await pool.camera_retained_attachment_history(
+            since=capture - timedelta(days=7), until=capture + timedelta(days=7)
+        )
+        assert evidence == []
+
+
+@pytest.mark.asyncio
+async def test_missing_retained_session_snapshot_fails_closed(tmp_path: Path) -> None:
+    config = CameraIngressConfig(
+        enabled=True,
+        listen_port=8765,
+        bearer_token_file=tmp_path / "unused-token",
+        principal="123",
+        tenant_id="marina",
+        chat_id="123",
+        session_key="telegram:123",
+    )
+    backend = OhmoSessionBackend(tmp_path)
+    pool = object.__new__(OhmoSessionRuntimePool)
+    pool._gateway_config = SimpleNamespace(camera_ingress=config)
+    pool._session_backend = backend
+    pool._attachment_store = backend.attachment_store
+
+    with pytest.raises(ValueError, match="retained private attachment history is unavailable"):
+        await pool.camera_retained_attachment_history(
+            since=datetime.now(timezone.utc) - timedelta(days=7),
+            until=datetime.now(timezone.utc),
+        )
+
+
+@pytest.mark.asyncio
+async def test_stale_capture_time_is_durably_acked_across_restart(tmp_path: Path) -> None:
+    ingress, root, bus, channel = _ingress(tmp_path)
+    stale = _candidate(root, capture_time=datetime.now(timezone.utc) - timedelta(days=8))
+    status, response = await _admit(ingress, root, "Bearer " + "s" * 40, stale)
+    assert status == 422
+    assert response["error"]["code"] == "candidate_capture_time_out_of_window"
+    assert response["ack_seq"] == 1
+    await ingress.close()
+
+    restarted = CameraIngress(ingress.config, workspace=tmp_path, bus=bus, telegram=channel)
+    replay_status, replay = await _admit(
+        restarted, root, "Bearer " + "s" * 40, stale
+    )
+    assert replay_status == status
+    assert replay["error"]["code"] == response["error"]["code"]
+    assert replay["ack_seq"] == 1
+    fresh = _candidate(root, index=1)
+    fresh_status, fresh_response = await _admit(
+        restarted, root, "Bearer " + "s" * 40, fresh
+    )
+    assert fresh_status == 202
+    assert fresh_response["ack_seq"] == 2
+    assert channel.calls == []  # inbound execution remains asynchronous
+    await restarted.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("replay_purpose", ["existing_outcome_only", "retire_ineligible"])
+async def test_reconcile_retires_absent_stale_candidate_and_advances_fresh_work(
+    tmp_path: Path, replay_purpose: str,
+) -> None:
+    ingress, root, bus, channel = _ingress(tmp_path)
+    stale = _candidate(root, capture_time=datetime.now(timezone.utc) - timedelta(days=8))
+    upload = await _leased_upload(ingress, root, "Bearer " + "s" * 40, stale)
+    first_ack = await ingress.reconcile("Bearer " + "s" * 40, upload)
+    assert first_ack == (200, {
+        "status": "retired",
+        "candidate_id": stale["candidate_id"],
+        "reason": "candidate_no_longer_eligible",
+        "session_id": upload.request["session_id"],
+        "epoch": upload.request["epoch"],
+        "ack_seq": upload.request["seq"],
+    })
+    assert ingress._attempts[stale["candidate_id"]]["state"] == "retired"
+    assert channel.calls == [] and bus.inbound_size == 0
+
+    # The response is intentionally treated as lost. The exact request keeps
+    # its ACK across process restart and the rotated epoch is not advanced.
+    await ingress.close()
+    restarted = CameraIngress(ingress.config, workspace=tmp_path, bus=bus, telegram=channel)
+    replay = await restarted.reconcile(
+        "Bearer " + "s" * 40, upload, purpose=replay_purpose
+    )
+    assert replay == first_ack
+    lease_status, new_lease = await restarted.lease("Bearer " + "s" * 40)
+    assert lease_status == 200
+    assert new_lease["epoch"] != upload.request["epoch"]
+    assert new_lease["committed_seq"] == 0
+
+    fresh = _candidate(root, index=1)
+    fresh_status, fresh_ack = await _admit(
+        restarted, root, "Bearer " + "s" * 40, fresh
+    )
+    assert fresh_status == 202 and fresh_ack["ack_seq"] == 1
+    retired_post = _upload(root, {
+        **stale,
+        "session_id": new_lease["session_id"],
+        "epoch": new_lease["epoch"],
+        "seq": 2,
+    })
+    assert await restarted.admit("Bearer " + "s" * 40, retired_post) == (
+        409, {"error": {"code": "candidate_retired"}}
+    )
+    await restarted.close()
+
+
+@pytest.mark.asyncio
+async def test_reconcile_existing_outcome_only_unknown_preserves_positive_request(
+    tmp_path: Path,
+) -> None:
+    ingress, root, bus, channel = _ingress(tmp_path)
+    request = _candidate(root)
+    upload = await _leased_upload(ingress, root, "Bearer " + "s" * 40, request)
+    journal_before = ingress._state_path.read_bytes()
+    status, response = await ingress.reconcile(
+        "Bearer " + "s" * 40, upload, purpose="existing_outcome_only"
+    )
+    assert status == 503 and response["error"]["code"] == "unknown_original_outcome"
+    assert request["candidate_id"] not in ingress._attempts
+    assert ingress._session["committed_seq"] == 0
+    assert ingress._state_path.read_bytes() == journal_before
+    # The unknown-outcome lookup does not call the positive candidate
+    # ineligible: its exact request can still take the ordinary admission path.
+    admitted, ack = await ingress.admit("Bearer " + "s" * 40, upload)
+    assert admitted == 202 and ack["ack_seq"] == 1
+    assert channel.calls == []
+    await ingress.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("known_outcome", [False, True])
+async def test_existing_outcome_lookup_does_not_rotate_expired_lease_or_write_journal(
+    tmp_path: Path, known_outcome: bool
+) -> None:
+    import copy
+
+    ingress, root, bus, channel = _ingress(tmp_path)
+    upload = await _leased_upload(
+        ingress, root, "Bearer " + "s" * 40, _candidate(root)
+    )
+    original_ack = await ingress.reconcile("Bearer " + "s" * 40, upload) if known_outcome else None
+    ingress._session["expires_at"] = (
+        datetime.now(timezone.utc) - timedelta(seconds=1)
+    ).isoformat()
+    ingress._save_attempts()
+    journal_before = ingress._state_path.read_bytes()
+    session_before = copy.deepcopy(ingress._session)
+    attempts_before = copy.deepcopy(ingress._attempts)
+
+    result = await ingress.reconcile(
+        "Bearer " + "s" * 40, upload, purpose="existing_outcome_only"
+    )
+    expected = original_ack or (
+        503, {"error": {"code": "unknown_original_outcome"}}
+    )
+    assert result == expected
+    assert ingress._state_path.read_bytes() == journal_before
+    assert ingress._session == session_before
+    assert ingress._attempts == attempts_before
+    assert channel.calls == [] and bus.inbound_size == 0
+    await ingress.close()
+
+
+@pytest.mark.asyncio
+async def test_expired_existing_outcome_lookup_returns_ack_when_save_would_fail(
+    tmp_path: Path,
+) -> None:
+    ingress, root, bus, channel = _ingress(tmp_path)
+    upload = await _leased_upload(
+        ingress, root, "Bearer " + "s" * 40, _candidate(root)
+    )
+    ack = await ingress.reconcile("Bearer " + "s" * 40, upload)
+    ingress._session["expires_at"] = (
+        datetime.now(timezone.utc) - timedelta(seconds=1)
+    ).isoformat()
+    ingress._save_attempts()
+    journal_before = ingress._state_path.read_bytes()
+
+    def fail_save() -> None:
+        raise OSError("synthetic journal write failure")
+
+    ingress._save_attempts = fail_save
+    assert await ingress.reconcile(
+        "Bearer " + "s" * 40, upload, purpose="existing_outcome_only"
+    ) == ack
+    assert ingress._state_path.read_bytes() == journal_before
+    assert ingress._session["epoch"] == upload.request["epoch"]
+    assert channel.calls == [] and bus.inbound_size == 0
+    await ingress.close()
+
+
+@pytest.mark.asyncio
+async def test_existing_outcome_lookup_keeps_synthetic_base_ack_recovery_read_only(
+    tmp_path: Path,
+) -> None:
+    import copy
+
+    ingress, root, bus, channel = _ingress(tmp_path)
+    upload = await _leased_upload(
+        ingress, root, "Bearer " + "s" * 40, _candidate(root)
+    )
+    original_ack = await ingress.admit("Bearer " + "s" * 40, upload)
+    assert original_ack[0] == 202
+    candidate_id = upload.request["candidate_id"]
+    await ingress.close()  # retain the admitted managed snapshot, cancel delivery
+
+    # Reconstruct the durable base shape from a real synthetic ACK and its
+    # managed snapshot: the base attempt and last_ack lacked these bindings.
+    base_attempt = ingress._attempts[candidate_id]
+    base_attempt.pop("request_identity", None)
+    base_attempt.pop("request_ack", None)
+    base_attempt.pop("image_sha256", None)
+    base_attempt.pop("image_phash", None)
+    base_attempt.pop("phash_algorithm", None)
+    ingress._session["last_ack"].pop("request_identity", None)
+    ingress._save_attempts()
+
+    upgraded = CameraIngress(ingress.config, workspace=tmp_path, bus=bus, telegram=channel)
+    recovered = upgraded._attempts[candidate_id]
+    assert recovered.get("request_identity") is None
+    assert recovered["legacy_base_recovery"]["proof"] == (
+        "base_session_ack_and_verified_managed_snapshot"
+    )
+    proof_journal = upgraded._state_path.read_bytes()
+    wrong_seq = replace(upload, request={
+        **upload.request, "seq": upload.request["seq"] + 1,
+    })
+    assert await upgraded.reconcile(
+        "Bearer " + "s" * 40, wrong_seq, purpose="existing_outcome_only"
+    ) == (409, {"error": {"code": "candidate_request_mismatch"}})
+    assert upgraded._state_path.read_bytes() == proof_journal
+    upgraded._session["expires_at"] = (
+        datetime.now(timezone.utc) - timedelta(seconds=1)
+    ).isoformat()
+    upgraded._save_attempts()
+    journal_before = upgraded._state_path.read_bytes()
+    session_before = copy.deepcopy(upgraded._session)
+    attempt_before = copy.deepcopy(recovered)
+
+    assert await upgraded.reconcile(
+        "Bearer " + "s" * 40, upload, purpose="existing_outcome_only"
+    ) == original_ack
+    assert upgraded._state_path.read_bytes() == journal_before
+    assert upgraded._session == session_before
+    assert upgraded._attempts[candidate_id] == attempt_before
+    assert recovered.get("request_identity") is None
+    assert recovered.get("request_ack") is None
+    assert "request_identity_proof" not in recovered
+    assert channel.calls == [] and bus.inbound_size == 0
+
+    # If the surviving base proof is absent, lookup stays unresolved and does
+    # not convert today's valid upload into historical proof.
+    recovered.pop("legacy_base_recovery")
+    upgraded._save_attempts()
+    unresolved_journal = upgraded._state_path.read_bytes()
+    unresolved_attempt = copy.deepcopy(recovered)
+    assert await upgraded.reconcile(
+        "Bearer " + "s" * 40, upload, purpose="existing_outcome_only"
+    ) == (503, {"error": {"code": "unknown_original_outcome"}})
+    assert upgraded._state_path.read_bytes() == unresolved_journal
+    assert recovered == unresolved_attempt
+    await upgraded.close()
+
+
+@pytest.mark.asyncio
+async def test_reconcile_settles_previously_deferred_candidate(tmp_path: Path) -> None:
+    ingress, root, bus, channel = _ingress(tmp_path)
+    active = _candidate(root)
+    deferred = _candidate(root, index=1)
+    assert (await _admit(ingress, root, "Bearer " + "s" * 40, active))[0] == 202
+    deferred_upload = await _leased_upload(
+        ingress, root, "Bearer " + "s" * 40, deferred
+    )
+    assert (await ingress.admit("Bearer " + "s" * 40, deferred_upload))[0] == 409
+    assert deferred["candidate_id"] not in ingress._attempts
+    retired = await ingress.reconcile("Bearer " + "s" * 40, deferred_upload)
+    assert retired[0] == 200 and retired[1]["status"] == "retired"
+    assert retired[1]["candidate_id"] == deferred["candidate_id"]
+    assert retired[1]["ack_seq"] == deferred_upload.request["seq"]
+    assert ingress._attempts[deferred["candidate_id"]]["state"] == "retired"
+    assert channel.calls == [] and bus.inbound_size == 0
+    await ingress.close()
+
+
+@pytest.mark.asyncio
+async def test_reconcile_admission_race_has_one_terminal_outcome(tmp_path: Path) -> None:
+    ingress, root, bus, channel = _ingress(tmp_path)
+    request = _candidate(root)
+    upload = await _leased_upload(ingress, root, "Bearer " + "s" * 40, request)
+    admitted, reconciled = await asyncio.gather(
+        ingress.admit("Bearer " + "s" * 40, upload),
+        ingress.reconcile("Bearer " + "s" * 40, upload),
+    )
+    assert admitted == reconciled
+    assert admitted[0] in {200, 202}
+    assert admitted[1]["candidate_id"] == request["candidate_id"]
+    assert ingress._attempts[request["candidate_id"]]["state"] in {
+        "retired", "admitted", "photo_sent", "delivery_unknown"
+    }
+    if admitted[1]["status"] == "retired":
+        assert channel.calls == [] and bus.inbound_size == 0
+    else:
+        assert admitted[1]["status"] == "admitted"
+        assert len(channel.calls) <= 1
+    await ingress.close()
+
+
+@pytest.mark.asyncio
+async def test_reconcile_failed_durable_write_retries_after_restart(tmp_path: Path) -> None:
+    ingress, root, bus, channel = _ingress(tmp_path)
+    request = _candidate(root)
+    upload = await _leased_upload(ingress, root, "Bearer " + "s" * 40, request)
+    save_attempts = ingress._save_attempts
+
+    def fail_save() -> None:
+        raise OSError("test journal failure")
+
+    ingress._save_attempts = fail_save
+    assert await ingress.reconcile("Bearer " + "s" * 40, upload) == (
+        503, {"error": {"code": "pre_admission_unavailable"}}
+    )
+    ingress._save_attempts = save_attempts
+    await ingress.close()
+
+    restarted = CameraIngress(ingress.config, workspace=tmp_path, bus=bus, telegram=channel)
+    assert request["candidate_id"] not in restarted._attempts
+    ack = await restarted.reconcile("Bearer " + "s" * 40, upload)
+    assert ack[0] == 200 and ack[1]["status"] == "retired"
+    assert channel.calls == [] and bus.inbound_size == 0
+    await restarted.close()
+
+
+@pytest.mark.asyncio
+async def test_reconcile_rejects_same_candidate_with_different_evidence(tmp_path: Path) -> None:
+    ingress, root, _, _ = _ingress(tmp_path)
+    request = _candidate(root)
+    upload = await _leased_upload(ingress, root, "Bearer " + "s" * 40, request)
+    admitted = await ingress.admit("Bearer " + "s" * 40, upload)
+    assert admitted[0] == 202
+    mutated = replace(upload, request={**upload.request, "source_revision": "other-revision"})
+    status, response = await ingress.reconcile("Bearer " + "s" * 40, mutated)
+    assert status == 422
+    assert response["error"]["code"] == "candidate_evidence_mismatch"
+    assert response.get("admission_id") is None
+    await ingress.close()
+
+
+@pytest.mark.asyncio
+async def test_reconcile_cannot_steal_another_candidates_sequence(tmp_path: Path) -> None:
+    ingress, root, _, _ = _ingress(tmp_path)
+    first = _candidate(root)
+    other = _candidate(root, index=1)
+    first_upload = await _leased_upload(ingress, root, "Bearer " + "s" * 40, first)
+    assert (await ingress.admit("Bearer " + "s" * 40, first_upload))[0] == 202
+    other_upload = replace(
+        await _leased_upload(ingress, root, "Bearer " + "s" * 40, other),
+        request={
+            **other,
+            "session_id": first_upload.request["session_id"],
+            "epoch": first_upload.request["epoch"],
+            "seq": first_upload.request["seq"],
+        },
+    )
+    status, response = await ingress.reconcile("Bearer " + "s" * 40, other_upload)
+    assert status == 409
+    assert response["error"]["code"] == "conflicting_sequence_owner"
+    assert other["candidate_id"] not in ingress._attempts
+    await ingress.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("purpose", ["existing_outcome_only", "retire_ineligible"])
+async def test_crash_after_202_leaves_tombstone_without_auto_retry(
+    tmp_path: Path, purpose: str
+) -> None:
     ingress, root, bus, channel = _ingress(tmp_path)
     request = _candidate(root)
     second = _candidate(root, index=1)
-    assert (await _admit(ingress, root, "Bearer " + "s" * 40, request))[0] == 202
+    original_upload = await _leased_upload(
+        ingress, root, "Bearer " + "s" * 40, request
+    )
+    assert (await ingress.admit("Bearer " + "s" * 40, original_upload))[0] == 202
     snapshot = Path(ingress._attempts[request["candidate_id"]]["snapshot"])
     assert snapshot.exists()
     await ingress.close()  # cancel before the scheduled worker executes
@@ -666,9 +2032,16 @@ async def test_crash_after_202_leaves_tombstone_without_auto_retry(tmp_path: Pat
     restarted = CameraIngress(ingress.config, workspace=tmp_path, bus=bus, telegram=channel)
     restarted.mark_restart_unknown()
     assert snapshot.exists()  # unresolved attempts retain their image for diagnosis/recovery
-    status, duplicate = await _admit(restarted, root, "Bearer " + "s" * 40, request)
+    _, rotated_lease = await restarted.lease("Bearer " + "s" * 40)
+    assert rotated_lease["epoch"] != original_upload.request["epoch"]
+    assert rotated_lease["committed_seq"] == 0
+    status, duplicate = await restarted.reconcile(
+        "Bearer " + "s" * 40, original_upload, purpose=purpose
+    )
     assert status == 202 and duplicate["ack_seq"] == 1
     assert duplicate["admission_id"] == ingress._attempts[request["candidate_id"]]["admission_id"]
+    _, still_rotated = await restarted.lease("Bearer " + "s" * 40)
+    assert still_rotated["committed_seq"] == 0
     assert channel.calls == []
     assert (await _admit(restarted, root, "Bearer " + "s" * 40, second))[0] == 409
 
@@ -995,12 +2368,26 @@ async def test_explicit_real_reply_target_not_bare_yes_stale_or_other_user(tmp_p
         OutboundDeliveryReceipt(channel="telegram", chat_id="123", native_message_ids=(89,)),
     )
     assert ingress._attempts[request["candidate_id"]]["state"] == "completed"
-    assert not snapshot.exists()
-    # A crash after persisting the terminal state but before unlinking is
-    # repaired when the ingress starts again.
-    snapshot.write_bytes(b"stale completed image")
-    CameraIngress(ingress.config, workspace=tmp_path, bus=MessageBus(), telegram=None)
-    assert not snapshot.exists()
+    assert snapshot.exists()
+    query = json.dumps({
+        "candidate_id": candidate_id_for("id:completed-reference-query", "rev-query"),
+        "capture_time": request["capture_time"],
+    }, separators=(",", ":")).encode()
+    status, reference, _ = await _reference_request(ingress, query)
+    assert status == 200
+    assert reference["references"] == [{
+        "candidate_id": request["candidate_id"],
+        "image_sha256": request["image_sha256"],
+        "capture_time": request["capture_time"],
+        "capture_time_authority": "exif",
+        "native_photo_message_id": ingress._attempts[request["candidate_id"]]["photo_id"],
+    }]
+    await ingress.close()
+    restarted = CameraIngress(ingress.config, workspace=tmp_path, bus=MessageBus(), telegram=None)
+    assert snapshot.exists()
+    status, after_restart, _ = await _reference_request(restarted, query)
+    assert status == 200 and after_restart == reference
+    await restarted.close()
     stale_reply = incoming("Я это съела", target=77)
     ingress.process_real_inbound(stale_reply)
     assert stale_reply.metadata.get("_camera_correction") is not CAMERA_AUTHORITY
@@ -1017,6 +2404,69 @@ async def test_explicit_real_reply_target_not_bare_yes_stale_or_other_user(tmp_p
     assert (await _admit(ingress, root, "Bearer " + "s" * 40, second))[0] == 202
     await asyncio.wait_for(bus.consume_inbound(), timeout=1)
     await ingress.close()
+
+
+@pytest.mark.asyncio
+async def test_completed_no_discussion_keeps_canonical_photo_reference_after_restart(
+    tmp_path: Path,
+) -> None:
+    ingress, root, bus, channel = _ingress(tmp_path)
+    request = _candidate(root)
+    assert (await _admit(ingress, root, "Bearer " + "s" * 40, request))[0] == 202
+    await asyncio.wait_for(bus.consume_inbound(), timeout=1)
+    attempt = ingress._attempts[request["candidate_id"]]
+    snapshot = Path(attempt["snapshot"])
+    question = OutboundMessage(
+        channel="telegram", chat_id="123", content="Вы это ели?",
+        metadata={"_camera_authority": CAMERA_AUTHORITY,
+                  "_camera_candidate_id": request["candidate_id"]},
+    )
+    ingress.note_assistant_receipt(
+        question, OutboundDeliveryReceipt(channel="telegram", chat_id="123", native_message_ids=(701,))
+    )
+    answer = InboundMessage(
+        channel="telegram", sender_id="123", chat_id="123", content="Нет, не ела",
+        metadata={"reply_to_message_id": 701, "_telegram_raw_text": "Нет, не ела"},
+    )
+    ingress.process_real_inbound(answer)
+    assert answer.metadata["_camera_answer"] == "no"
+    ingress.complete(answer, recorded=False)
+    assert attempt["state"] == "final_queued"
+    final = OutboundMessage(
+        channel="telegram", chat_id="123", content="Поняла, не записываю.",
+        metadata={"_camera_authority": CAMERA_AUTHORITY,
+                  "_camera_final": CAMERA_AUTHORITY,
+                  "_camera_candidate_id": request["candidate_id"],
+                  "_camera_turn_id": answer.metadata["_camera_turn_id"]},
+    )
+    ingress.note_assistant_receipt(
+        final, OutboundDeliveryReceipt(channel="telegram", chat_id="123", native_message_ids=(702,))
+    )
+    assert attempt["state"] == "completed"
+    assert "camera_commit" not in attempt  # a photo plus a denial creates no meal event
+    assert snapshot.exists()
+    query = json.dumps({
+        "candidate_id": candidate_id_for("id:no-reference-query", "rev-query"),
+        "capture_time": request["capture_time"],
+    }, separators=(",", ":")).encode()
+    status, reference, _ = await _reference_request(ingress, query)
+    assert status == 200
+    assert reference["references"] == [{
+        "candidate_id": request["candidate_id"],
+        "image_sha256": request["image_sha256"],
+        "capture_time": request["capture_time"],
+        "capture_time_authority": "exif",
+        "native_photo_message_id": attempt["photo_id"],
+    }]
+    assert len(channel.calls) == 1
+
+    await ingress.close()
+    restarted = CameraIngress(ingress.config, workspace=tmp_path, bus=MessageBus(), telegram=channel)
+    assert snapshot.exists()
+    status, after_restart, _ = await _reference_request(restarted, query)
+    assert status == 200 and after_restart == reference
+    assert len(channel.calls) == 1  # startup reference recovery never resends the photo
+    await restarted.close()
 
 
 @pytest.mark.asyncio
@@ -1493,7 +2943,8 @@ async def test_second_candidate_waits_for_first_final_native_receipt(tmp_path: P
     ingress.process_real_inbound(answer)
     assert answer.metadata["_camera_answer"] == "yes"
     ingress.complete(answer, recorded=True)  # runtime has not queued/sent final yet
-    assert (await _admit(ingress, root, "Bearer " + "s" * 40, second))[0] == 202
+    second_ack = await _admit(ingress, root, "Bearer " + "s" * 40, second)
+    assert second_ack[0] == 202
     progress = OutboundMessage(
         channel="telegram",
         chat_id="123",
@@ -1518,7 +2969,10 @@ async def test_second_candidate_waits_for_first_final_native_receipt(tmp_path: P
     service = SimpleNamespace(_camera_ingress=ingress)
     receipt = OutboundDeliveryReceipt(channel="telegram", chat_id="123", native_message_ids=(101,))
     await OhmoGatewayService._on_outbound_send_success(service, progress, receipt)
-    assert (await _admit(ingress, root, "Bearer " + "s" * 40, second))[0] == 202
+    second_request = ingress._attempts[second["candidate_id"]]["request_identity"]
+    assert await ingress.admit(
+        "Bearer " + "s" * 40, _upload(root, second_request)
+    ) == second_ack
     duplicate = InboundMessage(
         channel="telegram",
         sender_id="123",
@@ -1531,7 +2985,9 @@ async def test_second_candidate_waits_for_first_final_native_receipt(tmp_path: P
     assert duplicate.metadata.get("_camera_answer") == "yes"
     await OhmoGatewayService._on_outbound_send_success(service, final, receipt)
     assert ingress._attempts[first["candidate_id"]]["state"] == "completed"
-    assert (await _admit(ingress, root, "Bearer " + "s" * 40, second))[0] == 202
+    assert await ingress.admit(
+        "Bearer " + "s" * 40, _upload(root, second_request)
+    ) == second_ack
     await ingress.close()
 
 
@@ -1961,6 +3417,883 @@ class _LostResponseWriter(_Writer):
         raise ConnectionError("response lost after admission")
 
 
+async def _reference_request(ingress: CameraIngress, payload: bytes, *, token: str = "s" * 40,
+                             extra_headers: bytes = b"") -> tuple[int, dict, bytes]:
+    reader = asyncio.StreamReader()
+    reader.feed_data(
+        b"POST /internal/v1/camera/references HTTP/1.1\r\n"
+        + b"Authorization: Bearer " + token.encode() + b"\r\n"
+        + b"Content-Type: application/json\r\n"
+        + f"Content-Length: {len(payload)}\r\n".encode()
+        + extra_headers + b"\r\n" + payload
+    )
+    reader.feed_eof()
+    writer = _Writer()
+    await serve_camera_http(ingress, reader, writer)
+    head, body = writer.data.split(b"\r\n\r\n", 1)
+    return int(head.split(b" ", 2)[1]), json.loads(body), writer.data
+
+
+async def _reference_source_request(
+    ingress: CameraIngress,
+    root: Path,
+    candidate: dict,
+    *,
+    source_request: dict | None = None,
+    token: str = "s" * 40,
+    content_type: str | None = None,
+    body: bytes | None = None,
+    upload: CameraCandidateUpload | None = None,
+) -> tuple[int, dict, bytes]:
+    source = source_request or {
+        "schema_version": 1,
+        "candidate_id": candidate["candidate_id"],
+        "source_revision": candidate["source_revision"],
+        "manifest_sha256": candidate["manifest_sha256"],
+        "image_sha256": candidate["image_sha256"],
+        "capture_time": candidate["capture_time"],
+        "capture_time_authority": candidate["capture_time_authority"],
+    }
+    upload = upload or replace(_upload(root, candidate), request=source)
+    if body is None:
+        content_type, body = _multipart(upload)
+    assert content_type is not None
+    reader = asyncio.StreamReader()
+    reader.feed_data(
+        b"POST /internal/v1/camera/reference-source HTTP/1.1\r\n"
+        + b"Authorization: Bearer " + token.encode() + b"\r\n"
+        + f"Content-Type: {content_type}\r\nContent-Length: {len(body)}\r\n\r\n".encode()
+        + body
+    )
+    reader.feed_eof()
+    writer = _Writer()
+    await serve_camera_http(ingress, reader, writer)
+    head, response_body = writer.data.split(b"\r\n\r\n", 1)
+    return int(head.split(b" ", 2)[1]), json.loads(response_body), writer.data
+
+
+def test_completed_snapshot_cleanup_obeys_trusted_seven_day_window(tmp_path: Path) -> None:
+    ingress, _, _, _ = _ingress(tmp_path)
+    snapshots = tmp_path / "camera_ingress" / "snapshots"
+    snapshots.mkdir(parents=True, exist_ok=True)
+    now = datetime.now(timezone.utc)
+    cases = {
+        "inside": now - timedelta(days=7) + timedelta(seconds=1),
+        "outside": now - timedelta(days=7) - timedelta(seconds=1),
+    }
+    for name, capture in cases.items():
+        admission_id = f"{name}-admission"
+        path = snapshots / f"{admission_id}.jpg"
+        path.write_bytes(b"synthetic original")
+        ingress._attempts[name] = {
+            "state": "completed",
+            "admission_id": admission_id,
+            "snapshot": str(path),
+            "capture_time": capture.isoformat(),
+            "capture_time_authority": "exif",
+        }
+    pending_path = snapshots / "pending-admission.jpg"
+    pending_path.write_bytes(b"synthetic unresolved original")
+    ingress._attempts["pending"] = {
+        "state": "delivery_unknown",
+        "admission_id": "pending-admission",
+        "snapshot": str(pending_path),
+        "capture_time": (now - timedelta(days=8)).isoformat(),
+        "capture_time_authority": "exif",
+    }
+
+    ingress._remove_completed_snapshots()
+
+    assert (snapshots / "inside-admission.jpg").exists()
+    assert not (snapshots / "outside-admission.jpg").exists()
+    assert pending_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_http_camera_references_are_read_only_native_receipt_projection(tmp_path: Path) -> None:
+    ingress, root, bus, channel = _ingress(tmp_path)
+    capture = datetime.now(timezone.utc).replace(microsecond=0) - timedelta(seconds=15)
+    request = _candidate(root, index=911, capture_time=capture)
+    status, _ = await _admit(ingress, root, "Bearer " + "s" * 40, request)
+    assert status == 202
+    await asyncio.wait_for(bus.consume_inbound(), timeout=1)
+    attempt = ingress._attempts[request["candidate_id"]]
+    assert attempt["photo_delivery_confirmed"] is True
+    attempt["state"] = "delivery_unknown"  # receipt still proves the photo was sent
+    ingress._save_attempts()
+    query = json.dumps({
+        "candidate_id": candidate_id_for("id:fake-query", "rev-query"),
+        "capture_time": (capture + timedelta(seconds=5)).isoformat(),
+    }, separators=(",", ":")).encode()
+    journal = ingress._state_path.read_bytes()
+    journal_mtime = ingress._state_path.stat().st_mtime_ns
+    original_epoch = ingress._session["epoch"]
+    ingress._session["expires_at"] = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+    original_save = ingress._save_attempts
+    ingress._save_attempts = lambda: (_ for _ in ()).throw(AssertionError("read route saved journal"))
+    code, response, _ = await _reference_request(ingress, query)
+    assert code == 200
+    assert set(response) == {"schema_version", "scope", "selection_policy", "references", "pending_candidate_ids"}
+    assert response["schema_version"] == 1
+    assert response["scope"] == {
+        "principal": "123", "chat_id": "123", "tenant_id": "marina", "session_key": "telegram:123"
+    }
+    assert response["selection_policy"] == "confirmed-camera-five-minute-v1"
+    assert response["references"] == [{
+        "candidate_id": request["candidate_id"],
+        "image_sha256": request["image_sha256"],
+        "capture_time": capture.isoformat(),
+        "capture_time_authority": "exif",
+        "native_photo_message_id": attempt["photo_id"],
+    }]
+    assert response["pending_candidate_ids"] == []
+    assert ingress._state_path.read_bytes() == journal
+    assert ingress._state_path.stat().st_mtime_ns == journal_mtime
+    assert ingress._session["epoch"] == original_epoch
+    ingress._save_attempts = original_save
+    await ingress.close()
+    assert len(channel.calls) == 1
+    assert bus.inbound_size == 0
+
+
+@pytest.mark.asyncio
+async def test_http_camera_references_pending_bad_proof_and_strict_queries(tmp_path: Path) -> None:
+    ingress, root, _, _ = _ingress(tmp_path)
+    capture = datetime.now(timezone.utc).replace(microsecond=0) - timedelta(seconds=10)
+    request = _candidate(root, index=912, capture_time=capture)
+    request_id = request["candidate_id"]
+    ingress._attempts[request_id] = {
+        "state": "admitted", "capture_time": capture.isoformat(),
+        "capture_time_authority": "filename", "photo_delivery_confirmed": False,
+        "attention_active": True,
+    }
+    ingress._save_attempts()
+    query = json.dumps({"candidate_id": candidate_id_for("id:query", "rev"),
+                        "capture_time": (capture + timedelta(seconds=1)).isoformat()}).encode()
+    code, response, _ = await _reference_request(ingress, query)
+    assert code == 200
+    assert response["references"] == []
+    assert response["pending_candidate_ids"] == [request_id]
+
+    # A claimed native receipt with bool ID or missing snapshot cannot silently
+    # become a reference. A present snapshot with the wrong bytes fails too.
+    attempt = ingress._attempts[request_id]
+    attempt.update(photo_delivery_confirmed=True, photo_id=True,
+                   image_sha256=request["image_sha256"],
+                   snapshot=str(tmp_path / "camera_ingress/snapshots/fake.jpg"),
+                   admission_id="fake")
+    ingress._save_attempts()
+    code, error, _ = await _reference_request(ingress, query)
+    assert code == 503 and error["error"]["code"] == "reference_evidence_unavailable"
+    snapshot = Path(attempt["snapshot"])
+    snapshot.parent.mkdir(parents=True, exist_ok=True)
+    snapshot.write_bytes(b"different retained bytes")
+    code, error, _ = await _reference_request(ingress, query)
+    assert code == 503 and error["error"]["code"] == "reference_evidence_unavailable"
+    attempt["photo_id"] = 77
+    ingress._save_attempts()
+    code, error, _ = await _reference_request(ingress, query)
+    assert code == 503 and error["error"]["code"] == "reference_evidence_unavailable"
+
+    for malformed in (
+        b'{"candidate_id":"x","capture_time":"2026-10-01T00:00:00+00:00","scope":"other"}',
+        b'{"candidate_id":"x","capture_time":"2026-10-01T00:00:00"}',
+        b'{"candidate_id":"x","capture_time":"2026-10-01T00:00:00+00:00","candidate_id":"y"}',
+    ):
+        code, _, _ = await _reference_request(ingress, malformed)
+        assert code == 400
+    code, _, _ = await _reference_request(ingress, b" " * 4097)
+    assert code == 400
+    code, _, _ = await _reference_request(
+        ingress, query, extra_headers=b"X-Unexpected: value\r\n"
+    )
+    assert code == 400
+    code, _, _ = await _reference_request(
+        ingress, query, extra_headers=b"Authorization: Bearer " + b"s" * 40 + b"\r\n"
+    )
+    assert code == 400
+    code, _, _ = await _reference_request(
+        ingress, query, extra_headers=b"X-Large: " + b"x" * 9000 + b"\r\n"
+    )
+    assert code == 400
+    code, error, _ = await _reference_request(ingress, query, token="wrong")
+    assert code == 401 and error["error"]["code"] == "unauthorized"
+    ingress.config = ingress.config.model_copy(update={"enabled": False})
+    code, error, _ = await _reference_request(ingress, query)
+    assert code == 403 and error["error"]["code"] == "camera_disabled"
+    await ingress.close()
+
+
+@pytest.mark.asyncio
+async def test_http_camera_references_capture_window_and_restart_stability(tmp_path: Path) -> None:
+    ingress, root, bus, _ = _ingress(tmp_path)
+    assert (await ingress.lease("Bearer " + "s" * 40))[0] == 200
+    old_query = json.dumps({"candidate_id": candidate_id_for("id:q", "r"),
+                            "capture_time": (datetime.now(timezone.utc) - timedelta(days=7, seconds=1)).isoformat()}).encode()
+    code, error, _ = await _reference_request(ingress, old_query)
+    assert code == 422 and error["error"]["code"] == "capture_out_of_window"
+    capture = datetime.now(timezone.utc).replace(microsecond=0) - timedelta(seconds=20)
+    request = _candidate(root, index=913, capture_time=capture)
+    assert (await _admit(ingress, root, "Bearer " + "s" * 40, request))[0] == 202
+    await asyncio.wait_for(bus.consume_inbound(), timeout=1)
+    query = json.dumps({"candidate_id": candidate_id_for("id:q3", "r3"),
+                        "capture_time": (capture + timedelta(seconds=5)).isoformat()}).encode()
+    before_code, before_response, _ = await _reference_request(ingress, query)
+    assert before_code == 200 and len(before_response["references"]) == 1
+    journal = ingress._state_path.read_bytes()
+    journal_mtime = ingress._state_path.stat().st_mtime_ns
+    await ingress.close()
+    restarted = CameraIngress(ingress.config, workspace=tmp_path, bus=ingress._bus,
+                              telegram=ingress._telegram)
+    restarted._save_attempts = lambda: (_ for _ in ()).throw(AssertionError("read route saved journal"))
+    code, response, _ = await _reference_request(restarted, query)
+    assert code == 200 and response == before_response
+    assert restarted._state_path.read_bytes() == journal
+    assert restarted._state_path.stat().st_mtime_ns == journal_mtime
+    await restarted.close()
+
+
+@pytest.mark.asyncio
+async def test_v2_reestablishes_missing_legacy_source_without_changing_admission_history(
+    tmp_path: Path,
+) -> None:
+    ingress, root, bus, channel = _ingress(tmp_path)
+    capture = datetime.now(timezone.utc).replace(microsecond=0) - timedelta(seconds=45)
+    legacy = _candidate(root, index=921, capture_time=capture)
+    assert (await _admit(ingress, root, "Bearer " + "s" * 40, legacy))[0] == 202
+    await asyncio.wait_for(bus.consume_inbound(), timeout=1)
+    attempt = ingress._attempts[legacy["candidate_id"]]
+    assert attempt["photo_delivery_confirmed"] is True
+    attempt["state"] = "completed"
+    # Reproduce the retained base journal: native receipt and candidate remain,
+    # but its capture, hashes, request, and exact original bytes are absent.
+    original_snapshot = Path(attempt["snapshot"])
+    original_snapshot.unlink()
+    for field in (
+        "capture_time", "capture_time_authority", "image_sha256", "image_phash",
+        "phash_algorithm", "request_identity", "request_ack", "legacy_base_recovery",
+    ):
+        attempt.pop(field, None)
+    ingress._session["last_ack"] = None
+
+    for index in range(922, 925):
+        nearby = _candidate(root, index=index, capture_time=capture - timedelta(seconds=index - 921))
+        admission_id = f"cam1-{index:032x}"
+        image = _upload(root, nearby).image_bytes
+        path = tmp_path / "camera_ingress" / "snapshots" / f"{admission_id}.jpg"
+        path.write_bytes(image)
+        ingress._attempts[nearby["candidate_id"]] = {
+            "state": "completed",
+            "admission_id": admission_id,
+            "snapshot": str(path),
+            "photo_id": index,
+            "photo_delivery_confirmed": True,
+            "attention_active": False,
+            "admitted_at": datetime.now(timezone.utc).isoformat(),
+            "capture_time": nearby["capture_time"],
+            "capture_time_authority": nearby["capture_time_authority"],
+            "image_sha256": nearby["image_sha256"],
+        }
+    # The legacy format was a candidate-keyed object without schema/session
+    # wrappers. Load those retained rows through the production migration path.
+    ingress._state_path.write_text(
+        json.dumps(ingress._attempts, separators=(",", ":")), encoding="utf-8"
+    )
+    await ingress.close()
+    ingress = CameraIngress(ingress.config, workspace=tmp_path, bus=MessageBus(), telegram=channel)
+    query = json.dumps({
+        "schema_version": 2,
+        "candidate_id": candidate_id_for("id:v2-query", "rev-v2-query"),
+        "capture_time": capture.isoformat(),
+    }, separators=(",", ":")).encode()
+    initial_journal = ingress._state_path.read_bytes()
+    initial_journal_mtime = ingress._state_path.stat().st_mtime_ns
+    code, before, _ = await _reference_request(ingress, query)
+    assert code == 200 and before["schema_version"] == 2
+    assert before["coverage"] == "incomplete"
+    assert before["unresolved_candidate_ids"] == [legacy["candidate_id"]]
+    assert len(before["references"]) == 3
+    assert before["reestablished_references"] == []
+    assert ingress._state_path.read_bytes() == initial_journal
+    assert ingress._state_path.stat().st_mtime_ns == initial_journal_mtime
+
+    await ingress.close()
+    reopened = CameraIngress(ingress.config, workspace=tmp_path, bus=MessageBus(), telegram=channel)
+    reloaded = reopened._attempts[legacy["candidate_id"]]
+    assert reloaded.get("capture_time") is None and reloaded.get("request_identity") is None
+    assert reloaded["photo_delivery_confirmed"] is True and reloaded["photo_id"] > 0
+    session_before = json.loads(json.dumps(reopened._session))
+    legacy_attempt_before = json.loads(json.dumps(reloaded))
+    code, result, _ = await _reference_source_request(reopened, root, legacy)
+    assert code == 200 and result["status"] == "source_reestablished"
+    assert result["source_evidence_authority"] == "current_immutable_original_revision"
+    assert result["candidate_id"] == legacy["candidate_id"]
+    assert reopened._session == session_before
+    for field in ("state", "photo_id", "photo_delivery_confirmed", "request_identity", "request_ack"):
+        assert reloaded.get(field) == legacy_attempt_before.get(field)
+    assert datetime.fromisoformat(
+        reloaded["reference_source"]["capture_time"].replace("Z", "+00:00")
+    ) == datetime.fromisoformat(legacy["capture_time"].replace("Z", "+00:00"))
+    assert reloaded["reference_source"]["image_sha256"] == legacy["image_sha256"]
+    assert reloaded["reference_source"]["snapshot"] == str(original_snapshot)
+    assert not reloaded.get("camera_commit")
+    assert len(channel.calls) == 1 and reopened._bus.inbound_size == 0
+
+    code, complete, _ = await _reference_request(reopened, query)
+    assert code == 200 and complete["coverage"] == "complete"
+    assert complete["unresolved_candidate_ids"] == []
+    assert len(complete["references"]) == 3
+    assert complete["reestablished_references"] == [{
+        "candidate_id": legacy["candidate_id"],
+        "image_sha256": legacy["image_sha256"],
+        "capture_time": legacy["capture_time"],
+        "capture_time_authority": "exif",
+        "native_photo_message_id": legacy_attempt_before["photo_id"],
+        "source_evidence_authority": "current_immutable_original_revision",
+        "reestablished_at": result["reestablished_at"],
+    }]
+    journal = reopened._state_path.read_bytes()
+    journal_mtime = reopened._state_path.stat().st_mtime_ns
+    code, after, _ = await _reference_request(reopened, query)
+    assert code == 200 and after == complete
+    assert reopened._state_path.read_bytes() == journal
+    assert reopened._state_path.stat().st_mtime_ns == journal_mtime
+    code, retry, _ = await _reference_source_request(reopened, root, legacy)
+    assert code == 200 and retry == result
+    assert reopened._state_path.read_bytes() == journal
+    assert reopened._state_path.stat().st_mtime_ns == journal_mtime
+    duplicate = _candidate(
+        root, index=937, capture_time=datetime.fromisoformat(legacy["capture_time"]) + timedelta(seconds=2)
+    )
+    duplicate_manifest_path = root / duplicate["candidate_id"] / "manifest.json"
+    duplicate_manifest = json.loads(duplicate_manifest_path.read_text(encoding="utf-8"))
+    original_bytes = _upload(root, legacy).image_bytes
+    (root / duplicate["candidate_id"] / "original.jpg").write_bytes(original_bytes)
+    duplicate_manifest["original_size_bytes"] = len(original_bytes)
+    duplicate_manifest["original_sha256"] = hashlib.sha256(original_bytes).hexdigest()
+    duplicate_manifest_bytes = json.dumps(duplicate_manifest, separators=(",", ":")).encode()
+    duplicate_manifest_path.write_bytes(duplicate_manifest_bytes)
+    duplicate["image_sha256"] = hashlib.sha256(original_bytes).hexdigest()
+    duplicate["manifest_sha256"] = hashlib.sha256(duplicate_manifest_bytes).hexdigest()
+    _producer_sidecar(root, duplicate)
+    duplicate_status, duplicate_ack = await _admit(
+        reopened, root, "Bearer " + "s" * 40, duplicate
+    )
+    assert duplicate_status == 200 and duplicate_ack["status"] == "duplicate"
+    assert duplicate_ack["duplicate_of"] == legacy["candidate_id"]
+    assert reopened._attempts[duplicate["candidate_id"]]["state"] == "duplicate"
+    assert len(channel.calls) == 1 and reopened._bus.inbound_size == 0
+    await reopened.close()
+    assert len(channel.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_reference_source_keeps_historical_request_ack_across_restart(tmp_path: Path) -> None:
+    ingress, root, bus, channel = _ingress(tmp_path)
+    candidate = _candidate(root, index=939)
+    assert (await _admit(ingress, root, "Bearer " + "s" * 40, candidate))[0] == 202
+    await asyncio.wait_for(bus.consume_inbound(), timeout=1)
+    attempt = ingress._attempts[candidate["candidate_id"]]
+    attempt["state"] = "completed"
+    saved_identity = json.loads(json.dumps(attempt["request_identity"]))
+    saved_ack = json.loads(json.dumps(attempt["request_ack"]))
+    original_snapshot = Path(attempt["snapshot"])
+    original_snapshot.unlink()
+
+    code, result, _ = await _reference_source_request(ingress, root, candidate)
+    assert code == 200 and result["status"] == "source_reestablished"
+    assert attempt["request_identity"] == saved_identity
+    assert attempt["request_ack"] == saved_ack
+    assert datetime.fromisoformat(attempt["capture_time"].replace("Z", "+00:00")) == (
+        datetime.fromisoformat(saved_identity["capture_time"].replace("Z", "+00:00"))
+    )
+    assert attempt["image_sha256"] == saved_identity["image_sha256"]
+    assert Path(attempt["reference_source"]["snapshot"]).exists()
+    await ingress.close()
+
+    reopened = CameraIngress(ingress.config, workspace=tmp_path, bus=MessageBus(), telegram=channel)
+    restored = reopened._attempts[candidate["candidate_id"]]
+    assert restored["request_identity"] == saved_identity
+    assert restored["request_ack"] == saved_ack
+    query = json.dumps({
+        "schema_version": 2,
+        "candidate_id": candidate_id_for("id:request-identity-query", "rev-request-query"),
+        "capture_time": candidate["capture_time"],
+    }, separators=(",", ":")).encode()
+    code, response, _ = await _reference_request(reopened, query)
+    assert code == 200 and response["coverage"] == "complete"
+    assert response["reestablished_references"][0]["candidate_id"] == candidate["candidate_id"]
+    assert len(channel.calls) == 1 and reopened._bus.inbound_size == 0
+    await reopened.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure", ["stage", "journal", "journal-after-write", "publish", "verify"]
+)
+async def test_reference_source_failure_boundaries_hold_and_retry_idempotently(
+    tmp_path: Path, monkeypatch, failure: str
+) -> None:
+    ingress, root, bus, channel = _ingress(tmp_path)
+    candidate = _candidate(root, index=931)
+    assert (await _admit(ingress, root, "Bearer " + "s" * 40, candidate))[0] == 202
+    await asyncio.wait_for(bus.consume_inbound(), timeout=1)
+    attempt = ingress._attempts[candidate["candidate_id"]]
+    attempt["state"] = "completed"
+    Path(attempt["snapshot"]).unlink()
+    for field in ("capture_time", "capture_time_authority", "image_sha256"):
+        attempt.pop(field, None)
+    ingress._save_attempts()
+
+    original_stage = ingress._stage_reference_source_image
+    original_save = ingress._save_attempts
+    original_publish = ingress._publish_reference_source_image
+    if failure == "stage":
+        monkeypatch.setattr(
+            ingress, "_stage_reference_source_image",
+            lambda *_args: (_ for _ in ()).throw(OSError("stage failure")),
+        )
+    elif failure == "journal":
+        monkeypatch.setattr(
+            ingress, "_save_attempts",
+            lambda: (_ for _ in ()).throw(OSError("journal failure")),
+        )
+    elif failure == "journal-after-write":
+        def save_then_fail() -> None:
+            original_save()
+            raise OSError("post-write journal failure")
+
+        monkeypatch.setattr(ingress, "_save_attempts", save_then_fail)
+    elif failure == "verify":
+        original_read = camera_module._read_regular
+        target_name = Path(attempt["snapshot"]).name
+
+        def corrupted_target_read(path, maximum, *, dir_fd=None):
+            if Path(path).name == target_name:
+                return b"wrong retained bytes"
+            return original_read(path, maximum, dir_fd=dir_fd)
+
+        monkeypatch.setattr(camera_module, "_read_regular", corrupted_target_read)
+    else:
+        monkeypatch.setattr(
+            ingress, "_publish_reference_source_image",
+            lambda *_args: (_ for _ in ()).throw(OSError("publish failure")),
+        )
+    code, error, _ = await _reference_source_request(ingress, root, candidate)
+    assert code == 503 and error["error"]["code"] == "reference_source_persistence_failed"
+    if failure in {"stage", "journal"}:
+        assert "reference_source" not in attempt
+    else:
+        assert "reference_source" in attempt  # durable current metadata, no published bytes
+    if failure == "journal-after-write":
+        assert candidate["candidate_id"] in ingress._reference_source_pending_commit
+        monkeypatch.setattr(ingress, "_save_attempts", original_save)
+        seq_before = ingress._session["committed_seq"]
+        blocked = _candidate(root, index=938)
+        blocked_status, blocked_error = await _admit(
+            ingress, root, "Bearer " + "s" * 40, blocked
+        )
+        assert blocked_status == 503
+        assert blocked_error["error"]["code"] == "duplicate_evidence_unavailable"
+        assert ingress._session["committed_seq"] == seq_before
+        assert blocked["candidate_id"] not in ingress._attempts
+    query = json.dumps({
+        "schema_version": 2,
+        "candidate_id": candidate_id_for("id:failure-query", "rev-failure"),
+        "capture_time": candidate["capture_time"],
+    }, separators=(",", ":")).encode()
+    code, projection, _ = await _reference_request(ingress, query)
+    assert code == 200 and projection["coverage"] == "incomplete"
+    assert candidate["candidate_id"] in projection["unresolved_candidate_ids"]
+
+    monkeypatch.setattr(ingress, "_stage_reference_source_image", original_stage)
+    monkeypatch.setattr(ingress, "_save_attempts", original_save)
+    monkeypatch.setattr(ingress, "_publish_reference_source_image", original_publish)
+    if failure == "verify":
+        monkeypatch.setattr(camera_module, "_read_regular", original_read)
+    code, restored, _ = await _reference_source_request(ingress, root, candidate)
+    assert code == 200 and restored["status"] == "source_reestablished"
+    code, projection, _ = await _reference_request(ingress, query)
+    assert code == 200 and projection["coverage"] == "complete"
+    assert projection["unresolved_candidate_ids"] == []
+    assert len(channel.calls) == 1 and bus.inbound_size == 0
+    await ingress.close()
+
+
+@pytest.mark.asyncio
+async def test_reference_source_pending_commit_retries_after_capture_expires_without_restart(
+    tmp_path: Path, monkeypatch
+) -> None:
+    ingress, root, bus, channel = _ingress(tmp_path)
+    base = datetime.now(timezone.utc).replace(microsecond=0)
+
+    class ControlledDatetime(datetime):
+        current = base
+
+        @classmethod
+        def now(cls, tz=None):
+            value = cls.current
+            return value.astimezone(tz) if tz is not None else value.replace(tzinfo=None)
+
+    monkeypatch.setattr(camera_module, "datetime", ControlledDatetime)
+    captured = base - timedelta(minutes=1)
+    candidate = _candidate(root, index=939, capture_time=captured)
+    assert (await _admit(ingress, root, "Bearer " + "s" * 40, candidate))[0] == 202
+    await asyncio.wait_for(bus.consume_inbound(), timeout=1)
+    attempt = ingress._attempts[candidate["candidate_id"]]
+    attempt["state"] = "completed"
+    attempt["attention_active"] = False
+    original_request = json.dumps(attempt["request_identity"], sort_keys=True, separators=(",", ":"))
+    original_ack = json.dumps(attempt["request_ack"], sort_keys=True, separators=(",", ":"))
+    Path(attempt["snapshot"]).unlink()
+    ingress._save_attempts()
+
+    save_attempts = ingress._save_attempts
+
+    def save_then_fail() -> None:
+        save_attempts()
+        raise OSError("synthetic post-write fsync failure")
+
+    monkeypatch.setattr(ingress, "_save_attempts", save_then_fail)
+    status, error, _ = await _reference_source_request(ingress, root, candidate)
+    assert status == 503 and error["error"]["code"] == "reference_source_persistence_failed"
+    assert candidate["candidate_id"] in ingress._reference_source_pending_commit
+    observation = json.dumps(
+        attempt["reference_source"], sort_keys=True, separators=(",", ":")
+    )
+    ControlledDatetime.current = base + timedelta(days=8)
+    query = json.dumps({
+        "schema_version": 2,
+        "candidate_id": candidate_id_for("id:expired-source-query", "rev-expired-source"),
+        "capture_time": ControlledDatetime.current.isoformat(),
+    }, separators=(",", ":")).encode()
+    session_before_query = dict(ingress._session)
+    status, projection, _ = await _reference_request(ingress, query)
+    assert status == 200 and projection["coverage"] == "complete"
+    assert projection["unresolved_candidate_ids"] == []
+    assert projection["references"] == [] and projection["reestablished_references"] == []
+    assert candidate["candidate_id"] not in projection["pending_candidate_ids"]
+    assert ingress._session == session_before_query
+
+    # Keep the synthetic admission lease current while advancing the injected
+    # clock; the expired source observation must not act as a global barrier.
+    monkeypatch.setattr(ingress, "_save_attempts", save_attempts)
+    ingress._session["expires_at"] = (
+        ControlledDatetime.current + timedelta(hours=1)
+    ).isoformat()
+    fresh_capture = ControlledDatetime.current - timedelta(days=6)
+    fresh = _candidate(root, index=941, capture_time=fresh_capture)
+    admission_status, admission_ack = await _admit(
+        ingress, root, "Bearer " + "s" * 40, fresh
+    )
+    assert admission_status == 202 and admission_ack["ack_seq"] == 2, admission_ack
+    assert fresh["candidate_id"] in ingress._attempts
+    assert abs(
+        (fresh_capture - captured).total_seconds()
+    ) < timedelta(days=7).total_seconds()
+    fresh_attempt = ingress._attempts[fresh["candidate_id"]]
+    fresh_task = next(
+        (
+            task
+            for task in ingress._tasks
+            if task.get_name() == fresh_attempt["admission_id"]
+        ),
+        None,
+    )
+    if fresh_task is not None:
+        await asyncio.wait_for(asyncio.shield(fresh_task), timeout=1)
+    assert fresh_attempt["photo_delivery_confirmed"] is True
+    assert type(fresh_attempt["photo_id"]) is int and fresh_attempt["photo_id"] > 0
+    assert fresh_attempt["request_ack"]["status"] == 202
+    assert fresh_attempt["request_ack"]["body"]["ack_seq"] == admission_ack["ack_seq"]
+    fresh_event = await asyncio.wait_for(bus.consume_inbound(), timeout=1)
+    assert fresh_event.metadata["_camera_candidate_id"] == fresh["candidate_id"]
+    assert fresh_event.metadata["_camera_photo_id"] == fresh_attempt["photo_id"]
+
+    # Settle the new candidate's delivery task before taking the retry baseline.
+    journal_after_write = ingress._state_path.read_bytes()
+    session_before_retry = dict(ingress._session)
+    attempt_ids_before_retry = set(ingress._attempts)
+    native_calls_before_retry = len(channel.calls)
+    assert native_calls_before_retry == 2
+
+    status, restored, _ = await _reference_source_request(ingress, root, candidate)
+    assert status == 200 and restored["status"] == "source_reestablished"
+    assert candidate["candidate_id"] not in ingress._reference_source_pending_commit
+    assert json.dumps(attempt["reference_source"], sort_keys=True, separators=(",", ":")) == observation
+    assert ingress._state_path.read_bytes() == journal_after_write
+    assert json.dumps(attempt["request_identity"], sort_keys=True, separators=(",", ":")) == original_request
+    assert json.dumps(attempt["request_ack"], sort_keys=True, separators=(",", ":")) == original_ack
+    assert ingress._session == session_before_retry
+    assert set(ingress._attempts) == attempt_ids_before_retry
+    assert len(channel.calls) == native_calls_before_retry == 2
+    assert bus.inbound_size == 0
+
+    status, projection, _ = await _reference_request(ingress, query)
+    assert status == 200 and projection["coverage"] == "complete"
+    assert projection["unresolved_candidate_ids"] == []
+    assert projection["references"] == [] and projection["reestablished_references"] == []
+
+    await ingress.close()
+    reopened = CameraIngress(ingress.config, workspace=tmp_path, bus=MessageBus(), telegram=channel)
+    replay_observation = json.dumps(
+        reopened._attempts[candidate["candidate_id"]]["reference_source"],
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    assert replay_observation == observation
+    reopened_journal = reopened._state_path.read_bytes()
+    status, restored_again, _ = await _reference_source_request(reopened, root, candidate)
+    assert status == 200 and restored_again["status"] == "source_reestablished"
+    assert reopened._state_path.read_bytes() == reopened_journal
+    assert json.dumps(
+        reopened._attempts[candidate["candidate_id"]]["reference_source"],
+        sort_keys=True,
+        separators=(",", ":"),
+    ) == observation
+    status, projection, _ = await _reference_request(reopened, query)
+    assert status == 200 and projection["coverage"] == "complete"
+    assert projection["unresolved_candidate_ids"] == []
+    assert len(channel.calls) == 2
+    await reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_reference_source_pending_commit_holds_at_inclusive_seven_day_boundary(
+    tmp_path: Path, monkeypatch
+) -> None:
+    ingress, root, bus, channel = _ingress(tmp_path)
+    base = datetime.now(timezone.utc).replace(microsecond=0)
+
+    class ControlledDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return base.astimezone(tz) if tz is not None else base.replace(tzinfo=None)
+
+    monkeypatch.setattr(camera_module, "datetime", ControlledDatetime)
+    captured = base - timedelta(days=7)
+    candidate = _candidate(root, index=940, capture_time=captured)
+    assert (await _admit(ingress, root, "Bearer " + "s" * 40, candidate))[0] == 202
+    await asyncio.wait_for(bus.consume_inbound(), timeout=1)
+    attempt = ingress._attempts[candidate["candidate_id"]]
+    attempt["state"] = "completed"
+    Path(attempt["snapshot"]).unlink()
+    ingress._save_attempts()
+    save_attempts = ingress._save_attempts
+
+    def save_then_fail() -> None:
+        save_attempts()
+        raise OSError("synthetic post-write fsync failure")
+
+    monkeypatch.setattr(ingress, "_save_attempts", save_then_fail)
+    status, error, _ = await _reference_source_request(ingress, root, candidate)
+    assert status == 503 and error["error"]["code"] == "reference_source_persistence_failed"
+    assert candidate["candidate_id"] in ingress._reference_source_pending_commit
+    query = json.dumps({
+        "schema_version": 2,
+        "candidate_id": candidate_id_for("id:boundary-source-query", "rev-boundary-source"),
+        "capture_time": captured.isoformat(),
+    }, separators=(",", ":")).encode()
+    status, projection, _ = await _reference_request(ingress, query)
+    assert status == 200 and projection["coverage"] == "incomplete"
+    assert projection["unresolved_candidate_ids"] == [candidate["candidate_id"]]
+    at_boundary = _candidate(root, index=942, capture_time=base)
+    sequence_before = ingress._session["committed_seq"]
+    monkeypatch.setattr(ingress, "_save_attempts", save_attempts)
+    status, error = await _admit(ingress, root, "Bearer " + "s" * 40, at_boundary)
+    assert status == 503 and error["error"]["code"] == "duplicate_evidence_unavailable"
+    assert ingress._session["committed_seq"] == sequence_before
+    assert at_boundary["candidate_id"] not in ingress._attempts
+    assert len(channel.calls) == 1 and bus.inbound_size == 0
+    await ingress.close()
+
+
+@pytest.mark.asyncio
+async def test_reference_source_rejects_missing_receipt_and_contradictory_or_malformed_artifacts(
+    tmp_path: Path,
+) -> None:
+    ingress, root, bus, _ = _ingress(tmp_path)
+    candidate = _candidate(root, index=932)
+    valid_upload = replace(
+        _upload(root, candidate),
+        request={
+            "schema_version": 1,
+            "candidate_id": candidate["candidate_id"],
+            "source_revision": candidate["source_revision"],
+            "manifest_sha256": candidate["manifest_sha256"],
+            "image_sha256": candidate["image_sha256"],
+            "capture_time": candidate["capture_time"],
+            "capture_time_authority": candidate["capture_time_authority"],
+        },
+    )
+    malformed_type, malformed_body = _multipart(valid_upload)
+    malformed_body = malformed_body.replace(
+        b'name="producer"', b'name="unexpected"', 1
+    )
+    malformed, response, _ = await _reference_source_request(
+        ingress, root, candidate, content_type=malformed_type, body=malformed_body
+    )
+    assert malformed == 400 and response["error"]["code"] == "invalid_request"
+    missing, _, _ = await _reference_source_request(ingress, root, candidate)
+    assert missing == 503
+    assert ingress._session["committed_seq"] == 0 and ingress._attempts == {}
+
+    assert (await _admit(ingress, root, "Bearer " + "s" * 40, candidate))[0] == 202
+    await asyncio.wait_for(bus.consume_inbound(), timeout=1)
+    attempt = ingress._attempts[candidate["candidate_id"]]
+    saved_sha = attempt["image_sha256"]
+    attempt["image_sha256"] = "f" * 64
+    conflict, response, _ = await _reference_source_request(ingress, root, candidate)
+    assert conflict == 409 and response["error"]["code"] == "reference_source_conflict"
+    attempt["image_sha256"] = saved_sha
+
+    bad_request = {
+        "schema_version": 1,
+        "candidate_id": candidate["candidate_id"],
+        "source_revision": candidate["source_revision"],
+        "manifest_sha256": candidate["manifest_sha256"],
+        "image_sha256": "0" * 64,
+        "capture_time": candidate["capture_time"],
+        "capture_time_authority": candidate["capture_time_authority"],
+    }
+    mismatch, response, _ = await _reference_source_request(
+        ingress, root, candidate, source_request=bad_request
+    )
+    assert mismatch == 422 and response["error"]["code"] == "reference_source_mismatch"
+    other_id = candidate_id_for("id:wrong-source-candidate", "rev-wrong-source")
+    invalid_requests = (
+        {**bad_request, "image_sha256": candidate["image_sha256"], "seq": 1},
+        {**bad_request, "image_sha256": candidate["image_sha256"], "source_revision": "wrong-revision"},
+        {**bad_request, "image_sha256": candidate["image_sha256"], "candidate_id": other_id},
+        {
+            **bad_request,
+            "image_sha256": candidate["image_sha256"],
+            "capture_time": (datetime.fromisoformat(candidate["capture_time"]) + timedelta(seconds=1)).isoformat(),
+        },
+    )
+    for invalid in invalid_requests:
+        mismatch, response, _ = await _reference_source_request(
+            ingress, root, candidate, source_request=invalid
+        )
+        assert mismatch == 422 and response["error"]["code"] == "reference_source_mismatch"
+    other = _candidate(root, index=934)
+    wrong_sidecar = replace(
+        _upload(root, candidate),
+        request={
+            "schema_version": 1,
+            "candidate_id": candidate["candidate_id"],
+            "source_revision": candidate["source_revision"],
+            "manifest_sha256": candidate["manifest_sha256"],
+            "image_sha256": candidate["image_sha256"],
+            "capture_time": candidate["capture_time"],
+            "capture_time_authority": candidate["capture_time_authority"],
+        },
+        producer_sidecar_bytes=_upload(root, other).producer_sidecar_bytes,
+    )
+    mismatch, response, _ = await _reference_source_request(
+        ingress, root, candidate, upload=wrong_sidecar
+    )
+    assert mismatch == 422 and response["error"]["code"] == "reference_source_mismatch"
+
+    attempt["photo_id"] = True
+    no_receipt, response, _ = await _reference_source_request(ingress, root, candidate)
+    assert no_receipt == 503 and response["error"]["code"] == "reference_source_unresolved"
+    attempt["photo_id"] = 77
+    attempt["photo_delivery_confirmed"] = False
+    no_confirmed, _, _ = await _reference_source_request(ingress, root, candidate)
+    assert no_confirmed == 503
+    unauthorized, response, _ = await _reference_source_request(
+        ingress, root, candidate, token="wrong"
+    )
+    assert unauthorized == 401 and response["error"]["code"] == "unauthorized"
+    ingress.config = ingress.config.model_copy(update={"enabled": False})
+    disabled, response, _ = await _reference_source_request(ingress, root, candidate)
+    assert disabled == 403 and response["error"]["code"] == "camera_disabled"
+    await ingress.close()
+
+
+@pytest.mark.asyncio
+async def test_v2_out_of_window_source_records_capture_without_retaining_pixels(tmp_path: Path) -> None:
+    ingress, root, _, channel = _ingress(tmp_path)
+    old_capture = datetime.now(timezone.utc).replace(microsecond=0) - timedelta(days=8)
+    candidate = _candidate(root, index=933, capture_time=old_capture)
+    admission_id = "cam1-" + "9" * 32
+    attempt = {
+        "state": "completed",
+        "admission_id": admission_id,
+        "snapshot": str(tmp_path / "camera_ingress" / "snapshots" / f"{admission_id}.jpg"),
+        "photo_id": 733,
+        "photo_delivery_confirmed": True,
+        "attention_active": False,
+        "admitted_at": datetime.now(timezone.utc).isoformat(),
+    }
+    ingress._attempts[candidate["candidate_id"]] = attempt
+    status, result, _ = await _reference_source_request(ingress, root, candidate)
+    assert status == 200 and result["status"] == "source_reestablished"
+
+    assert attempt["reference_source"]["snapshot"] is None
+    assert not Path(attempt["snapshot"]).exists()
+    query = json.dumps({
+        "schema_version": 2,
+        "candidate_id": candidate_id_for("id:out-window-query", "rev-out-window"),
+        "capture_time": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
+    }, separators=(",", ":")).encode()
+    code, response, _ = await _reference_request(ingress, query)
+    assert code == 200 and response["coverage"] == "complete"
+    assert response["unresolved_candidate_ids"] == []
+    assert response["references"] == [] and response["reestablished_references"] == []
+    assert len(channel.calls) == 0
+    await ingress.close()
+    reopened = CameraIngress(ingress.config, workspace=tmp_path, bus=MessageBus(), telegram=channel)
+    assert reopened._attempts[candidate["candidate_id"]]["reference_source"]["snapshot"] is None
+    assert not Path(attempt["snapshot"]).exists()
+    code, after_restart, _ = await _reference_request(reopened, query)
+    assert code == 200 and after_restart["coverage"] == "complete"
+    assert after_restart["unresolved_candidate_ids"] == []
+    await reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_v2_wrong_source_scope_is_unresolved_and_pending_native_receipt_is_visible(
+    tmp_path: Path,
+) -> None:
+    ingress, root, bus, _ = _ingress(tmp_path)
+    captured = datetime.now(timezone.utc).replace(microsecond=0) - timedelta(seconds=12)
+    candidate = _candidate(root, index=935, capture_time=captured)
+    assert (await _admit(ingress, root, "Bearer " + "s" * 40, candidate))[0] == 202
+    await asyncio.wait_for(bus.consume_inbound(), timeout=1)
+    code, _, _ = await _reference_source_request(ingress, root, candidate)
+    assert code == 200
+    attempt = ingress._attempts[candidate["candidate_id"]]
+    attempt["reference_source"]["scope"]["principal"] = "another-owner"
+
+    pending = _candidate(root, index=936, capture_time=captured - timedelta(seconds=1))
+    ingress._attempts[pending["candidate_id"]] = {
+        "state": "admitted",
+        "admission_id": "cam1-" + "8" * 32,
+        "snapshot": str(tmp_path / "camera_ingress" / "snapshots" / ("cam1-" + "8" * 32 + ".jpg")),
+        "photo_id": None,
+        "photo_delivery_confirmed": False,
+        "attention_active": True,
+        "admitted_at": datetime.now(timezone.utc).isoformat(),
+        "capture_time": pending["capture_time"],
+        "capture_time_authority": "exif",
+        "image_sha256": pending["image_sha256"],
+    }
+    query = json.dumps({
+        "schema_version": 2,
+        "candidate_id": candidate_id_for("id:scope-query", "rev-scope"),
+        "capture_time": captured.isoformat(),
+    }, separators=(",", ":")).encode()
+    code, response, _ = await _reference_request(ingress, query)
+    assert code == 200 and response["coverage"] == "incomplete"
+    assert response["unresolved_candidate_ids"] == [candidate["candidate_id"]]
+    assert response["pending_candidate_ids"] == [pending["candidate_id"]]
+    source_retry, error, _ = await _reference_source_request(ingress, root, candidate)
+    assert source_retry == 503 and error["error"]["code"] == "reference_source_unresolved"
+    await ingress.close()
+
+
 @pytest.mark.asyncio
 async def test_http_exact_route_and_error_shape(tmp_path: Path) -> None:
     ingress, root, _, channel = _ingress(tmp_path)
@@ -1989,6 +4322,104 @@ async def test_http_exact_route_and_error_shape(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("purpose_header", [None, b"X-Camera-Reconcile-Purpose: retire_ineligible\r\n"])
+async def test_http_reconcile_route_returns_retired_without_admission(
+    tmp_path: Path, purpose_header: bytes | None
+) -> None:
+    ingress, root, bus, channel = _ingress(tmp_path)
+    request = _candidate(root, capture_time=datetime.now(timezone.utc) - timedelta(days=8))
+    upload = await _leased_upload(ingress, root, "Bearer " + "s" * 40, request)
+    content_type, body = _multipart(upload)
+    reader = asyncio.StreamReader()
+    reader.feed_data(
+        b"POST /internal/v1/camera/reconcile HTTP/1.1\r\n"
+        + b"Authorization: Bearer "
+        + b"s" * 40
+        + b"\r\n"
+        + (purpose_header or b"")
+        + f"Content-Type: {content_type}\r\n".encode()
+        + f"Content-Length: {len(body)}\r\n\r\n".encode()
+        + body
+    )
+    reader.feed_eof()
+    writer = _Writer()
+    await serve_camera_http(ingress, reader, writer)
+    assert writer.data.startswith(b"HTTP/1.1 200 ")
+    response = json.loads(writer.data.split(b"\r\n\r\n", 1)[1])
+    assert response["status"] == "retired"
+    assert response["candidate_id"] == request["candidate_id"]
+    assert response["reason"] == "candidate_no_longer_eligible"
+    assert response["ack_seq"] == 1
+    assert ingress._attempts[request["candidate_id"]]["state"] == "retired"
+    assert channel.calls == [] and bus.inbound_size == 0
+    await ingress.close()
+
+
+@pytest.mark.asyncio
+async def test_http_reconcile_existing_outcome_header_is_read_only_when_absent(
+    tmp_path: Path,
+) -> None:
+    ingress, root, bus, channel = _ingress(tmp_path)
+    request = _candidate(root)
+    upload = await _leased_upload(ingress, root, "Bearer " + "s" * 40, request)
+    content_type, body = _multipart(upload)
+    reader = asyncio.StreamReader()
+    reader.feed_data(
+        b"POST /internal/v1/camera/reconcile HTTP/1.1\r\n"
+        + b"Authorization: Bearer " + b"s" * 40 + b"\r\n"
+        + b"X-Camera-Reconcile-Purpose: existing_outcome_only\r\n"
+        + f"Content-Type: {content_type}\r\n".encode()
+        + f"Content-Length: {len(body)}\r\n\r\n".encode() + body
+    )
+    reader.feed_eof()
+    writer = _Writer()
+    await serve_camera_http(ingress, reader, writer)
+    assert writer.data.startswith(b"HTTP/1.1 503 ")
+    response = json.loads(writer.data.split(b"\r\n\r\n", 1)[1])
+    assert response["error"]["code"] == "unknown_original_outcome"
+    assert request["candidate_id"] not in ingress._attempts
+    assert ingress._session["committed_seq"] == 0
+    assert channel.calls == [] and bus.inbound_size == 0
+    await ingress.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("header_lines", [
+    [b"X-Camera-Reconcile-Purpose: unknown\r\n"],
+    [b"X-Camera-Reconcile-Purpose: existing_outcome_only,retire_ineligible\r\n"],
+    [
+        b"X-Camera-Reconcile-Purpose: existing_outcome_only\r\n",
+        b"x-camera-reconcile-purpose: retire_ineligible\r\n",
+    ],
+])
+async def test_http_reconcile_rejects_unknown_or_duplicate_purpose_header(
+    tmp_path: Path, header_lines: list[bytes]
+) -> None:
+    ingress, root, bus, channel = _ingress(tmp_path)
+    request = _candidate(root)
+    upload = await _leased_upload(ingress, root, "Bearer " + "s" * 40, request)
+    content_type, body = _multipart(upload)
+    reader = asyncio.StreamReader()
+    reader.feed_data(
+        b"POST /internal/v1/camera/reconcile HTTP/1.1\r\n"
+        + b"Authorization: Bearer " + b"s" * 40 + b"\r\n"
+        + b"".join(header_lines)
+        + f"Content-Type: {content_type}\r\n".encode()
+        + f"Content-Length: {len(body)}\r\n\r\n".encode() + body
+    )
+    reader.feed_eof()
+    writer = _Writer()
+    await serve_camera_http(ingress, reader, writer)
+    assert writer.data.startswith(b"HTTP/1.1 400 ")
+    response = json.loads(writer.data.split(b"\r\n\r\n", 1)[1])
+    assert response["error"]["code"] == "invalid_request"
+    assert request["candidate_id"] not in ingress._attempts
+    assert ingress._session["committed_seq"] == 0
+    assert channel.calls == [] and bus.inbound_size == 0
+    await ingress.close()
+
+
+@pytest.mark.asyncio
 async def test_lost_http_response_after_admission_never_causes_resend(tmp_path: Path) -> None:
     ingress, root, bus, channel = _ingress(tmp_path)
     request = _candidate(root)
@@ -2008,6 +4439,22 @@ async def test_lost_http_response_after_admission_never_causes_resend(tmp_path: 
     with pytest.raises(ConnectionError, match="response lost"):
         await serve_camera_http(ingress, reader, _LostResponseWriter())
 
+    lookup_reader = asyncio.StreamReader()
+    lookup_reader.feed_data(
+        b"POST /internal/v1/camera/reconcile HTTP/1.1\r\n"
+        + b"Authorization: Bearer " + b"s" * 40 + b"\r\n"
+        + b"X-Camera-Reconcile-Purpose: existing_outcome_only\r\n"
+        + f"Content-Type: {content_type}\r\n".encode()
+        + f"Content-Length: {len(body)}\r\n\r\n".encode() + body
+    )
+    lookup_reader.feed_eof()
+    lookup_writer = _Writer()
+    await serve_camera_http(ingress, lookup_reader, lookup_writer)
+    assert lookup_writer.data.startswith(b"HTTP/1.1 202 ")
+    lookup_body = json.loads(lookup_writer.data.split(b"\r\n\r\n", 1)[1])
+    assert lookup_body["candidate_id"] == request["candidate_id"]
+    assert lookup_body["ack_seq"] == 1
+
     retry_reader = asyncio.StreamReader()
     retry_reader.feed_data(
         b"POST /internal/v1/camera/candidates HTTP/1.1\r\n"
@@ -2024,6 +4471,7 @@ async def test_lost_http_response_after_admission_never_causes_resend(tmp_path: 
     assert retry_writer.data.startswith(b"HTTP/1.1 202 ")
     replay_body = json.loads(retry_writer.data.split(b"\r\n\r\n", 1)[1])
     assert replay_body["ack_seq"] == 1
+    assert lookup_body == replay_body
     await asyncio.wait_for(bus.consume_inbound(), timeout=1)
     assert len(channel.calls) == 1
     await ingress.close()
