@@ -364,6 +364,10 @@ async def test_late_food_identification_then_consumed_quantity_stays_on_original
     clarification = await _turn(pool, identified, ingress)
     assert "Сколько" in clarification.text
     assert attempt.get("camera_commit") is None
+    await pool._shadow_backend_for_scope(None).await_pending()
+    assert len(honcho.messages) == 2
+    assert honcho.messages[0].content == identified.content
+    assert honcho.messages[1].content == clarification.text
 
     quantity = InboundMessage(
         channel="telegram", sender_id="123", chat_id="123", content="Я съела 3 груши",
@@ -379,6 +383,7 @@ async def test_late_food_identification_then_consumed_quantity_stays_on_original
         "energy_kcal_min": None, "energy_kcal_max": None, "energy_kcal_best": None,
     }]
     assert nutrition["meal_at"] == request["capture_time"]
+    await pool._shadow_backend_for_scope(None).await_pending()
     assert len(honcho.messages) == 4
     await ingress.close()
 

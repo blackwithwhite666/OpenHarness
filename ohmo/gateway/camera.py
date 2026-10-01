@@ -132,6 +132,7 @@ _DEEPSEEK_MODEL = "deepseek/deepseek-v4.1-flash"
 _DEEPSEEK_ENDPOINT = "deepinfra/fp8"
 _DEEPSEEK_RELEASE = "deepseek-camera-production-v1"
 CAMERA_AUTHORITY = object()
+CAMERA_CONTEXT_QUESTION_AUTHORITY = object()
 COALESCED_ATTACHMENT_PROVENANCE_AUTHORITY = object()
 logger = logging.getLogger(__name__)
 
@@ -3043,7 +3044,46 @@ class CameraIngress:
         intent = _classify_answer(raw_text, anchored=target is not None)
         inbound_source_id = _source_message_id(metadata.get("message_id"))
         for replay_id, replay_attempt in self._attempts.items():
+            if (
+                inbound_source_id is not None
+                and replay_attempt.get("state") == "clarifying"
+                and replay_attempt.get("clarification_source_message_id") == inbound_source_id
+                and isinstance(replay_attempt.get("context_question_turn_id"), str)
+            ):
+                metadata.update(
+                    _camera_authority=CAMERA_AUTHORITY,
+                    _camera_candidate_id=replay_id,
+                    _camera_turn_id=replay_attempt["context_question_turn_id"],
+                    _camera_context_question=CAMERA_CONTEXT_QUESTION_AUTHORITY,
+                    _camera_context_question_reconcile=True,
+                )
+                if replay_attempt.get("snapshot"):
+                    message.media.append(replay_attempt["snapshot"])
+                return
             replay_source = replay_attempt.get("answer_source_message_id")
+            context_turn = replay_attempt.get("context_question_turn_id")
+            if (
+                not isinstance(context_turn, str)
+                and replay_attempt.get("answer_kind") == "context"
+            ):
+                context_turn = replay_attempt.get("answer_turn_id")
+            if (
+                inbound_source_id is not None
+                and replay_source == inbound_source_id
+                and replay_attempt.get("answer_kind") == "context"
+                and replay_attempt.get("state") in {"answering", "delivery_unknown", "final_queued"}
+                and isinstance(context_turn, str)
+            ):
+                metadata.update(
+                    _camera_authority=CAMERA_AUTHORITY,
+                    _camera_candidate_id=replay_id,
+                    _camera_turn_id=context_turn,
+                    _camera_context_question=CAMERA_CONTEXT_QUESTION_AUTHORITY,
+                    _camera_context_question_reconcile=True,
+                )
+                if replay_attempt.get("snapshot"):
+                    message.media.append(replay_attempt["snapshot"])
+                return
             if (
                 inbound_source_id is not None
                 and replay_source == inbound_source_id
@@ -3166,15 +3206,24 @@ class CameraIngress:
                 contextual_candidates = [
                     (key, value) for key, value in self._attempts.items()
                     if value.get("state") in {
-                        "photo_sent", "answering", "final_queued", "completed", "delivery_unknown"
+                        "photo_sent", "clarifying", "answering", "final_queued", "completed", "delivery_unknown"
                     }
                     and (
-                        value.get("state") in {"photo_sent", "answering", "final_queued"}
+                        value.get("state") in {"photo_sent", "clarifying", "answering", "final_queued"}
                         or isinstance(value.get("camera_commit"), dict)
                         or isinstance(value.get("answer_turn_id"), str)
                         or isinstance(value.get("final_turn_id"), str)
                     )
                 ]
+                active_clarifications = [
+                    pair for pair in contextual_candidates
+                    if pair[1].get("state") == "clarifying"
+                ]
+                if len(active_clarifications) == 1 and all(
+                    value.get("state") in {"clarifying", "completed"}
+                    for _, value in contextual_candidates
+                ):
+                    contextual_candidates = active_clarifications
                 if len(contextual_candidates) > 1:
                     metadata["_camera_unbound"] = CAMERA_AUTHORITY
                     return
@@ -3268,7 +3317,6 @@ class CameraIngress:
                     and not _CLARIFICATION_NEW_MEAL_RE.search(text)
                     and (
                         _clarification_related(text)
-                        or _camera_food_context_hint(text)
                     )
                 ):
                     pending = clarification_matches
@@ -3298,17 +3346,12 @@ class CameraIngress:
                 metadata["_camera_unbound"] = CAMERA_AUTHORITY
                 return
             answer = _classify_answer(text, anchored=target is not None)
-            if answer is None and _camera_food_context_hint(text):
-                self._bind_clarification_answer(
-                    message, candidate_id, attempt, "yes", target,
-                    "callback" if callback else ("reply" if target is not None else "context"),
-                )
-                if message.metadata.get("_camera_authority") is CAMERA_AUTHORITY:
-                    message.metadata["_camera_context_hint"] = CAMERA_AUTHORITY
-                return
             if answer is None and _CLARIFICATION_QUANTITY_RE.search(text):
                 answer = "yes"
             if answer is None:
+                if target is None and _camera_food_context_hint(text):
+                    self._bind_context_question(message, candidate_id, attempt)
+                    return
                 if target is None:
                     metadata["_camera_context_unrelated"] = CAMERA_AUTHORITY
                 return
@@ -3368,16 +3411,11 @@ class CameraIngress:
             # Bare text without a reply binds only through explicit
             # consumption or negation language, never a bare affirmation.
             classified = _classify_answer(raw_text, anchored=False)
-            if classified is None and _camera_food_context_hint(raw_text):
-                self._bind_clarification_answer(
-                    message, candidate_id, attempt, "yes", target,
-                    "callback" if callback else ("reply" if target is not None else "context"),
-                )
-                if message.metadata.get("_camera_authority") is CAMERA_AUTHORITY:
-                    message.metadata["_camera_context_hint"] = CAMERA_AUTHORITY
-                return
         if classified is None:
             if target is None:
+                if _camera_food_context_hint(raw_text):
+                    self._bind_context_question(message, candidate_id, attempt)
+                    return
                 metadata["_camera_context_unrelated"] = CAMERA_AUTHORITY
             else:
                 metadata["_camera_unbound"] = CAMERA_AUTHORITY
@@ -3397,7 +3435,10 @@ class CameraIngress:
         metadata["_camera_candidate_id"] = candidate_id
         metadata["_camera_answer"] = classified
         metadata["_camera_turn_id"] = attempt["answer_turn_id"]
-        if _CLARIFICATION_ONLY_PART_RE.search(raw_text if isinstance(raw_text, str) else "") or _camera_food_context_hint(raw_text):
+        # A trusted affirmative may still need quantity clarification. The
+        # finalizer must independently report missing/not-applicable nutrition;
+        # invalid or non-consumed annotations remain rejected by runtime.
+        if classified == "yes":
             metadata["_camera_clarification_allowed"] = CAMERA_AUTHORITY
         metadata["_camera_route"] = (
             "callback" if metadata.get("callback_query") else
@@ -3498,7 +3539,13 @@ class CameraIngress:
         """Arm completion; only a native final-send receipt releases the candidate."""
         if message.metadata.get("_camera_authority") is not CAMERA_AUTHORITY:
             return
-        if clarification and message.metadata.get("_camera_answer") == "yes":
+        is_context_question = (
+            message.metadata.get("_camera_context_question")
+            is CAMERA_CONTEXT_QUESTION_AUTHORITY
+        )
+        if clarification and (
+            message.metadata.get("_camera_answer") == "yes" or is_context_question
+        ):
             candidate_id = message.metadata.get("_camera_candidate_id")
             turn_id = message.metadata.get("_camera_turn_id")
             attempt = self._attempts.get(candidate_id) if isinstance(candidate_id, str) else None
@@ -3513,6 +3560,8 @@ class CameraIngress:
                 attempt["clarification_source_message_id"] = _source_message_id(
                     message.metadata.get("message_id")
                 )
+                if is_context_question:
+                    attempt["context_question_turn_id"] = turn_id
                 self._save_attempts()
             return
         if message.metadata.get("_camera_answer") == "no" or recorded:
@@ -3577,7 +3626,7 @@ class CameraIngress:
             _camera_route=route,
         )
         text = message.metadata.get("_telegram_raw_text", message.content)
-        if _CLARIFICATION_ONLY_PART_RE.search(text if isinstance(text, str) else "") or (
+        if answer == "yes" or _CLARIFICATION_ONLY_PART_RE.search(text if isinstance(text, str) else "") or (
             answer == "yes"
             and (
                 _camera_food_context_hint(text)
@@ -3585,10 +3634,75 @@ class CameraIngress:
             )
         ):
             message.metadata["_camera_clarification_allowed"] = CAMERA_AUTHORITY
+        if answer == "yes" and isinstance(text, str) and _CLARIFICATION_QUANTITY_RE.search(text):
+            message.metadata["_camera_context_hint"] = CAMERA_AUTHORITY
         if target is not None:
             message.metadata["_camera_native_binding"] = str(target)
         if answer == "yes" and attempt.get("snapshot"):
             message.media.append(attempt["snapshot"])
+
+    def _bind_context_question(
+        self, message: InboundMessage, candidate_id: str, attempt: dict
+    ) -> None:
+        """Bind model-visible context without granting consumption authority."""
+        turn_id = uuid4().hex
+        source_id = _source_message_id(message.metadata.get("message_id"))
+        attempt.update(
+            state="answering",
+            answer_turn_id=turn_id,
+            answer_kind="context",
+            answer_source_message_id=source_id,
+            finalizer_status="context_question_pending",
+            attention_active=False,
+        )
+        try:
+            self._save_attempts()
+        except OSError:
+            message.metadata["_camera_unbound"] = CAMERA_AUTHORITY
+            return
+        message.metadata.update(
+            _camera_authority=CAMERA_AUTHORITY,
+            _camera_candidate_id=candidate_id,
+            _camera_turn_id=turn_id,
+            _camera_context_hint=CAMERA_AUTHORITY,
+            _camera_context_question=CAMERA_CONTEXT_QUESTION_AUTHORITY,
+            _camera_route="context",
+        )
+        if attempt.get("snapshot"):
+            message.media.append(attempt["snapshot"])
+
+    def validate_context_question_binding(
+        self,
+        message: InboundMessage,
+        *,
+        principal: str,
+        chat_id: str,
+        tenant_id: str,
+    ) -> None:
+        candidate_id = message.metadata.get("_camera_candidate_id")
+        turn_id = message.metadata.get("_camera_turn_id")
+        attempt = self._attempts.get(candidate_id) if isinstance(candidate_id, str) else None
+        if (
+            message.metadata.get("_camera_context_question")
+            is not CAMERA_CONTEXT_QUESTION_AUTHORITY
+            or message.metadata.get("_camera_authority") is not CAMERA_AUTHORITY
+            or message.metadata.get("is_group") is True
+            or message.sender_id.split("|", 1)[0] != principal
+            or str(message.chat_id) != chat_id
+            or self.config.principal != principal
+            or self.config.chat_id != chat_id
+            or self.config.tenant_id != tenant_id
+            or message.metadata.get("_camera_answer") is not None
+            or attempt is None
+            or attempt.get("state") != "answering"
+            or attempt.get("answer_kind") != "context"
+            or attempt.get("answer_turn_id") != turn_id
+            or attempt.get("answer_source_message_id")
+            != _source_message_id(message.metadata.get("message_id"))
+            or not isinstance(attempt.get("snapshot"), str)
+            or attempt["snapshot"] not in message.media
+        ):
+            raise ValueError("Camera context question is not bound to the authorized owner source")
 
     async def close(self) -> None:
         for task in tuple(self._tasks):

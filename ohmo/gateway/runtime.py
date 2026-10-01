@@ -25,6 +25,7 @@ from ohmo.evals.nutrition_trace import (
 from ohmo.gateway.attachment_fingerprints import compute_attachment_fingerprints
 from ohmo.gateway.camera import (
     CAMERA_AUTHORITY,
+    CAMERA_CONTEXT_QUESTION_AUTHORITY,
     COALESCED_ATTACHMENT_PROVENANCE_AUTHORITY,
     RetainedAttachmentEvidence,
 )
@@ -392,25 +393,58 @@ def _build_conversation_turn_metadata(
     )
     if camera_yes and not nutrition_v2:
         assistant_metadata["camera_finalizer_outcome"] = "clarification"
+    if (
+        turn_ctx.camera_authorized
+        and message.metadata.get("_camera_context_question")
+        is CAMERA_CONTEXT_QUESTION_AUTHORITY
+    ):
+        for metadata in (user_metadata, assistant_metadata):
+            metadata["camera_candidate_id"] = message.metadata["_camera_candidate_id"]
+            metadata["camera_operation_id"] = message.metadata["_camera_candidate_id"]
+            metadata["camera_context_only"] = True
+            metadata["camera_route"] = "context"
+        assistant_metadata["camera_finalizer_outcome"] = "clarification"
     return logical_turn_id, user_metadata, assistant_metadata
 
 
 def _append_nutrition_saved_status(answer: str, annotation: NutritionAnnotationV2) -> str:
-    # A pre-append projection cannot report append outcome. Remove storage
-    # claims at sentence granularity while retaining nutrition detail and
-    # independent answers from the model turn.
-    storage_claim = re.compile(
-        r"\b(?:сохран\w*|запис\w*|баз\w*|проекц\w*|save[sd]?|record\w*|database|projection)\b",
+    # Resolve only a compound storage-failure assertion. Keep neighboring
+    # nutrition facts and independent advice, including positive save advice.
+    storage = re.compile(
+        r"\b(?:баз\w*|проекц\w*|сохран\w*|запис\w*|database|projection|save\w*|record\w*)\b",
         re.IGNORECASE,
     )
-    sentences = re.split(r"(?<=[.!?])\s+", answer.strip()) if answer.strip() else []
-    answer = " ".join(part for part in sentences if not storage_claim.search(part))
+    failure = re.compile(
+        r"\b(?:не\s+(?:удалось|смог\w*|получил\w*|получится|могу)|failed\s+to|could\s+not|couldn't)\b",
+        re.IGNORECASE,
+    )
+    empty_store = re.compile(
+        r"\b(?:баз\w*|проекц\w*|database|projection)\b.{0,80}"
+        r"\b(?:нет|пуст\w*|отсутств\w*|empty|no\s+record)\b",
+        re.IGNORECASE,
+    )
+    cleaned = []
+    for sentence in re.split(r"(?<=[.!?])\s+", answer.strip()):
+        clauses = re.split(r"[,;]|\s+но\s+", sentence, flags=re.IGNORECASE)
+        compound_failure = bool(storage.search(sentence) and failure.search(sentence))
+        if compound_failure:
+            cleaned.extend(
+                part.strip()
+                for part in clauses
+                if not (
+                    storage.search(part) and failure.search(part)
+                    or empty_store.search(part)
+                )
+            )
+        else:
+            cleaned.append(sentence)
+    content = " ".join(part for part in cleaned if part).strip()
     status = (
         "Записано. Баланс обновляется."
         if annotation.meal_at is not None or annotation.meal_date is not None
         else "Записано; приём пищи пока не привязан к дате."
     )
-    return f"{answer.rstrip()}\n{status}" if answer.strip() else status
+    return f"{content}\n{status}" if content else status
 
 
 def _receipt_has_consumed_nutrition(metadata: Mapping[str, object]) -> bool:
@@ -1060,7 +1094,11 @@ class OhmoSessionRuntimePool:
         metadata = message.metadata
         if (
             metadata.get("_camera_authority") is not CAMERA_AUTHORITY
-            or metadata.get("_camera_answer") not in {"yes", "no"}
+            or (
+                metadata.get("_camera_answer") not in {"yes", "no"}
+                and metadata.get("_camera_context_question")
+                is not CAMERA_CONTEXT_QUESTION_AUTHORITY
+            )
             or not isinstance(metadata.get("_camera_candidate_id"), str)
         ):
             return {}
@@ -1299,6 +1337,50 @@ class OhmoSessionRuntimePool:
                     metadata={"_session_key": session_key},
                 )
             return
+        if (
+            camera_authorized
+            and message.metadata.get("_camera_context_question_reconcile") is True
+        ):
+            candidate_id = message.metadata.get("_camera_candidate_id")
+            turn_id = message.metadata.get("_camera_turn_id")
+            backend = self._shadow_backend_for_scope(memory_scope)
+            try:
+                if backend is None or not isinstance(turn_id, str):
+                    raise ConversationReconciliationError("Camera context receipt is unavailable")
+                receipt = await backend.reconcile_durable_exchange(
+                    f"{turn_id}:user", f"{turn_id}:assistant"
+                )
+                if (
+                    receipt is None
+                    or not isinstance(receipt.assistant_metadata, Mapping)
+                    or receipt.assistant_metadata.get("camera_candidate_id") != candidate_id
+                    or receipt.assistant_metadata.get("camera_context_only") is not True
+                    or receipt.assistant_metadata.get("camera_finalizer_outcome") != "clarification"
+                    or receipt.assistant_metadata.get("source_message_id")
+                    != _normalize_source_message_ref(message.metadata.get("message_id"))
+                    or not isinstance(receipt.assistant_content, str)
+                ):
+                    raise ConversationReconciliationError("Camera context receipt did not match source")
+                self._camera_ingress.complete(
+                    message, recorded=False, clarification=True
+                )
+                yield GatewayStreamUpdate(
+                    kind="final",
+                    text=receipt.assistant_content,
+                    metadata={
+                        "_session_key": session_key,
+                        "camera_reconciled": candidate_id,
+                        **self._camera_final_delivery_metadata(message),
+                    },
+                )
+            except (ConversationReconciliationError, ValueError, TypeError):
+                logger.warning("Camera context receipt remains unresolved candidate=%s", candidate_id)
+                yield GatewayStreamUpdate(
+                    kind="error",
+                    text="I couldn't verify the previous Camera clarification. It was not repeated.",
+                    metadata={"_session_key": session_key},
+                )
+            return
         camera_meal_at = self._trusted_camera_answer_time(
             message, session_key=session_key, turn_ctx=turn_ctx
         )
@@ -1364,8 +1446,16 @@ class OhmoSessionRuntimePool:
         )
         if recorder is not None and camera_meal_at is not None:
             recorder.set_authoritative_nutrition_meal_at(camera_meal_at)
+        camera_context_question = (
+            message.metadata.get("_camera_context_question")
+            is CAMERA_CONTEXT_QUESTION_AUTHORITY
+        )
         if recorder is not None and (
-            (camera_authorized and message.metadata.get("_camera_answer") != "yes")
+            (
+                camera_authorized
+                and message.metadata.get("_camera_answer") != "yes"
+                and not camera_context_question
+            )
             or (
                 camera_authorized
                 and message.metadata.get("_camera_answer") == "yes"
@@ -1374,7 +1464,12 @@ class OhmoSessionRuntimePool:
             or message.metadata.get("_camera_unbound") is CAMERA_AUTHORITY
         ) and message.metadata.get("_camera_correction") is not CAMERA_AUTHORITY:
             recorder.forbid_nutrition_record()
-        if recorder is not None and message.metadata.get("_camera_context_hint") is CAMERA_AUTHORITY:
+        if (
+            recorder is not None
+            and message.metadata.get("_camera_context_hint") is CAMERA_AUTHORITY
+            and message.metadata.get("_camera_answer") != "yes"
+            and not camera_context_question
+        ):
             recorder.forbid_nutrition_record()
         if recorder is not None and message.metadata.get("_camera_context_unrelated") is CAMERA_AUTHORITY:
             recorder.forbid_nutrition_record()
@@ -1927,9 +2022,11 @@ class OhmoSessionRuntimePool:
             and finalizer_nutrition.consumption_status == "consumed"
         )
         if camera_clarification:
-            # Select a deterministic clarification final instead of trusting model
-            # prose that might claim persistence without a meal annotation.
-            reply = "Сколько примерно вы съели? Можно указать количество или долю порции."
+            # A context-bound but unconfirmed answer may be an unrelated owner
+            # turn. Preserve the model's ordinary response while keeping the
+            # operation open; only a direct consumed-answer path gets the fixed ask.
+            if message.metadata.get("_camera_context_hint") is not CAMERA_AUTHORITY:
+                reply = "Сколько примерно вы съели? Можно указать количество или долю порции."
             message.metadata["_camera_clarification_final"] = CAMERA_AUTHORITY
         elif camera_yes and finalizer_nutrition is not None:
             reply = _append_nutrition_saved_status(reply, finalizer_nutrition)
@@ -2003,7 +2100,11 @@ class OhmoSessionRuntimePool:
                 camera_ingress.complete(
                     message,
                     recorded=camera_meal_saved,
-                    clarification=camera_clarification,
+                    clarification=(
+                        camera_clarification
+                        or message.metadata.get("_camera_context_question")
+                        is CAMERA_CONTEXT_QUESTION_AUTHORITY
+                    ),
                 )
             logger.info(
                 "ohmo runtime processing complete session_key=%s session_id=%s reply=%r",
@@ -2091,12 +2192,45 @@ class OhmoSessionRuntimePool:
             and message.metadata.get("_camera_correction") is CAMERA_AUTHORITY
             and message.metadata.get("_camera_answer") == "no"
         )
+        camera_context_question = (
+            turn_ctx.camera_authorized
+            and turn_ctx.principal == self._gateway_config.camera_ingress.principal
+            and message.metadata.get("_camera_context_question")
+            is CAMERA_CONTEXT_QUESTION_AUTHORITY
+        )
         annotation = recorder.validated_nutrition_envelope if recorder is not None else None
         validated = (
             NutritionAnnotationV2.model_validate(annotation)
             if isinstance(annotation, Mapping) and annotation.get("schema_version", 1) == 2
             else None
         )
+        if camera_context_question:
+            ingress = getattr(self, "_camera_ingress", None)
+            camera_config = self._gateway_config.camera_ingress
+            context_scope = self._coerce_memory_scope(turn_ctx, memory_scope)
+            if (
+                ingress is None
+                or not turn_ctx.is_private
+                or turn_ctx.is_forwarded
+                or turn_ctx.channel != "telegram"
+                or str(turn_ctx.principal).split("|", 1)[0] != camera_config.principal
+                or str(turn_ctx.chat_id) != camera_config.chat_id
+                or context_scope is None
+                or context_scope.private_tenant != camera_config.tenant_id
+            ):
+                raise ValueError("Camera context question is not authorized in the current owner scope")
+            ingress.validate_context_question_binding(
+                message,
+                principal=camera_config.principal,
+                chat_id=camera_config.chat_id,
+                tenant_id=context_scope.private_tenant,
+            )
+            if (
+                recorder is None
+                or annotation is not None
+                or recorder.nutrition_annotation_status not in {"missing", "not_applicable"}
+            ):
+                raise ValueError("Camera context question requires a valid non-consumed finalizer")
         if camera_yes:
             camera_ingress = getattr(self, "_camera_ingress", None)
             trusted_meal_at = (
@@ -2148,11 +2282,17 @@ class OhmoSessionRuntimePool:
             ):
                 raise ValueError("Camera denial requires a validated not_consumed correction")
         if self._gateway_config.conversation_learning is not True:
+            if camera_context_question:
+                raise ValueError("Camera context clarification requires durable conversation learning")
             return
         scope = self._coerce_memory_scope(turn_ctx, memory_scope)
         if scope is None:
+            if camera_context_question:
+                raise ValueError("Camera context clarification has no authorized memory scope")
             return
         if not self._honcho_turn_allowed(turn_ctx, scope):
+            if camera_context_question:
+                raise ValueError("Camera context clarification is not authorized for append")
             return
         if camera_correction:
             ingress = getattr(self, "_camera_ingress", None)
@@ -2176,6 +2316,8 @@ class OhmoSessionRuntimePool:
             )
         shadow_backend = self._shadow_backend_for_scope(scope)
         if shadow_backend is None:
+            if camera_context_question:
+                raise ConversationReconciliationError("Camera context receipt is unavailable")
             return
         _, user_metadata, assistant_metadata = _build_conversation_turn_metadata(
             turn_ctx=turn_ctx,
@@ -2217,6 +2359,7 @@ class OhmoSessionRuntimePool:
             assistant_metadata=assistant_metadata,
             durable=(
                 camera_bound_answer
+                or camera_context_question
                 or (
                     validated is not None
                     and validated.record_type == "meal_observation"

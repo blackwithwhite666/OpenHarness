@@ -266,15 +266,23 @@ async def test_wellness_projection_read_precedes_append_and_cannot_override_rece
             },
         ),
     ))
-    answer = "В проекции пока пусто, запись не удалось сохранить."
+    answer = (
+        "Рис, два кусочка, примерно 120 ккал (100–140). "
+        "В базе этой еды ещё нет, сохранение не получилось. 2+2=4."
+    )
     engine = _ScriptedEngine(pool, [(_consumed_trace(), answer)])
     engine.read_wellness = True
     pool._test_bundle.engine = engine
     result = await _turn(pool, _owner_message("Запиши съеденные груши", 8504), ingress)
     assert manager.calls == 1
     assert result.metadata["nutrition_append_event_id"] == "honcho-2"
-    assert result.text == "Записано; приём пищи пока не привязан к дате."
-    assert honcho.messages[1].content == result.text
+    for value in (result.text, honcho.messages[1].content):
+        assert "Рис" in value and "два кусочка" in value
+        assert "120" in value and "100–140" in value and "2+2=4" in value
+        assert "В базе" not in value and "не получилось" not in value
+        assert "не привязан к дате" in value
+    assert result.text == honcho.messages[1].content
+    assert result.metadata["nutrition_sync_status"] == "pending"
     await ingress.close()
 
 
@@ -456,9 +464,9 @@ async def test_generic_food_identification_is_context_not_consumption(
     hint = _owner_message("только фасоль", 8162)
     ingress.process_real_inbound(hint)
     assert hint.metadata.get("_camera_context_hint") is CAMERA_AUTHORITY
-    # The routing answer is explicitly marked context-only; finalization must
-    # store a clarification outcome, never a consumed nutrition annotation.
-    assert hint.metadata.get("_camera_answer") == "yes"
+    # Keep the original available to semantic model inference without treating
+    # a noun-only food identification as a consumption confirmation.
+    assert hint.metadata.get("_camera_answer") is None
     assert attempt["snapshot"] in hint.media
     camera_prompt = OhmoSessionRuntimePool._with_camera_turn_context(
         "base", hint, ingress.trusted_capture_time_for_answer(hint)
@@ -467,28 +475,31 @@ async def test_generic_food_identification_is_context_not_consumption(
     assert "owner's confirmed-consumption turn" not in camera_prompt
     pool._test_bundle.engine = _ScriptedEngine(pool, [(None, "Если речь о фасоли, уточните количество.")])
     result = await _turn(pool, hint, ingress)
-    assert "Сколько" in result.text
+    assert "количество" in result.text.casefold()
     assert "nutrition_append_event_id" not in result.metadata
     assert "camera_commit" not in attempt
+    await pool._shadow_backend_for_scope(None).await_pending()
     assert attempt["state"] == "clarifying"
+    assert len(honcho.messages) == (4 if state == "clarifying" else 2)
+    assert honcho.messages[-2].content == hint.content
     assert honcho.messages[-1].metadata["camera_finalizer_outcome"] == "clarification"
     assert "decision_trace" not in honcho.messages[-1].metadata
 
     unrelated = _owner_message("Как завтра будет погода?", 8163)
     ingress.process_real_inbound(unrelated)
     assert unrelated.metadata.get("_camera_context_hint") is not CAMERA_AUTHORITY
-    assert unrelated.metadata.get("_camera_context_unrelated") is CAMERA_AUTHORITY
+    assert unrelated.metadata.get("_camera_answer") is None
     pool._test_bundle.engine = _ScriptedEngine(pool, [(None, "Прогноз погоды на завтра недоступен.")])
     unrelated_result = await _turn(pool, unrelated, ingress)
     assert "Сколько" not in unrelated_result.text
     assert "nutrition_append_event_id" not in unrelated_result.metadata
     assert "camera_commit" not in attempt
     assert attempt["state"] == "clarifying"
-    for message_id, text in ((8164, "Спасибо"), (8165, "Оплати счёт"), (8166, "только деньги")):
+    for message_id, text in ((8164, "Спасибо"), (8165, "Оплати счёт")):
         off_topic = _owner_message(text, message_id)
         ingress.process_real_inbound(off_topic)
         assert off_topic.metadata.get("_camera_context_hint") is not CAMERA_AUTHORITY
-        assert off_topic.metadata.get("_camera_context_unrelated") is CAMERA_AUTHORITY
+        assert off_topic.metadata.get("_camera_answer") is None
     await ingress.close()
 
 

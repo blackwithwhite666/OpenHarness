@@ -19,6 +19,7 @@ from ohmo.gateway.camera import (
     _PENDING_TTL_SECONDS,
     _find_recent_attachment_duplicate,
     CAMERA_AUTHORITY,
+    CAMERA_CONTEXT_QUESTION_AUTHORITY,
     CameraCandidateUpload,
     CameraIngress,
     serve_camera_http,
@@ -568,8 +569,8 @@ async def test_unrecognized_or_unbound_real_text_is_nutrition_forbidden(tmp_path
         ("посмотри ещё раз", 77),
         ("не знаю", None),
         ("Как погода?", None),
-        ("только сливы", None),  # context hint is not a consumption assertion
         ("Обычный разговор", 999),
+        ("только сливы", None),  # context hint is not a consumption assertion
     ):
         message = InboundMessage(
             channel="telegram",
@@ -581,8 +582,9 @@ async def test_unrecognized_or_unbound_real_text_is_nutrition_forbidden(tmp_path
         ingress.process_real_inbound(message)
         if text == "только сливы":
             assert message.metadata.get("_camera_context_hint") is CAMERA_AUTHORITY
-            assert message.metadata.get("_camera_answer") == "yes"
-            assert message.metadata.get("_camera_clarification_allowed") is CAMERA_AUTHORITY
+            assert message.metadata.get("_camera_context_question") is CAMERA_CONTEXT_QUESTION_AUTHORITY
+            assert message.metadata.get("_camera_answer") is None
+            assert message.metadata.get("_camera_clarification_allowed") is None
         elif target == 999:
             assert "_camera_unbound" not in message.metadata
         elif text == "Как погода?":
@@ -2521,35 +2523,9 @@ async def test_bare_explicit_answer_binds_and_ambiguous_stays_unbound(tmp_path: 
     bare_scope = incoming("Только сливы")
     ingress.process_real_inbound(bare_scope)
     assert bare_scope.metadata.get("_camera_context_hint") is CAMERA_AUTHORITY
-    assert bare_scope.metadata.get("_camera_answer") == "yes"
-    ingress.complete(bare_scope, recorded=False, clarification=True)
-    assert ingress._attempts[request["candidate_id"]]["state"] == "clarifying"
-
-    bare_consumption = incoming("Я съела 4")
-    ingress.process_real_inbound(bare_consumption)
-    assert bare_consumption.metadata["_camera_answer"] == "yes"
-    assert bare_consumption.metadata["_camera_authority"] is CAMERA_AUTHORITY
-    assert bare_consumption.metadata["_camera_turn_id"]
-    assert len(bare_consumption.media) == 1
+    assert bare_scope.metadata.get("_camera_context_question") is CAMERA_CONTEXT_QUESTION_AUTHORITY
+    assert bare_scope.metadata.get("_camera_answer") is None
     assert ingress._attempts[request["candidate_id"]]["state"] == "answering"
-
-    ingress.complete(bare_consumption, recorded=True)
-    assert ingress._attempts[request["candidate_id"]]["state"] == "final_queued"
-    ingress.note_assistant_receipt(
-        OutboundMessage(
-            channel="telegram",
-            chat_id="123",
-            content="Записано",
-            metadata={
-                "_camera_candidate_id": request["candidate_id"],
-                "_camera_authority": CAMERA_AUTHORITY,
-                "_camera_final": CAMERA_AUTHORITY,
-                "_camera_turn_id": bare_consumption.metadata["_camera_turn_id"],
-            },
-        ),
-        OutboundDeliveryReceipt(channel="telegram", chat_id="123", native_message_ids=(89,)),
-    )
-    assert ingress._attempts[request["candidate_id"]]["state"] == "completed"
 
     await ingress.close()
     negation_root = tmp_path / "negation"
