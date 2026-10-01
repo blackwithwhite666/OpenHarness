@@ -1794,8 +1794,8 @@ class CameraIngress:
                 except ValidationError as error:
                     raise ValueError("Camera current reference source is invalid") from error
                 if (
-                    source.candidate_id != key
-                    or candidate_id_for(source.file_id, source.source_revision) != key
+                    source.candidate_id != candidate_id
+                    or candidate_id_for(source.file_id, source.source_revision) != candidate_id
                     or value.get("photo_delivery_confirmed") is not True
                     or type(value.get("photo_id")) is not int
                     or value["photo_id"] <= 0
