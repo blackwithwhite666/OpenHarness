@@ -82,11 +82,13 @@ async def test_durable_exchange_returns_receipt_and_reconciles_retry() -> None:
     assert isinstance(first, ConversationAppendReceipt)
     assert second == first
     assert first.assistant_metadata == honcho.messages[1].metadata
+    assert first.assistant_content == "estimate"
     assert len(honcho.messages) == 2
     reconciled = await backend.reconcile_durable_exchange(
         first.user_client_op_id, first.assistant_client_op_id
     )
     assert reconciled == first
+    assert reconciled.assistant_content == honcho.messages[1].content
     assert len(honcho.messages) == 2
 
 

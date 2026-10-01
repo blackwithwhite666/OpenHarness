@@ -23,7 +23,11 @@ from ohmo.evals.nutrition_trace import (
     NutritionAnnotationV2,
 )
 from ohmo.gateway.attachment_fingerprints import compute_attachment_fingerprints
-from ohmo.gateway.camera import CAMERA_AUTHORITY, RetainedAttachmentEvidence
+from ohmo.gateway.camera import (
+    CAMERA_AUTHORITY,
+    COALESCED_ATTACHMENT_PROVENANCE_AUTHORITY,
+    RetainedAttachmentEvidence,
+)
 from ohmo.gateway.config import load_gateway_config
 from ohmo.gateway.group_tool import (
     CreateFeishuGroup,
@@ -376,7 +380,53 @@ def _build_conversation_turn_metadata(
     decision_trace = recorder.decision_trace_envelope if recorder is not None else None
     if decision_trace is not None:
         assistant_metadata["decision_trace"] = dict(decision_trace)
+    raw_nutrition = recorder.validated_nutrition_envelope if recorder is not None else None
+    nutrition_v2 = bool(
+        isinstance(raw_nutrition, Mapping)
+        and raw_nutrition.get("schema_version", 1) == 2
+    )
+    camera_yes = (
+        turn_ctx.camera_authorized
+        and message.metadata.get("_camera_authority") is CAMERA_AUTHORITY
+        and message.metadata.get("_camera_answer") == "yes"
+    )
+    if camera_yes and not nutrition_v2:
+        assistant_metadata["camera_finalizer_outcome"] = "clarification"
     return logical_turn_id, user_metadata, assistant_metadata
+
+
+def _append_nutrition_saved_status(answer: str, annotation: NutritionAnnotationV2) -> str:
+    # A pre-append projection cannot report append outcome. Remove storage
+    # claims at sentence granularity while retaining nutrition detail and
+    # independent answers from the model turn.
+    storage_claim = re.compile(
+        r"\b(?:сохран\w*|запис\w*|баз\w*|проекц\w*|save[sd]?|record\w*|database|projection)\b",
+        re.IGNORECASE,
+    )
+    sentences = re.split(r"(?<=[.!?])\s+", answer.strip()) if answer.strip() else []
+    answer = " ".join(part for part in sentences if not storage_claim.search(part))
+    status = (
+        "Записано. Баланс обновляется."
+        if annotation.meal_at is not None or annotation.meal_date is not None
+        else "Записано; приём пищи пока не привязан к дате."
+    )
+    return f"{answer.rstrip()}\n{status}" if answer.strip() else status
+
+
+def _receipt_has_consumed_nutrition(metadata: Mapping[str, object]) -> bool:
+    trace = metadata.get("decision_trace")
+    annotations = trace.get("annotations") if isinstance(trace, Mapping) else None
+    nutrition = annotations.get("nutrition") if isinstance(annotations, Mapping) else None
+    if not isinstance(nutrition, Mapping) or nutrition.get("schema_version") != 2:
+        return False
+    try:
+        validated = NutritionAnnotationV2.model_validate(nutrition)
+    except (TypeError, ValueError):
+        return False
+    return (
+        validated.record_type == "meal_observation"
+        and validated.consumption_status == "consumed"
+    )
 
 
 def _reminder_wellness_tenants(config) -> WellnessTenantResolver:
@@ -959,6 +1009,11 @@ class OhmoSessionRuntimePool:
             "`consumption_status` `consumed`, and `basis` including `image`. Estimate "
             "at least one total energy kcal field from the food and quantity; do not "
             "invent a fixed calorie value. "
+            "When a follow-up quantity depends on details of the earlier original photo, use "
+            "`load_conversation_image` to retrieve that retained source before estimating. "
+            "If the original is unavailable or the visible image is only a crop, preserve the "
+            "quantity uncertainty and ask one useful question; never treat a partial crop as "
+            "a confirmed whole plate or fabricate calories. "
             "Set `meal_at` and `meal_date` to null in the model payload: the gateway "
             "stamps the authoritative capture time into the validated annotation. "
             "Use a valid, unique `trace_event_id` for the finalization. Only claim the "
@@ -980,6 +1035,17 @@ class OhmoSessionRuntimePool:
     def _with_camera_turn_context(
         cls, prompt: str, message: InboundMessage, capture_time: datetime | None
     ) -> str:
+        if message.metadata.get("_camera_context_hint") is CAMERA_AUTHORITY:
+            prompt += (
+                "\n\n# Camera food context only\n"
+                "The attached original photo is retained context for the owner's short "
+                "food-identification message. That message alone does not confirm eating "
+                "or authorize a meal record. Use context only when the current text is "
+                "clearly about the pictured food; answer unrelated requests normally. "
+                "If food is identified but consumed quantity remains unknown, ask one "
+                "useful quantity question. Do not infer calories or consumption."
+            )
+            return prompt
         prompt = cls._with_camera_answer_context(prompt, capture_time)
         if (
             message.metadata.get("_camera_authority") is CAMERA_AUTHORITY
@@ -1006,10 +1072,17 @@ class OhmoSessionRuntimePool:
         }
         if metadata.get("_camera_correction") is CAMERA_AUTHORITY:
             result["_camera_correction"] = CAMERA_AUTHORITY
+        if metadata.get("_camera_clarification_final") is CAMERA_AUTHORITY:
+            result["_camera_clarification_final"] = CAMERA_AUTHORITY
         return result
 
     async def stream_message(self, message: InboundMessage, session_key: str):
         """Submit an inbound channel message and yield progress + final reply updates."""
+        if (
+            message.metadata.get("_camera_authority") is CAMERA_AUTHORITY
+            and message.metadata.get("_camera_duplicate_clarification_replay") is True
+        ):
+            return
         todo_lifecycle = _is_real_user_turn(message)
         wellness_reminder = _trusted_reminder_wellness(message)
         user_message = _build_inbound_user_message(
@@ -1158,6 +1231,22 @@ class OhmoSessionRuntimePool:
                     text = "Исправление записано, баланс обновляется."
                 elif message.metadata.get("_camera_answer") == "yes":
                     trace = receipt.assistant_metadata.get("decision_trace") if receipt.assistant_metadata else None
+                    if (
+                        receipt.assistant_metadata.get("camera_finalizer_outcome") == "clarification"
+                    ):
+                        self._camera_ingress.complete(
+                            message, recorded=False, clarification=True
+                        )
+                        text = "Сколько примерно вы съели? Можно указать количество или долю порции."
+                        message.metadata["_camera_clarification_final"] = CAMERA_AUTHORITY
+                        yield GatewayStreamUpdate(
+                            kind="final", text=text,
+                            metadata={
+                                "_session_key": session_key,
+                                **self._camera_final_delivery_metadata(message),
+                            },
+                        )
+                        return
                     annotations = trace.get("annotations") if isinstance(trace, Mapping) else None
                     nutrition = annotations.get("nutrition") if isinstance(annotations, Mapping) else None
                     validated = NutritionAnnotationV2.model_validate(nutrition)
@@ -1189,6 +1278,14 @@ class OhmoSessionRuntimePool:
                     metadata={
                         "_session_key": session_key,
                         "camera_reconciled": candidate_id,
+                        **(
+                            {
+                                "nutrition_append_event_id": receipt.assistant_message_id,
+                                "nutrition_sync_status": "pending",
+                            }
+                            if message.metadata.get("_camera_answer") == "yes"
+                            else {}
+                        ),
                         **self._camera_final_delivery_metadata(message),
                     },
                 )
@@ -1276,6 +1373,10 @@ class OhmoSessionRuntimePool:
             )
             or message.metadata.get("_camera_unbound") is CAMERA_AUTHORITY
         ) and message.metadata.get("_camera_correction") is not CAMERA_AUTHORITY:
+            recorder.forbid_nutrition_record()
+        if recorder is not None and message.metadata.get("_camera_context_hint") is CAMERA_AUTHORITY:
+            recorder.forbid_nutrition_record()
+        if recorder is not None and message.metadata.get("_camera_context_unrelated") is CAMERA_AUTHORITY:
             recorder.forbid_nutrition_record()
         if recorder is not None and camera_authorized and (
             message.sender_id == "__camera__"
@@ -1800,6 +1901,41 @@ class OhmoSessionRuntimePool:
             return
         reply = str(guard_state["reply"] or "")
 
+        camera_yes = (
+            turn_ctx.camera_authorized
+            and message.metadata.get("_camera_answer") == "yes"
+            and message.metadata.get("_camera_authority") is CAMERA_AUTHORITY
+        )
+        camera_clarification = bool(
+            camera_yes
+            and message.metadata.get("_camera_clarification_allowed") is CAMERA_AUTHORITY
+            and recorder is not None
+            and recorder.validated_nutrition_envelope is None
+            and recorder.nutrition_annotation_status in {"missing", "not_applicable"}
+        )
+        finalizer_nutrition = (
+            NutritionAnnotationV2.model_validate(recorder.validated_nutrition_envelope)
+            if recorder is not None
+            and recorder.validated_nutrition_envelope is not None
+            and recorder.validated_nutrition_envelope.get("schema_version", 1) == 2
+            else None
+        )
+        ordinary_meal = bool(
+            not camera_yes
+            and finalizer_nutrition is not None
+            and finalizer_nutrition.record_type == "meal_observation"
+            and finalizer_nutrition.consumption_status == "consumed"
+        )
+        if camera_clarification:
+            # Select a deterministic clarification final instead of trusting model
+            # prose that might claim persistence without a meal annotation.
+            reply = "Сколько примерно вы съели? Можно указать количество или долю порции."
+            message.metadata["_camera_clarification_final"] = CAMERA_AUTHORITY
+        elif camera_yes and finalizer_nutrition is not None:
+            reply = _append_nutrition_saved_status(reply, finalizer_nutrition)
+        elif ordinary_meal:
+            reply = _append_nutrition_saved_status(reply, finalizer_nutrition)
+
         self._maybe_schedule_memory_judge(
             bundle,
             session_key,
@@ -1816,14 +1952,58 @@ class OhmoSessionRuntimePool:
                 assistant_text=reply,
             )
             camera_ingress = getattr(self, "_camera_ingress", None)
+            camera_commit = None
+            if camera_ingress is not None and turn_ctx.camera_authorized:
+                candidate_id = message.metadata.get("_camera_candidate_id")
+                attempt = camera_ingress._attempts.get(candidate_id)
+                if isinstance(attempt, dict):
+                    camera_commit = attempt.get("camera_commit")
+            camera_meal_saved = bool(
+                append_receipt is not None
+                and isinstance(camera_commit, dict)
+                and camera_commit.get("event_id") == append_receipt.assistant_message_id
+                and camera_commit.get("client_op_id") == append_receipt.assistant_client_op_id
+            )
+            ordinary_meal_saved = bool(
+                ordinary_meal and append_receipt is not None
+                and isinstance(append_receipt.assistant_metadata, Mapping)
+                and append_receipt.user_client_op_id == f"{append_receipt.assistant_metadata.get('logical_turn_id')}:user"
+                and append_receipt.assistant_client_op_id == f"{append_receipt.assistant_metadata.get('logical_turn_id')}:assistant"
+                and append_receipt.assistant_metadata.get("role") == "assistant"
+                and append_receipt.assistant_metadata.get("client_op_id") == append_receipt.assistant_client_op_id
+                and append_receipt.assistant_metadata.get("tenant_id") == memory_scope.private_tenant
+                and append_receipt.assistant_metadata.get("source_principal") == f"{message.channel}:{canonical_principal(message.channel, turn_ctx.principal)}"
+                and append_receipt.assistant_metadata.get("source_message_id") == _normalize_source_message_ref(message.metadata.get("message_id"))
+                and append_receipt.assistant_metadata.get("received_at") == _trusted_utc_iso(message.timestamp)
+                and append_receipt.assistant_metadata.get("ingest_source") == "telegram"
+                and append_receipt.assistant_metadata.get("confirmation_required") is False
+                and _receipt_has_consumed_nutrition(append_receipt.assistant_metadata)
+                and isinstance(append_receipt.assistant_content, str)
+            )
+            committed_annotation = None
+            if ordinary_meal_saved and append_receipt is not None:
+                stored_trace = append_receipt.assistant_metadata.get("decision_trace")
+                stored_annotations = (
+                    stored_trace.get("annotations")
+                    if isinstance(stored_trace, Mapping) else None
+                )
+                stored_nutrition = (
+                    stored_annotations.get("nutrition")
+                    if isinstance(stored_annotations, Mapping) else None
+                )
+                try:
+                    committed_annotation = NutritionAnnotationV2.model_validate(stored_nutrition)
+                except (TypeError, ValueError):
+                    ordinary_meal_saved = False
+                else:
+                    # A durable retry may carry a different model proposal.
+                    # The final answer must describe the exact event already saved.
+                    reply = append_receipt.assistant_content
             if camera_ingress is not None and turn_ctx.camera_authorized:
                 camera_ingress.complete(
                     message,
-                    recorded=bool(
-                        append_receipt is not None
-                        and recorder is not None
-                        and recorder.validated_nutrition_envelope is not None
-                    ),
+                    recorded=camera_meal_saved,
+                    clarification=camera_clarification,
                 )
             logger.info(
                 "ohmo runtime processing complete session_key=%s session_id=%s reply=%r",
@@ -1836,6 +2016,35 @@ class OhmoSessionRuntimePool:
                 "_session_key": session_key,
                 **self._camera_final_delivery_metadata(message),
             }
+            if camera_meal_saved and isinstance(camera_commit, dict):
+                metadata.update(
+                    nutrition_append_event_id=camera_commit["event_id"],
+                    nutrition_sync_status="pending",
+                )
+            elif camera_yes and finalizer_nutrition is not None:
+                reply = "Не удалось подтвердить сохранение записи."
+            elif ordinary_meal:
+                if ordinary_meal_saved and append_receipt is not None:
+                    metadata.update(
+                        nutrition_append_event_id=append_receipt.assistant_message_id,
+                        nutrition_sync_status="pending",
+                        nutrition_committed_annotation=(
+                            committed_annotation.model_dump(mode="json")
+                            if committed_annotation is not None else None
+                        ),
+                        nutrition_model_proposal_annotation=(
+                            finalizer_nutrition.model_dump(mode="json")
+                            if finalizer_nutrition is not None else None
+                        ),
+                        nutrition_proposal_matches_committed=(
+                            finalizer_nutrition.model_dump(mode="json")
+                            == committed_annotation.model_dump(mode="json")
+                            if finalizer_nutrition is not None
+                            and committed_annotation is not None else False
+                        ),
+                    )
+                else:
+                    reply = "Не удалось подтвердить сохранение записи."
             if final_media:
                 metadata.update({"_media": final_media, "_final_media_fallback": True})
             yield GatewayStreamUpdate(
@@ -1882,6 +2091,12 @@ class OhmoSessionRuntimePool:
             and message.metadata.get("_camera_correction") is CAMERA_AUTHORITY
             and message.metadata.get("_camera_answer") == "no"
         )
+        annotation = recorder.validated_nutrition_envelope if recorder is not None else None
+        validated = (
+            NutritionAnnotationV2.model_validate(annotation)
+            if isinstance(annotation, Mapping) and annotation.get("schema_version", 1) == 2
+            else None
+        )
         if camera_yes:
             camera_ingress = getattr(self, "_camera_ingress", None)
             trusted_meal_at = (
@@ -1891,31 +2106,41 @@ class OhmoSessionRuntimePool:
             )
             if trusted_meal_at is None:
                 raise ValueError("Camera consumed meal requires trusted capture time")
-            annotation = recorder.validated_nutrition_envelope if recorder is not None else None
             if annotation is None:
-                raise ValueError("Camera confirmation requires a validated meal observation")
-            validated = NutritionAnnotationV2.model_validate(annotation)
-            if (
-                validated.record_type != "meal_observation"
-                or validated.consumption_status != "consumed"
-                or "image" not in validated.basis
-            ):
-                raise ValueError("Camera meal finalization requires a consumed image observation")
-            if validated.meal_at != trusted_meal_at or validated.meal_date is not None:
-                raise ValueError(
-                    "Camera consumed meal requires authoritative meal_at without meal_date"
-                )
-            if validated.explicit_new_consumption:
-                raise ValueError("Camera consumption cannot override exact-image replay identity")
+                if (
+                    recorder is None
+                    or message.metadata.get("_camera_clarification_allowed") is not CAMERA_AUTHORITY
+                    or recorder.nutrition_annotation_status not in {"missing", "not_applicable"}
+                ):
+                    raise ValueError(
+                        "Camera clarification requires a valid missing nutrition trace"
+                    )
+            else:
+                assert validated is not None
+                if (
+                    validated.record_type != "meal_observation"
+                    or validated.consumption_status != "consumed"
+                    or "image" not in validated.basis
+                ):
+                    raise ValueError(
+                        "Camera meal finalization requires a consumed image observation"
+                    )
+                if validated.meal_at != trusted_meal_at or validated.meal_date is not None:
+                    raise ValueError(
+                        "Camera consumed meal requires authoritative meal_at without meal_date"
+                    )
+                if validated.explicit_new_consumption:
+                    raise ValueError(
+                        "Camera consumption cannot override exact-image replay identity"
+                    )
         if camera_correction:
             ingress = getattr(self, "_camera_ingress", None)
             candidate_id = message.metadata.get("_camera_candidate_id")
             attempt = ingress._attempts.get(candidate_id) if ingress is not None else None
             target = attempt.get("camera_commit") if attempt is not None else None
-            annotation = recorder.validated_nutrition_envelope if recorder is not None else None
             if not isinstance(target, dict) or annotation is None:
                 raise ValueError("Camera denial requires a retained committed meal target")
-            validated = NutritionAnnotationV2.model_validate(annotation)
+            assert validated is not None
             if (
                 validated.record_type != "meal_correction"
                 or validated.consumption_status != "not_consumed"
@@ -1990,9 +2215,16 @@ class OhmoSessionRuntimePool:
             assistant_text,
             user_metadata=user_metadata,
             assistant_metadata=assistant_metadata,
-            durable=camera_bound_answer,
+            durable=(
+                camera_bound_answer
+                or (
+                    validated is not None
+                    and validated.record_type == "meal_observation"
+                    and validated.consumption_status == "consumed"
+                )
+            ),
         )
-        if camera_yes:
+        if camera_yes and validated is not None:
             self._camera_ingress.record_committed_meal(
                 message, receipt, validated.model_dump(mode="json")
             )
@@ -3832,14 +4064,35 @@ def _build_inbound_user_message(
             (message.metadata or {}).get("message_id")
         ),
     }
-    for media_path in message.media:
+    coalesced_sources = (
+        message.metadata.get("_coalesced_media_sources")
+        if message.metadata.get("_coalesced_media_provenance_authority")
+        is COALESCED_ATTACHMENT_PROVENANCE_AUTHORITY
+        else None
+    )
+    for media_index, media_path in enumerate(message.media):
         if not _is_image_attachment(media_path):
             continue
         try:
             image = ImageBlock.from_path(media_path)
             if attachment_store is not None:
                 ref = attachment_store.ingest_image_block(image)
-                content.append(ref.model_copy(update={"source_provenance": source_provenance}))
+                attachment_provenance = dict(source_provenance)
+                if isinstance(coalesced_sources, list) and media_index < len(coalesced_sources):
+                    source = coalesced_sources[media_index]
+                    if isinstance(source, Mapping):
+                        source_id = _normalize_source_message_ref(source.get("source_message_id"))
+                        received_at = source.get("received_at")
+                        if source_id is not None and isinstance(received_at, str):
+                            try:
+                                attachment_time = datetime.fromisoformat(received_at)
+                            except ValueError:
+                                attachment_time = None
+                            trusted_time = _trusted_utc_iso(attachment_time)
+                            if trusted_time is not None:
+                                attachment_provenance["source_message_id"] = source_id
+                                attachment_provenance["received_at"] = trusted_time
+                content.append(ref.model_copy(update={"source_provenance": attachment_provenance}))
             content.append(image)
         except Exception:
             logger.exception("ohmo runtime failed to encode image attachment path=%s", media_path)

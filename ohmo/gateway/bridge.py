@@ -13,7 +13,11 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 from ohmo.contact_registry import ContactStore
-from ohmo.gateway.camera import CAMERA_AUTHORITY, CameraIngress
+from ohmo.gateway.camera import (
+    CAMERA_AUTHORITY,
+    COALESCED_ATTACHMENT_PROVENANCE_AUTHORITY,
+    CameraIngress,
+)
 from ohmo.gateway.config import load_gateway_config, save_gateway_config
 from ohmo.gateway.router import session_key_for_message
 from ohmo.gateway.runtime import OhmoSessionRuntimePool
@@ -885,8 +889,20 @@ def _coalesce(messages: list[InboundMessage]) -> InboundMessage:
     last = messages[-1]
     content = "\n\n".join(m.content for m in messages)
     media: list[str] = []
+    media_sources: list[dict[str, object]] = []
     for m in messages:
         media.extend(m.media)
+        source_id = m.metadata.get("message_id") if isinstance(m.metadata, dict) else None
+        for _ in m.media:
+            media_sources.append({
+                "source_message_id": str(source_id) if source_id is not None else None,
+                "received_at": m.timestamp.isoformat() if m.timestamp.tzinfo else None,
+            })
+    metadata = dict(last.metadata)
+    metadata["_coalesced_media_sources"] = media_sources
+    metadata["_coalesced_media_provenance_authority"] = (
+        COALESCED_ATTACHMENT_PROVENANCE_AUTHORITY
+    )
     return InboundMessage(
         channel=last.channel,
         sender_id=last.sender_id,
@@ -894,7 +910,7 @@ def _coalesce(messages: list[InboundMessage]) -> InboundMessage:
         content=content,
         timestamp=last.timestamp,
         media=media,
-        metadata=dict(last.metadata),
+        metadata=metadata,
         session_key_override=last.session_key_override,
     )
 

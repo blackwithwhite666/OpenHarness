@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+from io import BytesIO
 import json
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
@@ -105,7 +106,8 @@ class FakeTelegram:
 
 
 def _candidate(
-    root: Path, *, index: int = 0, capture_time: datetime | None = None
+    root: Path, *, index: int = 0, capture_time: datetime | None = None,
+    image_bytes: bytes | None = None,
 ) -> dict:
     payload = json.loads(FIXTURE.read_text(encoding="utf-8"))
     payload["normalized_capture_time"] = (
@@ -119,7 +121,13 @@ def _candidate(
     payload["classifier_model"] = "deepseek/deepseek-v4.1-flash"
     payload["classifier_policy_version"] = "deepseek-camera-production-v1"
     payload["classifier_route_attestation_json"] = _deepseek_route_json()
-    image = b"fake-offline-image" + str(index).encode()
+    image = image_bytes if image_bytes is not None else b"fake-offline-image" + str(index).encode()
+    if image_bytes is not None:
+        from PIL import Image
+
+        with Image.open(BytesIO(image)) as decoded:
+            payload["width"], payload["height"] = decoded.size
+            payload["exif"]["width"], payload["exif"]["height"] = decoded.size
     payload["original_size_bytes"] = len(image)
     payload["original_sha256"] = hashlib.sha256(image).hexdigest()
     directory = root / payload["candidate_id"]
@@ -559,8 +567,8 @@ async def test_unrecognized_or_unbound_real_text_is_nutrition_forbidden(tmp_path
         # are covered by the binding tests; these must stay nutrition-forbidden.
         ("посмотри ещё раз", 77),
         ("не знаю", None),
-        ("только сливы", None),  # scope-only binds only when anchored
         ("Как погода?", None),
+        ("только сливы", None),  # context hint is not a consumption assertion
         ("Обычный разговор", 999),
     ):
         message = InboundMessage(
@@ -571,11 +579,21 @@ async def test_unrecognized_or_unbound_real_text_is_nutrition_forbidden(tmp_path
             metadata={"is_group": False, "reply_to_message_id": target, "_telegram_raw_text": text},
         )
         ingress.process_real_inbound(message)
-        if target == 999:
+        if text == "только сливы":
+            assert message.metadata.get("_camera_context_hint") is CAMERA_AUTHORITY
+            assert message.metadata.get("_camera_answer") == "yes"
+            assert message.metadata.get("_camera_clarification_allowed") is CAMERA_AUTHORITY
+        elif target == 999:
             assert "_camera_unbound" not in message.metadata
+        elif text == "Как погода?":
+            assert message.metadata.get("_camera_context_unrelated") is CAMERA_AUTHORITY
+            assert message.metadata.get("_camera_answer") is None
+        elif target is None:
+            assert message.metadata.get("_camera_context_unrelated") is CAMERA_AUTHORITY
         else:
             assert message.metadata.get("_camera_unbound") is CAMERA_AUTHORITY
-        assert message.metadata.get("_camera_answer") is None
+        if text not in {"только сливы", "Как погода?"}:
+            assert message.metadata.get("_camera_answer") is None
     await ingress.close()
 
 
@@ -2146,6 +2164,9 @@ async def test_stream_reconcile_records_meal_arms_native_receipt_and_allows_late
     assert attempt["state"] == "final_queued"
     assert attempt["final_turn_id"] == turn_id
     assert updates[0].metadata["_camera_final"] is CAMERA_AUTHORITY
+    assert updates[0].metadata["nutrition_append_event_id"] == "honcho-meal"
+    assert updates[0].metadata["nutrition_sync_status"] == "pending"
+    assert "honcho-meal" not in updates[0].text
 
     ingress.note_assistant_receipt(
         OutboundMessage(
@@ -2490,17 +2511,19 @@ async def test_bare_explicit_answer_binds_and_ambiguous_stays_unbound(tmp_path: 
     ambiguous = incoming("посмотри ещё раз")
     ingress.process_real_inbound(ambiguous)
     assert ambiguous.metadata.get("_camera_answer") is None
-    assert ambiguous.metadata["_camera_unbound"] is CAMERA_AUTHORITY
+    assert ambiguous.metadata["_camera_context_unrelated"] is CAMERA_AUTHORITY
 
     bare_affirmation = incoming("да")
     ingress.process_real_inbound(bare_affirmation)
     assert bare_affirmation.metadata.get("_camera_answer") is None
-    assert bare_affirmation.metadata["_camera_unbound"] is CAMERA_AUTHORITY
+    assert bare_affirmation.metadata["_camera_context_unrelated"] is CAMERA_AUTHORITY
 
     bare_scope = incoming("Только сливы")
     ingress.process_real_inbound(bare_scope)
-    assert bare_scope.metadata.get("_camera_answer") is None  # scope binds only anchored
-    assert bare_scope.metadata["_camera_unbound"] is CAMERA_AUTHORITY
+    assert bare_scope.metadata.get("_camera_context_hint") is CAMERA_AUTHORITY
+    assert bare_scope.metadata.get("_camera_answer") == "yes"
+    ingress.complete(bare_scope, recorded=False, clarification=True)
+    assert ingress._attempts[request["candidate_id"]]["state"] == "clarifying"
 
     bare_consumption = incoming("Я съела 4")
     ingress.process_real_inbound(bare_consumption)
@@ -2528,15 +2551,19 @@ async def test_bare_explicit_answer_binds_and_ambiguous_stays_unbound(tmp_path: 
     )
     assert ingress._attempts[request["candidate_id"]]["state"] == "completed"
 
+    await ingress.close()
+    negation_root = tmp_path / "negation"
+    negation_root.mkdir()
+    ingress, root, bus, _ = _ingress(negation_root)
     second = _candidate(root, index=1)
     assert (await _admit(ingress, root, "Bearer " + "s" * 40, second))[0] == 202
     await asyncio.wait_for(bus.consume_inbound(), timeout=1)
     bare_negation = incoming("Я это не ела")
     ingress.process_real_inbound(bare_negation)
-    assert bare_negation.metadata.get("_camera_answer") is None
-    assert bare_negation.metadata["_camera_unbound"] is CAMERA_AUTHORITY
+    assert bare_negation.metadata.get("_camera_answer") == "no"
+    assert bare_negation.metadata["_camera_authority"] is CAMERA_AUTHORITY
     assert len(bare_negation.media) == 0
-    assert ingress._attempts[second["candidate_id"]]["state"] == "photo_sent"
+    assert ingress._attempts[second["candidate_id"]]["state"] == "answering"
     await ingress.close()
 
 
