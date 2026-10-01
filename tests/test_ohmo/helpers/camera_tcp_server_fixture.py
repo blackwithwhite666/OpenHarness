@@ -173,6 +173,9 @@ class FixtureServer:
             ),
             "attempt_history": {
                 candidate_id: {
+                    "state": attempt.get("state"),
+                    "attention_active": attempt.get("attention_active"),
+                    "answer_kind": attempt.get("answer_kind"),
                     "request_identity": attempt.get("request_identity"),
                     "request_ack": attempt.get("request_ack"),
                     "admission_id": attempt.get("admission_id"),
@@ -213,8 +216,8 @@ class FixtureServer:
         self.server = await asyncio.start_server(self._handle, "127.0.0.1", 0)
         self.port = int(self.server.sockets[0].getsockname()[1])
 
-    def make_legacy_source_gap(self) -> str:
-        """Persist one receipt using the legacy journal shape without capture fields."""
+    def make_legacy_source_conflict(self) -> dict[str, str]:
+        """Persist a legacy receipt whose retained image digest contradicts its source."""
         candidates = [
             (candidate_id, attempt)
             for candidate_id, attempt in self.ingress._attempts.items()
@@ -223,11 +226,38 @@ class FixtureServer:
         if len(candidates) != 1:
             raise ValueError("fixture requires exactly one confirmed Camera receipt")
         candidate_id, attempt = candidates[0]
+        request_identity = attempt.get("request_identity")
+        original_sha256 = (
+            request_identity.get("image_sha256")
+            if isinstance(request_identity, dict)
+            else None
+        )
+        snapshot = attempt.get("snapshot")
+        admission_id = attempt.get("admission_id")
+        if (
+            not isinstance(original_sha256, str)
+            or attempt.get("image_sha256") != original_sha256
+            or not isinstance(snapshot, str)
+            or Path(snapshot).parent != self.ingress._state_dir / "snapshots"
+            or not isinstance(admission_id, str)
+            or Path(snapshot).name not in {
+                f"{admission_id}.jpg", f"{admission_id}.jpeg",
+                f"{admission_id}.png", f"{admission_id}.webp",
+            }
+            or hashlib.sha256(Path(snapshot).read_bytes()).hexdigest() != original_sha256
+        ):
+            raise ValueError("fixture receipt does not retain its exact original image evidence")
+        conflicting_sha256 = "0" * 64 if original_sha256 != "0" * 64 else "1" * 64
         attempt.pop("reference_source", None)
         attempt.pop("capture_time", None)
         attempt.pop("capture_time_authority", None)
+        attempt["image_sha256"] = conflicting_sha256
         self.ingress._save_attempts()
-        return candidate_id
+        return {
+            "candidate_id": candidate_id,
+            "original_image_sha256": original_sha256,
+            "conflicting_image_sha256": conflicting_sha256,
+        }
 
     def make_restorable_legacy_source_gap(self) -> str:
         """Model a legacy receipt missing capture fields and its managed snapshot."""
@@ -288,6 +318,9 @@ class FixtureServer:
     def release_photos(self) -> None:
         self.photo_gate.set()
 
+    def hold_photos(self) -> None:
+        self.photo_gate.clear()
+
     def advance_camera_days(self, days: int) -> None:
         FixtureClock.current += timedelta(days=days)
 
@@ -312,8 +345,8 @@ def _control(value: object) -> dict[str, object]:
         raise ValueError("control must be one bounded operation object")
     op = value.get("op")
     if op not in {
-        "counters", "await_idle", "restart", "release_photos",
-        "advance_camera_days", "make_legacy_source_gap",
+        "counters", "await_idle", "restart", "release_photos", "hold_photos",
+        "advance_camera_days", "make_legacy_source_conflict",
         "make_restorable_legacy_source_gap", "complete_negative_answer", "quit",
     }:
         raise ValueError("unsupported fixture control operation")
@@ -357,11 +390,14 @@ async def _run(workspace: Path, token_file: Path, ohmo_root: Path, *, hold_photo
                 elif op == "release_photos":
                     server.release_photos()
                     result = {"ok": True}
+                elif op == "hold_photos":
+                    server.hold_photos()
+                    result = {"ok": True}
                 elif op == "advance_camera_days":
                     server.advance_camera_days(command["days"])
                     result = {"ok": True, "camera_now": FixtureClock.current.isoformat()}
-                elif op == "make_legacy_source_gap":
-                    result = {"ok": True, "candidate_id": server.make_legacy_source_gap()}
+                elif op == "make_legacy_source_conflict":
+                    result = {"ok": True, **server.make_legacy_source_conflict()}
                 elif op == "make_restorable_legacy_source_gap":
                     result = {
                         "ok": True,

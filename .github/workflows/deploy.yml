@@ -29,6 +29,9 @@ jobs:
     runs-on: [self-hosted, linux, x64]
     steps:
       - uses: actions/checkout@v4
+        # Historical journal tests load a pinned Camera implementation with git show.
+        with:
+          fetch-depth: 0
 
       - name: Set up user session (systemd --user / D-Bus)
         # The bash/task tools sandbox subprocesses with `systemd-run --user

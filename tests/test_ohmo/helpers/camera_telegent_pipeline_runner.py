@@ -336,7 +336,7 @@ def main() -> None:
         target_result = next(
             (item for item in stage_results if item.candidate_id == target_id), None
         )
-        if target_result is None or target_result.outcome == "published":
+        if target_result is None:
             manifest = store.load_manifest(target_id)
             sidecar = store.load_producer(target_id)
             if manifest is None or sidecar is None:
@@ -385,9 +385,15 @@ def main() -> None:
                 is not None
             },
             "committed_seq": state.get("committed_seq") if state else None,
-            "scene_source_operations": scene_gate.source_operation_calls,
-            "scene_sources_reestablished": scene_gate.source_reestablished_count,
-            "scene_reference_hold_count": scene_gate.reference_hold_count,
+            "scene_source_operations": sum(
+                item.scene_source_operations for item in stage_results
+            ),
+            "scene_sources_reestablished": sum(
+                item.scene_sources_reestablished for item in stage_results
+            ),
+            "scene_reference_hold_count": sum(
+                item.scene_reference_hold_count for item in stage_results
+            ),
             "scene_provider_requests": len(scene_gate._fixture_scene_requests),
         }
         pipeline.close()

@@ -3731,9 +3731,9 @@ async def test_v2_reestablishes_missing_legacy_source_without_changing_admission
     assert reopened._session == session_before
     for field in ("state", "photo_id", "photo_delivery_confirmed", "request_identity", "request_ack"):
         assert reloaded.get(field) == legacy_attempt_before.get(field)
-    assert datetime.fromisoformat(reloaded["reference_source"]["capture_time"]) == datetime.fromisoformat(
-        legacy["capture_time"]
-    )
+    assert datetime.fromisoformat(
+        reloaded["reference_source"]["capture_time"].replace("Z", "+00:00")
+    ) == datetime.fromisoformat(legacy["capture_time"].replace("Z", "+00:00"))
     assert reloaded["reference_source"]["image_sha256"] == legacy["image_sha256"]
     assert reloaded["reference_source"]["snapshot"] == str(original_snapshot)
     assert not reloaded.get("camera_commit")
@@ -3804,8 +3804,8 @@ async def test_reference_source_keeps_historical_request_ack_across_restart(tmp_
     assert code == 200 and result["status"] == "source_reestablished"
     assert attempt["request_identity"] == saved_identity
     assert attempt["request_ack"] == saved_ack
-    assert datetime.fromisoformat(attempt["capture_time"]) == datetime.fromisoformat(
-        saved_identity["capture_time"]
+    assert datetime.fromisoformat(attempt["capture_time"].replace("Z", "+00:00")) == (
+        datetime.fromisoformat(saved_identity["capture_time"].replace("Z", "+00:00"))
     )
     assert attempt["image_sha256"] == saved_identity["image_sha256"]
     assert Path(attempt["reference_source"]["snapshot"]).exists()
@@ -3961,23 +3961,19 @@ async def test_reference_source_pending_commit_retries_after_capture_expires_wit
     observation = json.dumps(
         attempt["reference_source"], sort_keys=True, separators=(",", ":")
     )
-    journal_after_write = ingress._state_path.read_bytes()
-    session_before_retry = dict(ingress._session)
-    attempt_ids_before_retry = set(ingress._attempts)
-    native_calls_before_retry = len(channel.calls)
-
     ControlledDatetime.current = base + timedelta(days=8)
     query = json.dumps({
         "schema_version": 2,
         "candidate_id": candidate_id_for("id:expired-source-query", "rev-expired-source"),
         "capture_time": ControlledDatetime.current.isoformat(),
     }, separators=(",", ":")).encode()
+    session_before_query = dict(ingress._session)
     status, projection, _ = await _reference_request(ingress, query)
     assert status == 200 and projection["coverage"] == "complete"
     assert projection["unresolved_candidate_ids"] == []
     assert projection["references"] == [] and projection["reestablished_references"] == []
     assert candidate["candidate_id"] not in projection["pending_candidate_ids"]
-    assert ingress._session == session_before_retry
+    assert ingress._session == session_before_query
 
     # Keep the synthetic admission lease current while advancing the injected
     # clock; the expired source observation must not act as a global barrier.
@@ -3995,10 +3991,31 @@ async def test_reference_source_pending_commit_retries_after_capture_expires_wit
     assert abs(
         (fresh_capture - captured).total_seconds()
     ) < timedelta(days=7).total_seconds()
-    assert len(channel.calls) == 1
+    fresh_attempt = ingress._attempts[fresh["candidate_id"]]
+    fresh_task = next(
+        (
+            task
+            for task in ingress._tasks
+            if task.get_name() == fresh_attempt["admission_id"]
+        ),
+        None,
+    )
+    if fresh_task is not None:
+        await asyncio.wait_for(asyncio.shield(fresh_task), timeout=1)
+    assert fresh_attempt["photo_delivery_confirmed"] is True
+    assert type(fresh_attempt["photo_id"]) is int and fresh_attempt["photo_id"] > 0
+    assert fresh_attempt["request_ack"]["status"] == 202
+    assert fresh_attempt["request_ack"]["body"]["ack_seq"] == admission_ack["ack_seq"]
+    fresh_event = await asyncio.wait_for(bus.consume_inbound(), timeout=1)
+    assert fresh_event.metadata["_camera_candidate_id"] == fresh["candidate_id"]
+    assert fresh_event.metadata["_camera_photo_id"] == fresh_attempt["photo_id"]
+
+    # Settle the new candidate's delivery task before taking the retry baseline.
     journal_after_write = ingress._state_path.read_bytes()
     session_before_retry = dict(ingress._session)
     attempt_ids_before_retry = set(ingress._attempts)
+    native_calls_before_retry = len(channel.calls)
+    assert native_calls_before_retry == 2
 
     status, restored, _ = await _reference_source_request(ingress, root, candidate)
     assert status == 200 and restored["status"] == "source_reestablished"
@@ -4009,7 +4026,7 @@ async def test_reference_source_pending_commit_retries_after_capture_expires_wit
     assert json.dumps(attempt["request_ack"], sort_keys=True, separators=(",", ":")) == original_ack
     assert ingress._session == session_before_retry
     assert set(ingress._attempts) == attempt_ids_before_retry
-    assert len(channel.calls) == native_calls_before_retry == 1
+    assert len(channel.calls) == native_calls_before_retry == 2
     assert bus.inbound_size == 0
 
     status, projection, _ = await _reference_request(ingress, query)
@@ -4037,7 +4054,7 @@ async def test_reference_source_pending_commit_retries_after_capture_expires_wit
     status, projection, _ = await _reference_request(reopened, query)
     assert status == 200 and projection["coverage"] == "complete"
     assert projection["unresolved_candidate_ids"] == []
-    assert len(channel.calls) == 1
+    assert len(channel.calls) == 2
     await reopened.close()
 
 

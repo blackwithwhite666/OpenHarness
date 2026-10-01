@@ -577,7 +577,7 @@ def test_telegent_expired_unknown_request_retires_without_fresh_photo(tmp_path):
         server.close()
 
 
-def test_actual_scene_producer_fails_closed_on_legacy_source_gap(
+def test_actual_scene_producer_fails_closed_on_legacy_source_conflict(
     tmp_path,
 ):
     checkout_value = os.environ.get("TELEGENT_CHECKOUT")
@@ -609,37 +609,78 @@ def test_actual_scene_producer_fails_closed_on_legacy_source_gap(
         assert [item["request"]["seq"] for item in initial["observed"]] == [1]
         confirmed = server.control("await_idle")["counters"]
         assert confirmed["photo_calls"] == confirmed["confirmed_photo_attempts"] == 1
-        gap = server.control("make_legacy_source_gap")
-        assert gap["ok"] is True, gap
+        conflict = server.control("make_legacy_source_conflict")
+        a_id = conflict["candidate_id"]
+        assert conflict["ok"] is True, conflict
+        confirmed_history = confirmed["attempt_history"][a_id]
+        assert conflict["original_image_sha256"] == confirmed_history["image_sha256"]
+        assert conflict["conflicting_image_sha256"] != conflict["original_image_sha256"]
         restarted = server.control("restart")
         assert restarted["journal_preserved"] is True
         server.port = restarted["port"]
         pre_repair = server.control("counters")["counters"]
         assert pre_repair["reference_source_records"] == 0
+        before_history = pre_repair["attempt_history"][a_id]
+        assert before_history["request_identity"] == confirmed_history["request_identity"]
+        assert before_history["request_ack"] == confirmed_history["request_ack"]
+        assert before_history["photo_id"] == confirmed_history["photo_id"]
+        assert before_history["photo_delivery_confirmed"] is True
+        assert before_history["image_sha256"] == conflict["conflicting_image_sha256"]
         read_before = (pre_repair["journal_sha256"], pre_repair["journal_mtime_ns"])
 
         distinct = _run_scene_stage(
             checkout, producer_python, producer_state, server, token, "distinct", "non_food"
         )
-        assert distinct["scene_source_operations"] == 1
+        assert distinct["scene_source_operations"] == 1, {
+            "outcomes": distinct["outcomes"],
+            "results": distinct["results"],
+            "queries": [
+                (item["request"], item["response_status"], item["response_body"])
+                for item in distinct["reference_queries"]
+            ],
+            "source_operations": distinct["source_operations"],
+            "observed": [
+                (item["path"], item["response_status"], item["response_body"])
+                for item in distinct["observed"]
+            ],
+        }
         assert distinct["scene_sources_reestablished"] == 0
         assert distinct["scene_reference_hold_count"] == 1
         assert distinct["scene_provider_requests"] == 0
         assert len(distinct["source_operations"]) == 1
-        assert distinct["source_operations"][0]["response_status"] == 422
-        assert json.loads(distinct["source_operations"][0]["response_body"])["error"][
+        source_op = distinct["source_operations"][0]
+        assert source_op["request"]["image_sha256"] == conflict["original_image_sha256"]
+        assert source_op["image_sha256"] == conflict["original_image_sha256"]
+        assert source_op["response_status"] == 409
+        assert json.loads(source_op["response_body"])["error"][
             "code"
-        ] == "reference_source_mismatch"
+        ] == "reference_source_conflict"
         assert len(distinct["reference_queries"]) == 2
         assert all(item["response_status"] == 200 for item in distinct["reference_queries"])
+        assert all(
+            json.loads(item["response_body"])["coverage"] == "incomplete"
+            and json.loads(item["response_body"])["unresolved_candidate_ids"] == [a_id]
+            for item in distinct["reference_queries"]
+        )
         assert all(
             item["path"] != "/internal/v1/camera/candidates"
             or item["request"]["source_revision"] != "rev:tcp-b"
             for item in distinct["observed"]
         )
+        assert "/internal/v1/camera/session" not in distinct["operation_order"]
         after_hold = server.control("counters")["counters"]
         assert (after_hold["journal_sha256"], after_hold["journal_mtime_ns"]) == read_before
         assert after_hold["photo_calls"] == after_hold["confirmed_photo_attempts"] == 1
+        assert after_hold["camera_meal_commits"] == 0
+        assert after_hold["attempt_history"][a_id]["image_sha256"] == (
+            conflict["conflicting_image_sha256"]
+        )
+        assert after_hold["attempt_history"][a_id]["request_identity"] == (
+            confirmed_history["request_identity"]
+        )
+        assert after_hold["attempt_history"][a_id]["request_ack"] == (
+            confirmed_history["request_ack"]
+        )
         assert after_hold["journal_entries"] == 1
         assert after_hold["committed_seq"] == 0
     finally:
@@ -687,6 +728,20 @@ def test_actual_scene_producer_restores_immutable_legacy_source_before_admitting
         assert server.control("release_photos")["ok"] is True
         a_delivered = server.control("await_idle")["counters"]
         assert a_delivered["photo_calls"] == a_delivered["confirmed_photo_attempts"] == 1
+        completion = server.control("complete_negative_answer")
+        assert completion["ok"] is True and completion["candidate_id"] == a_id
+        a_completed = server.control("counters")["counters"]
+        a_history = a_completed["attempt_history"][a_id]
+        assert a_history["state"] == "final_queued"
+        assert a_history["attention_active"] is False
+        assert a_history["answer_kind"] == "no"
+        assert a_completed["camera_meal_commits"] == 0
+        delivered_history = a_delivered["attempt_history"][a_id]
+        for field in (
+            "request_identity", "request_ack", "image_sha256", "capture_time",
+            "capture_time_authority", "photo_id", "photo_delivery_confirmed",
+        ):
+            assert a_history[field] == delivered_history[field]
         a_capture = a_post["request"]["capture_time"]
         query_id = candidate_id_for("id:restore-query", "rev-restore-query")
         status, a_projection_body = _references(
@@ -697,7 +752,6 @@ def test_actual_scene_producer_restores_immutable_legacy_source_before_admitting
         assert a_projection["schema_version"] == 2
         a_receipt = next(item for item in a_projection["references"]
                          if item["candidate_id"] == a_id)
-        a_history = a_delivered["attempt_history"][a_id]
         assert a_history["request_identity"] == a_post["request"]
         assert a_history["request_ack"]["status"] == 202
         assert a_history["request_ack"]["body"] == a_ack
@@ -712,6 +766,9 @@ def test_actual_scene_producer_restores_immutable_legacy_source_before_admitting
         server.port = restarted["port"]
         before_repair = server.control("counters")["counters"]
         assert before_repair["reference_source_records"] == 0
+        assert before_repair["attempt_history"][a_id]["state"] == "final_queued"
+        assert before_repair["attempt_history"][a_id]["attention_active"] is False
+        assert before_repair["attempt_history"][a_id]["answer_kind"] == "no"
         assert before_repair["attempt_history"][a_id]["capture_time"] is None
         assert before_repair["attempt_history"][a_id]["capture_time_authority"] is None
         assert before_repair["attempt_history"][a_id]["request_identity"] == a_history[
@@ -724,11 +781,32 @@ def test_actual_scene_producer_restores_immutable_legacy_source_before_admitting
             "native_photo_message_id"
         ]
         assert before_repair["attempt_history"][a_id]["photo_delivery_confirmed"] is True
+        assert server.control("hold_photos")["ok"] is True
 
         distinct = _run_scene_stage(
             checkout, producer_python, producer_state, server, token, "distinct", "non_food"
         )
-        assert distinct["scene_source_operations"] == 1
+        assert distinct["scene_source_operations"] == 1, {
+            "results": [
+                (item["outcome"], item["submission_outcome"],
+                 item["scene_source_operations"], item["scene_sources_reestablished"],
+                 item["scene_reference_hold_count"])
+                for item in distinct["results"]
+            ],
+            "http": [(item["path"], item["response_status"])
+                     for item in distinct["observed"]],
+            "source_operations": [
+                (item["request"].get("candidate_id"), item["response_status"],
+                 json.loads(item["response_body"]).get("error", {}).get("code"))
+                for item in distinct["source_operations"]
+            ],
+            "queries": [
+                (item["request"].get("candidate_id"), item["response_status"],
+                 json.loads(item["response_body"]).get("coverage"),
+                 json.loads(item["response_body"]).get("unresolved_candidate_ids"))
+                for item in distinct["reference_queries"]
+            ],
+        }
         source_op = distinct["source_operations"][0]
         assert source_op["manifest_sha256"] == a_artifacts["manifest_sha256"]
         assert source_op["producer_sha256"] == a_artifacts["sidecar_sha256"]
@@ -831,6 +909,9 @@ def test_actual_scene_producer_restores_immutable_legacy_source_before_admitting
         assert b_uploads[0]["request"]["seq"] == 1
         after_restore = server.control("counters")["counters"]
         history_after = after_restore["attempt_history"][a_id]
+        assert history_after["state"] == "final_queued"
+        assert history_after["attention_active"] is False
+        assert history_after["answer_kind"] == "no"
         assert history_after["request_identity"] == a_history["request_identity"]
         assert history_after["request_ack"] == a_history["request_ack"]
         assert history_after["photo_id"] == a_history["photo_id"]
