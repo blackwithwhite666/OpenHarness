@@ -183,6 +183,11 @@ def test_ohmo_prompt_routes_calory_questions_without_loading_policy(tmp_path: Pa
     assert "participant health, nutrition, or activity" in prompt
     assert "питание, калории, вес" in prompt
     assert "invoke the `calory` skill first and follow its instructions" in prompt
+    assert "Keep wellness answers brief and user-oriented" in prompt
+    assert "owner, family, and proactive reports" in prompt
+    assert "express nutrition and energy values in kcal (ккал)" in prompt
+    assert "Convert supported kJ by exactly 4.184" in prompt
+    assert "Keep technical gate diagnostics out" in prompt
     assert "energy_kcal_best" not in prompt
     assert "meal_correction" not in prompt
     assert "HealthAutoExportMetric_basal_energy_burned" not in prompt
@@ -242,13 +247,51 @@ def test_ohmo_prompt_energy_days_reports_observed_facts_and_coverage(tmp_path: P
     ):
         assert f"`{field}`" in prompt
     assert "basal X/Y" in prompt
-    assert "observed sums normalized to kJ (`basal_unit=active_unit=kJ`)" in prompt
+    assert "observed sums normalized internally to kJ (`basal_unit=active_unit=kJ`)" in prompt
     assert "not raw submitted units" in prompt
     assert "original submitted units in `sample.unit`/`original_unit` when known" in prompt
     assert "an uncertified legacy point has no authoritative original unit" in prompt
     assert "Keep basal and active energy aggregate-only by default" in prompt
     assert "request raw HAE energy only when needed" in prompt
     assert "1,000-sample cap" in prompt
+    assert "Keep all returned `energy_days` facts available internally" in prompt
+    assert "Do not make users read snapshot revisions" in prompt
+    assert "unless they explicitly request diagnostics" in prompt
+    assert "do not show raw kJ/кДж by default" in prompt
+    assert "For example, 4,184 kJ displays as 1,000 kcal" in prompt
+    assert "even when a balance is not eligible" in prompt
+    assert "If no observation exists for the requested measure, report it as unknown" in prompt
+    assert "never turn an absent sum, missing sample, or unavailable reading into 0 kcal" in prompt
+    assert "may be shown even if balance gates fail" in prompt
+    assert "A material conflict still blocks balance" in prompt
+
+
+def test_ohmo_prompt_energy_presentation_hides_diagnostics_by_default_but_keeps_gates(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / ".ohmo-home"
+    initialize_workspace(workspace)
+    prompt = _calory_skill_body()
+
+    for obsolete_display_rule in (
+        "report each returned `device_id` and `local_day` separately",
+        "Also report `snapshot_revision`",
+        "report the quarantine count when explaining uncertainty",
+        "If any energy gate fails, report the observed facts, units",
+        "Surface nonzero unresolved or legacy-synthetic counts",
+    ):
+        assert obsolete_display_rule not in prompt
+    for preserved_safety_rule in (
+        "A preliminary observed energy balance is allowed only for a past local day",
+        "missing fields (including uncertainty fields on an older API response) fail closed",
+        "Require `unresolved_key_count == 0` and `legacy_synthetic_count == 0`",
+        "A conflict in either energy type blocks balance",
+        "do not auto-correct, deduplicate, or choose a value",
+        "Do not calculate or state a deficit, surplus, calorie target",
+        "an empty nutrition list is never zero intake",
+        "daily intake must never be reconstructed from conversation memory",
+    ):
+        assert preserved_safety_rule in prompt
 
 
 def test_ohmo_prompt_has_no_absolute_energy_ban_when_provisional_balance_is_allowed(
@@ -296,7 +339,7 @@ def test_ohmo_prompt_energy_balance_requires_every_positive_gate(
     "fail_closed_rule",
     [
         "If any energy gate fails",
-        "state that expenditure may be incomplete",
+        "state in one short qualification that expenditure or the balance may be incomplete",
         "Do not calculate or state a deficit, surplus, calorie target",
         "A conflict in either energy type blocks balance",
         "do not auto-correct, deduplicate, or choose a value",
