@@ -3061,12 +3061,10 @@ class CameraIngress:
                     message.media.append(replay_attempt["snapshot"])
                 return
             replay_source = replay_attempt.get("answer_source_message_id")
-            context_turn = replay_attempt.get("context_question_turn_id")
-            if (
-                not isinstance(context_turn, str)
-                and replay_attempt.get("answer_kind") == "context"
-            ):
-                context_turn = replay_attempt.get("answer_turn_id")
+            # A source still pending in ``answering`` belongs to the current
+            # answer operation. ``context_question_turn_id`` may intentionally
+            # retain a prior completed question for this same candidate.
+            context_turn = replay_attempt.get("answer_turn_id")
             if (
                 inbound_source_id is not None
                 and replay_source == inbound_source_id

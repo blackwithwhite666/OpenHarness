@@ -418,6 +418,12 @@ def _append_nutrition_saved_status(answer: str, annotation: NutritionAnnotationV
         r"\b(?:не\s+(?:удалось|смог\w*|получил\w*|получится|могу)|failed\s+to|could\s+not|couldn't)\b",
         re.IGNORECASE,
     )
+    failed_storage_action = re.compile(
+        r"\b(?:не\s+(?:удалось|смог\w*|получил\w*|получится|могу)\s+"
+        r"(?:сохран\w*|запис\w*)|"
+        r"(?:failed\s+to|could\s+not|couldn't)\s+(?:save\w*|record\w*))\b",
+        re.IGNORECASE,
+    )
     empty_store = re.compile(
         r"\b(?:баз\w*|проекц\w*|database|projection)\b.{0,80}"
         r"\b(?:нет|пуст\w*|отсутств\w*|empty|no\s+record)\b",
@@ -428,14 +434,25 @@ def _append_nutrition_saved_status(answer: str, annotation: NutritionAnnotationV
         clauses = re.split(r"[,;]|\s+но\s+", sentence, flags=re.IGNORECASE)
         compound_failure = bool(storage.search(sentence) and failure.search(sentence))
         if compound_failure:
-            cleaned.extend(
-                part.strip()
-                for part in clauses
-                if not (
-                    storage.search(part) and failure.search(part)
-                    or empty_store.search(part)
-                )
-            )
+            for part in clauses:
+                if empty_store.search(part):
+                    continue
+                if storage.search(part) and failure.search(part):
+                    # Remove the assertion itself, not its object/complement:
+                    # e.g. retain "two pears: about 120 kcal" in a failed-save
+                    # pre-append sentence once the authoritative append wins.
+                    part, substitutions = failed_storage_action.subn("", part)
+                    if substitutions:
+                        part = part.strip(" ,;:—-.")
+                        if storage.fullmatch(part):
+                            part = ""
+                    else:
+                        # Some failure phrasing puts the storage noun after the
+                        # failure verb. Keep the existing conservative clause
+                        # removal when no specific failed action is identifiable.
+                        part = ""
+                if part.strip():
+                    cleaned.append(part.strip())
         else:
             cleaned.append(sentence)
     content = " ".join(part for part in cleaned if part).strip()

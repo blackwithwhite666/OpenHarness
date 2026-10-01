@@ -54,6 +54,10 @@ async def pending(tmp_path, monkeypatch):
             "Две груши: 120 ккал. Сохраните рисунок в PNG, чтобы сохранить прозрачность.",
             ["груши", "120", "PNG"],
         ),
+        (
+            "Не удалось сохранить две груши: примерно 120 ккал, диапазон 100–140. 2+2=4.",
+            ["две груши", "120", "100–140", "2+2=4"],
+        ),
     ],
 )
 async def test_food_and_independent_storage_answer_survive(tmp_path, monkeypatch, answer, required):
@@ -312,4 +316,79 @@ async def test_context_question_receipt_survives_restart_and_bare_quantity_keeps
         reopened._attempts[request["candidate_id"]]["photo_id"],
         reopened._attempts[request["candidate_id"]]["capture_time"],
     ) == original
+    await reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_second_context_question_replay_uses_its_operation_and_then_quantity_commits(
+    tmp_path, monkeypatch
+):
+    ingress, _root, bus, telegram, request = await _open_camera(tmp_path, index=881)
+    honcho = _Honcho()
+    pool = _pool(tmp_path, ingress, honcho, monkeypatch)
+    pool._test_bundle.engine = _ScriptedEngine(pool, [
+        (None, "Сколько горстей винограда вы съели?"),
+        (None, "Сколько клубники вы съели?"),
+    ])
+    candidate = request["candidate_id"]
+    attempt = ingress._attempts[candidate]
+
+    first_question = _owner_message("только виноград", 8811)
+    ingress.process_real_inbound(first_question)
+    first_result = await _turn(pool, first_question, ingress)
+    first_turn = attempt["context_question_turn_id"]
+    assert "Сколько" in first_result.text
+    assert attempt["state"] == "clarifying"
+    assert len(honcho.messages) == 2
+
+    second_question = _owner_message("только клубника", 8812)
+    ingress.process_real_inbound(second_question)
+    second_turn = second_question.metadata["_camera_turn_id"]
+    assert second_turn != first_turn
+    original_complete = ingress.complete
+
+    def crash_after_second_append(message, **kwargs):
+        if message is second_question and kwargs.get("clarification"):
+            raise RuntimeError("controlled crash after second durable question")
+        return original_complete(message, **kwargs)
+
+    ingress.complete = crash_after_second_append
+    with pytest.raises(RuntimeError, match="controlled crash"):
+        await _turn(pool, second_question, ingress)
+    assert len(honcho.messages) == 4
+    assert honcho.messages[-1].metadata["client_op_id"] == second_turn + ":assistant"
+    await ingress.close()
+
+    reopened = CameraIngress(ingress.config, workspace=tmp_path, bus=bus, telegram=telegram)
+    reopened.mark_restart_unknown()
+    pool._camera_ingress = reopened
+    replay = _owner_message("только клубника", 8812)
+    replay.timestamp = second_question.timestamp
+    reopened.process_real_inbound(replay)
+    assert replay.metadata["_camera_turn_id"] == second_turn
+    replay_updates = [u async for u in pool.stream_message(replay, reopened.config.session_key)]
+    assert [(u.kind, u.text) for u in replay_updates] == [("final", "Сколько клубники вы съели?")]
+    assert len(honcho.messages) == 4
+    assert reopened._attempts[candidate]["state"] == "clarifying"
+    assert reopened._attempts[candidate]["context_question_turn_id"] == second_turn
+
+    trace = _consumed_trace()
+    trace["annotations"]["nutrition"].update(
+        basis=["image", "owner_statement"],
+        items=[{"name": "strawberries", "quantity_text": "3 handfuls"}],
+    )
+    pool._test_bundle.engine = _ScriptedEngine(pool, [(trace, "Три горсти клубники записаны." )])
+    quantity = _owner_message("3 горсти клубники", 8813)
+    reopened.process_real_inbound(quantity)
+    assert quantity.metadata["_camera_candidate_id"] == candidate
+    assert attempt["snapshot"] in quantity.media
+    final = await _turn(pool, quantity, reopened)
+    await pool._shadow_backend_for_scope(None).await_pending()
+    meal = honcho.messages[-1]
+    assert final.metadata["nutrition_append_event_id"] == meal.id
+    assert meal.metadata["ingest_source"] == "dropbox_camera"
+    assert meal.metadata["source_message_id"] == "8813"
+    assert meal.metadata["decision_trace"]["annotations"]["nutrition"]["meal_at"] == attempt["capture_time"]
+    assert len(honcho.messages) == 6
+    assert reopened._attempts[candidate]["state"] == "completed"
     await reopened.close()
