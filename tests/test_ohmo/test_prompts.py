@@ -185,8 +185,9 @@ def test_ohmo_prompt_routes_calory_questions_without_loading_policy(tmp_path: Pa
     assert "invoke the `calory` skill first and follow its instructions" in prompt
     assert "Keep wellness answers brief and user-oriented" in prompt
     assert "owner, family, and proactive reports" in prompt
-    assert "express nutrition and energy values in kcal (ккал)" in prompt
-    assert "Convert supported kJ by exactly 4.184" in prompt
+    assert "ENERGY amounts for food, intake, expenditure, balances, and proactive wellness summaries" in prompt
+    assert "Keep portions in their stated units, macros in grams, and body weight" in prompt
+    assert "dividing by exactly 4.184" in prompt
     assert "Keep technical gate diagnostics out" in prompt
     assert "energy_kcal_best" not in prompt
     assert "meal_correction" not in prompt
@@ -292,6 +293,24 @@ def test_ohmo_prompt_energy_presentation_hides_diagnostics_by_default_but_keeps_
         "daily intake must never be reconstructed from conversation memory",
     ):
         assert preserved_safety_rule in prompt
+
+
+def test_ohmo_energy_unit_presentation_preserves_food_macro_and_weight_units(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / ".ohmo-home"
+    initialize_workspace(workspace)
+    skill = _calory_skill_body()
+    router = build_ohmo_system_prompt(tmp_path, workspace=workspace)
+
+    for contract in (
+        "This rule applies to energy only",
+        "preserve food portions and quantities in their stated units",
+        "protein/fat/carbohydrate amounts in grams",
+        "body weight in kilograms",
+    ):
+        assert contract in skill
+    assert "Keep portions in their stated units, macros in grams, and body weight in kilograms" in router
 
 
 def test_ohmo_prompt_has_no_absolute_energy_ban_when_provisional_balance_is_allowed(
