@@ -1,26 +1,47 @@
-# Camera grader calibration prototype
+# Camera grader calibration
 
-This is a private 3–5 case calibration, not the release grader. Select a lane explicitly with `--lane judge_calibration` or `--lane product_a1` (the default). Both read a private JSON array of case objects and require an original local image path and its SHA-256. The source SHA is checked against the original file before decoding. Pillow validates the image without re-encoding it. The exact original bytes, including EXIF, GPS, and other embedded metadata, must be supplied to the native subscription Padavan reference turn. The grader retains those bytes for SHA validation; it does not upload or re-encode them. Malformed, unsupported, or oversized images stop before grading; source bytes are capped at 10 MB and decoded images at 20 million pixels. Product A1 requires 1–12 `prefix` turns; judge calibration requires the two conversation fields below.
+This private calibration has separate `judge_calibration` and `product_a1`
+lanes. Both use a private manifest, original local image bytes and SHA-256,
+native subscription results, and a mode `0600` aggregate report. Image bytes,
+EXIF, dialogue, prompts, and raw responses stay out of reports and Git.
 
-**JUDGE CALIBRATION** uses `JudgeCase`: `case_id`, `image_path`, `image_sha256`, `reference_prefix`, `dialogue`, and manually reviewed `labels`. Both conversation fields are required arrays of 1–12 role/text turns. `reference_prefix` contains only the conversation available before the candidate nutrition answer; give Sol that exact prompt and the original image to form an independent ideal. `dialogue` contains the full candidate user-visible conversation, including progress, questions, and final answer; give Luna the exact prompt without the image. Never put the candidate nutrition answer in `reference_prefix`, and keep both fields and the original image in the private manifest outside Git. The report omits both conversation fields and image bytes. It records equal `source_image_sha256` and `validated_image_sha256` for each validated case; this shows what the local grader read, not what Padavan received. The lead must verify the actual Padavan image payload.
+## Judge calibration
 
-Labels contain `consumption_state` (`consumed`, `not_consumed`, or `uncertain`), `kcal_min` and `kcal_max` for a confirmed consumed meal, `avoidable_turns`, `repeated_questions`, and optional nonnegative `avoidable_tolerance` and `repeated_tolerance` (default zero). An optional `estimate_kcal_min` and `estimate_kcal_max` pair scores the quality of a photo calorie estimate independently of whether the person ate it. Consumption and kcal refer to food in the attached image and selected trajectory. If the image clearly contains no food, `not_consumed` means no meal from this image; it says nothing about food eaten elsewhere. For a food photo, use `uncertain` when consumption cannot be determined; use `not_consumed` only when non-consumption of the pictured food is confirmed. A request to estimate kcal from a food photo does **not** establish consumption. For an estimate-only dialogue, label consumption `uncertain`, omit consumed-meal `kcal_min`/`kcal_max`, and supply the photo-estimate interval if the estimate is independently reviewable. The operator must review these labels against the private source before running. This lane does not claim Honcho commit evidence or product A1 success. Sol's consumption state, consumed-meal kcal, and any labeled photo estimate are compared independently; a mismatch is `FAIL`, invalid/unavailable model output is `INCONCLUSIVE`, and an uncertain Sol consumption result can `PASS` only when the human label is also uncertain. Three independent Luna votes run only after the combined reference passes. Median score and median avoidable turns, maximum repeated questions, and majority reason codes form the aggregate. The median avoidable count and maximum repeated-question count must each fall within the human tolerance. The report separates `consumption_quality`, `estimate_quality`, overall `reference_quality`, and `efficiency_quality`.
+`JudgeCase` carries `reference_prefix`, full candidate `dialogue`, and reviewed
+labels. Sol receives the original image and only the reference prefix. Luna
+receives full dialogue and no image. Consumption labels, photo-estimate labels,
+and dialogue efficiency remain separate. Estimate-only requests do not establish
+that food was consumed. The lane cannot establish a real persisted meal.
 
-For a confirmed nonfood photo, the operator can label `not_consumed` only if the private dialogue and image support that conclusion; the Sol prompt asks for null `kcal` and `estimated_kcal`. With no photo-estimate interval, `estimate_quality` is `NOT_ASSESSED`. The small judge lane checks a reviewed estimate against an interval and checks dialogue efficiency; it cannot establish a real meal record, authenticate person or Camera provenance, or judge open-ended nutrition quality beyond that interval. The September Camera positive answer belongs in product A1 only after its authoritative receipt and commit evidence is linked. Keep the private June/July/August/September assets and dialogues outside Git.
+## Product A1
 
-**PRODUCT A1** uses `Case`. Each case additionally needs a manually reviewed product state, source/owner/operation/meal IDs, a Camera native receipt ID and validation flag when applicable, and a verified complete authoritative ledger snapshot at a cutoff position. Ledger events carry unique event IDs, authoritative positions, validated finalizer commit flags, the same binding IDs, nutrition v2 annotations, and explicit correction/deletion targets. A negative with no events requires the complete ledger attestation. The booleans and snapshot ID are **operator supplied evidence assertions**; this prototype cannot authenticate a remote ledger or receipt by itself. Review those records before enabling calls.
+`Case` requires the same original-image evidence plus a full candidate dialogue
+and `persistence_evidence`: a reviewed nutrition goal, raw bounded Honcho
+snapshot, Telegent canonical snapshot, and read-only eval dialogue export. A1
+revalidates owner, source, principal, workspace, session, operation, trace,
+calendar day, stable meal ID, effective state, and kcal against the frozen Sol
+reference, with a hard 10% maximum tolerance. Legacy `CommitEvent` booleans and
+ledger flags remain historical fields only and cannot produce PASS. Missing raw
+evidence is `INCONCLUSIVE`; complete scoped absence fails a positive goal.
 
-The core functions work offline with an injected model call. Product A1 deduplicates identical event IDs, rejects conflicting replay and position ties, folds corrections in authoritative position order, checks exact negative absence or retraction, and uses an inclusive 10% kcal tolerance for one consumed meal. Missing or uncertain evidence gives `INCONCLUSIVE`. The fixed `openai/gpt-6-sol` high reference receives exact original image bytes and the prefix only. Product A1 remains a goal-achievement check based on reviewed state and authoritative ledger evidence, separate from the judge calibration facts. In product A1, an uncertain or invalid reference cannot pass and three separate `openai/gpt-6-luna` medium votes run only after A1 PASS. A2 cannot change A1. Luna receives dialogue and an efficiency rubric only, without case ID, reference, A1 result, or image. Reports record verdicts, the structured reference, aggregate votes, and the two image hashes, never image bytes, metadata, or dialogue. This prompt scope repair does not implement source-aware automatic intake or contextual late replies; product reference coverage remains a required reviewed release refinement.
+After A1 PASS only, three separate native subscription Luna medium votes score
+dialogue efficiency. A2 sees the full candidate dialogue, including assistant
+updates and the gateway final. It never falls back to the short reference prefix
+and cannot change A1. Sol's reference prompt never includes the candidate final
+answer.
 
-Prepare each model turn through the authorized native subscription Padavan wrapper. Native `padavan-cli start` uses model IDs **without** `openai/`: `--model gpt-6-sol --model-provider native --reasoning high` for Sol and `--model gpt-6-luna --model-provider native --reasoning medium` for Luna. For example, use `padavan-cli start --name UNIQUE_SOL_SESSION --model gpt-6-sol --model-provider native --reasoning high --workdir ABSOLUTE_PRIVATE_WORKDIR --prompt-file ABSOLUTE_PRIVATE_SOL_PROMPT_FILE`; start each of the three Luna votes with a different session name and the Luna flags above. Only run Luna after that case passes its reference gate. The core Sol prompt is `sol_prompt(case)`; Luna's core prompt is `a2_prompt(case)`. The native wrapper adds its own envelope, so the full model-facing prompt is not byte-identical to the core prompt. Keep the raw authorized dialogue intact. Supply the original JPEG bytes, including EXIF, to Sol through the authorized wrapper after checking its SHA-256; `--prompt-file` supplies text and does not itself attach an image. The lead must compare each saved response and session/turn ID with the actual `padavan-cli` result. This local prototype cannot authenticate native service provenance from supplied fields. Earlier `gpt-6.1-sol` high probes failed without model result artifacts; their cause and API route are unknown, and they count toward neither the results file nor the grading sample. Native `gpt-6-sol` high remains the human-authorized temporary reference. There is no automatic fallback.
-
-Save a private JSON array of one object per consumed turn, ordered by case and call order. Each object has exactly these keys:
+New reference results use native Padavan `gpt-6.1-sol` with high reasoning;
+author results use `gpt-6-luna` with medium reasoning. In result JSON, model IDs
+include the `openai/` prefix. Intake checks exact route, model, effort, case,
+prompt, image SHA, session/turn provenance, and response schema. Previous
+reports that name `gpt-6-sol` remain historical and are never relabeled as
+6.1 results.
 
 ```json
 {
   "route": "native_subscription_padavan",
   "case_id": "reviewed-case-id",
-  "model": "openai/gpt-6-sol",
+  "model": "openai/gpt-6.1-sol",
   "reasoning_effort": "high",
   "prompt": "exact prompt from sol_prompt(case)",
   "source_image_sha256": "64 lowercase hex characters for Sol; null for Luna",
@@ -30,27 +51,5 @@ Save a private JSON array of one object per consumed turn, ordered by case and c
 }
 ```
 
-Use the core's canonical IDs **with** `openai/` in the results JSON: `openai/gpt-6-sol` with `high`, and `openai/gpt-6-luna` with `medium`. These JSON values describe the native turns but are not the `padavan-cli --model` values. The intake rejects missing or extra entries, mismatched model, effort, case, prompt or image SHA, reused session/turn provenance, repeated Luna sessions per case, and invalid response schemas. A product A1 failure must have no Luna entries. The core preserves the median score and avoidable turns, maximum repeated questions, and majority reason codes. Supply the manifest and result file outside Git with mode `0600`; the workspace must also be outside Git. For a reviewed run:
-
-```sh
-python -m ohmo.evals.camera_calibration PRIVATE_MANIFEST.json \
-  --lane judge_calibration --workspace PRIVATE_OHMO_WORKSPACE \
-  --subscription-results PRIVATE_RESULTS.json --max-calls 20
-```
-
-The limit counts consumed subscription turns/results, at most 20 for five cases. Actual billed cost is `unknown` unless separately evidenced; the report makes no USD reservation or cost estimate. A mode `0600` aggregate report is written under the existing private Ohmo `evals/reports` directory. It labels `reference_model` as `openai/gpt-6-sol`, `reference_reasoning_effort` as `high`, `reference_selection` as `human_authorized_temporary`, and `sol_prompt_version` as `image_target_v2` for before/after calibration comparison. Earlier reports lacking this version used the ambiguous prompt; they must not be relabeled as passing results. It omits raw dialogue, prompts, images, and responses. Keep all private inputs, source assets, and reports outside Git.
-
-Reuse: `NutritionAnnotationV2` validates existing Ohmo trace annotations, and `get_eval_store()` provides the existing eval report layout. Local glue is the Camera provenance/commit fold, strict Sol and Luna response schemas, and the offline subscription result intake. The generic Ohmo runner and completion cache are not used because they can persist full private model messages.
-
-## Independent lead calibration result (2026-09-29)
-
-The lead's private strict-intake report is outside Git at `/home/blackwithwhite/tmp/camera-grader-private-20260929/ohmo-workspace/evals/reports/camera_calibration.json` (mode `0600`). It contains three real reviewed cases and one explicitly mutated repeat-question dialogue. The reviewed human consumption, estimate, and efficiency labels matched the resulting judge verdicts. This is judge calibration, not product A1 or expert gold. The report records 16 consumed subscription results: one Sol high reference and three Luna medium votes for each case, with distinct Luna sessions. The logical attempt history has 18 successful turns including an initial nonfood scope failure and an image-audit repeat; those two turns are not among the 16 consumed results. Earlier `gpt-6.1-sol` high failed probes had no result artifacts and are excluded. Native subscription wrapper prompts carry an envelope around the exact core prompt; the local source JPEG and SHA were checked and EXIF was preserved, but the remote upload bytes were not independently attested. Provider request count and USD cost are unknown; there was no human hard budget.
-
-| Reviewed case | Sol high reference | Luna medium aggregate | Judge result |
-| --- | --- | --- | --- |
-| Real nonfood | `not_consumed`, null kcal and photo estimate | Score 5; avoidable 0; repeated 0 | Reference and efficiency PASS; photo estimate not assessed. |
-| Real July estimate only | Consumption uncertain; photo estimate 350 kcal | Score 5; avoidable 0; repeated 0 | Reference, estimate, and efficiency PASS. |
-| Real four plums | Consumed 84 kcal; separate photo estimate 230 kcal | Score 5; avoidable 0; repeated 0 | Reference and efficiency PASS; photo estimate not assessed. |
-| Explicit July repeat mutation | Consumption uncertain; photo estimate 400 kcal | Score 2; avoidable 2; repeated 1 | Reference, estimate, and efficiency PASS against the mutated human labels. |
-
-The 29 September lead event `HgnxWvJPprlPhuM72gLd2` used a synthetic four-plum image and yielded a technical runtime projection of 140 kcal. There is no Sol ideal for that synthetic image. Independently, the real 26 September Camera JPEG and trajectory produced a historical answer of 80 kcal and a Sol reference of 84 kcal. Those two real-case numbers are within 10%, but the source journal failed, so the product A1 goal is FAIL. The 84 kcal reference does not apply to the synthetic 140 kcal projection. The storage-only 320 kcal observation and immutable 0 kcal correction already passed independently; this calibration introduced no new storage prototype.
+The lead verifies actual Padavan turns, image payload, review goals, and the
+combined candidate. Provider cost remains unknown unless separately evidenced.

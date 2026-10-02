@@ -407,6 +407,57 @@ def _build_conversation_turn_metadata(
     return logical_turn_id, user_metadata, assistant_metadata
 
 
+def _camera_eval_capture_provenance(
+    *, message: InboundMessage, turn_ctx: TurnContext, scope: MemoryScope,
+    camera_config: object, camera_ingress: object | None, logical_turn_id: str,
+    assistant_metadata: Mapping[str, object],
+) -> tuple[dict[str, str] | None, dict[str, object] | None]:
+    """Capture trusted Camera receipt context after the runtime authorization gate."""
+    metadata = message.metadata or {}
+    config = camera_config
+    attempts = getattr(camera_ingress, "_attempts", None)
+    if (not turn_ctx.camera_authorized or metadata.get("_camera_authority") is not CAMERA_AUTHORITY
+            or getattr(camera_ingress, "config", None) != config or not getattr(config, "enabled", False)
+            or message.channel != "telegram" or str(message.chat_id) != getattr(config, "chat_id", None)
+            or scope.private_tenant != getattr(config, "tenant_id", None)
+            or not isinstance(attempts, dict)):
+        return None, None
+    candidate_id = metadata.get("_camera_candidate_id")
+    attempt = attempts.get(candidate_id) if isinstance(candidate_id, str) else None
+    photo_id = attempt.get("photo_id") if isinstance(attempt, dict) else None
+    if (not isinstance(candidate_id, str) or not candidate_id or not isinstance(attempt, dict)
+            or attempt.get("candidate_id", candidate_id) != candidate_id
+            or attempt.get("photo_delivery_confirmed") is not True
+            or type(photo_id) is not int or photo_id <= 0):
+        return None, None
+    principal = f"telegram:{canonical_principal('telegram', str(getattr(config, 'principal', '')))}"
+    common: dict[str, object] = {
+        "candidate_id": candidate_id, "native_photo_id": photo_id,
+        "tenant_id": scope.private_tenant, "gateway_session_id": turn_ctx.session_id,
+        "recipient_principal": principal,
+    }
+    if message.sender_id == "__camera__":
+        if (metadata.get("_synthetic") is not True or metadata.get("_camera_photo_id") != photo_id
+                or assistant_metadata.get("source_message_id") is not None or not message.media):
+            return None, None
+        return None, {**common, "kind": "initial_context"}
+    source = assistant_metadata.get("source_message_id")
+    op = assistant_metadata.get("client_op_id")
+    principal_id = assistant_metadata.get("source_principal")
+    retained_turn = metadata.get("_camera_turn_id")
+    if (turn_ctx.principal != canonical_principal("telegram", str(getattr(config, "principal", "")))
+            or not isinstance(source, str) or not source or retained_turn != logical_turn_id
+            or not isinstance(op, str) or op != f"{logical_turn_id}:assistant" or principal_id != principal):
+        return None, None
+    native_binding = metadata.get("_camera_native_binding")
+    allowed_bindings = {str(photo_id), *(str(value) for value in attempt.get("reply_ids", []))}
+    if native_binding is not None and (not isinstance(native_binding, str) or native_binding not in allowed_bindings):
+        return None, None
+    turn = {"source_message_id": source, "principal_id": principal_id,
+            "logical_turn_id": logical_turn_id, "operation_id": op}
+    return turn, {**common, "kind": "owner_turn", **turn}
+
+
 def _append_nutrition_saved_status(answer: str, annotation: NutritionAnnotationV2) -> str:
     # Resolve only a compound storage-failure assertion. Keep neighboring
     # nutrition facts and independent advice, including positive save advice.
@@ -1449,6 +1500,17 @@ class OhmoSessionRuntimePool:
             _content_snippet(user_prompt),
         )
 
+        camera_logical_turn_id, _, camera_turn_metadata = (
+            _build_conversation_turn_metadata(turn_ctx=turn_ctx, message=message, scope=memory_scope)
+            if camera_authorized
+            else (None, None, {})
+        )
+        camera_turn_provenance, camera_capture_context = _camera_eval_capture_provenance(
+            message=message, turn_ctx=turn_ctx, scope=memory_scope,
+            camera_config=getattr(self._gateway_config, "camera_ingress", None),
+            camera_ingress=getattr(self, "_camera_ingress", None),
+            logical_turn_id=camera_logical_turn_id or "", assistant_metadata=camera_turn_metadata,
+        )
         recorder = (
             GatewayEvalRecorder.start(
                 workspace=self._workspace,
@@ -1457,6 +1519,8 @@ class OhmoSessionRuntimePool:
                 session_key=session_key,
                 user_text=command_prompt,
                 user_goal=user_prompt,
+                trusted_turn_provenance=camera_turn_provenance,
+                trusted_camera_context=camera_capture_context,
             )
             if _evals_capture_enabled(self._gateway_config)
             else None
@@ -1512,6 +1576,9 @@ class OhmoSessionRuntimePool:
                 if update.kind == "final":
                     if recorder is not None:
                         recorder.record_gateway_final(text=update.text, metadata=update.metadata)
+                elif update.kind == "assistant_update":
+                    if recorder is not None:
+                        recorder.record_gateway_update(text=update.text, metadata=update.metadata)
                 elif update.kind == "error":
                     episode_status = "error"
                     if recorder is not None:

@@ -525,6 +525,16 @@ async def test_runtime_pool_splits_per_turn_assistant_updates_from_final(tmp_pat
     assert final.text == "Готово: купе есть."
     assert "Проверю через travel-cli" not in final.text
 
+    # The runtime hook must persist the same public update through the indexed
+    # eval store so dialogue exports retain it for product review.
+    episode, events = _single_eval_episode(workspace)
+    assert any(event.kind == "assistant_update" and event.payload["text"] ==
+               "Проверю через travel-cli." for event in events)
+    from ohmo.evals.nutrition_persistence import export_eval_dialogue
+
+    exported = export_eval_dialogue(workspace / "evals", episode_ids=[episode.episode_id])
+    assert {"role": "assistant", "text": "Проверю через travel-cli."} in exported["episodes"][0]["dialogue"]
+
 
 @pytest.mark.asyncio
 async def test_runtime_pool_stream_message_emits_progress_and_tool_hint(tmp_path, monkeypatch):
