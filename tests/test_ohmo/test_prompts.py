@@ -345,6 +345,22 @@ def test_ohmo_policy_text_and_synthetic_intake_cases_require_confirmed_consumpti
     assert "do not count it as consumed or silently treat it as known zero" in prompt
 
 
+def test_ohmo_policy_text_keeps_rolling_intake_membership_when_energy_gate_fails() -> None:
+    """Prompt text covers gate-independent intake membership; this does not execute an LLM."""
+    skill = next(skill for skill in get_bundled_skills() if skill.name == "calory")
+    prompt = skill.content
+
+    for rule in (
+        "These exact-window membership rules also apply to every rolling-window intake or food subtotal when an energy gate fails",
+        "Never state the full calories of a partial-boundary date-only record as intake within that exact window",
+        "identify the recorded food amount with its time marked unknown, or give its bounded possible-intake range",
+        "with missing active-energy facts and a consumed 250 kcal date-only record on a partial boundary day",
+        "say that 250 kcal is recorded with unknown window membership and that the rolling balance is unavailable",
+        "Do not claim those 250 kcal fall inside the window",
+    ):
+        assert rule in prompt
+
+
 def test_ohmo_policy_text_retains_historical_past_local_day_guard() -> None:
     skill = next(skill for skill in get_bundled_skills() if skill.name == "calory")
     assert (
