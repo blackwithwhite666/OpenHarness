@@ -5365,3 +5365,390 @@ def test_camera_prompt_authority_fails_closed_for_unbound_turns(
         )
         is None
     )
+
+
+@pytest.mark.asyncio
+async def test_real_camera_initial_signal_is_captured_as_context_without_fake_source_id(tmp_path: Path):
+    from datetime import date
+
+    from ohmo.evals.nutrition_persistence import (
+        Goal, Manifest, bind_wellness_snapshot, derive_meal_id, export_eval_dialogue,
+        grade_manifest, validate_dialogue_binding,
+    )
+    from ohmo.gateway.runtime import _camera_eval_capture_provenance, _build_conversation_turn_metadata
+    from ohmo.gateway.turn_context import build_turn_context
+
+    now = datetime(2026, 10, 1, 12, tzinfo=timezone.utc)
+    ingress, root, bus, _ = _ingress(tmp_path)
+    request = _candidate(root)
+    assert (await _admit(ingress, root, "Bearer " + "s" * 40, request))[0] == 202
+    message = await asyncio.wait_for(bus.consume_inbound(), timeout=1)
+    assert message.sender_id == "__camera__"
+    assert message.metadata["_camera_authority"] is CAMERA_AUTHORITY
+    assert "message_id" not in message.metadata
+    turn_ctx = replace(build_turn_context(message, session_id="camera-session", owner_principals=("123",)),
+                       camera_authorized=True)
+    scope = MemoryScope(ingress.config.tenant_id, ())
+    logical, _, assistant = _build_conversation_turn_metadata(turn_ctx=turn_ctx, message=message, scope=scope)
+    turn_provenance, camera_context = _camera_eval_capture_provenance(
+        message=message, turn_ctx=turn_ctx, scope=scope, camera_config=ingress.config,
+        camera_ingress=ingress, logical_turn_id=logical, assistant_metadata=assistant)
+    assert turn_provenance is None
+    assert camera_context["kind"] == "initial_context"
+    assert camera_context["candidate_id"] == request["candidate_id"]
+    assert camera_context["native_photo_id"] == ingress._attempts[request["candidate_id"]]["photo_id"]
+
+    recorder = GatewayEvalRecorder.start(workspace=tmp_path,
+        bundle=SimpleNamespace(session_id="camera-session", cwd=str(tmp_path)), message=message,
+        session_key=ingress.config.session_key, user_text=message.content,
+        trusted_camera_context=camera_context)
+    # Exercise the public stream update through the real gateway recorder path.
+    recorder.record_gateway_update(text="Checking the drink")
+    recorder.record_gateway_final(text="Did you eat or drink this?")
+    recorder.finish(status="completed")
+    exported = export_eval_dialogue(tmp_path / "evals", episode_ids=[recorder.episode_id])["episodes"][0]
+    assert exported["dialogue"] == [
+        {"role": "assistant", "text": "Checking the drink"},
+        {"role": "assistant", "text": "Did you eat or drink this?"},
+    ]
+    assert exported["dialogue_complete"] is True
+    assert exported["trusted_camera_context"]["kind"] == "initial_context"
+
+    reply = InboundMessage(channel="telegram", sender_id="123|synthetic-owner", chat_id="123",
+        content="Да, я это съел", timestamp=now,
+        metadata={"message_id": 900, "reply_to_message_id": message.metadata["_camera_photo_id"],
+                  "_telegram_raw_text": "Да, я это съел"})
+    ingress.process_real_inbound(reply)
+    assert reply.metadata["_camera_authority"] is CAMERA_AUTHORITY
+    assert reply.metadata["_camera_candidate_id"] == request["candidate_id"]
+    owner_turn_ctx = replace(build_turn_context(reply, session_id="camera-session", owner_principals=("123",)),
+                              camera_authorized=True)
+    owner_logical, _, owner_source_metadata = _build_conversation_turn_metadata(
+        turn_ctx=owner_turn_ctx, message=reply, scope=scope)
+    owner_turn, owner_context = _camera_eval_capture_provenance(
+        message=reply, turn_ctx=owner_turn_ctx, scope=scope, camera_config=ingress.config,
+        camera_ingress=ingress, logical_turn_id=owner_logical, assistant_metadata=owner_source_metadata)
+    assert owner_turn is not None and owner_context["kind"] == "owner_turn"
+    owner_recorder = GatewayEvalRecorder.start(workspace=tmp_path,
+        bundle=SimpleNamespace(session_id="camera-session", cwd=str(tmp_path)), message=reply,
+        session_key=ingress.config.session_key, user_text=reply.content,
+        trusted_turn_provenance=owner_turn, trusted_camera_context=owner_context)
+    _, _, assistant_metadata = _build_conversation_turn_metadata(
+        turn_ctx=owner_turn_ctx, message=reply, scope=scope, recorder=owner_recorder)
+    nutrition = {"schema_version": 2, "record_type": "meal_observation", "basis": ["user_report"],
+        "consumption_status": "consumed", "meal_date": "2026-10-01", "energy_kcal_min": 25,
+        "energy_kcal_max": 25, "energy_kcal_best": 25, "changed_fields": []}
+    assistant_metadata["role"] = "assistant"
+    assistant_metadata["decision_trace"] = {"episode_id": owner_recorder.episode_id,
+        "annotations": {"nutrition": nutrition}}
+    owner_recorder.record_gateway_final(text="I recorded the drink as 25 kcal.")
+    owner_recorder.finish(status="completed")
+    ingress.complete(reply, recorded=True)
+    full_export = export_eval_dialogue(tmp_path / "evals",
+        episode_ids=[recorder.episode_id, owner_recorder.episode_id])
+    binding_goal = Goal.model_validate({
+        "case_id": "camera-tea", "episode_ids": [recorder.episode_id, owner_recorder.episode_id],
+        "owner_id": ingress.config.tenant_id, "principal_id": "telegram:123", "workspace_id": "workspace-1",
+        "eval_workspace": str(tmp_path.resolve()), "peer_id": "ohmo", "canonical_owner_id": "owner-1",
+        "canonical_login": "owner", "session_id": "honcho-session", "gateway_session_id": "camera-session",
+        "source_message_id": "900", "meal_date": date(2026, 10, 1), "meal_timezone": "UTC",
+        "trajectory_started_at": datetime(2026, 10, 1, 11, tzinfo=timezone.utc),
+        "trajectory_as_of": now, "logical_turn_id": owner_logical, "trace_episode_id": owner_recorder.episode_id,
+        "operation_id": owner_turn["operation_id"],
+        "canonical_meal_id": derive_meal_id(tenant_id=ingress.config.tenant_id, source_principal="telegram:123",
+            gateway_session_id="camera-session", source_message_id="900"),
+        "expected_consumed": True, "expected_kcal": 25, "expectation_origin": "reviewed_user_dialogue",
+        "expectation_source": "review:camera-initial-reply", "review_notes": "Owner answered the retained Camera photo.",
+    })
+    binding = validate_dialogue_binding(Manifest(schema_version=1, goals=[binding_goal]), full_export)["camera-tea"]
+    assert binding["complete"] is True
+    combined = [turn for item in full_export["episodes"] for turn in item["dialogue"]]
+    assert combined == [{"role": "assistant", "text": "Checking the drink"},
+        {"role": "assistant", "text": "Did you eat or drink this?"},
+        {"role": "user", "text": "Да, я это съел"},
+        {"role": "assistant", "text": "I recorded the drink as 25 kcal."}]
+    assert all(turn["text"] != message.content for turn in combined)
+
+    owner_only_export = export_eval_dialogue(
+        tmp_path / "evals", episode_ids=[owner_recorder.episode_id]
+    )
+    owner_only_goal = Goal.model_validate({
+        **binding_goal.model_dump(mode="json"),
+        "episode_ids": [owner_recorder.episode_id],
+    })
+    owner_only_binding = validate_dialogue_binding(
+        Manifest(schema_version=1, goals=[owner_only_goal]), owner_only_export
+    )["camera-tea"]
+    assert owner_only_binding["complete"] is False
+    assert "initial Camera context" in owner_only_binding["reason"]
+
+    from copy import deepcopy
+
+    reversed_export = deepcopy(full_export)
+    initial_export = next(
+        item for item in reversed_export["episodes"]
+        if item["trusted_camera_context"]["kind"] == "initial_context"
+    )
+    owner_export = next(
+        item for item in reversed_export["episodes"]
+        if item["trusted_camera_context"]["kind"] == "owner_turn"
+    )
+    initial_export["episode"]["created_at"] = (
+        datetime.fromisoformat(owner_export["episode"]["created_at"].replace("Z", "+00:00"))
+        + timedelta(seconds=1)
+    ).isoformat()
+    reversed_binding = validate_dialogue_binding(
+        Manifest(schema_version=1, goals=[binding_goal]), reversed_export
+    )["camera-tea"]
+    assert reversed_binding["complete"] is False
+    assert "out of order" in reversed_binding["reason"]
+
+    annotation_row = {"id": "honcho-camera-event", "peer_id": "ohmo", "session_id": "honcho-session",
+        "workspace_id": "workspace-1", "created_at": now.isoformat(), "content": "persisted meal",
+        "metadata": {**assistant_metadata, "decision_trace_episode_id": owner_recorder.episode_id}}
+    context_metadata = _build_conversation_turn_metadata(turn_ctx=turn_ctx, message=message, scope=scope,
+        recorder=recorder)[2]
+    context_metadata["role"] = "assistant"
+    context_row = {"id": "honcho-camera-context", "peer_id": "ohmo", "session_id": "honcho-session",
+        "workspace_id": "workspace-1", "created_at": "2026-10-01T11:59:00+00:00",
+        "content": message.content, "metadata": context_metadata}
+    honcho = {"complete": True, "workspace_id": "workspace-1", "session_id": "honcho-session",
+        "owner_id": ingress.config.tenant_id, "since": "2026-10-01T00:00:00+00:00",
+        "until": now.isoformat(), "queried_at": now.isoformat(), "messages": [context_row, annotation_row]}
+    meal = {"meal_id": binding_goal.canonical_meal_id, "revision": 1, "status": "active",
+        "latest_event_id": "honcho-camera-event", "day": "2026-10-01", "provisional": True,
+        "capture_time": now.isoformat(), "meal_at": None, "meal_date": "2026-10-01",
+        "source_message_id": "900", "ingest_source": "dropbox_camera", "confirmation_required": True,
+        "reply_to_source_message_id": None, "received_at": None, "is_forwarded": False,
+        "source_message_at": None, "is_estimate": True, "basis": ["user_report"],
+        "consumption_status": "consumed", "energy_kcal_min": 25, "energy_kcal_max": 25,
+        "energy_kcal_best": 25, "protein_g": None, "fat_g": None, "carbohydrate_g": None,
+        "items": [], "confidence": "medium", "assumptions": [], "warnings": []}
+    wellness = {"complete": True, "user_id": "owner-1", "login": "owner",
+        "start": "2026-10-01T00:00:00+00:00", "end": now.isoformat(), "queried_at": now.isoformat(),
+        "meals": [meal], "unassigned": []}
+    canonical = bind_wellness_snapshot(wellness, goal=binding_goal)
+    result = grade_manifest(Manifest(schema_version=1, goals=[binding_goal]), honcho, canonical, now=now,
+        reviewed_turn_sources=binding["reviewed_turn_sources"],
+        reviewed_turn_provenance=binding["reviewed_turn_provenance"])[0]
+    assert result["a1"] == "PASS"
+
+    forged = replace(message, metadata={**message.metadata, "_camera_authority": "serialized object marker"})
+    forged_turn = replace(turn_ctx, camera_authorized=True)
+    _, forged_context = _camera_eval_capture_provenance(message=forged, turn_ctx=forged_turn, scope=scope,
+        camera_config=ingress.config, camera_ingress=ingress, logical_turn_id=logical,
+        assistant_metadata=assistant)
+    assert forged_context is None
+    await ingress.close()
+
+
+@pytest.mark.asyncio
+async def test_late_reply_binds_its_matching_initial_context_among_two_camera_photos(
+    tmp_path: Path, monkeypatch
+):
+    from datetime import date
+
+    from ohmo.evals.nutrition_persistence import (
+        Goal, Manifest, bind_wellness_snapshot, derive_meal_id, export_eval_dialogue,
+        grade_manifest, validate_dialogue_binding,
+    )
+    from ohmo.gateway.runtime import (
+        _build_conversation_turn_metadata, _camera_eval_capture_provenance,
+    )
+    from ohmo.gateway.turn_context import build_turn_context
+
+    base = datetime.now(timezone.utc).replace(microsecond=0)
+
+    class ControlledDatetime(datetime):
+        current = base
+
+        @classmethod
+        def now(cls, tz=None):
+            return cls.current.astimezone(tz) if tz is not None else cls.current.replace(tzinfo=None)
+
+    monkeypatch.setattr(camera_module, "datetime", ControlledDatetime)
+    ingress, root, bus, _ = _ingress(tmp_path)
+    scope = MemoryScope(ingress.config.tenant_id, ())
+
+    async def admit_initial(index: int):
+        request = _candidate(root, index=index, capture_time=ControlledDatetime.current)
+        assert (await _admit(ingress, root, "Bearer " + "s" * 40, request))[0] == 202
+        message = await asyncio.wait_for(bus.consume_inbound(), timeout=1)
+        turn_ctx = replace(
+            build_turn_context(message, session_id="camera-session", owner_principals=("123",)),
+            camera_authorized=True,
+        )
+        logical, _, assistant = _build_conversation_turn_metadata(
+            turn_ctx=turn_ctx, message=message, scope=scope
+        )
+        turn, context = _camera_eval_capture_provenance(
+            message=message, turn_ctx=turn_ctx, scope=scope,
+            camera_config=ingress.config, camera_ingress=ingress,
+            logical_turn_id=logical, assistant_metadata=assistant,
+        )
+        assert turn is None and context["kind"] == "initial_context"
+        recorder = GatewayEvalRecorder.start(
+            workspace=tmp_path,
+            bundle=SimpleNamespace(session_id="camera-session", cwd=str(tmp_path)),
+            message=message, session_key=ingress.config.session_key,
+            user_text=message.content, trusted_camera_context=context,
+        )
+        return request, message, turn_ctx, recorder
+
+    first_request, first, first_ctx, first_recorder = await admit_initial(0)
+    first_recorder.record_gateway_update(text="Checking the first photo")
+    first_recorder.record_gateway_final(text="Did you eat or drink this first photo?")
+    first_recorder.finish(status="completed")
+    ingress.complete(first, recorded=False)
+
+    ControlledDatetime.current += timedelta(minutes=31)
+    second_request, second, second_ctx, second_recorder = await admit_initial(1)
+    second_recorder.record_gateway_final(text="Did you eat this second photo?")
+    second_recorder.finish(status="completed")
+    ingress.complete(second, recorded=False)
+
+    reply = InboundMessage(
+        channel="telegram", sender_id="123|synthetic-owner", chat_id="123",
+        content="Yes, I drank the first one, 25 kcal", timestamp=ControlledDatetime.current,
+        metadata={"message_id": 900, "reply_to_message_id": first.metadata["_camera_photo_id"],
+                  "_telegram_raw_text": "Да, я это съел"},
+    )
+    ingress.process_real_inbound(reply)
+    assert reply.metadata["_camera_candidate_id"] == first_request["candidate_id"]
+    assert reply.metadata["_camera_candidate_id"] != second_request["candidate_id"]
+    owner_ctx = replace(
+        build_turn_context(reply, session_id="camera-session", owner_principals=("123",)),
+        camera_authorized=True,
+    )
+    owner_logical, _, owner_assistant = _build_conversation_turn_metadata(
+        turn_ctx=owner_ctx, message=reply, scope=scope
+    )
+    owner_turn, owner_context = _camera_eval_capture_provenance(
+        message=reply, turn_ctx=owner_ctx, scope=scope,
+        camera_config=ingress.config, camera_ingress=ingress,
+        logical_turn_id=owner_logical, assistant_metadata=owner_assistant,
+    )
+    assert owner_turn is not None and owner_context["candidate_id"] == first_request["candidate_id"]
+    owner_recorder = GatewayEvalRecorder.start(
+        workspace=tmp_path,
+        bundle=SimpleNamespace(session_id="camera-session", cwd=str(tmp_path)),
+        message=reply, session_key=ingress.config.session_key, user_text=reply.content,
+        trusted_turn_provenance=owner_turn, trusted_camera_context=owner_context,
+    )
+    _, _, food_metadata = _build_conversation_turn_metadata(
+        turn_ctx=owner_ctx, message=reply, scope=scope, recorder=owner_recorder
+    )
+    food_metadata.update(role="assistant")
+    food_metadata["decision_trace"] = {
+        "episode_id": owner_recorder.episode_id,
+        "annotations": {"nutrition": {
+            "schema_version": 2, "record_type": "meal_observation", "basis": ["user_report"],
+            "consumption_status": "consumed", "meal_date": reply.timestamp.date().isoformat(),
+            "energy_kcal_min": 25, "energy_kcal_max": 25, "energy_kcal_best": 25,
+            "changed_fields": [],
+        }},
+    }
+    owner_recorder.record_gateway_update(text="Checking the saved drink")
+    owner_recorder.record_gateway_final(text="I recorded 25 kcal")
+    owner_recorder.finish(status="completed")
+    ingress.complete(reply, recorded=True)
+
+    later = reply.timestamp + timedelta(seconds=1)
+    goal_data = {
+        "case_id": "late-camera-tea",
+        "episode_ids": [first_recorder.episode_id, second_recorder.episode_id,
+                        owner_recorder.episode_id],
+        "owner_id": ingress.config.tenant_id, "principal_id": "telegram:123",
+        "workspace_id": "workspace-1", "eval_workspace": str(tmp_path.resolve()),
+        "peer_id": "ohmo", "canonical_owner_id": "owner-1", "canonical_login": "owner",
+        "session_id": "honcho-session", "gateway_session_id": "camera-session",
+        "source_message_id": "900", "meal_date": date.fromisoformat(reply.timestamp.date().isoformat()),
+        "meal_timezone": "UTC", "trajectory_started_at": first.timestamp - timedelta(seconds=1),
+        "trajectory_as_of": reply.timestamp, "logical_turn_id": owner_logical,
+        "trace_episode_id": owner_recorder.episode_id, "operation_id": owner_turn["operation_id"],
+        "canonical_meal_id": derive_meal_id(
+            tenant_id=ingress.config.tenant_id, source_principal="telegram:123",
+            gateway_session_id="camera-session", source_message_id="900",
+        ),
+        "expected_consumed": True, "expected_kcal": 25,
+        "expectation_origin": "reviewed_user_dialogue", "expectation_source": "review:late-camera-first-photo",
+    }
+    reviewed_goal = Goal.model_validate(goal_data)
+    manifest = Manifest(schema_version=1, goals=[reviewed_goal])
+    exported = export_eval_dialogue(
+        tmp_path / "evals", episode_ids=goal_data["episode_ids"]
+    )
+    binding = validate_dialogue_binding(manifest, exported)["late-camera-tea"]
+    assert binding["complete"] is True
+    public_turns = [turn for episode in exported["episodes"] for turn in episode["dialogue"]]
+    assert public_turns == [
+        {"role": "assistant", "text": "Checking the first photo"},
+        {"role": "assistant", "text": "Did you eat or drink this first photo?"},
+        {"role": "assistant", "text": "Did you eat this second photo?"},
+        {"role": "user", "text": "Yes, I drank the first one, 25 kcal"},
+        {"role": "assistant", "text": "Checking the saved drink"},
+        {"role": "assistant", "text": "I recorded 25 kcal"},
+    ]
+
+    food = {
+        "id": "honcho-late-camera-food", "peer_id": "ohmo", "session_id": "honcho-session",
+        "workspace_id": "workspace-1", "created_at": reply.timestamp.isoformat(),
+        "metadata": {**food_metadata, "decision_trace_episode_id": owner_recorder.episode_id},
+    }
+    initial_rows = []
+    for message, turn_ctx, recorder in (
+        (first, first_ctx, first_recorder), (second, second_ctx, second_recorder),
+    ):
+        _, _, context_metadata = _build_conversation_turn_metadata(
+            turn_ctx=turn_ctx, message=message, scope=scope, recorder=recorder
+        )
+        context_metadata["role"] = "assistant"
+        initial_rows.append({
+            "id": f"honcho-context-{recorder.episode_id}", "peer_id": "ohmo",
+            "session_id": "honcho-session", "workspace_id": "workspace-1",
+            "created_at": message.timestamp.isoformat(), "metadata": context_metadata,
+        })
+    day_start = datetime.combine(reply.timestamp.date(), datetime.min.time(), timezone.utc)
+    honcho = {
+        "complete": True, "workspace_id": "workspace-1", "session_id": "honcho-session",
+        "owner_id": ingress.config.tenant_id, "since": day_start.isoformat(),
+        "until": later.isoformat(), "queried_at": later.isoformat(),
+        "messages": [*initial_rows, food],
+    }
+    meal = {
+        "meal_id": reviewed_goal.canonical_meal_id, "revision": 1, "status": "active",
+        "latest_event_id": food["id"], "day": reply.timestamp.date().isoformat(), "provisional": True,
+        "capture_time": reply.timestamp.isoformat(), "meal_at": None,
+        "meal_date": reply.timestamp.date().isoformat(), "source_message_id": "900",
+        "ingest_source": "dropbox_camera", "confirmation_required": True,
+        "reply_to_source_message_id": str(first.metadata["_camera_photo_id"]),
+        "received_at": None, "is_forwarded": False, "source_message_at": None,
+        "is_estimate": True, "basis": ["user_report"], "consumption_status": "consumed",
+        "energy_kcal_min": 25, "energy_kcal_max": 25, "energy_kcal_best": 25,
+        "protein_g": None, "fat_g": None, "carbohydrate_g": None, "items": [],
+        "confidence": "medium", "assumptions": [], "warnings": [],
+    }
+    wellness = {
+        "complete": True, "user_id": "owner-1", "login": "owner",
+        "start": day_start.isoformat(), "end": later.isoformat(), "queried_at": later.isoformat(),
+        "meals": [meal], "unassigned": [],
+    }
+    canonical = bind_wellness_snapshot(wellness, goal=reviewed_goal)
+    result = grade_manifest(
+        manifest, honcho, canonical, now=later,
+        reviewed_turn_sources=binding["reviewed_turn_sources"],
+        reviewed_turn_provenance=binding["reviewed_turn_provenance"],
+    )[0]
+    assert result["a1"] == "PASS"
+    assert result["actual_event_ids"] == [food["id"]]
+
+    missing_match_goal = Goal.model_validate({
+        **goal_data,
+        "episode_ids": [second_recorder.episode_id, owner_recorder.episode_id],
+    })
+    missing_match = validate_dialogue_binding(
+        Manifest(schema_version=1, goals=[missing_match_goal]),
+        export_eval_dialogue(tmp_path / "evals", episode_ids=missing_match_goal.episode_ids),
+    )["late-camera-tea"]
+    assert missing_match["complete"] is False
+    await ingress.close()

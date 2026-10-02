@@ -517,6 +517,80 @@ class HonchoClient:
                 raise HonchoError("recent message pagination ended before the final page")
         raise HonchoError("recent message listing exceeded pagination limit")
 
+    async def list_messages_in_window(
+        self,
+        session: str,
+        *,
+        expected_peer_id: str | None,
+        since: dt.datetime,
+        until: dt.datetime,
+        page_size: int = 100,
+        max_pages: int = 100,
+    ) -> list[dict[str, object]]:
+        """Return raw persisted messages from a complete bounded scoped read.
+
+        Unlike the metadata-only dedup reader this intentionally retains content
+        and nutrition annotations for an explicitly requested private audit.
+        Pagination totals, scope, timestamps, duplicate IDs and configured bounds
+        are verified before the result is returned.
+        """
+        if not session:
+            raise ValueError("session is required")
+        for name, value in (("since", since), ("until", until)):
+            if value.tzinfo is None or value.utcoffset() is None:
+                raise ValueError(f"{name} must be timezone-aware")
+        if since > until:
+            raise ValueError("since must not be after until")
+        if not 1 <= page_size <= 100 or not 1 <= max_pages <= 100:
+            raise ValueError("message pagination bounds outside safe limits")
+        filters: dict[str, object] = {"created_at": {
+            "gte": since.isoformat(), "lte": until.isoformat(),
+        }}
+        if expected_peer_id is not None:
+            filters = {"AND": [filters, {"peer_id": expected_peer_id}]}
+        result: list[dict[str, object]] = []
+        seen: set[str] = set()
+        expected_total: int | None = None
+        for page in range(1, max_pages + 1):
+            payload = _mapping(await self._request(
+                "POST", self._workspace_path(f"sessions/{_segment(session)}/messages/list"),
+                json={"filters": filters}, params={"page": page, "size": page_size},
+            ), "message page")
+            items = _object_list(payload.get("items"), "message page")
+            current = _pagination_int(payload, "page", minimum=1)
+            size = _pagination_int(payload, "size", minimum=1)
+            pages = _pagination_int(payload, "pages", minimum=0)
+            total = _pagination_int(payload, "total", minimum=0)
+            if current != page or size != page_size or pages != math.ceil(total / size):
+                raise HonchoError("message pagination metadata is inconsistent")
+            if pages > max_pages or total > page_size * max_pages:
+                raise HonchoError("message listing exceeded configured bound")
+            if expected_total is None:
+                expected_total = total
+            elif expected_total != total:
+                raise HonchoError("message pagination totals changed during traversal")
+            for item in items:
+                message = dict(item)
+                if message.get("session_id") != session or (
+                    expected_peer_id is not None and message.get("peer_id") != expected_peer_id
+                ):
+                    raise HonchoError("message escaped requested session or peer")
+                created = _required_datetime(message, "created_at")
+                if created.tzinfo is None or not since <= created <= until:
+                    raise HonchoError("message escaped requested time window")
+                message_id = _required_bounded_str(message, "id", _HONCHO_RESOURCE_ID_MAX_LENGTH)
+                if message_id in seen:
+                    raise HonchoError("message pagination returned duplicate ID")
+                seen.add(message_id)
+                result.append(message)
+            if page >= pages:
+                if len(result) != total:
+                    raise HonchoError("message pagination returned partial history")
+                return result
+            if not items:
+                raise HonchoError("message pagination ended before final page")
+        raise HonchoError("message listing exceeded pagination limit")
+
     async def dialectic(
         self,
         query: str,

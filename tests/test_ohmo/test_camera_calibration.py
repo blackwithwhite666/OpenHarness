@@ -30,6 +30,8 @@ from ohmo.evals.camera_calibration import (
     write_report,
 )
 from ohmo.evals.camera_subscription_results import SubscriptionResults, read_private_json
+from ohmo.evals.nutrition_persistence import Goal, derive_meal_id
+from datetime import date, datetime, timezone
 
 
 def annotation(record_type="meal_observation", **values):
@@ -45,7 +47,7 @@ def make_case(tmp_path, *, state="consumed", events=None):
                 annotation("meal_observation", consumption_status="consumed", energy_kcal_best=440)
             )
         ]
-    return Case.model_validate(
+    case = Case.model_validate(
         {
             "case_id": "private-1",
             "image_path": image,
@@ -53,6 +55,11 @@ def make_case(tmp_path, *, state="consumed", events=None):
             "prefix": [
                 {"role": "user", "text": "I ate this."},
                 {"role": "assistant", "text": "What was the amount?"},
+            ],
+            "dialogue": [
+                {"role": "user", "text": "I ate this."},
+                {"role": "assistant", "text": "What was the amount?"},
+                {"role": "assistant", "text": "I recorded the meal."},
             ],
             "reviewed_state": state,
             "origin": "camera",
@@ -68,6 +75,89 @@ def make_case(tmp_path, *, state="consumed", events=None):
             "events": events,
         }
     )
+    case.persistence_evidence = persistence_evidence(case, consumed=state == "consumed")
+    return case
+
+
+PERSIST_NOW = datetime(2026, 10, 1, 12, tzinfo=timezone.utc)
+
+
+def persistence_evidence(case, *, consumed=True, kcal=400, trace_id="ep-product"):
+    from openharness.channels.bus.events import InboundMessage
+    from ohmo.gateway.memory_gate import MemoryScope
+    from ohmo.gateway.runtime import _build_conversation_turn_metadata
+    from ohmo.gateway.turn_context import build_turn_context
+
+    inbound = InboundMessage(channel="telegram", sender_id="owner-1|mutable_name", chat_id="chat-product",
+        content="I ate this.", timestamp=PERSIST_NOW, metadata={"message_id": case.source_message_id})
+    turn_context = build_turn_context(inbound, session_id="gateway-session")
+    logical_turn_id, _, assistant_metadata = _build_conversation_turn_metadata(
+        turn_ctx=turn_context, message=inbound, scope=MemoryScope(case.owner_id, ()))
+    goal = Goal(
+        case_id=case.case_id, episode_ids=[trace_id], owner_id=case.owner_id,
+        principal_id="telegram:owner-1", workspace_id="workspace-1", eval_workspace="synthetic-evals",
+        peer_id="ohmo", canonical_owner_id=case.owner_id, canonical_login="owner",
+        session_id="honcho-session",
+        gateway_session_id="gateway-session", source_message_id=case.source_message_id,
+        meal_date=date(2026, 10, 1), meal_timezone="UTC",
+        trajectory_started_at=PERSIST_NOW.replace(hour=11), trajectory_as_of=PERSIST_NOW,
+        logical_turn_id=logical_turn_id, trace_episode_id=trace_id,
+        operation_id=assistant_metadata["client_op_id"],
+        canonical_meal_id=derive_meal_id(tenant_id=case.owner_id, source_principal="telegram:owner-1",
+                                         gateway_session_id="gateway-session", source_message_id=case.source_message_id),
+        expected_consumed=consumed,
+        expected_kcal=kcal if consumed else None, expectation_origin="reviewed_user_dialogue",
+        expectation_source="review:camera-product-1",
+    )
+    nutrition = {
+        "schema_version": 2, "record_type": "meal_observation", "basis": ["user_report"],
+        "consumption_status": "consumed" if consumed else "not_consumed", "meal_date": "2026-10-01",
+        "energy_kcal_min": kcal if consumed else None, "energy_kcal_max": kcal if consumed else None,
+        "energy_kcal_best": kcal if consumed else None,
+    }
+    persisted = {
+        "id": "persisted-product-1", "peer_id": "ohmo", "session_id": "honcho-session",
+        "workspace_id": "workspace-1", "created_at": PERSIST_NOW.isoformat(),
+        "metadata": {**assistant_metadata, "tenant_id": case.owner_id, "role": "assistant",
+                     "decision_trace_episode_id": trace_id,
+                     "decision_trace": {"episode_id": trace_id, "annotations": {"nutrition": nutrition}}},
+    }
+    honcho = {"complete": True, "workspace_id": "workspace-1", "session_id": "honcho-session",
+              "owner_id": case.owner_id, "since": "2026-10-01T00:00:00+00:00",
+              "until": PERSIST_NOW.isoformat(), "queried_at": PERSIST_NOW.isoformat(),
+              "messages": [persisted] if consumed else []}
+    meals = [{"meal_id": goal.canonical_meal_id, "revision": 1, "status": "active",
+              "latest_event_id": "persisted-product-1", "day": "2026-10-01", "provisional": True,
+              "capture_time": PERSIST_NOW.isoformat(), "meal_at": None, "meal_date": "2026-10-01",
+              "source_message_id": case.source_message_id, "ingest_source": "telegram",
+              "confirmation_required": None, "reply_to_source_message_id": None, "received_at": None,
+              "is_forwarded": False, "source_message_at": None, "is_estimate": True,
+              "basis": ["user_report"], "consumption_status": "consumed",
+              "energy_kcal_min": kcal, "energy_kcal_max": kcal, "energy_kcal_best": kcal,
+              "protein_g": None, "fat_g": None, "carbohydrate_g": None, "items": [],
+              "confidence": "medium", "assumptions": [], "warnings": []}] if consumed else []
+    dialogue = [turn.model_dump() for turn in case.dialogue]
+    export = {"privacy": "private", "episodes": [{"episode": {"episode_id": trace_id,
+              "session_id": "gateway-session", "metadata": {"workspace": "synthetic-evals"}},
+              "principal_id": "telegram:owner-1", "dialogue": dialogue,
+              "dialogue_complete": True, "source_message_ids": [case.source_message_id],
+              "turn_provenance": [{"source_message_id": case.source_message_id,
+                  "logical_turn_id": logical_turn_id, "operation_id": assistant_metadata["client_op_id"],
+                  "principal_id": assistant_metadata["source_principal"],
+                  "episode_id": trace_id}]}]}
+    telegent = {"complete": True, "user_id": case.owner_id, "login": "owner",
+                "start": "2026-10-01T00:00:00+00:00", "end": PERSIST_NOW.isoformat(),
+                "queried_at": PERSIST_NOW.isoformat(), "meals": meals, "unassigned": []}
+    return {"goal": goal.model_dump(mode="json"), "honcho_snapshot": honcho,
+            "telegent_snapshot": telegent, "dialogue_export": export}
+
+
+def set_persisted_kcal(case, kcal):
+    evidence = case.persistence_evidence
+    evidence["honcho_snapshot"]["messages"][0]["metadata"]["decision_trace"]["annotations"]["nutrition"].update(
+        energy_kcal_min=kcal, energy_kcal_max=kcal, energy_kcal_best=kcal,
+    )
+    evidence["telegent_snapshot"]["meals"][0]["energy_kcal_best"] = kcal
 
 
 def event(payload, *, event_id="event-1", position=1, target=None):
@@ -233,6 +323,29 @@ async def test_private_report_path_has_restricted_mode_and_no_source_material(tm
     assert case.dialogue[0].text not in path.read_text()
 
 
+@pytest.mark.asyncio
+async def test_product_a1_does_not_accept_legacy_commit_booleans_without_persisted_evidence(tmp_path):
+    case = make_case(tmp_path)
+    case.persistence_evidence = None
+    calls = []
+
+    async def fake(model, effort, prompt, image):
+        calls.append(model)
+        return reference().model_dump_json()
+
+    result = await calibrate_case(case, fake, CallBudget(max_calls=4))
+    assert result["a1"] == "INCONCLUSIVE"
+    assert result["a2"] == "NOT_RUN"
+    assert calls == ["openai/gpt-6.1-sol"]
+
+
+def test_product_a2_refuses_to_fall_back_to_reference_prefix(tmp_path):
+    case = make_case(tmp_path)
+    case.dialogue = None
+    with pytest.raises(ValueError, match="full dialogue"):
+        a2_prompt(case)
+
+
 @pytest.mark.parametrize("missing", ["reference_prefix", "dialogue"])
 def test_judge_requires_both_conversation_fields(tmp_path, missing):
     data = make_judge_case(tmp_path).model_dump()
@@ -289,11 +402,11 @@ async def test_judge_reference_is_blind_to_candidate_answer_and_luna_sees_dialog
 def test_positive_inclusive_boundary_and_over(tmp_path):
     case = make_case(tmp_path)
     assert score_a1(case, reference())[0] == "PASS"
-    case.events[0].annotation["energy_kcal_best"] = 440.1
+    set_persisted_kcal(case, 440.1)
     assert score_a1(case, reference())[0] == "FAIL"
-    case.events[0].annotation["energy_kcal_best"] = 360
+    set_persisted_kcal(case, 360)
     assert score_a1(case, reference())[0] == "PASS"
-    case.events[0].annotation["energy_kcal_best"] = 359.9
+    set_persisted_kcal(case, 359.9)
     assert score_a1(case, reference())[0] == "FAIL"
 
 
@@ -315,11 +428,10 @@ def test_negative_exact_absence_and_retraction(tmp_path):
     )
     case = make_case(tmp_path, state="validly_retracted", events=[observed, correction])
     assert effective_meal(case) == ("validly_retracted", None)
+    case.persistence_evidence = persistence_evidence(case, consumed=False)
     assert score_a1(case, negative)[0] == "PASS"
-    assert (
-        score_a1(make_case(tmp_path, state="never_recorded", events=[observed]), negative)[0]
-        == "FAIL"
-    )
+    unexpected = make_case(tmp_path, state="consumed")
+    assert score_a1(unexpected, negative)[0] == "FAIL"
 
 
 def test_replay_dedup_and_authoritative_order(tmp_path):
@@ -336,24 +448,22 @@ def test_replay_dedup_and_authoritative_order(tmp_path):
     )
     case = make_case(tmp_path, events=[correction, observed, observed])
     assert effective_meal(case) == ("consumed", 440)
+    set_persisted_kcal(case, 440)
     assert score_a1(case, reference())[0] == "PASS"
-    case.events[1].position = 2
+    case.persistence_evidence["honcho_snapshot"]["complete"] = False
     assert score_a1(case, reference())[0] == "INCONCLUSIVE"
 
 
 @pytest.mark.parametrize(
     "break_case",
     [
-        lambda c: c.image_path.unlink(),
-        lambda c: setattr(c, "image_sha256", "0" * 64),
-        lambda c: setattr(c, "ledger_verified_complete", False),
-        lambda c: setattr(c.events[0], "committed", False),
-        lambda c: setattr(c.events[0], "operation_id", "foreign"),
-        lambda c: setattr(c.events[0], "source_message_id", "foreign"),
-        lambda c: setattr(c.events[0], "owner_id", "foreign"),
+        lambda c: c.persistence_evidence["honcho_snapshot"].update(complete=False),
+        lambda c: c.persistence_evidence["goal"].update(operation_id="foreign"),
+        lambda c: c.persistence_evidence["goal"].update(source_message_id="foreign"),
+        lambda c: c.persistence_evidence["goal"].update(owner_id="foreign"),
     ],
 )
-def test_missing_pixels_hash_commit_or_binding_fail_closed(tmp_path, break_case):
+def test_persistence_evidence_incomplete_or_unbound_fails_closed(tmp_path, break_case):
     case = make_case(tmp_path)
     break_case(case)
     assert score_a1(case, reference())[0] == "INCONCLUSIVE"
@@ -375,7 +485,7 @@ async def test_a1_gates_a2_and_a2_prompt_is_blind(tmp_path):
         ).model_dump_json()
 
     failed = make_case(tmp_path)
-    failed.events[0].annotation["energy_kcal_best"] = 500
+    set_persisted_kcal(failed, 500)
     result = await calibrate_case(failed, fake, CallBudget(max_calls=4))
     assert result["a1"] == "FAIL" and result["a2"] == "NOT_RUN"
     assert len(calls) == 1
@@ -388,10 +498,22 @@ async def test_a1_gates_a2_and_a2_prompt_is_blind(tmp_path):
         assert model == "openai/gpt-6-luna" and effort == "medium" and image is None
         assert "400" not in prompt and "private-1" not in prompt
         assert "PASS" not in prompt and "gpt-6-sol" not in prompt.lower()
-    assert calls[0][0] == "openai/gpt-6-sol" and calls[0][1] == "high"
+    assert calls[0][0] == "openai/gpt-6.1-sol" and calls[0][1] == "high"
     assert calls[0][3] is not None
     assert_original_payload(passed, calls[0][3])
     assert "private-1" not in a2_prompt(passed)
+
+
+def test_full_product_dialogue_is_for_a2_while_sol_uses_reference_prefix(tmp_path):
+    case = make_case(tmp_path)
+    final = {"role": "assistant", "text": "I could not confirm the journal save."}
+    duplicate = {"role": "assistant", "text": "Was there sugar?"}
+    full = Case.model_validate({
+        **case.model_dump(), "dialogue": [*case.prefix, duplicate, final],
+    })
+    assert final["text"] in a2_prompt(full)
+    assert duplicate["text"] in a2_prompt(full)
+    assert final["text"] not in sol_prompt(full)
 
 
 @pytest.mark.asyncio
@@ -438,7 +560,7 @@ async def test_judge_lane_without_events_and_human_efficiency(tmp_path, state, k
     assert result["efficiency_quality"] == "PASS"
     assert "a1" not in result
     assert len(calls) == 4
-    assert calls[0][0:2] == ("openai/gpt-6-sol", "high")
+    assert calls[0][0:2] == ("openai/gpt-6.1-sol", "high")
     assert calls[0][3] is not None
     assert_original_payload(case, calls[0][3])
     assert all(
@@ -615,7 +737,7 @@ def subscription_entries(case, *, luna=True):
         {
             "route": "native_subscription_padavan",
             "case_id": case.case_id,
-            "model": "openai/gpt-6-sol",
+            "model": "openai/gpt-6.1-sol",
             "reasoning_effort": "high",
             "prompt": sol_prompt(case),
             "source_image_sha256": case.image_sha256,
@@ -674,7 +796,7 @@ async def test_subscription_intake_exact_route_and_exif_bytes(tmp_path):
     [
         ("route", "direct_api"),
         ("model", "openai/gpt-6-luna"),
-        ("model", "openai/gpt-6.1-sol"),
+        ("model", "openai/gpt-6-sol"),
         ("reasoning_effort", "medium"),
         ("prompt", "different prompt"),
         ("source_image_sha256", "0" * 64),
@@ -712,7 +834,7 @@ async def test_subscription_rejects_missing_extra_and_reused_evidence(tmp_path):
     with pytest.raises(ValueError, match="missing subscription result"):
         await calibrate_case(case, intake.call, CallBudget(max_calls=4))
     failed = make_case(tmp_path)
-    failed.events[0].annotation["energy_kcal_best"] = 500
+    set_persisted_kcal(failed, 500)
     intake = SubscriptionResults(entries, [failed])
     result = await calibrate_case(failed, intake.call, CallBudget(max_calls=4))
     assert result["a1"] == "FAIL" and result["a2"] == "NOT_RUN"
@@ -783,7 +905,7 @@ def test_subscription_cli_writes_only_aggregate_report(tmp_path, monkeypatch):
     report = json.loads(path.read_text())
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
     assert report["subscription_turns"] == 12
-    assert report["reference_model"] == "openai/gpt-6-sol"
+    assert report["reference_model"] == "openai/gpt-6.1-sol"
     assert report["reference_reasoning_effort"] == "high"
     assert report["reference_selection"] == "human_authorized_temporary"
     assert report["sol_prompt_version"] == SOL_PROMPT_VERSION == "image_target_v2"

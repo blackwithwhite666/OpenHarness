@@ -41,7 +41,7 @@ class SubscriptionResult(BaseModel):
 
     route: Literal["native_subscription_padavan"]
     case_id: str = Field(min_length=1, max_length=128)
-    model: Literal["openai/gpt-6-sol", "openai/gpt-6-luna"]
+    model: Literal["openai/gpt-6.1-sol", "openai/gpt-6-luna"]
     reasoning_effort: Literal["high", "medium"]
     prompt: str = Field(min_length=1, max_length=16_000)
     source_image_sha256: str | None = Field(pattern=r"^[0-9a-f]{64}$")
@@ -69,7 +69,7 @@ class SubscriptionResults:
                 raise ValueError("reused Padavan session/turn provenance")
             provenances.add(key)
             try:
-                if item.model == "openai/gpt-6-sol":
+                if item.model == "openai/gpt-6.1-sol":
                     Reference.model_validate_json(item.response_json)
                 else:
                     A2Vote.model_validate_json(item.response_json)
@@ -80,7 +80,7 @@ class SubscriptionResults:
         if self.index >= len(self.results):
             raise ValueError("missing subscription result")
         item = self.results[self.index]
-        if model == "openai/gpt-6-sol":
+        if model == "openai/gpt-6.1-sol":
             self.case_index += 1
             self.luna_sessions.clear()
         if self.case_index >= len(self.cases):

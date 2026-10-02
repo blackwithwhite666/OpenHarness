@@ -24,11 +24,12 @@ from ohmo.evals.adapter import get_eval_store
 from ohmo.evals.nutrition_trace import NutritionAnnotationV2
 from openharness.utils.fs import atomic_write_text
 
-SOL_MODEL = "openai/gpt-6-sol"
+SOL_MODEL = "openai/gpt-6.1-sol"
 LUNA_MODEL = "openai/gpt-6-luna"
 SOL_PROMPT_VERSION = "image_target_v2"
 MAX_CASES = 5
 MAX_PREFIX = 12
+MAX_DIALOGUE = 100
 MAX_EVENTS = 24
 MAX_IMAGE_BYTES = 10_000_000
 MAX_IMAGE_PIXELS = 20_000_000
@@ -61,6 +62,10 @@ class Case(StrictModel):
     image_path: Path
     image_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     prefix: list[Turn] = Field(min_length=1, max_length=MAX_PREFIX)
+    # Complete product dialogue for A2; reference judging remains prefix-only.
+    dialogue: list[Turn] | None = Field(default=None, max_length=MAX_DIALOGUE)
+    # Bound raw snapshots and the read-only eval export used by product A1.
+    persistence_evidence: dict[str, Any] | None = None
     reviewed_state: Literal["consumed", "never_recorded", "validly_retracted"]
     origin: Literal["camera", "person"]
     source_message_id: str = Field(min_length=1)
@@ -127,7 +132,7 @@ class JudgeCase(StrictModel):
     image_path: Path
     image_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     reference_prefix: list[Turn] = Field(min_length=1, max_length=MAX_PREFIX)
-    dialogue: list[Turn] = Field(min_length=1, max_length=MAX_PREFIX)
+    dialogue: list[Turn] = Field(min_length=1, max_length=MAX_DIALOGUE)
     labels: JudgeLabels
 
 
@@ -263,28 +268,71 @@ def effective_meal(case: Case) -> tuple[str, float | None]:
     raise ValueError("effective meal state or kcal is unresolved")
 
 
-def score_a1(case: Case, reference: Reference) -> tuple[str, str]:
-    """Validation gaps are inconclusive; observed semantic mismatch is failure."""
-    try:
-        checked_image(case)
-        state, kcal = effective_meal(case)
-    except ValidationError:
-        return "INCONCLUSIVE", "invalid nutrition annotation"
-    except (OSError, ValueError) as exc:
-        return "INCONCLUSIVE", str(exc)
+def _score_a1_details(case: Case, reference: Reference) -> dict[str, Any]:
+    """Require raw persisted evidence; legacy Case commit booleans are historical only."""
+    evidence = case.persistence_evidence
+    if not isinstance(evidence, dict):
+        return {"a1": "INCONCLUSIVE", "reason": "scoped Honcho and Telegent persistence evidence is missing",
+                "persistence_stage": "EVIDENCE_MISSING"}
     if reference.consumption_state == "uncertain":
-        return "INCONCLUSIVE", "reference is uncertain"
-    if case.reviewed_state == "consumed" and reference.consumption_state != "consumed":
-        return "INCONCLUSIVE", "reviewed state and reference disagree"
-    if case.reviewed_state != "consumed" and reference.consumption_state != "not_consumed":
-        return "INCONCLUSIVE", "reviewed state and reference disagree"
-    if state != case.reviewed_state:
-        return "FAIL", "effective consumption state differs from reviewed state"
-    if state == "consumed":
-        assert kcal is not None and reference.kcal is not None
-        if abs(kcal - reference.kcal) > reference.kcal * 0.10 + 1e-9:
-            return "FAIL", "effective kcal exceeds 10% reference tolerance"
-    return "PASS", "effective meal matches reviewed state and frozen reference"
+        return {"a1": "INCONCLUSIVE", "reason": "frozen reference is uncertain",
+                "persistence_stage": "REFERENCE_UNCERTAIN"}
+    try:
+        from ohmo.evals.nutrition_persistence import (
+            Goal, Manifest, grade_manifest, validate_dialogue_binding,
+        )
+
+        goal = Goal.model_validate(evidence["goal"])
+        manifest = Manifest(schema_version=1, goals=[goal])
+        bound = validate_dialogue_binding(manifest, evidence["dialogue_export"])
+        if bound[goal.case_id]["complete"] is not True:
+            return {"a1": "INCONCLUSIVE", "reason": "reviewed goal is not bound to complete owner dialogue",
+                    "persistence_stage": "DIALOGUE_BINDING_FAILED"}
+        expected_turns = []
+        for exported in evidence["dialogue_export"]["episodes"]:
+            if exported.get("episode", {}).get("episode_id") in goal.episode_ids:
+                expected_turns.extend(
+                    {"role": turn["role"], "text": turn["text"]}
+                    for turn in exported.get("dialogue", []) if turn.get("role") in {"user", "assistant"}
+                )
+        if case.dialogue is None or [turn.model_dump() for turn in case.dialogue] != expected_turns:
+            return {"a1": "INCONCLUSIVE", "reason": "full Case dialogue is missing or differs from bound export",
+                    "persistence_stage": "DIALOGUE_BINDING_FAILED"}
+        if goal.source_message_id != case.source_message_id or goal.owner_id != case.owner_id:
+            return {"a1": "INCONCLUSIVE", "reason": "reviewed nutrition goal does not bind to product Case identity",
+                    "persistence_stage": "CASE_BINDING_FAILED"}
+        telegent = evidence["telegent_snapshot"]
+        from ohmo.evals.nutrition_persistence import bind_wellness_snapshot
+
+        canonical = bind_wellness_snapshot(telegent, goal=goal)
+        result = grade_manifest(manifest, evidence["honcho_snapshot"], canonical,
+                                reviewed_turn_sources=bound[goal.case_id]["reviewed_turn_sources"],
+                                reviewed_turn_provenance=bound[goal.case_id]["reviewed_turn_provenance"])[0]
+    except (KeyError, TypeError, ValueError, AttributeError, ValidationError):
+        return {"a1": "INCONCLUSIVE", "reason": "persistence evidence is malformed or ambiguously bound",
+                "persistence_stage": "EVIDENCE_INVALID"}
+    details = {"persistence_stage": result.get("stage", "UNKNOWN")}
+    details.update({key: result[key] for key in ("actual_event_ids", "actual_latest_event_id",
+                                                  "actual_kcal", "evidence_limitations") if key in result})
+    details["persistence_reason"] = result.get("reason", "")
+    if result["a1"] != "PASS":
+        return {"a1": result["a1"], "reason": result["reason"], **details}
+    expected_state = "consumed" if goal.expected_consumed else "not_consumed"
+    if reference.consumption_state != expected_state:
+        return {"a1": "FAIL", "reason": "frozen Sol reference disagrees with reviewed persisted goal", **details}
+    if goal.expected_consumed:
+        assert reference.kcal is not None
+        actual_kcal = result.get("actual_kcal")
+        if not isinstance(actual_kcal, (int, float)) or isinstance(actual_kcal, bool):
+            return {"a1": "INCONCLUSIVE", "reason": "persisted numeric meal value is unavailable", **details}
+        if abs(actual_kcal - reference.kcal) > reference.kcal * 0.10 + 1e-9:
+            return {"a1": "FAIL", "reason": "persisted kcal exceeds frozen Sol reference tolerance", **details}
+    return {"a1": "PASS", "reason": "persisted same-event meal matches reviewed goal and frozen reference", **details}
+
+
+def score_a1(case: Case, reference: Reference) -> tuple[str, str]:
+    result = _score_a1_details(case, reference)
+    return result["a1"], result["reason"]
 
 
 def sol_prompt(case: Case | JudgeCase) -> str:
@@ -323,7 +371,9 @@ def sol_prompt(case: Case | JudgeCase) -> str:
 
 
 def a2_prompt(case: Case | JudgeCase) -> str:
-    turns = case.dialogue if isinstance(case, JudgeCase) else case.prefix
+    turns = case.dialogue
+    if turns is None:
+        raise ValueError("full dialogue is required before A2 scoring")
     dialogue = [{"role": turn.role, "text": turn.text} for turn in turns]
     return (
         "Judge dialogue efficiency only. Return JSON: score (0..5), "
@@ -472,7 +522,6 @@ async def calibrate_case(case: Case, call: ModelCall, budget: CallBudget) -> dic
     """Sol runs first; three independent Luna votes only follow A1 PASS."""
     try:
         image = checked_image(case)
-        effective_meal(case)
     except ValidationError:
         return {
             "case_id": case.case_id,
@@ -505,7 +554,8 @@ async def calibrate_case(case: Case, call: ModelCall, budget: CallBudget) -> dic
             **image_hashes,
         }
     assert isinstance(reference, Reference)
-    verdict, reason = score_a1(case, reference)
+    a1_result = _score_a1_details(case, reference)
+    verdict, reason = a1_result["a1"], a1_result["reason"]
     result: dict[str, Any] = {
         "case_id": case.case_id,
         "lane": "PRODUCT_A1",
@@ -514,11 +564,17 @@ async def calibrate_case(case: Case, call: ModelCall, budget: CallBudget) -> dic
         "a2": "NOT_RUN",
         **image_hashes,
     }
+    result.update({key: value for key, value in a1_result.items()
+                   if key not in {"a1", "reason"}})
     result["reference"] = {
         "consumption_state": reference.consumption_state,
         "kcal": reference.kcal,
     }
     if verdict != "PASS":
+        return result
+    if case.dialogue is None:
+        result["a2"] = "INCONCLUSIVE"
+        result["a2_reason"] = "full dialogue is missing"
         return result
     votes: list[A2Vote] = []
     for _ in range(3):

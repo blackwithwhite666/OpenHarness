@@ -73,6 +73,8 @@ class GatewayEvalRecorder:
         session_key: str,
         user_text: str,
         user_goal: str | None = None,
+        trusted_turn_provenance: Mapping[str, Any] | None = None,
+        trusted_camera_context: Mapping[str, Any] | None = None,
     ) -> GatewayEvalRecorder:
         normalized_user_goal = user_goal or ""
         recorder = cls(
@@ -88,6 +90,43 @@ class GatewayEvalRecorder:
             "media_count": len(message.media or []),
             "inbound": _inbound_metadata(message),
         }
+        if trusted_turn_provenance is not None:
+            source = trusted_turn_provenance.get("source_message_id")
+            principal = trusted_turn_provenance.get("principal_id")
+            logical = trusted_turn_provenance.get("logical_turn_id")
+            operation = trusted_turn_provenance.get("operation_id")
+            if (not all(isinstance(value, str) and value for value in (source, principal, logical, operation))
+                    or operation != f"{logical}:assistant"):
+                raise ValueError("trusted gateway turn provenance is incomplete")
+            metadata["trusted_camera_turn_provenance"] = {
+                "source_message_id": source, "principal_id": principal,
+                "logical_turn_id": logical, "operation_id": operation,
+                "episode_id": recorder.episode_id,
+            }
+        if trusted_camera_context is not None:
+            context = dict(trusted_camera_context)
+            kind = context.get("kind")
+            candidate = context.get("candidate_id")
+            photo_id = context.get("native_photo_id")
+            tenant = context.get("tenant_id")
+            gateway_session = context.get("gateway_session_id")
+            recipient = context.get("recipient_principal")
+            if (kind not in {"initial_context", "owner_turn"} or not isinstance(candidate, str) or not candidate
+                    or type(photo_id) is not int or photo_id <= 0 or not isinstance(tenant, str) or not tenant
+                    or gateway_session != str(getattr(bundle, "session_id", "") or "")
+                    or not isinstance(recipient, str) or not recipient):
+                raise ValueError("trusted Camera receipt context is incomplete")
+            if kind == "owner_turn" and (
+                    trusted_turn_provenance is None
+                    or any(context.get(key) != trusted_turn_provenance.get(turn_key) for key, turn_key in (
+                        ("source_message_id", "source_message_id"), ("principal_id", "principal_id"),
+                        ("logical_turn_id", "logical_turn_id"), ("operation_id", "operation_id")))):
+                raise ValueError("trusted Camera owner context is not bound to its turn")
+            if kind == "initial_context" and trusted_turn_provenance is not None:
+                raise ValueError("initial Camera context cannot claim a human source turn")
+            metadata["trusted_camera_context"] = {
+                **context, "episode_id": recorder.episode_id,
+            }
         recorder.store.append_episode(
             EvalEpisode(
                 episode_id=recorder.episode_id,
@@ -204,6 +243,10 @@ class GatewayEvalRecorder:
             "gateway_final",
             payload={"text": text, "metadata": metadata or {}},
         )
+
+    def record_gateway_update(self, *, text: str, metadata: Mapping[str, Any] | None = None) -> None:
+        """Persist public assistant text emitted before tool calls for dialogue review."""
+        self.record_event("assistant_update", payload={"text": text, "metadata": metadata or {}})
 
     def record_gateway_error(
         self, *, text: str, metadata: Mapping[str, Any] | None = None

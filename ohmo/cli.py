@@ -37,6 +37,7 @@ from openharness.utils.fs import atomic_write_text
 
 from ohmo.gateway.config import load_gateway_config, save_gateway_config
 from ohmo.gateway.models import GatewayConfig
+from ohmo.evals.nutrition_persistence import export_eval_dialogue
 from ohmo.gateway.service import (
     OhmoGatewayService,
     gateway_status,
@@ -83,6 +84,7 @@ from ohmo.memory_store import MemoryStore
 from ohmo.runtime import launch_ohmo_react_tui, run_ohmo_backend, run_ohmo_print_mode
 from ohmo.session_storage import OhmoSessionBackend
 from ohmo.workspace import (
+    get_evals_dir,
     get_gateway_config_path,
     get_logs_dir,
     get_workspace_root,
@@ -1269,6 +1271,33 @@ def evals_mine_cmd(
         f"{result.candidates.manifest.record_count} candidates and "
         f"{result.cases.manifest.record_count} draft cases"
     )
+
+
+@evals_app.command("nutrition-export")
+def evals_nutrition_export_cmd(
+    output: Path = typer.Option(..., "--output", help="Private JSON output path (mode 0600)"),
+    workspace: str | None = typer.Option(None, "--workspace", help=_WORKSPACE_HELP),
+    episode_id: list[str] = typer.Option([], "--episode-id", help="Explicit episode ID; repeat to select several"),
+    session_id: str | None = typer.Option(None, "--session-id", help="Read a bounded eval session range"),
+    principal_id: str | None = typer.Option(None, "--principal-id", help="Required channel:sender principal for session-range selection"),
+    since: str | None = typer.Option(None, "--since", help="Inclusive episode creation lower bound"),
+    until: str | None = typer.Option(None, "--until", help="Inclusive episode creation upper bound"),
+    limit: int = typer.Option(100, "--limit", min=1, max=500),
+) -> None:
+    """Export selected full eval dialogue read-only for reviewed nutrition goals."""
+    if bool(episode_id) == bool(session_id):
+        raise typer.BadParameter("supply --episode-id or --session-id")
+    if session_id and (not since or not until):
+        raise typer.BadParameter("--session-id requires both --since and --until")
+    try:
+        export = export_eval_dialogue(
+            get_evals_dir(workspace), episode_ids=episode_id or None,
+            session_id=session_id, principal_id=principal_id, since=since, until=until, limit=limit,
+        )
+    except (OSError, ValueError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    atomic_write_text(output.expanduser(), json.dumps(export, ensure_ascii=False, indent=2) + "\n", mode=0o600)
+    print(f"Wrote private dialogue export ({len(export['episodes'])} episodes)")
 
 
 @evals_app.command("segment-sessions")
