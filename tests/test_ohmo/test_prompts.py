@@ -267,6 +267,92 @@ def test_ohmo_prompt_energy_days_reports_observed_facts_and_coverage(tmp_path: P
     assert "A material conflict still blocks balance" in prompt
 
 
+def test_ohmo_prompt_rolling_balance_uses_interval_contract_and_exact_request_bounds() -> None:
+    """Current windows need interval facts; daily buckets cannot satisfy this path."""
+    skill = next(skill for skill in get_bundled_skills() if skill.name == "calory")
+    prompt = skill.content.split("---", 2)[2]
+
+    for field in (
+        "energy_intervals",
+        "exact requested `start`/`end` bounds",
+        "`basal_sum`/`basal_unit`/`basal_points`/`basal_minutes_with_samples`",
+        "`active_sum`/`active_unit`/`active_points`",
+        "`snapshot_revision`",
+        "both conflict counts",
+        "`unresolved_key_count`",
+        "`possible_replay_count`",
+        "`legacy_synthetic_count`",
+        "Require all these gate facts to be present",
+        "supported units (`kJ` or `kcal`)",
+        "A zero sum with positive points is a valid observed zero",
+    ):
+        assert field in prompt
+    assert "a null sum, an absent energy type, or zero points means expenditure is unknown" in prompt
+    assert "Possible replay alone does not deny a result" in prompt
+    assert "Do not combine devices, use full-day `energy_days`, prorate daily sums" in prompt
+
+
+@pytest.mark.parametrize(
+    ("request_class", "required_rule"),
+    [
+        ("current", "For a current/today calorie balance request, use the exact rolling 24 hours"),
+        ("today", "Request and use `energy_intervals` for that exact window only"),
+        (
+            "historical",
+            "Explicit historical dates and calendar-day requests keep the existing local-day policy",
+        ),
+    ],
+)
+def test_ohmo_balance_policy_text_distinguishes_window_types(
+    request_class: str, required_rule: str
+) -> None:
+    """Guard the routed skill policy across now/today and explicit-date turns."""
+    del request_class  # Names the user-turn trajectory represented by each policy row.
+    loaded = next(skill for skill in get_bundled_skills() if skill.name == "calory")
+    assert required_rule in loaded.content
+
+
+def test_ohmo_rolling_balance_nutrition_range_policy_text_preserves_unknown_meal_time() -> None:
+    skill = next(skill for skill in get_bundled_skills() if skill.name == "calory")
+    prompt = skill.content
+
+    for rule in (
+        "Precisely timed consumed records are included only when their `meal_at` is within the exact rolling window",
+        "A date-only consumed record for a fully contained local calendar day may count in full",
+        "Date-only consumed records on either partial boundary day have unknown window membership",
+        "report a provisional balance range accounting for their possible inclusion or exclusion",
+        "Undated records, including `nutrition_unassigned_records`, are unknown and must be disclosed",
+        "Do not invent `meal_at` or treat capture/receive timestamps as consumption time",
+        "do not reconstruct or write meals for a report",
+    ):
+        assert rule in prompt
+
+
+def test_ohmo_policy_text_and_synthetic_intake_cases_require_confirmed_consumption() -> None:
+    skill = next(skill for skill in get_bundled_skills() if skill.name == "calory")
+    prompt = skill.content
+    synthetic_records = [
+        {"meal_id": "synthetic-consumed", "consumption_status": "consumed", "energy_kcal_best": 250},
+        {"meal_id": "synthetic-planned", "consumption_status": "planned", "energy_kcal_best": 400},
+        {"meal_id": "synthetic-unknown", "consumption_status": "unknown", "energy_kcal_best": 300},
+    ]
+    counted = [record for record in synthetic_records if record["consumption_status"] == "consumed"]
+
+    assert [record["meal_id"] for record in counted] == ["synthetic-consumed"]
+    assert "Only records with `consumption_status` == `consumed` count as intake" in prompt
+    assert "planned or not-consumed records do not contribute" in prompt
+    assert "An `unknown` consumption status is unconfirmed intake" in prompt
+    assert "do not count it as consumed or silently treat it as known zero" in prompt
+
+
+def test_ohmo_policy_text_retains_historical_past_local_day_guard() -> None:
+    skill = next(skill for skill in get_bundled_skills() if skill.name == "calory")
+    assert (
+        "For an explicit historical/calendar-day balance, require the requested local calendar day to be in the past"
+        in skill.content
+    )
+
+
 def test_ohmo_prompt_energy_presentation_hides_diagnostics_by_default_but_keeps_gates(
     tmp_path: Path,
 ) -> None:
@@ -283,7 +369,7 @@ def test_ohmo_prompt_energy_presentation_hides_diagnostics_by_default_but_keeps_
     ):
         assert obsolete_display_rule not in prompt
     for preserved_safety_rule in (
-        "A preliminary observed energy balance is allowed only for a past local day",
+        "A preliminary observed energy balance for an explicit historical/calendar day",
         "missing fields (including uncertainty fields on an older API response) fail closed",
         "Require `unresolved_key_count == 0` and `legacy_synthetic_count == 0`",
         "A conflict in either energy type blocks balance",
@@ -329,7 +415,7 @@ def test_ohmo_prompt_has_no_absolute_energy_ban_when_provisional_balance_is_allo
 @pytest.mark.parametrize(
     "required_rule",
     [
-        "past local day",
+        "explicit historical/calendar day",
         "trusted `nutrition_status=complete` policy",
         "basal_minutes_with_samples == day_minutes",
         "`active_points > 0`",
@@ -357,7 +443,7 @@ def test_ohmo_prompt_energy_balance_requires_every_positive_gate(
 @pytest.mark.parametrize(
     "fail_closed_rule",
     [
-        "If any energy gate fails",
+        "If a historical/calendar-day energy gate fails",
         "state in one short qualification that expenditure or the balance may be incomplete",
         "Do not calculate or state a deficit, surplus, calorie target",
         "A conflict in either energy type blocks balance",
@@ -455,10 +541,13 @@ def test_ohmo_prompt_wellness_and_nutrition_safety_contract(tmp_path: Path) -> N
     assert 'raw_health_types=["HealthAutoExportMetric_weight_body_mass"]' in prompt
     assert "Keep basal and active energy aggregate-only by default" in prompt
     assert "request raw HAE energy only when needed" in prompt
-    assert "Filter every displayed daily value" in prompt
+    assert "Filter daily values to the participant's local calendar day and rolling-window values to their exact requested bounds" in prompt
     assert "Observed basal and active energy sums and coverage are factual" in prompt
-    assert "only when every energy gate below passes" in prompt
-    assert "otherwise never infer an energy deficit" in prompt
+    assert "For a current/today calorie balance request" in prompt
+    assert "Explicit historical dates and calendar-day requests keep the existing local-day policy" in prompt
+    assert "For rolling windows, omit a numeric balance when required interval energy facts are missing or invalid" in prompt
+    assert "authoritative nutrition is unavailable or incomplete" in prompt
+    assert "This veto does not include bounded possible inclusion or exclusion" in prompt
     assert "nutrition_status` is not `complete`" in prompt
     assert "an empty nutrition list is never zero intake" in prompt
     assert "conversation-only" in prompt
@@ -483,5 +572,5 @@ def test_ohmo_prompt_covers_marina_wellness_regressions(tmp_path: Path) -> None:
     assert "every recalculated energy or macronutrient field" in prompt
     assert "never display it as `0 kcal`" in prompt
     assert "there is no durable weight-write tool" in prompt
-    assert "only when every energy gate below passes" in prompt
-    assert "otherwise never infer an energy deficit" in prompt
+    assert "For a current/today calorie balance request" in prompt
+    assert "For rolling windows, omit a numeric balance when required interval energy facts are missing or invalid" in prompt

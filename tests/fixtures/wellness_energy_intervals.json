@@ -1,0 +1,57 @@
+{
+  "login": "synthetic_owner",
+  "linked_device_ids": [
+    "watch-1"
+  ],
+  "interval": {
+    "start": "2026-10-01T05:00:00+00:00",
+    "end": "2026-10-02T05:00:00+00:00"
+  },
+  "energy_snapshot_revision": 8,
+  "nutrition_status": "complete",
+  "nutrition_records": [],
+  "nutrition_unassigned_records": [],
+  "energy_days": [
+    {
+      "device_id": "watch-1",
+      "local_day": "2026-10-02",
+      "timezone": "Europe/Moscow",
+      "basal_sum": 8368.0,
+      "basal_unit": "kJ",
+      "basal_points": 1440,
+      "basal_minutes_with_samples": 1440,
+      "day_minutes": 1440,
+      "active_sum": 418.4,
+      "active_unit": "kJ",
+      "active_points": 12,
+      "next_day_basal_observed": false,
+      "basal_conflicting_timestamps": 0,
+      "active_conflicting_timestamps": 0,
+      "snapshot_revision": 8,
+      "unresolved_key_count": 0,
+      "possible_replay_count": 0,
+      "legacy_synthetic_count": 0
+    }
+  ],
+  "energy_intervals": [
+    {
+      "device_id": "watch-1",
+      "start": "2026-10-01T05:00:00+00:00",
+      "end": "2026-10-02T05:00:00+00:00",
+      "timezone": "Europe/Moscow",
+      "basal_sum": 7950.0,
+      "basal_unit": "kJ",
+      "basal_points": 1368,
+      "basal_minutes_with_samples": 1360,
+      "active_sum": 376.56,
+      "active_unit": "kJ",
+      "active_points": 11,
+      "basal_conflicting_timestamps": 0,
+      "active_conflicting_timestamps": 0,
+      "snapshot_revision": 8,
+      "unresolved_key_count": 0,
+      "possible_replay_count": 1,
+      "legacy_synthetic_count": 0
+    }
+  ]
+}
