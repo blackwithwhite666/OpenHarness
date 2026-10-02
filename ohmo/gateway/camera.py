@@ -1673,6 +1673,8 @@ class CameraIngress:
         return original
 
     def _load_attempts(self) -> tuple[dict[str, dict], dict | None]:
+        self._journal_present = False
+        self._journal_schema_version = None
         try:
             state_fd = self._open_state_dir(create=False)
         except FileNotFoundError:
@@ -1684,8 +1686,10 @@ class CameraIngress:
                 return {}, None
         finally:
             os.close(state_fd)
+        self._journal_present = True
         session = None
         if isinstance(payload, dict) and payload.get("schema_version") == 2:
+            self._journal_schema_version = 2
             if set(payload) != {"schema_version", "attempts", "session"}:
                 raise ValueError("camera attempt journal is invalid")
             attempts = payload["attempts"]
@@ -2688,7 +2692,7 @@ class CameraIngress:
     ) -> tuple[int, dict]:
         """Replay exact outcomes or retire an ineligible request, without delivery."""
         if not isinstance(purpose, str) or purpose not in {
-            "existing_outcome_only", "retire_ineligible"
+            "existing_outcome_only", "retire_ineligible", "prove_not_admitted"
         }:
             return self._error(400, "invalid_request")
         if not self.config.enabled:
@@ -2717,6 +2721,10 @@ class CameraIngress:
                 # lease or require a write before returning an already durable
                 # outcome. Artifact validation remains inside the admission lock.
                 return self._lookup_existing_outcome(request, upload)
+            if purpose == "prove_not_admitted":
+                if type(upload.request.get("seq")) is not int:
+                    return self._error(400, "invalid_request")
+                return self._prove_not_admitted(request, upload)
 
             if self._refresh_expired_session():
                 try:
@@ -2917,6 +2925,131 @@ class CameraIngress:
         ):
             return self._error(503, "unknown_original_outcome")
         return ack["status"], ack["body"]
+
+    def _prove_not_admitted(
+        self, request: CameraCandidateRequest, upload: CameraCandidateUpload
+    ) -> tuple[int, dict]:
+        """Prove only that this exact candidate was not admitted in this lineage.
+
+        The v1 journal atomically retains an attempt tombstone before dispatch.
+        A fresh read is required here: an in-memory absence is not evidence if
+        the backing journal disappeared, changed schema, or cannot be parsed.
+        """
+        try:
+            self._validate_upload(request, upload)
+        except (OSError, ValueError, TypeError, ValidationError):
+            return self._error(422, "candidate_evidence_mismatch")
+
+        try:
+            expires_at = datetime.fromisoformat(self._session["expires_at"])
+        except (KeyError, TypeError, ValueError):
+            return self._error(503, "unknown_original_outcome")
+        if (
+            expires_at.tzinfo is None
+            or expires_at.utcoffset() is None
+            or datetime.now(timezone.utc) >= expires_at
+            or request.session_id != self._session["session_id"]
+            or request.epoch == self._session["epoch"]
+        ):
+            return self._error(503, "unknown_original_outcome")
+
+        migrated_before = getattr(self, "_journal_migrated", False)
+        try:
+            backing_attempts, backing_session = self._load_attempts()
+        except (OSError, ValueError, TypeError, ValidationError):
+            return self._error(503, "unknown_original_outcome")
+        finally:
+            self._journal_migrated = migrated_before
+
+        if (
+            not self._journal_present
+            or self._journal_schema_version != 2
+            or not isinstance(backing_session, dict)
+            or set(backing_session)
+            != {"session_id", "epoch", "committed_seq", "expires_at", "last_ack"}
+            or type(backing_session.get("committed_seq")) is not int
+            or type(self._session.get("committed_seq")) is not int
+            or backing_session != self._session
+            or request.candidate_id in self._attempts
+            or request.candidate_id in backing_attempts
+        ):
+            return self._error(503, "unknown_original_outcome")
+
+        # Refuse any recorded owner of the original sequence. Unrelated legacy
+        # candidate tombstones remain useful coverage even when their older
+        # schema did not retain request_identity: candidate IDs are the durable
+        # admission keys and tombstones are never removed.
+        for candidate_id, attempt in (*self._attempts.items(), *backing_attempts.items()):
+            identity = attempt.get("request_identity")
+            recovery = attempt.get("legacy_base_recovery")
+            if isinstance(identity, dict) and type(identity.get("seq")) is not int:
+                return self._error(503, "unknown_original_outcome")
+            if (
+                isinstance(identity, dict)
+                and identity.get("session_id") == request.session_id
+                and identity.get("epoch") == request.epoch
+                and identity.get("seq") == request.seq
+            ) or (
+                isinstance(recovery, dict)
+                and recovery.get("session_id") == request.session_id
+                and recovery.get("epoch") == request.epoch
+                and recovery.get("seq") == request.seq
+            ):
+                return self._error(503, "unknown_original_outcome")
+
+        last_ack = backing_session.get("last_ack")
+        committed_seq = backing_session["committed_seq"]
+        if committed_seq == 0:
+            if last_ack is not None:
+                return self._error(503, "unknown_original_outcome")
+        else:
+            if not isinstance(last_ack, dict) or set(last_ack) != {
+                "seq", "candidate_id", "request_identity", "status", "body"
+            }:
+                return self._error(503, "unknown_original_outcome")
+            identity = last_ack.get("request_identity")
+            body = last_ack.get("body")
+            if (
+                type(last_ack.get("seq")) is not int
+                or last_ack["seq"] != committed_seq
+                or type(last_ack.get("status")) is not int
+                or not isinstance(last_ack.get("candidate_id"), str)
+                or not isinstance(identity, dict)
+                or type(identity.get("seq")) is not int
+                or not isinstance(body, dict)
+                or identity.get("candidate_id") != last_ack["candidate_id"]
+                or identity.get("session_id") != self._session["session_id"]
+                or identity.get("epoch") != self._session["epoch"]
+                or identity.get("seq") != committed_seq
+                or (
+                    body.get("candidate_id") is not None
+                    and body.get("candidate_id") != last_ack["candidate_id"]
+                )
+                or body.get("session_id") != self._session["session_id"]
+                or body.get("epoch") != self._session["epoch"]
+                or type(body.get("ack_seq")) is not int
+                or body.get("ack_seq") != committed_seq
+                or last_ack["candidate_id"] == request.candidate_id
+            ):
+                return self._error(503, "unknown_original_outcome")
+            try:
+                ack_request = CameraCandidateRequest.model_validate(identity)
+            except ValidationError:
+                return self._error(503, "unknown_original_outcome")
+            if self._request_identity(ack_request) != identity:
+                return self._error(503, "unknown_original_outcome")
+
+        return 200, {
+            "status": "not_admitted",
+            "proof": "same_session_durable_journal_v1",
+            "request_identity": self._request_identity(request),
+            "current_lease": {
+                "session_id": self._session["session_id"],
+                "epoch": self._session["epoch"],
+                "committed_seq": self._session["committed_seq"],
+                "expires_at": self._session["expires_at"],
+            },
+        }
 
     @staticmethod
     def _error(status: int, code: str) -> tuple[int, dict]:
@@ -3819,7 +3952,9 @@ async def serve_camera_http(
             if reconcile_route:
                 if reconcile_purpose is None:
                     reconcile_purpose = "retire_ineligible"
-                if reconcile_purpose not in {"existing_outcome_only", "retire_ineligible"}:
+                if reconcile_purpose not in {
+                    "existing_outcome_only", "retire_ineligible", "prove_not_admitted"
+                }:
                     status, response = ingress._error(400, "invalid_request")
                     reconcile_purpose = None
                     invalid_reconcile_header = True
