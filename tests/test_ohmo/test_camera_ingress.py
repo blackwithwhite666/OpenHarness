@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 from io import BytesIO
 import json
@@ -1789,6 +1790,289 @@ async def test_reconcile_existing_outcome_only_unknown_preserves_positive_reques
     admitted, ack = await ingress.admit("Bearer " + "s" * 40, upload)
     assert admitted == 202 and ack["ack_seq"] == 1
     assert channel.calls == []
+    await ingress.close()
+
+
+@pytest.mark.asyncio
+async def test_prove_not_admitted_is_read_only_for_complete_rotated_journal(
+    tmp_path: Path,
+) -> None:
+    ingress, root, bus, channel = _ingress(tmp_path)
+    request = _candidate(root)
+    upload = await _leased_upload(ingress, root, "Bearer " + "s" * 40, request)
+    unrelated = _candidate(root, index=91)
+    legacy_id = unrelated["candidate_id"]
+    ingress._attempts[legacy_id] = {
+        "state": "completed",
+        "admitted_at": datetime.now(timezone.utc).isoformat(),
+        "attention_active": False,
+        "photo_delivery_confirmed": False,
+    }
+    ingress._save_attempts()
+    old_epoch = upload.request["epoch"]
+    ingress._session["expires_at"] = "2000-01-01T00:00:00+00:00"
+    status, lease = await ingress.lease("Bearer " + "s" * 40)
+    assert status == 200 and lease["epoch"] != old_epoch
+    later_request = _candidate(root, index=93)
+    later_upload = await _leased_upload(
+        ingress, root, "Bearer " + "s" * 40, later_request
+    )
+    rejected = await ingress.admit(
+        "Bearer " + "s" * 40,
+        replace(later_upload, image_bytes=later_upload.image_bytes + b"x"),
+    )
+    assert rejected[0] == 422 and ingress._session["committed_seq"] == 1
+
+    before_journal = ingress._state_path.read_bytes()
+    before_attempts = copy.deepcopy(ingress._attempts)
+    before_session = copy.deepcopy(ingress._session)
+    content_type, body = _multipart(upload)
+    reader = asyncio.StreamReader()
+    reader.feed_data(
+        b"POST /internal/v1/camera/reconcile HTTP/1.1\r\n"
+        + b"Authorization: Bearer " + b"s" * 40 + b"\r\n"
+        + b"X-Camera-Reconcile-Purpose: prove_not_admitted\r\n"
+        + f"Content-Type: {content_type}\r\n".encode()
+        + f"Content-Length: {len(body)}\r\n\r\n".encode() + body
+    )
+    reader.feed_eof()
+    writer = _Writer()
+    await serve_camera_http(ingress, reader, writer)
+    status_line, response_bytes = writer.data.split(b"\r\n\r\n", 1)
+    status, response = int(status_line.split()[1]), json.loads(response_bytes)
+
+    assert status == 200 and status_line.startswith(b"HTTP/1.1 200 ")
+    assert set(response) == {"status", "proof", "request_identity", "current_lease"}
+    assert response["status"] == "not_admitted"
+    assert response["proof"] == "same_session_durable_journal_v1"
+    assert response["request_identity"] == ingress._request_identity(
+        camera_module.CameraCandidateRequest.model_validate(upload.request)
+    )
+    assert response["current_lease"] == {
+        "session_id": before_session["session_id"],
+        "epoch": before_session["epoch"],
+        "committed_seq": before_session["committed_seq"],
+        "expires_at": before_session["expires_at"],
+    }
+    assert ingress._state_path.read_bytes() == before_journal
+    assert ingress._attempts == before_attempts
+    assert ingress._session == before_session
+    assert channel.calls == [] and bus.inbound_size == 0
+    await ingress.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("journal_state", ["missing", "corrupt", "unsupported"])
+async def test_prove_not_admitted_fails_closed_without_complete_schema2_journal(
+    tmp_path: Path, journal_state: str
+) -> None:
+    ingress, root, bus, channel = _ingress(tmp_path)
+    request = _candidate(root)
+    upload = await _leased_upload(ingress, root, "Bearer " + "s" * 40, request)
+    ingress._session["expires_at"] = "2000-01-01T00:00:00+00:00"
+    assert (await ingress.lease("Bearer " + "s" * 40))[0] == 200
+    if journal_state == "missing":
+        ingress._state_path.unlink()
+    elif journal_state == "corrupt":
+        ingress._state_path.write_bytes(b"{")
+    else:
+        ingress._state_path.write_text(
+            json.dumps({"schema_version": 999, "attempts": {}, "session": ingress._session}),
+            encoding="utf-8",
+        )
+    journal_before = ingress._state_path.read_bytes() if ingress._state_path.exists() else None
+    status, response = await ingress.reconcile(
+        "Bearer " + "s" * 40, upload, purpose="prove_not_admitted"
+    )
+    assert status == 503 and response["error"]["code"] == "unknown_original_outcome"
+    assert (ingress._state_path.read_bytes() if ingress._state_path.exists() else None) == journal_before
+    assert channel.calls == [] and bus.inbound_size == 0
+    await ingress.close()
+
+
+@pytest.mark.asyncio
+async def test_prove_not_admitted_rejects_candidate_record_and_old_sequence_owner(
+    tmp_path: Path,
+) -> None:
+    ingress, root, bus, channel = _ingress(tmp_path)
+    request = _candidate(root)
+    upload = await _leased_upload(ingress, root, "Bearer " + "s" * 40, request)
+    other = _candidate(root, index=92)
+    owner_request = {
+        **other,
+        "session_id": upload.request["session_id"],
+        "epoch": upload.request["epoch"],
+        "seq": upload.request["seq"],
+    }
+    ingress._attempts[other["candidate_id"]] = {
+        "state": "admitted",
+        "admission_id": "cam1-" + "a" * 32,
+        "admitted_at": datetime.now(timezone.utc).isoformat(),
+        "attention_active": True,
+        "photo_delivery_confirmed": False,
+        "capture_time": other["capture_time"],
+        "capture_time_authority": "exif",
+        "image_sha256": other["image_sha256"],
+        "request_identity": owner_request,
+    }
+    ingress._save_attempts()
+    ingress._session["expires_at"] = "2000-01-01T00:00:00+00:00"
+    assert (await ingress.lease("Bearer " + "s" * 40))[0] == 200
+    status, response = await ingress.reconcile(
+        "Bearer " + "s" * 40, upload, purpose="prove_not_admitted"
+    )
+    assert status == 503 and response["error"]["code"] == "unknown_original_outcome"
+    assert request["candidate_id"] not in ingress._attempts
+    assert channel.calls == [] and bus.inbound_size == 0
+    await ingress.close()
+
+
+@pytest.mark.asyncio
+async def test_prove_not_admitted_rejects_tombstone_after_native_delivery_unknown(
+    tmp_path: Path,
+) -> None:
+    ingress, root, bus, channel = _ingress(tmp_path, FakeTelegram(fail=True))
+    request = _candidate(root)
+    upload = await _leased_upload(ingress, root, "Bearer " + "s" * 40, request)
+    assert (await ingress.admit("Bearer " + "s" * 40, upload))[0] == 202
+    await asyncio.gather(*list(ingress._tasks))
+    assert ingress._attempts[request["candidate_id"]]["state"] == "delivery_unknown"
+    ingress._session["expires_at"] = "2000-01-01T00:00:00+00:00"
+    assert (await ingress.lease("Bearer " + "s" * 40))[0] == 200
+    before = ingress._state_path.read_bytes()
+    status, response = await ingress.reconcile(
+        "Bearer " + "s" * 40, upload, purpose="prove_not_admitted"
+    )
+    assert status == 503 and response["error"]["code"] == "unknown_original_outcome"
+    assert ingress._state_path.read_bytes() == before
+    assert len(channel.calls) == 1
+    await ingress.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_point", ["before_replace", "after_replace"])
+async def test_prove_not_admitted_respects_failed_admission_journal_replace(
+    tmp_path: Path, failure_point: str
+) -> None:
+    ingress, root, bus, channel = _ingress(tmp_path)
+    request = _candidate(root)
+    upload = await _leased_upload(ingress, root, "Bearer " + "s" * 40, request)
+    save_attempts = ingress._save_attempts
+    if failure_point == "before_replace":
+        ingress._save_attempts = lambda: (_ for _ in ()).throw(OSError("before replace"))
+    else:
+        def save_then_fail() -> None:
+            save_attempts()
+            raise OSError("after replace")
+        ingress._save_attempts = save_then_fail
+
+    assert await ingress.admit("Bearer " + "s" * 40, upload) == (
+        503, {"error": {"code": "pre_admission_unavailable"}}
+    )
+    ingress._save_attempts = save_attempts
+    assert channel.calls == [] and bus.inbound_size == 0
+    await ingress.close()
+
+    restarted = CameraIngress(
+        ingress.config, workspace=tmp_path, bus=bus, telegram=channel
+    )
+    assert (await restarted.lease("Bearer " + "s" * 40))[0] == 200
+    status, response = await restarted.reconcile(
+        "Bearer " + "s" * 40, upload, purpose="prove_not_admitted"
+    )
+    if failure_point == "before_replace":
+        assert status == 200 and response["status"] == "not_admitted"
+    else:
+        assert status == 503 and response["error"]["code"] == "unknown_original_outcome"
+        assert request["candidate_id"] in restarted._attempts
+    assert channel.calls == [] and bus.inbound_size == 0
+    await restarted.close()
+
+
+@pytest.mark.asyncio
+async def test_prove_not_admitted_rejects_same_epoch_and_modified_artifacts(
+    tmp_path: Path,
+) -> None:
+    ingress, root, bus, channel = _ingress(tmp_path)
+    request = _candidate(root)
+    upload = await _leased_upload(ingress, root, "Bearer " + "s" * 40, request)
+    before = ingress._state_path.read_bytes()
+    assert await ingress.reconcile(
+        "Bearer " + "s" * 40, upload, purpose="prove_not_admitted"
+    ) == (503, {"error": {"code": "unknown_original_outcome"}})
+    assert await ingress.reconcile(
+        "Bearer " + "s" * 40,
+        replace(upload, image_bytes=upload.image_bytes + b"x"),
+        purpose="prove_not_admitted",
+    ) == (422, {"error": {"code": "candidate_evidence_mismatch"}})
+    assert await ingress.reconcile(
+        "Bearer " + "s" * 40,
+        replace(upload, request={**upload.request, "seq": True}),
+        purpose="prove_not_admitted",
+    ) == (400, {"error": {"code": "invalid_request"}})
+    assert ingress._state_path.read_bytes() == before
+    wrong_session = replace(
+        upload,
+        request={**upload.request, "session_id": "f" * 32},
+    )
+    assert await ingress.reconcile(
+        "Bearer " + "s" * 40, wrong_session, purpose="prove_not_admitted"
+    ) == (503, {"error": {"code": "unknown_original_outcome"}})
+    assert ingress._state_path.read_bytes() == before
+    assert channel.calls == [] and bus.inbound_size == 0
+    await ingress.close()
+
+
+@pytest.mark.asyncio
+async def test_prove_not_admitted_does_not_refresh_expired_current_lease(
+    tmp_path: Path,
+) -> None:
+    ingress, root, bus, channel = _ingress(tmp_path)
+    request = _candidate(root)
+    upload = await _leased_upload(ingress, root, "Bearer " + "s" * 40, request)
+    ingress._session["expires_at"] = "2000-01-01T00:00:00+00:00"
+    assert (await ingress.lease("Bearer " + "s" * 40))[0] == 200
+    ingress._session["expires_at"] = "2000-01-01T00:00:00+00:00"
+    before = ingress._state_path.read_bytes()
+    current_session = copy.deepcopy(ingress._session)
+    status, response = await ingress.reconcile(
+        "Bearer " + "s" * 40, upload, purpose="prove_not_admitted"
+    )
+    assert status == 503 and response["error"]["code"] == "unknown_original_outcome"
+    assert ingress._state_path.read_bytes() == before
+    assert ingress._session == current_session
+    assert channel.calls == [] and bus.inbound_size == 0
+    await ingress.close()
+
+
+@pytest.mark.asyncio
+async def test_prove_not_admitted_fails_closed_for_unbound_current_session_ack(
+    tmp_path: Path,
+) -> None:
+    ingress, root, bus, channel = _ingress(tmp_path)
+    request = _candidate(root)
+    upload = await _leased_upload(ingress, root, "Bearer " + "s" * 40, request)
+    ingress._session["expires_at"] = "2000-01-01T00:00:00+00:00"
+    assert (await ingress.lease("Bearer " + "s" * 40))[0] == 200
+    later_upload = await _leased_upload(
+        ingress, root, "Bearer " + "s" * 40, _candidate(root, index=94)
+    )
+    rejected = await ingress.admit(
+        "Bearer " + "s" * 40,
+        replace(later_upload, image_bytes=later_upload.image_bytes + b"x"),
+    )
+    assert rejected[0] == 422 and ingress._session["committed_seq"] == 1
+    ingress._session["last_ack"].pop("request_identity")
+    payload = json.loads(ingress._state_path.read_bytes())
+    payload["session"]["last_ack"].pop("request_identity")
+    ingress._state_path.write_text(json.dumps(payload), encoding="utf-8")
+    before = ingress._state_path.read_bytes()
+    status, response = await ingress.reconcile(
+        "Bearer " + "s" * 40, upload, purpose="prove_not_admitted"
+    )
+    assert status == 503 and response["error"]["code"] == "unknown_original_outcome"
+    assert ingress._state_path.read_bytes() == before
+    assert channel.calls == [] and bus.inbound_size == 0
     await ingress.close()
 
 
