@@ -24,6 +24,7 @@ from openharness.tools.mcp_tool import (
 )
 from openharness.tools.read_mcp_resource_tool import ReadMcpResourceTool
 from openharness.untrusted import UNTRUSTED_BANNER
+from openharness.skills.bundled import get_bundled_skills
 
 
 class _FakeMcpManager:
@@ -483,7 +484,81 @@ class TestWellnessLoginInjectingAdapter:
         )
 
         assert result.is_error is False
-        assert json.loads(result.output.split("\n\n", 1)[1]) == json.loads(_energy_fixture())
+        returned = json.loads(result.output.split("\n\n", 1)[1])
+        assert returned == json.loads(_energy_fixture())
+        assert "energy_intervals" not in returned
+        skill = next(skill for skill in get_bundled_skills() if skill.name == "calory")
+        assert "never substitute, add, prorate, or extrapolate `energy_days`" in skill.content
+
+    async def test_current_window_call_preserves_exact_bounds_and_interval_result(self):
+        payload = Path(__file__).parents[1].joinpath(
+            "fixtures", "wellness_energy_intervals.json"
+        ).read_text(encoding="utf-8")
+        manager = _RecordingMcpManager(tool_output=payload)
+        adapter = WellnessLoginInjectingAdapter(_wellness_ref_delegate(manager))
+        adapter.set_trusted_principal("990000001", trusted_login="synthetic_owner", owner_turn=True)
+        skill = next(skill for skill in get_bundled_skills() if skill.name == "calory")
+        assert "use the exact rolling 24 hours ending at trusted `get_time` now" in skill.content
+
+        start = "2026-10-01T05:00:00+00:00"
+        end = "2026-10-02T05:00:00+00:00"
+        result = await adapter.execute(
+            adapter.input_model(params={"start": start, "end": end}),
+            ToolExecutionContext(cwd=Path(".")),
+        )
+
+        assert result.is_error is False
+        assert manager.calls == [
+            ("worfalomey", "get_wellness_data", {
+                "params": {"login": "synthetic_owner", "start": start, "end": end}
+            })
+        ]
+        returned = json.loads(result.output.split("\n\n", 1)[1])
+        assert returned["linked_device_ids"] == ["watch-1"]
+        assert returned["interval"] == {"start": start, "end": end}
+        assert returned["energy_snapshot_revision"] == 8
+        assert returned["nutrition_unassigned_records"] == []
+        interval = returned["energy_intervals"][0]
+        day = returned["energy_days"][0]
+        assert set(interval) == {
+            "device_id", "start", "end", "timezone", "basal_sum", "basal_unit",
+            "basal_points", "basal_minutes_with_samples", "active_sum", "active_unit",
+            "active_points", "basal_conflicting_timestamps", "active_conflicting_timestamps",
+            "snapshot_revision", "unresolved_key_count", "possible_replay_count",
+            "legacy_synthetic_count",
+        }
+        assert interval["start"] == start and interval["end"] == end
+        assert interval["timezone"] == "Europe/Moscow"
+        assert interval["device_id"] == day["device_id"]
+        assert interval["snapshot_revision"] == day["snapshot_revision"]
+        assert interval["snapshot_revision"] == returned["energy_snapshot_revision"]
+        assert interval["basal_sum"] != day["basal_sum"]
+        assert interval["basal_minutes_with_samples"] < 24 * 60
+        assert interval["possible_replay_count"] == 1
+        assert interval["basal_sum"] / 4.184 == pytest.approx(1900.0956022944565)
+        assert interval["active_sum"] / 4.184 == pytest.approx(90.0)
+
+    async def test_yesterday_call_preserves_local_calendar_bounds(self):
+        manager = _RecordingMcpManager(tool_output=_energy_fixture())
+        adapter = WellnessLoginInjectingAdapter(_wellness_ref_delegate(manager))
+        adapter.set_trusted_principal("990000001", trusted_login="synthetic_owner", owner_turn=True)
+        skill = next(skill for skill in get_bundled_skills() if skill.name == "calory")
+        assert "Explicit historical dates and calendar-day requests keep the existing local-day policy" in skill.content
+
+        start = "2026-10-01T00:00:00+03:00"
+        end = "2026-10-02T00:00:00+03:00"
+        result = await adapter.execute(
+            adapter.input_model(params={"start": start, "end": end}),
+            ToolExecutionContext(cwd=Path(".")),
+        )
+
+        assert result.is_error is False
+        assert manager.calls[0][2] == {
+            "params": {"login": "synthetic_owner", "start": start, "end": end}
+        }
+        returned = json.loads(result.output.split("\n\n", 1)[1])
+        assert returned["energy_days"]
+        assert "energy_intervals" not in returned
 
     async def test_current_schema_omitted_login_has_no_stale_extra(self):
         manager = _RecordingMcpManager()
