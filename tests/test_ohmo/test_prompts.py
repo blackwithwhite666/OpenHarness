@@ -361,6 +361,24 @@ def test_ohmo_policy_text_keeps_rolling_intake_membership_when_energy_gate_fails
         assert rule in prompt
 
 
+def test_ohmo_policy_text_defines_rolling_balance_as_intake_minus_expenditure() -> None:
+    """Guard the stated sign convention and example; this does not execute an LLM."""
+    skill = next(skill for skill in get_bundled_skills() if skill.name == "calory")
+    prompt = skill.content
+
+    for rule in (
+        "Define every eligible rolling observed balance as intake in kcal minus observed expenditure in kcal",
+        "calculate `[minimum_intake_kcal - E_kcal, maximum_intake_kcal - E_kcal]`",
+        "present endpoints from low to high",
+        "Never reverse the subtraction or define balance as expenditure minus intake",
+        "(7,950 kJ + 376.56 kJ) / 4.184 = 1,990.0956 kcal",
+        "possible intake `[0, 250] kcal` gives `[-1,990.0956, -1,740.0956] kcal`",
+        "displayed about `−1,990…−1,740 kcal` as provisional observed data",
+        "not a settled physiological deficit, surplus, or target",
+    ):
+        assert rule in prompt
+
+
 def test_ohmo_policy_text_retains_historical_past_local_day_guard() -> None:
     skill = next(skill for skill in get_bundled_skills() if skill.name == "calory")
     assert (
