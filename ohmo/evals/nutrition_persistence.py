@@ -163,6 +163,7 @@ def _event_from_raw(message: dict[str, Any]) -> dict[str, Any] | None:
         return {"invalid": True}
     return {
         "event_id": message["id"],
+        "metadata": metadata,
         "owner_id": metadata["tenant_id"],
         "session_id": message["session_id"],
         "workspace_id": message["workspace_id"],
@@ -230,40 +231,117 @@ def _grade_one(goal: Goal, honcho: dict[str, Any], telegent: dict[str, Any], *, 
     except (ValueError, TypeError):
         return {**base, "a1": "INCONCLUSIVE", "stage": "HONCHO_BOUNDS_MISMATCH", "reason": "Honcho query bounds do not cover the reviewed calendar day"}
 
+    reviewed_sources = {source for episode in goal.episode_ids
+                        for source in (reviewed_turn_sources or {}).get(episode, [])}
+    reviewed_turn_bindings = [(episode, turn) for episode in goal.episode_ids
+                              for turn in (reviewed_turn_provenance or {}).get(episode, [])]
+    reviewed_turns = [turn for _, turn in reviewed_turn_bindings]
+    reviewed_logical_turns = {turn.get("logical_turn_id") for turn in reviewed_turns}
+    reviewed_operations = {turn.get("operation_id") for turn in reviewed_turns}
     for event in events:
         metadata = event.get("metadata", {})
         event_tenant = metadata.get("tenant_id") if event.get("unannotated") else event.get("owner_id")
         if (event["session_id"] != goal.session_id or event["workspace_id"] != goal.workspace_id
                 or event["peer_id"] != goal.peer_id or not lower <= event["created_at"] <= upper
-                or event_tenant != goal.owner_id
-                or metadata.get("gateway_session_id") not in (None, goal.gateway_session_id)):
+                or event_tenant != goal.owner_id):
             return {**base, "a1": "INCONCLUSIVE", "stage": "HONCHO_SCOPE_MISMATCH",
                     "reason": "persisted message escaped queried owner, session, peer, workspace, or time scope"}
-        if (not event.get("unannotated") and event.get("principal_id") != goal.principal_id):
+
+        # The Honcho read is scoped to the shared owner/workspace/session/peer and
+        # can contain legitimate traffic from rotated gateway sessions. Only rows
+        # with a possible identity edge to this goal need goal-level binding.
+        source_id = metadata.get("source_message_id")
+        reply_id = metadata.get("reply_to_source_message_id")
+        trace_episode = (metadata.get("decision_trace_episode_id")
+                         if event.get("unannotated") else event.get("trace_episode_id"))
+        raw_trace = _dict(metadata.get("decision_trace"))
+        nested_trace_episode = raw_trace.get("episode_id") if raw_trace else None
+        if not event.get("unannotated"):
+            nested_trace_episode = event.get("nested_trace_episode_id")
+        logical_turn = metadata.get("logical_turn_id")
+        operation = metadata.get("client_op_id")
+        stable_meal_ids = (metadata.get("canonical_meal_id"), metadata.get("meal_id"))
+        relevant = (source_id == goal.source_message_id or reply_id == goal.source_message_id
+                    or trace_episode in goal.episode_ids
+                    or nested_trace_episode in goal.episode_ids
+                    or logical_turn == goal.logical_turn_id or operation == goal.operation_id
+                    or (isinstance(source_id, str) and source_id in reviewed_sources)
+                    or (isinstance(logical_turn, str) and logical_turn in reviewed_logical_turns)
+                    or (isinstance(operation, str) and operation in reviewed_operations)
+                    or goal.canonical_meal_id in stable_meal_ids)
+
+        is_unresolved_edit = (not event.get("unannotated")
+                              and event["annotation"]["record_type"] in {"meal_correction", "meal_deletion"}
+                              and not reply_id)
+        if is_unresolved_edit and (relevant or event.get("attachment_fingerprints")):
+            return {**base, "a1": "INCONCLUSIVE", "stage": "HONCHO_TARGET_UNAVAILABLE",
+                    "reason": "correction or deletion target is unresolved in bounded history"}
+        if not relevant:
+            continue
+        if (metadata.get("gateway_session_id") not in (None, goal.gateway_session_id)):
             return {**base, "a1": "INCONCLUSIVE", "stage": "HONCHO_SCOPE_MISMATCH",
-                    "reason": "annotated nutrition event has a different source principal"}
+                    "reason": "goal-relevant persisted message has a different gateway session"}
+        relevant_principal = (metadata.get("source_principal") if event.get("unannotated")
+                              else event.get("principal_id"))
+        if relevant_principal != goal.principal_id:
+            return {**base, "a1": "INCONCLUSIVE", "stage": "HONCHO_SCOPE_MISMATCH",
+                    "reason": "goal-relevant persisted message has a different source principal"}
+        if (goal.canonical_meal_id in stable_meal_ids
+                and source_id != goal.source_message_id and reply_id != goal.source_message_id):
+            return {**base, "a1": "INCONCLUSIVE", "stage": "HONCHO_SOURCE_MISMATCH",
+                    "reason": "reviewed stable meal identity is attached to a different source"}
+        reviewed_turn_edge = (
+            (isinstance(source_id, str) and source_id in reviewed_sources)
+            or (isinstance(logical_turn, str) and logical_turn in reviewed_logical_turns)
+            or (isinstance(operation, str) and operation in reviewed_operations))
+        export_identity_matches = False
+        if reviewed_turn_edge:
+            linked_turns = [(episode, turn) for episode, turn in reviewed_turn_bindings
+                            if (turn.get("source_message_id") == source_id
+                                or turn.get("logical_turn_id") == logical_turn
+                                or turn.get("operation_id") == operation)]
+            exact_turns = [(episode, turn) for episode, turn in linked_turns
+                           if (episode == trace_episode
+                               and turn.get("source_message_id") == source_id
+                               and turn.get("logical_turn_id") == logical_turn
+                               and turn.get("operation_id") == operation
+                               and turn.get("principal_id") == relevant_principal)]
+            export_identity_matches = len(linked_turns) == 1 and len(exact_turns) == 1
+            if not export_identity_matches:
+                return {**base, "a1": "INCONCLUSIVE", "stage": "HONCHO_TURN_BINDING_MISMATCH",
+                        "reason": "persisted source, episode, logical turn, or operation conflicts with reviewed export"}
+        if nested_trace_episode is not None and nested_trace_episode != trace_episode:
+            return {**base, "a1": "INCONCLUSIVE", "stage": "HONCHO_TURN_BINDING_MISMATCH",
+                    "reason": "goal-relevant message has conflicting outer and nested trace episodes"}
+        if (logical_turn == goal.logical_turn_id and source_id != goal.source_message_id):
+            return {**base, "a1": "INCONCLUSIVE", "stage": "HONCHO_SOURCE_MISMATCH",
+                    "reason": "reviewed logical turn is attached to a different source message"}
+        if (operation == goal.operation_id
+                and (logical_turn != goal.logical_turn_id or source_id != goal.source_message_id)):
+            return {**base, "a1": "INCONCLUSIVE", "stage": "HONCHO_SOURCE_MISMATCH",
+                    "reason": "reviewed operation is attached to a different source turn"}
+        if ((trace_episode in goal.episode_ids or nested_trace_episode in goal.episode_ids)
+                and source_id != goal.source_message_id and reply_id != goal.source_message_id
+                and not (event.get("unannotated") and export_identity_matches)):
+            return {**base, "a1": "INCONCLUSIVE", "stage": "HONCHO_TURN_BINDING_MISMATCH",
+                    "reason": "reviewed trace episode is attached to a different source meal"}
         if event.get("unannotated"):
-            source_id = metadata.get("source_message_id")
-            reply_id = metadata.get("reply_to_source_message_id")
-            if source_id == goal.source_message_id or reply_id == goal.source_message_id:
-                trace_episode = metadata.get("decision_trace_episode_id")
-                logical_turn = metadata.get("logical_turn_id")
-                operation = metadata.get("client_op_id")
-                principal = metadata.get("source_principal")
-                exported_turn = next((turn for turn in
-                    (reviewed_turn_provenance or {}).get(trace_episode, [])
-                    if turn.get("source_message_id") == source_id), None)
-                if (not isinstance(source_id, str) or not source_id or trace_episode not in goal.episode_ids
-                        or not isinstance(logical_turn, str) or operation != f"{logical_turn}:assistant"
-                        or principal != goal.principal_id or exported_turn is None
-                        or exported_turn.get("logical_turn_id") != logical_turn
-                        or exported_turn.get("operation_id") != operation
-                        or exported_turn.get("principal_id") != principal
-                        or (source_id == goal.source_message_id and
-                            (trace_episode != goal.trace_episode_id or logical_turn != goal.logical_turn_id
-                             or operation != goal.operation_id))):
-                    return {**base, "a1": "INCONCLUSIVE", "stage": "HONCHO_TURN_BINDING_MISSING",
-                            "reason": "unannotated source relevant to goal has incomplete or mismatched turn identity"}
+            principal = metadata.get("source_principal")
+            exported_turn = next((turn for turn in
+                (reviewed_turn_provenance or {}).get(trace_episode, [])
+                if turn.get("source_message_id") == source_id), None)
+            if (not isinstance(source_id, str) or not source_id or trace_episode not in goal.episode_ids
+                    or source_id not in (reviewed_turn_sources or {}).get(trace_episode, [])
+                    or not isinstance(logical_turn, str) or operation != f"{logical_turn}:assistant"
+                    or principal != goal.principal_id or exported_turn is None
+                    or exported_turn.get("logical_turn_id") != logical_turn
+                    or exported_turn.get("operation_id") != operation
+                    or exported_turn.get("principal_id") != principal
+                    or (source_id == goal.source_message_id and
+                        (trace_episode != goal.trace_episode_id or logical_turn != goal.logical_turn_id
+                         or operation != goal.operation_id))):
+                return {**base, "a1": "INCONCLUSIVE", "stage": "HONCHO_TURN_BINDING_MISSING",
+                        "reason": "goal-linked unannotated turn lacks exact reviewed source and operation binding"}
 
     selected = []
     for event in events:
@@ -271,10 +349,6 @@ def _grade_one(goal: Goal, honcho: dict[str, Any], telegent: dict[str, Any], *, 
             continue
         record_type = event["annotation"]["record_type"]
         if record_type in {"meal_correction", "meal_deletion"} and not event["reply_to_source_message_id"]:
-            fingerprints = event.get("attachment_fingerprints")
-            if event["trace_episode_id"] in goal.episode_ids or fingerprints:
-                return {**base, "a1": "INCONCLUSIVE", "stage": "HONCHO_TARGET_UNAVAILABLE",
-                        "reason": "correction or deletion target is unresolved in bounded history"}
             continue
         if event["root_source_message_id"] != goal.source_message_id:
             continue
