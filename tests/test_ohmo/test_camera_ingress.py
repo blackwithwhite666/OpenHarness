@@ -912,15 +912,30 @@ async def test_exact_delivered_image_returns_durable_explicit_duplicate(tmp_path
 
 
 @pytest.mark.asyncio
-async def test_human_attachment_metadata_duplicate_is_owner_bound(tmp_path: Path) -> None:
+@pytest.mark.parametrize("current_camera_reply", [False, True])
+async def test_human_attachment_metadata_duplicate_is_owner_bound(
+    tmp_path: Path, current_camera_reply: bool,
+) -> None:
+    candidate_id = "dropbox-camera-v1-" + "d" * 64
+
     async def history(*, since, until):
         from types import SimpleNamespace
+        metadata = {
+            "role": "user", "source_principal": "telegram:123",
+            "is_forwarded": False, "is_group": False,
+            "attachment_fingerprints": [{"sha256": image_hash}],
+        }
+        if current_camera_reply:
+            metadata.update(
+                ingest_source="dropbox_camera", confirmation_required=True,
+                camera_candidate_id=candidate_id, camera_operation_id=candidate_id,
+                logical_turn_id="current-camera-turn",
+                client_op_id="current-camera-turn:user",
+            )
         return [SimpleNamespace(
             id="owner-message-1", created_at=since,
             session_id="private-session", peer_id="owner-peer",
-            metadata={"role": "user", "source_principal": "telegram:123",
-                      "is_forwarded": False, "is_group": False,
-                      "attachment_fingerprints": [{"sha256": image_hash}]},
+            metadata=metadata,
         )]
 
     ingress, root, bus, channel = _ingress(tmp_path)
@@ -1253,6 +1268,166 @@ def test_history_match_is_not_returned_before_tail_validation() -> None:
     )
     with pytest.raises(ValueError, match="fingerprint is malformed"):
         _find_recent_attachment_duplicate([match, malformed_tail], **kwargs)
+
+
+def test_only_exact_legacy_nutrition_estimation_is_excluded() -> None:
+    now = datetime.now(timezone.utc)
+    candidate_id = "dropbox-camera-v1-" + "b" * 64
+    old_camera = SimpleNamespace(
+        id="old-camera-user", peer_id="peer", session_id="session", created_at=now,
+        metadata={
+            "role": "user", "source_principal": "telegram:123",
+            "ingest_source": "dropbox_camera", "confirmation_required": True,
+            "_nutrition_trusted": True, "nutrition_phase": "estimation",
+            "tenant_id": "marina", "candidate_id": candidate_id,
+            "logical_turn_id": "old-camera-turn",
+            "client_op_id": f"{candidate_id}:meal-user:v1", "is_forwarded": False,
+            "nutrition_consumed": False, "nutrition_explicit_new_consumption": False,
+            "nutrition_capture_time": now.isoformat(), "nutrition_capture_source": "exif",
+            "nutrition_manifest_version": 2,
+            "attachment_fingerprints": [{"sha256": "a" * 64}],
+        },
+    )
+    kwargs = dict(
+        candidate={"sha256": "a" * 64}, since=now - timedelta(days=7), until=now,
+        principal="telegram:123", expected_session="session", expected_peer="peer",
+        session_key="telegram:123", chat_id="123", expected_tenant="marina",
+    )
+    assert _find_recent_attachment_duplicate([old_camera], **kwargs) is None
+
+    # Malformed legacy fingerprint data is still audited before the exclusion.
+    bad_hash = SimpleNamespace(
+        id="old-camera-bad-hash", peer_id="peer", session_id="session", created_at=now,
+        metadata={**old_camera.metadata, "attachment_fingerprints": [{
+            "sha256": "a" * 64, "phash": "a" * 16,
+            "phash_algorithm": camera_module.PHASH_ALGORITHM,
+        }]},
+    )
+    with pytest.raises(ValueError, match="pHash version is malformed"):
+        _find_recent_attachment_duplicate([bad_hash], **kwargs)
+
+    # Change one discriminator at a time while preserving the historical
+    # missing-group shape. Non-legacy metadata must fail closed on that gap.
+    for key, value in (
+        ("_nutrition_trusted", False),
+        ("nutrition_phase", "consumed"),
+        ("confirmation_required", False),
+        ("client_op_id", f"{candidate_id}:meal-observation:v1"),
+        ("candidate_id", "forged-camera-id"),
+        ("tenant_id", "other-tenant"),
+        ("logical_turn_id", ""),
+        ("ingest_source", "telegram"),
+        ("source_image_attachment_count", 1),
+        ("camera_candidate_id", candidate_id),
+    ):
+        malformed_legacy = SimpleNamespace(
+            id="incomplete-legacy-tag", peer_id="peer", session_id="session",
+            created_at=now,
+            metadata={**old_camera.metadata, key: value},
+        )
+        with pytest.raises(ValueError, match="missing private-source provenance"):
+            _find_recent_attachment_duplicate([malformed_legacy], **kwargs)
+
+    for key in ("ingest_source", "logical_turn_id", "client_op_id", "_nutrition_trusted"):
+        missing_legacy_field = SimpleNamespace(
+            id="missing-legacy-field", peer_id="peer", session_id="session",
+            created_at=now,
+            metadata={key_: value_ for key_, value_ in old_camera.metadata.items() if key_ != key},
+        )
+        with pytest.raises(ValueError, match="missing private-source provenance"):
+            _find_recent_attachment_duplicate([missing_legacy_field], **kwargs)
+
+    # Explicit forwarding/group metadata follows the existing exclusion policy;
+    # neither case is accepted as legacy provenance.
+    forwarded_legacy = SimpleNamespace(
+        id="forwarded-photo", peer_id="peer", session_id="session", created_at=now,
+        metadata={**old_camera.metadata, "is_forwarded": True},
+    )
+    group_legacy = SimpleNamespace(
+        id="group-photo", peer_id="peer", session_id="session", created_at=now,
+        metadata={**old_camera.metadata, "is_group": True},
+    )
+    assert _find_recent_attachment_duplicate([forwarded_legacy], **kwargs) is None
+    assert _find_recent_attachment_duplicate([group_legacy], **kwargs) is None
+
+    current_writer_shape = SimpleNamespace(
+        id="current-camera-user", peer_id="peer", session_id="session", created_at=now,
+        metadata={
+            "role": "user", "source_principal": "telegram:123",
+            "ingest_source": "dropbox_camera", "confirmation_required": True,
+            "camera_candidate_id": candidate_id,
+            "logical_turn_id": "old-camera-turn", "client_op_id": "old-camera-turn:user",
+            "is_forwarded": False, "is_group": False,
+            "source_image_attachment_count": 1,
+            "attachment_fingerprints": [{"sha256": "a" * 64}],
+        },
+    )
+    assert _find_recent_attachment_duplicate([current_writer_shape], **kwargs) == "current-camera-user"
+
+    human = SimpleNamespace(
+        id="human-photo", peer_id="peer", session_id="session", created_at=now,
+        metadata={"role": "user", "source_principal": "telegram:123",
+                  "attachment_fingerprints": [{"sha256": "a" * 64}]},
+    )
+    with pytest.raises(ValueError, match="missing private-source provenance"):
+        _find_recent_attachment_duplicate([human], **kwargs)
+
+    malformed_tail = SimpleNamespace(metadata=None)
+    with pytest.raises(ValueError, match="attachment history item is invalid"):
+        _find_recent_attachment_duplicate([old_camera, malformed_tail], **kwargs)
+
+
+@pytest.mark.asyncio
+async def test_legacy_nutrition_estimation_history_allows_admission_then_repeat_is_suppressed(
+    tmp_path: Path,
+) -> None:
+    ingress, root, bus, channel = _ingress(tmp_path)
+    request = _candidate(root)
+    upload = await _leased_upload(ingress, root, "Bearer " + "s" * 40, request)
+    received = datetime.fromisoformat(request["capture_time"]).astimezone(timezone.utc)
+    old_camera = SimpleNamespace(
+        id="old-camera-user", peer_id="owner-peer", session_id="honcho-session",
+        created_at=received,
+        metadata={
+            "role": "user", "source_principal": "telegram:123",
+            "ingest_source": "dropbox_camera", "confirmation_required": True,
+            "_nutrition_trusted": True, "nutrition_phase": "estimation",
+            "tenant_id": "marina", "candidate_id": "dropbox-camera-v1-" + "c" * 64,
+            "logical_turn_id": "old-camera-turn",
+            "client_op_id": "dropbox-camera-v1-" + "c" * 64 + ":meal-user:v1",
+            "is_forwarded": False, "nutrition_consumed": False,
+            "nutrition_explicit_new_consumption": False,
+            "nutrition_capture_time": request["capture_time"],
+            "nutrition_capture_source": "exif", "nutrition_manifest_version": 2,
+            "attachment_fingerprints": [{
+                "sha256": request["image_sha256"], "phash": "a" * 64,
+                "phash_algorithm": camera_module.PHASH_ALGORITHM,
+            }],
+        },
+    )
+
+    async def history(*, since, until):
+        return [old_camera]
+
+    ingress._recent_attachments = history
+    ingress._recent_session = "honcho-session"
+    ingress._recent_peer = "owner-peer"
+    status, body = await ingress.admit("Bearer " + "s" * 40, upload)
+    assert status == 202 and body["status"] == "admitted"
+    event = await asyncio.wait_for(bus.consume_inbound(), timeout=1)
+    assert event.sender_id == "__camera__"
+    assert len(channel.calls) == 1
+    assert bus.inbound_size == 0
+    assert ingress._attempts[request["candidate_id"]]["state"] == "photo_sent"
+
+    repeated_status, repeated = await ingress.admit("Bearer " + "s" * 40, upload)
+    assert repeated_status == 202 and repeated["status"] == "admitted"
+    assert repeated["admission_id"] == body["admission_id"]
+    assert repeated["ack_seq"] == body["ack_seq"] == 1
+    assert ingress._session["committed_seq"] == 1
+    assert len(channel.calls) == 1
+    assert bus.inbound_size == 0
+    await ingress.close()
 
 
 @pytest.mark.asyncio
