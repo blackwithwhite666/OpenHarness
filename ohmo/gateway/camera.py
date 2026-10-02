@@ -459,6 +459,7 @@ def _find_recent_attachment_duplicate(
     expected_peer: str | None,
     session_key: str,
     chat_id: str,
+    expected_tenant: str | None = None,
     local_snapshot: bool = False,
 ) -> str | None:
     """Validate one complete bounded owner history and return its stable target."""
@@ -526,6 +527,31 @@ def _find_recent_attachment_duplicate(
         if image_count is not None and image_count > len(fingerprints):
             history_incomplete = True
         if fingerprints == []:
+            continue
+        legacy_candidate = metadata.get("candidate_id")
+        legacy_turn = metadata.get("logical_turn_id")
+        if (
+            metadata.get("ingest_source") == "dropbox_camera"
+            and metadata.get("confirmation_required") is True
+            and metadata.get("_nutrition_trusted") is True
+            and metadata.get("nutrition_phase") == "estimation"
+            and isinstance(legacy_candidate, str)
+            and re.fullmatch(r"dropbox-camera-v1-[0-9a-f]{64}", legacy_candidate)
+            and isinstance(legacy_turn, str)
+            and bool(legacy_turn)
+            and metadata.get("client_op_id") == f"{legacy_candidate}:meal-user:v1"
+            and expected_tenant is not None
+            and metadata.get("tenant_id") == expected_tenant
+            and metadata.get("is_forwarded") is False
+            and "is_group" not in metadata
+            and "source_image_attachment_count" not in metadata
+            and "camera_candidate_id" not in metadata
+        ):
+            # This exact pre-migration estimation tuple was emitted only by
+            # the coordinator-authorized synthetic nutrition writer. It is not
+            # evidence that a native Camera delivery occurred. Validate all
+            # descriptors before excluding it from human-photo matching.
+            _fingerprints_match(fingerprints, candidate)
             continue
         if metadata.get("is_forwarded") is True or metadata.get("is_group") is True:
             continue
@@ -2526,6 +2552,7 @@ class CameraIngress:
                         expected_peer=self._recent_peer,
                         session_key=self.config.session_key,
                         chat_id=self.config.chat_id,
+                        expected_tenant=self.config.tenant_id,
                     )
                     if duplicate_of is not None:
                         reason = "human_photo_already_seen"
