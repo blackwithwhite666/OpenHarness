@@ -20,7 +20,10 @@ and `persistence_evidence`: a reviewed nutrition goal, raw bounded Honcho
 snapshot, Telegent canonical snapshot, and read-only eval dialogue export. A1
 revalidates owner, source, principal, workspace, session, operation, trace,
 calendar day, stable meal ID, effective state, and kcal against the frozen Sol
-reference, with a hard 10% maximum tolerance. Legacy `CommitEvent` booleans and
+reference, with the reviewed goal's inclusive tolerance (default and maximum
+30%). This is a reference-relative grading criterion, not a claim of physical
+truth. Explicit tighter tolerances remain valid for older reviewed manifests.
+Legacy `CommitEvent` booleans and
 ledger flags remain historical fields only and cannot produce PASS. Missing raw
 evidence is `INCONCLUSIVE`; complete scoped absence fails a positive goal.
 

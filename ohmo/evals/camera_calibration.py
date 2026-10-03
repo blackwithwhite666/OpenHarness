@@ -327,7 +327,7 @@ def _score_a1_details(case: Case, reference: Reference) -> dict[str, Any]:
         actual_kcal = result.get("actual_kcal")
         if not isinstance(actual_kcal, (int, float)) or isinstance(actual_kcal, bool):
             return {"a1": "INCONCLUSIVE", "reason": "persisted numeric meal value is unavailable", **details}
-        if abs(actual_kcal - reference.kcal) > reference.kcal * 0.10 + 1e-9:
+        if abs(actual_kcal - reference.kcal) > reference.kcal * goal.tolerance_fraction + 1e-9:
             return {"a1": "FAIL", "reason": "persisted kcal exceeds frozen Sol reference tolerance", **details}
     return {"a1": "PASS", "reason": "persisted same-event meal matches reviewed goal and frozen reference", **details}
 

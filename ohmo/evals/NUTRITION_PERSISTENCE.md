@@ -16,9 +16,12 @@ source message. It also carries the meal's calendar timezone and reviewed
 conversation start/as-of bounds. The tenant alias and channel sender principal
 are distinct identities.
 
-Consumed goals require a finite expected kcal value. The tolerance is immutable
-at no more than 10%. Negative goals omit kcal. Every expectation includes its
-origin (`explicit_fixture`, `reviewed_user_dialogue`, or
+Consumed goals require a finite expected kcal value. The default tolerance is
+30%, and a goal may select any finite strict fraction from 0 through 0.30,
+inclusive. This is a criterion relative to the reviewed expected kcal value;
+it does not establish physical truth. Explicit tighter values, including 0.1
+from older reviewed manifests, remain valid. Negative goals omit kcal. Every
+expectation includes its origin (`explicit_fixture`, `reviewed_user_dialogue`, or
 `frozen_photo_reference`), source identity, and optional uncertainty notes.
 Goals are selected from reviewed dialogue independently of whether an assistant
 nutrition annotation exists.
@@ -49,7 +52,7 @@ nutrition annotation exists.
     "trajectory_as_of": "2026-10-01T12:00:00+03:00",
     "expected_consumed": true,
     "expected_kcal": 25,
-    "tolerance_fraction": 0.1,
+    "tolerance_fraction": 0.3,
     "expectation_origin": "reviewed_user_dialogue",
     "expectation_source": "review:tea-case-1",
     "review_notes": "User confirms milk, then says no sugar and asks to add the drink."

@@ -792,12 +792,47 @@ async def test_judge_reference_is_blind_to_candidate_answer_and_luna_sees_dialog
 def test_positive_inclusive_boundary_and_over(tmp_path):
     case = make_case(tmp_path)
     assert score_a1(case, reference())[0] == "PASS"
+    set_persisted_kcal(case, 520)
+    assert score_a1(case, reference())[0] == "PASS"
+    set_persisted_kcal(case, 520.1)
+    assert score_a1(case, reference())[0] == "FAIL"
+    set_persisted_kcal(case, 280)
+    assert score_a1(case, reference())[0] == "PASS"
+    set_persisted_kcal(case, 279.9)
+    assert score_a1(case, reference())[0] == "FAIL"
+
+
+def test_explicit_tighter_goal_tolerance_remains_inclusive(tmp_path):
+    case = make_case(tmp_path)
+    case.persistence_evidence["goal"]["tolerance_fraction"] = 0.10
+    set_persisted_kcal(case, 440)
+    assert score_a1(case, reference())[0] == "PASS"
     set_persisted_kcal(case, 440.1)
     assert score_a1(case, reference())[0] == "FAIL"
     set_persisted_kcal(case, 360)
     assert score_a1(case, reference())[0] == "PASS"
     set_persisted_kcal(case, 359.9)
     assert score_a1(case, reference())[0] == "FAIL"
+
+
+@pytest.mark.parametrize(("actual", "expected"), [
+    (150, "PASS"), (105, "PASS"), (156, "PASS"), (156.1, "FAIL"),
+])
+def test_reference_relative_thirty_percent_accepts_estimates_without_changing_gold(
+    tmp_path, actual, expected,
+):
+    case = make_case(tmp_path)
+    case.persistence_evidence["goal"]["expected_kcal"] = 120
+    set_persisted_kcal(case, actual)
+    assert score_a1(case, reference(kcal=120))[0] == expected
+
+
+@pytest.mark.parametrize("actual", [150, 105])
+def test_reference_relative_estimates_fail_with_explicit_ten_percent_goal(tmp_path, actual):
+    case = make_case(tmp_path)
+    case.persistence_evidence["goal"].update(expected_kcal=actual, tolerance_fraction=0.10)
+    set_persisted_kcal(case, actual)
+    assert score_a1(case, reference(kcal=120))[0] == "FAIL"
 
 
 def test_negative_exact_absence_and_retraction(tmp_path):
@@ -875,7 +910,7 @@ async def test_a1_gates_a2_and_a2_prompt_is_blind(tmp_path):
         ).model_dump_json()
 
     failed = make_case(tmp_path)
-    set_persisted_kcal(failed, 500)
+    set_persisted_kcal(failed, 520.1)
     result = await calibrate_case(failed, fake, CallBudget(max_calls=4))
     assert result["a1"] == "FAIL" and result["a2"] == "NOT_RUN"
     assert len(calls) == 1
@@ -1224,7 +1259,7 @@ async def test_subscription_rejects_missing_extra_and_reused_evidence(tmp_path):
     with pytest.raises(ValueError, match="missing subscription result"):
         await calibrate_case(case, intake.call, CallBudget(max_calls=4))
     failed = make_case(tmp_path)
-    set_persisted_kcal(failed, 500)
+    set_persisted_kcal(failed, 520.1)
     intake = SubscriptionResults(entries, [failed])
     result = await calibrate_case(failed, intake.call, CallBudget(max_calls=4))
     assert result["a1"] == "FAIL" and result["a2"] == "NOT_RUN"
