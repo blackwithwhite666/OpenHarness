@@ -9,6 +9,7 @@ import logging
 import os
 import re
 import time
+from datetime import datetime
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 
@@ -196,6 +197,10 @@ class OhmoGatewayBridge:
 
             if self._camera_ingress is not None and message.sender_id != "__camera__":
                 self._camera_ingress.process_real_inbound(message)
+                if message.metadata.get("_camera_classifier_feedback") is CAMERA_AUTHORITY:
+                    # Owner-authorized classifier feedback is journaled by the
+                    # Camera ingress; it is not a nutrition/model turn.
+                    continue
 
             session_key = session_key_for_message(message)
             logger.info(
@@ -893,10 +898,25 @@ def _coalesce(messages: list[InboundMessage]) -> InboundMessage:
     for m in messages:
         media.extend(m.media)
         source_id = m.metadata.get("message_id") if isinstance(m.metadata, dict) else None
+        source_time = (
+            m.metadata.get("received_at")
+            if m.channel == "telegram" and "received_at" in m.metadata
+            else m.timestamp
+        )
+        received_at = None
+        if isinstance(source_time, datetime) and source_time.tzinfo is not None:
+            received_at = source_time.isoformat()
+        elif isinstance(source_time, str):
+            try:
+                parsed = datetime.fromisoformat(source_time.strip())
+            except ValueError:
+                parsed = None
+            if parsed is not None and parsed.tzinfo is not None:
+                received_at = parsed.isoformat()
         for _ in m.media:
             media_sources.append({
                 "source_message_id": str(source_id) if source_id is not None else None,
-                "received_at": m.timestamp.isoformat() if m.timestamp.tzinfo else None,
+                "received_at": received_at,
             })
     metadata = dict(last.metadata)
     metadata["_coalesced_media_sources"] = media_sources

@@ -1136,7 +1136,8 @@ class TelegramChannel(BaseChannel):
         )
 
     async def send_camera_photo(
-        self, *, chat_id: str, image_path: str, caption: str
+        self, *, chat_id: str, image_path: str, caption: str,
+        buttons: list[str] | None = None,
     ) -> OutboundDeliveryReceipt:
         """Return only a native photo receipt; never use the generic text fallback.
 
@@ -1147,7 +1148,8 @@ class TelegramChannel(BaseChannel):
             raise RuntimeError("Telegram Camera channel is unavailable")
         with open(image_path, "rb") as photo:
             sent = await self._app.bot.send_photo(
-                chat_id=int(chat_id), photo=photo, caption=caption
+                chat_id=int(chat_id), photo=photo, caption=caption,
+                reply_markup=self._build_keyboard(buttons or []),
             )
         message_id = getattr(sent, "message_id", None)
         native_photo = getattr(sent, "photo", None)
@@ -1958,6 +1960,7 @@ class TelegramChannel(BaseChannel):
                 "native_message_id": message.message_id,
                 "callback_query": True,
                 "callback_data": data,
+                "callback_query_id": getattr(query, "id", None),
                 "user_id": user.id,
                 "username": user.username,
                 "first_name": user.first_name,

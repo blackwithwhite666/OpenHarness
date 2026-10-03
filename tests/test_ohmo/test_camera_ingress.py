@@ -95,9 +95,14 @@ class FakeTelegram:
         self.fail = fail
         self.text_receipt = text_receipt
         self.calls: list[tuple[str, str]] = []
+        self.captions: list[str] = []
+        self.buttons: list[list[str]] = []
 
-    async def send_camera_photo(self, *, chat_id: str, image_path: str, caption: str):
+    async def send_camera_photo(self, *, chat_id: str, image_path: str, caption: str,
+                                buttons: list[str] | None = None):
         self.calls.append((chat_id, image_path))
+        self.captions.append(caption)
+        self.buttons.append(buttons or [])
         if self.fail:
             raise RuntimeError("photo failed")
         return OutboundDeliveryReceipt(
@@ -2685,7 +2690,7 @@ async def test_stream_recovery_keeps_the_current_denial_for_correction_inference
     pool._configure_turn_memory_surfaces = lambda *_args, **_kwargs: None
 
     async def get_bundle(*_args, **_kwargs):
-        return SimpleNamespace(session_id="session")
+        return SimpleNamespace(session_id="session", engine=SimpleNamespace(messages=[]))
 
     async def reconcile(*_args):
         return receipt
@@ -3206,8 +3211,116 @@ async def test_expired_operation_remains_addressable_without_clearing_new_attent
     assert answer.metadata["_camera_candidate_id"] == first["candidate_id"]
     assert answer.metadata["_camera_answer"] == "no"
     assert ingress._attempts[first["candidate_id"]]["state"] == "answering"
+    assert "classifier_feedback" not in ingress._attempts[first["candidate_id"]]
     assert ingress._attempts[second["candidate_id"]]["attention_active"] is True
     assert "_camera_unbound" not in answer.metadata
+    await ingress.close()
+
+
+@pytest.mark.asyncio
+async def test_not_food_callback_is_durable_classifier_feedback_not_consumption(
+    tmp_path: Path,
+) -> None:
+    ingress, root, bus, telegram = _ingress(tmp_path)
+    captured = datetime(2026, 9, 30, 18, 45, tzinfo=timezone.utc)
+    request = _candidate(root, capture_time=captured)
+    assert (await _admit(ingress, root, "Bearer " + "s" * 40, request))[0] == 202
+    await asyncio.wait_for(bus.consume_inbound(), timeout=1)
+    ingress._attempts[request["candidate_id"]]["attention_active"] = False
+    ingress._save_attempts()
+    from PIL import Image
+
+    distinct_photo = BytesIO()
+    Image.new("RGB", (8, 8), "green").save(distinct_photo, format="JPEG")
+    newer = _candidate(root, index=1, image_bytes=distinct_photo.getvalue())
+    newer_status, newer_response = await _admit(
+        ingress, root, "Bearer " + "s" * 40, newer
+    )
+    assert newer_status == 202, newer_response
+    await asyncio.wait_for(bus.consume_inbound(), timeout=1)
+
+    ingress._attempts[request["candidate_id"]]["admitted_at"] = (
+        datetime.now(timezone.utc) - timedelta(seconds=_PENDING_TTL_SECONDS + 1)
+    ).isoformat()
+
+    assert telegram.captions[0] == "Съели ли вы это? Фото сделано 2026-09-30."
+    assert telegram.buttons[0] == ["Да, я это съел(а)", "Нет, не ел(а)", "Это не еда"]
+    candidate_id = request["candidate_id"]
+    photo_id = ingress._attempts[candidate_id]["photo_id"]
+    callback = InboundMessage(
+        channel="telegram", sender_id="123", chat_id="123", content="Это не еда",
+        metadata={"callback_query": True, "native_message_id": photo_id,
+                  "callback_data": "ask:2", "callback_query_id": "cb-notfood-1",
+                  "message_id": photo_id,
+                  "_telegram_raw_text": "Это не еда"},
+    )
+    ingress.process_real_inbound(callback)
+    assert callback.metadata["_camera_classifier_feedback"] is CAMERA_AUTHORITY
+    assert "_camera_answer" not in callback.metadata
+    assert "_camera_candidate_id" not in callback.metadata
+    feedback = ingress._attempts[candidate_id]["classifier_feedback"]
+    assert feedback["candidate_id"] == candidate_id
+    assert feedback["photo_id"] == photo_id
+    assert feedback["source_id"] == "cb-notfood-1"
+    assert feedback["verdict"] == "not_food"
+    assert feedback["owner_id"] == "123"
+    assert feedback["classifier"] == "deepseek-camera-production-v1"
+    assert ingress._attempts[candidate_id]["attention_active"] is False
+    assert ingress._attempts[newer["candidate_id"]]["attention_active"] is True
+    assert "camera_commit" not in ingress._attempts[candidate_id]
+
+    reopened = CameraIngress(ingress.config, workspace=tmp_path, bus=MessageBus(), telegram=None)
+    assert reopened._attempts[candidate_id]["classifier_feedback"] == feedback
+    duplicate = InboundMessage(
+        channel="telegram", sender_id="123", chat_id="123", content="Это не еда",
+        metadata={"callback_query": True, "native_message_id": photo_id,
+                  "callback_data": "ask:2", "callback_query_id": "cb-notfood-1",
+                  "message_id": photo_id,
+                  "_telegram_raw_text": "Это не еда"},
+    )
+    reopened.process_real_inbound(duplicate)
+    assert reopened._attempts[candidate_id]["classifier_feedback"] == feedback
+    assert "camera_commit" not in reopened._attempts[candidate_id]
+    assert reopened._attempts[newer["candidate_id"]]["attention_active"] is True
+    await ingress.close()
+
+
+@pytest.mark.asyncio
+async def test_foreign_or_unpersisted_not_food_callback_cannot_grant_feedback_authority(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    ingress, root, bus, _ = _ingress(tmp_path)
+    request = _candidate(root)
+    assert (await _admit(ingress, root, "Bearer " + "s" * 40, request))[0] == 202
+    await asyncio.wait_for(bus.consume_inbound(), timeout=1)
+    attempt = ingress._attempts[request["candidate_id"]]
+    photo_id = attempt["photo_id"]
+
+    foreign = InboundMessage(
+        channel="telegram", sender_id="456", chat_id="123", content="Это не еда",
+        metadata={"callback_query": True, "native_message_id": photo_id,
+                  "callback_data": "ask:2", "callback_query_id": "foreign-callback",
+                  "_telegram_raw_text": "Это не еда"},
+    )
+    ingress.process_real_inbound(foreign)
+    assert "classifier_feedback" not in attempt
+    assert "_camera_classifier_feedback" not in foreign.metadata
+
+    monkeypatch.setattr(
+        ingress, "_save_attempts", lambda: (_ for _ in ()).throw(OSError("synthetic write failure"))
+    )
+    failed_save = InboundMessage(
+        channel="telegram", sender_id="123", chat_id="123", content="Это не еда",
+        metadata={"callback_query": True, "native_message_id": photo_id,
+                  "callback_data": "ask:2", "callback_query_id": "owner-callback",
+                  "_telegram_raw_text": "Это не еда"},
+    )
+    ingress.process_real_inbound(failed_save)
+    assert "classifier_feedback" not in attempt
+    assert attempt["attention_active"] is True
+    assert failed_save.metadata.get("_camera_classifier_feedback") is None
+    assert failed_save.metadata["_camera_unbound"] is CAMERA_AUTHORITY
     await ingress.close()
 
 
@@ -3855,6 +3968,331 @@ def test_camera_recorder_replaces_model_date_without_changing_generic_turn(tmp_p
     assert parsed_meal_at.utcoffset() == timedelta(0)
     assert parsed_meal_at == expected_meal_at
     assert unchanged["meal_date"] == "2026-09-29"
+
+
+@pytest.mark.parametrize(
+    ("explicit_time", "explicit_date", "expected_time", "expected_date"),
+    [
+        (None, None, "2026-09-30T21:10:00+00:00", None),
+        ("2026-09-01T08:15:00+00:00", None, "2026-09-01T08:15:00+00:00", None),
+        (None, "2026-09-01", None, "2026-09-01"),
+    ],
+)
+def test_owner_photo_send_time_is_saved_as_meal_default_and_explicit_time_wins(
+    tmp_path: Path,
+    explicit_time: str | None,
+    explicit_date: str | None,
+    expected_time: str | None,
+    expected_date: str | None,
+) -> None:
+    from PIL import Image
+    from ohmo.gateway.runtime import _trusted_utc_iso
+
+    photo = tmp_path / "owner-food.jpg"
+    Image.new("RGB", (4, 4), "red").save(photo, format="JPEG")
+    sent_at = datetime.fromisoformat("2026-10-01T00:10:00+03:00")
+    message = InboundMessage(
+        channel="telegram", sender_id="123", chat_id="123",
+        content="I ate this; calculate calories.",
+        timestamp=sent_at, media=[str(photo)],
+        metadata={"message_id": "owner-photo-1", "is_group": False},
+    )
+    turn = TurnContext(
+        principal="123", is_owner=True, is_private=True, channel="telegram",
+        chat_id="123", session_id="source-session",
+    )
+    pool = object.__new__(OhmoSessionRuntimePool)
+    pool._gateway_config = GatewayConfig(owner_principals=("123",))
+    trusted_time = pool._trusted_user_photo_time(message, turn_ctx=turn)
+    assert trusted_time == datetime.fromisoformat("2026-09-30T21:10:00+00:00")
+    assert "directly at" in pool._with_user_photo_context(
+        "BASE PROMPT", trusted_time
+    )
+    assert "do not create a meal" in pool._with_user_photo_context("BASE PROMPT", trusted_time)
+    assert pool._trusted_user_photo_time(
+        replace(message, content="How many calories?"), turn_ctx=turn
+    ) is None
+    assert pool._trusted_user_photo_time(
+        replace(message, content="What is this?"), turn_ctx=turn
+    ) is None
+    assert pool._trusted_user_photo_time(
+        replace(message, content="Give me a recipe for this."), turn_ctx=turn
+    ) is None
+
+    backend = OhmoSessionBackend(tmp_path)
+    inbound = _build_inbound_user_message(
+        message, backend.attachment_store, session_key="telegram:123"
+    )
+    ref = next(block for block in inbound.content if isinstance(block, AttachmentRefBlock))
+    assert ref.source_provenance["source_message_id"] == "owner-photo-1"
+    assert ref.source_provenance["received_at"] == _trusted_utc_iso(sent_at)
+    assert ref.source_provenance["timestamp_authority"] == "inbound_event_timestamp"
+    assert ref.source_provenance["is_forwarded"] is False
+    assert sent_at.astimezone(timezone.utc).date().isoformat() == "2026-09-30"
+    assert sent_at.date().isoformat() == "2026-10-01"
+
+    recorder = GatewayEvalRecorder.start(
+        workspace=tmp_path,
+        bundle=SimpleNamespace(session_id="source-session", cwd=str(tmp_path), model="offline"),
+        message=message,
+        session_key="telegram:123",
+        user_text="",
+    )
+    recorder.set_authoritative_nutrition_meal_at(trusted_time, preserve_explicit=True)
+    recorder.mark_trusted_direct_photo_intent()
+    assert recorder.decision_trace_recorder.trace_requirement_signals("photo") == (
+        "ohmo_nutrition_request",
+    )
+    nutrition = {
+        "schema_version": 2, "record_type": "meal_observation", "basis": ["image"],
+        "consumption_status": "consumed", "meal_at": explicit_time,
+        "meal_date": explicit_date, "is_estimate": True,
+        "energy_kcal_min": 100, "energy_kcal_max": 120, "energy_kcal_best": 110,
+        "protein_g": None, "fat_g": None, "carbohydrate_g": None, "items": [],
+        "confidence": "high", "assumptions": [], "warnings": [],
+        "changed_fields": [], "summary_date": None, "explicit_new_consumption": False,
+    }
+    recorder.decision_trace_recorder.record(
+        TRACE_FINALIZATION,
+        {"schema_version": 1, "trace_event_id": "photo-meal-finalization",
+         "annotations": {"nutrition": nutrition}},
+    )
+    stored = next(
+        event for event in get_eval_store(tmp_path).iter_events(recorder.episode_id)
+        if event.kind == TRACE_FINALIZATION
+    )
+    saved = stored.payload["annotations"]["nutrition"]
+    assert saved["consumption_status"] == "consumed"
+    saved_time = saved.get("meal_at")
+    if isinstance(saved_time, str):
+        saved_time = datetime.fromisoformat(saved_time.replace("Z", "+00:00")).isoformat()
+    assert saved_time == expected_time
+    assert saved.get("meal_date") == expected_date
+
+
+def test_exact_repeat_user_photo_has_no_new_send_time_default(tmp_path: Path) -> None:
+    from PIL import Image
+
+    photo = tmp_path / "repeat.jpg"
+    Image.new("RGB", (4, 4), "blue").save(photo, format="JPEG")
+    prior_message = InboundMessage(
+        channel="telegram", sender_id="123", chat_id="123", content="",
+        timestamp=datetime(2026, 9, 1, tzinfo=timezone.utc), media=[str(photo)],
+        metadata={"message_id": "first-photo", "is_group": False},
+    )
+    backend = OhmoSessionBackend(tmp_path)
+    prior = _build_inbound_user_message(
+        prior_message, backend.attachment_store, session_key="telegram:123"
+    )
+    resent = InboundMessage(
+        channel="telegram", sender_id="123", chat_id="123", content="",
+        timestamp=datetime(2026, 10, 1, tzinfo=timezone.utc), media=[str(photo)],
+        metadata={"message_id": "resent-photo", "is_group": False},
+    )
+    turn = TurnContext(
+        principal="123", is_owner=True, is_private=True, channel="telegram",
+        chat_id="123", session_id="source-session",
+    )
+    pool = object.__new__(OhmoSessionRuntimePool)
+    pool._gateway_config = GatewayConfig(owner_principals=("123",))
+    assert pool._known_user_photo_repeat(resent, [prior])
+    assert pool._trusted_user_photo_time(resent, turn_ctx=turn, history=[prior]) is None
+    repeat_prompt = pool._with_user_photo_context(
+        "BASE PROMPT", None, known_repeat=True
+    )
+    assert "do not record another meal" in repeat_prompt
+    assert "Do not use the resent image's send time" in repeat_prompt
+
+
+def test_native_photo_without_received_at_keeps_time_unknown(tmp_path: Path) -> None:
+    from PIL import Image
+
+    photo = tmp_path / "time-unknown.jpg"
+    Image.new("RGB", (4, 4), "white").save(photo, format="JPEG")
+    message = InboundMessage(
+        channel="telegram", sender_id="123", chat_id="123", content="",
+        media=[str(photo)], metadata={"message_id": "missing-native-time",
+                                      "is_group": False, "received_at": None},
+    )
+    turn = TurnContext(
+        principal="123", is_owner=True, is_private=True, channel="telegram",
+        chat_id="123", session_id="source-session",
+    )
+    pool = object.__new__(OhmoSessionRuntimePool)
+    pool._gateway_config = GatewayConfig(owner_principals=("123",))
+    assert pool._trusted_user_photo_time(message, turn_ctx=turn) is None
+    backend = OhmoSessionBackend(tmp_path)
+    inbound = _build_inbound_user_message(
+        message, backend.attachment_store, session_key="telegram:123"
+    )
+    ref = next(block for block in inbound.content if isinstance(block, AttachmentRefBlock))
+    assert ref.source_provenance["received_at"] is None
+    assert ref.source_provenance["timestamp_authority"] is None
+
+
+def test_text_only_photo_portion_followup_does_not_use_reply_time_as_photo_time(
+    tmp_path: Path,
+) -> None:
+    from PIL import Image
+
+    photo = tmp_path / "clarified-food.jpg"
+    Image.new("RGB", (4, 4), "orange").save(photo, format="JPEG")
+    original = InboundMessage(
+        channel="telegram", sender_id="123", chat_id="123", content="",
+        timestamp=datetime(2026, 9, 29, 20, tzinfo=timezone.utc), media=[str(photo)],
+        metadata={"message_id": "original-food-photo", "is_group": False},
+    )
+    backend = OhmoSessionBackend(tmp_path)
+    retained = _build_inbound_user_message(
+        original, backend.attachment_store, session_key="telegram:123"
+    )
+    followup = InboundMessage(
+        channel="telegram", sender_id="123", chat_id="123", content="Около половины",
+        timestamp=datetime(2026, 10, 2, 9, tzinfo=timezone.utc), media=[],
+        metadata={"message_id": "portion-answer", "reply_to_message_id": "assistant-question-77",
+                  "reply_to_message_text": "Сколько вы съели?", "is_group": False},
+    )
+    turn = TurnContext(
+        principal="123", is_owner=True, is_private=True, channel="telegram",
+        chat_id="123", session_id="source-session",
+    )
+    pool = object.__new__(OhmoSessionRuntimePool)
+    pool._gateway_config = GatewayConfig(owner_principals=("123",))
+    assert pool._trusted_user_photo_time(followup, turn_ctx=turn, history=[retained]) is None
+
+
+@pytest.mark.parametrize(
+    ("sender", "turn_principal", "metadata", "timestamp", "media", "is_owner", "trusted"),
+    [
+        ("123", "123", {"message_id": "x", "is_group": True}, datetime.now(timezone.utc), ["x.jpg"], True, False),
+        ("123", "123", {"message_id": "x", "is_group": False, "is_forwarded": True}, datetime.now(timezone.utc), ["x.jpg"], True, False),
+        ("123", "123", {"message_id": "x", "is_group": False}, None, ["x.jpg"], True, False),
+        ("__camera__", "123", {"message_id": "x", "is_group": False}, datetime.now(timezone.utc), ["x.jpg"], True, False),
+        ("123", "123", {"message_id": "x", "is_group": False}, datetime.now(timezone.utc), [], True, False),
+        ("456", "123", {"message_id": "x", "is_group": False}, datetime.now(timezone.utc), ["x.jpg"], False, False),
+        ("123", "", {"message_id": "x", "is_group": False}, datetime.now(timezone.utc), ["x.jpg"], False, False),
+    ],
+)
+def test_photo_default_time_rejects_forwarded_group_assistant_or_untrusted_sources(
+    sender, turn_principal, metadata, timestamp, media, is_owner, trusted,
+) -> None:
+    pool = object.__new__(OhmoSessionRuntimePool)
+    pool._gateway_config = GatewayConfig(owner_principals=("123",))
+    message = InboundMessage(
+        channel="telegram", sender_id=sender, chat_id="123", content="",
+        timestamp=timestamp, media=media, metadata=metadata,
+    )
+    turn = TurnContext(
+        principal=turn_principal, is_owner=is_owner, is_private=metadata.get("is_group") is False,
+        channel="telegram", chat_id="123", session_id="source-session",
+        is_forwarded=metadata.get("is_forwarded") is True,
+    )
+    assert (pool._trusted_user_photo_time(message, turn_ctx=turn) is not None) is trusted
+
+
+def test_family_participant_uses_only_own_private_photo_source(tmp_path: Path) -> None:
+    from PIL import Image
+
+    photo = tmp_path / "marina-food.jpg"
+    Image.new("RGB", (4, 4), "green").save(photo, format="JPEG")
+    sent_at = datetime.fromisoformat("2026-10-01T23:59:58+03:00")
+    pool = object.__new__(OhmoSessionRuntimePool)
+    pool._gateway_config = GatewayConfig(
+        family_principals={"200": "marina"}, enabled_memory_tenants=("marina",)
+    )
+    pool._session_owner_principals = {}
+    message = InboundMessage(
+        channel="telegram", sender_id="200", chat_id="200", content="",
+        timestamp=sent_at, media=[str(photo)],
+        metadata={"message_id": "marina-photo", "is_group": False},
+    )
+    own_turn = TurnContext(
+        principal="200", is_owner=False, is_private=True, channel="telegram",
+        chat_id="200", session_id="marina-session",
+    )
+    pool._bind_session_owner(message, "telegram:200", own_turn)
+    assert pool._trusted_user_photo_time(message, turn_ctx=own_turn) == sent_at.astimezone(timezone.utc)
+    foreign_turn = replace(own_turn, principal="300")
+    assert pool._trusted_user_photo_time(message, turn_ctx=foreign_turn) is None
+    anonymous = replace(message, sender_id="", metadata={"is_group": False})
+    assert pool._trusted_user_photo_time(anonymous, turn_ctx=own_turn) is None
+    forwarded = replace(message, metadata={**message.metadata, "is_forwarded": True})
+    forwarded_turn = replace(own_turn, is_forwarded=True)
+    assert pool._trusted_user_photo_time(forwarded, turn_ctx=forwarded_turn) is None
+    group = replace(message, metadata={**message.metadata, "is_group": True})
+    assert pool._trusted_user_photo_time(group, turn_ctx=replace(own_turn, is_private=False)) is None
+
+    recorder = GatewayEvalRecorder.start(
+        workspace=tmp_path,
+        bundle=SimpleNamespace(session_id="marina-session", cwd=str(tmp_path), model="offline"),
+        message=message,
+        session_key="telegram:200",
+        user_text="",
+    )
+    trusted_time = pool._trusted_user_photo_time(message, turn_ctx=own_turn)
+    recorder.set_authoritative_nutrition_meal_at(trusted_time, preserve_explicit=True)
+    recorder.mark_trusted_direct_photo_intent()
+    nutrition = {
+        "schema_version": 2, "record_type": "meal_observation", "basis": ["image"],
+        "consumption_status": "consumed", "meal_at": None, "meal_date": None,
+        "is_estimate": True, "energy_kcal_min": 100, "energy_kcal_max": 120,
+        "energy_kcal_best": 110, "protein_g": None, "fat_g": None,
+        "carbohydrate_g": None, "items": [], "confidence": "high",
+        "assumptions": [], "warnings": [], "changed_fields": [],
+        "summary_date": None, "explicit_new_consumption": False,
+    }
+    recorder.decision_trace_recorder.record(
+        TRACE_FINALIZATION,
+        {"schema_version": 1, "trace_event_id": "marina-photo-finalization",
+         "annotations": {"nutrition": nutrition}},
+    )
+    saved = next(
+        event.payload["annotations"]["nutrition"]
+        for event in get_eval_store(tmp_path).iter_events(recorder.episode_id)
+        if event.kind == TRACE_FINALIZATION
+    )
+    assert saved["consumption_status"] == "consumed"
+    assert datetime.fromisoformat(saved["meal_at"].replace("Z", "+00:00")) == sent_at.astimezone(
+        timezone.utc
+    )
+
+
+def test_coalesced_photo_default_uses_original_photo_native_time_across_midnight(
+    tmp_path: Path,
+) -> None:
+    from PIL import Image
+    from ohmo.gateway.bridge import _coalesce
+
+    photo = tmp_path / "coalesced-food.jpg"
+    Image.new("RGB", (4, 4), "yellow").save(photo, format="JPEG")
+    photo_time = datetime.fromisoformat("2026-10-01T23:59:58+03:00")
+    later_text_time = datetime.fromisoformat("2026-10-02T00:00:04+03:00")
+    photo_message = InboundMessage(
+        channel="telegram", sender_id="123", chat_id="123", content="",
+        timestamp=photo_time, media=[str(photo)],
+        metadata={"message_id": "native-photo-55", "is_group": False,
+                  "received_at": photo_time.isoformat()},
+    )
+    text_message = InboundMessage(
+        channel="telegram", sender_id="123", chat_id="123", content="I ate this",
+        timestamp=later_text_time, metadata={"message_id": "native-text-56", "is_group": False,
+                                             "received_at": later_text_time.isoformat()},
+    )
+    merged = _coalesce([photo_message, text_message])
+    pool = object.__new__(OhmoSessionRuntimePool)
+    pool._gateway_config = GatewayConfig(owner_principals=("123",))
+    turn = TurnContext(
+        principal="123", is_owner=True, is_private=True, channel="telegram",
+        chat_id="123", session_id="source-session",
+    )
+    expected = photo_time.astimezone(timezone.utc)
+    assert pool._trusted_user_photo_time(merged, turn_ctx=turn) == expected
+    backend = OhmoSessionBackend(tmp_path)
+    inbound = _build_inbound_user_message(merged, backend.attachment_store, session_key="telegram:123")
+    ref = next(block for block in inbound.content if isinstance(block, AttachmentRefBlock))
+    assert ref.source_provenance["source_message_id"] == "native-photo-55"
+    assert ref.source_provenance["received_at"] == expected.isoformat()
+    assert ref.source_provenance["received_at"] != later_text_time.astimezone(timezone.utc).isoformat()
 
 
 class _Writer:

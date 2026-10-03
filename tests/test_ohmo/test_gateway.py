@@ -44,6 +44,7 @@ from openharness.tools.base import ToolExecutionContext, ToolRegistry
 
 from ohmo.evals import get_eval_store
 from ohmo.gateway.bridge import OhmoGatewayBridge, _format_gateway_error
+from ohmo.gateway.camera import CAMERA_AUTHORITY
 from ohmo.gateway.config import load_gateway_config, save_gateway_config
 from ohmo.gateway.group_tool import OhmoCreateFeishuGroupInput, OhmoCreateFeishuGroupTool
 from ohmo.gateway.models import GatewayConfig, GatewayState
@@ -1984,6 +1985,45 @@ async def test_gateway_bridge_publishes_progress_updates():
     assert second.content.startswith("🛠️ ")
     assert "web_fetch" in second.content
     assert third.content == "Done"
+
+
+@pytest.mark.asyncio
+async def test_bridge_consumes_not_food_feedback_without_model_or_persistence_turn():
+    bus = MessageBus()
+    handled = asyncio.Event()
+    calls = []
+
+    class FeedbackIngress:
+        def process_real_inbound(self, message):
+            message.metadata["_camera_classifier_feedback"] = CAMERA_AUTHORITY
+            handled.set()
+
+    class Runtime:
+        async def stream_message(self, message, session_key):
+            calls.append(message)
+            yield SimpleNamespace(kind="final", text="unexpected", metadata={})
+
+    bridge = OhmoGatewayBridge(
+        bus=bus, runtime_pool=Runtime(), camera_ingress=FeedbackIngress()
+    )
+    task = asyncio.create_task(bridge.run())
+    try:
+        await bus.publish_inbound(InboundMessage(
+            channel="telegram", sender_id="123", chat_id="123", content="Это не еда",
+            metadata={"callback_query": True},
+        ))
+        await asyncio.wait_for(handled.wait(), timeout=1)
+        await asyncio.sleep(0.05)
+    finally:
+        bridge.stop()
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    assert calls == []
+    assert bus.outbound_size == 0
 
 
 @pytest.mark.asyncio

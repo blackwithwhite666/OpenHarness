@@ -19,9 +19,11 @@ from ohmo.attachment_store import AttachmentStore
 from ohmo.contact_registry import ContactStore
 from ohmo.conversation_image_tool import LoadConversationImageTool
 from ohmo.evals import GatewayEvalRecorder
+from ohmo.evals.recorder import _contains_nutrition_record_intent
 from ohmo.evals.nutrition_trace import (
     NutritionAnnotationV2,
 )
+from ohmo.evals.nutrition_persistence import derive_meal_id
 from ohmo.gateway.attachment_fingerprints import compute_attachment_fingerprints
 from ohmo.gateway.camera import (
     CAMERA_AUTHORITY,
@@ -48,6 +50,7 @@ from ohmo.gateway.provider_commands import (
     handle_gateway_provider_command,
 )
 from ohmo.gateway.router import session_key_for_message
+from ohmo.gateway.selected_source import resolve_selected_photo_source
 from ohmo.gateway.turn_context import (
     TurnContext,
     build_turn_context,
@@ -155,6 +158,7 @@ _IMAGE_FALLBACK_NOTE = (
 )
 _NO_GROUP_REQUEST = object()
 _UNRESOLVED_MEMORY_SCOPE = object()
+_SELECTED_SOURCE_AUTHORITY = object()
 _GROUP_TOOL_NAME = "ohmo_create_feishu_group"
 _WELLNESS_TOOL_NAME = "mcp__worfalomey__get_wellness_data"
 _GROUP_AGENT_PROMPT_PREFIX = "The user invoked `/group` from a Feishu private chat."
@@ -172,6 +176,13 @@ _CONVERSATION_TRACE_DISABLED_STATUS = "disabled"
 _TODO_RECONCILIATION_MAX_ATTEMPTS = 2
 _TODO_TOOL_NAME = "todo_write"
 _TODO_STATE_READ_ERROR_MARKER = "TODO_STATE_READ_ERROR"
+_USER_PHOTO_ADVISORY_RE = re.compile(
+    r"\b(?:what\s+is\s+this|identify|advice|recipe|how\s+to\s+cook|"
+    r"how\s+many\s+calories|calories?|"
+    r"сколько\s+калори\w*|посоветуй|рецепт|что\s+это|что\s+на\s+фото|"
+    r"как\s+приготовить|оцени\s+калори\w*)\b",
+    re.IGNORECASE,
+)
 
 
 class TodoRuntimeStateError(RuntimeError):
@@ -204,6 +215,18 @@ def _trusted_utc_iso(value: object) -> str | None:
         return timestamp.astimezone(timezone.utc).isoformat()
     except (OverflowError, ValueError):
         return None
+
+
+def _trusted_inbound_event_time(message: InboundMessage) -> datetime | None:
+    """Use Telegram's native received_at marker when the adapter supplies it."""
+    metadata = message.metadata or {}
+    value: object = message.timestamp
+    if message.channel == "telegram" and "received_at" in metadata:
+        value = metadata.get("received_at")
+    normalized = _trusted_utc_iso(value)
+    if normalized is None:
+        return None
+    return datetime.fromisoformat(normalized)
 
 
 @dataclass(frozen=True)
@@ -356,7 +379,7 @@ def _build_conversation_turn_metadata(
         "decision_trace_status": decision_trace_status,
         "nutrition_annotation_status": nutrition_annotation_status,
         "decision_trace_episode_id": recorder.episode_id if recorder is not None else None,
-        "received_at": _trusted_utc_iso(message.timestamp),
+        "received_at": _trusted_utc_iso(_trusted_inbound_event_time(message)),
         "is_forwarded": turn_ctx.is_forwarded,
         "is_group": not turn_ctx.is_private,
         "source_message_at": _trusted_utc_iso(message_metadata.get("source_message_at")),
@@ -367,6 +390,66 @@ def _build_conversation_turn_metadata(
         "attachment_fingerprints": attachment_fingerprints,
         "source_image_attachment_count": source_image_attachment_count,
     }
+    selected_binding = message.metadata.get("_selected_source_binding")
+    if (
+        isinstance(selected_binding, tuple)
+        and len(selected_binding) == 2
+        and selected_binding[0] is _SELECTED_SOURCE_AUTHORITY
+        and isinstance(selected_binding[1], Mapping)
+    ):
+        binding = selected_binding[1]
+        raw_nutrition = recorder.validated_nutrition_envelope if recorder is not None else None
+        try:
+            correction = NutritionAnnotationV2.model_validate(raw_nutrition)
+        except (TypeError, ValueError):
+            correction = None
+        if (
+            correction is not None
+            and correction.record_type in {"meal_correction", "meal_deletion"}
+            and scope.private_tenant == binding.get("tenant_id")
+            and turn_ctx.is_private
+            and not turn_ctx.is_forwarded
+            and binding.get("source_principal") == source_principal
+            and binding.get("gateway_session_id") == turn_ctx.session_id
+            and isinstance(binding.get("append_source_message_id"), str)
+        ):
+            evidence = {
+                key: binding[key]
+                for key in (
+                    "schema_version", "tenant_id", "source_principal",
+                    "gateway_session_id", "source_message_id",
+                    "append_source_message_id", "is_private", "is_forwarded", "is_group",
+                )
+            }
+            base_metadata["selected_source"] = evidence
+            base_metadata["target_meal_id"] = derive_meal_id(
+                tenant_id=scope.private_tenant,
+                source_principal=source_principal,
+                gateway_session_id=turn_ctx.session_id,
+                source_message_id=binding["append_source_message_id"],
+            )
+        elif (
+            correction is not None
+            and correction.record_type == "meal_observation"
+            and correction.consumption_status == "consumed"
+            and scope.private_tenant == binding.get("tenant_id")
+            and turn_ctx.is_private
+            and not turn_ctx.is_forwarded
+            and binding.get("source_principal") == source_principal
+            and binding.get("gateway_session_id") == turn_ctx.session_id
+            and isinstance(binding.get("append_source_message_id"), str)
+            and isinstance(binding.get("attachment_id"), str)
+        ):
+            base_metadata["photo_occurrence_source"] = {
+                key: binding[key]
+                for key in (
+                    "schema_version", "tenant_id", "source_principal",
+                    "gateway_session_id", "source_message_id",
+                    "append_source_message_id", "attachment_id", "received_at",
+                    "chat_id", "session_key",
+                    "is_private", "is_forwarded", "is_group",
+                )
+            }
     if (
         turn_ctx.camera_authorized
         and message.metadata.get("_camera_authority") is CAMERA_AUTHORITY
@@ -521,6 +604,31 @@ def _append_nutrition_saved_status(answer: str, annotation: NutritionAnnotationV
     return f"{content}\n{status}" if content else status
 
 
+def _committed_nutrition_reply(
+    annotation: NutritionAnnotationV2, *, status: str
+) -> str:
+    """Present only committed observation nutrients and the validated receipt status."""
+    if annotation.record_type != "meal_observation":
+        return status
+    minimum = annotation.energy_kcal_min
+    maximum = annotation.energy_kcal_max
+    best = annotation.energy_kcal_best
+    if minimum is not None and maximum is not None:
+        amount = (
+            f"Примерно {minimum:g}–{maximum:g} ккал."
+            if minimum < maximum else f"Примерно {minimum:g} ккал."
+        )
+    elif best is not None:
+        amount = f"Примерно {best:g} ккал."
+    elif minimum is not None:
+        amount = f"Не менее {minimum:g} ккал."
+    elif maximum is not None:
+        amount = f"Не более {maximum:g} ккал."
+    else:
+        return status
+    return f"{amount}\n{status}"
+
+
 def _receipt_has_consumed_nutrition(metadata: Mapping[str, object]) -> bool:
     trace = metadata.get("decision_trace")
     annotations = trace.get("annotations") if isinstance(trace, Mapping) else None
@@ -535,6 +643,79 @@ def _receipt_has_consumed_nutrition(metadata: Mapping[str, object]) -> bool:
         validated.record_type == "meal_observation"
         and validated.consumption_status == "consumed"
     )
+
+
+def _record_consumed_photo_occurrence(
+    history: list[ConversationMessage],
+    binding: Mapping[str, object],
+    *,
+    receipt_event_id: str,
+    client_op_id: str,
+    append_source_message_id: str,
+) -> bool:
+    """Persist one uniquely matched, receipt-proven consumption on its photo ref."""
+    attachment_id = binding.get("attachment_id")
+    if (
+        type(binding.get("schema_version")) is not int
+        or binding.get("schema_version") != 1
+        or binding.get("is_private") is not True
+        or binding.get("is_forwarded") is not False
+        or binding.get("is_group") is not False
+        or not isinstance(receipt_event_id, str) or not receipt_event_id
+        or not isinstance(client_op_id, str) or not client_op_id
+        or not isinstance(append_source_message_id, str) or not append_source_message_id
+    ):
+        return False
+    expected = {
+        "principal": binding.get("source_principal"),
+        "chat_id": binding.get("chat_id"),
+        "session_key": binding.get("session_key"),
+        "gateway_session_id": binding.get("gateway_session_id"),
+        "source_message_id": binding.get("source_message_id"),
+    }
+    if not isinstance(attachment_id, str) or not all(
+        isinstance(value, str) and value for value in expected.values()
+    ):
+        return False
+    matches = [
+        block
+        for message in history
+        for block in message.content
+        if isinstance(block, AttachmentRefBlock)
+        and block.attachment_id == attachment_id
+        and isinstance(block.source_provenance, dict)
+        and all(block.source_provenance.get(key) == value for key, value in expected.items())
+    ]
+    if len(matches) != 1:
+        return False
+    for message in history:
+        for block in message.content:
+            provenance = block.source_provenance if isinstance(block, AttachmentRefBlock) else None
+            occurrences = provenance.get("consumed_occurrences") if isinstance(provenance, dict) else None
+            if not isinstance(occurrences, list):
+                continue
+            for prior in occurrences:
+                if not isinstance(prior, Mapping):
+                    continue
+                if (
+                    prior.get("receipt_event_id") == receipt_event_id
+                    and prior.get("client_op_id") == client_op_id
+                    and block.attachment_id != attachment_id
+                ):
+                    return False
+    provenance = matches[0].source_provenance
+    assert isinstance(provenance, dict)
+    occurrences = provenance.get("consumed_occurrences")
+    if not isinstance(occurrences, list):
+        occurrences = []
+    occurrence = {
+        "append_source_message_id": append_source_message_id,
+        "receipt_event_id": receipt_event_id,
+        "client_op_id": client_op_id,
+    }
+    if occurrence not in occurrences:
+        provenance["consumed_occurrences"] = [*occurrences, occurrence]
+    return True
 
 
 def _reminder_wellness_tenants(config) -> WellnessTenantResolver:
@@ -1101,6 +1282,130 @@ class OhmoSessionRuntimePool:
         ingress = getattr(self, "_camera_ingress", None)
         return ingress.trusted_capture_time_for_answer(message) if ingress is not None else None
 
+    def _trusted_user_photo_time(
+        self, message: InboundMessage, *, turn_ctx: TurnContext,
+        history: list[ConversationMessage] | None = None,
+    ) -> datetime | None:
+        """Return the authenticated participant's original image message time."""
+        metadata = message.metadata or {}
+        principal = canonical_principal(message.channel, message.sender_id)
+        config = self._gateway_config
+        owners = {
+            canonical_principal("telegram", owner)
+            for owner in getattr(config, "owner_principals", ())
+            if str(owner).strip()
+        }
+        family_principals = getattr(config, "family_principals", {})
+        family_tenant = family_principals.get(principal)
+        owner_principal = turn_ctx.is_owner is True and principal in owners
+        family_principal = False
+        if family_tenant is not None:
+            scope = self._resolve_turn_memory_scope(turn_ctx)
+            family_principal = scope is not None and scope.private_tenant == family_tenant
+        configured_private_principal = owner_principal or family_principal
+        content = message.content or ""
+        if (
+            message.sender_id == "__camera__"
+            or message.channel != "telegram"
+            or not configured_private_principal
+            or not turn_ctx.is_private
+            or not is_private_message(message)
+            or turn_ctx.channel.strip().lower() != "telegram"
+            or canonical_principal(turn_ctx.channel, turn_ctx.principal) != principal
+            or turn_ctx.is_forwarded
+            or metadata.get("_camera_authority") is CAMERA_AUTHORITY
+            or not _normalize_source_message_ref(metadata.get("message_id"))
+            or not any(_is_image_attachment(path) for path in message.media or [])
+            or OhmoSessionRuntimePool._known_user_photo_repeat(message, history or [])
+            or (
+                _USER_PHOTO_ADVISORY_RE.search(content)
+                and not _contains_nutrition_record_intent(content)
+            )
+        ):
+            return None
+        coalesced_sources = (
+            metadata.get("_coalesced_media_sources")
+            if metadata.get("_coalesced_media_provenance_authority")
+            is COALESCED_ATTACHMENT_PROVENANCE_AUTHORITY
+            else None
+        )
+        if isinstance(coalesced_sources, list):
+            for media_index, path in enumerate(message.media or []):
+                if not _is_image_attachment(path) or media_index >= len(coalesced_sources):
+                    continue
+                source = coalesced_sources[media_index]
+                if not isinstance(source, Mapping):
+                    continue
+                source_id = _normalize_source_message_ref(source.get("source_message_id"))
+                source_time = source.get("received_at")
+                if source_id is not None and isinstance(source_time, str):
+                    normalized = _trusted_utc_iso(source_time)
+                    if normalized is not None:
+                        return datetime.fromisoformat(normalized)
+            return None
+        return _trusted_inbound_event_time(message)
+
+    @staticmethod
+    def _known_user_photo_repeat(
+        message: InboundMessage, history: list[ConversationMessage]
+    ) -> bool:
+        """Recognize exact bytes already seen in this trusted private owner session."""
+        current = compute_attachment_fingerprints(message.media or [])
+        current_hashes = {
+            item.get("sha256") for item in current if isinstance(item, Mapping)
+        }
+        if not current_hashes:
+            return False
+        principal = f"{message.channel}:{canonical_principal(message.channel, message.sender_id)}"
+        for prior in history:
+            if prior.role != "user":
+                continue
+            for block in prior.content:
+                if not isinstance(block, AttachmentRefBlock):
+                    continue
+                provenance = block.source_provenance
+                if (
+                    not isinstance(provenance, Mapping)
+                    or provenance.get("principal") != principal
+                    or provenance.get("chat_id") != str(message.chat_id)
+                    or provenance.get("is_group") is not False
+                    or provenance.get("is_forwarded") is not False
+                    or provenance.get("timestamp_authority") != "inbound_event_timestamp"
+                ):
+                    continue
+                if block.attachment_id in current_hashes:
+                    return True
+        return False
+
+    @staticmethod
+    def _with_user_photo_context(
+        prompt: str, sent_at: datetime | None, *, known_repeat: bool = False
+    ) -> str:
+        if known_repeat:
+            return (
+                prompt + "\n\n# Previously seen user photo\n"
+                "This exact image was already sent by the owner in this private session. "
+                "Treat it as the existing photo/source; do not record another meal unless "
+                "the user explicitly says this is a new, separate consumption. Do not use "
+                "the resent image's send time as a meal-time default."
+            )
+        if sent_at is None:
+            return prompt
+        return (
+            prompt + "\n\n# Trusted user photo intake\n"
+                "The authenticated participant sent the attached image directly at "
+            f"{sent_at.isoformat()}. Treat a clear food photo as a direct request to log "
+            "the pictured food as consumed; do not ask whether it was eaten. If the image "
+            "does not clearly establish food or its portion, ask one useful clarification. "
+            "For nonfood images, or if the accompanying text asks only for identification, "
+            "advice, a recipe, or a calorie estimate, do not create a meal. An "
+            "explicit meal date or time in the user's text overrides the photo send time. "
+                "Use the gateway's trusted photo send time as the default only when no explicit "
+                "alternative was given. This is a gateway send-date convention, not evidence "
+                "that the food was physically eaten at that exact instant. Claim persistence "
+                "only after a durable append receipt."
+        )
+
     @staticmethod
     def _with_camera_answer_context(prompt: str, capture_time: datetime | None) -> str:
         if capture_time is None:
@@ -1458,6 +1763,16 @@ class OhmoSessionRuntimePool:
         camera_meal_at = self._trusted_camera_answer_time(
             message, session_key=session_key, turn_ctx=turn_ctx
         )
+        prior_messages = getattr(bundle.engine, "messages", [])
+        prior_messages = prior_messages if isinstance(prior_messages, list) else []
+        user_photo_repeat = self._known_user_photo_repeat(message, prior_messages)
+        user_photo_meal_at = (
+            None
+            if camera_meal_at is not None
+            else self._trusted_user_photo_time(
+                message, turn_ctx=turn_ctx, history=prior_messages
+            )
+        )
         system_prompt = await self._runtime_system_prompt(
                     bundle,
                     user_prompt,
@@ -1467,6 +1782,9 @@ class OhmoSessionRuntimePool:
                 )
         system_prompt = self._with_camera_turn_context(
             system_prompt, message, camera_meal_at
+        )
+        system_prompt = self._with_user_photo_context(
+            system_prompt, user_photo_meal_at, known_repeat=user_photo_repeat
         )
         bundle.engine.set_system_prompt(system_prompt)
         if wellness_reminder is not None:
@@ -1533,6 +1851,11 @@ class OhmoSessionRuntimePool:
         )
         if recorder is not None and camera_meal_at is not None:
             recorder.set_authoritative_nutrition_meal_at(camera_meal_at)
+        elif recorder is not None and user_photo_meal_at is not None:
+            recorder.set_authoritative_nutrition_meal_at(
+                user_photo_meal_at, preserve_explicit=True
+            )
+            recorder.mark_trusted_direct_photo_intent()
         camera_context_question = (
             message.metadata.get("_camera_context_question")
             is CAMERA_CONTEXT_QUESTION_AUTHORITY
@@ -1639,6 +1962,8 @@ class OhmoSessionRuntimePool:
                             recorder=recorder,
                             todo_lifecycle=todo_lifecycle,
                             camera_meal_at=camera_meal_at,
+                            user_photo_meal_at=user_photo_meal_at,
+                            user_photo_repeat=user_photo_repeat,
                         )
                     ):
                         yield update
@@ -1669,6 +1994,8 @@ class OhmoSessionRuntimePool:
                             recorder=recorder,
                             todo_lifecycle=todo_lifecycle,
                             camera_meal_at=camera_meal_at,
+                            user_photo_meal_at=user_photo_meal_at,
+                            user_photo_repeat=user_photo_repeat,
                         )
                     ):
                         yield update
@@ -1689,6 +2016,8 @@ class OhmoSessionRuntimePool:
                         recorder=recorder,
                         todo_lifecycle=todo_lifecycle,
                         camera_meal_at=camera_meal_at,
+                        user_photo_meal_at=user_photo_meal_at,
+                        user_photo_repeat=user_photo_repeat,
                     )
                 ):
                     yield update
@@ -1706,6 +2035,8 @@ class OhmoSessionRuntimePool:
                     recorder=recorder,
                     todo_lifecycle=todo_lifecycle,
                     camera_meal_at=camera_meal_at,
+                    user_photo_meal_at=user_photo_meal_at,
+                    user_photo_repeat=user_photo_repeat,
                 )
             ):
                 yield update
@@ -1742,6 +2073,8 @@ class OhmoSessionRuntimePool:
         recorder: GatewayEvalRecorder | None = None,
         todo_lifecycle: bool = True,
         camera_meal_at: datetime | None = None,
+        user_photo_meal_at: datetime | None = None,
+        user_photo_repeat: bool = False,
     ):
         if result.refresh_runtime:
             bundle = await self._refresh_bundle(
@@ -1786,6 +2119,8 @@ class OhmoSessionRuntimePool:
                     recorder=recorder,
                     todo_lifecycle=todo_lifecycle,
                     camera_meal_at=camera_meal_at,
+                    user_photo_meal_at=user_photo_meal_at,
+                    user_photo_repeat=user_photo_repeat,
                 ):
                     yield update
             finally:
@@ -1917,7 +2252,10 @@ class OhmoSessionRuntimePool:
         recorder: GatewayEvalRecorder | None = None,
         todo_lifecycle: bool = True,
         camera_meal_at: datetime | None = None,
+        user_photo_meal_at: datetime | None = None,
+        user_photo_repeat: bool = False,
     ):
+        message.metadata.pop("_selected_source_binding", None)
         todo_error = getattr(bundle, "_todo_runtime_error", None)
         if todo_lifecycle and isinstance(todo_error, TodoRuntimeStateError):
             yield GatewayStreamUpdate(
@@ -1933,9 +2271,11 @@ class OhmoSessionRuntimePool:
             memory_scope=memory_scope,
             include_todo=todo_lifecycle,
         )
-        bundle.engine.set_system_prompt(
-            self._with_camera_turn_context(system_prompt, message, camera_meal_at)
+        system_prompt = self._with_camera_turn_context(system_prompt, message, camera_meal_at)
+        system_prompt = self._with_user_photo_context(
+            system_prompt, user_photo_meal_at, known_repeat=user_photo_repeat
         )
+        bundle.engine.set_system_prompt(system_prompt)
         todo_error = getattr(bundle, "_todo_runtime_error", None)
         if todo_lifecycle and isinstance(todo_error, TodoRuntimeStateError):
             yield GatewayStreamUpdate(
@@ -1966,6 +2306,66 @@ class OhmoSessionRuntimePool:
             },
         )
         previous_group_request = self._set_group_request_context(bundle, message, session_key)
+        active_turn = {"active": True}
+        attempted_attachment_ids: set[str] = set()
+
+        def restore_independent_time_default() -> None:
+            if recorder is None:
+                return
+            recorder.set_authoritative_nutrition_meal_at(
+                camera_meal_at or user_photo_meal_at,
+                preserve_explicit=True,
+            )
+
+        def on_attachment_load_started(attachment_id: str) -> None:
+            if not active_turn["active"]:
+                return
+            attempted_attachment_ids.add(attachment_id)
+            message.metadata.pop("_selected_source_binding", None)
+            restore_independent_time_default()
+
+        def bind_loaded_attachment(attachment_id: str) -> str | None:
+            if not active_turn["active"]:
+                return None
+            if len(attempted_attachment_ids) != 1 or attachment_id not in attempted_attachment_ids:
+                message.metadata.pop("_selected_source_binding", None)
+                restore_independent_time_default()
+                return None
+            if memory_scope is None or not isinstance(memory_scope, MemoryScope):
+                return None
+            principal = canonical_principal("telegram", turn_ctx.principal)
+            family_tenant = self._gateway_config.family_principals.get(principal)
+            binding = resolve_selected_photo_source(
+                attachment_id=attachment_id,
+                history=getattr(bundle.engine, "messages", []),
+                message=message,
+                turn_ctx=turn_ctx,
+                session_key=session_key,
+                gateway_session_id=bundle.session_id,
+                tenant_id=memory_scope.private_tenant,
+                authorized_participant=(
+                    turn_ctx.is_owner is True
+                    or family_tenant == memory_scope.private_tenant
+                ),
+            )
+            if binding is None:
+                message.metadata.pop("_selected_source_binding", None)
+                restore_independent_time_default()
+                return None
+            stamped_time = _trusted_utc_iso(binding.get("received_at"))
+            if stamped_time is None:
+                message.metadata.pop("_selected_source_binding", None)
+                restore_independent_time_default()
+                return None
+            message.metadata["_selected_source_binding"] = (
+                _SELECTED_SOURCE_AUTHORITY, binding
+            )
+            if recorder is not None:
+                recorder.set_authoritative_nutrition_meal_at(
+                    datetime.fromisoformat(stamped_time), preserve_explicit=True,
+                    historical_photo=True,
+                )
+            return stamped_time
         decision_trace_restore = _install_gateway_decision_trace_recorder(
             bundle.engine,
             recorder,
@@ -1973,6 +2373,8 @@ class OhmoSessionRuntimePool:
         self._register_conversation_image_tool(
             bundle,
             current_message=user_message,
+            on_attachment_load_started=on_attachment_load_started,
+            on_attachment_loaded=bind_loaded_attachment,
         )
         try:
             async for event in bundle.engine.submit_message(user_message):
@@ -2051,6 +2453,7 @@ class OhmoSessionRuntimePool:
             self._clear_reminder_context(bundle)
             raise
         finally:
+            active_turn["active"] = False
             _restore_gateway_decision_trace_recorder(decision_trace_restore)
             self._register_conversation_image_tool(bundle)
         self._restore_group_request_context(bundle, previous_group_request)
@@ -2111,6 +2514,39 @@ class OhmoSessionRuntimePool:
             and finalizer_nutrition.record_type == "meal_observation"
             and finalizer_nutrition.consumption_status == "consumed"
         )
+        requested_correction = bool(
+            finalizer_nutrition is not None
+            and finalizer_nutrition.record_type in {"meal_correction", "meal_deletion"}
+            and message.metadata.get("_camera_correction") is not CAMERA_AUTHORITY
+        )
+        selected_binding = message.metadata.get("_selected_source_binding")
+        native_reply_target = _normalize_source_message_ref(
+            message.metadata.get("reply_to_message_id")
+        )
+        principal_id = canonical_principal("telegram", turn_ctx.principal)
+        configured_family_tenant = self._gateway_config.family_principals.get(principal_id)
+        native_reply_authorized = bool(
+            native_reply_target is not None
+            and turn_ctx.channel == "telegram"
+            and message.channel == "telegram"
+            and turn_ctx.is_private
+            and not turn_ctx.is_forwarded
+            and is_private_message(message)
+            and not turn_ctx.camera_authorized
+            and isinstance(memory_scope, MemoryScope)
+            and memory_scope.private_tenant
+            and (
+                turn_ctx.is_owner is True
+                or configured_family_tenant == memory_scope.private_tenant
+            )
+        )
+        ordinary_correction = bool(
+            requested_correction
+            and isinstance(selected_binding, tuple)
+            and len(selected_binding) == 2
+            and selected_binding[0] is _SELECTED_SOURCE_AUTHORITY
+            or requested_correction and native_reply_authorized
+        )
         if camera_clarification:
             # A context-bound but unconfirmed answer may be an unrelated owner
             # turn. Preserve the model's ordinary response while keeping the
@@ -2122,6 +2558,8 @@ class OhmoSessionRuntimePool:
             reply = _append_nutrition_saved_status(reply, finalizer_nutrition)
         elif ordinary_meal:
             reply = _append_nutrition_saved_status(reply, finalizer_nutrition)
+        elif ordinary_correction:
+            pass
 
         self._maybe_schedule_memory_judge(
             bundle,
@@ -2160,11 +2598,72 @@ class OhmoSessionRuntimePool:
                 and append_receipt.assistant_metadata.get("client_op_id") == append_receipt.assistant_client_op_id
                 and append_receipt.assistant_metadata.get("tenant_id") == memory_scope.private_tenant
                 and append_receipt.assistant_metadata.get("source_principal") == f"{message.channel}:{canonical_principal(message.channel, turn_ctx.principal)}"
+                and append_receipt.assistant_metadata.get("gateway_session_id") == turn_ctx.session_id
                 and append_receipt.assistant_metadata.get("source_message_id") == _normalize_source_message_ref(message.metadata.get("message_id"))
-                and append_receipt.assistant_metadata.get("received_at") == _trusted_utc_iso(message.timestamp)
+                and append_receipt.assistant_metadata.get("received_at")
+                == _trusted_utc_iso(_trusted_inbound_event_time(message))
+                and append_receipt.assistant_metadata.get("is_group") is False
+                and append_receipt.assistant_metadata.get("is_forwarded") is False
                 and append_receipt.assistant_metadata.get("ingest_source") == "telegram"
                 and append_receipt.assistant_metadata.get("confirmation_required") is False
                 and _receipt_has_consumed_nutrition(append_receipt.assistant_metadata)
+                and isinstance(append_receipt.assistant_content, str)
+            )
+            if ordinary_meal_saved and append_receipt is not None:
+                stored_metadata = append_receipt.assistant_metadata
+                if (
+                    isinstance(stored_metadata, Mapping)
+                    and isinstance(stored_metadata.get("photo_occurrence_source"), Mapping)
+                ):
+                    append_source = stored_metadata.get("source_message_id")
+                    occurrence_source = stored_metadata["photo_occurrence_source"]
+                    if (
+                        isinstance(append_source, str)
+                        and occurrence_source.get("tenant_id") == stored_metadata.get("tenant_id")
+                        and occurrence_source.get("source_principal") == stored_metadata.get("source_principal")
+                        and occurrence_source.get("gateway_session_id") == stored_metadata.get("gateway_session_id")
+                        and _record_consumed_photo_occurrence(
+                        getattr(bundle.engine, "messages", []),
+                        occurrence_source,
+                        receipt_event_id=append_receipt.assistant_message_id,
+                        client_op_id=append_receipt.assistant_client_op_id,
+                        append_source_message_id=append_source,
+                        )
+                    ):
+                        await self._save_snapshot(bundle, session_key, user_prompt)
+            expected_selected = (
+                _build_conversation_turn_metadata(
+                    turn_ctx=turn_ctx,
+                    message=message,
+                    scope=memory_scope,
+                    recorder=recorder,
+                )[1]
+                if ordinary_correction
+                and append_receipt is not None
+                and isinstance(memory_scope, MemoryScope)
+                else {}
+            )
+            ordinary_correction_saved = bool(
+                ordinary_correction
+                and append_receipt is not None
+                and isinstance(append_receipt.assistant_metadata, Mapping)
+                and append_receipt.user_client_op_id == f"{append_receipt.assistant_metadata.get('logical_turn_id')}:user"
+                and append_receipt.assistant_client_op_id == f"{append_receipt.assistant_metadata.get('logical_turn_id')}:assistant"
+                and append_receipt.assistant_metadata.get("role") == "assistant"
+                and append_receipt.assistant_metadata.get("client_op_id") == append_receipt.assistant_client_op_id
+                and isinstance(memory_scope, MemoryScope)
+                and append_receipt.assistant_metadata.get("tenant_id") == memory_scope.private_tenant
+                and append_receipt.assistant_metadata.get("source_principal") == f"{message.channel}:{canonical_principal(message.channel, turn_ctx.principal)}"
+                and append_receipt.assistant_metadata.get("gateway_session_id") == turn_ctx.session_id
+                and append_receipt.assistant_metadata.get("source_message_id") == _normalize_source_message_ref(message.metadata.get("message_id"))
+                and append_receipt.assistant_metadata.get("reply_to_source_message_id") == _normalize_source_message_ref(message.metadata.get("reply_to_message_id"))
+                and append_receipt.assistant_metadata.get("received_at") == _trusted_utc_iso(_trusted_inbound_event_time(message))
+                and append_receipt.assistant_metadata.get("is_forwarded") is False
+                and append_receipt.assistant_metadata.get("is_group") is False
+                and append_receipt.assistant_metadata.get("ingest_source") == "telegram"
+                and append_receipt.assistant_metadata.get("confirmation_required") is False
+                and append_receipt.assistant_metadata.get("target_meal_id") == expected_selected.get("target_meal_id")
+                and append_receipt.assistant_metadata.get("selected_source") == expected_selected.get("selected_source")
                 and isinstance(append_receipt.assistant_content, str)
             )
             committed_annotation = None
@@ -2185,7 +2684,32 @@ class OhmoSessionRuntimePool:
                 else:
                     # A durable retry may carry a different model proposal.
                     # The final answer must describe the exact event already saved.
-                    reply = append_receipt.assistant_content
+                    meal_status = (
+                        "Записано. Баланс обновляется."
+                        if committed_annotation.meal_at is not None
+                        or committed_annotation.meal_date is not None
+                        else "Записано; приём пищи пока не привязан к дате. Баланс обновляется."
+                    )
+                    reply = _committed_nutrition_reply(
+                        committed_annotation, status=meal_status
+                    )
+            if ordinary_correction_saved and append_receipt is not None:
+                stored_trace = append_receipt.assistant_metadata.get("decision_trace")
+                stored_annotations = stored_trace.get("annotations") if isinstance(stored_trace, Mapping) else None
+                stored_nutrition = stored_annotations.get("nutrition") if isinstance(stored_annotations, Mapping) else None
+                try:
+                    stored_correction = NutritionAnnotationV2.model_validate(stored_nutrition)
+                except (TypeError, ValueError):
+                    ordinary_correction_saved = False
+                else:
+                    if stored_correction.record_type not in {"meal_correction", "meal_deletion"}:
+                        ordinary_correction_saved = False
+                    else:
+                        reply = (
+                            "Удаление сохранено; баланс обновляется."
+                            if stored_correction.record_type == "meal_deletion"
+                            else "Изменение сохранено; баланс обновляется."
+                        )
             if camera_ingress is not None and turn_ctx.camera_authorized:
                 camera_ingress.complete(
                     message,
@@ -2236,8 +2760,17 @@ class OhmoSessionRuntimePool:
                     )
                 else:
                     reply = "Не удалось подтвердить сохранение записи."
+            elif requested_correction:
+                if ordinary_correction_saved and append_receipt is not None:
+                    metadata.update(
+                        nutrition_append_event_id=append_receipt.assistant_message_id,
+                        nutrition_sync_status="pending",
+                    )
+                else:
+                    reply = "Не удалось подтвердить сохранение изменения."
             if final_media:
                 metadata.update({"_media": final_media, "_final_media_fallback": True})
+            message.metadata.pop("_selected_source_binding", None)
             yield GatewayStreamUpdate(
                 kind="final",
                 text=reply,
@@ -2282,6 +2815,7 @@ class OhmoSessionRuntimePool:
             and message.metadata.get("_camera_correction") is CAMERA_AUTHORITY
             and message.metadata.get("_camera_answer") == "no"
         )
+        selected_binding = message.metadata.get("_selected_source_binding")
         camera_context_question = (
             turn_ctx.camera_authorized
             and turn_ctx.principal == self._gateway_config.camera_ingress.principal
@@ -2294,6 +2828,33 @@ class OhmoSessionRuntimePool:
             if isinstance(annotation, Mapping) and annotation.get("schema_version", 1) == 2
             else None
         )
+        ordinary_correction = bool(
+            validated is not None
+            and validated.record_type in {"meal_correction", "meal_deletion"}
+            and isinstance(selected_binding, tuple)
+            and len(selected_binding) == 2
+            and selected_binding[0] is _SELECTED_SOURCE_AUTHORITY
+        )
+        native_reply_candidate = bool(
+            validated is not None
+            and validated.record_type in {"meal_correction", "meal_deletion"}
+            and not camera_correction
+            and turn_ctx.channel == "telegram"
+            and message.channel == "telegram"
+            and turn_ctx.is_private
+            and not turn_ctx.is_forwarded
+            and is_private_message(message)
+            and _normalize_source_message_ref(message.metadata.get("reply_to_message_id"))
+            is not None
+        )
+        if (
+            validated is not None
+            and validated.record_type in {"meal_correction", "meal_deletion"}
+            and not camera_correction
+            and not ordinary_correction
+            and not native_reply_candidate
+        ):
+            return None
         if camera_context_question:
             ingress = getattr(self, "_camera_ingress", None)
             camera_config = self._gateway_config.camera_ingress
@@ -2384,6 +2945,15 @@ class OhmoSessionRuntimePool:
             if camera_context_question:
                 raise ValueError("Camera context clarification is not authorized for append")
             return
+        if native_reply_candidate and not ordinary_correction:
+            ordinary_correction = self._honcho_turn_allowed(turn_ctx, scope)
+        if (
+            validated is not None
+            and validated.record_type in {"meal_correction", "meal_deletion"}
+            and not camera_correction
+            and not ordinary_correction
+        ):
+            return
         if camera_correction:
             ingress = getattr(self, "_camera_ingress", None)
             camera_config = self._gateway_config.camera_ingress
@@ -2415,6 +2985,12 @@ class OhmoSessionRuntimePool:
             scope=scope,
             recorder=recorder,
         )
+        if (
+            ordinary_correction
+            and not assistant_metadata.get("target_meal_id")
+            and not _normalize_source_message_ref(message.metadata.get("reply_to_message_id"))
+        ):
+            return None
         if (
             message.channel == "telegram"
             and turn_ctx.is_private
@@ -2450,6 +3026,7 @@ class OhmoSessionRuntimePool:
             durable=(
                 camera_bound_answer
                 or camera_context_question
+                or ordinary_correction
                 or (
                     validated is not None
                     and validated.record_type == "meal_observation"
@@ -3543,6 +4120,8 @@ class OhmoSessionRuntimePool:
         bundle: RuntimeBundle,
         *,
         current_message: ConversationMessage | str | None = None,
+        on_attachment_load_started=None,
+        on_attachment_loaded=None,
     ) -> None:
         registry = getattr(bundle, "tool_registry", None)
         tools = getattr(registry, "_tools", None)
@@ -3563,6 +4142,8 @@ class OhmoSessionRuntimePool:
                 is_attachment_allowed=lambda attachment_id: self._conversation_attachment_allowed(
                     bundle, attachment_id
                 ),
+                on_load_started=on_attachment_load_started,
+                on_loaded=on_attachment_loaded,
             )
         )
 
@@ -4279,7 +4860,7 @@ def _build_inbound_user_message(
         prefix = "\n\n" if base else ""
         content.append(TextBlock(text=prefix + attachment_notes))
 
-    source_timestamp = _trusted_utc_iso(message.timestamp)
+    source_timestamp = _trusted_utc_iso(_trusted_inbound_event_time(message))
     source_provenance: dict[str, object] = {
         "schema_version": 1,
         "channel": str(message.channel),
@@ -4294,6 +4875,11 @@ def _build_inbound_user_message(
         "is_group": not is_private_message(message),
         "is_forwarded": build_turn_context(message, session_id="").is_forwarded,
         "source_message_id": _normalize_source_message_ref(
+            (message.metadata or {}).get("message_id")
+        ),
+        # The current user event can coalesce multiple inbound messages. Keep
+        # its append identity next to the original attachment's own source ID.
+        "append_source_message_id": _normalize_source_message_ref(
             (message.metadata or {}).get("message_id")
         ),
     }

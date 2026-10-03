@@ -141,9 +141,13 @@ async def test_load_conversation_image_returns_trusted_transient_content_only(
     workspace = initialize_workspace(tmp_path / ".ohmo-home")
     store = AttachmentStore(workspace)
     ref = store.ingest_bytes(PNG_BYTES, media_type="image/png", label="meal.png")
+    attempts: list[str] = []
+    loaded: list[str] = []
     tool = LoadConversationImageTool(
         store,
         is_attachment_allowed=lambda attachment_id: attachment_id == ref.attachment_id,
+        on_load_started=attempts.append,
+        on_loaded=loaded.append,
     )
 
     result = await tool.execute(
@@ -152,6 +156,8 @@ async def test_load_conversation_image_returns_trusted_transient_content_only(
     )
 
     assert result.is_error is False
+    assert attempts == [ref.attachment_id]
+    assert loaded == [ref.attachment_id]
     assert ref.attachment_id in result.output
     transient = result.metadata["_openharness_transient_image"]
     assert isinstance(transient, ImageBlock)
@@ -162,9 +168,13 @@ async def test_load_conversation_image_returns_trusted_transient_content_only(
 @pytest.mark.asyncio
 async def test_load_conversation_image_rejects_nonexistent_id(tmp_path: Path) -> None:
     workspace = initialize_workspace(tmp_path / ".ohmo-home")
+    attempts: list[str] = []
+    loaded: list[str] = []
     tool = LoadConversationImageTool(
         AttachmentStore(workspace),
         is_attachment_allowed=lambda _attachment_id: True,
+        on_load_started=attempts.append,
+        on_loaded=loaded.append,
     )
 
     result = await tool.execute(
@@ -175,6 +185,8 @@ async def test_load_conversation_image_rejects_nonexistent_id(tmp_path: Path) ->
     assert result.is_error is True
     assert result.output == "Conversation image unavailable."
     assert "_openharness_transient_image" not in result.metadata
+    assert attempts == ["0" * 64]
+    assert loaded == []
 
 
 @pytest.mark.asyncio

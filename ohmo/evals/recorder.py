@@ -321,9 +321,19 @@ class GatewayEvalRecorder:
         nutrition = annotations.get("nutrition")
         return nutrition if isinstance(nutrition, Mapping) else None
 
-    def set_authoritative_nutrition_meal_at(self, meal_at: datetime | None) -> None:
-        """Stamp the trusted Dropbox capture time before trace validation."""
-        self._runtime_recorder.set_authoritative_nutrition_meal_at(meal_at)
+    def set_authoritative_nutrition_meal_at(
+        self, meal_at: datetime | None, *, preserve_explicit: bool = False,
+        historical_photo: bool = False,
+    ) -> None:
+        """Bind a gateway-owned default time, optionally preserving explicit user dates."""
+        self._runtime_recorder.set_authoritative_nutrition_meal_at(
+            meal_at, preserve_explicit=preserve_explicit,
+            historical_photo=historical_photo,
+        )
+
+    def mark_trusted_direct_photo_intent(self) -> None:
+        """Treat a verified configured participant photo as a nutrition trace request."""
+        self._runtime_recorder.mark_trusted_direct_photo_intent()
 
     def forbid_nutrition_record(self) -> None:
         """Prevent a Camera classification or unbound reply from creating a meal."""
@@ -408,7 +418,10 @@ class _GatewayDecisionTraceRecorderAdapter:
         self._latest_finalization: EvalEvent | None = None
         self._saw_invalid_finalization = False
         self._nutrition_applicable = False
+        self._trusted_direct_photo_intent = False
         self._authoritative_nutrition_meal_at: datetime | None = None
+        self._preserve_explicit_nutrition_time = False
+        self._authoritative_time_is_historical = False
         self._nutrition_record_forbidden = False
         self._explicit_new_consumption_forbidden = False
 
@@ -418,10 +431,18 @@ class _GatewayDecisionTraceRecorderAdapter:
     def forbid_explicit_new_consumption(self) -> None:
         self._explicit_new_consumption_forbidden = True
 
-    def set_authoritative_nutrition_meal_at(self, meal_at: datetime | None) -> None:
+    def mark_trusted_direct_photo_intent(self) -> None:
+        self._trusted_direct_photo_intent = True
+
+    def set_authoritative_nutrition_meal_at(
+        self, meal_at: datetime | None, *, preserve_explicit: bool = False,
+        historical_photo: bool = False,
+    ) -> None:
         if meal_at is not None and (meal_at.tzinfo is None or meal_at.utcoffset() is None):
             raise ValueError("authoritative nutrition meal_at must be timezone-aware")
         self._authoritative_nutrition_meal_at = meal_at
+        self._preserve_explicit_nutrition_time = preserve_explicit
+        self._authoritative_time_is_historical = historical_photo and meal_at is not None
 
     def record(
         self,
@@ -485,6 +506,18 @@ class _GatewayDecisionTraceRecorderAdapter:
         nutrition = annotations.get("nutrition") if isinstance(annotations, Mapping) else None
         if not isinstance(nutrition, Mapping) or nutrition.get("schema_version") != 2:
             return payload
+        if (
+            self._preserve_explicit_nutrition_time
+            and (
+                nutrition.get("record_type") != "meal_observation"
+                or nutrition.get("consumption_status") != "consumed"
+                or nutrition.get("meal_at") is not None
+                or nutrition.get("meal_date") is not None
+            )
+        ):
+            return payload
+        if self._authoritative_time_is_historical and nutrition.get("explicit_new_consumption") is True:
+            return payload
         stamped = copy.deepcopy(dict(payload))
         stamped_annotations = dict(stamped.get("annotations") or {})
         stamped_nutrition = dict(stamped_annotations.get("nutrition") or {})
@@ -504,7 +537,7 @@ class _GatewayDecisionTraceRecorderAdapter:
 
     def trace_requirement_signals(self, final_text: str) -> tuple[str, ...]:
         intent_text = self._user_goal if self._user_goal.strip() else final_text
-        if _contains_nutrition_record_intent(intent_text):
+        if self._trusted_direct_photo_intent or _contains_nutrition_record_intent(intent_text):
             self._nutrition_applicable = True
             return (_NUTRITION_REQUIREMENT_SIGNAL,)
         return ()
