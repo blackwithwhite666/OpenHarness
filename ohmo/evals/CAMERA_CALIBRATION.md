@@ -27,6 +27,29 @@ Legacy `CommitEvent` booleans and
 ledger flags remain historical fields only and cannot produce PASS. Missing raw
 evidence is `INCONCLUSIVE`; complete scoped absence fails a positive goal.
 
+The product reference uses only the original image, curated source prefix, and
+trusted `Case.origin`. Its `consumed` label means the expected meal state under
+the selected source policy. It does not claim physical ingestion or a saved
+database record. For person-sent clear food with a supportable visible portion
+or known unit, the reference defaults to a meal without separate eating
+confirmation. It should give a useful calorie estimate, state calorie
+uncertainty, and not demand exact grams or a label when an estimate is useful.
+An explicit partial amount overrides a whole-unit default. Explicit denial,
+analysis-only or informational context, and recipe requests override that
+default. Unclear food or a genuinely unsupported meaningful amount remains
+uncertain pending useful clarification. Clearly nonfood means no meal from
+that image; it does not claim the person ate nothing elsewhere.
+
+Camera food requires a meaningful owner consumption answer in the curated
+prefix, bound to the image and including current unit or partial-amount details.
+Pixels and the unchanged validated native delivery receipt alone do not confirm
+consumption. Missing or unresolved Camera consumption remains uncertain, not a
+definite negative. A native receipt remains a Case validation prerequisite.
+Neither persistence evidence, reviewed state, expected goal/kcal, full candidate
+dialogue, answer, receipt, nor result enters the reference prompt. The separate
+historical `JudgeCase` prompt and its physical-consumption interpretation remain
+unchanged.
+
 After A1 PASS only, three separate native subscription Luna medium votes score
 dialogue efficiency. A2 sees the full candidate dialogue, including assistant
 updates and the gateway final. It never falls back to the short reference prefix
@@ -44,6 +67,11 @@ required. The base median score and the one-time bonus remain separate in the
 report. Displayed controls, typed replies, malformed or foreign callbacks, and
 cases without callback evidence receive no bonus. Old vote responses remain
 valid and default to no bonus. A2 never implies that a meal was persisted.
+
+The product reference prompt changed for this selected policy. New product runs
+require a fresh exact-prompt native Sol 6.1 high freeze before intake or any
+conformance claim. Existing reports remain dated historical results and are not
+relabeled or admitted through a prompt bypass.
 
 New reference results use native Padavan `gpt-6.1-sol` with high reasoning;
 author results use `gpt-6-luna` with medium reasoning. In result JSON, model IDs

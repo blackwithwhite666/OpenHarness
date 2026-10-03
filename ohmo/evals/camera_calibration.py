@@ -340,16 +340,16 @@ def score_a1(case: Case, reference: Reference) -> tuple[str, str]:
 def sol_prompt(case: Case | JudgeCase) -> str:
     turns = case.reference_prefix if isinstance(case, JudgeCase) else case.prefix
     prefix = [{"role": turn.role, "text": turn.text} for turn in turns]
-    target_scope = (
-        "Judge consumption_state and kcal for the food shown in the attached image and "
-        "this selected trajectory, not whether the person ate unrelated food elsewhere. "
-        "If the image clearly contains no food, return not_consumed with kcal null and "
-        "estimated_kcal null: no meal from this image, without claiming the person ate "
-        "nothing elsewhere. If the image contains food but whether it was eaten is unclear, "
-        "return uncertain with kcal null; a supportable photo estimate may still be provided "
-        "as estimated_kcal. "
-    )
     if isinstance(case, JudgeCase):
+        target_scope = (
+            "Judge consumption_state and kcal for the food shown in the attached image and "
+            "this selected trajectory, not whether the person ate unrelated food elsewhere. "
+            "If the image clearly contains no food, return not_consumed with kcal null and "
+            "estimated_kcal null: no meal from this image, without claiming the person ate "
+            "nothing elsewhere. If the image contains food but whether it was eaten is unclear, "
+            "return uncertain with kcal null; a supportable photo estimate may still be provided "
+            "as estimated_kcal. "
+        )
         return (
             "Use only this image and dialogue prefix. "
             + target_scope
@@ -363,12 +363,33 @@ def sol_prompt(case: Case | JudgeCase) -> str:
             "may still be provided. Do not infer "
             "a meal record from an estimate. Prefix: " + json.dumps(prefix, ensure_ascii=False)
         )
+    target_scope = (
+        "Judge the expected policy meal state and kcal for the food shown in this image and "
+        "selected trajectory. Here consumed means the meal state expected by the selected "
+        "source policy; it does not assert physical ingestion or that a database record was saved. "
+        "If the image clearly contains no food, return not_consumed with kcal null: there is no "
+        "meal from this image, without claiming the person ate nothing elsewhere. Explicitly "
+        "stated denial, analysis-only or informational context, and recipe requests override a "
+        "person-photo meal default and mean not_consumed. For origin=person, clear food with a "
+        "supportable visible portion or known unit defaults to consumed without separate eating "
+        "confirmation; estimate kcal from the visible amount and state calorie uncertainty "
+        "honestly. Do not ask for exact grams or a nutrition label when a useful estimate exists. "
+        "An explicit partial amount overrides a whole-unit default. Unknown exact grams alone do "
+        "not force uncertainty when a reasonable visible-portion or known-unit estimate exists. "
+        "For origin=camera, food pixels and a native delivery receipt alone never confirm "
+        "consumption: require a meaningful owner answer in this curated prefix, bound to this "
+        "image, including any stated unit or partial amount. Without that answer, return uncertain, "
+        "not not_consumed. For either origin, unclear food or a genuinely unsupported meaningful "
+        "amount remains uncertain pending useful clarification. "
+    )
     return (
-        "Use only this image and dialogue prefix. " + target_scope + "Return one JSON object with "
-        "consumption_state (consumed|not_consumed|uncertain), kcal (positive number "
-        "only if consumed, else null), uncertainty (brief explanation). If the image contains "
-        "food and consumption or amount is unclear, return uncertain; do not guess. Prefix: "
-        + json.dumps(prefix, ensure_ascii=False)
+        "Use only this original image, trusted Case.origin, and curated dialogue prefix. "
+        f"Selected trusted source: origin={case.origin}. "
+        + target_scope + "Return one JSON object with consumption_state "
+        "(consumed|not_consumed|uncertain), kcal (positive number only if consumed, else null), "
+        "and uncertainty (brief explanation). Do not use reviewed state, persistence evidence, "
+        "expected goal/kcal, candidate dialogue, answer, receipt, or result to select the reference. "
+        "Prefix: " + json.dumps(prefix, ensure_ascii=False)
     )
 
 
