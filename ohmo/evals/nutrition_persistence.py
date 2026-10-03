@@ -115,6 +115,14 @@ def _normalize_login(value: str) -> str:
     return normalized.lower()
 
 
+def _validated_nutrition_annotation(value: object) -> dict[str, Any] | None:
+    """Normalize one recorded schema-v2 annotation or fail closed."""
+    try:
+        return NutritionAnnotationV2.model_validate(value).model_dump(mode="json")
+    except (TypeError, ValueError):
+        return None
+
+
 def derive_meal_id(*, tenant_id: str, source_principal: str, gateway_session_id: str,
                    source_message_id: str) -> str:
     """Mirror Telegent's published stable identity derivation without importing it."""
@@ -195,6 +203,160 @@ def _event_from_raw(message: dict[str, Any]) -> dict[str, Any] | None:
     }
 
 
+def _trusted_context_target(goal: Goal, event: dict[str, Any], turns: list[dict[str, Any]],
+                            events: list[dict[str, Any]]) -> str | None:
+    """Resolve a no-reply edit only through both recorded accepted receipts."""
+    matches = [turn for turn in turns
+               if turn.get("episode_id") == event.get("trace_episode_id")
+               and turn.get("source_message_id") == event.get("source_message_id")
+               and turn.get("logical_turn_id") == event.get("logical_turn_id")
+               and turn.get("operation_id") == event.get("operation_id")
+               and turn.get("principal_id") == event.get("principal_id")]
+    if len(matches) != 1:
+        return None
+    final = matches[0].get("gateway_final_metadata")
+    evidence = _dict(final.get("nutrition_context_evidence")) if isinstance(final, dict) else None
+    committed = _dict(final.get("nutrition_committed_annotation")) if isinstance(final, dict) else None
+    proposal = _dict(final.get("nutrition_model_proposal_annotation")) if isinstance(final, dict) else None
+    execution = _dict(final.get("nutrition_finalization")) if isinstance(final, dict) else None
+    committed_annotation = _validated_nutrition_annotation(committed)
+    proposed_annotation = _validated_nutrition_annotation(proposal)
+    executed_annotation = _validated_nutrition_annotation(
+        execution.get("annotation") if execution is not None else None
+    )
+    proposal_matches = final.get("nutrition_proposal_matches_committed") if isinstance(final, dict) else None
+    fields = ("tenant_id", "source_principal", "gateway_session_id", "photo_source_message_id",
+              "photo_received_at",
+              "consumed_source_message_id", "target_meal_id", "original_receipt_event_id",
+              "original_operation_id", "current_receipt_event_id", "current_operation_id",
+              "current_logical_turn_id", "current_trace_episode_id")
+    if (evidence is None or type(evidence.get("schema_version")) is not int
+            or evidence.get("schema_version") != 1
+            or any(not isinstance(evidence.get(key), str) or not evidence[key] for key in fields)
+            or evidence.get("tenant_id") != goal.owner_id
+            or evidence.get("source_principal") != goal.principal_id
+            or evidence.get("gateway_session_id") != goal.gateway_session_id
+            or evidence.get("current_receipt_event_id") != event.get("event_id")
+            or evidence.get("current_operation_id") != event.get("operation_id")
+            or evidence.get("current_logical_turn_id") != event.get("logical_turn_id")
+            or evidence.get("current_trace_episode_id") != event.get("trace_episode_id")
+            or final.get("nutrition_append_event_id") != event.get("event_id")
+            or execution is None or type(execution.get("schema_version")) is not int
+            or execution.get("schema_version") != 1
+            or committed_annotation is None or proposed_annotation is None
+            or executed_annotation is None
+            or executed_annotation.get("record_type") not in {"meal_correction", "meal_deletion"}
+            or committed_annotation != event.get("annotation")
+            or executed_annotation != proposed_annotation
+            or type(proposal_matches) is not bool
+            or proposal_matches is not (proposed_annotation == committed_annotation)):
+        return None
+    original_rows = [item for item in events if item.get("event_id") == evidence["original_receipt_event_id"]]
+    if len(original_rows) != 1:
+        return None
+    original = original_rows[0]
+    try:
+        _parse_time(evidence["photo_received_at"])
+    except (TypeError, ValueError):
+        return None
+    original_turns = [turn for turn in turns
+                      if turn.get("operation_id") == evidence["original_operation_id"]
+                      and turn.get("source_message_id") == evidence["consumed_source_message_id"]
+                      and turn.get("principal_id") == goal.principal_id
+                      and turn.get("episode_id") == original.get("trace_episode_id")]
+    if not original_turns:
+        return None
+    original_finals = [turn.get("gateway_final_metadata") for turn in original_turns]
+    if any(not isinstance(item, dict) for item in original_finals):
+        return None
+    original_final = original_finals[0]
+    if any(item != original_final for item in original_finals[1:]):
+        return None
+    occurrence = _dict(original_final.get("nutrition_consumed_occurrence")) if isinstance(original_final, dict) else None
+    original_committed = _dict(original_final.get("nutrition_committed_annotation")) if isinstance(original_final, dict) else None
+    original_execution = _dict(original_final.get("nutrition_finalization")) if isinstance(original_final, dict) else None
+    original_committed_annotation = _validated_nutrition_annotation(original_committed)
+    original_executed_annotation = _validated_nutrition_annotation(
+        original_execution.get("annotation") if original_execution is not None else None
+    )
+    if (not isinstance(original_final, dict)
+            or original_execution is None or type(original_execution.get("schema_version")) is not int
+            or original_execution.get("schema_version") != 1
+            or original_committed_annotation is None or original_executed_annotation is None
+            or original_executed_annotation.get("record_type") != "meal_observation"
+            or original_executed_annotation.get("consumption_status") != "consumed"
+            or original_executed_annotation != original.get("annotation")
+            or original.get("annotation", {}).get("record_type") != "meal_observation"
+            or original.get("annotation", {}).get("consumption_status") != "consumed"
+            or original.get("operation_id") != evidence["original_operation_id"]
+            or original.get("source_message_id") != evidence["consumed_source_message_id"]
+            or original.get("created_at") > event.get("created_at")
+            or original_final.get("nutrition_append_event_id") != original.get("event_id")
+            or original_committed_annotation != original.get("annotation")
+            or original_executed_annotation != original_committed_annotation
+            or occurrence is None or occurrence.get("schema_version") != 1
+            or occurrence.get("receipt_event_id") != original.get("event_id")
+            or occurrence.get("client_op_id") != original.get("operation_id")
+            or occurrence.get("tenant_id") != goal.owner_id
+            or occurrence.get("source_principal") != goal.principal_id
+            or occurrence.get("gateway_session_id") != goal.gateway_session_id
+            or type(occurrence.get("schema_version")) is not int
+            or occurrence.get("schema_version") != 1
+            or occurrence.get("append_source_message_id") != evidence["consumed_source_message_id"]
+            or occurrence.get("photo_source_message_id") != evidence.get("photo_source_message_id")
+            or occurrence.get("photo_received_at") != evidence.get("photo_received_at")
+            ):
+        return None
+    return evidence["consumed_source_message_id"]
+
+
+def _is_receipt_reconciled_retry(goal: Goal, event: dict[str, Any], turn: dict[str, Any],
+                                accepted_turn: dict[str, Any], principal: Any) -> bool:
+    """Prove an extra exported turn reconciled to this exact accepted receipt."""
+    final = _dict(turn.get("gateway_final_metadata"))
+    evidence = _dict(final.get("nutrition_context_evidence")) if final is not None else None
+    committed = _dict(final.get("nutrition_committed_annotation")) if final is not None else None
+    proposal = _dict(final.get("nutrition_model_proposal_annotation")) if final is not None else None
+    execution = _dict(final.get("nutrition_finalization")) if final is not None else None
+    committed_annotation = _validated_nutrition_annotation(committed)
+    proposed_annotation = _validated_nutrition_annotation(proposal)
+    executed_annotation = _validated_nutrition_annotation(
+        execution.get("annotation") if execution is not None else None
+    )
+    accepted_final = _dict(accepted_turn.get("gateway_final_metadata"))
+    accepted_evidence = (_dict(accepted_final.get("nutrition_context_evidence"))
+                         if accepted_final is not None else None)
+    if (final is None or evidence is None or committed is None or proposal is None
+            or execution is None or type(execution.get("schema_version")) is not int
+            or execution.get("schema_version") != 1
+            or committed_annotation is None or proposed_annotation is None
+            or executed_annotation is None
+            or accepted_evidence is None):
+        return False
+    proposal_matches = final.get("nutrition_proposal_matches_committed")
+    return (
+        turn.get("episode_id") != event.get("trace_episode_id")
+        and turn.get("source_message_id") == event.get("source_message_id")
+        and turn.get("logical_turn_id") == event.get("logical_turn_id")
+        and turn.get("operation_id") == event.get("operation_id")
+        and turn.get("principal_id") == principal == goal.principal_id
+        and type(proposal_matches) is bool
+        and proposal_matches == (proposed_annotation == committed_annotation)
+        and executed_annotation == proposed_annotation
+        and type(evidence.get("schema_version")) is int and evidence.get("schema_version") == 1
+        and evidence.get("tenant_id") == goal.owner_id
+        and evidence.get("source_principal") == principal
+        and evidence.get("gateway_session_id") == goal.gateway_session_id
+        and evidence.get("current_receipt_event_id") == event.get("event_id")
+        and evidence.get("current_operation_id") == event.get("operation_id")
+        and evidence.get("current_logical_turn_id") == event.get("logical_turn_id")
+        and evidence.get("current_trace_episode_id") == event.get("trace_episode_id")
+        and evidence == accepted_evidence
+        and final.get("nutrition_append_event_id") == event.get("event_id")
+        and committed_annotation == event.get("annotation")
+    )
+
+
 def _grade_one(goal: Goal, honcho: dict[str, Any], telegent: dict[str, Any], *, now: datetime,
                grace_seconds: int, reviewed_turn_sources: dict[str, list[str]] | None = None,
                reviewed_turn_provenance: dict[str, list[dict[str, Any]]] | None = None) -> dict[str, Any]:
@@ -204,7 +366,23 @@ def _grade_one(goal: Goal, honcho: dict[str, Any], telegent: dict[str, Any], *, 
         return {**base, "a1": "INCONCLUSIVE", "stage": "READ_INCOMPLETE", "reason": "scoped authoritative read incomplete"}
     if (telegent.get("user_id") != goal.canonical_owner_id
             or telegent.get("login") != _normalize_login(goal.canonical_login)):
-        return {**base, "a1": "INCONCLUSIVE", "stage": "TELEGENT_SCOPE_MISMATCH", "reason": "canonical snapshot is not bound to reviewed owner"}
+        return {**base, "a1": "INCONCLUSIVE", "stage": "TELEGENT_SCOPE_MISMATCH",
+                "reason": "canonical snapshot is not bound to reviewed owner"}
+    canonical_rows = telegent.get("canonical_meals")
+    if not isinstance(canonical_rows, list) or any(
+        not isinstance(row, dict)
+        or not _valid_canonical_meal(row, allow_unassigned=row.get("status") == "unassigned")
+        or row.get("user_id") != goal.canonical_owner_id
+        for row in canonical_rows
+    ):
+        return {**base, "a1": "INCONCLUSIVE", "stage": "CANONICAL_INVALID",
+                "reason": "complete canonical read does not preserve its validated scoped row set"}
+    source_count_present = "source_occurrence_count" in telegent
+    source_occurrence_count = telegent.get("source_occurrence_count")
+    if source_count_present and (isinstance(source_occurrence_count, bool)
+            or not isinstance(source_occurrence_count, int) or source_occurrence_count < 0):
+        return {**base, "a1": "INCONCLUSIVE", "stage": "CANONICAL_INVALID",
+                "reason": "canonical source occurrence count is malformed"}
     try:
         t_start = _parse_time(telegent.get("start"))
         t_end = _parse_time(telegent.get("end"))
@@ -256,6 +434,7 @@ def _grade_one(goal: Goal, honcho: dict[str, Any], telegent: dict[str, Any], *, 
                                   if isinstance(context.get("logical_turn_id"), str))
     reviewed_operations.update(context.get("operation_id") for context in reviewed_camera_contexts
                                if isinstance(context.get("operation_id"), str))
+    contextual_targets: dict[str, str | None] = {}
     for event in events:
         metadata = event.get("metadata", {})
         event_tenant = metadata.get("tenant_id") if event.get("unannotated") else event.get("owner_id")
@@ -288,6 +467,11 @@ def _grade_one(goal: Goal, honcho: dict[str, Any], telegent: dict[str, Any], *, 
                                   or (isinstance(context.get("operation_id"), str)
                                       and operation == context.get("operation_id"))]
         raw_annotations = raw_trace.get("annotations") if raw_trace else None
+        contextual_target = None
+        if (not event.get("unannotated")
+                and event["annotation"]["record_type"] in {"meal_correction", "meal_deletion"}):
+            contextual_target = _trusted_context_target(goal, event, reviewed_turns, events)
+            contextual_targets[event["event_id"]] = contextual_target
         relevant = (bool(initial_identity_edges)
                     or source_id == goal.source_message_id or reply_id == goal.source_message_id
                     or trace_episode in goal.episode_ids
@@ -296,16 +480,68 @@ def _grade_one(goal: Goal, honcho: dict[str, Any], telegent: dict[str, Any], *, 
                     or (isinstance(source_id, str) and source_id in reviewed_sources)
                     or (isinstance(logical_turn, str) and logical_turn in reviewed_logical_turns)
                     or (isinstance(operation, str) and operation in reviewed_operations)
-                    or goal.canonical_meal_id in stable_meal_ids)
-
-        is_unresolved_edit = (not event.get("unannotated")
-                              and event["annotation"]["record_type"] in {"meal_correction", "meal_deletion"}
-                              and not reply_id)
-        if is_unresolved_edit and (relevant or event.get("attachment_fingerprints")):
+                    or goal.canonical_meal_id in stable_meal_ids
+                    or contextual_target == goal.source_message_id)
+        is_contextual_edit = (not event.get("unannotated")
+                              and event["annotation"]["record_type"] in {"meal_correction", "meal_deletion"})
+        is_unresolved_edit = is_contextual_edit and not reply_id
+        contextual_binding_claimed = (
+            "selected_source" in metadata
+            or any(
+                turn.get("episode_id") == trace_episode
+                and turn.get("source_message_id") == source_id
+                and turn.get("logical_turn_id") == logical_turn
+                and turn.get("operation_id") == operation
+                and "nutrition_context_evidence" in (_dict(turn.get("gateway_final_metadata")) or {})
+                for turn in reviewed_turns
+            )
+        )
+        raw_target_relevant = (
+            metadata.get("target_meal_id") == goal.canonical_meal_id
+            or (_dict(metadata.get("selected_source")) or {}).get("append_source_message_id") == goal.source_message_id
+        )
+        if (is_contextual_edit and (is_unresolved_edit or contextual_binding_claimed)
+                and contextual_target is None and (relevant or raw_target_relevant)):
             return {**base, "a1": "INCONCLUSIVE", "stage": "HONCHO_TARGET_UNAVAILABLE",
                     "reason": "correction or deletion target is unresolved in bounded history"}
         if not relevant:
             continue
+        if contextual_target is not None:
+            if reply_id and reply_id != contextual_target:
+                return {**base, "a1": "FAIL", "stage": "HONCHO_TARGET_MISMATCH",
+                        "reason": "native reply target contradicts independently receipt-proven consumed occurrence"}
+            contextual_turn = next(turn for turn in reviewed_turns
+                if turn.get("episode_id") == event.get("trace_episode_id")
+                and turn.get("source_message_id") == event.get("source_message_id")
+                and turn.get("operation_id") == event.get("operation_id"))
+            context_metadata = contextual_turn["gateway_final_metadata"]
+            context_evidence = context_metadata["nutrition_context_evidence"]
+            selected_source = _dict(metadata.get("selected_source"))
+            persisted_target = metadata.get("target_meal_id")
+            if (selected_source is None or not isinstance(persisted_target, str) or not persisted_target
+                    or type(selected_source.get("schema_version")) is not int
+                    or selected_source.get("schema_version") != 1
+                    or selected_source.get("tenant_id") != goal.owner_id
+                    or selected_source.get("source_principal") != goal.principal_id
+                    or selected_source.get("gateway_session_id") != goal.gateway_session_id
+                    or selected_source.get("is_private") is not True
+                    or selected_source.get("is_forwarded") is not False
+                    or selected_source.get("is_group") is not False):
+                return {**base, "a1": "INCONCLUSIVE", "stage": "HONCHO_TARGET_UNAVAILABLE",
+                        "reason": "persisted target receipt fields are missing, malformed, or outside the reviewed owner scope"}
+            if selected_source.get("source_message_id") != context_evidence.get("photo_source_message_id"):
+                return {**base, "a1": "INCONCLUSIVE", "stage": "HONCHO_SOURCE_MISMATCH",
+                        "reason": "persisted photo identity conflicts with the independently receipt-proven occurrence"}
+            expected_target_meal_id = derive_meal_id(
+                tenant_id=goal.owner_id, source_principal=goal.principal_id,
+                gateway_session_id=goal.gateway_session_id, source_message_id=contextual_target)
+            if (contextual_target != goal.source_message_id
+                    or context_evidence.get("target_meal_id") != expected_target_meal_id
+                    or persisted_target != expected_target_meal_id
+                    or selected_source.get("append_source_message_id") != contextual_target
+                    or expected_target_meal_id != goal.canonical_meal_id):
+                return {**base, "a1": "FAIL", "stage": "HONCHO_TARGET_MISMATCH",
+                        "reason": "receipt-proven intended occurrence differs from the persisted target"}
         if event.get("malformed_annotation"):
             return {**base, "a1": "INCONCLUSIVE", "stage": "HONCHO_INVALID",
                     "reason": "goal-relevant persisted nutrition annotation is malformed"}
@@ -350,6 +586,19 @@ def _grade_one(goal: Goal, honcho: dict[str, Any], telegent: dict[str, Any], *, 
         if relevant_principal != goal.principal_id:
             return {**base, "a1": "INCONCLUSIVE", "stage": "HONCHO_SCOPE_MISMATCH",
                     "reason": "goal-relevant persisted message has a different source principal"}
+        if event.get("unannotated") and metadata.get("role") == "user":
+            linked_user_turns = [turn for episode, turn in reviewed_turn_bindings
+                if episode == trace_episode and turn.get("source_message_id") == source_id
+                and turn.get("logical_turn_id") == logical_turn
+                and turn.get("principal_id") == relevant_principal]
+            if (len(linked_user_turns) != 1 or not isinstance(logical_turn, str)
+                    or operation != f"{logical_turn}:user"
+                    or metadata.get("tenant_id") != goal.owner_id
+                    or metadata.get("gateway_session_id") != goal.gateway_session_id
+                    or nested_trace_episode not in (None, trace_episode)):
+                return {**base, "a1": "INCONCLUSIVE", "stage": "HONCHO_TURN_BINDING_MISMATCH",
+                        "reason": "goal-linked user event lacks its exact recorded inbound turn binding"}
+            continue
         if (goal.canonical_meal_id in stable_meal_ids
                 and source_id != goal.source_message_id and reply_id != goal.source_message_id):
             return {**base, "a1": "INCONCLUSIVE", "stage": "HONCHO_SOURCE_MISMATCH",
@@ -370,7 +619,14 @@ def _grade_one(goal: Goal, honcho: dict[str, Any], telegent: dict[str, Any], *, 
                                and turn.get("logical_turn_id") == logical_turn
                                and turn.get("operation_id") == operation
                                and turn.get("principal_id") == relevant_principal)]
-            export_identity_matches = len(linked_turns) == 1 and len(exact_turns) == 1
+            retry_turns = [pair for pair in linked_turns if pair not in exact_turns]
+            export_identity_matches = (
+                len(exact_turns) == 1
+                and len(exact_turns) + len(retry_turns) == len(linked_turns)
+                and all(_is_receipt_reconciled_retry(
+                            goal, event, turn, exact_turns[0][1], relevant_principal)
+                        for _, turn in retry_turns)
+            )
             if not export_identity_matches:
                 return {**base, "a1": "INCONCLUSIVE", "stage": "HONCHO_TURN_BINDING_MISMATCH",
                         "reason": "persisted source, episode, logical turn, or operation conflicts with reviewed export"}
@@ -386,6 +642,7 @@ def _grade_one(goal: Goal, honcho: dict[str, Any], telegent: dict[str, Any], *, 
                     "reason": "reviewed operation is attached to a different source turn"}
         if ((trace_episode in goal.episode_ids or nested_trace_episode in goal.episode_ids)
                 and source_id != goal.source_message_id and reply_id != goal.source_message_id
+                and contextual_target != goal.source_message_id
                 and not (event.get("unannotated") and export_identity_matches)):
             return {**base, "a1": "INCONCLUSIVE", "stage": "HONCHO_TURN_BINDING_MISMATCH",
                     "reason": "reviewed trace episode is attached to a different source meal"}
@@ -411,10 +668,13 @@ def _grade_one(goal: Goal, honcho: dict[str, Any], telegent: dict[str, Any], *, 
     for event in events:
         if event.get("unannotated"):
             continue
+        contextual_target = contextual_targets.get(event["event_id"])
         record_type = event["annotation"]["record_type"]
         if record_type in {"meal_correction", "meal_deletion"} and not event["reply_to_source_message_id"]:
-            continue
-        if event["root_source_message_id"] != goal.source_message_id:
+            if contextual_target is None:
+                continue
+        if (event["root_source_message_id"] != goal.source_message_id
+                and contextual_target != goal.source_message_id):
             continue
         if (event["owner_id"] != goal.owner_id or event["session_id"] != goal.session_id
                 or event["gateway_session_id"] != goal.gateway_session_id
@@ -461,10 +721,80 @@ def _grade_one(goal: Goal, honcho: dict[str, Any], telegent: dict[str, Any], *, 
         if old != event:
             return {**base, "a1": "INCONCLUSIVE", "stage": "HONCHO_AMBIGUOUS", "reason": "conflicting replay of persisted event id"}
     selected = list(ids.values())
+    operation_events: dict[str, str] = {}
+    for event in selected:
+        previous = operation_events.setdefault(event["operation_id"], event["event_id"])
+        if previous != event["event_id"]:
+            return {**base, "a1": "INCONCLUSIVE", "stage": "HONCHO_AMBIGUOUS",
+                    "reason": "one gateway operation has multiple distinct committed nutrition events"}
     try:
         effective = _fold_events(selected, goal.meal_timezone)
     except ValueError as exc:
         return {**base, "a1": "INCONCLUSIVE", "stage": "HONCHO_AMBIGUOUS", "reason": str(exc)}
+    if selected and effective.get("meal_date") == goal.meal_date.isoformat():
+        original_annotation = selected[0]["annotation"]
+        original_date = original_annotation.get("meal_date")
+        if original_date is None and original_annotation.get("meal_at") is not None:
+            original_date = _parse_time(original_annotation["meal_at"]).astimezone(
+                ZoneInfo(goal.meal_timezone)).date().isoformat()
+        if original_date is not None and original_date != effective.get("meal_date"):
+            original_day = date.fromisoformat(original_date)
+            original_start = datetime.combine(original_day, datetime.min.time(), ZoneInfo(goal.meal_timezone))
+            corrected_day = date.fromisoformat(effective["meal_date"])
+            corrected_start = datetime.combine(corrected_day, datetime.min.time(), ZoneInfo(goal.meal_timezone))
+            day_ends = [
+                datetime.combine(day + timedelta(days=1), datetime.min.time(), ZoneInfo(goal.meal_timezone))
+                - timedelta(microseconds=1)
+                for day in (original_day, corrected_day)
+            ]
+            required_end = min(max(day_ends), now.astimezone(ZoneInfo(goal.meal_timezone)))
+            if t_start > min(original_start, corrected_start) or t_end < required_end:
+                return {**base, "a1": "INCONCLUSIVE", "stage": "TELEGENT_BOUNDS_MISMATCH",
+                        "reason": "canonical interval does not cover both verified local days through observation time"}
+    if any(target is not None for target in contextual_targets.values()) and not source_count_present:
+        return {**base, "a1": "INCONCLUSIVE", "stage": "CANONICAL_INVALID",
+                "reason": "canonical read does not report complete source occurrence coverage"}
+    if source_occurrence_count is not None and source_occurrence_count > 1:
+        return {**base, "a1": "FAIL", "stage": "CANONICAL_MISMATCH",
+                "reason": "complete canonical read contains duplicate rows for the reviewed meal source"}
+    selected_ids = {event["event_id"] for event in selected}
+    edge_rows = [row for row in canonical_rows
+                 if row.get("latest_event_id") in selected_ids
+                 or row.get("meal_id") == goal.canonical_meal_id
+                 or row.get("source_message_id") == goal.source_message_id]
+    selected_event_rows: dict[str, list[dict[str, Any]]] = {}
+    for row in canonical_rows:
+        if row.get("latest_event_id") in selected_ids:
+            selected_event_rows.setdefault(row["latest_event_id"], []).append(row)
+    if any(len(rows) > 1 for rows in selected_event_rows.values()):
+        return {**base, "a1": "FAIL", "stage": "CANONICAL_MISMATCH",
+                "reason": "one persisted source event appears under multiple canonical meal rows",
+                "actual_event_ids": [event["event_id"] for event in selected]}
+    for row in edge_rows:
+        if (row.get("meal_id") == goal.canonical_meal_id
+                and row.get("source_message_id") != goal.source_message_id):
+            return {**base, "a1": "FAIL", "stage": "CANONICAL_MISMATCH",
+                    "reason": "reviewed canonical meal id is currently bound to a different source",
+                    "actual_event_ids": [event["event_id"] for event in selected],
+                    "actual_latest_event_id": row.get("latest_event_id")}
+        if (row.get("source_message_id") == goal.source_message_id
+                and row.get("meal_id") != goal.canonical_meal_id):
+            return {**base, "a1": "FAIL", "stage": "CANONICAL_MISMATCH",
+                    "reason": "reviewed source is currently projected under a different canonical meal id",
+                    "actual_event_ids": [event["event_id"] for event in selected],
+                    "actual_latest_event_id": row.get("latest_event_id")}
+        latest_event = next((event for event in selected
+                             if event["event_id"] == row.get("latest_event_id")), None)
+        if latest_event is not None and (
+            row.get("meal_id") != goal.canonical_meal_id
+            or row.get("source_message_id") != goal.source_message_id
+            or latest_event.get("metadata", {}).get("target_meal_id", goal.canonical_meal_id)
+            != goal.canonical_meal_id
+        ):
+            return {**base, "a1": "FAIL", "stage": "CANONICAL_MISMATCH",
+                    "reason": "persisted goal event is projected under a different source or meal edge",
+                    "actual_event_ids": [event["event_id"] for event in selected],
+                    "actual_latest_event_id": row.get("latest_event_id")}
     if selected and effective["meal_date"] != goal.meal_date.isoformat():
         return {**base, "a1": "FAIL", "stage": "HONCHO_GOAL_MISMATCH",
                 "reason": "effective persisted meal date differs from reviewed goal",
@@ -492,11 +822,17 @@ def _grade_one(goal: Goal, honcho: dict[str, Any], telegent: dict[str, Any], *, 
         if not goal.expected_consumed and not effective["consumed"]:
             return {**base, "a1": "PASS", "stage": "COMPLETE_ABSENCE",
                     "reason": "complete reads confirm current reviewed source is not consumed",
-                    "actual_event_ids": [item["event_id"] for item in selected], "actual_kcal": 0}
+                    "actual_event_ids": [item["event_id"] for item in selected], "actual_kcal": 0,
+                    "evidence_limitations": [
+                        "wellness read does not prove an exact deletion tombstone, internal index keys, or aggregate balance",
+                        "one bounded snapshot cannot prove unrelated meal records stayed unchanged"]}
         if not selected:
             return {**base, "a1": "PASS" if not goal.expected_consumed else "FAIL",
                     "stage": "COMPLETE_ABSENCE", "reason": "complete scoped reads show no persisted or canonical meal",
-                    "actual_event_ids": [], "actual_kcal": None}
+                    "actual_event_ids": [], "actual_kcal": None,
+                    "evidence_limitations": [
+                        "wellness read does not prove an exact deletion tombstone, internal index keys, or aggregate balance",
+                        "one bounded snapshot cannot prove unrelated meal records stayed unchanged"]}
         age = (now - effective["latest_created_at"]).total_seconds()
         if age <= grace_seconds:
             return {**base, "a1": "PENDING", "stage": "HONCHO_SAVED_TELEGENT_PENDING", "reason": "persisted event is inside sync grace period",
@@ -513,8 +849,8 @@ def _grade_one(goal: Goal, honcho: dict[str, Any], telegent: dict[str, Any], *, 
         if canonical.get("source_message_id") != goal.source_message_id:
             raise ValueError("canonical source mismatch")
         canonical_day = _canonical_local_day(canonical, goal.meal_timezone)
-        if canonical_day != goal.meal_date.isoformat() or canonical.get("status") != "active":
-            raise ValueError("canonical meal date or status mismatch")
+        if canonical.get("status") != "active":
+            raise ValueError("canonical meal status mismatch")
         latest = canonical.get("latest_event_id")
         if not isinstance(latest, str) or latest not in {event["event_id"] for event in selected}:
             raise ValueError("canonical latest event is not the exact persisted source event")
@@ -536,7 +872,10 @@ def _grade_one(goal: Goal, honcho: dict[str, Any], telegent: dict[str, Any], *, 
             prior_matches = prior is not None and (
                 canonical.get("consumption_status") == ("consumed" if prior["consumed"] else "not_consumed")
                 and (not prior["consumed"] or canonical.get("energy_kcal_best") == prior["energy_kcal_best"])
-                and _canonical_local_day(canonical, goal.meal_timezone) == prior["meal_date"])
+                and _canonical_local_day(canonical, goal.meal_timezone) == prior["meal_date"]
+                and canonical.get("meal_date") == prior.get("meal_date_field")
+                and _same_instant(canonical.get("meal_at"), prior.get("meal_at"))
+                and canonical.get("revision") == prior.get("revision"))
             if prior_matches and (now - effective["latest_created_at"]).total_seconds() <= grace_seconds:
                 return {**base, "a1": "PENDING", "stage": "HONCHO_SAVED_TELEGENT_PENDING",
                         "reason": "canonical still shows a verified prior revision inside sync grace",
@@ -546,6 +885,14 @@ def _grade_one(goal: Goal, honcho: dict[str, Any], telegent: dict[str, Any], *, 
             raise ValueError("canonical latest revision is stale relative to effective persisted source history")
         consumed = effective["consumed"]
         kcal = effective["energy_kcal_best"]
+        if canonical_day != goal.meal_date.isoformat():
+            raise ValueError("canonical meal date differs from the reviewed effective date")
+        if canonical.get("meal_date") != effective.get("meal_date_field"):
+            raise ValueError("canonical explicit meal_date differs from effective persisted source history")
+        if canonical.get("revision") != effective["revision"]:
+            raise ValueError("canonical revision differs from effective persisted source history")
+        if not _same_instant(canonical.get("meal_at"), effective.get("meal_at")):
+            raise ValueError("canonical meal time differs from effective persisted source history")
         expected_status = "consumed" if consumed else "not_consumed"
         if canonical.get("consumption_status") != expected_status:
             raise ValueError("canonical consumption state disagrees with persisted current event")
@@ -568,7 +915,10 @@ def _grade_one(goal: Goal, honcho: dict[str, Any], telegent: dict[str, Any], *, 
               "actual_event_ids": [item["event_id"] for item in selected],
               "actual_latest_event_id": latest, "actual_kcal": kcal if consumed else 0,
               "canonical_contributing_event_ids": None,
-              "evidence_limitations": ["CanonicalMealRecord has latest_event_id but no contributing event_ids list"]}
+              "evidence_limitations": [
+                  "canonical meal record has latest_event_id but no contributing event_ids list",
+                  "wellness read does not expose internal index keys or aggregate balance",
+                  "one bounded snapshot cannot prove unrelated meal records stayed unchanged"]}
     return result
 
 
@@ -579,6 +929,15 @@ def _parse_time(value: object) -> datetime:
     if result.tzinfo is None:
         raise ValueError("persisted created_at must be timezone aware")
     return result
+
+
+def _same_instant(left: object, right: object) -> bool:
+    if left is None or right is None:
+        return left is None and right is None
+    try:
+        return _parse_time(left).astimezone(timezone.utc) == _parse_time(right).astimezone(timezone.utc)
+    except (TypeError, ValueError):
+        return False
 
 
 def _utc_index_timestamp(value: datetime) -> str:
@@ -681,6 +1040,7 @@ def _fold_events(events: list[dict[str, Any]], meal_timezone: str = "UTC") -> di
     state: dict[str, Any] | None = None
     deleted = False
     history: list[dict[str, Any]] = []
+    revision = 0
     for event in events:
         annotation = event["annotation"]
         kind = annotation["record_type"]
@@ -709,6 +1069,13 @@ def _fold_events(events: list[dict[str, Any]], meal_timezone: str = "UTC") -> di
                 if field in state and state[field] != value:
                     changed = True
                 state[field] = value
+            if "meal_at" in changes and "meal_date" not in changes:
+                changed = changed or state.get("meal_date") is not None
+                state["meal_date"] = None
+            if "meal_date" in changes and "meal_at" not in changes:
+                # Telegent's date-only correction clears the old precise instant.
+                changed = changed or state.get("meal_at") is not None
+                state["meal_at"] = None
             if not changed:
                 event["effective_revision"] = False
             else:
@@ -723,12 +1090,15 @@ def _fold_events(events: list[dict[str, Any]], meal_timezone: str = "UTC") -> di
         else:
             raise ValueError("non-meal nutrition event is ambiguous for this source goal")
         if event.get("effective_revision"):
+            revision += 1
             date_value = state.get("meal_date")
             if date_value is None and state.get("meal_at") is not None:
                 date_value = _parse_time(state["meal_at"]).astimezone(ZoneInfo(meal_timezone)).date().isoformat()
             history.append({"event_id": event["event_id"],
                             "consumed": state.get("consumption_status") == "consumed",
-                            "energy_kcal_best": state.get("energy_kcal_best"), "meal_date": date_value})
+                            "energy_kcal_best": state.get("energy_kcal_best"), "meal_date": date_value,
+                            "meal_date_field": state.get("meal_date"),
+                            "meal_at": state.get("meal_at"), "revision": revision})
     if state is None:
         return {"consumed": False, "meal_date": None, "energy_kcal_best": 0,
                 "latest_event_id": None, "history": history}
@@ -739,7 +1109,9 @@ def _fold_events(events: list[dict[str, Any]], meal_timezone: str = "UTC") -> di
         meal_date = _parse_time(state["meal_at"]).astimezone(ZoneInfo(meal_timezone)).date().isoformat()
     return {"consumed": state.get("consumption_status") == "consumed",
             "meal_date": meal_date,
+            "meal_date_field": state.get("meal_date"),
             "energy_kcal_best": state.get("energy_kcal_best"),
+            "meal_at": state.get("meal_at"), "revision": revision,
             "effective_event_ids": [event["event_id"] for event in effective_events],
             "latest_event_id": latest["event_id"],
             "latest_created_at": latest["_created_at"], "history": history}
@@ -868,12 +1240,9 @@ def export_eval_dialogue(eval_root: str | Path, *, episode_ids: list[str] | None
         initial_camera_prompt_id = next((event.get("_index_id") for event in events
             if event.get("kind") == "inbound_message"
             and _is_recorded_camera_initial_prompt(episode, _dict(event.get("payload")) or {})), None)
-        turns = _dialogue(events, suppress_camera_initial_id=initial_camera_prompt_id)
+        turns = _dialogue(events, episode=episode, suppress_camera_initial_id=initial_camera_prompt_id)
         public_turns_valid = all(
-            isinstance((_dict(event.get("payload")) or {}).get(
-                "user_text" if event.get("kind") == "inbound_message" else "text"), str)
-            and bool((_dict(event.get("payload")) or {}).get(
-                "user_text" if event.get("kind") == "inbound_message" else "text"))
+            _public_turn_input_valid(event, episode)
             for event in events
             if event.get("kind") in {"inbound_message", "assistant_update", "gateway_final", "gateway_error"}
         )
@@ -892,6 +1261,9 @@ def export_eval_dialogue(eval_root: str | Path, *, episode_ids: list[str] | None
                 inbound_sources.append(source_id)
             trusted_turn = _derive_exported_turn_provenance(episode, payload)
             if trusted_turn is not None:
+                final_provenance = _export_gateway_final_provenance(events)
+                if final_provenance is not None:
+                    trusted_turn["gateway_final_metadata"] = final_provenance
                 turn_provenance.append(trusted_turn)
         episodes.append({
             "episode": episode,
@@ -1084,7 +1456,30 @@ def _read_offset(root: Path, relative: str, offset: int) -> dict[str, Any]:
     return value
 
 
-def _dialogue(events: list[dict[str, Any]], *, suppress_camera_initial_id: Any = None) -> list[dict[str, str]]:
+def _attachment_only_count(episode: dict[str, Any], payload: dict[str, Any]) -> int | None:
+    """Return the recorder-authenticated attachment count for an empty human input."""
+    if payload.get("user_text") != "":
+        return None
+    event_count = payload.get("media_count")
+    inbound = _dict((_dict(episode.get("metadata")) or {}).get("inbound")) or {}
+    episode_count = inbound.get("media_count")
+    if (type(event_count) is not int or event_count <= 0
+            or type(episode_count) is not int or episode_count != event_count):
+        return None
+    return event_count
+
+
+def _public_turn_input_valid(event: dict[str, Any], episode: dict[str, Any]) -> bool:
+    payload = _dict(event.get("payload")) or {}
+    text = payload.get("user_text" if event.get("kind") == "inbound_message" else "text")
+    if isinstance(text, str) and text:
+        return True
+    return (event.get("kind") == "inbound_message" and text == ""
+            and _attachment_only_count(episode, payload) is not None)
+
+
+def _dialogue(events: list[dict[str, Any]], *, episode: dict[str, Any],
+              suppress_camera_initial_id: Any = None) -> list[dict[str, str]]:
     turns: list[dict[str, str]] = []
     for event in events:
         kind = event.get("kind")
@@ -1095,6 +1490,9 @@ def _dialogue(events: list[dict[str, Any]], *, suppress_camera_initial_id: Any =
             text = payload.get("user_text")
             if isinstance(text, str) and text:
                 turns.append({"role": "user", "text": text})
+            elif count := _attachment_only_count(episode, payload):
+                noun = "attachment" if count == 1 else "attachments"
+                turns.append({"role": "user", "text": f"Sent {count} {noun}."})
         elif kind in {"assistant_update", "gateway_final", "gateway_error"}:
             text = payload.get("text")
             if isinstance(text, str) and text:
@@ -1105,6 +1503,43 @@ def _dialogue(events: list[dict[str, Any]], *, suppress_camera_initial_id: Any =
             if isinstance(output, str) and output and name in {"get_wellness_data", "record_nutrition"}:
                 turns.append({"role": "tool", "text": output})
     return turns
+
+
+def _export_gateway_final_provenance(events: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Export only recorder metadata that can bind nutrition persistence evidence."""
+    finals = [event for event in events if event.get("kind") == "gateway_final"]
+    if len(finals) != 1:
+        return None
+    payload = _dict(finals[0].get("payload")) or {}
+    metadata = _dict(payload.get("metadata"))
+    if metadata is None:
+        return None
+    exported: dict[str, Any] = {}
+    for key in (
+        "nutrition_append_event_id", "nutrition_sync_status", "nutrition_committed_annotation",
+        "nutrition_model_proposal_annotation", "nutrition_proposal_matches_committed",
+        "nutrition_consumed_occurrence", "nutrition_context_evidence",
+    ):
+        if key in metadata:
+            exported[key] = metadata[key]
+    executions = [event for event in events if event.get("kind") == "trace_finalization"
+                  and not event.get("is_error")]
+    if len(executions) == 1:
+        payload = _dict(executions[0].get("payload")) or {}
+        annotations = _dict(payload.get("annotations"))
+        nutrition = _dict(annotations.get("nutrition")) if annotations is not None else None
+        try:
+            validated = NutritionAnnotationV2.model_validate(nutrition)
+        except (TypeError, ValueError):
+            validated = None
+        if validated is not None:
+            exported["nutrition_finalization"] = {
+                "schema_version": 1,
+                "annotation": validated.model_dump(
+                    mode="json", exclude_unset=validated.record_type == "meal_correction"
+                ),
+            }
+    return exported or None
 
 
 def _derive_exported_turn_provenance(episode: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any] | None:
@@ -1285,7 +1720,7 @@ async def read_telegent_wellness(*, owner_login: str, start: datetime, end: date
 
 
 def bind_wellness_snapshot(snapshot: dict[str, Any], *, goal: Goal) -> dict[str, Any]:
-    """Select exactly one canonical meal bound to owner and source for this goal."""
+    """Select the goal meal and retain every validated row from its scoped read."""
     if not isinstance(snapshot, dict):
         return {"complete": False, "error": "canonical snapshot is not an object"}
     scope = {key: snapshot.get(key) for key in ("user_id", "login", "start", "end", "queried_at")}
@@ -1311,22 +1746,41 @@ def bind_wellness_snapshot(snapshot: dict[str, Any], *, goal: Goal) -> dict[str,
         not _valid_canonical_meal(meal, allow_unassigned=True) for meal in unassigned
     ):
         return {"complete": False, **scope, "error": "canonical response contains malformed meal rows"}
+    all_canonical_rows = [
+        {**meal, "user_id": snapshot["user_id"]} for meal in [*meals, *unassigned]
+    ]
+    source_matches = [meal for meal in [*meals, *unassigned] if isinstance(meal, dict)
+                      and meal.get("source_message_id") == goal.source_message_id]
     matches = [meal for meal in meals if isinstance(meal, dict)
                and meal.get("source_message_id") == goal.source_message_id]
     other_meals = [meal for meal in meals if isinstance(meal, dict)
                    and meal.get("day") == goal.meal_date.isoformat()
                    and meal.get("source_message_id") != goal.source_message_id]
-    if len(matches) > 1:
-        return {"complete": False, **scope, "error": "ambiguous canonical source identity"}
-    if not matches:
-        if any(meal.get("meal_id") == goal.canonical_meal_id for meal in meals):
+    if len(source_matches) > 1:
+        return {"complete": True, **scope, "meal": None,
+                "source_occurrence_count": len(source_matches), "other_meals": other_meals,
+                "canonical_meals": all_canonical_rows}
+    if not source_matches:
+        same_id_rows = [meal for meal in meals if meal.get("meal_id") == goal.canonical_meal_id]
+        if any(isinstance(meal.get("source_message_id"), str)
+               and meal.get("source_message_id") != goal.source_message_id
+               for meal in same_id_rows):
+            return {"complete": True, **scope, "meal": None,
+                    "source_occurrence_count": 0, "other_meals": other_meals,
+                    "canonical_meals": all_canonical_rows}
+        if same_id_rows:
             return {"complete": False, **scope, "error": "canonical source identity is missing for the reviewed meal"}
-        if any(meal.get("source_message_id") == goal.source_message_id for meal in unassigned):
-            return {"complete": True, **scope, "meal": {"user_id": goal.canonical_owner_id,
-                    "source_message_id": goal.source_message_id, "status": "unassigned"}}
-        return {"complete": True, **scope, "meal": None, "other_meals": other_meals}
+        return {"complete": True, **scope, "meal": None,
+                "source_occurrence_count": 0, "other_meals": other_meals,
+                "canonical_meals": all_canonical_rows}
+    if source_matches[0] in unassigned:
+        return {"complete": True, **scope, "meal": {"user_id": goal.canonical_owner_id,
+                "source_message_id": goal.source_message_id, "status": "unassigned"},
+                "source_occurrence_count": 1, "other_meals": other_meals,
+                "canonical_meals": all_canonical_rows}
     return {"complete": True, **scope, "meal": {**matches[0], "user_id": snapshot["user_id"]},
-            "other_meals": other_meals}
+            "source_occurrence_count": 1, "other_meals": other_meals,
+            "canonical_meals": all_canonical_rows}
 
 
 def _valid_canonical_meal(meal: Any, *, allow_unassigned: bool = False) -> bool:

@@ -547,6 +547,13 @@ def _camera_eval_capture_provenance(
     return turn, {**common, "kind": "owner_turn", **turn}
 
 
+def _nutrition_annotation_metadata(annotation: NutritionAnnotationV2) -> dict[str, object]:
+    """Keep correction metadata sparse so changed_fields remains authoritative."""
+    return annotation.model_dump(
+        mode="json", exclude_unset=annotation.record_type == "meal_correction"
+    )
+
+
 def _append_nutrition_saved_status(answer: str, annotation: NutritionAnnotationV2) -> str:
     # Resolve only a compound storage-failure assertion. Keep neighboring
     # nutrition facts and independent advice, including positive save advice.
@@ -785,6 +792,91 @@ def _record_consumed_photo_occurrence(
     if occurrence not in occurrences:
         provenance["consumed_occurrences"] = [*occurrences, occurrence]
     return True
+
+
+def _current_verified_photo_occurrence_source(
+    history: list[ConversationMessage], *, message: InboundMessage,
+    receipt_metadata: Mapping[str, object], session_key: str,
+) -> dict[str, object] | None:
+    """Bind a just-accepted append receipt to its unique authenticated inbound photo ref."""
+    source_principal = receipt_metadata.get("source_principal")
+    gateway_session_id = receipt_metadata.get("gateway_session_id")
+    append_source_id = receipt_metadata.get("source_message_id")
+    if (message.channel != "telegram" or not is_private_message(message)
+            or not (message.media and any(_is_image_attachment(item) for item in message.media))
+            or not all(isinstance(item, str) and item for item in
+                       (source_principal, gateway_session_id, append_source_id))
+            or source_principal != f"telegram:{canonical_principal('telegram', str(message.sender_id))}"
+            or _normalize_source_message_ref(message.metadata.get("message_id")) != append_source_id
+            or receipt_metadata.get("is_group") is not False
+            or receipt_metadata.get("is_forwarded") is not False):
+        return None
+
+    coalesced_sources = message.metadata.get("_coalesced_media_sources")
+    coalesced_authorized = (
+        message.metadata.get("_coalesced_media_provenance_authority")
+        is COALESCED_ATTACHMENT_PROVENANCE_AUTHORITY
+    )
+    matches: list[dict[str, object]] = []
+    for historical in history:
+        for block in historical.content:
+            if not isinstance(block, AttachmentRefBlock) or not isinstance(block.source_provenance, Mapping):
+                continue
+            provenance = block.source_provenance
+            photo_source_id = provenance.get("source_message_id")
+            received_at = provenance.get("received_at")
+            if (provenance.get("schema_version") != 1
+                    or provenance.get("channel") != "telegram"
+                    or provenance.get("principal") != source_principal
+                    or provenance.get("chat_id") != str(message.chat_id)
+                    or provenance.get("session_key") != session_key
+                    or provenance.get("gateway_session_id") != gateway_session_id
+                    or provenance.get("is_group") is not False
+                    or provenance.get("is_forwarded") is not False
+                    or provenance.get("timestamp_authority") != "inbound_event_timestamp"
+                    or not isinstance(photo_source_id, str) or not photo_source_id
+                    or not isinstance(received_at, str) or not received_at
+                    or provenance.get("append_source_message_id") != append_source_id):
+                continue
+            try:
+                received = datetime.fromisoformat(received_at.replace("Z", "+00:00"))
+            except ValueError:
+                continue
+            if received.tzinfo is None or received.utcoffset() is None:
+                continue
+            if (photo_source_id == append_source_id
+                    and _trusted_utc_iso(received) != receipt_metadata.get("received_at")):
+                continue
+            if photo_source_id != append_source_id:
+                if not coalesced_authorized or not isinstance(coalesced_sources, list):
+                    continue
+                matching_sources = []
+                for item in coalesced_sources:
+                    if not isinstance(item, Mapping):
+                        continue
+                    listed_id = _normalize_source_message_ref(item.get("source_message_id"))
+                    listed_time = item.get("received_at")
+                    if not isinstance(listed_time, str):
+                        continue
+                    try:
+                        listed_dt = datetime.fromisoformat(listed_time.replace("Z", "+00:00"))
+                    except ValueError:
+                        continue
+                    if (listed_id == photo_source_id and listed_dt.tzinfo is not None
+                            and listed_dt.utcoffset() is not None
+                            and _trusted_utc_iso(listed_dt) == _trusted_utc_iso(received)):
+                        matching_sources.append(item)
+                if len(matching_sources) != 1:
+                    continue
+            matches.append({
+                "schema_version": 1, "tenant_id": receipt_metadata.get("tenant_id"),
+                "source_principal": source_principal, "gateway_session_id": gateway_session_id,
+                "source_message_id": photo_source_id, "append_source_message_id": append_source_id,
+                "attachment_id": block.attachment_id, "received_at": _trusted_utc_iso(received),
+                "chat_id": str(message.chat_id), "session_key": session_key,
+                "is_private": True, "is_forwarded": False, "is_group": False,
+            })
+    return matches[0] if len(matches) == 1 else None
 
 
 def _reminder_wellness_tenants(config) -> WellnessTenantResolver:
@@ -2678,16 +2770,45 @@ class OhmoSessionRuntimePool:
                 and _receipt_has_consumed_nutrition(append_receipt.assistant_metadata)
                 and isinstance(append_receipt.assistant_content, str)
             )
+            consumed_occurrence_source: Mapping[str, object] | None = None
             if ordinary_meal_saved and append_receipt is not None:
                 stored_metadata = append_receipt.assistant_metadata
-                if (
-                    isinstance(stored_metadata, Mapping)
-                    and isinstance(stored_metadata.get("photo_occurrence_source"), Mapping)
-                ):
+                if isinstance(stored_metadata, Mapping):
                     append_source = stored_metadata.get("source_message_id")
-                    occurrence_source = stored_metadata["photo_occurrence_source"]
+                    receipt_photo_source = stored_metadata.get("photo_occurrence_source")
+                    locally_bound_photo_source = None
+                    if isinstance(memory_scope, MemoryScope):
+                        local_metadata = _build_conversation_turn_metadata(
+                            turn_ctx=turn_ctx,
+                            message=message,
+                            scope=memory_scope,
+                            recorder=recorder,
+                        )[2]
+                        candidate = local_metadata.get("photo_occurrence_source")
+                        if isinstance(candidate, Mapping):
+                            locally_bound_photo_source = dict(candidate)
+                    current_photo_source = _current_verified_photo_occurrence_source(
+                        getattr(bundle.engine, "messages", []), message=message,
+                        receipt_metadata=stored_metadata, session_key=session_key,
+                    )
+                    occurrence_source = None
+                    if (isinstance(receipt_photo_source, Mapping)
+                            and locally_bound_photo_source is not None
+                            and dict(receipt_photo_source) == locally_bound_photo_source):
+                        occurrence_source = locally_bound_photo_source
+                    elif (isinstance(receipt_photo_source, Mapping)
+                          and current_photo_source is not None
+                          and dict(receipt_photo_source) == current_photo_source):
+                        occurrence_source = current_photo_source
+                    elif receipt_photo_source is None:
+                        occurrence_source = current_photo_source
                     if (
-                        isinstance(append_source, str)
+                        isinstance(occurrence_source, Mapping)
+                        and isinstance(append_source, str)
+                        and isinstance(occurrence_source.get("source_message_id"), str)
+                        and occurrence_source.get("source_message_id")
+                        and isinstance(occurrence_source.get("append_source_message_id"), str)
+                        and occurrence_source.get("append_source_message_id")
                         and occurrence_source.get("tenant_id") == stored_metadata.get("tenant_id")
                         and occurrence_source.get("source_principal") == stored_metadata.get("source_principal")
                         and occurrence_source.get("gateway_session_id") == stored_metadata.get("gateway_session_id")
@@ -2699,6 +2820,7 @@ class OhmoSessionRuntimePool:
                         append_source_message_id=append_source,
                         )
                     ):
+                        consumed_occurrence_source = occurrence_source
                         await self._save_snapshot(bundle, session_key, user_prompt)
             expected_selected = (
                 _build_conversation_turn_metadata(
@@ -2815,11 +2937,11 @@ class OhmoSessionRuntimePool:
                         nutrition_append_event_id=append_receipt.assistant_message_id,
                         nutrition_sync_status="pending",
                         nutrition_committed_annotation=(
-                            committed_annotation.model_dump(mode="json")
+                            _nutrition_annotation_metadata(committed_annotation)
                             if committed_annotation is not None else None
                         ),
                         nutrition_model_proposal_annotation=(
-                            finalizer_nutrition.model_dump(mode="json")
+                            _nutrition_annotation_metadata(finalizer_nutrition)
                             if finalizer_nutrition is not None else None
                         ),
                         nutrition_proposal_matches_committed=(
@@ -2829,14 +2951,106 @@ class OhmoSessionRuntimePool:
                             and committed_annotation is not None else False
                         ),
                     )
+                    occurrence = consumed_occurrence_source
+                    if isinstance(occurrence, Mapping):
+                        # This is emitted only after the persisted receipt passed
+                        # the full observation checks above and the occurrence
+                        # was attached to exactly one historical photo reference.
+                        if any(
+                            isinstance(block, AttachmentRefBlock)
+                            and block.attachment_id == occurrence.get("attachment_id")
+                            and isinstance(block.source_provenance, dict)
+                            and block.source_provenance.get("source_message_id") == occurrence.get("source_message_id")
+                            and block.source_provenance.get("received_at") == occurrence.get("received_at")
+                            and any(
+                                isinstance(item, Mapping)
+                                and item.get("receipt_event_id") == append_receipt.assistant_message_id
+                                and item.get("client_op_id") == append_receipt.assistant_client_op_id
+                                and item.get("append_source_message_id")
+                                == append_receipt.assistant_metadata.get("source_message_id")
+                                for item in block.source_provenance.get("consumed_occurrences", [])
+                            )
+                            for historical in getattr(bundle.engine, "messages", [])
+                            for block in historical.content
+                        ):
+                            metadata["nutrition_consumed_occurrence"] = {
+                                "schema_version": 1,
+                                "tenant_id": occurrence.get("tenant_id"),
+                                "source_principal": occurrence.get("source_principal"),
+                                "gateway_session_id": occurrence.get("gateway_session_id"),
+                                "photo_source_message_id": occurrence.get("source_message_id"),
+                                "append_source_message_id": append_receipt.assistant_metadata.get("source_message_id"),
+                                "photo_received_at": occurrence.get("received_at"),
+                                "receipt_event_id": append_receipt.assistant_message_id,
+                                "client_op_id": append_receipt.assistant_client_op_id,
+                            }
                 else:
                     reply = "Не удалось подтвердить сохранение записи."
             elif requested_correction:
                 if ordinary_correction_saved and append_receipt is not None:
+                    committed_annotation = None
+                    stored_trace = append_receipt.assistant_metadata.get("decision_trace")
+                    stored_annotations = stored_trace.get("annotations") if isinstance(stored_trace, Mapping) else None
+                    stored_nutrition = stored_annotations.get("nutrition") if isinstance(stored_annotations, Mapping) else None
+                    try:
+                        committed_annotation = NutritionAnnotationV2.model_validate(stored_nutrition)
+                    except (TypeError, ValueError):
+                        committed_annotation = None
                     metadata.update(
                         nutrition_append_event_id=append_receipt.assistant_message_id,
                         nutrition_sync_status="pending",
                     )
+                    if committed_annotation is not None:
+                        metadata["nutrition_committed_annotation"] = _nutrition_annotation_metadata(
+                            committed_annotation
+                        )
+                    metadata["nutrition_model_proposal_annotation"] = (
+                        _nutrition_annotation_metadata(finalizer_nutrition)
+                        if finalizer_nutrition is not None else None
+                    )
+                    metadata["nutrition_proposal_matches_committed"] = (
+                        finalizer_nutrition.model_dump(mode="json")
+                        == committed_annotation.model_dump(mode="json")
+                        if finalizer_nutrition is not None and committed_annotation is not None else False
+                    )
+                    if (committed_annotation is not None
+                            and isinstance(selected_binding, tuple) and len(selected_binding) == 2
+                            and selected_binding[0] is _SELECTED_SOURCE_AUTHORITY
+                            and isinstance(selected_binding[1], Mapping)):
+                        binding = selected_binding[1]
+                        occurrence_matches = []
+                        attachment_id = binding.get("attachment_id")
+                        for historical in getattr(bundle.engine, "messages", []):
+                            for block in historical.content:
+                                if not isinstance(block, AttachmentRefBlock):
+                                    continue
+                                provenance = block.source_provenance
+                                occurrences = provenance.get("consumed_occurrences") if isinstance(provenance, Mapping) else None
+                                if (block.attachment_id != attachment_id or not isinstance(occurrences, list)
+                                        or provenance.get("source_message_id") != binding.get("source_message_id")):
+                                    continue
+                                occurrence_matches.extend(
+                                    item for item in occurrences if isinstance(item, Mapping)
+                                    and item.get("append_source_message_id") == binding.get("append_source_message_id")
+                                )
+                        if len(occurrence_matches) == 1:
+                            occurrence = occurrence_matches[0]
+                            metadata["nutrition_context_evidence"] = {
+                                "schema_version": 1,
+                                "tenant_id": binding.get("tenant_id"),
+                                "source_principal": binding.get("source_principal"),
+                                "gateway_session_id": binding.get("gateway_session_id"),
+                                "photo_source_message_id": binding.get("source_message_id"),
+                                "photo_received_at": binding.get("received_at"),
+                                "consumed_source_message_id": binding.get("append_source_message_id"),
+                                "target_meal_id": append_receipt.assistant_metadata.get("target_meal_id"),
+                                "original_receipt_event_id": occurrence.get("receipt_event_id"),
+                                "original_operation_id": occurrence.get("client_op_id"),
+                                "current_receipt_event_id": append_receipt.assistant_message_id,
+                                "current_operation_id": append_receipt.assistant_client_op_id,
+                                "current_logical_turn_id": append_receipt.assistant_metadata.get("logical_turn_id"),
+                                "current_trace_episode_id": append_receipt.assistant_metadata.get("decision_trace_episode_id"),
+                            }
                 else:
                     reply = "Не удалось подтвердить сохранение изменения."
             if final_media:
