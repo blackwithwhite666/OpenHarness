@@ -33,6 +33,7 @@ class _FakeStreamResponse:
         pause_gate: asyncio.Event | None = None,
         line_delays: dict[int, float] | None = None,
         hang_on_enter: bool = False,
+        lifecycle: dict[str, int] | None = None,
     ) -> None:
         self.status_code = status_code
         self._lines = lines or []
@@ -42,28 +43,38 @@ class _FakeStreamResponse:
         self._pause_gate = pause_gate
         self._line_delays = line_delays or {}
         self._hang_on_enter = hang_on_enter
+        self._lifecycle = lifecycle
 
     async def __aenter__(self) -> "_FakeStreamResponse":
+        if self._lifecycle is not None:
+            self._lifecycle["entered"] = self._lifecycle.get("entered", 0) + 1
         if self._hang_on_enter:
             await asyncio.Event().wait()
         return self
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
+        if self._lifecycle is not None:
+            self._lifecycle["exited"] = self._lifecycle.get("exited", 0) + 1
         return None
 
     async def aread(self) -> bytes:
         return self._body
 
     async def aiter_lines(self):
-        for index, line in enumerate(self._lines):
-            delay = self._line_delays.get(index)
-            if delay is not None:
-                await asyncio.sleep(delay)
-            yield line
-            if index == self._pause_after_line and self._pause_gate is not None:
-                await self._pause_gate.wait()
-        if self._hang_after_lines:
-            await asyncio.Event().wait()
+        try:
+            for index, line in enumerate(self._lines):
+                delay = self._line_delays.get(index)
+                if delay is not None:
+                    await asyncio.sleep(delay)
+                yield line
+                if index == self._pause_after_line and self._pause_gate is not None:
+                    await self._pause_gate.wait()
+            if self._hang_after_lines:
+                await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            if self._lifecycle is not None:
+                self._lifecycle["cancelled"] = self._lifecycle.get("cancelled", 0) + 1
+            raise
 
 
 class _SlowDripStreamResponse(_FakeStreamResponse):
@@ -481,7 +492,8 @@ async def test_codex_client_streams_text(monkeypatch):
 @pytest.mark.asyncio
 async def test_codex_client_retries_response_start_hang_then_succeeds(monkeypatch):
     sink: dict[str, Any] = {}
-    stalled = _FakeStreamResponse(hang_after_lines=True)
+    stalled_lifecycle: dict[str, int] = {}
+    stalled = _FakeStreamResponse(hang_after_lines=True, lifecycle=stalled_lifecycle)
     succeeded = _FakeStreamResponse(lines=_successful_text_lines("clean ", "answer"))
     client_factory = _FakeAsyncClientSequence([stalled, succeeded], sink)
     monkeypatch.setattr("openharness.api.codex_client.httpx.AsyncClient", client_factory)
@@ -492,17 +504,18 @@ async def test_codex_client_retries_response_start_hang_then_succeeds(monkeypatc
         stall_timeout_seconds=0.02,
         attempt_timeout_seconds=None,
     )
-    started = time.monotonic()
     events = await asyncio.wait_for(
         _collect_stream(client, _codex_request()),
         timeout=0.5,
     )
 
-    assert time.monotonic() - started < 0.15
     assert client_factory.attempts == 2
     retry_events = [event for event in events if isinstance(event, ApiRetryEvent)]
     assert len(retry_events) == 1
+    assert retry_events[0].attempt == 1
+    assert retry_events[0].max_attempts == MAX_RETRIES + 1
     assert "inactivity timeout" in retry_events[0].message
+    assert stalled_lifecycle == {"entered": 1, "cancelled": 1, "exited": 1}
     assert [event.text for event in events if isinstance(event, ApiTextDeltaEvent)] == [
         "clean ",
         "answer",

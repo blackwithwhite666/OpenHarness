@@ -141,12 +141,20 @@ def _event_from_raw(message: dict[str, Any]) -> dict[str, Any] | None:
         if value is not None and (not isinstance(value, str) or not value):
             return {"invalid": True}
     trace = _dict(metadata.get("decision_trace")) if metadata else None
-    annotations = _dict(trace.get("annotations")) if trace else None
-    nutrition = _dict(annotations.get("nutrition")) if annotations else None
+    raw_annotations = trace.get("annotations") if trace else None
+    annotations = _dict(raw_annotations)
+    has_annotations = trace is not None and "annotations" in trace
+    has_nutrition = annotations is not None and "nutrition" in annotations
+    raw_nutrition = annotations.get("nutrition") if annotations else None
+    nutrition = _dict(raw_nutrition)
+    malformed_annotation = (
+        (has_annotations and annotations is None)
+        or (has_nutrition and nutrition is None)
+    )
     if nutrition is None:
         return {"unannotated": True, "metadata": metadata, "created_at": created_at,
                 "session_id": message["session_id"], "workspace_id": message["workspace_id"],
-                "peer_id": message["peer_id"]}
+                "peer_id": message["peer_id"], "malformed_annotation": malformed_annotation}
     try:
         annotation = NutritionAnnotationV2.model_validate(nutrition)
     except ValidationError:
@@ -163,6 +171,7 @@ def _event_from_raw(message: dict[str, Any]) -> dict[str, Any] | None:
         return {"invalid": True}
     return {
         "event_id": message["id"],
+        "metadata": metadata,
         "owner_id": metadata["tenant_id"],
         "session_id": message["session_id"],
         "workspace_id": message["workspace_id"],
@@ -230,40 +239,173 @@ def _grade_one(goal: Goal, honcho: dict[str, Any], telegent: dict[str, Any], *, 
     except (ValueError, TypeError):
         return {**base, "a1": "INCONCLUSIVE", "stage": "HONCHO_BOUNDS_MISMATCH", "reason": "Honcho query bounds do not cover the reviewed calendar day"}
 
+    reviewed_sources = {source for episode in goal.episode_ids
+                        for source in (reviewed_turn_sources or {}).get(episode, [])}
+    reviewed_turn_bindings = [(episode, turn) for episode in goal.episode_ids
+                              for turn in (reviewed_turn_provenance or {}).get(episode, [])]
+    reviewed_turns = [turn for _, turn in reviewed_turn_bindings]
+    reviewed_logical_turns = {turn.get("logical_turn_id") for turn in reviewed_turns
+                              if isinstance(turn.get("logical_turn_id"), str)}
+    reviewed_operations = {turn.get("operation_id") for turn in reviewed_turns
+                           if isinstance(turn.get("operation_id"), str)}
+    reviewed_camera_contexts = [
+        context for turn in reviewed_turns
+        if isinstance((context := turn.get("trusted_camera_initial_context")), dict)
+    ]
+    reviewed_logical_turns.update(context.get("logical_turn_id") for context in reviewed_camera_contexts
+                                  if isinstance(context.get("logical_turn_id"), str))
+    reviewed_operations.update(context.get("operation_id") for context in reviewed_camera_contexts
+                               if isinstance(context.get("operation_id"), str))
     for event in events:
         metadata = event.get("metadata", {})
         event_tenant = metadata.get("tenant_id") if event.get("unannotated") else event.get("owner_id")
         if (event["session_id"] != goal.session_id or event["workspace_id"] != goal.workspace_id
                 or event["peer_id"] != goal.peer_id or not lower <= event["created_at"] <= upper
-                or event_tenant != goal.owner_id
-                or metadata.get("gateway_session_id") not in (None, goal.gateway_session_id)):
+                or event_tenant != goal.owner_id):
             return {**base, "a1": "INCONCLUSIVE", "stage": "HONCHO_SCOPE_MISMATCH",
                     "reason": "persisted message escaped queried owner, session, peer, workspace, or time scope"}
-        if (not event.get("unannotated") and event.get("principal_id") != goal.principal_id):
+
+        # The Honcho read is scoped to the shared owner/workspace/session/peer and
+        # can contain legitimate traffic from rotated gateway sessions. Only rows
+        # with a possible identity edge to this goal need goal-level binding.
+        source_id = metadata.get("source_message_id")
+        reply_id = metadata.get("reply_to_source_message_id")
+        trace_episode = (metadata.get("decision_trace_episode_id")
+                         if event.get("unannotated") else event.get("trace_episode_id"))
+        raw_trace = _dict(metadata.get("decision_trace"))
+        nested_trace_episode = raw_trace.get("episode_id") if raw_trace else None
+        if not event.get("unannotated"):
+            nested_trace_episode = event.get("nested_trace_episode_id")
+        logical_turn = metadata.get("logical_turn_id")
+        operation = metadata.get("client_op_id")
+        stable_meal_ids = (metadata.get("canonical_meal_id"), metadata.get("meal_id"))
+        camera_contexts = [context for episode, turn in reviewed_turn_bindings
+                           if episode == trace_episode
+                           and isinstance((context := turn.get("trusted_camera_initial_context")), dict)]
+        initial_identity_edges = [context for context in reviewed_camera_contexts
+                                  if (isinstance(context.get("logical_turn_id"), str)
+                                      and logical_turn == context.get("logical_turn_id"))
+                                  or (isinstance(context.get("operation_id"), str)
+                                      and operation == context.get("operation_id"))]
+        raw_annotations = raw_trace.get("annotations") if raw_trace else None
+        relevant = (bool(initial_identity_edges)
+                    or source_id == goal.source_message_id or reply_id == goal.source_message_id
+                    or trace_episode in goal.episode_ids
+                    or nested_trace_episode in goal.episode_ids
+                    or logical_turn == goal.logical_turn_id or operation == goal.operation_id
+                    or (isinstance(source_id, str) and source_id in reviewed_sources)
+                    or (isinstance(logical_turn, str) and logical_turn in reviewed_logical_turns)
+                    or (isinstance(operation, str) and operation in reviewed_operations)
+                    or goal.canonical_meal_id in stable_meal_ids)
+
+        is_unresolved_edit = (not event.get("unannotated")
+                              and event["annotation"]["record_type"] in {"meal_correction", "meal_deletion"}
+                              and not reply_id)
+        if is_unresolved_edit and (relevant or event.get("attachment_fingerprints")):
+            return {**base, "a1": "INCONCLUSIVE", "stage": "HONCHO_TARGET_UNAVAILABLE",
+                    "reason": "correction or deletion target is unresolved in bounded history"}
+        if not relevant:
+            continue
+        if event.get("malformed_annotation"):
+            return {**base, "a1": "INCONCLUSIVE", "stage": "HONCHO_INVALID",
+                    "reason": "goal-relevant persisted nutrition annotation is malformed"}
+        if "decision_trace" in metadata and not isinstance(metadata["decision_trace"], dict):
+            return {**base, "a1": "INCONCLUSIVE", "stage": "HONCHO_INVALID",
+                    "reason": "goal-relevant persisted decision trace is malformed"}
+        if initial_identity_edges:
+            exact_initial_context = (
+                len(initial_identity_edges) == 1 and len(camera_contexts) == 1
+                and camera_contexts[0] == initial_identity_edges[0]
+                and event.get("unannotated") is True
+                and metadata.get("role") == "assistant"
+                and source_id is None and reply_id is None
+                and all(value is None for value in stable_meal_ids)
+                and ("decision_trace" not in metadata or (
+                    raw_trace is not None
+                    and raw_trace.get("episode_id") == trace_episode
+                    and isinstance(raw_annotations, dict) and not raw_annotations
+                ))
+                and trace_episode == initial_identity_edges[0].get("episode_id")
+                and nested_trace_episode in (None, trace_episode)
+                and initial_identity_edges[0].get("kind") == "initial_context"
+                and initial_identity_edges[0].get("tenant_id") == goal.owner_id
+                and initial_identity_edges[0].get("gateway_session_id") == goal.gateway_session_id
+                and initial_identity_edges[0].get("recipient_principal") == goal.principal_id
+                and logical_turn == initial_identity_edges[0].get("logical_turn_id")
+                and operation == initial_identity_edges[0].get("operation_id")
+                and operation == f"{logical_turn}:assistant"
+                and metadata.get("source_principal") == initial_identity_edges[0].get("source_principal")
+                and metadata.get("gateway_session_id") == goal.gateway_session_id
+                and metadata.get("tenant_id") == goal.owner_id
+            )
+            if not exact_initial_context:
+                return {**base, "a1": "INCONCLUSIVE", "stage": "HONCHO_TURN_BINDING_MISMATCH",
+                        "reason": "goal-linked initial Camera context has contradictory identity"}
+            continue
+        if (metadata.get("gateway_session_id") not in (None, goal.gateway_session_id)):
             return {**base, "a1": "INCONCLUSIVE", "stage": "HONCHO_SCOPE_MISMATCH",
-                    "reason": "annotated nutrition event has a different source principal"}
+                    "reason": "goal-relevant persisted message has a different gateway session"}
+        relevant_principal = (metadata.get("source_principal") if event.get("unannotated")
+                              else event.get("principal_id"))
+        if relevant_principal != goal.principal_id:
+            return {**base, "a1": "INCONCLUSIVE", "stage": "HONCHO_SCOPE_MISMATCH",
+                    "reason": "goal-relevant persisted message has a different source principal"}
+        if (goal.canonical_meal_id in stable_meal_ids
+                and source_id != goal.source_message_id and reply_id != goal.source_message_id):
+            return {**base, "a1": "INCONCLUSIVE", "stage": "HONCHO_SOURCE_MISMATCH",
+                    "reason": "reviewed stable meal identity is attached to a different source"}
+        reviewed_turn_edge = (
+            (isinstance(source_id, str) and source_id in reviewed_sources)
+            or (isinstance(logical_turn, str) and logical_turn in reviewed_logical_turns)
+            or (isinstance(operation, str) and operation in reviewed_operations))
+        export_identity_matches = False
+        if reviewed_turn_edge:
+            linked_turns = [(episode, turn) for episode, turn in reviewed_turn_bindings
+                            if (turn.get("source_message_id") == source_id
+                                or turn.get("logical_turn_id") == logical_turn
+                                or turn.get("operation_id") == operation)]
+            exact_turns = [(episode, turn) for episode, turn in linked_turns
+                           if (episode == trace_episode
+                               and turn.get("source_message_id") == source_id
+                               and turn.get("logical_turn_id") == logical_turn
+                               and turn.get("operation_id") == operation
+                               and turn.get("principal_id") == relevant_principal)]
+            export_identity_matches = len(linked_turns) == 1 and len(exact_turns) == 1
+            if not export_identity_matches:
+                return {**base, "a1": "INCONCLUSIVE", "stage": "HONCHO_TURN_BINDING_MISMATCH",
+                        "reason": "persisted source, episode, logical turn, or operation conflicts with reviewed export"}
+        if nested_trace_episode is not None and nested_trace_episode != trace_episode:
+            return {**base, "a1": "INCONCLUSIVE", "stage": "HONCHO_TURN_BINDING_MISMATCH",
+                    "reason": "goal-relevant message has conflicting outer and nested trace episodes"}
+        if (logical_turn == goal.logical_turn_id and source_id != goal.source_message_id):
+            return {**base, "a1": "INCONCLUSIVE", "stage": "HONCHO_SOURCE_MISMATCH",
+                    "reason": "reviewed logical turn is attached to a different source message"}
+        if (operation == goal.operation_id
+                and (logical_turn != goal.logical_turn_id or source_id != goal.source_message_id)):
+            return {**base, "a1": "INCONCLUSIVE", "stage": "HONCHO_SOURCE_MISMATCH",
+                    "reason": "reviewed operation is attached to a different source turn"}
+        if ((trace_episode in goal.episode_ids or nested_trace_episode in goal.episode_ids)
+                and source_id != goal.source_message_id and reply_id != goal.source_message_id
+                and not (event.get("unannotated") and export_identity_matches)):
+            return {**base, "a1": "INCONCLUSIVE", "stage": "HONCHO_TURN_BINDING_MISMATCH",
+                    "reason": "reviewed trace episode is attached to a different source meal"}
         if event.get("unannotated"):
-            source_id = metadata.get("source_message_id")
-            reply_id = metadata.get("reply_to_source_message_id")
-            if source_id == goal.source_message_id or reply_id == goal.source_message_id:
-                trace_episode = metadata.get("decision_trace_episode_id")
-                logical_turn = metadata.get("logical_turn_id")
-                operation = metadata.get("client_op_id")
-                principal = metadata.get("source_principal")
-                exported_turn = next((turn for turn in
-                    (reviewed_turn_provenance or {}).get(trace_episode, [])
-                    if turn.get("source_message_id") == source_id), None)
-                if (not isinstance(source_id, str) or not source_id or trace_episode not in goal.episode_ids
-                        or not isinstance(logical_turn, str) or operation != f"{logical_turn}:assistant"
-                        or principal != goal.principal_id or exported_turn is None
-                        or exported_turn.get("logical_turn_id") != logical_turn
-                        or exported_turn.get("operation_id") != operation
-                        or exported_turn.get("principal_id") != principal
-                        or (source_id == goal.source_message_id and
-                            (trace_episode != goal.trace_episode_id or logical_turn != goal.logical_turn_id
-                             or operation != goal.operation_id))):
-                    return {**base, "a1": "INCONCLUSIVE", "stage": "HONCHO_TURN_BINDING_MISSING",
-                            "reason": "unannotated source relevant to goal has incomplete or mismatched turn identity"}
+            principal = metadata.get("source_principal")
+            exported_turn = next((turn for turn in
+                (reviewed_turn_provenance or {}).get(trace_episode, [])
+                if turn.get("source_message_id") == source_id), None)
+            if (not isinstance(source_id, str) or not source_id or trace_episode not in goal.episode_ids
+                    or source_id not in (reviewed_turn_sources or {}).get(trace_episode, [])
+                    or not isinstance(logical_turn, str) or operation != f"{logical_turn}:assistant"
+                    or principal != goal.principal_id or exported_turn is None
+                    or exported_turn.get("logical_turn_id") != logical_turn
+                    or exported_turn.get("operation_id") != operation
+                    or exported_turn.get("principal_id") != principal
+                    or (source_id == goal.source_message_id and
+                        (trace_episode != goal.trace_episode_id or logical_turn != goal.logical_turn_id
+                         or operation != goal.operation_id))):
+                return {**base, "a1": "INCONCLUSIVE", "stage": "HONCHO_TURN_BINDING_MISSING",
+                        "reason": "goal-linked unannotated turn lacks exact reviewed source and operation binding"}
 
     selected = []
     for event in events:
@@ -271,10 +413,6 @@ def _grade_one(goal: Goal, honcho: dict[str, Any], telegent: dict[str, Any], *, 
             continue
         record_type = event["annotation"]["record_type"]
         if record_type in {"meal_correction", "meal_deletion"} and not event["reply_to_source_message_id"]:
-            fingerprints = event.get("attachment_fingerprints")
-            if event["trace_episode_id"] in goal.episode_ids or fingerprints:
-                return {**base, "a1": "INCONCLUSIVE", "stage": "HONCHO_TARGET_UNAVAILABLE",
-                        "reason": "correction or deletion target is unresolved in bounded history"}
             continue
         if event["root_source_message_id"] != goal.source_message_id:
             continue
@@ -448,6 +586,25 @@ def _utc_index_timestamp(value: datetime) -> str:
     return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def _is_recorded_camera_initial_prompt(episode: dict[str, Any], payload: dict[str, Any]) -> bool:
+    """Recognize the recorded synthetic Camera envelope for display omission only."""
+    episode_metadata = _dict(episode.get("metadata")) or {}
+    context = _dict(episode_metadata.get("trusted_camera_context"))
+    metadata = _dict(payload.get("metadata"))
+    if (context is None or context.get("kind") != "initial_context"
+            or context.get("episode_id") != episode.get("episode_id")
+            or payload.get("sender_id") != "__camera__" or metadata is None
+            or metadata.get("_synthetic") is not True
+            or not isinstance(metadata.get("_camera_candidate_id"), str)
+            or not metadata.get("_camera_candidate_id")
+            or type(metadata.get("_camera_photo_id")) is not int
+            or metadata.get("_camera_photo_id") <= 0):
+        return False
+    nested = _dict(metadata.get("metadata")) or {}
+    return not any(key in metadata or key in nested for key in (
+        "message_id", "source_message_id", "reply_to_message_id"))
+
+
 def _exported_camera_context(episode: dict[str, Any], events: list[dict[str, Any]]) -> dict[str, Any] | None:
     episode_metadata = _dict(episode.get("metadata")) or {}
     context = _dict(episode_metadata.get("trusted_camera_context"))
@@ -468,13 +625,25 @@ def _exported_camera_context(episode: dict[str, Any], events: list[dict[str, Any
             or channel_metadata.get("_camera_candidate_id") != context.get("candidate_id")):
         return None
     if context.get("kind") == "initial_context":
+        logical_turn = context.get("logical_turn_id")
+        operation = context.get("operation_id")
+        source_principal = context.get("source_principal")
         if (payload.get("sender_id") != "__camera__" or channel_metadata.get("_synthetic") is not True
                 or channel_metadata.get("message_id") is not None
                 or channel_metadata.get("_camera_photo_id") != photo_id):
             return None
+        derived = _derive_exported_turn_provenance(episode, payload)
+        if (derived is None or not isinstance(logical_turn, str) or not logical_turn
+                or operation != f"{logical_turn}:assistant"
+                or derived.get("logical_turn_id") != logical_turn
+                or derived.get("operation_id") != operation
+                or source_principal != derived.get("principal_id")
+                or source_principal != _inbound_principal(payload)):
+            return None
         return {key: context[key] for key in (
             "kind", "episode_id", "candidate_id", "native_photo_id", "tenant_id",
-            "gateway_session_id", "recipient_principal")}
+            "gateway_session_id", "recipient_principal", "source_principal",
+            "logical_turn_id", "operation_id")}
     if context.get("kind") != "owner_turn":
         return None
     turn = _dict(episode_metadata.get("trusted_camera_turn_provenance")) or {}
@@ -696,7 +865,10 @@ def export_eval_dialogue(eval_root: str | Path, *, episode_ids: list[str] | None
         camera_context = _exported_camera_context(episode, events)
         camera_context_invalid = camera_context_present and camera_context is None
         is_initial_camera_context = camera_context is not None and camera_context.get("kind") == "initial_context"
-        turns = _dialogue(events, suppress_camera_initial=is_initial_camera_context)
+        initial_camera_prompt_id = next((event.get("_index_id") for event in events
+            if event.get("kind") == "inbound_message"
+            and _is_recorded_camera_initial_prompt(episode, _dict(event.get("payload")) or {})), None)
+        turns = _dialogue(events, suppress_camera_initial_id=initial_camera_prompt_id)
         public_turns_valid = all(
             isinstance((_dict(event.get("payload")) or {}).get(
                 "user_text" if event.get("kind") == "inbound_message" else "text"), str)
@@ -772,12 +944,26 @@ def validate_dialogue_binding(manifest: Manifest, export: dict[str, Any]) -> dic
             episode_data = _dict(by_id[episode_id].get("episode")) or {}
             camera_context = _dict(by_id[episode_id].get("trusted_camera_context")) or {}
             initial_camera_context = camera_context.get("kind") == "initial_context"
+            inbound = _dict((_dict(episode_data.get("metadata")) or {}).get("inbound")) or {}
+            derived_initial = (_derive_exported_turn_provenance(episode_data, inbound)
+                               if initial_camera_context else None)
+            initial_identity_valid = (
+                not initial_camera_context or (
+                    derived_initial is not None
+                    and camera_context.get("source_principal") == derived_initial.get("principal_id")
+                    and camera_context.get("logical_turn_id") == derived_initial.get("logical_turn_id")
+                    and camera_context.get("operation_id") == derived_initial.get("operation_id")
+                    and camera_context.get("operation_id") == f"{camera_context.get('logical_turn_id')}:assistant"
+                    and camera_context.get("source_principal") == _inbound_principal(inbound)
+                )
+            )
             public_roles_valid = ("assistant" in roles and "user" not in roles if initial_camera_context
                                   else "user" in roles and "assistant" in roles)
             principal_valid = (by_id[episode_id].get("principal_id") == goal.principal_id
                                if not initial_camera_context else
                                camera_context.get("recipient_principal") == goal.principal_id
-                               and camera_context.get("tenant_id") == goal.owner_id)
+                               and camera_context.get("tenant_id") == goal.owner_id
+                               and initial_identity_valid)
             if (by_id[episode_id].get("dialogue_complete") is not True
                     or not public_roles_valid
                     or episode_data.get("session_id") != goal.gateway_session_id
@@ -866,6 +1052,15 @@ def validate_dialogue_binding(manifest: Manifest, export: dict[str, Any]) -> dic
         else:
             camera_context_bound = True
         good = not missing and not incomplete and source_bound and root_identity_bound and camera_context_bound
+        if good and initial_contexts:
+            for episode_id in goal.episode_ids:
+                if episode_id not in by_id:
+                    continue
+                context = _dict(by_id[episode_id].get("trusted_camera_context")) or {}
+                if context.get("kind") == "initial_context":
+                    turn_provenance.setdefault(episode_id, []).append(
+                        {"trusted_camera_initial_context": context}
+                    )
         result[goal.case_id] = {"complete": good,
                                 "reason": ("reviewed source is bound to complete exported dialogue" if good else
                                            camera_context_reason or
@@ -889,13 +1084,13 @@ def _read_offset(root: Path, relative: str, offset: int) -> dict[str, Any]:
     return value
 
 
-def _dialogue(events: list[dict[str, Any]], *, suppress_camera_initial: bool = False) -> list[dict[str, str]]:
+def _dialogue(events: list[dict[str, Any]], *, suppress_camera_initial_id: Any = None) -> list[dict[str, str]]:
     turns: list[dict[str, str]] = []
     for event in events:
         kind = event.get("kind")
         payload = _dict(event.get("payload")) or {}
         if kind == "inbound_message":
-            if suppress_camera_initial and payload.get("sender_id") == "__camera__":
+            if suppress_camera_initial_id is not None and event.get("_index_id") == suppress_camera_initial_id:
                 continue
             text = payload.get("user_text")
             if isinstance(text, str) and text:
@@ -912,11 +1107,15 @@ def _dialogue(events: list[dict[str, Any]], *, suppress_camera_initial: bool = F
     return turns
 
 
-def _derive_exported_turn_provenance(episode: dict[str, Any], payload: dict[str, Any]) -> dict[str, str] | None:
+def _derive_exported_turn_provenance(episode: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any] | None:
     """Recompute the trusted ordinary-turn operation from its recorded inbound envelope."""
     inbound_metadata = _dict(payload.get("metadata"))
     episode_metadata = _dict(episode.get("metadata")) or {}
     trusted = _dict(episode_metadata.get("trusted_camera_turn_provenance"))
+    camera_context = _dict(episode_metadata.get("trusted_camera_context")) or {}
+    initial_camera_context = camera_context.get("kind") == "initial_context"
+    if initial_camera_context and "trusted_camera_turn_provenance" in episode_metadata:
+        return None
     if trusted is not None:
         source = inbound_metadata.get("message_id") if inbound_metadata else None
         if isinstance(source, int) and not isinstance(source, bool):
@@ -930,7 +1129,10 @@ def _derive_exported_turn_provenance(episode: dict[str, Any], payload: dict[str,
                     ("source_message_id", "logical_turn_id", "operation_id", "principal_id")} | {
                         "episode_id": trusted["episode_id"]}
         return None
-    if inbound_metadata and ("_camera_turn_id" in inbound_metadata or "_camera_authority" in inbound_metadata):
+    if initial_camera_context and inbound_metadata and "_camera_turn_id" in inbound_metadata:
+        return None
+    if inbound_metadata and not initial_camera_context and (
+            "_camera_turn_id" in inbound_metadata or "_camera_authority" in inbound_metadata):
         return None
     channel, sender_id, chat_id = payload.get("channel"), payload.get("sender_id"), payload.get("chat_id")
     timestamp = payload.get("timestamp")
@@ -944,9 +1146,13 @@ def _derive_exported_turn_provenance(episode: dict[str, Any], payload: dict[str,
         from ohmo.gateway.runtime import _build_conversation_turn_metadata
         from ohmo.gateway.turn_context import build_turn_context
 
+        recompute_metadata = dict(inbound_metadata)
+        if initial_camera_context:
+            recompute_metadata.pop("_camera_authority", None)
+            recompute_metadata.pop("_camera_turn_id", None)
         message = InboundMessage(channel=channel, sender_id=sender_id, chat_id=chat_id,
             content=str(payload.get("user_text") or ""), timestamp=_parse_time(timestamp),
-            metadata=inbound_metadata)
+            metadata=recompute_metadata)
         session = episode.get("session_id")
         if not isinstance(session, str) or not session:
             return None
@@ -956,8 +1162,16 @@ def _derive_exported_turn_provenance(episode: dict[str, Any], payload: dict[str,
         source_id = assistant_metadata.get("source_message_id")
         operation_id = assistant_metadata.get("client_op_id")
         principal_id = assistant_metadata.get("source_principal")
-        if (not isinstance(source_id, str) or not source_id or not isinstance(operation_id, str)
+        if (not isinstance(operation_id, str)
                 or not isinstance(principal_id, str) or not principal_id):
+            return None
+        if initial_camera_context:
+            if (source_id is not None or sender_id != "__camera__"
+                    or inbound_metadata.get("_synthetic") is not True):
+                return None
+            return {"logical_turn_id": logical_turn_id, "operation_id": operation_id,
+                    "principal_id": principal_id, "episode_id": episode["episode_id"]}
+        if not isinstance(source_id, str) or not source_id:
             return None
         return {"source_message_id": source_id, "logical_turn_id": logical_turn_id,
                 "operation_id": operation_id, "principal_id": principal_id,

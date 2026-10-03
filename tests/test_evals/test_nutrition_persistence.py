@@ -142,9 +142,220 @@ def test_missing_honcho_row_fails_even_when_episode_completed_and_trace_is_missi
     honcho["episode_status"] = "completed"
     assert grade(honcho, telegent)["a1"] == "FAIL"
     honcho["messages"] = [{"id": "assistant-proposal", "session_id": "session-1", "peer_id": "ohmo",
-                               "workspace_id": "workspace-1", "created_at": NOW.isoformat(),
-                               "metadata": {"tenant_id": "owner-1", "role": "assistant"}}]
+                           "workspace_id": "workspace-1", "created_at": NOW.isoformat(),
+                           "metadata": {"tenant_id": "owner-1", "role": "assistant"}}]
     assert grade(honcho, telegent)["a1"] == "FAIL"
+
+
+def rotated_gateway_event(event_id="evt-new-session", *, source="src-new-session", annotated=False):
+    row = per_turn_event(event_id, source=source, episode="ep-new-session", turn="turn-new-session",
+                         kcal=99)
+    row["metadata"]["gateway_session_id"] = "gateway-session-new"
+    if not annotated:
+        row["metadata"]["decision_trace"]["annotations"] = {}
+    return row
+
+
+def reviewed_context_turn(event_id, *, source, episode, logical_turn, created):
+    row = per_turn_event(event_id, source=source, episode=episode, turn=logical_turn, kcal=0,
+                         created=created)
+    row["metadata"]["decision_trace"]["annotations"] = {}
+    return row
+
+
+@pytest.mark.parametrize("annotated", [False, True], ids=["ordinary", "food"])
+def test_rotated_gateway_traffic_is_scoped_but_not_mistaken_for_reviewed_goal(annotated):
+    unrelated = rotated_gateway_event(annotated=annotated)
+
+    honcho, telegent = snapshots([unrelated], canonical=False)
+    missing = grade(honcho, telegent)
+    assert missing["a1"] == "FAIL" and missing["stage"] == "HONCHO_GOAL_MISMATCH"
+
+    valid, canonical = snapshots()
+    valid["messages"].append(unrelated)
+    assert grade(valid, canonical)["a1"] == "PASS"
+
+    negative = Manifest(schema_version=1, goals=[goal(expected=False, kcal=None)])
+    absent, canonical_absence = snapshots([unrelated], canonical=False)
+    assert grade_manifest(negative, absent, canonical_absence, now=NOW)[0]["a1"] == "PASS"
+
+
+def test_relevant_gateway_mismatch_and_shared_query_scope_contamination_stay_inconclusive():
+    relevant = raw_event()
+    relevant["metadata"]["gateway_session_id"] = "gateway-session-new"
+    honcho, telegent = snapshots([relevant])
+    assert grade(honcho, telegent)["a1"] == "INCONCLUSIVE"
+
+    for field, value in (("tenant_id", "other-owner"), ("session_id", "other-session"),
+                         ("workspace_id", "other-workspace"),
+                         ("peer_id", "other-peer"), ("created_at", "2025-01-01T00:00:00+00:00")):
+        for annotated in (False, True):
+            row = rotated_gateway_event(annotated=annotated)
+            (row["metadata"] if field == "tenant_id" else row)[field] = value
+            honcho, telegent = snapshots([row], canonical=False)
+            assert grade(honcho, telegent)["a1"] == "INCONCLUSIVE", (field, annotated)
+
+
+@pytest.mark.parametrize("edge", ["nested_trace", "logical_turn"])
+@pytest.mark.parametrize("foreign_principal", [False, True], ids=["same-principal", "foreign-principal"])
+@pytest.mark.parametrize("expected_consumed", [False, True], ids=["negative", "positive"])
+def test_annotated_goal_identity_edges_cannot_hide_contradictory_rows(
+        edge, foreign_principal, expected_consumed):
+    reviewed = goal(expected=expected_consumed, kcal=25 if expected_consumed else None)
+    row = per_turn_event("evt-conflict", source="src-other", episode="ep-other", turn="other", kcal=99)
+    metadata = row["metadata"]
+    if foreign_principal:
+        metadata["source_principal"] = "telegram:foreign-principal"
+    if edge == "nested_trace":
+        metadata["decision_trace"]["episode_id"] = reviewed.trace_episode_id
+    else:
+        metadata["logical_turn_id"] = reviewed.logical_turn_id
+    honcho, telegent = snapshots() if expected_consumed else snapshots([], canonical=False)
+    honcho["messages"].append(row)
+    result = grade_manifest(Manifest(schema_version=1, goals=[reviewed]), honcho, telegent, now=NOW)[0]
+    assert result["a1"] == "INCONCLUSIVE", result
+
+
+@pytest.mark.parametrize("edge", ["nested_trace", "logical_turn"])
+def test_same_principal_contradictory_goal_identity_stays_ambiguous(edge):
+    row = per_turn_event("evt-conflict", source="src-other", episode="ep-other", turn="other", kcal=99)
+    if edge == "nested_trace":
+        row["metadata"]["decision_trace"]["episode_id"] = "ep-tea"
+    else:
+        row["metadata"]["logical_turn_id"] = goal().logical_turn_id
+    honcho, telegent = snapshots()
+    honcho["messages"].append(row)
+    result = grade(honcho, telegent)
+    assert result["a1"] == "INCONCLUSIVE", result
+
+
+@pytest.mark.parametrize("kind", ["meal_correction", "meal_deletion"])
+def test_unresolved_correction_or_deletion_linked_by_nested_trace_is_fail_closed(kind):
+    row = per_turn_event("evt-orphan", source="src-correction", episode="ep-other", turn="other",
+                         kcal=99, kind=kind, reply="src-unknown")
+    row["metadata"]["reply_to_source_message_id"] = None
+    row["metadata"]["source_principal"] = "telegram:foreign-principal"
+    row["metadata"]["decision_trace"]["episode_id"] = "ep-tea"
+    honcho, telegent = snapshots()
+    honcho["messages"].append(row)
+    result = grade(honcho, telegent)
+    assert result["a1"] == "INCONCLUSIVE" and result["stage"] == "HONCHO_TARGET_UNAVAILABLE", result
+
+
+def reviewed_multiepisode_fixture():
+    context = reviewed_context_turn("evt-balance", source="src-balance", episode="ep-balance",
+                                    logical_turn="turn-balance", created="2026-10-01T11:20:00+00:00")
+    clarification = reviewed_context_turn("evt-clarify", source="src-clarify", episode="ep-clarify",
+                                          logical_turn="turn-clarify", created="2026-10-01T11:40:00+00:00")
+    root = raw_event(created="2026-10-01T11:55:00+00:00")
+    reviewed = Goal.model_validate({**goal().model_dump(mode="json"),
+                                    "episode_ids": ["ep-balance", "ep-clarify", "ep-tea"]})
+    provenance = reviewed_turn_map(context, clarification, root)
+    sources = {episode: [turn["source_message_id"] for turn in turns]
+               for episode, turns in provenance.items()}
+    honcho, telegent = snapshots([context, clarification, root])
+    telegent["meal"]["capture_time"] = root["created_at"]
+    return reviewed, context, clarification, root, honcho, telegent, sources, provenance
+
+
+def test_valid_unannotated_context_and_clarification_turns_bind_to_their_own_exported_sources():
+    reviewed, _, _, _, honcho, telegent, sources, provenance = reviewed_multiepisode_fixture()
+    result = grade_manifest(Manifest(schema_version=1, goals=[reviewed]), honcho, telegent, now=NOW,
+                            reviewed_turn_sources=sources, reviewed_turn_provenance=provenance)[0]
+    assert result["a1"] == "PASS", (result.get("stage"), result.get("reason"))
+
+
+def test_valid_context_turns_do_not_mask_missing_root_consumed_event():
+    reviewed, context, clarification, _, _, _, sources, provenance = reviewed_multiepisode_fixture()
+    honcho, telegent = snapshots([], canonical=False)
+    honcho["messages"] = [context, clarification]
+    result = grade_manifest(Manifest(schema_version=1, goals=[reviewed]), honcho, telegent, now=NOW,
+                            reviewed_turn_sources=sources, reviewed_turn_provenance=provenance)[0]
+    assert result["a1"] == "FAIL" and result["stage"] == "HONCHO_GOAL_MISMATCH", result
+
+
+@pytest.mark.parametrize("mutation", ["source", "episode", "logical_turn", "operation", "principal"])
+def test_mismatched_context_turn_export_binding_cannot_silently_pass(mutation):
+    reviewed, context, clarification, root, honcho, telegent, sources, provenance = reviewed_multiepisode_fixture()
+    row = json.loads(json.dumps(context))
+    metadata = row["metadata"]
+    if mutation == "source":
+        metadata["source_message_id"] = "src-unreviewed-context"
+    elif mutation == "episode":
+        metadata["decision_trace_episode_id"] = "ep-unreviewed-context"
+        metadata["decision_trace"]["episode_id"] = "ep-unreviewed-context"
+    elif mutation == "logical_turn":
+        metadata["logical_turn_id"] = "turn-forged-context"
+    elif mutation == "operation":
+        metadata["client_op_id"] = "turn-forged-context:assistant"
+    else:
+        metadata["source_principal"] = "telegram:foreign-principal"
+    honcho["messages"] = [row, clarification, root]
+    result = grade_manifest(Manifest(schema_version=1, goals=[reviewed]), honcho, telegent, now=NOW,
+                            reviewed_turn_sources=sources, reviewed_turn_provenance=provenance)[0]
+    assert result["a1"] == "INCONCLUSIVE", (mutation, result)
+
+
+@pytest.mark.parametrize("kind", ["meal_correction", "meal_deletion"])
+@pytest.mark.parametrize("mutation", ["nutrition_string", "nutrition_list", "nutrition_null", "annotations_list"])
+def test_malformed_reviewed_edit_annotations_do_not_disappear_as_unannotated_context(kind, mutation):
+    root = per_turn_event("evt-root", source="src-tea", episode="ep-tea", turn="root", kcal=25,
+                          created="2026-10-01T11:58:00+00:00")
+    edit = per_turn_event("evt-edit", source="src-edit", episode="ep-edit", turn="edit", kcal=99,
+                          kind=kind, reply="src-tea", created="2026-10-01T11:59:00+00:00")
+    reviewed = Goal.model_validate({**goal().model_dump(mode="json"),
+                                    "episode_ids": ["ep-tea", "ep-edit"]})
+    manifest = Manifest(schema_version=1, goals=[reviewed])
+    sources = {"ep-tea": ["src-tea"], "ep-edit": ["src-edit"]}
+    provenance = reviewed_turn_map(root, edit)
+    honcho, canonical = snapshots([root, edit])
+    canonical["meal"].update(
+        latest_event_id="evt-root", energy_kcal_best=25,
+        capture_time=root["created_at"], consumption_status="consumed",
+    )
+
+    valid = grade_manifest(manifest, honcho, canonical, now=NOW,
+                           reviewed_turn_sources=sources, reviewed_turn_provenance=provenance)[0]
+    assert valid["a1"] == "FAIL" and valid["stage"] == "HONCHO_GOAL_MISMATCH", valid
+
+    malformed = json.loads(json.dumps(honcho))
+    trace = malformed["messages"][1]["metadata"]["decision_trace"]
+    if mutation == "nutrition_string":
+        trace["annotations"]["nutrition"] = "malformed"
+    elif mutation == "nutrition_list":
+        trace["annotations"]["nutrition"] = []
+    elif mutation == "nutrition_null":
+        trace["annotations"]["nutrition"] = None
+    else:
+        trace["annotations"] = []
+    result = grade_manifest(manifest, malformed, canonical, now=NOW,
+                            reviewed_turn_sources=sources, reviewed_turn_provenance=provenance)[0]
+    assert result["a1"] == "INCONCLUSIVE" and result["stage"] == "HONCHO_INVALID", result
+
+    unrelated = per_turn_event("evt-unrelated-edit", source="src-unrelated-edit", episode="ep-unrelated",
+                               turn="unrelated-edit", kcal=99, kind=kind, reply="src-not-reviewed",
+                               created="2026-10-01T11:59:00+00:00")
+    unrelated["metadata"]["decision_trace"]["annotations"]["nutrition"] = "malformed"
+    unrelated_honcho, _ = snapshots([root, unrelated])
+    unrelated_result = grade_manifest(manifest, unrelated_honcho, canonical, now=NOW,
+                                      reviewed_turn_sources=sources,
+                                      reviewed_turn_provenance=provenance)[0]
+    assert unrelated_result["a1"] == "PASS", unrelated_result
+
+
+@pytest.mark.parametrize("mutation", ["nutrition_string", "annotations_list"])
+def test_malformed_reviewed_ordinary_context_annotations_fail_closed_only_when_relevant(mutation):
+    reviewed, context, clarification, root, honcho, canonical, sources, provenance = reviewed_multiepisode_fixture()
+    malformed = json.loads(json.dumps(context))
+    trace = malformed["metadata"]["decision_trace"]
+    if mutation == "nutrition_string":
+        trace["annotations"]["nutrition"] = "malformed"
+    else:
+        trace["annotations"] = []
+    honcho["messages"] = [malformed, clarification, root]
+    result = grade_manifest(Manifest(schema_version=1, goals=[reviewed]), honcho, canonical, now=NOW,
+                            reviewed_turn_sources=sources, reviewed_turn_provenance=provenance)[0]
+    assert result["a1"] == "INCONCLUSIVE" and result["stage"] == "HONCHO_INVALID", result
 
 
 def test_missing_reviewed_episode_writes_inconclusive_snapshot_cli_report(tmp_path, monkeypatch):
@@ -458,6 +669,76 @@ def test_eval_export_reads_read_only_sqlite_and_exports_gateway_final(tmp_path: 
     uri = (root / "evals.sqlite").as_uri() + "?mode=ro"
     with sqlite3.connect(uri, uri=True) as connection:
         assert connection.execute("SELECT COUNT(*) FROM episodes").fetchone()[0] == 2
+
+
+def test_historical_camera_prompt_omission_does_not_authorize_incomplete_binding(tmp_path: Path):
+    prompt = "SYNTHETIC INTERNAL ANALYSIS PROMPT"
+    for variant in ("correct_receipt_missing_tuple", "missing_receipt", "corrupt_receipt"):
+        root = tmp_path / variant / "evals"
+        store = EvalStore(root)
+        camera_context = {
+            "kind": "initial_context", "episode_id": "ep-camera", "candidate_id": "candidate-1",
+            "native_photo_id": 77, "tenant_id": "owner-1", "gateway_session_id": "session-1",
+            "recipient_principal": "telegram:owner-1",
+        }
+        if variant == "missing_receipt":
+            camera_context.pop("native_photo_id")
+        elif variant == "corrupt_receipt":
+            camera_context["native_photo_id"] = 78
+        camera_inbound = {
+            "channel": "telegram", "chat_id": "chat-1", "sender_id": "__camera__",
+            "timestamp": (NOW.replace(hour=10)).isoformat(),
+            "metadata": {"_synthetic": True, "_camera_candidate_id": "candidate-1", "_camera_photo_id": 77},
+        }
+        store.append_episode(EvalEpisode(episode_id="ep-camera", session_id="session-1", source="gateway",
+            created_at=NOW.replace(hour=10), metadata={"workspace": "synthetic-evals",
+            "inbound": camera_inbound, "trusted_camera_context": camera_context}))
+        store.append_event(EvalEvent(episode_id="ep-camera", kind="inbound_message",
+            payload={**camera_inbound, "user_text": prompt}))
+        store.append_event(EvalEvent(episode_id="ep-camera", kind="gateway_final",
+            payload={"text": "Synthetic analysis completed."}))
+        store.append_event(EvalEvent(episode_id="ep-camera", kind="episode_finished",
+            payload={"status": "completed"}))
+
+        owner_inbound = {
+            "channel": "telegram", "chat_id": "chat-1", "sender_id": "owner-1|mutable_name",
+            "timestamp": NOW.isoformat(), "metadata": {"message_id": "src-tea"},
+        }
+        store.append_episode(EvalEpisode(episode_id="ep-tea", session_id="session-1", source="gateway",
+            created_at=NOW, metadata={"workspace": "synthetic-evals", "inbound": owner_inbound}))
+        store.append_event(EvalEvent(episode_id="ep-tea", kind="inbound_message",
+            payload={**owner_inbound, "user_text": "I drank tea."}))
+        store.append_event(EvalEvent(episode_id="ep-tea", kind="gateway_final",
+            payload={"text": "I could not confirm the save."}))
+        store.append_event(EvalEvent(episode_id="ep-tea", kind="episode_finished",
+            payload={"status": "completed"}))
+
+        exported = export_eval_dialogue(root, episode_ids=["ep-camera", "ep-tea"])
+        camera, owner = exported["episodes"]
+        assert camera["dialogue"] == [{"role": "assistant", "text": "Synthetic analysis completed."}]
+        assert camera["source_message_ids"] == []
+        assert camera["dialogue_complete"] is False
+        reviewed = Goal.model_validate({**goal().model_dump(mode="json"),
+            "episode_ids": ["ep-camera", "ep-tea"]})
+        assert not validate_dialogue_binding(Manifest(schema_version=1, goals=[reviewed]), exported)["tea"]["complete"]
+        assert owner["dialogue"][0] == {"role": "user", "text": "I drank tea."}
+        assert list(store.iter_events("ep-camera"))[0].payload["user_text"] == prompt
+
+    human_root = tmp_path / "human-camera-looking" / "evals"
+    human_store = EvalStore(human_root)
+    human_inbound = {"channel": "telegram", "chat_id": "chat-1", "sender_id": "owner-1",
+        "timestamp": NOW.isoformat(), "metadata": {"message_id": "__camera__"}}
+    human_store.append_episode(EvalEpisode(episode_id="ep-human", session_id="session-1", source="gateway",
+        created_at=NOW, metadata={"workspace": "synthetic-evals", "inbound": human_inbound}))
+    human_store.append_event(EvalEvent(episode_id="ep-human", kind="inbound_message",
+        payload={**human_inbound, "user_text": prompt}))
+    human_store.append_event(EvalEvent(episode_id="ep-human", kind="gateway_final",
+        payload={"text": "Reply."}))
+    human_store.append_event(EvalEvent(episode_id="ep-human", kind="episode_finished",
+        payload={"status": "completed"}))
+    human_export = export_eval_dialogue(human_root, episode_ids=["ep-human"])["episodes"][0]
+    assert human_export["dialogue"][0] == {"role": "user", "text": prompt}
+    assert human_export["source_message_ids"] == ["__camera__"]
 
 
 def test_eval_export_requires_terminal_finish_event(tmp_path: Path):
