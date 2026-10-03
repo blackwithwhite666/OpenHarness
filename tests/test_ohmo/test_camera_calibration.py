@@ -744,26 +744,98 @@ def test_judge_requires_both_conversation_fields(tmp_path, missing):
         JudgeCase.model_validate(data)
 
 
-@pytest.mark.parametrize("lane", ["product_a1", "judge_calibration"])
-def test_sol_prompt_scopes_nonfood_to_attached_image_without_erasing_food_uncertainty(
-    tmp_path, lane
-):
-    case = make_case(tmp_path) if lane == "product_a1" else make_judge_case(tmp_path)
-    prompt = sol_prompt(case)
+def test_judge_prompt_retains_exact_historical_bytes(tmp_path):
+    case = make_judge_case(tmp_path)
+    expected = (
+        "Use only this image and dialogue prefix. Judge consumption_state and kcal for the food "
+        "shown in the attached image and this selected trajectory, not whether the person ate "
+        "unrelated food elsewhere. If the image clearly contains no food, return not_consumed "
+        "with kcal null and estimated_kcal null: no meal from this image, without claiming the "
+        "person ate nothing elsewhere. If the image contains food but whether it was eaten is "
+        "unclear, return uncertain with kcal null; a supportable photo estimate may still be "
+        "provided as estimated_kcal. Return one JSON object with consumption_state "
+        "(consumed|not_consumed|uncertain), kcal (positive number only for a confirmed consumed "
+        "meal, else null), estimated_kcal (positive photo calorie estimate when supportable, else "
+        "null), and uncertainty (brief explanation). A request to estimate calories does not "
+        "establish that the person ate the food. For food shown in the image, keep consumption_state "
+        "uncertain if the dialogue does not resolve whether it was eaten; an estimated_kcal may "
+        "still be provided. Do not infer a meal record from an estimate. Prefix: "
+        + json.dumps([{"role": t.role, "text": t.text} for t in case.reference_prefix],
+                     ensure_ascii=False)
+    )
+    assert sol_prompt(case) == expected
+    assert "A request to estimate calories does not establish" in sol_prompt(case)
 
-    assert "food shown in the attached image and this selected trajectory" in prompt
-    assert "not whether the person ate unrelated food elsewhere" in prompt
-    assert "image clearly contains no food, return not_consumed" in prompt
-    assert "kcal null and estimated_kcal null" in prompt
-    assert "without claiming the person ate nothing elsewhere" in prompt
-    assert "image contains food but whether it was eaten is unclear" in prompt
-    assert "return uncertain with kcal null" in prompt
-    assert "supportable photo estimate may still be provided" in prompt
-    if lane == "judge_calibration":
-        assert "A request to estimate calories does not establish" in prompt
-        assert "For food shown in the image, keep consumption_state uncertain" in prompt
-    else:
-        assert "If the image contains food and consumption or amount is unclear" in prompt
+
+@pytest.mark.parametrize(
+    "scenario,prefix",
+    [
+        ("person-clear-food", "My lunch: one bowl of soup, about 300 ml."),
+        ("camera-same-food-without-answer", "I sent this photo to you."),
+        ("camera-meaningful-answer", "Yes, I ate one bowl, about half of it."),
+        ("explicit-partial-known-unit", "I ate half of one sandwich."),
+        ("nonfood", "What is in this picture?"),
+        ("denied", "That was for someone else; I did not eat it."),
+        ("analysis-recipe", "Estimate a recipe from this food photo."),
+        ("possible-food-unsupported-portion", "Could this be food? I cannot tell the amount."),
+    ],
+)
+def test_product_prompt_applies_source_policy_without_outcome_leakage(
+    tmp_path, scenario, prefix
+):
+    person = make_case(tmp_path)
+    camera = make_case(tmp_path)
+    person.origin = "person"
+    camera.prefix = [type(camera.prefix[0])(role="user", text=prefix)]
+    person.prefix = [type(person.prefix[0])(role="user", text=prefix)]
+    camera_prompt = sol_prompt(camera)
+    person_prompt = sol_prompt(person)
+
+    assert camera_prompt != person_prompt
+    assert "Selected trusted source: origin=person." in person_prompt
+    assert "Selected trusted source: origin=camera." in camera_prompt
+    assert person_prompt.index("Selected trusted source: origin=person.") < person_prompt.index("Prefix: ")
+    assert camera_prompt.index("Selected trusted source: origin=camera.") < camera_prompt.index("Prefix: ")
+    assert json.dumps([{"role": "user", "text": prefix}], ensure_ascii=False) in person_prompt
+    assert "trusted Case.origin" in person_prompt
+    assert "consumed means the meal state expected by the selected source policy" in person_prompt
+    assert "does not assert physical ingestion" in person_prompt
+    assert "does not assert" in person_prompt and "database record was saved" in person_prompt
+    assert "Explicitly stated denial, analysis-only or informational context, and recipe requests" in person_prompt
+    assert "clear food with a supportable visible portion or known unit defaults to consumed" in person_prompt
+    assert "Do not ask for exact grams or a nutrition label when a useful estimate exists" in person_prompt
+    assert "An explicit partial amount overrides a whole-unit default" in person_prompt
+    assert "meaningful owner answer in this curated prefix" in camera_prompt
+    assert "Without that answer, return uncertain, not not_consumed" in camera_prompt
+    assert "unclear food or a genuinely unsupported meaningful amount remains uncertain" in person_prompt
+    assert "expected goal/kcal, candidate dialogue, answer, receipt, or result" in person_prompt
+
+    # These private grading inputs and full candidate turns cannot steer the reference.
+    before = sol_prompt(person)
+    person.reviewed_state = "never_recorded"
+    person.persistence_evidence["goal"]["expected_kcal"] = 9999
+    person.persistence_evidence["goal"]["expected_consumed"] = False
+    person.persistence_evidence["goal"]["result"] = "candidate result sentinel"
+    person.dialogue.append(type(person.dialogue[0])(
+        role="assistant", text="candidate answer sentinel 98765 kcal"
+    ))
+    assert sol_prompt(person) == before
+
+
+@pytest.mark.asyncio
+async def test_uncertain_product_reference_stops_before_luna(tmp_path):
+    calls = []
+
+    async def fake(model, effort, prompt, image):
+        calls.append((model, effort, prompt, image))
+        return Reference(consumption_state="uncertain", kcal=None,
+                         uncertainty="Camera has no owner consumption answer").model_dump_json()
+
+    result = await calibrate_case(make_case(tmp_path), fake, CallBudget(max_calls=4))
+    assert result["a1"] == "INCONCLUSIVE"
+    assert result["a2"] == "NOT_RUN"
+    assert len(calls) == 1
+    assert calls[0][:2] == ("openai/gpt-6.1-sol", "high")
 
 
 @pytest.mark.asyncio
