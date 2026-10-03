@@ -114,7 +114,7 @@ class FakeTelegram:
 
 def _candidate(
     root: Path, *, index: int = 0, capture_time: datetime | None = None,
-    image_bytes: bytes | None = None,
+    image_bytes: bytes | None = None, classifier_decision: str = "ambiguous",
 ) -> dict:
     payload = json.loads(FIXTURE.read_text(encoding="utf-8"))
     payload["normalized_capture_time"] = (
@@ -128,6 +128,7 @@ def _candidate(
     payload["classifier_model"] = "deepseek/deepseek-v4.1-flash"
     payload["classifier_policy_version"] = "deepseek-camera-production-v1"
     payload["classifier_route_attestation_json"] = _deepseek_route_json()
+    payload["classifier_output"]["decision"] = classifier_decision
     image = image_bytes if image_bytes is not None else b"fake-offline-image" + str(index).encode()
     if image_bytes is not None:
         from PIL import Image
@@ -216,6 +217,116 @@ async def _admit(ingress: CameraIngress, root: Path, authorization: str | None, 
         "seq": lease["committed_seq"] + 1,
     }
     return await ingress.admit(authorization, _upload(root, payload))
+
+
+async def _actual_native_camera_prompt(
+    ingress: CameraIngress,
+    root: Path,
+    bus: MessageBus,
+    request: dict,
+    *,
+    question: str,
+    options: list[str],
+    unknown_decision: bool = False,
+    selected_index: int | None = 0,
+):
+    """Run one Camera response through bridge, native Telegram UI and callback ingress."""
+    from openharness.channels.impl.telegram import TelegramChannel
+    from openharness.config.schema import TelegramConfig
+
+    class Bot:
+        def __init__(self):
+            self.calls = []
+
+        async def send_photo(self, **kwargs):
+            self.calls.append(("send_photo", kwargs))
+            return SimpleNamespace(message_id=77, chat_id=123, photo=[object()])
+
+        async def edit_message_caption(self, **kwargs):
+            self.calls.append(("edit_message_caption", kwargs))
+
+        async def send_message(self, **kwargs):
+            self.calls.append(("send_message", kwargs))
+            return SimpleNamespace(message_id=78)
+
+    bot = Bot()
+    channel = TelegramChannel(TelegramConfig(token="token"), bus)
+    channel._app = SimpleNamespace(bot=bot)
+    channel.polling_started = True
+    channel._camera_ingress_authority = ingress
+    channel._start_typing = lambda _chat_id: None
+    channel._stop_typing = lambda _chat_id: None
+    ingress._telegram = channel
+
+    assert (await _admit(ingress, root, "Bearer " + "s" * 40, request))[0] == 202
+    initial = await asyncio.wait_for(bus.consume_inbound(), timeout=1)
+    if unknown_decision:
+        ingress._attempts[request["candidate_id"]].pop("classifier_decision", None)
+        ingress._save_attempts()
+        initial.metadata["_camera_classifier_decision"] = None
+
+    class Runtime:
+        async def stream_message(self, message, session_key):
+            yield GatewayStreamUpdate(
+                kind="final",
+                text=f"На фото еда. [[ask: {question} | {' | '.join(options)}]]",
+                metadata={},
+            )
+
+    bridge = OhmoGatewayBridge(bus=bus, runtime_pool=Runtime(), camera_ingress=ingress)
+    await bridge._process_message(initial, "telegram:123")
+    final = await asyncio.wait_for(bus.consume_outbound(), timeout=1)
+    receipt = await channel.send(final)
+    ingress.note_assistant_receipt(final, receipt)
+    edit = next((kwargs for name, kwargs in bot.calls if name == "edit_message_caption"), None)
+    markup = edit.get("reply_markup") if edit else None
+    native_options = [button.text for row in markup.inline_keyboard for button in row] if markup else []
+    clicked = None
+    if selected_index is not None and markup is not None:
+        class Query:
+            data = f"ask:{selected_index}"
+            id = "native-camera-regression-click"
+            message = SimpleNamespace(
+                caption=(
+                    f"{final.metadata['_camera_caption']}\n\n{final.content}"
+                ),
+                caption_html=(
+                    f"{final.metadata['_camera_caption']}\n\n{final.content}"
+                ),
+                text=None,
+                message_id=receipt.native_message_ids[0],
+                chat_id=123,
+                chat=SimpleNamespace(type="private"),
+                reply_markup=markup,
+            )
+
+            async def answer(self):
+                pass
+
+            async def edit_message_caption(self, **_kwargs):
+                pass
+
+            async def edit_message_reply_markup(self, **_kwargs):
+                pass
+
+        async def publish_callback(**kwargs):
+            await bus.publish_inbound(InboundMessage(
+                channel="telegram", sender_id=kwargs["sender_id"],
+                chat_id=kwargs["chat_id"], content=kwargs["content"],
+                metadata=kwargs["metadata"],
+            ))
+
+        channel._handle_message = publish_callback
+        await channel._on_callback(
+            SimpleNamespace(
+                callback_query=Query(),
+                effective_user=SimpleNamespace(id=123, username=None, first_name="Owner"),
+            ),
+            None,
+        )
+        clicked = await asyncio.wait_for(bus.consume_inbound(), timeout=1)
+        ingress.process_real_inbound(clicked)
+    return initial, final, receipt, native_options, clicked, channel, bot
 
 
 def _observed_camera_meal_receipt(
@@ -380,6 +491,736 @@ async def test_admission_photo_receipt_precedes_one_ordinary_synthetic_turn(tmp_
     assert ingress._attempts[request["candidate_id"]]["state"] == "photo_sent"
     assert ingress._attempts[request["candidate_id"]]["capture_time"] == request["capture_time"]
     assert ingress._attempts[request["candidate_id"]]["capture_time_authority"] == "exif"
+    assert "Проверенное решение классификатора: ambiguous" in event.content
+    assert "Добавь вариант «Это не еда»." in event.content
+
+
+@pytest.mark.asyncio
+async def test_two_cup_model_question_edits_the_exact_original_photo_once(tmp_path: Path) -> None:
+    from openharness.channels.impl.telegram import TelegramChannel
+    from openharness.config.schema import TelegramConfig
+
+    class Bot:
+        def __init__(self):
+            self.calls = []
+
+        async def send_photo(self, **kwargs):
+            self.calls.append(("send_photo", kwargs))
+            return SimpleNamespace(message_id=77, chat_id=123, photo=[object()])
+
+        async def edit_message_caption(self, **kwargs):
+            self.calls.append(("edit_message_caption", kwargs))
+
+        async def send_message(self, **kwargs):
+            self.calls.append(("send_message", kwargs))
+            return SimpleNamespace(message_id=78)
+
+    ingress, root, bus, _fake = _ingress(tmp_path)
+    bot = Bot()
+    channel = TelegramChannel(TelegramConfig(token="token"), bus)
+    channel._app = SimpleNamespace(bot=bot)
+    channel.polling_started = True
+    ingress._telegram = channel
+    channel._camera_ingress_authority = ingress
+    request = _candidate(root, classifier_decision="food")
+    assert (await _admit(ingress, root, "Bearer " + "s" * 40, request))[0] == 202
+    synthetic = await asyncio.wait_for(bus.consume_inbound(), timeout=1)
+    assert bot.calls[0][0] == "send_photo"
+    assert bot.calls[0][1]["reply_markup"] is None
+    assert "Проверенное решение классификатора: food." in synthetic.content
+    assert "Добавь вариант «Это не еда»." not in synthetic.content
+
+    class ScriptedRuntime:
+        seen = None
+
+        async def stream_message(self, message, session_key):
+            self.seen = message
+            yield GatewayStreamUpdate(
+                kind="final",
+                text="На фото две чашки кофе. [[ask: Ты пила этот кофе? | Маленькую чашку | Большую чашку | Обе | Не пила]]",
+                metadata={},
+            )
+
+    runtime = ScriptedRuntime()
+    bridge = OhmoGatewayBridge(bus=bus, runtime_pool=runtime)
+    await bridge._process_message(synthetic, synthetic.session_key)
+    final = await asyncio.wait_for(bus.consume_outbound(), timeout=1)
+    receipt = await channel.send(final)
+    assert runtime.seen is synthetic
+    assert "Ты пила этот кофе?" in final.content
+    assert final.buttons == ["Маленькую чашку", "Большую чашку", "Обе", "Не пила"]
+    assert final.metadata["_camera_photo_id"] == 77
+    assert [name for name, _ in bot.calls] == ["send_photo", "edit_message_caption"]
+    assert bot.calls[1][1]["message_id"] == 77
+    keyboard = bot.calls[1][1]["reply_markup"].inline_keyboard
+    assert [row[0].text for row in keyboard] == final.buttons
+    assert receipt.native_message_ids == (77,)
+
+
+@pytest.mark.asyncio
+async def test_small_cup_native_callback_reaches_camera_runtime_as_one_portion(tmp_path: Path) -> None:
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    from openharness.channels.impl.telegram import TelegramChannel
+    from openharness.config.schema import TelegramConfig
+
+    ingress, root, bus, _ = _ingress(tmp_path)
+    import tests.test_ohmo.test_camera_f84_joint_runtime as joint_runtime
+    request = _candidate(
+        root, classifier_decision="food", capture_time=joint_runtime.BASE,
+    )
+    assert (await _admit(ingress, root, "Bearer " + "s" * 40, request))[0] == 202
+    synthetic = await asyncio.wait_for(bus.consume_inbound(), timeout=1)
+    photo_id = synthetic.metadata["_camera_photo_id"]
+    attempt = ingress._attempts[request["candidate_id"]]
+    attempt["attention_active"] = False
+    attempt["admitted_at"] = (datetime.now(timezone.utc) - timedelta(minutes=101)).isoformat()
+    ingress._save_attempts()
+    from PIL import Image
+    other_bytes = BytesIO()
+    Image.new("RGB", (8, 8), "green").save(other_bytes, format="JPEG")
+    other = _candidate(root, index=1, image_bytes=other_bytes.getvalue())
+    assert (await _admit(ingress, root, "Bearer " + "s" * 40, other))[0] == 202
+    other_synthetic = await asyncio.wait_for(bus.consume_inbound(), timeout=1)
+    labels = ["Маленькую чашку", "Большую чашку", "Обе", "Не пила"]
+    channel = TelegramChannel(TelegramConfig(token="token"), bus)
+    channel._start_typing = lambda _chat_id: None
+
+    async def receive_callback(**kwargs):
+        await bus.publish_inbound(InboundMessage(
+            channel="telegram", sender_id=kwargs["sender_id"], chat_id=kwargs["chat_id"],
+            content=kwargs["content"], metadata=kwargs["metadata"],
+        ))
+
+    channel._handle_message = receive_callback
+    class Query:
+        data = "ask:0"
+        id = "small-cup-click"
+        message = SimpleNamespace(
+            caption="Съели ли вы это? Фото сделано 2026-10-03. На фото две чашки. Ты пила этот кофе?",
+            caption_html="Съели ли вы это? Фото сделано 2026-10-03. На фото две чашки. Ты пила этот кофе?",
+            text=None, message_id=photo_id, chat_id=123,
+            chat=SimpleNamespace(type="private"),
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(label, callback_data=f"ask:{i}")]
+                for i, label in enumerate(labels)
+            ]),
+        )
+
+        async def answer(self):
+            pass
+
+        async def edit_message_caption(self, **_kwargs):
+            pass
+
+        async def edit_message_reply_markup(self, **_kwargs):
+            pass
+
+    await channel._on_callback(
+        SimpleNamespace(callback_query=Query(), effective_user=SimpleNamespace(
+            id=123, username=None, first_name="Marina")), None,
+    )
+    clicked = await asyncio.wait_for(bus.consume_inbound(), timeout=1)
+    clicked.timestamp = joint_runtime.BASE + timedelta(minutes=101)
+    assert clicked.metadata["native_keyboard_options"] == labels
+    assert clicked.metadata["native_keyboard_selected_label"] == "Маленькую чашку"
+    ingress.process_real_inbound(clicked)
+    assert clicked.metadata["_camera_answer"] == "yes"
+    assert clicked.metadata["_camera_native_binding"] == str(photo_id)
+    assert clicked.media == [ingress._attempts[request["candidate_id"]]["snapshot"]]
+
+    for label in (
+        "Не уверена", "Только не уверена", "Только неизвестно",
+        "Узнать состав", "Только узнать состав", "Только рецепт",
+        "Только посмотреть", "Only information",
+    ):
+        uncertain = dict(clicked.metadata)
+        options = list(clicked.metadata["native_keyboard_options"])
+        options.append(label)
+        uncertain.update(
+            native_keyboard_options=options,
+            native_keyboard_selected_index=len(options) - 1,
+            native_keyboard_selected_label=label,
+            callback_data=f"ask:{len(options) - 1}",
+        )
+        assert camera_module._native_button_answer_kind(uncertain, label) is None
+
+    composition = {
+        "callback_query": True,
+        "native_keyboard_options": ["Маленькую чашку", "Только оценить состав"],
+        "native_keyboard_selected_index": 1,
+        "native_keyboard_selected_label": "Только оценить состав",
+        "callback_data": "ask:1",
+        "native_keyboard_prompt": "Съели ли вы это? Фото сделано 2026-10-03.",
+        "native_keyboard_question": "",
+    }
+    assert camera_module._native_button_answer_kind(
+        composition, "Только оценить состав"
+    ) is None
+    composition.update(
+        native_keyboard_question="Ты выпила этот кофе?",
+        native_keyboard_prompt=(
+            "Съели ли вы это? Фото сделано 2026-10-03. Ты выпила этот кофе?"
+        ),
+    )
+    assert camera_module._native_button_answer_kind(
+        composition, "Только оценить состав"
+    ) is None
+    composition.update(
+        native_keyboard_selected_index=0,
+        native_keyboard_selected_label="Маленькую чашку",
+        callback_data="ask:0",
+        native_keyboard_question="Ты выпила этот кофе?",
+    )
+    assert camera_module._native_button_answer_kind(
+        composition, "Маленькую чашку"
+    ) == "yes"
+    composition["native_keyboard_prompt"] += " На фото кофе. Какую чашку подробно разобрать по составу?"
+    composition["native_keyboard_question"] = "Какую чашку подробно разобрать по составу?"
+    assert camera_module._native_button_answer_kind(
+        composition, "Маленькую чашку"
+    ) is None
+    assert camera_module._CLARIFICATION_QUANTITY_RE.search("Маленькую чашку")
+
+    uncertain_labels = ["Маленькую чашку", "Большую чашку", "Обе", "Не пила", "Не уверена"]
+
+    class UncertainQuery:
+        data = "ask:4"
+        id = "uncertain-small-cup-click"
+        message = SimpleNamespace(
+            caption="Ты пила этот кофе?", caption_html="Ты пила этот кофе?", text=None,
+            message_id=other_synthetic.metadata["_camera_photo_id"], chat_id=123,
+            chat=SimpleNamespace(type="private"),
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(label, callback_data=f"ask:{i}")]
+                for i, label in enumerate(uncertain_labels)
+            ]),
+        )
+
+        async def answer(self):
+            pass
+
+        async def edit_message_caption(self, **_kwargs):
+            pass
+
+        async def edit_message_reply_markup(self, **_kwargs):
+            pass
+
+    await channel._on_callback(
+        SimpleNamespace(callback_query=UncertainQuery(), effective_user=SimpleNamespace(
+            id=123, username=None, first_name="Marina")), None,
+    )
+    uncertain_click = await asyncio.wait_for(bus.consume_inbound(), timeout=1)
+    ingress.process_real_inbound(uncertain_click)
+    assert uncertain_click.metadata.get("_camera_answer") is None
+    assert uncertain_click.metadata.get("_camera_authority") is not CAMERA_AUTHORITY
+    assert ingress._attempts[other["candidate_id"]]["state"] == "photo_sent"
+
+    # Run the same native callback through the maintained nutrition runtime
+    # and append boundary. The transcript names one cup; the annotation and
+    # persisted event must not silently expand it to both cups.
+    RUNTIME_BASE = joint_runtime.BASE
+    runtime_inbound = joint_runtime.inbound
+    observation = joint_runtime.observation
+    runtime_setup = joint_runtime.setup
+
+    pool, bundle, server, client = runtime_setup(str(tmp_path / "small-cup-runtime"))
+    pool._gateway_config = pool._gateway_config.model_copy(update={
+        "camera_ingress": ingress.config,
+        "family_principals": {"123": ingress.config.tenant_id},
+        "enabled_memory_tenants": (ingress.config.tenant_id,),
+    })
+    pool._camera_ingress = ingress
+    pool._session_owner_principals = {"gateway-session": "123"}
+    runtime_clicked, ctx, user = runtime_inbound(
+        pool, clicked.metadata["message_id"], clicked.content,
+        when=RUNTIME_BASE + timedelta(minutes=101),
+        media=clicked.media,
+        metadata_extra=clicked.metadata,
+    )
+    assert runtime_clicked.metadata.get("_camera_authority") is CAMERA_AUTHORITY
+    assert runtime_clicked.metadata.get("_camera_answer") == "yes"
+    camera_config = pool._gateway_config.camera_ingress
+    assert runtime_clicked.channel == "telegram"
+    assert str(runtime_clicked.chat_id) == camera_config.chat_id
+    assert "telegram:123" == camera_config.session_key
+    assert camera_config.enabled is True
+    assert runtime_clicked.sender_id.split("|", 1)[0] in {"__camera__", camera_config.principal}
+    assert pool._resolve_turn_memory_scope(ctx) == MemoryScope(ingress.config.tenant_id, ())
+    assert pool._honcho_turn_allowed(ctx, MemoryScope(ingress.config.tenant_id, ()))
+    bundle.engine.annotation = observation(
+        meal_at=datetime.fromisoformat(request["capture_time"]),
+        energy_kcal_best=80,
+        items=[{"name": "coffee", "quantity_text": "1 small cup", "energy_kcal_best": 80}],
+    )
+    bundle.engine.answer = "Записала одну маленькую чашку кофе."
+
+    async def existing_bundle(*_args, **_kwargs):
+        return bundle
+
+    pool.get_bundle = existing_bundle
+    pool._bundles = {"telegram:123": bundle}
+    bundle.commands = SimpleNamespace(lookup=lambda _text: None)
+    pool._configure_turn_memory_surfaces = lambda *_args, **_kwargs: None
+    pool._todo_store = SimpleNamespace(read_snapshot=lambda _session_id: ([], "synthetic"))
+    append_context = {}
+    original_append = pool._append_conversation_turn
+
+    async def capture_append_context(**kwargs):
+        append_context["turn_ctx"] = kwargs["turn_ctx"]
+        append_context["message"] = kwargs["message"]
+        return await original_append(**kwargs)
+
+    pool._append_conversation_turn = capture_append_context
+    updates = [
+        update async for update in pool.stream_message(runtime_clicked, "telegram:123")
+    ]
+    await bundle.review_backend.await_pending()
+    final = next((update for update in updates if update.kind == "final"), None)
+    assert final is not None, [(update.kind, update.text) for update in updates]
+    assert final.metadata.get("nutrition_sync_status") == "pending", {
+        "text": final.text, "metadata": final.metadata, "rows": server.rows,
+    }
+    append_row = next(
+        row for row in server.rows if row["metadata"].get("role") == "assistant"
+    )
+    assert append_context["turn_ctx"].camera_authorized, append_context["turn_ctx"]
+    assert append_context["turn_ctx"].principal == ingress.config.principal
+    assert append_context["message"].metadata.get("_camera_answer") == "yes"
+    assert append_row["metadata"].get("camera_candidate_id") == request["candidate_id"], {
+        "row": append_row, "turn_ctx": append_context.get("turn_ctx"),
+        "message": append_context.get("message"),
+        "gateway_config": pool._gateway_config.camera_ingress,
+    }
+    assert append_row["metadata"]["camera_answer_bound"] == "yes"
+    assert append_row["metadata"]["camera_reply_to_native_message_id"] == str(photo_id)
+    saved = append_row["metadata"]["decision_trace"]["annotations"]["nutrition"]
+    assert saved["items"] == [{
+        "name": "coffee", "quantity_text": "1 small cup",
+        "energy_kcal_min": None, "energy_kcal_max": None, "energy_kcal_best": 80,
+    }]
+    assert "both cups" not in str(saved).casefold()
+    assert ingress._attempts[other["candidate_id"]]["state"] == "photo_sent"
+    await client.aclose()
+
+    class ScriptedRuntime:
+        seen = None
+
+        async def stream_message(self, message, session_key):
+            self.seen = message
+            yield GatewayStreamUpdate(kind="final", text="Учла одну маленькую чашку.", metadata={})
+
+    runtime = ScriptedRuntime()
+    bridge = OhmoGatewayBridge(bus=bus, runtime_pool=runtime, camera_ingress=ingress)
+    await bridge._process_message(clicked, "telegram:123")
+    assert runtime.seen is clicked
+    assert runtime.seen.content == "Маленькую чашку"
+    assert "Большую чашку" not in runtime.seen.content
+    assert runtime.seen.metadata["_camera_answer"] == "yes"
+    await ingress.close()
+
+
+def _configure_joint_camera_runtime(pool, bundle, ingress):
+    pool._gateway_config = pool._gateway_config.model_copy(update={
+        "camera_ingress": ingress.config,
+        "family_principals": {"123": ingress.config.tenant_id},
+        "enabled_memory_tenants": (ingress.config.tenant_id,),
+    })
+    pool._camera_ingress = ingress
+    pool._session_owner_principals = {"gateway-session": "123"}
+
+    async def existing_bundle(*_args, **_kwargs):
+        return bundle
+
+    pool.get_bundle = existing_bundle
+    pool._bundles = {"telegram:123": bundle}
+    # Full stream handling for text-only Camera callbacks resolves slash
+    # command context before entering the ordinary response path.
+    pool._cwd = pool._workspace
+    pool._session_backend = SimpleNamespace()
+    bundle.commands = SimpleNamespace(lookup=lambda _text: None)
+    pool._configure_turn_memory_surfaces = lambda *_args, **_kwargs: None
+    pool._todo_store = SimpleNamespace(read_snapshot=lambda _session_id: ([], "synthetic"))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("classifier", ["food", "legacy_unknown", "ambiguous"])
+async def test_filtered_not_food_option_keeps_actual_native_camera_prompt(tmp_path, classifier):
+    ingress, root, bus, _ = _ingress(tmp_path)
+    request = _candidate(
+        root, classifier_decision="ambiguous" if classifier == "ambiguous" else "food",
+    )
+    initial, final, receipt, native_options, clicked, channel, bot = (
+        await _actual_native_camera_prompt(
+            ingress, root, bus, request, question="Ты пила этот кофе?",
+            options=["Маленькую чашку", "Это не еда"],
+            unknown_decision=classifier == "legacy_unknown",
+            selected_index=None,
+        )
+    )
+    expected = (
+        ["Маленькую чашку", "Это не еда"]
+        if classifier == "ambiguous"
+        else ["Маленькую чашку", "Нет, не ел(а)"]
+    )
+    if classifier == "legacy_unknown":
+        assert "classifier_decision" not in ingress._attempts[request["candidate_id"]]
+        assert initial.metadata["_camera_classifier_decision"] is None
+    assert final.content.startswith("На фото еда.")
+    assert final.buttons == native_options == expected
+    assert [name for name, _ in bot.calls] == ["send_photo", "edit_message_caption"]
+    assert bot.calls[0][1]["reply_markup"] is None
+    assert bot.calls[1][1]["message_id"] == receipt.native_message_ids[0] == 77
+    assert bot.calls[1][1]["reply_markup"] is not None
+    assert final.metadata["_camera_caption"] == (
+        "Съели ли вы это? Фото сделано "
+        + datetime.fromisoformat(request["capture_time"]).date().isoformat() + "."
+    )
+    assert receipt.native_message_ids == (77,)
+    assert clicked is None
+    assert ingress._attempts[request["candidate_id"]]["state"] == "photo_sent"
+    await ingress.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("label", "question"),
+    [
+        ("Только рецепт", "Вы это ели?"),
+        ("Только посмотреть", "Вы это ели?"),
+        ("Only information", "Вы это ели?"),
+        ("Только рецепт", "Что вы хотите узнать?"),
+        ("Только посмотреть", "Что показать?"),
+        ("Only information", "What information do you want?"),
+    ],
+)
+async def test_information_scope_native_callbacks_do_not_authorize_camera_runtime(
+    tmp_path, label, question,
+):
+    import tests.test_ohmo.test_camera_f84_joint_runtime as joint_runtime
+
+    ingress, root, bus, _ = _ingress(tmp_path)
+    request = _candidate(
+        root, classifier_decision="food", capture_time=joint_runtime.BASE,
+    )
+    _, _, receipt, native_options, clicked, _, bot = await _actual_native_camera_prompt(
+        ingress, root, bus, request, question=question,
+        options=[label, "Нет, не ела"],
+    )
+    assert native_options == [label, "Нет, не ела"]
+    assert clicked is not None
+    assert clicked.metadata["native_keyboard_question"] == question
+    assert clicked.metadata["native_keyboard_prompt"].startswith(
+        "Съели ли вы это? Фото сделано "
+    )
+    assert clicked.metadata.get("_camera_answer") is None
+    assert clicked.metadata.get("_camera_authority") is not CAMERA_AUTHORITY
+    assert clicked.metadata["_camera_unbound"] is CAMERA_AUTHORITY
+    assert clicked.media == []
+    assert [name for name, _ in bot.calls] == ["send_photo", "edit_message_caption"]
+    assert receipt.native_message_ids == (77,)
+
+    pool, bundle, server, client = joint_runtime.setup(
+        str(tmp_path / "information-scope-runtime")
+    )
+    _configure_joint_camera_runtime(pool, bundle, ingress)
+    runtime_message, turn_ctx, _user = joint_runtime.inbound(
+        pool, clicked.metadata["message_id"], clicked.content,
+        when=joint_runtime.BASE + timedelta(minutes=1),
+        media=clicked.media, metadata_extra=clicked.metadata,
+    )
+    bundle.engine.annotation = None
+    bundle.engine.answer = "Это информационный запрос."
+    assert not turn_ctx.camera_authorized
+    assert pool._trusted_camera_answer_time(
+        runtime_message, session_key="telegram:123", turn_ctx=turn_ctx
+    ) is None
+    updates = [
+        update async for update in pool.stream_message(runtime_message, "telegram:123")
+    ]
+    await bundle.review_backend.await_pending()
+    final = next(update for update in updates if update.kind == "final")
+    assert "# Verified Camera answer for this turn" not in bundle.engine.observed_prompts[-1]
+    assert final.metadata.get("nutrition_sync_status") is None
+    assert ingress._attempts[request["candidate_id"]]["state"] == "photo_sent"
+    assert "camera_commit" not in ingress._attempts[request["candidate_id"]]
+    assert not any(
+        row.get("metadata", {}).get("camera_candidate_id") == request["candidate_id"]
+        for row in server.rows
+    )
+    await client.aclose()
+
+    # A model-supplied meal annotation cannot override the missing native
+    # owner answer. The recorder must reject this adversarial finalization.
+    rejected_pool, rejected_bundle, rejected_server, rejected_client = joint_runtime.setup(
+        str(tmp_path / "information-scope-adversarial-runtime")
+    )
+    _configure_joint_camera_runtime(rejected_pool, rejected_bundle, ingress)
+    rejected_message, _, _ = joint_runtime.inbound(
+        rejected_pool, clicked.metadata["message_id"], clicked.content,
+        when=joint_runtime.BASE + timedelta(minutes=1),
+        media=clicked.media, metadata_extra=clicked.metadata,
+    )
+    rejected_bundle.engine.annotation = joint_runtime.observation(
+        meal_at=joint_runtime.BASE,
+        energy_kcal_best=70,
+        items=[{"name": "plums", "quantity_text": "one portion", "energy_kcal_best": 70}],
+    )
+    rejected_bundle.engine.answer = "Это информационный запрос."
+    with pytest.raises(
+        DecisionTraceValidationError,
+        match="Camera meal requires a bound explicit owner answer",
+    ):
+        async for _ in rejected_pool.stream_message(rejected_message, "telegram:123"):
+            pass
+    await rejected_bundle.review_backend.await_pending()
+    assert "# Verified Camera answer for this turn" not in rejected_bundle.engine.observed_prompts[-1]
+    assert ingress._attempts[request["candidate_id"]]["state"] == "photo_sent"
+    assert "camera_commit" not in ingress._attempts[request["candidate_id"]]
+    assert not any(
+        row.get("metadata", {}).get("camera_candidate_id") == request["candidate_id"]
+        for row in rejected_server.rows
+    )
+    await rejected_client.aclose()
+    await ingress.close()
+
+
+@pytest.mark.asyncio
+async def test_native_plum_scope_commits_one_camera_portion_without_extra_yes(tmp_path):
+    import tests.test_ohmo.test_camera_f84_joint_runtime as joint_runtime
+
+    ingress, root, bus, _ = _ingress(tmp_path)
+    request = _candidate(
+        root, classifier_decision="food", capture_time=joint_runtime.BASE,
+    )
+    _, _, receipt, native_options, clicked, channel, _bot = await _actual_native_camera_prompt(
+        ingress, root, bus, request, question="Вы ели эти сливы?",
+        options=["Только сливы", "Нет, не ела"],
+    )
+    assert native_options == ["Только сливы", "Нет, не ела"]
+    assert clicked is not None
+    assert clicked.metadata["native_keyboard_selected_label"] == "Только сливы"
+    assert clicked.metadata["native_keyboard_question"] == "Вы ели эти сливы?"
+    assert clicked.metadata["_camera_answer"] == "yes"
+    assert clicked.metadata["_camera_native_binding"] == str(receipt.native_message_ids[0])
+    assert clicked.media == [ingress._attempts[request["candidate_id"]]["snapshot"]]
+
+    pool, bundle, server, client = joint_runtime.setup(
+        str(tmp_path / "plum-scope-runtime")
+    )
+    _configure_joint_camera_runtime(pool, bundle, ingress)
+    runtime_message, turn_ctx, _user = joint_runtime.inbound(
+        pool, clicked.metadata["message_id"], clicked.content,
+        when=joint_runtime.BASE + timedelta(minutes=1),
+        media=clicked.media, metadata_extra=clicked.metadata,
+    )
+    bundle.engine.annotation = joint_runtime.observation(
+        meal_at=datetime.fromisoformat(request["capture_time"]),
+        energy_kcal_best=70,
+        items=[{"name": "plums", "quantity_text": "one portion", "energy_kcal_best": 70}],
+    )
+    bundle.engine.answer = "Записала одну порцию слив."
+    assert runtime_message.metadata["_camera_authority"] is CAMERA_AUTHORITY
+    append_context = {}
+    original_append = pool._append_conversation_turn
+
+    async def capture_append_context(**kwargs):
+        append_context["turn_ctx"] = kwargs["turn_ctx"]
+        return await original_append(**kwargs)
+
+    pool._append_conversation_turn = capture_append_context
+    updates = [
+        update async for update in pool.stream_message(runtime_message, "telegram:123")
+    ]
+    await bundle.review_backend.await_pending()
+    final = next(update for update in updates if update.kind == "final")
+    rows = [row for row in server.rows if row.get("metadata", {}).get("role") == "assistant"]
+    assert final.metadata.get("nutrition_sync_status") == "pending"
+    assert len(rows) == 1
+    assert append_context["turn_ctx"].camera_authorized
+    assert rows[0]["metadata"]["camera_candidate_id"] == request["candidate_id"]
+    saved = rows[0]["metadata"]["decision_trace"]["annotations"]["nutrition"]
+    assert saved["items"] == [
+        {"name": "plums", "quantity_text": "one portion",
+         "energy_kcal_min": None, "energy_kcal_max": None, "energy_kcal_best": 70}
+    ]
+    assert ingress._attempts[request["candidate_id"]]["camera_commit"]["event_id"] == rows[0]["id"]
+    attempt = ingress._attempts[request["candidate_id"]]
+    assert attempt["state"] == "final_queued"
+    assert final.metadata.get("_camera_final") is CAMERA_AUTHORITY
+    assert final.metadata.get("_camera_turn_id") == attempt["final_turn_id"]
+    final_message = OutboundMessage(
+        channel="telegram", chat_id="123", content=final.text, metadata=final.metadata,
+    )
+    final_receipt = await channel.send(final_message)
+    assert final_receipt is not None
+    ingress.note_assistant_receipt(final_message, final_receipt)
+    assert attempt["state"] == "completed"
+    await client.aclose()
+    await ingress.close()
+
+
+@pytest.mark.asyncio
+async def test_current_native_composition_question_cannot_inherit_camera_caption_yes(tmp_path):
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    from openharness.channels.impl.telegram import TelegramChannel
+    from openharness.config.schema import TelegramConfig
+
+    ingress, root, bus, _ = _ingress(tmp_path)
+    request = _candidate(root, classifier_decision="food")
+    assert (await _admit(ingress, root, "Bearer " + "s" * 40, request))[0] == 202
+    synthetic = await asyncio.wait_for(bus.consume_inbound(), timeout=1)
+    photo_id = synthetic.metadata["_camera_photo_id"]
+    labels = ["Маленькую чашку", "Нет, не ела"]
+    channel = TelegramChannel(TelegramConfig(token="token"), bus)
+    channel._start_typing = lambda _chat_id: None
+
+    async def receive_callback(**kwargs):
+        await bus.publish_inbound(InboundMessage(
+            channel="telegram", sender_id=kwargs["sender_id"], chat_id=kwargs["chat_id"],
+            content=kwargs["content"], metadata=kwargs["metadata"],
+        ))
+
+    channel._handle_message = receive_callback
+
+    class Query:
+        data = "ask:0"
+        id = "composition-question-small-cup"
+        message = SimpleNamespace(
+            caption=(
+                "Съели ли вы это? Фото сделано 2026-10-03. На фото кофе. "
+                "Какую чашку подробно разобрать по составу?"
+            ),
+            caption_html=(
+                "Съели ли вы это? Фото сделано 2026-10-03. На фото кофе. "
+                "Какую чашку подробно разобрать по составу?"
+            ),
+            text=None, message_id=photo_id, chat_id=123,
+            chat=SimpleNamespace(type="private"),
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(label, callback_data=f"ask:{index}")]
+                for index, label in enumerate(labels)
+            ]),
+        )
+
+        async def answer(self):
+            pass
+
+        async def edit_message_caption(self, **_kwargs):
+            pass
+
+        async def edit_message_reply_markup(self, **_kwargs):
+            pass
+
+    await channel._on_callback(
+        SimpleNamespace(callback_query=Query(), effective_user=SimpleNamespace(
+            id=123, username=None, first_name="Marina")), None,
+    )
+    clicked = await asyncio.wait_for(bus.consume_inbound(), timeout=1)
+    assert "Съели ли вы это? Фото сделано 2026-10-03." in clicked.metadata["native_keyboard_prompt"]
+    assert clicked.metadata["native_keyboard_question"] == "Какую чашку подробно разобрать по составу?"
+
+    ingress.process_real_inbound(clicked)
+    attempt = ingress._attempts[request["candidate_id"]]
+    assert "_camera_answer" not in clicked.metadata
+    assert clicked.metadata.get("_camera_authority") is not CAMERA_AUTHORITY
+    assert clicked.media == []
+    assert attempt["state"] == "photo_sent"
+
+    class BareAffirmationQuery:
+        data = "ask:0"
+        id = "composition-question-bare-yes"
+        message = SimpleNamespace(
+            caption=(
+                "Съели ли вы это? Фото сделано 2026-10-03. На фото кофе. "
+                "Хочешь узнать состав?"
+            ),
+            caption_html=(
+                "Съели ли вы это? Фото сделано 2026-10-03. На фото кофе. "
+                "Хочешь узнать состав?"
+            ),
+            text=None, message_id=photo_id, chat_id=123,
+            chat=SimpleNamespace(type="private"),
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("Да", callback_data="ask:0")],
+                [InlineKeyboardButton("Только оценить состав", callback_data="ask:1")],
+            ]),
+        )
+
+        async def answer(self):
+            pass
+
+        async def edit_message_caption(self, **_kwargs):
+            pass
+
+        async def edit_message_reply_markup(self, **_kwargs):
+            pass
+
+    await channel._on_callback(
+        SimpleNamespace(callback_query=BareAffirmationQuery(), effective_user=SimpleNamespace(
+            id=123, username=None, first_name="Marina")), None,
+    )
+    bare_yes = await asyncio.wait_for(bus.consume_inbound(), timeout=1)
+    assert bare_yes.metadata["native_keyboard_question"] == "Хочешь узнать состав?"
+    ingress.process_real_inbound(bare_yes)
+    assert "_camera_answer" not in bare_yes.metadata
+    assert bare_yes.media == []
+    assert attempt["state"] == "photo_sent"
+    await ingress.close()
+
+
+@pytest.mark.asyncio
+async def test_initial_photo_edit_timeout_uses_linked_text_without_photo_resend(tmp_path: Path) -> None:
+    from openharness.channels.impl.telegram import TelegramChannel
+    from openharness.config.schema import TelegramConfig
+
+    class Bot:
+        def __init__(self):
+            self.calls = []
+
+        async def send_photo(self, **kwargs):
+            self.calls.append(("send_photo", kwargs))
+            return SimpleNamespace(message_id=77, chat_id=123, photo=[object()])
+
+        async def edit_message_caption(self, **kwargs):
+            self.calls.append(("edit_message_caption", kwargs))
+            raise asyncio.TimeoutError("synthetic edit timeout")
+
+        async def send_message(self, **kwargs):
+            self.calls.append(("send_message", kwargs))
+            return SimpleNamespace(message_id=78)
+
+    ingress, root, bus, _ = _ingress(tmp_path)
+    bot = Bot()
+    channel = TelegramChannel(TelegramConfig(token="token"), bus)
+    channel._app = SimpleNamespace(bot=bot)
+    channel.polling_started = True
+    channel._camera_ingress_authority = ingress
+    ingress._telegram = channel
+    request = _candidate(root, classifier_decision="food")
+    assert (await _admit(ingress, root, "Bearer " + "s" * 40, request))[0] == 202
+    synthetic = await asyncio.wait_for(bus.consume_inbound(), timeout=1)
+
+    class Runtime:
+        async def stream_message(self, message, session_key):
+            original = message.media[0]
+            yield GatewayStreamUpdate(
+                kind="final",
+                text="Две чашки кофе. [[ask: Ты пила кофе? | Маленькую чашку | Большую чашку | Обе | Не пила]]",
+                metadata={"_media": [original]},
+            )
+
+    bridge = OhmoGatewayBridge(bus=bus, runtime_pool=Runtime())
+    await bridge._process_message(synthetic, "telegram:123")
+    final = await bus.consume_outbound()
+    assert final.media == []
+    receipt = await channel.send(final)
+    assert [name for name, _ in bot.calls] == [
+        "send_photo", "edit_message_caption", "send_message",
+    ]
+    assert bot.calls[-1][1]["reply_parameters"].message_id == 77
+    assert receipt.native_message_ids == (78,)
+    assert ingress._attempts[request["candidate_id"]]["prompt_edit_claimed"] is True
+    await ingress.close()
 
 
 @pytest.mark.asyncio
@@ -431,6 +1272,18 @@ async def test_candidate_manifest_mime_mismatch_is_rejected(tmp_path: Path) -> N
     request["manifest_sha256"] = hashlib.sha256(raw).hexdigest()
     assert (await _admit(ingress, root, "Bearer " + "s" * 40, request))[0] == 422
     assert channel.calls == [] and bus.inbound_size == 0
+
+
+@pytest.mark.asyncio
+async def test_classifier_sidecar_disagreement_is_rejected_before_admission(tmp_path: Path) -> None:
+    ingress, root, bus, channel = _ingress(tmp_path)
+    request = _candidate(root)
+    upload = await _leased_upload(ingress, root, "Bearer " + "s" * 40, request)
+    sidecar = json.loads(upload.producer_sidecar_bytes)
+    sidecar["decision"]["output"]["decision"] = "food"
+    forged = replace(upload, producer_sidecar_bytes=json.dumps(sidecar).encode())
+    assert (await ingress.admit("Bearer " + "s" * 40, forged))[0] == 422
+    assert channel.calls == [] and bus.inbound_size == 0 and not ingress._attempts
 
 
 @pytest.mark.asyncio
@@ -3030,7 +3883,12 @@ async def test_ask_callback_answer_binds_and_foreign_callback_rejected(
         OutboundDeliveryReceipt(channel="telegram", chat_id="123", native_message_ids=(88,)),
     )
 
-    def callback(label: str, *, target: int, data: str = "ask:1") -> InboundMessage:
+    def callback(
+        label: str, *, target: int, data: str = "ask:1", options: list[str] | None = None,
+        question: str = "Вы это ели?",
+    ) -> InboundMessage:
+        options = options or ["Да, всё на фото", "Нет, не ел"]
+        selected_index = options.index(label) if label in options else 0
         return InboundMessage(
             channel="telegram",
             sender_id="123",
@@ -3040,7 +3898,14 @@ async def test_ask_callback_answer_binds_and_foreign_callback_rejected(
                 "is_group": False,
                 "callback_query": True,
                 "native_message_id": target,
-                "callback_data": data,
+                "message_id": target,
+                "callback_query_id": f"callback-{target}-{label}",
+                "native_keyboard_options": options,
+                "native_keyboard_selected_index": selected_index,
+                "native_keyboard_selected_label": label,
+                "native_keyboard_prompt": question,
+                "native_keyboard_question": question,
+                "callback_data": data if data != "ask:1" or label not in options else f"ask:{selected_index}",
             },
         )
 
@@ -3091,9 +3956,28 @@ async def test_ask_callback_answer_binds_and_foreign_callback_rejected(
         ),
         OutboundDeliveryReceipt(channel="telegram", chat_id="123", native_message_ids=(90,)),
     )
-    scope = callback("Только сливы", target=90, data="ask:1")
+    composition_scope = callback(
+        "Только оценить состав", target=90, data="ask:0",
+        options=["Только оценить состав", "Только сливы"],
+        question="Какую чашку подробно разобрать по составу?",
+    )
+    composition_scope.metadata["native_keyboard_prompt"] = (
+        "Съели ли вы это? Фото сделано 2026-10-03. "
+        "Какую чашку подробно разобрать по составу?"
+    )
+    ingress.process_real_inbound(composition_scope)
+    assert composition_scope.metadata.get("_camera_answer") is None
+    assert composition_scope.media == []
+
+    scope = callback(
+        "Только сливы", target=90, data="ask:0",
+        options=["Только сливы", "Только оценить состав"],
+    )
+    scope.metadata["native_keyboard_prompt"] = (
+        "Съели ли вы это? Фото сделано 2026-10-03. Вы это ели?"
+    )
     ingress.process_real_inbound(scope)
-    assert scope.metadata["_camera_answer"] == "yes"  # anchored scope-only binds
+    assert scope.metadata["_camera_answer"] == "yes"
     assert len(scope.media) == 1
     await ingress.close()
 
@@ -3205,7 +4089,13 @@ async def test_expired_operation_remains_addressable_without_clearing_new_attent
         answer = InboundMessage(
             channel="telegram", sender_id="123", chat_id="123", content="Нет, не ела",
             metadata={"callback_query": True, "native_message_id": 90,
-                      "callback_data": "ask:0", "_telegram_raw_text": "Нет, не ела"},
+                      "message_id": 90, "callback_query_id": "late-owned-click",
+                      "native_keyboard_options": ["Маленькую чашку", "Нет, не ела"],
+                      "native_keyboard_selected_index": 1,
+                      "native_keyboard_selected_label": "Нет, не ела",
+                      "native_keyboard_prompt": "Вы это ели?",
+                      "native_keyboard_question": "Вы это ели?",
+                      "callback_data": "ask:1", "_telegram_raw_text": "Нет, не ела"},
         )
     ingress.process_real_inbound(answer)
     assert answer.metadata["_camera_candidate_id"] == first["candidate_id"]
@@ -3244,18 +4134,58 @@ async def test_not_food_callback_is_durable_classifier_feedback_not_consumption(
     ).isoformat()
 
     assert telegram.captions[0] == "Съели ли вы это? Фото сделано 2026-09-30."
-    assert telegram.buttons[0] == ["Да, я это съел(а)", "Нет, не ел(а)", "Это не еда"]
+    assert telegram.buttons[0] == []
+    assert ingress._attempts[request["candidate_id"]]["classifier_decision"] == "ambiguous"
     candidate_id = request["candidate_id"]
     photo_id = ingress._attempts[candidate_id]["photo_id"]
-    callback = InboundMessage(
-        channel="telegram", sender_id="123", chat_id="123", content="Это не еда",
-        metadata={"callback_query": True, "native_message_id": photo_id,
-                  "callback_data": "ask:2", "callback_query_id": "cb-notfood-1",
-                  "message_id": photo_id,
-                  "_telegram_raw_text": "Это не еда"},
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    from openharness.channels.impl.telegram import TelegramChannel
+    from openharness.config.schema import TelegramConfig
+
+    native_channel = TelegramChannel(TelegramConfig(token="token"), bus)
+    native_channel._start_typing = lambda _chat_id: None
+
+    async def receive_callback(**kwargs):
+        await bus.publish_inbound(InboundMessage(
+            channel="telegram", sender_id=kwargs["sender_id"], chat_id=kwargs["chat_id"],
+            content=kwargs["content"], metadata=kwargs["metadata"],
+        ))
+
+    native_channel._handle_message = receive_callback
+
+    class Query:
+        data = "ask:2"
+        id = "cb-notfood-1"
+        message = SimpleNamespace(
+            caption="Съели ли вы это? Фото сделано 2026-09-30. Что изображено?",
+            caption_html="Съели ли вы это? Фото сделано 2026-09-30. Что изображено?",
+            text=None, message_id=photo_id, chat_id=123,
+            chat=SimpleNamespace(type="private"),
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("Да, я это съел(а)", callback_data="ask:0")],
+                [InlineKeyboardButton("Нет, не ел(а)", callback_data="ask:1")],
+                [InlineKeyboardButton("Это не еда", callback_data="ask:2")],
+            ]),
+        )
+
+        async def answer(self):
+            pass
+
+        async def edit_message_caption(self, **_kwargs):
+            pass
+
+        async def edit_message_reply_markup(self, **_kwargs):
+            pass
+
+    await native_channel._on_callback(
+        SimpleNamespace(callback_query=Query(), effective_user=SimpleNamespace(
+            id=123, username=None, first_name="Marina")), None,
     )
+    callback = await asyncio.wait_for(bus.consume_inbound(), timeout=1)
     ingress.process_real_inbound(callback)
     assert callback.metadata["_camera_classifier_feedback"] is CAMERA_AUTHORITY
+    assert callback.metadata["_camera_ingress_callback_eligible"] is True
+    assert callback.metadata["_camera_feedback_receipt"]["candidate_id"] == candidate_id
     assert "_camera_answer" not in callback.metadata
     assert "_camera_candidate_id" not in callback.metadata
     feedback = ingress._attempts[candidate_id]["classifier_feedback"]
@@ -3269,17 +4199,52 @@ async def test_not_food_callback_is_durable_classifier_feedback_not_consumption(
     assert ingress._attempts[newer["candidate_id"]]["attention_active"] is True
     assert "camera_commit" not in ingress._attempts[candidate_id]
 
+    import tests.test_ohmo.test_camera_f84_joint_runtime as joint_runtime
+    pool, bundle, server, client = joint_runtime.setup(str(tmp_path / "not-food-runtime"))
+    runtime_message, ctx, user = joint_runtime.inbound(
+        pool, callback.metadata["message_id"], callback.content,
+        metadata_extra=callback.metadata,
+    )
+    bundle.engine.answer = "Поняла, это не еда."
+    bundle.engine.annotation = None
+
+    async def existing_bundle(*_args, **_kwargs):
+        return bundle
+
+    pool.get_bundle = existing_bundle
+    pool._bundles = {"telegram:123": bundle}
+    pool._cwd = pool._workspace
+    pool._session_backend = SimpleNamespace()
+    bundle.commands = SimpleNamespace(lookup=lambda _text: None)
+    pool._configure_turn_memory_surfaces = lambda *_args, **_kwargs: None
+    pool._todo_store = SimpleNamespace(read_snapshot=lambda _session_id: ([], "synthetic"))
+    updates = [
+        update async for update in pool.stream_message(runtime_message, "telegram:123")
+    ]
+    await bundle.review_backend.await_pending()
+    final = next(update for update in updates if update.kind == "final")
+    assert "nutrition_sync_status" not in final.metadata
+    assert all(
+        "nutrition" not in ((row.get("metadata", {}).get("decision_trace") or {}).get("annotations") or {})
+        for row in server.rows
+    )
+    await client.aclose()
+
     reopened = CameraIngress(ingress.config, workspace=tmp_path, bus=MessageBus(), telegram=None)
     assert reopened._attempts[candidate_id]["classifier_feedback"] == feedback
     duplicate = InboundMessage(
         channel="telegram", sender_id="123", chat_id="123", content="Это не еда",
         metadata={"callback_query": True, "native_message_id": photo_id,
                   "callback_data": "ask:2", "callback_query_id": "cb-notfood-1",
+                  "native_keyboard_options": ["Да, я это съел(а)", "Нет, не ел(а)", "Это не еда"],
+                  "native_keyboard_selected_index": 2, "native_keyboard_selected_label": "Это не еда",
                   "message_id": photo_id,
                   "_telegram_raw_text": "Это не еда"},
     )
     reopened.process_real_inbound(duplicate)
     assert reopened._attempts[candidate_id]["classifier_feedback"] == feedback
+    assert duplicate.metadata["_camera_ingress_callback_eligible"] is False
+    assert "_camera_feedback_receipt" not in duplicate.metadata
     assert "camera_commit" not in reopened._attempts[candidate_id]
     assert reopened._attempts[newer["candidate_id"]]["attention_active"] is True
     await ingress.close()
@@ -3300,7 +4265,12 @@ async def test_foreign_or_unpersisted_not_food_callback_cannot_grant_feedback_au
     foreign = InboundMessage(
         channel="telegram", sender_id="456", chat_id="123", content="Это не еда",
         metadata={"callback_query": True, "native_message_id": photo_id,
+                  "message_id": photo_id,
                   "callback_data": "ask:2", "callback_query_id": "foreign-callback",
+                  "native_keyboard_options": ["Да", "Нет", "Это не еда"],
+                  "native_keyboard_selected_index": 2, "native_keyboard_selected_label": "Это не еда",
+                  "native_keyboard_prompt": "Съели ли вы это? Фото сделано 2026-10-03. Что изображено?",
+                  "native_keyboard_question": "Что изображено?",
                   "_telegram_raw_text": "Это не еда"},
     )
     ingress.process_real_inbound(foreign)
@@ -3313,7 +4283,12 @@ async def test_foreign_or_unpersisted_not_food_callback_cannot_grant_feedback_au
     failed_save = InboundMessage(
         channel="telegram", sender_id="123", chat_id="123", content="Это не еда",
         metadata={"callback_query": True, "native_message_id": photo_id,
+                  "message_id": photo_id,
                   "callback_data": "ask:2", "callback_query_id": "owner-callback",
+                  "native_keyboard_options": ["Да", "Нет", "Это не еда"],
+                  "native_keyboard_selected_index": 2, "native_keyboard_selected_label": "Это не еда",
+                  "native_keyboard_prompt": "Съели ли вы это? Фото сделано 2026-10-03. Что изображено?",
+                  "native_keyboard_question": "Что изображено?",
                   "_telegram_raw_text": "Это не еда"},
     )
     ingress.process_real_inbound(failed_save)
@@ -3321,6 +4296,37 @@ async def test_foreign_or_unpersisted_not_food_callback_cannot_grant_feedback_au
     assert attempt["attention_active"] is True
     assert failed_save.metadata.get("_camera_classifier_feedback") is None
     assert failed_save.metadata["_camera_unbound"] is CAMERA_AUTHORITY
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("decision", ["food", None])
+async def test_not_food_feedback_requires_validated_ambiguous_decision(
+    tmp_path: Path, decision: str | None,
+) -> None:
+    ingress, root, bus, _ = _ingress(tmp_path)
+    request = _candidate(root)
+    assert (await _admit(ingress, root, "Bearer " + "s" * 40, request))[0] == 202
+    await asyncio.wait_for(bus.consume_inbound(), timeout=1)
+    attempt = ingress._attempts[request["candidate_id"]]
+    if decision is None:
+        attempt.pop("classifier_decision")
+    else:
+        attempt["classifier_decision"] = decision
+    ingress._save_attempts()
+    photo_id = attempt["photo_id"]
+    callback = InboundMessage(
+        channel="telegram", sender_id="123", chat_id="123", content="Это не еда",
+        metadata={
+            "callback_query": True, "native_message_id": photo_id,
+            "callback_data": "ask:2", "callback_query_id": "not-food-unknown",
+            "native_keyboard_options": ["Да", "Нет", "Это не еда"],
+            "native_keyboard_selected_index": 2, "native_keyboard_selected_label": "Это не еда",
+            "_telegram_raw_text": "Это не еда",
+        },
+    )
+    ingress.process_real_inbound(callback)
+    assert callback.metadata.get("_camera_classifier_feedback") is not CAMERA_AUTHORITY
+    assert "classifier_feedback" not in attempt
     await ingress.close()
 
 
@@ -3729,6 +4735,116 @@ async def test_bridge_marks_only_camera_final_for_completion() -> None:
     await bus.consume_outbound()
     manual_final = await bus.consume_outbound()
     assert manual_final.metadata.get("_camera_final") is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("decision", "model_options", "expected"),
+    [
+        ("food", ["Маленькую чашку", "Большую чашку", "Это не еда"],
+         ["Маленькую чашку", "Большую чашку"]),
+        ("ambiguous", ["Да", "Нет"], ["Да", "Нет", "Это не еда"]),
+        (None, ["Да", "Нет", "Это не еда"], ["Да", "Нет"]),
+        ("ambiguous", ["Да", "Нет", "1", "2", "3", "4", "5", "6"],
+         ["Да", "Нет", "1", "2", "3", "4", "5", "Это не еда"]),
+        ("ambiguous", ["Это не еда", "Это не еда"],
+         ["Я это съел(а)", "Нет, не ел(а)", "Это не еда"]),
+        (None, [], ["Я это съел", "Нет, не ел"]),
+    ],
+)
+@pytest.mark.parametrize("path_alias", [False, True])
+async def test_classifier_decision_controls_actual_initial_keyboard(
+    decision, model_options, expected, path_alias
+) -> None:
+    candidate_id = "dropbox-camera-v1-" + "b" * 64
+    original = "/synthetic/camera.jpg"
+    returned_path = "/synthetic/./camera.jpg" if path_alias else original
+
+    class Runtime:
+        async def stream_message(self, message, session_key):
+            choices = " | ".join(model_options)
+            ask = f" [[ask: Ты пила этот кофе? | {choices}]]" if model_options else ""
+            yield GatewayStreamUpdate(
+                kind="final", text=f"На фото кофе.{ask}",
+                metadata={"_media": [returned_path]},
+            )
+
+    bus = MessageBus()
+    bridge = OhmoGatewayBridge(bus=bus, runtime_pool=Runtime())
+    message = InboundMessage(
+        channel="telegram", sender_id="__camera__", chat_id="123",
+        content="Проанализируй фото.", media=[original],
+        metadata={
+            "_synthetic": True, "_camera_authority": CAMERA_AUTHORITY,
+            "_camera_initial_prompt": CAMERA_AUTHORITY,
+            "_camera_candidate_id": candidate_id, "_camera_photo_id": 77,
+            "_camera_caption": "Съели ли вы это? Фото сделано 2026-10-03.",
+            "_camera_classifier_decision": decision,
+        },
+    )
+    await bridge._process_message(message, "telegram:123")
+    final = await bus.consume_outbound()
+    assert final.buttons == expected
+    assert final.media == []
+    assert final.metadata.get("_camera_edit_existing_photo") is CAMERA_AUTHORITY
+
+
+@pytest.mark.asyncio
+async def test_initial_photo_edit_claim_requires_live_exact_ingress_receipt(tmp_path):
+    ingress, root, bus, _ = _ingress(tmp_path)
+    request = _candidate(root, classifier_decision="food")
+    assert (await _admit(ingress, root, "Bearer " + "s" * 40, request))[0] == 202
+    await asyncio.wait_for(bus.consume_inbound(), timeout=1)
+    attempt = ingress._attempts[request["candidate_id"]]
+    message = OutboundMessage(
+        channel="telegram", chat_id="123", content="На фото кофе. Ты пила кофе?",
+        buttons=["Маленькую чашку", "Большую чашку"],
+        metadata={
+            "_camera_authority": CAMERA_AUTHORITY, "_camera_final": CAMERA_AUTHORITY,
+            "_camera_edit_existing_photo": CAMERA_AUTHORITY,
+            "_camera_initial_prompt": CAMERA_AUTHORITY,
+            "_camera_candidate_id": request["candidate_id"],
+            "_camera_photo_id": attempt["photo_id"],
+            "_camera_caption": ingress._telegram.captions[0],
+        },
+    )
+    assert not await ingress.claim_initial_prompt_edit(message, "124")
+    forged = copy.copy(message)
+    forged.metadata = {**message.metadata, "_camera_edit_existing_photo": object()}
+    assert not await ingress.claim_initial_prompt_edit(forged, "123")
+    forged.metadata = {**message.metadata, "_camera_candidate_id": "foreign-candidate"}
+    assert not await ingress.claim_initial_prompt_edit(forged, "123")
+    forged.metadata = {**message.metadata, "_camera_photo_id": attempt["photo_id"] + 1}
+    assert not await ingress.claim_initial_prompt_edit(forged, "123")
+    assert await ingress.claim_initial_prompt_edit(message, "123")
+    assert not await ingress.claim_initial_prompt_edit(message, "123")
+    attempt["state"] = "completed"
+    attempt["prompt_edit_claimed"] = False
+    assert not await ingress.claim_initial_prompt_edit(message, "123")
+    await ingress.close()
+
+
+@pytest.mark.asyncio
+async def test_later_camera_answer_final_does_not_edit_initial_photo() -> None:
+    class Runtime:
+        async def stream_message(self, message, session_key):
+            yield GatewayStreamUpdate(kind="final", text="Записала одну чашку.", metadata={})
+
+    bus = MessageBus()
+    bridge = OhmoGatewayBridge(bus=bus, runtime_pool=Runtime())
+    message = InboundMessage(
+        channel="telegram", sender_id="123", chat_id="123", content="Маленькую чашку",
+        metadata={
+            "_camera_authority": CAMERA_AUTHORITY,
+            "_camera_candidate_id": "dropbox-camera-v1-" + "c" * 64,
+            "_camera_photo_id": 77,
+            "_camera_caption": "Съели ли вы это? Фото сделано 2026-10-03.",
+            "_camera_turn_id": "answer-turn",
+        },
+    )
+    await bridge._process_message(message, "telegram:123")
+    final = await bus.consume_outbound()
+    assert final.metadata.get("_camera_edit_existing_photo") is None
 
 
 @pytest.mark.asyncio

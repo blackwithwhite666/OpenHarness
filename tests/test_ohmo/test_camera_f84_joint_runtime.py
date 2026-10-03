@@ -5,9 +5,10 @@ import copy
 import json
 import os
 from io import BytesIO
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
+from zoneinfo import ZoneInfo
 
 import httpx
 import pytest
@@ -49,6 +50,14 @@ def observation(**extra):
 def correction(day="2026-10-02"):
     return {"schema_version": 2, "record_type": "meal_correction",
             "changed_fields": ["meal_date"], "meal_date": day}
+
+
+def assert_annotation_round_trip(value, *, sparse):
+    from ohmo.evals.nutrition_trace import NutritionAnnotationV2
+
+    parsed = NutritionAnnotationV2.model_validate(value)
+    assert parsed.model_dump(mode="json", exclude_unset=sparse) == value
+    return parsed
 
 
 def original_photo_time_correction(meal_at):
@@ -192,7 +201,114 @@ async def turn(pool, bundle, message, ctx, user, annotation, *, loads=(), answer
         memory_scope=SCOPE, recorder=recorder, todo_lifecycle=False,
         user_photo_meal_at=default, user_photo_repeat=repeat)]
     await bundle.review_backend.await_pending()
-    return next(update for update in updates if update.kind == "final"), recorder
+    final_update = next(update for update in updates if update.kind == "final")
+    recorder.record_gateway_final(text=final_update.text, metadata=final_update.metadata)
+    recorder.finish(status="completed")
+    return final_update, recorder
+
+
+def grade_contextual_receipts(pool, server, original_final, correction_final,
+                              original_recorder, correction_recorder, *, source_id, meal_day, case_id,
+                              additional_turns=(), canonical_revision=2,
+                              canonical_meal_at=None, omit_explicit_meal_date=False):
+    """Grade real recorder exports and SDK receipts with synthetic wellness boundary data."""
+    from ohmo.evals.nutrition_persistence import (
+        Goal, Manifest, bind_wellness_snapshot, derive_meal_id, export_eval_dialogue,
+        grade_manifest, validate_dialogue_binding,
+    )
+    recorders = [original_recorder, *(recorder for _, recorder in additional_turns), correction_recorder]
+    episode_ids = list(dict.fromkeys(recorder.episode_id for recorder in recorders))
+    original_id = original_final.metadata["nutrition_append_event_id"]
+    correction_id = correction_final.metadata["nutrition_append_event_id"]
+    original_row = next(row for row in server.rows if row["id"] == original_id)
+    correction_row = next(row for row in server.rows if row["id"] == correction_id)
+    goal = Goal(
+        case_id=case_id, episode_ids=episode_ids,
+        owner_id="review-tenant", principal_id="telegram:123", workspace_id="review-workspace",
+        eval_workspace=str(pool._workspace), peer_id="ohmo", canonical_owner_id="review-tenant",
+        canonical_login="owner", session_id="review-session", gateway_session_id="gateway-session",
+        source_message_id=source_id, meal_date=meal_day, meal_timezone="UTC",
+        trajectory_started_at=datetime.fromisoformat(original_row["created_at"].replace("Z", "+00:00")),
+        trajectory_as_of=datetime.fromisoformat(correction_row["created_at"].replace("Z", "+00:00")),
+        logical_turn_id=original_row["metadata"]["logical_turn_id"],
+        trace_episode_id=original_row["metadata"]["decision_trace_episode_id"],
+        operation_id=original_row["metadata"]["client_op_id"],
+        canonical_meal_id=derive_meal_id(tenant_id="review-tenant", source_principal="telegram:123",
+            gateway_session_id="gateway-session", source_message_id=source_id),
+        expected_consumed=True, expected_kcal=750, expectation_origin="reviewed_user_dialogue",
+        expectation_source="synthetic-joint-runtime-review")
+    manifest = Manifest(schema_version=1, goals=[goal])
+    exported = export_eval_dialogue(recorders[0].store.root,
+        episode_ids=episode_ids)
+    binding = validate_dialogue_binding(manifest, exported)[case_id]
+    assert binding["complete"] is True, binding
+    rows = [row for row in server.rows
+            if row["peer_id"] == goal.peer_id
+            and row["session_id"] == goal.session_id
+            and row["workspace_id"] == goal.workspace_id
+            and goal.trajectory_started_at <= datetime.fromisoformat(
+                row["created_at"].replace("Z", "+00:00")) <= goal.trajectory_as_of]
+    original_annotation = original_row["metadata"]["decision_trace"]["annotations"]["nutrition"]
+    original_date_value = original_annotation.get("meal_date")
+    if original_date_value is None and original_annotation.get("meal_at"):
+        original_date_value = datetime.fromisoformat(original_annotation["meal_at"].replace("Z", "+00:00")).date().isoformat()
+    lower_day = min(date.fromisoformat(original_date_value or meal_day.isoformat()), meal_day)
+    meal_tz = ZoneInfo(goal.meal_timezone)
+    start = datetime.combine(lower_day, datetime.min.time(), meal_tz).isoformat()
+    corrected_day_end = (datetime.combine(
+        goal.meal_date + timedelta(days=1), datetime.min.time(), meal_tz
+    ) - timedelta(microseconds=1))
+    wellness_end = max(goal.trajectory_as_of.astimezone(meal_tz), corrected_day_end)
+    queried = (wellness_end + timedelta(seconds=1)).isoformat()
+    honcho = {"complete": True, "workspace_id": goal.workspace_id, "session_id": goal.session_id,
+        "owner_id": goal.owner_id, "since": goal.trajectory_started_at.isoformat(),
+        "until": goal.trajectory_as_of.isoformat(), "queried_at": queried, "messages": rows}
+    canonical = {"meal_id": goal.canonical_meal_id, "revision": canonical_revision, "status": "active",
+        "latest_event_id": correction_id, "day": meal_day.isoformat(), "provisional": True,
+        "capture_time": correction_row["created_at"], "meal_at": canonical_meal_at,
+        "meal_date": None if omit_explicit_meal_date else meal_day.isoformat(),
+        "source_message_id": source_id, "ingest_source": "telegram", "confirmation_required": False,
+        "reply_to_source_message_id": None, "received_at": None, "is_forwarded": False,
+        "source_message_at": None, "is_estimate": True, "basis": ["image"],
+        "consumption_status": "consumed", "energy_kcal_min": 750, "energy_kcal_max": 750,
+        "energy_kcal_best": 750, "protein_g": None, "fat_g": None, "carbohydrate_g": None,
+        "items": [], "confidence": "medium", "assumptions": [], "warnings": []}
+    wellness = bind_wellness_snapshot({"complete": True, "user_id": goal.canonical_owner_id,
+        "login": goal.canonical_login, "start": start, "end": wellness_end.isoformat(),
+        "queried_at": queried, "meals": [canonical], "unassigned": []}, goal=goal)
+    result = grade_manifest(manifest, honcho, wellness, now=datetime.fromisoformat(queried),
+        reviewed_turn_sources=binding["reviewed_turn_sources"],
+        reviewed_turn_provenance=binding["reviewed_turn_provenance"])[0]
+    if correction_recorder.episode_id != correction_row["metadata"].get("decision_trace_episode_id"):
+        retry_episode_id = correction_recorder.episode_id
+        accepted_episode_id = correction_row["metadata"]["decision_trace_episode_id"]
+        base_provenance = binding["reviewed_turn_provenance"]
+
+        def assert_retry_proof_rejected(mutated_provenance):
+            rejected = grade_manifest(manifest, honcho, wellness,
+                now=goal.trajectory_as_of + timedelta(seconds=1),
+                reviewed_turn_sources=binding["reviewed_turn_sources"],
+                reviewed_turn_provenance=mutated_provenance)[0]
+            assert rejected["a1"] == "INCONCLUSIVE" and rejected["a2"] == "NOT_RUN", rejected
+
+        for mutation in (
+            lambda turn: turn["gateway_final_metadata"].update(
+                nutrition_append_event_id="different-accepted-event"),
+            lambda turn: turn.update(principal_id="telegram:foreign"),
+            lambda turn: turn.update(source_message_id="different-source"),
+            lambda turn: turn.update(operation_id="different-operation:assistant"),
+            lambda turn: turn["gateway_final_metadata"].update(
+                nutrition_committed_annotation={"record_type": "meal_correction", "meal_at": "2030-01-01T00:00:00Z"}),
+        ):
+            mutated_provenance = copy.deepcopy(base_provenance)
+            mutation(mutated_provenance[retry_episode_id][0])
+            assert_retry_proof_rejected(mutated_provenance)
+
+        for field in ("nutrition_finalization", "nutrition_committed_annotation"):
+            mutated_provenance = copy.deepcopy(base_provenance)
+            mutated_provenance[accepted_episode_id][0]["gateway_final_metadata"].pop(field)
+            assert_retry_proof_rejected(mutated_provenance)
+    return result
 
 
 async def runtime():
@@ -203,7 +319,7 @@ async def runtime():
 
     pool, bundle, server, client = setup("direct-correction")
     msg, ctx, user = inbound(pool, "photo-1", media=[str(photo)])
-    original, _ = await turn(
+    original, original_recorder = await turn(
         pool, bundle, msg, ctx, user, observation(),
         answer="Бургер примерно 700–800 ккал. Я не знаю, когда ты его съел; "
         "подтверждения сохранения записи тоже нет.",
@@ -216,7 +332,7 @@ async def runtime():
     bundle.engine.messages = [ConversationMessage.model_validate(row)
                               for row in load_latest(pool._workspace)["messages"]]
     msg2, ctx2, user2 = inbound(pool, "date-correction", "Это было 2 октября", when=BASE+timedelta(days=1))
-    final, _ = await turn(
+    final, correction_recorder = await turn(
         pool, bundle, msg2, ctx2, user2, correction(), loads=[ref.attachment_id],
         answer="Бургер примерно 700–800 ккал. Точное время в запись не подставляю; "
         "проверка журнала пока не подтвердила, что дата обновилась.",
@@ -233,6 +349,220 @@ async def runtime():
     assert "Изменение сохранено; баланс обновляется." in final.text
     assert "2026-10-02" not in final.text and "2 октября" not in final.text
     assert final.metadata["nutrition_sync_status"] == "pending"
+    photo_stamp = original.metadata["nutrition_committed_annotation"]["meal_at"]
+    assert photo_stamp and datetime.fromisoformat(photo_stamp.replace("Z", "+00:00")) == BASE
+    assert original.metadata["nutrition_consumed_occurrence"]["receipt_event_id"]
+    assert original.metadata["nutrition_consumed_occurrence"]["photo_source_message_id"] == "photo-1"
+    assert original.metadata["nutrition_consumed_occurrence"]["append_source_message_id"] == "photo-1"
+    assert final.metadata["nutrition_committed_annotation"]["record_type"] == "meal_correction"
+    context_evidence = final.metadata["nutrition_context_evidence"]
+    assert context_evidence["consumed_source_message_id"] == "photo-1"
+    assert context_evidence["photo_source_message_id"] == "photo-1"
+    assert context_evidence["photo_received_at"]
+    assert context_evidence["original_receipt_event_id"] == original.metadata["nutrition_append_event_id"]
+    assert context_evidence["current_receipt_event_id"] == final.metadata["nutrition_append_event_id"]
+    from ohmo.evals.nutrition_persistence import export_eval_dialogue
+    direct_export = export_eval_dialogue(original_recorder.store.root,
+        episode_ids=[original_recorder.episode_id, correction_recorder.episode_id])
+    exported_correction = next(item for item in direct_export["episodes"]
+        if item["episode"]["episode_id"] == correction_recorder.episode_id)
+    exported_turn = exported_correction["turn_provenance"][0]
+    exported_original = next(item for item in direct_export["episodes"]
+        if item["episode"]["episode_id"] == original_recorder.episode_id)["turn_provenance"][0]
+    assert exported_turn["gateway_final_metadata"]["nutrition_append_event_id"] == final.metadata["nutrition_append_event_id"]
+    assert exported_turn["gateway_final_metadata"]["nutrition_committed_annotation"] == final.metadata["nutrition_committed_annotation"]
+    assert exported_turn["gateway_final_metadata"]["nutrition_context_evidence"] == context_evidence
+    assert exported_turn["gateway_final_metadata"]["nutrition_finalization"]["annotation"]["record_type"] == "meal_correction"
+    exported_final = exported_turn["gateway_final_metadata"]
+    assert exported_final["nutrition_model_proposal_annotation"] == (
+        exported_final["nutrition_finalization"]["annotation"]
+    )
+    assert exported_final["nutrition_proposal_matches_committed"] is (
+        exported_final["nutrition_model_proposal_annotation"]
+        == exported_final["nutrition_committed_annotation"]
+    )
+    for serialized in (
+        exported_final["nutrition_model_proposal_annotation"],
+        exported_final["nutrition_committed_annotation"],
+        exported_final["nutrition_finalization"]["annotation"],
+    ):
+        parsed = assert_annotation_round_trip(serialized, sparse=True)
+        assert parsed.record_type == "meal_correction"
+    for serialized in (
+        exported_original["gateway_final_metadata"]["nutrition_committed_annotation"],
+        exported_original["gateway_final_metadata"]["nutrition_finalization"]["annotation"],
+    ):
+        parsed = assert_annotation_round_trip(serialized, sparse=False)
+        assert parsed.record_type == "meal_observation"
+    from ohmo.evals.nutrition_persistence import (
+        Goal, Manifest, bind_wellness_snapshot, derive_meal_id, grade_manifest,
+        validate_dialogue_binding,
+    )
+    original_row = next(row for row in server.rows
+        if row["metadata"].get("client_op_id") == context_evidence["original_operation_id"]
+        and row["metadata"].get("role") == "assistant")
+    correction_row = next(row for row in server.rows
+        if row["id"] == context_evidence["current_receipt_event_id"])
+    goal_value = Goal(
+        case_id="direct-photo-date-correction",
+        episode_ids=[original_recorder.episode_id, correction_recorder.episode_id],
+        owner_id="review-tenant", principal_id="telegram:123", workspace_id="review-workspace",
+        eval_workspace=str(pool._workspace), peer_id="ohmo", canonical_owner_id="review-tenant",
+        canonical_login="owner", session_id="review-session", gateway_session_id="gateway-session",
+        source_message_id="photo-1", meal_date=date(2026, 10, 2),
+        meal_timezone="UTC", trajectory_started_at=datetime(2026, 10, 1, 20, 59, 58, tzinfo=timezone.utc),
+        trajectory_as_of=datetime(2026, 10, 2, 20, 59, 58, tzinfo=timezone.utc),
+        logical_turn_id=original_row["metadata"]["logical_turn_id"],
+        trace_episode_id=original_row["metadata"]["decision_trace_episode_id"],
+        operation_id=context_evidence["original_operation_id"],
+        canonical_meal_id=derive_meal_id(tenant_id="review-tenant", source_principal="telegram:123",
+            gateway_session_id="gateway-session", source_message_id="photo-1"),
+        expected_consumed=True, expected_kcal=750, expectation_origin="reviewed_user_dialogue",
+        expectation_source="synthetic-joint-runtime-review",
+    )
+    manifest = Manifest(schema_version=1, goals=[goal_value])
+    dialogue_binding = validate_dialogue_binding(manifest, direct_export)["direct-photo-date-correction"]
+    assert dialogue_binding["complete"] is True
+    scoped_rows = [row for row in server.rows
+                   if row["peer_id"] == goal_value.peer_id
+                   and row["session_id"] == goal_value.session_id
+                   and row["workspace_id"] == goal_value.workspace_id
+                   and datetime.fromisoformat("2026-10-01T00:00:00+00:00") <= datetime.fromisoformat(
+                       row["created_at"].replace("Z", "+00:00"))
+                   <= datetime.fromisoformat("2026-10-02T23:59:59.999999+00:00")]
+    honcho_snapshot = {"complete": True, "workspace_id": "review-workspace", "session_id": "review-session",
+        "owner_id": "review-tenant", "since": "2026-10-01T00:00:00+00:00",
+        "until": "2026-10-02T23:59:59.999999+00:00", "queried_at": "2026-10-03T00:00:00+00:00",
+        "messages": scoped_rows}
+    canonical = {
+        "meal_id": goal_value.canonical_meal_id, "revision": 2, "status": "active",
+        "latest_event_id": correction_row["id"], "day": "2026-10-02", "provisional": True,
+        "capture_time": correction_row["created_at"], "meal_at": None, "meal_date": "2026-10-02",
+        "source_message_id": "photo-1", "ingest_source": "telegram", "confirmation_required": False,
+        "reply_to_source_message_id": None, "received_at": None, "is_forwarded": False,
+        "source_message_at": None, "is_estimate": True, "basis": ["image"],
+        "consumption_status": "consumed", "energy_kcal_min": 750, "energy_kcal_max": 750,
+        "energy_kcal_best": 750, "protein_g": None, "fat_g": None, "carbohydrate_g": None,
+        "items": [], "confidence": "medium", "assumptions": [], "warnings": [],
+    }
+    wellness_snapshot_bound = bind_wellness_snapshot({"complete": True, "user_id": "review-tenant", "login": "owner",
+        "start": "2026-10-01T00:00:00+00:00", "end": "2026-10-02T23:59:59.999999+00:00",
+        "queried_at": "2026-10-03T00:00:00+00:00", "meals": [canonical], "unassigned": []}, goal=goal_value)
+    grade = grade_manifest(manifest, honcho_snapshot, wellness_snapshot_bound,
+        now=datetime(2026, 10, 3, tzinfo=timezone.utc),
+        reviewed_turn_sources=dialogue_binding["reviewed_turn_sources"],
+        reviewed_turn_provenance=dialogue_binding["reviewed_turn_provenance"])[0]
+    assert (grade["a1"], grade["stage"], grade.get("actual_latest_event_id")) == (
+        "PASS", "SAME_EVENT_PROJECTED", correction_row["id"]), grade
+    assert canonical["meal_at"] is None and canonical["revision"] == 2 and canonical["day"] == "2026-10-02"
+
+    def regrade(rows=None, provenance=None, wellness_snapshot=None, now=None):
+        return grade_manifest(manifest, {**honcho_snapshot,
+            "messages": copy.deepcopy(scoped_rows if rows is None else rows)},
+            copy.deepcopy(wellness_snapshot_bound if wellness_snapshot is None else wellness_snapshot),
+            now=now or datetime(2026, 10, 3, tzinfo=timezone.utc),
+            reviewed_turn_sources=dialogue_binding["reviewed_turn_sources"],
+            reviewed_turn_provenance=copy.deepcopy(
+                dialogue_binding["reviewed_turn_provenance"] if provenance is None else provenance))[0]
+
+    current_provenance = dialogue_binding["reviewed_turn_provenance"][correction_recorder.episode_id][0]
+    for bad_provenance in (
+        {**dialogue_binding["reviewed_turn_provenance"], correction_recorder.episode_id: [{
+            **current_provenance, "gateway_final_metadata": {
+                **current_provenance["gateway_final_metadata"], "nutrition_context_evidence": {
+                    **context_evidence, "schema_version": 99}}}]},
+        {**dialogue_binding["reviewed_turn_provenance"], correction_recorder.episode_id: [{
+            **current_provenance, "gateway_final_metadata": {
+                **current_provenance["gateway_final_metadata"], "nutrition_context_evidence": {
+                    **context_evidence, "tenant_id": "foreign-owner"}}}]},
+        {**dialogue_binding["reviewed_turn_provenance"], correction_recorder.episode_id: [{
+            **current_provenance, "gateway_final_metadata": {
+                key: value for key, value in current_provenance["gateway_final_metadata"].items()
+                if key != "nutrition_context_evidence"}}]},
+        {**dialogue_binding["reviewed_turn_provenance"], correction_recorder.episode_id: [{
+            **current_provenance, "gateway_final_metadata": {
+                key: value for key, value in current_provenance["gateway_final_metadata"].items()
+                if key != "nutrition_finalization"}}]},
+    ):
+        inconclusive = regrade(provenance=bad_provenance)
+        assert inconclusive["a1"] == "INCONCLUSIVE" and inconclusive["a2"] == "NOT_RUN"
+    missing_original_execution = copy.deepcopy(dialogue_binding["reviewed_turn_provenance"])
+    original_turn = missing_original_execution[original_recorder.episode_id][0]
+    original_turn["gateway_final_metadata"].pop("nutrition_consumed_occurrence")
+    missing_execution = regrade(provenance=missing_original_execution)
+    assert missing_execution["a1"] == "INCONCLUSIVE" and missing_execution["a2"] == "NOT_RUN"
+    missing_finalization = copy.deepcopy(dialogue_binding["reviewed_turn_provenance"])
+    missing_finalization[original_recorder.episode_id][0]["gateway_final_metadata"].pop("nutrition_finalization")
+    no_execution = regrade(provenance=missing_finalization)
+    assert no_execution["a1"] == "INCONCLUSIVE" and no_execution["a2"] == "NOT_RUN"
+    current_mutations = [
+        lambda final: final["nutrition_finalization"]["annotation"].update(meal_date="2030-01-01"),
+        lambda final: final["nutrition_finalization"].update(
+            annotation={"record_type": "meal_deletion"}),
+        lambda final: final.pop("nutrition_model_proposal_annotation"),
+        lambda final: final.update(
+            nutrition_proposal_matches_committed=not final.get("nutrition_proposal_matches_committed")),
+        lambda final: final.update(
+            nutrition_model_proposal_annotation={"schema_version": 99, "record_type": "meal_deletion"}),
+    ]
+    if correction_recorder.episode_id == correction_row["metadata"].get("decision_trace_episode_id"):
+        current_mutations.append(
+            lambda final: final["nutrition_model_proposal_annotation"].update(meal_date="2030-01-01")
+        )
+    for mutate_current in current_mutations:
+        mutated = copy.deepcopy(dialogue_binding["reviewed_turn_provenance"])
+        mutate_current(mutated[correction_recorder.episode_id][0]["gateway_final_metadata"])
+        invalid_execution = regrade(provenance=mutated)
+        assert invalid_execution["a1"] == "INCONCLUSIVE" and invalid_execution["a2"] == "NOT_RUN", invalid_execution
+    retry_turns = [
+        (episode_id, turn)
+        for episode_id, turns in dialogue_binding["reviewed_turn_provenance"].items()
+        for turn in turns
+        if episode_id != correction_recorder.episode_id
+        and turn.get("gateway_final_metadata", {}).get("nutrition_append_event_id") == correction_row["id"]
+    ]
+    if retry_turns:
+        retry_episode, _ = retry_turns[0]
+        for mutate_retry in (
+            lambda final: final.pop("nutrition_finalization"),
+            lambda final: final["nutrition_finalization"]["annotation"].update(meal_date="2030-01-01"),
+            lambda final: final.pop("nutrition_model_proposal_annotation"),
+        ):
+            mutated = copy.deepcopy(dialogue_binding["reviewed_turn_provenance"])
+            mutate_retry(mutated[retry_episode][0]["gateway_final_metadata"])
+            invalid_retry = regrade(provenance=mutated)
+            assert invalid_retry["a1"] == "INCONCLUSIVE" and invalid_retry["a2"] == "NOT_RUN", invalid_retry
+    short_day = copy.deepcopy(wellness_snapshot_bound)
+    short_day["end"] = "2026-10-02T00:00:00+00:00"
+    incomplete_days = regrade(wellness_snapshot=short_day)
+    assert incomplete_days["a1"] == "INCONCLUSIVE" and incomplete_days["stage"] == "TELEGENT_BOUNDS_MISMATCH"
+    capped_query = regrade(now=datetime(2026, 10, 2, 12, tzinfo=timezone.utc))
+    assert capped_query["a1"] == "INCONCLUSIVE" and capped_query["stage"] == "TELEGENT_BOUNDS_MISMATCH"
+    missing_original = regrade(rows=[row for row in scoped_rows if row["id"] != original_row["id"]])
+    assert missing_original["a1"] == "INCONCLUSIVE" and missing_original["a2"] == "NOT_RUN"
+    stale_receipt_rows = copy.deepcopy(scoped_rows)
+    next(row for row in stale_receipt_rows if row["id"] == correction_row["id"])["metadata"]["client_op_id"] = "stale:assistant"
+    stale_receipt = regrade(rows=stale_receipt_rows)
+    assert stale_receipt["a1"] == "INCONCLUSIVE" and stale_receipt["a2"] == "NOT_RUN"
+    wrong_target_rows = copy.deepcopy(scoped_rows)
+    next(row for row in wrong_target_rows if row["id"] == correction_row["id"])["metadata"]["target_meal_id"] = "wrong-meal-id"
+    wrong_target_grade = regrade(rows=wrong_target_rows)
+    assert wrong_target_grade["a1"] == "FAIL" and wrong_target_grade["stage"] == "HONCHO_TARGET_MISMATCH"
+    assert wrong_target_grade["a2"] == "NOT_RUN"
+    malformed_selection_rows = copy.deepcopy(scoped_rows)
+    next(row for row in malformed_selection_rows if row["id"] == correction_row["id"])["metadata"].pop("selected_source")
+    malformed_selection = regrade(rows=malformed_selection_rows)
+    assert malformed_selection["a1"] == "INCONCLUSIVE" and malformed_selection["a2"] == "NOT_RUN"
+    wrong_selection_rows = copy.deepcopy(scoped_rows)
+    next(row for row in wrong_selection_rows if row["id"] == correction_row["id"])["metadata"]["selected_source"]["append_source_message_id"] = "other-occurrence"
+    wrong_selection = regrade(rows=wrong_selection_rows)
+    assert wrong_selection["a1"] == "FAIL" and wrong_selection["stage"] == "HONCHO_TARGET_MISMATCH"
+    assert wrong_selection["a2"] == "NOT_RUN"
+    contradiction_rows = copy.deepcopy(scoped_rows)
+    next(row for row in contradiction_rows if row["id"] == correction_row["id"])["metadata"]["reply_to_source_message_id"] = "other-photo"
+    contradiction_grade = regrade(rows=contradiction_rows)
+    assert contradiction_grade["a1"] == "FAIL" and contradiction_grade["stage"] == "HONCHO_TARGET_MISMATCH"
+    assert contradiction_grade["a2"] == "NOT_RUN"
     assert "2026-10-01T20:59:58" in bundle.engine.observed_prompts[0]
     prompt = bundle.engine.observed_prompts[1]
     assert "When correcting or deleting a prior meal from a historical photo" in prompt
@@ -248,6 +578,8 @@ async def runtime():
     )
     assert len(server.rows) == before_retry
     assert retry.metadata["nutrition_append_event_id"] == committed_event
+    assert retry.metadata["nutrition_committed_annotation"] == final.metadata["nutrition_committed_annotation"]
+    assert retry.metadata["nutrition_context_evidence"] == final.metadata["nutrition_context_evidence"]
     assert "900 ккал" not in retry.text and "3 октября" not in retry.text
     assert retry.text == "Изменение сохранено; баланс обновляется."
     # Retained tool from a unique successful load must be inert after teardown.
@@ -285,7 +617,7 @@ async def runtime():
             }],
         },
     )
-    burst_final, _ = await turn(
+    burst_final, burst_recorder = await turn(
         pool, bundle, burst, burst_ctx, burst_user,
         observation(meal_at=burst_photo_at.isoformat()),
     )
@@ -295,15 +627,27 @@ async def runtime():
         pool, "burst-date-correction", "Это было 1 октября",
         when=burst_append_at + timedelta(minutes=1),
     )
-    burst_fixed, _ = await turn(
+    burst_fixed, burst_correction_recorder = await turn(
         pool, bundle, burst_correction, burst_correction_ctx, burst_correction_user,
         correction("2026-10-01"), loads=[burst_ref.attachment_id],
     )
     assert burst_final.metadata["nutrition_sync_status"] == "pending"
     assert burst_fixed.metadata["nutrition_sync_status"] == "pending"
+    assert burst_final.metadata["nutrition_consumed_occurrence"]["photo_source_message_id"] == "burst-original-photo"
+    assert burst_final.metadata["nutrition_consumed_occurrence"]["append_source_message_id"] == "burst-append"
+    assert assert_annotation_round_trip(
+        burst_final.metadata["nutrition_committed_annotation"], sparse=False
+    ).record_type == "meal_observation"
+    assert burst_fixed.metadata["nutrition_context_evidence"]["photo_source_message_id"] == "burst-original-photo"
+    assert burst_fixed.metadata["nutrition_context_evidence"]["consumed_source_message_id"] == "burst-append"
     assert server.rows[-1]["metadata"]["selected_source"]["source_message_id"] == "burst-original-photo"
     assert server.rows[-1]["metadata"]["selected_source"]["append_source_message_id"] == "burst-append"
     assert burst_fixed.text == "Изменение сохранено; баланс обновляется."
+    coalesced_grade = grade_contextual_receipts(pool, server, burst_final, burst_fixed,
+        burst_recorder, burst_correction_recorder, source_id="burst-append",
+        meal_day=date(2026, 10, 1), case_id="coalesced-physical-vs-append")
+    assert (coalesced_grade["a1"], coalesced_grade["stage"], coalesced_grade["actual_latest_event_id"]) == (
+        "PASS", "SAME_EVENT_PROJECTED", burst_fixed.metadata["nutrition_append_event_id"])
     handoff["coalesced"] = copy.deepcopy(server.rows)
     await client.aclose()
 
@@ -320,7 +664,7 @@ async def runtime():
     legacy, legacy_ctx, legacy_user = inbound(
         pool, "legacy-original-photo", "Что на фото?", media=[str(legacy_photo)], when=original_at,
     )
-    original_final, _ = await turn(
+    original_final, legacy_recorder = await turn(
         pool, bundle, legacy, legacy_ctx, legacy_user, observation(),
         answer="Бургер примерно 700–800 ккал.",
     )
@@ -333,7 +677,7 @@ async def runtime():
         pool, "original-photo-date-correction", "Это было 2 октября",
         when=original_at + timedelta(days=1),
     )
-    date_final, _ = await turn(
+    date_final, date_recorder = await turn(
         pool, bundle, date_only, date_ctx, date_user, correction("2026-10-02"),
         loads=[legacy_ref.attachment_id],
         answer="Дата сохранена; точное время не указываю.",
@@ -346,7 +690,7 @@ async def runtime():
         pool, "original-photo-time-correction", "Съел когда написал",
         when=original_at + timedelta(days=2),
     )
-    phrase_final, _ = await turn(
+    phrase_final, phrase_recorder = await turn(
         pool, bundle, phrase, phrase_ctx, phrase_user,
         original_photo_time_correction(original_at), loads=[legacy_ref.attachment_id],
         answer="Бургер примерно 700–800 ккал. Точное время в запись не подставляю; "
@@ -362,7 +706,7 @@ async def runtime():
     assert isinstance(phrase_event["metadata"].get("target_meal_id"), str)
     phrase_event_id = phrase_final.metadata["nutrition_append_event_id"]
     before_phrase_retry = len(server.rows)
-    phrase_retry, _ = await turn(
+    phrase_retry, phrase_retry_recorder = await turn(
         pool, bundle, phrase, phrase_ctx, phrase_user,
         original_photo_time_correction(original_at + timedelta(hours=4)),
         loads=[legacy_ref.attachment_id],
@@ -371,8 +715,25 @@ async def runtime():
     assert len(server.rows) == before_phrase_retry
     assert phrase_retry.metadata["nutrition_append_event_id"] == phrase_event_id
     assert phrase_retry.metadata["nutrition_sync_status"] == "pending"
+    assert phrase_retry.metadata["nutrition_committed_annotation"] == phrase_final.metadata["nutrition_committed_annotation"]
+    assert phrase_retry.metadata["nutrition_proposal_matches_committed"] is False
+    for field in ("nutrition_committed_annotation", "nutrition_model_proposal_annotation"):
+        assert assert_annotation_round_trip(phrase_retry.metadata[field], sparse=True).record_type == "meal_correction"
     assert phrase_retry.text == "Изменение сохранено; баланс обновляется."
     assert "900 ккал" not in phrase_retry.text
+    phrase_retry_grade = grade_contextual_receipts(
+        pool, server, original_final, phrase_retry, legacy_recorder, phrase_retry_recorder,
+        source_id="legacy-original-photo", meal_day=date(2026, 10, 1),
+        case_id="reconciled-contextual-time-retry",
+        additional_turns=((date_final, date_recorder), (phrase_final, phrase_recorder),
+                          (phrase_retry, phrase_retry_recorder)),
+        canonical_revision=3, canonical_meal_at=original_at.isoformat(),
+        omit_explicit_meal_date=True)
+    assert (phrase_retry_grade["a1"], phrase_retry_grade["stage"],
+            phrase_retry_grade["actual_latest_event_id"]) == (
+        "PASS", "SAME_EVENT_PROJECTED", phrase_event_id)
+    phrase_operations = {phrase_event["metadata"]["client_op_id"]}
+    assert sum(row["metadata"].get("client_op_id") in phrase_operations for row in server.rows) == 1
     handoff["legacy_photo_time"] = copy.deepcopy(server.rows)
     await client.aclose()
 
@@ -384,7 +745,7 @@ async def runtime():
         pool, "portion-answer", "Я съел половину 2 октября около 22:15",
         when=BASE+timedelta(days=1),
     )
-    await turn(
+    portion_final, portion_recorder = await turn(
         pool, bundle, msg2, ctx2, user2,
         observation(meal_at="2026-10-02T22:15:00+00:00"),
         loads=[ref.attachment_id],
@@ -397,21 +758,43 @@ async def runtime():
         if isinstance(block, AttachmentRefBlock) and block.attachment_id == ref.attachment_id
     )
     assert provenance["consumed_occurrences"][0]["append_source_message_id"] == "portion-answer"
+    occurrence = portion_final.metadata["nutrition_consumed_occurrence"]
+    photo_binding = portion_receipt["metadata"]["photo_occurrence_source"]
+    assert photo_binding["source_message_id"] == "uncertain-photo"
+    assert photo_binding["append_source_message_id"] == "uncertain-photo"
+    assert photo_binding["is_private"] is True and photo_binding["is_forwarded"] is False
+    assert photo_binding["is_group"] is False and photo_binding["attachment_id"] == ref.attachment_id
+    assert occurrence["photo_source_message_id"] == photo_binding["source_message_id"]
+    assert occurrence["append_source_message_id"] == portion_receipt["metadata"]["source_message_id"]
+    assert occurrence["receipt_event_id"] == portion_receipt["id"]
+    assert occurrence["client_op_id"] == portion_receipt["metadata"]["client_op_id"]
     save_session_snapshot(cwd=pool._workspace, workspace=pool._workspace, model="offline",
         system_prompt="BASE", messages=bundle.engine.messages, usage=UsageSnapshot(),
         session_id=bundle.session_id, session_key="telegram:123")
     bundle.engine.messages = [ConversationMessage.model_validate(row)
                               for row in load_latest(pool._workspace)["messages"]]
     msg3, ctx3, user3 = inbound(pool, "portion-date-correction", "Это было 3 октября", when=BASE+timedelta(days=2))
-    final, _ = await turn(
+    final, portion_correction_recorder = await turn(
         pool, bundle, msg3, ctx3, user3, correction("2026-10-03"), loads=[ref.attachment_id]
     )
     out["portion_then_correction"] = {"response": final.text, "delivery": final.metadata}
     handoff["portion"] = copy.deepcopy(server.rows)
     assert final.metadata["nutrition_sync_status"] == "pending"
+    assert portion_final.metadata["nutrition_consumed_occurrence"]["photo_source_message_id"] == "uncertain-photo"
+    assert portion_final.metadata["nutrition_consumed_occurrence"]["append_source_message_id"] == "portion-answer"
+    assert final.metadata["nutrition_context_evidence"]["photo_source_message_id"] == "uncertain-photo"
+    assert final.metadata["nutrition_context_evidence"]["consumed_source_message_id"] == "portion-answer"
     assert server.rows[-1]["metadata"]["selected_source"]["append_source_message_id"] == "portion-answer"
     assert server.rows[-1]["metadata"]["target_meal_id"]
     assert portion_receipt["metadata"]["source_message_id"] == "portion-answer"
+    portion_grade = grade_contextual_receipts(pool, server, portion_final, final,
+        portion_recorder, portion_correction_recorder, source_id="portion-answer",
+        meal_day=date(2026, 10, 3), case_id="portion-context-restored")
+    assert (portion_grade["a1"], portion_grade["stage"],
+            portion_grade.get("actual_latest_event_id")) == (
+        "PASS", "SAME_EVENT_PROJECTED", final.metadata["nutrition_append_event_id"]), {
+            key: portion_grade.get(key) for key in ("a1", "stage", "reason", "a2")
+        }
     await client.aclose()
 
     pool, bundle, server, client = setup("failed-load")
@@ -621,4 +1004,177 @@ async def test_f84_receipt_stream_binding_prompt_and_joint_event_handoff(tmp_pat
         assert handoff["coalesced"] and handoff["legacy_photo_time"]
         await status_stream()
     finally:
+        ROOT = previous_root
+
+
+@pytest.mark.asyncio
+async def test_receipt_photo_occurrence_patch_cannot_authorize_unrelated_text_consumption(tmp_path):
+    global ROOT
+    previous_root, ROOT = ROOT, tmp_path
+    try:
+        photo = ROOT / "synthetic.png"
+        photo.write_bytes(PNG_BYTES)
+        pool, bundle, server, client = setup("forged-occurrence")
+        old_photo, old_ctx, old_user = inbound(pool, "never-consumed-photo", media=[str(photo)])
+        await turn(pool, bundle, old_photo, old_ctx, old_user, None, answer="What food is shown?")
+        ref = next(block for block in old_user.content if isinstance(block, AttachmentRefBlock))
+        provenance = ref.source_provenance
+        server.assistant_metadata_patch = {
+            "photo_occurrence_source": {
+                "schema_version": 1, "tenant_id": "review-tenant",
+                "source_principal": provenance["principal"],
+                "gateway_session_id": provenance["gateway_session_id"],
+                "source_message_id": provenance["source_message_id"],
+                "append_source_message_id": provenance["append_source_message_id"],
+                "attachment_id": ref.attachment_id, "received_at": provenance["received_at"],
+                "chat_id": provenance["chat_id"], "session_key": provenance["session_key"],
+                "is_private": True, "is_forwarded": False, "is_group": False,
+            }
+        }
+        unrelated, unrelated_ctx, unrelated_user = inbound(
+            pool, "unrelated-text-meal", "I ate a different meal", when=BASE + timedelta(minutes=1)
+        )
+        accepted, accepted_recorder = await turn(
+            pool, bundle, unrelated, unrelated_ctx, unrelated_user,
+            observation(meal_at=BASE.isoformat()), loads=(),
+        )
+        assert bundle.engine.captured_tools == []
+        assert not unrelated.media
+        assert "nutrition_consumed_occurrence" not in accepted.metadata
+        assert not ref.source_provenance.get("consumed_occurrences")
+        server.assistant_metadata_patch = {}
+        edit, edit_ctx, edit_user = inbound(
+            pool, "forged-photo-correction", "Correct that photo date", when=BASE + timedelta(days=1)
+        )
+        corrected, correction_recorder = await turn(
+            pool, bundle, edit, edit_ctx, edit_user, correction(), loads=[ref.attachment_id]
+        )
+        assert "nutrition_context_evidence" not in corrected.metadata
+        result = grade_contextual_receipts(
+            pool, server, accepted, corrected, accepted_recorder, correction_recorder,
+            source_id="unrelated-text-meal", meal_day=date(2026, 10, 2),
+            case_id="forged-original-occurrence",
+        )
+        assert result["a1"] == "INCONCLUSIVE" and result["a2"] == "NOT_RUN", result
+        await client.aclose()
+    finally:
+        ROOT = previous_root
+
+
+@pytest.mark.asyncio
+async def test_native_reply_with_selected_photo_still_requires_context_receipt_proof(tmp_path, monkeypatch):
+    global ROOT
+    previous_root, ROOT = ROOT, tmp_path
+    photo = ROOT / "synthetic.png"
+    photo.write_bytes(PNG_BYTES)
+    pool, bundle, server, client = setup("native-with-selected-context-proof")
+    try:
+        original_message, original_ctx, original_user = inbound(
+            pool, "native-context-photo", media=[str(photo)]
+        )
+        original, original_recorder = await turn(
+            pool, bundle, original_message, original_ctx, original_user, observation()
+        )
+        ref = next(block for block in original_user.content if isinstance(block, AttachmentRefBlock))
+        edit_message, edit_ctx, edit_user = inbound(
+            pool, "native-context-correction", "Correct the date",
+            when=BASE + timedelta(days=1),
+            metadata_extra={"reply_to_message_id": "native-context-photo"},
+        )
+        edit, edit_recorder = await turn(
+            pool, bundle, edit_message, edit_ctx, edit_user, correction(),
+            loads=[ref.attachment_id],
+        )
+        correction_receipt = next(
+            row for row in server.rows
+            if row["id"] == edit.metadata["nutrition_append_event_id"]
+        )
+        assert correction_receipt["metadata"]["reply_to_source_message_id"] == "native-context-photo"
+        assert correction_receipt["metadata"]["selected_source"]["append_source_message_id"] == "native-context-photo"
+        assert edit.metadata["nutrition_context_evidence"]
+
+        import ohmo.evals.nutrition_persistence as persistence
+        original_grade = persistence.grade_manifest
+        captured = []
+
+        def capture_grade(manifest, honcho, wellness, **kwargs):
+            captured.append(copy.deepcopy((manifest, honcho, wellness, kwargs)))
+            return original_grade(manifest, honcho, wellness, **kwargs)
+
+        monkeypatch.setattr(persistence, "grade_manifest", capture_grade)
+        baseline = grade_contextual_receipts(
+            pool, server, original, edit, original_recorder, edit_recorder,
+            source_id="native-context-photo", meal_day=date(2026, 10, 2),
+            case_id="native-reply-with-selected-context",
+        )
+        assert baseline["a1"] == "PASS", baseline
+        assert len(captured) == 1
+        manifest, honcho, wellness, kwargs = captured[0]
+
+        for mutation in (
+            lambda final: final.pop("nutrition_finalization"),
+            lambda final: final.pop("nutrition_context_evidence"),
+            lambda final: final["nutrition_context_evidence"].update(tenant_id="foreign-owner"),
+            lambda final: final["nutrition_context_evidence"].update(schema_version=99),
+        ):
+            mutated_provenance = copy.deepcopy(kwargs["reviewed_turn_provenance"])
+            mutation(mutated_provenance[edit_recorder.episode_id][0]["gateway_final_metadata"])
+            result = original_grade(
+                manifest, honcho, wellness,
+                **{**kwargs, "reviewed_turn_provenance": mutated_provenance},
+            )[0]
+            assert result["a1"] == "INCONCLUSIVE" and result["a2"] == "NOT_RUN", result
+
+        contradicted = copy.deepcopy(honcho)
+        contradicted_row = next(
+            row for row in contradicted["messages"]
+            if row["id"] == correction_receipt["id"]
+        )
+        contradicted_row["metadata"]["reply_to_source_message_id"] = "different-photo"
+        mismatch = original_grade(manifest, contradicted, wellness, **kwargs)[0]
+        assert mismatch["a1"] == "FAIL" and mismatch["stage"] == "HONCHO_TARGET_MISMATCH", mismatch
+    finally:
+        await client.aclose()
+        ROOT = previous_root
+
+
+@pytest.mark.asyncio
+async def test_native_only_reply_correction_passes_without_contextual_selection(tmp_path):
+    global ROOT
+    previous_root, ROOT = ROOT, tmp_path
+    photo = ROOT / "synthetic.png"
+    photo.write_bytes(PNG_BYTES)
+    native_pool, native_bundle, native_server, native_client = setup("native-only-correction")
+    try:
+        native_photo, native_photo_ctx, native_photo_user = inbound(
+            native_pool, "native-only-photo", media=[str(photo)]
+        )
+        native_original, native_original_recorder = await turn(
+            native_pool, native_bundle, native_photo, native_photo_ctx, native_photo_user,
+            observation(),
+        )
+        native_edit_message, native_edit_ctx, native_edit_user = inbound(
+            native_pool, "native-only-correction", "Correct the date",
+            when=BASE + timedelta(days=1),
+            metadata_extra={"reply_to_message_id": "native-only-photo"},
+        )
+        native_edit, native_edit_recorder = await turn(
+            native_pool, native_bundle, native_edit_message, native_edit_ctx, native_edit_user,
+            correction(),
+        )
+        native_receipt = next(
+            row for row in native_server.rows
+            if row["id"] == native_edit.metadata["nutrition_append_event_id"]
+        )
+        assert "selected_source" not in native_receipt["metadata"]
+        assert "nutrition_context_evidence" not in native_edit.metadata
+        native_grade = grade_contextual_receipts(
+            native_pool, native_server, native_original, native_edit,
+            native_original_recorder, native_edit_recorder,
+            source_id="native-only-photo", meal_day=date(2026, 10, 2),
+            case_id="native-only-correction",
+        )
+        assert native_grade["a1"] == "PASS", native_grade
+    finally:
+        await native_client.aclose()
         ROOT = previous_root

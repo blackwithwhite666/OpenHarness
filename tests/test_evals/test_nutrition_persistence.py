@@ -19,6 +19,7 @@ from ohmo.evals.nutrition_persistence import (
     validate_dialogue_binding,
     derive_meal_id,
 )
+from ohmo.evals.nutrition_trace import NutritionAnnotationV2
 from openharness.evals import EvalEpisode, EvalEvent, EvalStore
 from ohmo.memory_service.honcho_client import HonchoClient, HonchoError
 
@@ -124,11 +125,16 @@ def snapshots(events=None, *, canonical=True, status="complete"):
               "owner_id": "owner-1", "since": "2026-10-01T00:00:00+00:00",
               "until": NOW.isoformat(), "queried_at": NOW.isoformat(), "messages": events}
     record = canonical_record(kcal=25, latest=events[-1]["id"] if events else "evt-1")
+    if events:
+        # The external canonical fixture names its latest stored event directly;
+        # it does not derive expected state by invoking the grader's fold.
+        record["capture_time"] = events[-1]["created_at"]
     telegent = {"complete": True, "user_id": "owner-1", "login": "owner", "start": "2026-10-01T00:00:00+00:00",
                 "end": NOW.isoformat(), "queried_at": NOW.isoformat(), "meals": [record], "unassigned": []}
     return honcho, bind_wellness_snapshot(telegent, goal=goal()) if canonical else {
         "complete": True, "user_id": "owner-1", "login": "owner", "start": "2026-10-01T00:00:00+00:00",
         "end": NOW.isoformat(), "queried_at": NOW.isoformat(), "meal": None,
+        "canonical_meals": [],
     }
 
 
@@ -405,6 +411,122 @@ def test_deployed_canonical_shape_reports_missing_contributor_id_list_without_in
     assert "event_ids" in result["evidence_limitations"][0]
 
 
+@pytest.mark.parametrize("edge", [
+    "same_meal_id_wrong_source",
+    "same_event_under_wrong_source_and_meal",
+])
+def test_context_binding_preserves_and_grades_wrong_source_canonical_edges(edge):
+    honcho, bound = snapshots()
+    meals = [canonical_record(latest="evt-1")]
+    if edge == "same_meal_id_wrong_source":
+        wrong = canonical_record(source="different-source", latest="unrelated-event")
+        wrong["meal_id"] = goal().canonical_meal_id
+    else:
+        wrong = canonical_record(source="different-source", latest="evt-1")
+    meals.append(wrong)
+    snapshot = {
+        "complete": True, "user_id": "owner-1", "login": "owner",
+        "start": bound["start"], "end": bound["end"], "queried_at": bound["queried_at"],
+        "meals": meals, "unassigned": [],
+    }
+    bound = bind_wellness_snapshot(snapshot, goal=goal())
+    assert len(bound["canonical_meals"]) == 2
+    result = grade(honcho, bound)
+    assert result["a1"] == "FAIL" and result["a2"] == "NOT_RUN"
+    assert result["stage"] == "CANONICAL_MISMATCH"
+    if edge == "same_meal_id_wrong_source":
+        only_wrong_target = bind_wellness_snapshot({**snapshot, "meals": [wrong]}, goal=goal())
+        assert only_wrong_target["complete"] is True
+        lone_result = grade(honcho, only_wrong_target)
+        assert lone_result["a1"] == "FAIL" and lone_result["stage"] == "CANONICAL_MISMATCH"
+
+
+def test_context_binding_keeps_legitimate_unrelated_canonical_rows_without_poisoning_goal():
+    honcho, bound = snapshots()
+    unrelated = canonical_record(source="other-source", latest="other-event")
+    snapshot = {
+        "complete": True, "user_id": "owner-1", "login": "owner",
+        "start": bound["start"], "end": bound["end"], "queried_at": bound["queried_at"],
+        "meals": [canonical_record(latest="evt-1"), unrelated], "unassigned": [],
+    }
+    bound = bind_wellness_snapshot(snapshot, goal=goal())
+    assert [row["source_message_id"] for row in bound["canonical_meals"]] == ["src-tea", "other-source"]
+    assert grade(honcho, bound)["a1"] == "PASS"
+    bound.pop("canonical_meals")
+    missing_scoped_rows = grade(honcho, bound)
+    assert missing_scoped_rows["a1"] == "INCONCLUSIVE" and missing_scoped_rows["a2"] == "NOT_RUN"
+
+
+def test_cross_day_coverage_uses_local_day_tail_and_caps_at_observation_time():
+    from zoneinfo import ZoneInfo
+
+    root = raw_event("evt-root", created="2026-10-01T11:58:00+00:00")
+    correction = per_turn_event(
+        "evt-correction", source="src-correction", episode="ep-correction", turn="correction",
+        kcal=25, kind="meal_correction", reply="src-tea", created="2026-10-01T11:59:00+00:00",
+    )
+    correction["metadata"]["decision_trace"]["annotations"]["nutrition"]["meal_date"] = "2026-10-02"
+    review = goal()
+    tz_name = "America/Los_Angeles"
+    review = Goal.model_validate({
+        **review.model_dump(mode="json"), "episode_ids": ["ep-tea", "ep-correction"],
+        "meal_date": "2026-10-02", "meal_timezone": tz_name,
+        "trajectory_started_at": "2026-10-01T11:00:00+00:00",
+        "trajectory_as_of": "2026-10-01T12:00:00+00:00",
+    })
+    manifest = Manifest(schema_version=1, goals=[review])
+    honcho = {
+        "complete": True, "workspace_id": review.workspace_id, "session_id": review.session_id,
+        "owner_id": review.owner_id, "since": "2026-10-01T11:00:00+00:00",
+        "until": "2026-10-01T12:00:00+00:00", "queried_at": "2026-10-03T04:00:00+00:00",
+        "messages": [root, correction],
+    }
+    sources = {
+        episode: [turn["source_message_id"] for turn in turns]
+        for episode, turns in reviewed_turn_map(root, correction).items()
+    }
+    provenance = {
+        "ep-tea": [{"source_message_id": "src-tea", "logical_turn_id": root["metadata"]["logical_turn_id"],
+                    "operation_id": root["metadata"]["client_op_id"], "principal_id": review.principal_id}],
+        "ep-correction": [{"source_message_id": "src-correction",
+                           "logical_turn_id": correction["metadata"]["logical_turn_id"],
+                           "operation_id": correction["metadata"]["client_op_id"],
+                           "principal_id": review.principal_id}],
+    }
+    capture_time = correction["created_at"]
+    meal = canonical_record(day="2026-10-02", latest="evt-correction")
+    meal.update(revision=2, capture_time=capture_time)
+    zone = ZoneInfo(tz_name)
+    start = datetime.combine(date(2026, 10, 1), datetime.min.time(), zone)
+    observation_time = datetime.fromisoformat("2026-10-03T04:00:00+00:00")
+    complete_snapshot = {
+        "complete": True, "user_id": review.canonical_owner_id, "login": review.canonical_login,
+        "start": start.isoformat(), "end": observation_time.isoformat(),
+        "queried_at": observation_time.isoformat(), "meals": [meal], "unassigned": [],
+    }
+    bound = bind_wellness_snapshot(complete_snapshot, goal=review)
+    result = grade_manifest(manifest, honcho, bound, now=observation_time,
+                            reviewed_turn_sources=sources,
+                            reviewed_turn_provenance=provenance)[0]
+    assert result["a1"] == "PASS", (result.get("stage"), result.get("reason"))
+
+    short = {**complete_snapshot, "end": "2026-10-03T00:00:00+00:00"}
+    short_bound = bind_wellness_snapshot(short, goal=review)
+    missing_local_tail = grade_manifest(manifest, honcho, short_bound,
+        now=observation_time, reviewed_turn_sources=sources,
+        reviewed_turn_provenance=provenance)[0]
+    assert missing_local_tail["a1"] == "INCONCLUSIVE"
+    assert missing_local_tail["stage"] == "TELEGENT_BOUNDS_MISMATCH"
+
+    over_now = {**complete_snapshot, "end": "2026-10-03T05:00:00+00:00",
+                "queried_at": "2026-10-03T05:00:00+00:00"}
+    over_now_bound = bind_wellness_snapshot(over_now, goal=review)
+    capped = grade_manifest(manifest, honcho, over_now_bound,
+        now=observation_time, reviewed_turn_sources=sources,
+        reviewed_turn_provenance=provenance)[0]
+    assert capped["a1"] == "INCONCLUSIVE" and capped["stage"] == "TELEGENT_BOUNDS_MISMATCH"
+
+
 @pytest.mark.parametrize("field,value", [
     ("user_id", "other-owner"), ("source_message_id", "other-source"),
     ("latest_event_id", "forged"), ("day", "2026-09-30"), ("energy_kcal_best", 250),
@@ -455,10 +577,13 @@ def test_prior_revision_pending_requires_prior_values_to_match_effective_history
                                 turn="turn-correction", kcal=25, kind="meal_correction", reply="src-tea",
                                 created="2026-10-01T11:59:00+00:00")
     honcho, telegent = snapshots([root, correction])
+    telegent["meal"].update(latest_event_id="evt-correction", revision=2,
+        meal_date=DAY.isoformat(), day=DAY.isoformat(), meal_at=None,
+        capture_time=correction["created_at"])
     reviewed = Goal.model_validate({**goal(kcal=25).model_dump(mode="json"),
         "episode_ids": ["ep-tea", "ep-correction"]})
     telegent["meal"].update(latest_event_id="evt-root", energy_kcal_best=100,
-                            capture_time="2026-10-01T11:58:00+00:00")
+                            capture_time="2026-10-01T11:58:00+00:00", revision=1)
     sources = {"ep-tea": ["src-tea"], "ep-correction": ["src-correction"]}
     provenance = reviewed_turn_map(root, correction)
     assert grade_manifest(Manifest(schema_version=1, goals=[reviewed]), honcho, telegent,
@@ -479,7 +604,7 @@ def test_real_distinct_turn_correction_binds_per_turn_and_nested_episode():
         "episode_ids": ["ep-tea", "ep-correction"],
         "logical_turn_id": root["metadata"]["logical_turn_id"],
         "trace_episode_id": "ep-tea", "operation_id": root["metadata"]["client_op_id"]})
-    telegent["meal"].update(latest_event_id="evt-correction", energy_kcal_best=25)
+    telegent["meal"].update(latest_event_id="evt-correction", energy_kcal_best=25, revision=2)
     telegent["meal"]["capture_time"] = "2026-10-01T11:59:00+00:00"
     sources = {"ep-tea": ["src-tea"], "ep-correction": ["src-correction"]}
     provenance = reviewed_turn_map(root, correction)
@@ -567,7 +692,10 @@ def test_wrong_saved_date_and_unrelated_canonical_row_do_not_extend_grace():
     assert grade(honcho, telegent)["a1"] == "FAIL"
     honcho, telegent = snapshots(canonical=False)
     honcho["messages"][0]["created_at"] = "2026-10-01T11:50:00+00:00"
-    telegent["other_meals"] = [canonical_record(source="some-other-source")]
+    unrelated = canonical_record(source="some-other-source")
+    unrelated["user_id"] = goal().canonical_owner_id
+    telegent["other_meals"] = [unrelated]
+    telegent["canonical_meals"] = [telegent["other_meals"][0]]
     assert grade(honcho, telegent)["a1"] == "FAIL"
 
 
@@ -583,6 +711,7 @@ def test_correction_uses_latest_same_source_event_and_retraction_counts_zero():
     telegent["meals"] = []  # Telegent omits retracted/not_consumed rows.
     telegent["meal"] = None
     telegent.pop("other_meals", None)
+    telegent["canonical_meals"] = []
     negative_goal = Goal.model_validate({**goal(expected=False, kcal=None).model_dump(mode="json"),
         "episode_ids": ["ep-tea", "ep-correction"]})
     negative = Manifest(schema_version=1, goals=[negative_goal])
@@ -593,6 +722,7 @@ def test_correction_uses_latest_same_source_event_and_retraction_counts_zero():
     telegent["meal"] = canonical_record(latest="evt-1")
     telegent["meal"].update(user_id="owner-1", energy_kcal_best=25)
     telegent["meal"]["capture_time"] = "2026-10-01T11:58:00+00:00"
+    telegent["meal"]["revision"] = 1
     assert grade_manifest(negative, honcho, telegent, now=NOW, reviewed_turn_sources=sources,
                           reviewed_turn_provenance=operations)[0]["a1"] == "PENDING"
 
@@ -760,6 +890,53 @@ def test_eval_export_requires_terminal_finish_event(tmp_path: Path):
     store.append_event(EvalEvent(episode_id="ep-unfinished", kind="assistant_update", payload={"text": "late update"}))
     malformed = export_eval_dialogue(root, episode_ids=["ep-unfinished"])
     assert malformed["episodes"][0]["dialogue_complete"] is False
+
+
+@pytest.mark.parametrize(
+    ("event_media_count", "episode_media_count", "expected_complete", "expected_user_text"),
+    [
+        (1, 1, True, "Sent 1 attachment."),
+        (2, 2, True, "Sent 2 attachments."),
+        (1, 2, False, None),
+        (0, 0, False, None),
+        (-1, -1, False, None),
+        (True, True, False, None),
+        ("1", "1", False, None),
+        (None, None, False, None),
+    ],
+)
+def test_image_only_export_requires_matching_positive_recorded_media_count(
+    tmp_path: Path, event_media_count, episode_media_count, expected_complete, expected_user_text,
+):
+    root = tmp_path / "evals"
+    store = EvalStore(root)
+    inbound = {
+        "channel": "telegram", "chat_id": "chat-1", "sender_id": "424242",
+        "timestamp": NOW.isoformat(), "media_count": episode_media_count,
+        "metadata": {"message_id": "image-only-source"},
+    }
+    store.append_episode(EvalEpisode(
+        episode_id="ep-image-only", session_id="session-1", source="gateway", created_at=NOW,
+        metadata={"workspace": "synthetic-evals", "inbound": inbound},
+    ))
+    store.append_event(EvalEvent(episode_id="ep-image-only", kind="inbound_message", payload={
+        **inbound, "media_count": event_media_count, "user_text": "",
+    }))
+    store.append_event(EvalEvent(episode_id="ep-image-only", kind="gateway_final",
+        payload={"text": "I could not confirm the save."}))
+    store.append_event(EvalEvent(episode_id="ep-image-only", kind="episode_finished",
+        payload={"status": "completed"}))
+
+    exported = export_eval_dialogue(root, episode_ids=["ep-image-only"])["episodes"][0]
+    assert exported["dialogue_complete"] is expected_complete
+    assert exported["source_message_ids"] == ["image-only-source"]
+    if expected_user_text is None:
+        assert all(turn["role"] != "user" for turn in exported["dialogue"])
+    else:
+        assert exported["dialogue"] == [
+            {"role": "user", "text": expected_user_text},
+            {"role": "assistant", "text": "I could not confirm the save."},
+        ]
 
 
 def test_eval_export_rejects_partial_episode_selection_and_bad_source(tmp_path: Path):
@@ -1146,10 +1323,15 @@ def test_online_asof_and_moscow_local_day_are_scoped_without_future_completeness
 
 def test_retry_and_noop_correction_keep_effective_latest_revision():
     first = raw_event("evt-1")
-    retry = raw_event("evt-2")
+    retry = dict(first)
     honcho, telegent = snapshots([first, retry])
     telegent["meal"]["latest_event_id"] = "evt-1"
     assert grade(honcho, telegent)["a1"] == "PASS"
+    second_commit = raw_event("evt-2")
+    assert second_commit["metadata"]["client_op_id"] == first["metadata"]["client_op_id"]
+    ambiguous_honcho, ambiguous_telegent = snapshots([first, second_commit])
+    ambiguous_retry = grade(ambiguous_honcho, ambiguous_telegent)
+    assert ambiguous_retry["a1"] == "INCONCLUSIVE" and ambiguous_retry["stage"] == "HONCHO_AMBIGUOUS"
     noop = per_turn_event("evt-noop", source="src-noop", episode="ep-noop", turn="noop", kcal=25,
                           kind="meal_correction", reply="src-tea")
     honcho, telegent = snapshots([first, noop])
@@ -1171,6 +1353,7 @@ def test_prior_canonical_revision_is_pending_only_inside_grace():
     telegent["meal"]["latest_event_id"] = "evt-1"
     telegent["meal"]["energy_kcal_best"] = 100
     telegent["meal"]["capture_time"] = "2026-10-01T11:58:00+00:00"
+    telegent["meal"]["revision"] = 1
     revised_goal = Goal.model_validate({**goal(kcal=25).model_dump(mode="json"),
         "episode_ids": ["ep-tea", "ep-correction"]})
     sources = {"ep-tea": ["src-tea"], "ep-correction": ["src-correction"]}
@@ -1187,6 +1370,29 @@ def test_prior_canonical_revision_is_pending_only_inside_grace():
     assert future["stage"] == "CANONICAL_PROVENANCE_MISMATCH"
 
 
+def test_prior_revision_requires_exact_revision_and_precise_instant():
+    first = per_turn_event("evt-1", source="src-tea", episode="ep-tea", turn="root", kcal=100,
+                           created="2026-10-01T11:58:00+00:00")
+    correction = per_turn_event("evt-2", source="src-correction", episode="ep-correction",
+        turn="correction", kcal=25, kind="meal_correction", reply="src-tea", created="2026-10-01T11:59:00+00:00")
+    honcho, telegent = snapshots([first, correction])
+    telegent["meal"].update(latest_event_id="evt-1", energy_kcal_best=100,
+        capture_time="2026-10-01T11:58:00+00:00", revision=1)
+    reviewed = Goal.model_validate({**goal(kcal=25).model_dump(mode="json"),
+        "episode_ids": ["ep-tea", "ep-correction"]})
+    sources = {"ep-tea": ["src-tea"], "ep-correction": ["src-correction"]}
+    provenance = reviewed_turn_map(first, correction)
+    args = (Manifest(schema_version=1, goals=[reviewed]), honcho)
+    assert grade_manifest(*args, telegent, now=NOW, reviewed_turn_sources=sources,
+        reviewed_turn_provenance=provenance)[0]["a1"] == "PENDING"
+    for mutation in ({"revision": 2}, {"meal_at": "2026-10-01T10:00:00Z"}):
+        broken = json.loads(json.dumps(telegent))
+        broken["meal"].update(mutation)
+        result = grade_manifest(*args, broken, now=NOW, reviewed_turn_sources=sources,
+            reviewed_turn_provenance=provenance)[0]
+        assert result["a1"] == "FAIL" and result["a2"] == "NOT_RUN", result
+
+
 def test_precise_meal_at_can_bind_local_day_without_meal_date():
     honcho, telegent = snapshots()
     annotation = honcho["messages"][0]["metadata"]["decision_trace"]["annotations"]["nutrition"]
@@ -1196,6 +1402,100 @@ def test_precise_meal_at_can_bind_local_day_without_meal_date():
     telegent["meal"]["meal_date"] = None
     telegent["meal"]["meal_at"] = "2026-10-01T10:00:00+00:00"
     assert grade(honcho, telegent)["a1"] == "PASS"
+
+
+def test_same_day_date_only_correction_clears_old_precise_time_and_advances_revision():
+    root = per_turn_event("evt-root", source="src-tea", episode="ep-tea", turn="root", kcal=25,
+                          created="2026-10-01T11:58:00+00:00")
+    root["metadata"]["decision_trace"]["annotations"]["nutrition"]["meal_at"] = "2026-10-01T10:00:00+00:00"
+    correction = per_turn_event("evt-correction", source="src-correction", episode="ep-correction",
+        turn="correction", kcal=25, kind="meal_correction", reply="src-tea",
+        created="2026-10-01T11:59:00+00:00")
+    correction_nutrition = NutritionAnnotationV2.model_validate({
+        "schema_version": 2,
+        "record_type": "meal_correction",
+        "changed_fields": ["meal_date"],
+        "meal_date": DAY.isoformat(),
+    })
+    correction["metadata"]["decision_trace"]["annotations"]["nutrition"] = (
+        correction_nutrition.model_dump(mode="json", exclude_unset=True)
+    )
+    NutritionAnnotationV2.model_validate(
+        correction["metadata"]["decision_trace"]["annotations"]["nutrition"]
+    )
+    honcho, telegent = snapshots([root, correction])
+    telegent["meal"].update(latest_event_id="evt-correction", revision=2,
+        meal_date=DAY.isoformat(), day=DAY.isoformat(), meal_at=None,
+        capture_time=correction["created_at"])
+    revised_goal = Goal.model_validate({**goal().model_dump(mode="json"),
+        "episode_ids": ["ep-tea", "ep-correction"],
+        "logical_turn_id": root["metadata"]["logical_turn_id"],
+        "trace_episode_id": root["metadata"]["decision_trace_episode_id"],
+        "operation_id": root["metadata"]["client_op_id"]})
+    result = grade_manifest(Manifest(schema_version=1, goals=[revised_goal]), honcho, telegent,
+        now=NOW, reviewed_turn_sources={"ep-tea": ["src-tea"], "ep-correction": ["src-correction"]},
+        reviewed_turn_provenance=reviewed_turn_map(root, correction))[0]
+    assert result["a1"] == "PASS"
+    assert telegent["meal"]["revision"] == 2 and telegent["meal"]["meal_at"] is None
+
+
+def test_correction_round_trip_requires_sparse_changed_fields_serialization():
+    from ohmo.evals.nutrition_persistence import _validated_nutrition_annotation
+
+    source = {
+        "schema_version": 2,
+        "record_type": "meal_correction",
+        "changed_fields": ["meal_date"],
+        "meal_date": "2026-10-02",
+    }
+    parsed = NutritionAnnotationV2.model_validate(source)
+    sparse = parsed.model_dump(mode="json", exclude_unset=True)
+    assert sparse == source
+    assert _validated_nutrition_annotation(sparse) is not None
+
+    # Full dumps make model defaults look like explicit unmasked replacements.
+    # Keep that input invalid; producers must preserve the sparse source mask.
+    assert _validated_nutrition_annotation(parsed.model_dump(mode="json")) is None
+    assert _validated_nutrition_annotation({**sparse, "energy_kcal_best": 750}) is None
+
+
+def test_precise_time_override_clears_stale_meal_date_and_requires_projected_null():
+    root = per_turn_event("evt-root", source="src-tea", episode="ep-tea", turn="root", kcal=25,
+                          created="2026-10-01T11:58:00+00:00")
+    correction = per_turn_event("evt-correction", source="src-correction", episode="ep-correction",
+        turn="correction", kcal=25, kind="meal_correction", reply="src-tea",
+        created="2026-10-01T11:59:00+00:00")
+    nutrition = NutritionAnnotationV2.model_validate({
+        "schema_version": 2,
+        "record_type": "meal_correction",
+        "changed_fields": ["meal_at"],
+        "meal_at": "2026-10-01T10:00:00Z",
+    })
+    correction["metadata"]["decision_trace"]["annotations"]["nutrition"] = (
+        nutrition.model_dump(mode="json", exclude_unset=True)
+    )
+    NutritionAnnotationV2.model_validate(
+        correction["metadata"]["decision_trace"]["annotations"]["nutrition"]
+    )
+    honcho, telegent = snapshots([root, correction])
+    telegent["meal"].update(latest_event_id="evt-correction", revision=2,
+        capture_time=correction["created_at"], meal_date=None, day=DAY.isoformat(),
+        meal_at="2026-10-01T10:00:00+00:00")
+    reviewed = Goal.model_validate({**goal().model_dump(mode="json"),
+        "episode_ids": ["ep-tea", "ep-correction"],
+        "logical_turn_id": root["metadata"]["logical_turn_id"],
+        "trace_episode_id": root["metadata"]["decision_trace_episode_id"],
+        "operation_id": root["metadata"]["client_op_id"]})
+    sources = {"ep-tea": ["src-tea"], "ep-correction": ["src-correction"]}
+    provenance = reviewed_turn_map(root, correction)
+    args = (Manifest(schema_version=1, goals=[reviewed]), honcho)
+    result = grade_manifest(*args, telegent, now=NOW, reviewed_turn_sources=sources,
+        reviewed_turn_provenance=provenance)[0]
+    assert result["a1"] == "PASS", result
+    telegent["meal"]["meal_date"] = DAY.isoformat()
+    stale = grade_manifest(*args, telegent, now=NOW, reviewed_turn_sources=sources,
+        reviewed_turn_provenance=provenance)[0]
+    assert stale["a1"] == "FAIL" and stale["a2"] == "NOT_RUN", stale
 
 
 def test_complete_unannotated_gateway_turn_without_trace_fails_known_consumed_goal(tmp_path: Path):

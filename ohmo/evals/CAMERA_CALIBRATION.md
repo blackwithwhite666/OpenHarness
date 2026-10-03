@@ -30,6 +30,18 @@ updates and the gateway final. It never falls back to the short reference prefix
 and cannot change A1. Sol's reference prompt never includes the candidate final
 answer.
 
+For a selected owner trajectory, an actually clicked native Telegram option
+may add one A2 point, capped at 5. The maintained export must bind the click to
+the reviewed episode, principal, session, native keyboard, offered options,
+selected index, and selected label. A Camera callback also needs the ingress
+binding for the exact native message; a text fallback may have a different
+native message ID from its original photo. Each of the three Luna votes judges
+whether the clicked option was useful in the full dialogue; a majority is
+required. The base median score and the one-time bonus remain separate in the
+report. Displayed controls, typed replies, malformed or foreign callbacks, and
+cases without callback evidence receive no bonus. Old vote responses remain
+valid and default to no bonus. A2 never implies that a meal was persisted.
+
 New reference results use native Padavan `gpt-6.1-sol` with high reasoning;
 author results use `gpt-6-luna` with medium reasoning. In result JSON, model IDs
 include the `openai/` prefix. Intake checks exact route, model, effort, case,

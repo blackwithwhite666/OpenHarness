@@ -12,6 +12,7 @@ import hashlib
 import io
 import json
 import math
+import re
 import warnings
 from collections.abc import Awaitable, Callable, Sequence
 from pathlib import Path
@@ -161,6 +162,7 @@ class A2Vote(StrictModel):
     avoidable_turns: int = Field(ge=0, le=MAX_PREFIX)
     repeated_questions: int = Field(ge=0, le=MAX_PREFIX)
     reason_codes: list[Literal["repeat", "avoidable", "necessary_clarification", "concise"]]
+    useful_button_click: bool = False
 
 
 class CallBudget:
@@ -375,13 +377,175 @@ def a2_prompt(case: Case | JudgeCase) -> str:
     if turns is None:
         raise ValueError("full dialogue is required before A2 scoring")
     dialogue = [{"role": turn.role, "text": turn.text} for turn in turns]
+    click_evidence = _button_click_evidence(case)
+    if not click_evidence:
+        # Keep the exact historical prompt so existing Luna results remain
+        # intake-compatible. Their response schema defaults the new vote to false.
+        return (
+            "Judge dialogue efficiency only. Return JSON: score (0..5), "
+            "avoidable_turns (integer), repeated_questions (integer), reason_codes "
+            "(repeat|avoidable|necessary_clarification|concise). A question needed to "
+            "resolve ambiguous consumption or amount is not avoidable. Dialogue: "
+            + json.dumps(dialogue, ensure_ascii=False)
+        )
     return (
         "Judge dialogue efficiency only. Return JSON: score (0..5), "
         "avoidable_turns (integer), repeated_questions (integer), reason_codes "
-        "(repeat|avoidable|necessary_clarification|concise). A question needed to "
-        "resolve ambiguous consumption or amount is not avoidable. Dialogue: "
-        + json.dumps(dialogue, ensure_ascii=False)
+        "(repeat|avoidable|necessary_clarification|concise), useful_button_click (boolean). "
+        "Penalize avoidable turns and repeated questions; report their counts accurately. A question needed to "
+        "resolve ambiguous consumption or amount is not avoidable. Add one point, capped at 5, "
+        "only when the supplied native callback evidence proves a user clicked an actually "
+        "offered option that is relevant to this dialogue. A button attached only to an "
+        "unnecessary repeated or useless question is not useful. Keep this bonus separate: score is "
+        "the base score before the bonus, and useful_button_click reports relevance only. A "
+        "displayed button, typed answer, irrelevant option, or missing/invalid evidence earns "
+        "no point. This score says nothing about persistence. Native callback evidence: "
+        + json.dumps(click_evidence, ensure_ascii=False)
+        + ". Dialogue: " + json.dumps(dialogue, ensure_ascii=False)
     )
+
+
+def _button_click_evidence(case: Case | JudgeCase) -> list[dict[str, Any]]:
+    """Return native clicks bound to the selected owner trajectory."""
+    if not isinstance(case, Case) or not case.persistence_evidence:
+        return []
+    try:
+        goal = case.persistence_evidence["goal"]
+        exported = case.persistence_evidence["dialogue_export"]["episodes"]
+        episode_ids = set(goal["episode_ids"])
+    except (KeyError, TypeError):
+        return []
+    evidence = []
+    for episode in exported:
+        try:
+            if episode.get("episode", {}).get("episode_id") not in episode_ids:
+                continue
+            ctx = episode.get("trusted_camera_context")
+            turn_provenance = episode.get("turn_provenance")
+            inbound = episode.get("episode", {}).get("metadata", {}).get("inbound", {})
+            md = inbound.get("metadata", {})
+            camera_callback_candidate = md.get("_camera_ingress_callback_candidate")
+            camera_callback_eligible = md.get("_camera_ingress_callback_eligible")
+            feedback_receipt = md.get("_camera_feedback_receipt")
+            options = md.get("native_keyboard_options")
+            idx = md.get("native_keyboard_selected_index")
+            label = md.get("native_keyboard_selected_label")
+            data = md.get("callback_data")
+            episode_id = episode.get("episode", {}).get("episode_id")
+            common_binding = (
+                episode.get("principal_id") == goal.get("principal_id")
+                and episode.get("episode", {}).get("session_id") == goal.get("gateway_session_id")
+            )
+            camera_binding = (
+                isinstance(ctx, dict) and ctx.get("kind") == "owner_turn"
+                and ctx.get("tenant_id") == case.owner_id
+                and ctx.get("principal_id") == goal.get("principal_id")
+                and ctx.get("recipient_principal") == goal.get("principal_id")
+                and ctx.get("gateway_session_id") == goal.get("gateway_session_id")
+                and ctx.get("episode_id") == episode_id
+                and isinstance(ctx.get("source_message_id"), str)
+                and isinstance(ctx.get("candidate_id"), str) and bool(ctx.get("candidate_id"))
+                and type(ctx.get("native_photo_id")) is int
+                and md.get("_camera_candidate_id") == ctx.get("candidate_id")
+                and md.get("_camera_native_binding") == str(md.get("native_message_id"))
+                and any(
+                    isinstance(item, dict)
+                    and item.get("episode_id") == episode_id
+                    and item.get("source_message_id") == ctx.get("source_message_id")
+                    and item.get("principal_id") == ctx.get("principal_id")
+                    and item.get("operation_id") == ctx.get("operation_id")
+                    for item in (turn_provenance if isinstance(turn_provenance, list) else [])
+                )
+            )
+            provenance_binding = any(
+                isinstance(item, dict)
+                and item.get("source_message_id") == str(md.get("message_id"))
+                and item.get("principal_id") == goal.get("principal_id")
+                and item.get("episode_id") == episode_id
+                and isinstance(item.get("operation_id"), str)
+                and item.get("operation_id") == f"{item.get('logical_turn_id')}:assistant"
+                for item in (turn_provenance if isinstance(turn_provenance, list) else [])
+            )
+            callback_id = md.get("callback_query_id")
+            callback_message_id = md.get("message_id")
+            feedback_binding = (
+                ctx is None
+                and isinstance(feedback_receipt, dict)
+                and feedback_receipt.get("kind") == "not_food"
+                and feedback_receipt.get("tenant_id") == case.owner_id
+                and feedback_receipt.get("owner_principal") == goal.get("principal_id")
+                and feedback_receipt.get("gateway_session_id") == goal.get("gateway_session_id")
+                and feedback_receipt.get("candidate_id") == camera_callback_candidate
+                and isinstance(camera_callback_candidate, str)
+                and bool(camera_callback_candidate)
+                and camera_callback_eligible is True
+                and type(feedback_receipt.get("native_photo_id")) is int
+                and feedback_receipt.get("native_photo_id") > 0
+                and feedback_receipt.get("native_message_id") == str(md.get("native_message_id"))
+                and str(feedback_receipt.get("native_message_id")) == str(callback_message_id)
+                and feedback_receipt.get("source_message_id") == str(callback_message_id)
+                and isinstance(callback_id, str) and bool(callback_id)
+                and feedback_receipt.get("callback_query_id") == callback_id
+                and feedback_receipt.get("operation_id")
+                == f"{camera_callback_candidate}:classifier_feedback:{callback_id}"
+                and md.get("native_keyboard_reflection_confirmed") is True
+                and "✅ Это не еда" in str(md.get("native_keyboard_reflection") or "")
+                and isinstance(turn_provenance, list)
+            )
+            bound_native_episode = (
+                camera_binding if ctx is not None
+                else feedback_binding if isinstance(feedback_receipt, dict)
+                else provenance_binding
+            )
+            camera_callback_facts = (
+                camera_callback_candidate is None
+                or (
+                    isinstance(ctx, dict)
+                    and camera_callback_candidate == ctx.get("candidate_id")
+                    and camera_callback_eligible is True
+                )
+                or feedback_binding
+            )
+            # A native Camera photo caption is itself a production fact. If its
+            # trusted Camera receipt context is absent, the tap was rejected or
+            # lost its binding and cannot earn relevance votes through ordinary
+            # Telegram provenance.
+            camera_caption = re.match(
+                r"^Съели ли вы это\? Фото сделано \d{4}-\d{2}-\d{2}\.",
+                md.get("native_keyboard_prompt", "")
+                if isinstance(md.get("native_keyboard_prompt", ""), str) else "",
+            )
+            if camera_caption and ctx is None and not feedback_binding:
+                camera_callback_facts = False
+            if (
+                not common_binding or not bound_native_episode
+                or not camera_callback_facts
+                or inbound.get("channel") != "telegram"
+                or md.get("callback_query") is not True
+                or type(md.get("native_message_id")) is not int
+                or md.get("native_message_id") <= 0
+                or not isinstance(data, str) or not data.startswith("ask:")
+                or not isinstance(options, list) or not 2 <= len(options) <= 8
+                or any(not isinstance(option, str) or not option or len(option) > 60 for option in options)
+                or type(idx) is not int or not 0 <= idx < len(options)
+                or options[idx] != label or not isinstance(label, str) or not label
+                or not isinstance(md.get("native_keyboard_prompt"), str)
+                or not md["native_keyboard_prompt"].strip()
+                or len(md["native_keyboard_prompt"]) > 2000
+                or data != f"ask:{idx}"
+            ):
+                continue
+            evidence.append({"episode_id": episode["episode"]["episode_id"],
+                             "source_message_id": str(md["message_id"]),
+                             "native_message_id": md["native_message_id"],
+                             "operation_id": (ctx or {}).get("operation_id") if isinstance(ctx, dict)
+                             else next((item.get("operation_id") for item in turn_provenance
+                                        if isinstance(item, dict) and item.get("source_message_id") == str(md.get("message_id"))), None),
+                             "prompt": md["native_keyboard_prompt"],
+                             "options": options, "selected_index": idx, "selected_label": label})
+        except (KeyError, TypeError, AttributeError):
+            continue
+    return evidence[:MAX_EVENTS]
 
 
 class ModelResponseError(ValueError):
@@ -407,9 +571,15 @@ async def model_result(
         raise ModelResponseError("model result unavailable or invalid") from None
 
 
-def aggregate_votes(votes: list[A2Vote]) -> dict[str, Any]:
+def aggregate_votes(votes: list[A2Vote], *, click_evidence: bool = False) -> dict[str, Any]:
+    base_score = sorted(v.score for v in votes)[1]
+    useful_click_votes = sum(v.useful_button_click for v in votes) if click_evidence else 0
+    bonus = int(useful_click_votes >= 2)
     return {
-        "a2_scores": sorted(v.score for v in votes)[1],
+        "a2_base_score": base_score,
+        "a2_button_bonus": bonus,
+        "a2_useful_button_click_votes": useful_click_votes,
+        "a2_scores": min(5, base_score + bonus),
         "a2_avoidable_turns": sorted(v.avoidable_turns for v in votes)[1],
         "a2_repeated_questions": max(v.repeated_questions for v in votes),
         "a2_reason_codes": sorted(
@@ -587,7 +757,7 @@ async def calibrate_case(case: Case, call: ModelCall, budget: CallBudget) -> dic
         assert isinstance(vote, A2Vote)
         votes.append(vote)
     result["a2"] = "SCORED"
-    result.update(aggregate_votes(votes))
+    result.update(aggregate_votes(votes, click_evidence=bool(_button_click_evidence(case))))
     return result
 
 

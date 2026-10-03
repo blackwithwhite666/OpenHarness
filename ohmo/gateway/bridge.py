@@ -14,14 +14,16 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 from ohmo.contact_registry import ContactStore
+from ohmo.evals import GatewayEvalRecorder
 from ohmo.gateway.camera import (
     CAMERA_AUTHORITY,
     COALESCED_ATTACHMENT_PROVENANCE_AUTHORITY,
     CameraIngress,
+    _classify_answer,
 )
 from ohmo.gateway.config import load_gateway_config, save_gateway_config
 from ohmo.gateway.router import session_key_for_message
-from ohmo.gateway.runtime import OhmoSessionRuntimePool
+from ohmo.gateway.runtime import OhmoSessionRuntimePool, _evals_capture_enabled
 from ohmo.group_registry import load_managed_group_record
 from ohmo.workspace import get_gateway_interrupted_requests_path
 from openharness.channels.bus.events import InboundMessage, OutboundMessage
@@ -199,7 +201,9 @@ class OhmoGatewayBridge:
                 self._camera_ingress.process_real_inbound(message)
                 if message.metadata.get("_camera_classifier_feedback") is CAMERA_AUTHORITY:
                     # Owner-authorized classifier feedback is journaled by the
-                    # Camera ingress; it is not a nutrition/model turn.
+                    # Camera ingress and recorded from the native receipt only.
+                    # It never enters the model or nutrition turn path.
+                    self._record_camera_feedback_export(message)
                     continue
 
             session_key = session_key_for_message(message)
@@ -337,6 +341,76 @@ class OhmoGatewayBridge:
                 message.chat_id,
                 exc_info=True,
             )
+
+    def _record_camera_feedback_export(self, message: InboundMessage) -> str | None:
+        """Capture accepted native classifier feedback without starting a model turn."""
+        metadata = message.metadata or {}
+        receipt = metadata.get("_camera_feedback_receipt")
+        options = metadata.get("native_keyboard_options")
+        index = metadata.get("native_keyboard_selected_index")
+        label = metadata.get("native_keyboard_selected_label")
+        callback_id = metadata.get("callback_query_id")
+        candidate_id = metadata.get("_camera_ingress_callback_candidate")
+        camera_config = getattr(getattr(self._runtime_pool, "_gateway_config", None),
+                                "camera_ingress", None)
+        bundles = getattr(self._runtime_pool, "_bundles", None)
+        workspace = getattr(self._runtime_pool, "_workspace", None)
+        session_key = session_key_for_message(message)
+        bundle = bundles.get(session_key) if isinstance(bundles, dict) else None
+        if (
+            not isinstance(receipt, dict)
+            or metadata.get("_camera_ingress_callback_eligible") is not True
+            or camera_config is None
+            or not getattr(camera_config, "enabled", False)
+            or message.channel != "telegram"
+            or str(message.chat_id) != str(getattr(camera_config, "chat_id", ""))
+            or message.sender_id.split("|", 1)[0] != str(getattr(camera_config, "principal", ""))
+            or receipt.get("kind") != "not_food"
+            or receipt.get("candidate_id") != candidate_id
+            or receipt.get("tenant_id") != getattr(camera_config, "tenant_id", None)
+            or receipt.get("owner_principal") != f"telegram:{getattr(camera_config, 'principal', '')}"
+            or type(receipt.get("native_photo_id")) is not int
+            or receipt.get("native_photo_id") <= 0
+            or receipt.get("native_message_id") != str(metadata.get("native_message_id"))
+            or receipt.get("source_message_id") != str(metadata.get("message_id"))
+            or receipt.get("callback_query_id") != callback_id
+            or receipt.get("operation_id") != f"{candidate_id}:classifier_feedback:{callback_id}"
+            or metadata.get("callback_query") is not True
+            or not isinstance(options, list)
+            or type(index) is not int or not 0 <= index < len(options)
+            or options[index] != "Это не еда" or label != "Это не еда"
+            or metadata.get("callback_data") != f"ask:{index}"
+            or metadata.get("native_keyboard_reflection_confirmed") is not True
+            or "✅ Это не еда" not in str(metadata.get("native_keyboard_reflection") or "")
+            or bundle is None
+            or not isinstance(workspace, (str, Path))
+            or not _evals_capture_enabled(getattr(self._runtime_pool, "_gateway_config", None))
+        ):
+            return None
+        session_id = getattr(bundle, "session_id", None)
+        if not isinstance(session_id, str) or not session_id:
+            return None
+        try:
+            bound_receipt = dict(receipt)
+            bound_receipt["gateway_session_id"] = session_id
+            metadata["_camera_feedback_receipt"] = bound_receipt
+            recorder = GatewayEvalRecorder.start(
+                workspace=workspace,
+                bundle=bundle,
+                message=message,
+                session_key=session_key,
+                user_text=message.content,
+                user_goal="Owner marked the Camera image as not food.",
+            )
+            recorder.record_gateway_final(
+                text=str(metadata["native_keyboard_reflection"]),
+                metadata={"camera_feedback_operation_id": receipt["operation_id"]},
+            )
+            recorder.finish(status="completed")
+            return recorder.episode_id
+        except Exception:
+            logger.warning("Camera classifier feedback eval capture failed", exc_info=True)
+            return None
 
     async def _dispatch(self, message: InboundMessage, session_key: str) -> None:
         await self._interrupt_session(
@@ -760,6 +834,46 @@ class OhmoGatewayBridge:
         base_dir = cwd_fn(message, session_key) if callable(cwd_fn) else None
         content, media = _extract_attachments(reply, base_dir=base_dir)
         content, question, options = _extract_ask(content)
+        initial_camera_prompt = (
+            message.metadata.get("_camera_authority") is CAMERA_AUTHORITY
+            and message.metadata.get("_camera_initial_prompt") is CAMERA_AUTHORITY
+        )
+        if initial_camera_prompt and not options:
+            # A model response without a bounded ask still gets the existing
+            # caption's explicit consumption question and native choices.
+            options = ["Я это съел", "Нет, не ел"]
+        if initial_camera_prompt and options:
+            # The admitted manifest, not the model's wording, decides whether
+            # the classifier feedback choice is present.
+            decision = message.metadata.get("_camera_classifier_decision")
+            filtered_options = []
+            seen_options = set()
+            for option in options:
+                normalized = option.strip().casefold()
+                if option == "Это не еда" or normalized in seen_options:
+                    continue
+                seen_options.add(normalized)
+                filtered_options.append(option)
+            if decision == "ambiguous":
+                # Keep the model's first-party choices, but reserve one native
+                # slot for the correction that closes the loop on ambiguity.
+                if not filtered_options:
+                    filtered_options = ["Я это съел(а)", "Нет, не ел(а)"]
+                options = filtered_options[:7]
+                options.append("Это не еда")
+            else:
+                options = filtered_options
+                if len(options) < 2:
+                    if not options:
+                        options = ["Я это съел(а)", "Нет, не ел(а)"]
+                    else:
+                        alternative = (
+                            "Я это съел(а)"
+                            if _classify_answer(options[0], anchored=False) == "no"
+                            else "Нет, не ел(а)"
+                        )
+                        if alternative.casefold() != options[0].strip().casefold():
+                            options.append(alternative)
         if options:
             # Show the question above the buttons (the visible text may already
             # carry context; append the question so the choices read clearly).
@@ -771,6 +885,19 @@ class OhmoGatewayBridge:
         # would send — the file twice. Dedup (order-preserving) so an image
         # referenced by an absolute [[attach:]] path is delivered exactly once.
         final_media_paths = list(dict.fromkeys([*final_media, *media]))
+        if initial_camera_prompt:
+            # The original photo already has a confirmed native message. Its
+            # file must never flow into the normal media-send branch, including
+            # after an edit failure or when the native receipt is unusable.
+            def same_original_file(path: str) -> bool:
+                try:
+                    resolved = Path(path).resolve(strict=False)
+                    return any(resolved == Path(original).resolve(strict=False)
+                               for original in message.media or [])
+                except (OSError, RuntimeError, TypeError, ValueError):
+                    return path in set(message.media or [])
+
+            final_media_paths = [path for path in final_media_paths if not same_original_file(path)]
         if duplicate_assistant_update and not final_media_paths and not options:
             logger.info(
                 "ohmo final duplicates already-delivered assistant update channel=%s chat_id=%s session_key=%s",
@@ -802,6 +929,12 @@ class OhmoGatewayBridge:
             final_meta["_camera_candidate_id"] = message.metadata["_camera_candidate_id"]
             final_meta["_camera_authority"] = CAMERA_AUTHORITY
             final_meta["_camera_final"] = CAMERA_AUTHORITY
+            photo_id = message.metadata.get("_camera_photo_id")
+            if initial_camera_prompt and type(photo_id) is int and photo_id > 0:
+                final_meta["_camera_photo_id"] = photo_id
+                final_meta["_camera_caption"] = message.metadata.get("_camera_caption")
+                final_meta["_camera_edit_existing_photo"] = CAMERA_AUTHORITY
+                final_meta["_camera_initial_prompt"] = CAMERA_AUTHORITY
             final_meta.pop("_camera_turn_id", None)
             turn_id = message.metadata.get("_camera_turn_id")
             if isinstance(turn_id, str):
