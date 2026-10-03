@@ -430,7 +430,8 @@ async def test_ordinary_meal_append_is_receipt_bound_and_replay_safe(tmp_path, m
         timestamp=datetime(2026, 9, 28, 8, 30, tzinfo=timezone.utc),
     )
     result = await _turn(pool, first, ingress)
-    assert result.text == "Записано; приём пищи пока не привязан к дате."
+    assert result.text == honcho.messages[1].content
+    assert "Записано; приём пищи пока не привязан к дате." in result.text
     assert result.metadata["nutrition_sync_status"] == "pending"
     event_id = result.metadata["nutrition_append_event_id"]
     assert event_id == "honcho-2"
@@ -479,7 +480,8 @@ async def test_ordinary_meal_append_reconciles_timeout_and_never_claims_unknown(
         metadata={"message_id": 811, "is_group": False, "_synthetic": True},
     )
     result = await _turn(pool, message, ingress)
-    assert result.text == "Записано; приём пищи пока не привязан к дате."
+    assert result.text == honcho.messages[1].content
+    assert "Записано; приём пищи пока не привязан к дате." in result.text
     assert result.metadata["nutrition_append_event_id"] == "honcho-2"
     assert len(honcho.messages) == 2
 

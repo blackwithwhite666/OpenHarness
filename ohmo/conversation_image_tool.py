@@ -38,9 +38,13 @@ class LoadConversationImageTool(BaseTool):
         store: AttachmentStore,
         *,
         is_attachment_allowed: Callable[[str], bool],
+        on_load_started: Callable[[str], None] | None = None,
+        on_loaded: Callable[[str], str | None] | None = None,
     ) -> None:
         self._store = store
         self._is_attachment_allowed = is_attachment_allowed
+        self._on_load_started = on_load_started
+        self._on_loaded = on_loaded
 
     def is_read_only(self, arguments: BaseModel) -> bool:
         del arguments
@@ -52,6 +56,8 @@ class LoadConversationImageTool(BaseTool):
         context: ToolExecutionContext,
     ) -> ToolResult:
         del context
+        if self._on_load_started is not None:
+            self._on_load_started(arguments.attachment_id)
         try:
             allowed = self._is_attachment_allowed(arguments.attachment_id)
         except Exception:
@@ -63,11 +69,17 @@ class LoadConversationImageTool(BaseTool):
         except (FileNotFoundError, ValueError):
             return ToolResult(output=_UNAVAILABLE_MESSAGE, is_error=True)
         ref = stored.ref
+        verified_source_time = (
+            self._on_loaded(ref.attachment_id) if self._on_loaded is not None else None
+        )
+        output = (
+            "Loaded conversation image "
+            f"{ref.attachment_id} ({ref.media_type}, {ref.byte_size} bytes)."
+        )
+        if isinstance(verified_source_time, str) and verified_source_time:
+            output += f" Verified original Telegram photo send time (UTC): {verified_source_time}."
         return ToolResult(
-            output=(
-                "Loaded conversation image "
-                f"{ref.attachment_id} ({ref.media_type}, {ref.byte_size} bytes)."
-            ),
+            output=output,
             metadata={
                 "attachment_id": ref.attachment_id,
                 "media_type": ref.media_type,

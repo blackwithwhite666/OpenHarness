@@ -57,7 +57,8 @@ _SESSION_ID = re.compile(r"[0-9a-f]{32}\Z")
 _YES = frozenset(
     {"да, я это съела", "я это съела", "я съела это", "я съела", "я это ел", "я это съел"}
 )
-_NO = frozenset({"нет, не ела", "нет, не ел", "это не еда"})
+_NO = frozenset({"нет, не ела", "нет, не ел"})
+_NOT_FOOD = frozenset({"это не еда", "не еда", "это не пища"})
 _PENDING_TTL_SECONDS = 30 * 60
 _ANSWER_EXPLICIT_NO_RE = re.compile(
     r"\b(?:не\s+(?:ел|ела|ели|пил|пила|выпил|выпила|употреблял|употребляла)\b"
@@ -140,7 +141,7 @@ logger = logging.getLogger(__name__)
 def _classify_answer(text: object, *, anchored: bool) -> str | None:
     """Classify an explicit user answer to a Camera question.
 
-    Returns "yes", "no", or None (ambiguous, must stay unbound). Bare,
+    Returns "yes", "no", "not_food", or None (ambiguous, must stay unbound). Bare,
     non-anchored text binds only through explicit consumption or negation
     language; bare affirmations and scope-only answers stay ambiguous
     outside a native reply or a first-party ask button.
@@ -150,6 +151,8 @@ def _classify_answer(text: object, *, anchored: bool) -> str | None:
         return None
     if answer in _YES:
         return "yes"
+    if answer in _NOT_FOOD:
+        return "not_food"
     if answer in _NO:
         return "no"
     if _ANSWER_NEGATED_CONSUMPTION_RE.search(answer) or _ANSWER_EXPLICIT_NO_RE.search(answer):
@@ -3085,10 +3088,17 @@ class CameraIngress:
     async def _deliver(self, candidate_id: str) -> None:
         attempt = self._attempts[candidate_id]
         try:
+            captured = self._attempt_capture_time(attempt)
+            caption = (
+                f"Съели ли вы это? Фото сделано {captured.date().isoformat()}."
+                if captured is not None
+                else "Съели ли вы это? Дата съёмки неизвестна."
+            )
             receipt: OutboundDeliveryReceipt = await self._telegram.send_camera_photo(
                 chat_id=self.config.chat_id,
                 image_path=attempt["snapshot"],
-                caption="Фото из Camera. Ответьте на это фото: «Я это съел(а)» или «Нет, не ел(а)».",
+                caption=caption,
+                buttons=["Да, я это съел(а)", "Нет, не ел(а)", "Это не еда"],
             )
             if (
                 receipt.channel != "telegram"
@@ -3109,7 +3119,8 @@ class CameraIngress:
                     sender_id="__camera__",
                     chat_id=self.config.chat_id,
                     content=(
-                        "Проанализируй снимок Camera и спроси пользователя, ел(а) ли он(а) это. "
+                        "Проанализируй снимок Camera. Вопрос о том, съел(а) ли пользователь это, "
+                        "уже задан в подписи и кнопках к фото; не задавай его повторно. "
                         "Это только анализ: не записывай приём пищи без явного ответа пользователя."
                     ),
                     media=[attempt["snapshot"]],
@@ -3202,6 +3213,37 @@ class CameraIngress:
             return
 
         intent = _classify_answer(raw_text, anchored=target is not None)
+        if intent == "not_food":
+            if not callback or len(target_matches) != 1:
+                metadata["_camera_unbound"] = CAMERA_AUTHORITY
+                return
+            candidate_id, attempt = target_matches[0]
+            source_id = _source_message_id(metadata.get("callback_query_id"))
+            if attempt.get("state") != "photo_sent" or target is None or source_id is None:
+                metadata["_camera_unbound"] = CAMERA_AUTHORITY
+                return
+            feedback = attempt.get("classifier_feedback")
+            if feedback is None:
+                prior_attention = attempt.get("attention_active", True)
+                attempt["classifier_feedback"] = {
+                    "candidate_id": candidate_id,
+                    "photo_id": attempt.get("photo_id"),
+                    "source_id": source_id,
+                    "verdict": "not_food",
+                    "owner_id": self.config.principal,
+                    "recorded_at": datetime.now(timezone.utc).isoformat(),
+                    "classifier": _DEEPSEEK_RELEASE,
+                }
+                attempt["attention_active"] = False
+                try:
+                    self._save_attempts()
+                except OSError:
+                    attempt.pop("classifier_feedback", None)
+                    attempt["attention_active"] = prior_attention
+                    metadata["_camera_unbound"] = CAMERA_AUTHORITY
+                    return
+            metadata["_camera_classifier_feedback"] = CAMERA_AUTHORITY
+            return
         inbound_source_id = _source_message_id(metadata.get("message_id"))
         for replay_id, replay_attempt in self._attempts.items():
             if (

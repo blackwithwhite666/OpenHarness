@@ -1033,6 +1033,15 @@ class ShadowMemoryBackend(MemoryBackend):
             assistant_message = by_role.get("assistant")
             if user_message is None or assistant_message is None:
                 raise ConversationReconciliationError("Honcho response omitted a paired message")
+            if (
+                user_message.metadata.get("client_op_id") != user_op
+                or user_message.metadata.get("role") != "user"
+                or assistant_message.metadata.get("client_op_id") != assistant_op
+                or assistant_message.metadata.get("role") != "assistant"
+            ):
+                raise ConversationReconciliationError(
+                    "Honcho response operation pair did not match the requested exchange"
+                )
             return ConversationAppendReceipt(
                 user_message_id=user_message.id,
                 assistant_message_id=assistant_message.id,

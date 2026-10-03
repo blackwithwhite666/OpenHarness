@@ -95,10 +95,19 @@ async def test_camera_photo_accepts_only_photo_shaped_message(tmp_path) -> None:
     channel = _channel(bot)
     channel.polling_started = True
     receipt = await channel.send_camera_photo(
-        chat_id="123", image_path=str(image), caption="Camera"
+        chat_id="123", image_path=str(image), caption="Camera",
+        buttons=["Да, я это съел(а)", "Нет, не ел(а)", "Это не еда"],
     )
     assert receipt.native_message_ids == (77,)
     assert len(bot.calls) == 1
+    flat = [
+        button
+        for row in bot.calls[0][1]["reply_markup"].inline_keyboard
+        for button in row
+    ]
+    assert [button.text for button in flat] == [
+        "Да, я это съел(а)", "Нет, не ел(а)", "Это не еда"
+    ]
 
 
 @pytest.mark.asyncio
@@ -211,7 +220,13 @@ async def test_bad_request_failures_propagate(tmp_path, bot: ReceiptBot) -> None
 
 
 @pytest.mark.asyncio
-async def test_photo_caption_callback_uses_caption_api_and_forwards_native_id() -> None:
+@pytest.mark.parametrize(
+    ("index", "label"),
+    [(0, "Да, я это съела"), (1, "Нет, не ела"), (2, "Это не еда")],
+)
+async def test_photo_caption_callback_uses_native_label_and_forwards_native_id(
+    index: int, label: str,
+) -> None:
     channel = _channel(ReceiptBot())
     channel.config.allow_from = ["42"]
     captured = []
@@ -223,7 +238,7 @@ async def test_photo_caption_callback_uses_caption_api_and_forwards_native_id() 
     edited = []
 
     class Query:
-        data = "ask:2"
+        data = f"ask:{index}"
         message = SimpleNamespace(
             caption="Вы это съели?\nДата: 05.08.2026 12:00 (по EXIF фото)",
             caption_html="Вы это съели?\nДата: 05.08.2026 12:00 (по EXIF фото)",
@@ -254,11 +269,43 @@ async def test_photo_caption_callback_uses_caption_api_and_forwards_native_id() 
     await channel._on_callback(update, None)
 
     assert edited[0][0] == "caption"
-    assert captured[0].content == "Это не еда"
+    assert captured[0].content == label
     assert captured[0].metadata["message_id"] == 55
     assert captured[0].metadata["native_message_id"] == 55
-    assert captured[0].metadata["callback_data"] == "ask:2"
+    assert captured[0].metadata["callback_data"] == f"ask:{index}"
     assert captured[0].chat_id == "123"
+
+
+@pytest.mark.asyncio
+async def test_malformed_photo_callback_never_publishes_an_answer() -> None:
+    channel = _channel(ReceiptBot())
+    published = []
+
+    async def publish(message):
+        published.append(message)
+
+    channel.bus.publish_inbound = publish
+
+    class Query:
+        data = "ask:99"
+        message = SimpleNamespace(
+            caption="Question", text=None, message_id=55, chat_id=123,
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("Это не еда", callback_data="ask:0")]]
+            ),
+        )
+
+        async def answer(self):
+            pass
+
+    await channel._on_callback(
+        SimpleNamespace(
+            callback_query=Query(),
+            effective_user=SimpleNamespace(id=42, username=None, first_name="Marina"),
+        ),
+        None,
+    )
+    assert published == []
 
 
 # ---------------------------------------------------------------------------
