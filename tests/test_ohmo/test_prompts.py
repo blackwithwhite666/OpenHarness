@@ -596,7 +596,14 @@ def test_ohmo_prompt_wellness_and_nutrition_safety_contract(tmp_path: Path) -> N
         "Nonfood images, advice, hypothetical, explicit identification/estimate requests, "
         "and image-analysis-only turns do not create a `meal_observation`." in prompt
     )
-    assert "If food or portion is uncertain, ask one useful clarification." in prompt
+    assert "use that known unit as the default amount after meaningful owner confirmation" in prompt
+    assert "do not ask for exact grams, volume, or macros just because they are unknown" in prompt
+    assert "Explicit partial quantities and composition override whole-unit defaults" in prompt
+    assert (
+        "Ask one useful clarification only when the food/target, whether it was consumed, "
+        "or a material amount/composition cannot reasonably be estimated" in prompt
+    )
+    assert "Do not infer Camera consumption before meaningful owner confirmation" in prompt
     assert "explicit consumed/log intent" in prompt
     assert "text as authoritative over ambiguous image inference" in prompt
     assert "ask for clarification before recording" in prompt

@@ -598,6 +598,19 @@ def _append_nutrition_saved_status(answer: str, annotation: NutritionAnnotationV
         r"(?:[,;]\s*)?\bне\s+подтвержден\w*[^.!?;]*\b(?:сохран|запис|примен|обнов)\w*",
         re.IGNORECASE,
     )
+    standalone_unconfirmed_save = re.compile(
+        r"\s*(?:\*\*|__|\*|_)?сохранение\s+не\s+подтверждено"
+        r"(?:\*\*|__|\*|_)?\s*[.!?]?\s*",
+        re.IGNORECASE,
+    )
+    food_terms = {
+        term.casefold()
+        for item in annotation.items
+        for term in re.findall(r"[\w-]+", item.name)
+        if len(term) >= 4
+        and term.casefold() not in {"pack", "упаковка", "упаковки"}
+        and not term.casefold().endswith(("ый", "ий", "ая", "ое", "ее", "ые", "ие"))
+    }
     applied_date_claim = re.compile(
         r"(?:[,;]\s*)?\b(?:дат\w*|врем\w*)\b[^.!?;]{0,50}"
         r"\b(?:обновил\w*|применил\w*|отразил\w*|перенес\w*)\b[^.!?;]*",
@@ -611,6 +624,28 @@ def _append_nutrition_saved_status(answer: str, annotation: NutritionAnnotationV
         applied_date_claim,
     ):
         cleaned_answer = pattern.sub("", cleaned_answer)
+    sentence_parts = re.split(r"(?<=[.!?])(?=\s|$)", cleaned_answer)
+    for index, sentence in enumerate(sentence_parts):
+        current_food_missing = food_terms and any(
+            re.fullmatch(
+                rf"\s*в\s+журнал\w*\s+{re.escape(term)}\s+пока\s+не\s+"
+                r"(?:появил\w*|добавил\w*|отразил\w*)\s*[.!?]?\s*",
+                sentence,
+                re.IGNORECASE,
+            )
+            or re.fullmatch(
+                rf"\s*в\s+журнал\w*\s+{re.escape(term)}\s+пока\s+не\s+"
+                r"(?:появил\w*|добавил\w*|отразил\w*)\s*[—–-]\s*"
+                r"(?:\*\*|__|\*|_)?сохранение\s+не\s+подтверждено"
+                r"(?:\*\*|__|\*|_)?\s*[.!?]?\s*",
+                sentence,
+                re.IGNORECASE,
+            )
+            for term in food_terms
+        )
+        if standalone_unconfirmed_save.fullmatch(sentence) or current_food_missing:
+            sentence_parts[index] = ""
+    cleaned_answer = "".join(sentence_parts)
     if known_meal_time:
         cleaned_answer = uncertain_date.sub("", cleaned_answer)
     cleaned_answer = re.sub(r"\s+([,;.!?])", r"\1", cleaned_answer)

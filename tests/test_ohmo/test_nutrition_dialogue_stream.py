@@ -40,6 +40,7 @@ class _Honcho:
         self.messages: list[Message] = []
         self.fail_before_append = False
         self.timeout_after_append = False
+        self.wrong_assistant_operation = False
 
     async def find_messages_by_client_op_id(self, session: str, operation: str):
         del session
@@ -50,12 +51,15 @@ class _Honcho:
             raise OSError("synthetic append unavailable")
         result = []
         for value in values:
+            metadata = dict(value["metadata"])
+            if self.wrong_assistant_operation and metadata.get("role") == "assistant":
+                metadata["client_op_id"] = "synthetic-wrong-operation"
             message = Message(
                 id=f"honcho-{len(self.messages) + 1}",
                 content=value["content"],
                 peer_id=value["peer_id"],
                 session_id=session,
-                metadata=value["metadata"],
+                metadata=metadata,
                 created_at=datetime.now(timezone.utc),
                 workspace_id="fixture",
                 token_count=1,
@@ -100,6 +104,14 @@ class _Engine:
         ):
             payload = _consumed_payload()
             payload["trace_event_id"] = f"synthetic-meal-{message.metadata.get('message_id')}"
+            if message.metadata.get("_camera_answer") == "yes":
+                nutrition = payload["annotations"]["nutrition"]
+                nutrition["energy_kcal_best"] = 105
+                nutrition["items"] = [{
+                    "name": "Мягкий творог Синтетик 5%, упаковка 125 г",
+                    "quantity_text": "1 pack (125 g)",
+                    "energy_kcal_best": 105,
+                }]
             if "3 груши" in lowered:
                 payload["annotations"]["nutrition"]["items"] = [
                     {"name": "pears", "quantity_text": "3 pears"}
@@ -112,7 +124,21 @@ class _Engine:
                     {"name": "milk", "quantity_text": "half portion"}
                 ]
             recorder.record(TRACE_FINALIZATION, payload)
-            text = "Запись не удалось сохранить." if lowered != "2 кусочка" else "Спасибо."
+            text = (
+                "Пачка: примерно 105 ккал (состав точно неясен). "
+                "В журнале творог пока не появился — **сохранение не подтверждено**. "
+                "Отдельно: в журнале ужин пока не появился. "
+                "В журнале вчерашний творог пока не появился. "
+                "В журнале мягкий сыр пока не появился. "
+                "В журнале творог пока не появился, а ужин тоже пока отсутствует. "
+                "Сохранение витаминов при готовке не подтверждено. "
+                "Запись вчерашнего ужина не подтверждена. "
+                "Про вчерашний ужин: сохранение не подтверждено. "
+                "Речь о витаминах после нагрева: сохранение не подтверждено. "
+                "**сохранение не подтверждено**."
+                if message.metadata.get("_camera_answer") == "yes"
+                else "Запись не удалось сохранить." if lowered != "2 кусочка" else "Спасибо."
+            )
         else:
             text = "Сколько примерно вы съели?"
         yield AssistantTextDelta(text=text)
@@ -278,6 +304,106 @@ async def test_real_stream_clarification_then_quantity_commits_once(tmp_path, mo
     ingress.process_real_inbound(replay)
     assert replay.metadata.get("_camera_answer") is None
     assert len(honcho.messages) == 4
+    await ingress.close()
+
+
+@pytest.mark.asyncio
+async def test_camera_yes_for_known_single_pack_commits_once_without_quantity_turn(
+    tmp_path, monkeypatch
+):
+    ingress, root, bus, _ = _ingress(tmp_path, FakeTelegram())
+    request = _candidate(root, index=79)
+    assert (await _admit(ingress, root, "Bearer " + "s" * 40, request))[0] == 202
+    await bus.consume_inbound()
+    photo_id = ingress._attempts[request["candidate_id"]]["photo_id"]
+    honcho = _Honcho()
+    pool = _pool(tmp_path, ingress, honcho, monkeypatch)
+
+    answer = InboundMessage(
+        channel="telegram", sender_id="123", chat_id="123",
+        content="Да, я это съела",
+        metadata={"message_id": 791, "reply_to_message_id": photo_id,
+                  "_telegram_raw_text": "Да, я это съела", "is_group": False,
+                  "_synthetic": True},
+    )
+    ingress.process_real_inbound(answer)
+    assert answer.metadata["_camera_answer"] == "yes"
+    result = await _turn(pool, answer, ingress)
+
+    assert result.metadata["nutrition_append_event_id"] == "honcho-2"
+    assert result.text.startswith("Пачка: примерно 105 ккал")
+    assert "состав точно неясен" in result.text
+    assert "**сохранение не подтверждено**" not in result.text
+    assert "В журнале творог пока не появился." not in result.text
+    assert "ужин пока не появился" in result.text
+    assert "В журнале вчерашний творог пока не появился." in result.text
+    assert "В журнале мягкий сыр пока не появился." in result.text
+    assert "В журнале творог пока не появился, а ужин тоже пока отсутствует." in result.text
+    assert "Сохранение витаминов при готовке не подтверждено." in result.text
+    assert "Запись вчерашнего ужина не подтверждена." in result.text
+    assert "Про вчерашний ужин: сохранение не подтверждено." in result.text
+    assert "Речь о витаминах после нагрева: сохранение не подтверждено." in result.text
+    assert "**сохранение не подтверждено**." not in result.text
+    assert "Записано. Баланс обновляется." in result.text
+    saved = honcho.messages[1].metadata["decision_trace"]["annotations"]["nutrition"]
+    assert saved["consumption_status"] == "consumed"
+    assert len(saved["items"]) == 1
+    assert saved["items"][0]["name"] == "Мягкий творог Синтетик 5%, упаковка 125 г"
+    assert saved["items"][0]["quantity_text"] == "1 pack (125 g)"
+    assert saved["items"][0]["energy_kcal_best"] == 105
+    assert len(honcho.messages) == 2
+
+    replay = InboundMessage(
+        channel="telegram", sender_id="123", chat_id="123",
+        content=answer.content,
+        metadata={"message_id": 791, "reply_to_message_id": photo_id,
+                  "_telegram_raw_text": answer.content, "is_group": False,
+                  "_synthetic": True},
+    )
+    ingress.process_real_inbound(replay)
+    assert replay.metadata.get("_camera_answer") is None
+    assert len(honcho.messages) == 2
+    await ingress.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_mode", ["append", "mismatch"])
+async def test_camera_receipt_failure_never_returns_saved_status(
+    tmp_path, monkeypatch, failure_mode
+):
+    ingress, root, bus, _ = _ingress(tmp_path, FakeTelegram())
+    request = _candidate(root, index=80)
+    assert (await _admit(ingress, root, "Bearer " + "s" * 40, request))[0] == 202
+    await bus.consume_inbound()
+    photo_id = ingress._attempts[request["candidate_id"]]["photo_id"]
+    honcho = _Honcho()
+    if failure_mode == "append":
+        honcho.fail_before_append = True
+    else:
+        honcho.wrong_assistant_operation = True
+    pool = _pool(tmp_path, ingress, honcho, monkeypatch)
+    answer = InboundMessage(
+        channel="telegram", sender_id="123", chat_id="123",
+        content="Да, я это съела",
+        metadata={"message_id": 801, "reply_to_message_id": photo_id,
+                  "_telegram_raw_text": "Да, я это съела", "is_group": False,
+                  "_synthetic": True},
+    )
+    ingress.process_real_inbound(answer)
+    pool._active_message = answer
+    updates = []
+    expected = OSError if failure_mode == "append" else Exception
+    with pytest.raises(expected):
+        async for update in pool.stream_message(answer, ingress.config.session_key):
+            updates.append(update)
+
+    assert not any(update.kind == "final" for update in updates)
+    assert all("Записано" not in update.text for update in updates)
+    if failure_mode == "append":
+        assert honcho.messages == []
+    else:
+        assert len(honcho.messages) == 2
+        assert honcho.messages[1].metadata["client_op_id"] == "synthetic-wrong-operation"
     await ingress.close()
 
 
@@ -493,9 +619,32 @@ async def test_ordinary_meal_append_reconciles_timeout_and_never_claims_unknown(
         content="Я съела два кусочка, запиши завтрак",
         metadata={"message_id": 812, "is_group": False, "_synthetic": True},
     )
+    pool2._active_message = failed_message
+    failed_updates = []
     with pytest.raises(OSError, match="synthetic append unavailable"):
-        await _turn(pool2, failed_message, ingress)
+        async for update in pool2.stream_message(failed_message, ingress.config.session_key):
+            failed_updates.append(update)
+    assert not any(update.kind == "final" for update in failed_updates)
+    assert all("Записано" not in update.text for update in failed_updates)
     assert honcho2.messages == []
+
+    honcho3 = _Honcho()
+    honcho3.wrong_assistant_operation = True
+    pool3 = _pool(tmp_path / "mismatched", ingress, honcho3, monkeypatch)
+    mismatched_message = InboundMessage(
+        channel="telegram", sender_id="123", chat_id="123",
+        content="Я съела два кусочка, запиши завтрак",
+        metadata={"message_id": 813, "is_group": False, "_synthetic": True},
+    )
+    pool3._active_message = mismatched_message
+    mismatched_updates = []
+    with pytest.raises(Exception, match="(?i)(receipt|reconcil|operation)"):
+        async for update in pool3.stream_message(mismatched_message, ingress.config.session_key):
+            mismatched_updates.append(update)
+    assert not any(update.kind == "final" for update in mismatched_updates)
+    assert all("Записано" not in update.text for update in mismatched_updates)
+    assert len(honcho3.messages) == 2
+    assert honcho3.messages[1].metadata["client_op_id"] == "synthetic-wrong-operation"
     await ingress.close()
 
 

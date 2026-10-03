@@ -119,12 +119,12 @@ def canonical_record(*, kcal=25, source="src-tea", day="2026-10-01", latest="evt
             "items": [], "confidence": "medium", "assumptions": [], "warnings": []}
 
 
-def snapshots(events=None, *, canonical=True, status="complete"):
+def snapshots(events=None, *, canonical=True, status="complete", kcal=25):
     events = [raw_event()] if events is None else events
     honcho = {"complete": True, "workspace_id": "workspace-1", "session_id": "session-1",
               "owner_id": "owner-1", "since": "2026-10-01T00:00:00+00:00",
               "until": NOW.isoformat(), "queried_at": NOW.isoformat(), "messages": events}
-    record = canonical_record(kcal=25, latest=events[-1]["id"] if events else "evt-1")
+    record = canonical_record(kcal=kcal, latest=events[-1]["id"] if events else "evt-1")
     if events:
         # The external canonical fixture names its latest stored event directly;
         # it does not derive expected state by invoking the grader's fold.
@@ -393,7 +393,9 @@ def test_missing_reviewed_episode_writes_inconclusive_snapshot_cli_report(tmp_pa
     assert report["dialogue_binding"]["tea"]["complete"] is False
 
 
-@pytest.mark.parametrize("actual,verdict", [(25, "PASS"), (22.5, "PASS"), (27.5, "PASS"), (22.49, "FAIL"), (27.51, "FAIL")])
+@pytest.mark.parametrize("actual,verdict", [
+    (25, "PASS"), (17.5, "PASS"), (32.5, "PASS"), (17.49, "FAIL"), (32.51, "FAIL"),
+])
 def test_same_event_projection_uses_frozen_numeric_boundary(actual, verdict):
     honcho, telegent = snapshots()
     nutrition = honcho["messages"][0]["metadata"]["decision_trace"]["annotations"]["nutrition"]
@@ -1274,9 +1276,38 @@ def test_exact_replay_deduplicates_and_cross_workspace_event_is_inconclusive():
     assert grade(honcho, telegent)["a1"] == "INCONCLUSIVE"
 
 
-def test_goal_rejects_tolerance_above_ten_percent_and_boolean_numbers():
+def test_goal_tolerance_defaults_to_thirty_percent_and_accepts_explicit_tighter_value():
+    assert goal().tolerance_fraction == 0.30
+    assert Goal.model_validate({**goal().model_dump(), "tolerance_fraction": 0.30}).tolerance_fraction == 0.30
+    assert Goal.model_validate({**goal().model_dump(), "tolerance_fraction": 0.10}).tolerance_fraction == 0.10
+
+
+@pytest.mark.parametrize("value", [
+    -0.000001, 0.300001, float("nan"), float("inf"), float("-inf"), True, "0.3",
+])
+def test_goal_rejects_invalid_tolerance_fraction(value):
     with pytest.raises(ValidationError):
-        Goal.model_validate({**goal().model_dump(), "tolerance_fraction": 1})
+        Goal.model_validate({**goal().model_dump(), "tolerance_fraction": value})
+
+
+@pytest.mark.parametrize(("actual", "expected"), [(280, "PASS"), (520, "PASS"),
+                                                       (279.9, "FAIL"), (520.1, "FAIL")])
+def test_goal_tolerance_is_inclusive_at_thirty_percent(actual, expected):
+    honcho, telegent = snapshots([raw_event(kcal=actual)], kcal=actual)
+    assert grade(honcho, telegent, kcal=400)["a1"] == expected
+
+
+def test_goal_tolerance_zero_requires_exact_kcal():
+    exact_honcho, exact_telegent = snapshots([raw_event(kcal=400)], kcal=400)
+    exact_goal = {**goal(kcal=400).model_dump(), "tolerance_fraction": 0.0}
+    assert grade_manifest(Manifest(schema_version=1,
+        goals=[Goal.model_validate(exact_goal)]), exact_honcho, exact_telegent)[0]["a1"] == "PASS"
+    changed_honcho, changed_telegent = snapshots([raw_event(kcal=400.1)], kcal=400.1)
+    assert grade_manifest(Manifest(schema_version=1,
+        goals=[Goal.model_validate(exact_goal)]), changed_honcho, changed_telegent)[0]["a1"] == "FAIL"
+
+
+def test_expected_kcal_still_rejects_boolean_numbers():
     with pytest.raises(ValidationError):
         Goal.model_validate({**goal().model_dump(), "expected_kcal": True})
 

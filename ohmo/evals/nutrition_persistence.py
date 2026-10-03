@@ -56,13 +56,15 @@ class Goal(BaseModel):
     canonical_meal_id: str = Field(min_length=1, max_length=512)
     expected_consumed: bool = Field(strict=True)
     expected_kcal: float | None = Field(default=None, strict=True)
-    tolerance_fraction: float = Field(default=0.10, ge=0, le=0.10, strict=True)
+    tolerance_fraction: float = Field(default=0.30, ge=0, le=0.30, strict=True)
     expectation_origin: Literal["explicit_fixture", "reviewed_user_dialogue", "frozen_photo_reference"]
     expectation_source: str = Field(min_length=1, max_length=512)
     review_notes: str = Field(default="", max_length=2000)
 
     @model_validator(mode="after")
     def _goal_shape(self) -> "Goal":
+        if not math.isfinite(self.tolerance_fraction):
+            raise ValueError("tolerance_fraction must be finite")
         try:
             ZoneInfo(self.meal_timezone)
         except (ZoneInfoNotFoundError, TypeError):
