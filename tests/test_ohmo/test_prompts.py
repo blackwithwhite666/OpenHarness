@@ -206,12 +206,19 @@ def test_ohmo_prompt_nutrition_contract_contains_versioned_annotation_rules(tmp_
     assert '"consumption_status": "unknown"' in prompt
     assert '"meal_date": null' in prompt
     assert '"meal_at": null' in prompt
-    assert "only when the user explicitly states" in prompt
+    assert (
+        "A directly sent photo from an authenticated configured participant in their own private conversation"
+        in prompt
+    )
+    assert "is itself a request to log clearly identifiable pictured food as consumed" in prompt
+    assert "the gateway's trusted native photo send time is the default date convention" in prompt
+    assert "An explicit user date/time overrides that default." in prompt
+    assert "If trusted source time is unavailable, preserve unknown." in prompt
     assert "forwarded source timestamp" in prompt
     assert "receive timestamp" in prompt
-    assert "image metadata" in prompt
+    assert "EXIF" in prompt
     assert "model guess" in prompt
-    assert "without explicit consumption language" in prompt
+    assert "without an accompanying advisory request" in prompt
     assert (
         "At least one total energy field (`energy_kcal_min|max|best`) is required "
         "only for `meal_observation`." in prompt
@@ -585,7 +592,11 @@ def test_ohmo_prompt_wellness_and_nutrition_safety_contract(tmp_path: Path) -> N
     assert "nutrition_status` is not `complete`" in prompt
     assert "an empty nutrition list is never zero intake" in prompt
     assert "conversation-only" in prompt
-    assert "read-only, advisory, hypothetical, and image-analysis-only" in prompt
+    assert (
+        "Nonfood images, advice, hypothetical, explicit identification/estimate requests, "
+        "and image-analysis-only turns do not create a `meal_observation`." in prompt
+    )
+    assert "If food or portion is uncertain, ask one useful clarification." in prompt
     assert "explicit consumed/log intent" in prompt
     assert "text as authoritative over ambiguous image inference" in prompt
     assert "ask for clarification before recording" in prompt
@@ -597,8 +608,9 @@ def test_ohmo_prompt_covers_marina_wellness_regressions(tmp_path: Path) -> None:
     initialize_workspace(workspace)
     prompt = _calory_skill_body()
 
-    assert "oatmeal advice or an oatmeal calorie estimate" in prompt
-    assert "must not create a nutrition annotation" in prompt
+    assert "without an accompanying advisory request" in prompt
+    assert "advice, hypothetical, explicit identification/estimate requests" in prompt
+    assert "do not create a `meal_observation`" in prompt
     assert "«рис с яйцом»" in prompt
     assert "explicit text saying one egg" in prompt
     assert "keep one egg" in prompt

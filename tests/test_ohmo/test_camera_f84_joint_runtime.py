@@ -1,7 +1,6 @@
 """Synthetic end-to-end regressions for photo receipt and correction context."""
 from __future__ import annotations
 
-import asyncio
 import copy
 import json
 import os
@@ -21,7 +20,6 @@ from openharness.evals import TRACE_FINALIZATION
 from openharness.tools.base import ToolExecutionContext, ToolRegistry
 from ohmo.conversation_image_tool import LoadConversationImageInput
 from ohmo.evals import GatewayEvalRecorder
-from ohmo.evals.nutrition_trace import NutritionAnnotationV2
 from ohmo.gateway.memory_gate import MemoryScope
 from ohmo.gateway.models import GatewayConfig
 import ohmo.gateway.runtime as runtime_module
@@ -225,7 +223,10 @@ async def runtime():
     )
     out["direct_correction"] = {"observation_status": original.text, "correction_status": final.text,
                               "correction_delivery": final.metadata}
-    assert "750 ккал" in original.text
+    assert "700–800 ккал" in original.text
+    assert original.metadata["nutrition_committed_annotation"]["energy_kcal_best"] == 750
+    assert "не знаю" not in original.text
+    assert original.text == server.rows[1]["content"]
     assert final.text == "Изменение сохранено; баланс обновляется."
     assert "подтверждения сохранения записи тоже нет" not in original.text
     assert "пока не подтвердила" not in final.text
@@ -558,8 +559,34 @@ async def status_stream():
     photo.write_bytes(PNG_BYTES)
     pool, bundle, server, client = setup("status-stream")
     msg, ctx, user = inbound(pool, "dated-status-photo", media=[str(photo)])
-    first, _ = await turn(pool, bundle, msg, ctx, user, observation(), answer=
-        "Бургер — примерно 750 ккал; я не знаю, когда ты его съел.")
+    first, _ = await turn(
+        pool,
+        bundle,
+        msg,
+        ctx,
+        user,
+        observation(energy_kcal_min=650, energy_kcal_max=900),
+        answer=(
+            "На фото бургер; оценка — ≈750 ккал (примерно 650–900 ккал). "
+            "Вес и состав точно не известны. Я не знаю, когда ты его съел, "
+            "поэтому пока не отношу к сегодняшнему итогу; подтверждения "
+            "сохранения записи тоже нет. Записано; приём пищи пока не "
+            "привязан к дате."
+        ),
+    )
+    committed_time = first.metadata["nutrition_committed_annotation"]["meal_at"]
+    assert committed_time == "2026-10-01T20:59:58Z"
+    assert first.text == server.rows[1]["content"]
+    for committed_text in (first.text, server.rows[1]["content"]):
+        assert "бургер" in committed_text.lower()
+        assert "750 ккал" in committed_text
+        assert "650–900 ккал" in committed_text
+        assert "не знаю, когда" not in committed_text
+        assert "не отношу к сегодняшнему итогу" not in committed_text
+        assert "подтверждения сохранения записи" not in committed_text
+        assert "приём пищи пока не привязан к дате" not in committed_text
+        assert ".." not in committed_text
+    assert first.text.endswith("Записано. Баланс обновляется.")
     ref = next(block for block in user.content if isinstance(block, AttachmentRefBlock))
     msg2, ctx2, user2 = inbound(pool, "dated-status-correction", "Это было 2 октября")
     second, _ = await turn(pool, bundle, msg2, ctx2, user2, correction(), loads=[ref.attachment_id], answer=
@@ -572,11 +599,8 @@ async def status_stream():
         loads=[ref.attachment_id],
         answer="Бургер — 750 ккал; точное время в запись не подставляю.",
     )
-    result = {"observation": {"text": first.text, "delivery": first.metadata},
-              "correction": {"text": second.text, "delivery": second.metadata},
-              "second_correction": {"text": third.text, "delivery": third.metadata}}
     assert len(server.rows) == 6
-    assert first.text == "Примерно 750 ккал.\nЗаписано. Баланс обновляется."
+    assert first.text == server.rows[1]["content"]
     assert "Записано. Баланс обновляется." in first.text
     assert second.text == "Изменение сохранено; баланс обновляется."
     assert third.text == "Изменение сохранено; баланс обновляется."

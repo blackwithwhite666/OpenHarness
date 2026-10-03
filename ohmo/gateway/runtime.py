@@ -569,32 +569,89 @@ def _append_nutrition_saved_status(answer: str, annotation: NutritionAnnotationV
         r"\b(?:нет|пуст\w*|отсутств\w*|empty|no\s+record)\b",
         re.IGNORECASE,
     )
+    known_meal_time = annotation.meal_at is not None or annotation.meal_date is not None
+    uncertain_date = re.compile(
+        r"(?:[,;]\s*)?(?:я\s+)?не\s+(?:знаю|уверен\w*)\b"
+        r"[^.!?;]{0,100}\b(?:когда|дат\w*|врем\w*)\b[^.!?;]*",
+        re.IGNORECASE,
+    )
+    stale_projection = re.compile(
+        r"(?:[,;]\s*)?\bпровер\w*\s+(?:журнал\w*|баз\w*|проекц\w*)\b"
+        r"[^.!?;]*\bне\s+подтверд\w*\b[^.!?;]*\b(?:дат\w*|врем\w*|обнов\w*|примен\w*)\b[^.!?;]*|"
+        r"(?:[,;]\s*)?\bне\s+подтверд\w*\b[^.!?;]*\b(?:дат\w*|врем\w*|обнов\w*|примен\w*)\b[^.!?;]*",
+        re.IGNORECASE,
+    )
+    precise_time_disclaimer = re.compile(
+        r"(?:[,;]\s*)?\bточн\w*\s+врем\w*\b[^.!?;]{0,50}"
+        r"\bне\s+(?:подстав\w*|внес\w*|запис\w*|указ\w*)\b[^.!?;]*",
+        re.IGNORECASE,
+    )
+    unconfirmed_save = re.compile(
+        r"(?:[,;]\s*)?\bподтвержден\w*[^.!?;]{0,60}\bнет\b|"
+        r"(?:[,;]\s*)?\bне\s+подтвержден\w*[^.!?;]*\b(?:сохран|запис|примен|обнов)\w*",
+        re.IGNORECASE,
+    )
+    applied_date_claim = re.compile(
+        r"(?:[,;]\s*)?\b(?:дат\w*|врем\w*)\b[^.!?;]{0,50}"
+        r"\b(?:обновил\w*|применил\w*|отразил\w*|перенес\w*)\b[^.!?;]*",
+        re.IGNORECASE,
+    )
+    cleaned_answer = answer.strip()
+    for pattern in (
+        stale_projection,
+        precise_time_disclaimer,
+        unconfirmed_save,
+        applied_date_claim,
+    ):
+        cleaned_answer = pattern.sub("", cleaned_answer)
+    if known_meal_time:
+        cleaned_answer = uncertain_date.sub("", cleaned_answer)
+    cleaned_answer = re.sub(r"\s+([,;.!?])", r"\1", cleaned_answer)
+    cleaned_answer = re.sub(r"([.!?])\s*[,;]", r"\1", cleaned_answer)
+    # A dated committed receipt supersedes this standalone status left by an
+    # earlier model draft. Keep the same wording for genuinely undated meals.
+    stale_undated_status = re.compile(
+        r"Записано;\s*приём пищи пока не привязан к дате\.", re.IGNORECASE
+    )
+    if known_meal_time:
+        cleaned_answer = re.sub(
+            r"(?<=[.!?])\s+Записано;\s*приём пищи пока не привязан к дате\.\s*$",
+            "",
+            cleaned_answer,
+            flags=re.IGNORECASE,
+        )
+        if stale_undated_status.fullmatch(cleaned_answer.strip()):
+            cleaned_answer = ""
+        cleaned_answer = re.sub(r"(?<!\.)\.\.(?!\.)", ".", cleaned_answer)
     cleaned = []
-    for sentence in re.split(r"(?<=[.!?])\s+", answer.strip()):
+    for sentence in re.split(r"(?<=[.!?])\s+", cleaned_answer):
+        if known_meal_time and stale_undated_status.fullmatch(sentence.strip()):
+            continue
         clauses = re.split(r"[,;]|\s+но\s+", sentence, flags=re.IGNORECASE)
         compound_failure = bool(storage.search(sentence) and failure.search(sentence))
-        if compound_failure:
-            for part in clauses:
-                if empty_store.search(part):
-                    continue
-                if storage.search(part) and failure.search(part):
-                    # Remove the assertion itself, not its object/complement:
-                    # e.g. retain "two pears: about 120 kcal" in a failed-save
-                    # pre-append sentence once the authoritative append wins.
-                    part, substitutions = failed_storage_action.subn("", part)
-                    if substitutions:
-                        part = part.strip(" ,;:—-.")
-                        if storage.fullmatch(part):
-                            part = ""
-                    else:
-                        # Some failure phrasing puts the storage noun after the
-                        # failure verb. Keep the existing conservative clause
-                        # removal when no specific failed action is identifiable.
+        if not compound_failure:
+            if sentence.strip():
+                cleaned.append(sentence.strip())
+            continue
+        for part in clauses:
+            if empty_store.search(part):
+                continue
+            if storage.search(part) and failure.search(part):
+                # Remove the assertion itself, not its object/complement:
+                # e.g. retain "two pears: about 120 kcal" in a failed-save
+                # pre-append sentence once the authoritative append wins.
+                part, substitutions = failed_storage_action.subn("", part)
+                if substitutions:
+                    part = part.strip(" ,;:—-.")
+                    if storage.fullmatch(part):
                         part = ""
-                if part.strip():
-                    cleaned.append(part.strip())
-        else:
-            cleaned.append(sentence)
+                else:
+                    # Some failure phrasing puts the storage noun after the
+                    # failure verb. Keep the existing conservative clause
+                    # removal when no specific failed action is identifiable.
+                    part = ""
+            if part.strip():
+                cleaned.append(part.strip())
     content = " ".join(part for part in cleaned if part).strip()
     status = (
         "Записано. Баланс обновляется."
@@ -605,11 +662,23 @@ def _append_nutrition_saved_status(answer: str, annotation: NutritionAnnotationV
 
 
 def _committed_nutrition_reply(
-    annotation: NutritionAnnotationV2, *, status: str
+    annotation: NutritionAnnotationV2,
+    *,
+    status: str,
+    assistant_content: str | None = None,
 ) -> str:
-    """Present only committed observation nutrients and the validated receipt status."""
+    """Keep receipt content while applying the committed observation status."""
     if annotation.record_type != "meal_observation":
         return status
+    if assistant_content is not None:
+        content = re.sub(
+            r"(?:\n)?(?:Записано\. Баланс обновляется\.|"
+            r"Записано; приём пищи пока не привязан к дате\.)\s*$",
+            "",
+            assistant_content.strip(),
+            flags=re.IGNORECASE,
+        ).strip()
+        return _append_nutrition_saved_status(content, annotation) if content else status
     minimum = annotation.energy_kcal_min
     maximum = annotation.energy_kcal_max
     best = annotation.energy_kcal_best
@@ -2524,7 +2593,6 @@ class OhmoSessionRuntimePool:
             message.metadata.get("reply_to_message_id")
         )
         principal_id = canonical_principal("telegram", turn_ctx.principal)
-        configured_family_tenant = self._gateway_config.family_principals.get(principal_id)
         native_reply_authorized = bool(
             native_reply_target is not None
             and turn_ctx.channel == "telegram"
@@ -2537,7 +2605,8 @@ class OhmoSessionRuntimePool:
             and memory_scope.private_tenant
             and (
                 turn_ctx.is_owner is True
-                or configured_family_tenant == memory_scope.private_tenant
+                or self._gateway_config.family_principals.get(principal_id)
+                == memory_scope.private_tenant
             )
         )
         ordinary_correction = bool(
@@ -2688,10 +2757,12 @@ class OhmoSessionRuntimePool:
                         "Записано. Баланс обновляется."
                         if committed_annotation.meal_at is not None
                         or committed_annotation.meal_date is not None
-                        else "Записано; приём пищи пока не привязан к дате. Баланс обновляется."
+                        else "Записано; приём пищи пока не привязан к дате."
                     )
                     reply = _committed_nutrition_reply(
-                        committed_annotation, status=meal_status
+                        committed_annotation,
+                        status=meal_status,
+                        assistant_content=append_receipt.assistant_content,
                     )
             if ordinary_correction_saved and append_receipt is not None:
                 stored_trace = append_receipt.assistant_metadata.get("decision_trace")
