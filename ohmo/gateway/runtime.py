@@ -437,10 +437,16 @@ def _camera_eval_capture_provenance(
         "recipient_principal": principal,
     }
     if message.sender_id == "__camera__":
+        source_principal = assistant_metadata.get("source_principal")
+        operation_id = assistant_metadata.get("client_op_id")
         if (metadata.get("_synthetic") is not True or metadata.get("_camera_photo_id") != photo_id
-                or assistant_metadata.get("source_message_id") is not None or not message.media):
+                or assistant_metadata.get("source_message_id") is not None or not message.media
+                or not isinstance(logical_turn_id, str) or not logical_turn_id
+                or operation_id != f"{logical_turn_id}:assistant"
+                or not isinstance(source_principal, str) or not source_principal):
             return None, None
-        return None, {**common, "kind": "initial_context"}
+        return None, {**common, "kind": "initial_context", "source_principal": source_principal,
+                      "logical_turn_id": logical_turn_id, "operation_id": operation_id}
     source = assistant_metadata.get("source_message_id")
     op = assistant_metadata.get("client_op_id")
     principal_id = assistant_metadata.get("source_principal")

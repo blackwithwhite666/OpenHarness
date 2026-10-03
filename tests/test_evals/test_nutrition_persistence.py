@@ -296,6 +296,68 @@ def test_mismatched_context_turn_export_binding_cannot_silently_pass(mutation):
     assert result["a1"] == "INCONCLUSIVE", (mutation, result)
 
 
+@pytest.mark.parametrize("kind", ["meal_correction", "meal_deletion"])
+@pytest.mark.parametrize("mutation", ["nutrition_string", "nutrition_list", "nutrition_null", "annotations_list"])
+def test_malformed_reviewed_edit_annotations_do_not_disappear_as_unannotated_context(kind, mutation):
+    root = per_turn_event("evt-root", source="src-tea", episode="ep-tea", turn="root", kcal=25,
+                          created="2026-10-01T11:58:00+00:00")
+    edit = per_turn_event("evt-edit", source="src-edit", episode="ep-edit", turn="edit", kcal=99,
+                          kind=kind, reply="src-tea", created="2026-10-01T11:59:00+00:00")
+    reviewed = Goal.model_validate({**goal().model_dump(mode="json"),
+                                    "episode_ids": ["ep-tea", "ep-edit"]})
+    manifest = Manifest(schema_version=1, goals=[reviewed])
+    sources = {"ep-tea": ["src-tea"], "ep-edit": ["src-edit"]}
+    provenance = reviewed_turn_map(root, edit)
+    honcho, canonical = snapshots([root, edit])
+    canonical["meal"].update(
+        latest_event_id="evt-root", energy_kcal_best=25,
+        capture_time=root["created_at"], consumption_status="consumed",
+    )
+
+    valid = grade_manifest(manifest, honcho, canonical, now=NOW,
+                           reviewed_turn_sources=sources, reviewed_turn_provenance=provenance)[0]
+    assert valid["a1"] == "FAIL" and valid["stage"] == "HONCHO_GOAL_MISMATCH", valid
+
+    malformed = json.loads(json.dumps(honcho))
+    trace = malformed["messages"][1]["metadata"]["decision_trace"]
+    if mutation == "nutrition_string":
+        trace["annotations"]["nutrition"] = "malformed"
+    elif mutation == "nutrition_list":
+        trace["annotations"]["nutrition"] = []
+    elif mutation == "nutrition_null":
+        trace["annotations"]["nutrition"] = None
+    else:
+        trace["annotations"] = []
+    result = grade_manifest(manifest, malformed, canonical, now=NOW,
+                            reviewed_turn_sources=sources, reviewed_turn_provenance=provenance)[0]
+    assert result["a1"] == "INCONCLUSIVE" and result["stage"] == "HONCHO_INVALID", result
+
+    unrelated = per_turn_event("evt-unrelated-edit", source="src-unrelated-edit", episode="ep-unrelated",
+                               turn="unrelated-edit", kcal=99, kind=kind, reply="src-not-reviewed",
+                               created="2026-10-01T11:59:00+00:00")
+    unrelated["metadata"]["decision_trace"]["annotations"]["nutrition"] = "malformed"
+    unrelated_honcho, _ = snapshots([root, unrelated])
+    unrelated_result = grade_manifest(manifest, unrelated_honcho, canonical, now=NOW,
+                                      reviewed_turn_sources=sources,
+                                      reviewed_turn_provenance=provenance)[0]
+    assert unrelated_result["a1"] == "PASS", unrelated_result
+
+
+@pytest.mark.parametrize("mutation", ["nutrition_string", "annotations_list"])
+def test_malformed_reviewed_ordinary_context_annotations_fail_closed_only_when_relevant(mutation):
+    reviewed, context, clarification, root, honcho, canonical, sources, provenance = reviewed_multiepisode_fixture()
+    malformed = json.loads(json.dumps(context))
+    trace = malformed["metadata"]["decision_trace"]
+    if mutation == "nutrition_string":
+        trace["annotations"]["nutrition"] = "malformed"
+    else:
+        trace["annotations"] = []
+    honcho["messages"] = [malformed, clarification, root]
+    result = grade_manifest(Manifest(schema_version=1, goals=[reviewed]), honcho, canonical, now=NOW,
+                            reviewed_turn_sources=sources, reviewed_turn_provenance=provenance)[0]
+    assert result["a1"] == "INCONCLUSIVE" and result["stage"] == "HONCHO_INVALID", result
+
+
 def test_missing_reviewed_episode_writes_inconclusive_snapshot_cli_report(tmp_path, monkeypatch):
     import sys
 
@@ -607,6 +669,76 @@ def test_eval_export_reads_read_only_sqlite_and_exports_gateway_final(tmp_path: 
     uri = (root / "evals.sqlite").as_uri() + "?mode=ro"
     with sqlite3.connect(uri, uri=True) as connection:
         assert connection.execute("SELECT COUNT(*) FROM episodes").fetchone()[0] == 2
+
+
+def test_historical_camera_prompt_omission_does_not_authorize_incomplete_binding(tmp_path: Path):
+    prompt = "SYNTHETIC INTERNAL ANALYSIS PROMPT"
+    for variant in ("correct_receipt_missing_tuple", "missing_receipt", "corrupt_receipt"):
+        root = tmp_path / variant / "evals"
+        store = EvalStore(root)
+        camera_context = {
+            "kind": "initial_context", "episode_id": "ep-camera", "candidate_id": "candidate-1",
+            "native_photo_id": 77, "tenant_id": "owner-1", "gateway_session_id": "session-1",
+            "recipient_principal": "telegram:owner-1",
+        }
+        if variant == "missing_receipt":
+            camera_context.pop("native_photo_id")
+        elif variant == "corrupt_receipt":
+            camera_context["native_photo_id"] = 78
+        camera_inbound = {
+            "channel": "telegram", "chat_id": "chat-1", "sender_id": "__camera__",
+            "timestamp": (NOW.replace(hour=10)).isoformat(),
+            "metadata": {"_synthetic": True, "_camera_candidate_id": "candidate-1", "_camera_photo_id": 77},
+        }
+        store.append_episode(EvalEpisode(episode_id="ep-camera", session_id="session-1", source="gateway",
+            created_at=NOW.replace(hour=10), metadata={"workspace": "synthetic-evals",
+            "inbound": camera_inbound, "trusted_camera_context": camera_context}))
+        store.append_event(EvalEvent(episode_id="ep-camera", kind="inbound_message",
+            payload={**camera_inbound, "user_text": prompt}))
+        store.append_event(EvalEvent(episode_id="ep-camera", kind="gateway_final",
+            payload={"text": "Synthetic analysis completed."}))
+        store.append_event(EvalEvent(episode_id="ep-camera", kind="episode_finished",
+            payload={"status": "completed"}))
+
+        owner_inbound = {
+            "channel": "telegram", "chat_id": "chat-1", "sender_id": "owner-1|mutable_name",
+            "timestamp": NOW.isoformat(), "metadata": {"message_id": "src-tea"},
+        }
+        store.append_episode(EvalEpisode(episode_id="ep-tea", session_id="session-1", source="gateway",
+            created_at=NOW, metadata={"workspace": "synthetic-evals", "inbound": owner_inbound}))
+        store.append_event(EvalEvent(episode_id="ep-tea", kind="inbound_message",
+            payload={**owner_inbound, "user_text": "I drank tea."}))
+        store.append_event(EvalEvent(episode_id="ep-tea", kind="gateway_final",
+            payload={"text": "I could not confirm the save."}))
+        store.append_event(EvalEvent(episode_id="ep-tea", kind="episode_finished",
+            payload={"status": "completed"}))
+
+        exported = export_eval_dialogue(root, episode_ids=["ep-camera", "ep-tea"])
+        camera, owner = exported["episodes"]
+        assert camera["dialogue"] == [{"role": "assistant", "text": "Synthetic analysis completed."}]
+        assert camera["source_message_ids"] == []
+        assert camera["dialogue_complete"] is False
+        reviewed = Goal.model_validate({**goal().model_dump(mode="json"),
+            "episode_ids": ["ep-camera", "ep-tea"]})
+        assert not validate_dialogue_binding(Manifest(schema_version=1, goals=[reviewed]), exported)["tea"]["complete"]
+        assert owner["dialogue"][0] == {"role": "user", "text": "I drank tea."}
+        assert list(store.iter_events("ep-camera"))[0].payload["user_text"] == prompt
+
+    human_root = tmp_path / "human-camera-looking" / "evals"
+    human_store = EvalStore(human_root)
+    human_inbound = {"channel": "telegram", "chat_id": "chat-1", "sender_id": "owner-1",
+        "timestamp": NOW.isoformat(), "metadata": {"message_id": "__camera__"}}
+    human_store.append_episode(EvalEpisode(episode_id="ep-human", session_id="session-1", source="gateway",
+        created_at=NOW, metadata={"workspace": "synthetic-evals", "inbound": human_inbound}))
+    human_store.append_event(EvalEvent(episode_id="ep-human", kind="inbound_message",
+        payload={**human_inbound, "user_text": prompt}))
+    human_store.append_event(EvalEvent(episode_id="ep-human", kind="gateway_final",
+        payload={"text": "Reply."}))
+    human_store.append_event(EvalEvent(episode_id="ep-human", kind="episode_finished",
+        payload={"status": "completed"}))
+    human_export = export_eval_dialogue(human_root, episode_ids=["ep-human"])["episodes"][0]
+    assert human_export["dialogue"][0] == {"role": "user", "text": prompt}
+    assert human_export["source_message_ids"] == ["__camera__"]
 
 
 def test_eval_export_requires_terminal_finish_event(tmp_path: Path):

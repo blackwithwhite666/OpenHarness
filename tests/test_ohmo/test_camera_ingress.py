@@ -6005,6 +6005,7 @@ async def test_real_camera_initial_signal_is_captured_as_context_without_fake_so
 async def test_late_reply_binds_its_matching_initial_context_among_two_camera_photos(
     tmp_path: Path, monkeypatch
 ):
+    from copy import deepcopy
     from datetime import date
 
     from ohmo.evals.nutrition_persistence import (
@@ -6200,6 +6201,182 @@ async def test_late_reply_binds_its_matching_initial_context_among_two_camera_ph
     )[0]
     assert result["a1"] == "PASS"
     assert result["actual_event_ids"] == [food["id"]]
+
+    context_only = {**honcho, "messages": initial_rows}
+    context_only_result = grade_manifest(
+        manifest, context_only, canonical, now=later,
+        reviewed_turn_sources=binding["reviewed_turn_sources"],
+        reviewed_turn_provenance=binding["reviewed_turn_provenance"],
+    )[0]
+    assert context_only_result["a1"] == "FAIL"
+    assert context_only_result["stage"] == "HONCHO_GOAL_MISMATCH"
+
+    for malformed_trace in ("malformed", []):
+        changed = deepcopy(honcho)
+        changed["messages"][0]["metadata"]["decision_trace"] = malformed_trace
+        malformed_result = grade_manifest(
+            manifest, changed, canonical, now=later,
+            reviewed_turn_sources=binding["reviewed_turn_sources"],
+            reviewed_turn_provenance=binding["reviewed_turn_provenance"],
+        )[0]
+        assert malformed_result["a1"] == "INCONCLUSIVE"
+
+    for record_type in ("meal_observation", "meal_correction", "meal_deletion"):
+        changed = deepcopy(honcho)
+        context_metadata = changed["messages"][0]["metadata"]
+        context_metadata["source_message_id"] = "unrelated-source"
+        context_metadata["decision_trace_episode_id"] = "unreviewed-camera-episode"
+        context_metadata["decision_trace"] = deepcopy(food["metadata"]["decision_trace"])
+        context_metadata["decision_trace"]["episode_id"] = "unreviewed-camera-episode"
+        annotation = context_metadata["decision_trace"]["annotations"]["nutrition"]
+        annotation["record_type"] = record_type
+        if record_type == "meal_correction":
+            context_metadata["reply_to_source_message_id"] = "unrelated-correction-target"
+            annotation["changed_fields"] = [
+                "basis", "consumption_status", "meal_date", "energy_kcal_best",
+                "energy_kcal_min", "energy_kcal_max",
+            ]
+            annotation["energy_kcal_best"] = 26
+        elif record_type == "meal_deletion":
+            context_metadata["reply_to_source_message_id"] = "unrelated-deletion-target"
+            annotation.update(
+                consumption_status="not_consumed", energy_kcal_min=None,
+                energy_kcal_max=None, energy_kcal_best=None,
+            )
+        relabelled_result = grade_manifest(
+            manifest, changed, canonical, now=later,
+            reviewed_turn_sources=binding["reviewed_turn_sources"],
+            reviewed_turn_provenance=binding["reviewed_turn_provenance"],
+        )[0]
+        assert relabelled_result["a1"] == "INCONCLUSIVE", (record_type, relabelled_result)
+
+    for mutation in ("source", "principal", "operation", "meal_identity"):
+        changed = deepcopy(honcho)
+        context_metadata = changed["messages"][0]["metadata"]
+        if mutation == "source":
+            context_metadata["source_message_id"] = "900"
+        elif mutation == "principal":
+            context_metadata["source_principal"] = "telegram:123"
+        elif mutation == "operation":
+            context_metadata["client_op_id"] = "forged-camera-operation:assistant"
+        else:
+            context_metadata["canonical_meal_id"] = reviewed_goal.canonical_meal_id
+        changed_result = grade_manifest(
+            manifest, changed, canonical, now=later,
+            reviewed_turn_sources=binding["reviewed_turn_sources"],
+            reviewed_turn_provenance=binding["reviewed_turn_provenance"],
+        )[0]
+        assert changed_result["a1"] == "INCONCLUSIVE", (mutation, changed_result)
+
+    annotated_context = deepcopy(honcho)
+    annotated_metadata = annotated_context["messages"][0]["metadata"]
+    annotated_metadata["source_message_id"] = "900"
+    annotated_trace = annotated_metadata.get("decision_trace")
+    if not isinstance(annotated_trace, dict):
+        annotated_trace = {"episode_id": annotated_metadata["decision_trace_episode_id"], "annotations": {}}
+        annotated_metadata["decision_trace"] = annotated_trace
+    annotated_trace.setdefault("annotations", {})["nutrition"] = deepcopy(
+        food["metadata"]["decision_trace"]["annotations"]["nutrition"]
+    )
+    annotated_result = grade_manifest(
+        manifest, annotated_context, canonical, now=later,
+        reviewed_turn_sources=binding["reviewed_turn_sources"],
+        reviewed_turn_provenance=binding["reviewed_turn_provenance"],
+    )[0]
+    assert annotated_result["a1"] == "INCONCLUSIVE"
+
+    malformed_context = deepcopy(honcho)
+    malformed_metadata = malformed_context["messages"][0]["metadata"]
+    malformed_metadata["source_message_id"] = "900"
+    malformed_trace = malformed_metadata.get("decision_trace")
+    if not isinstance(malformed_trace, dict):
+        malformed_trace = {"episode_id": malformed_metadata["decision_trace_episode_id"], "annotations": {}}
+        malformed_metadata["decision_trace"] = malformed_trace
+    malformed_trace.setdefault("annotations", {})["nutrition"] = {"schema_version": 2}
+    malformed_result = grade_manifest(
+        manifest, malformed_context, canonical, now=later,
+        reviewed_turn_sources=binding["reviewed_turn_sources"],
+        reviewed_turn_provenance=binding["reviewed_turn_provenance"],
+    )[0]
+    assert malformed_result["a1"] == "INCONCLUSIVE"
+
+    forged_receipt_export = deepcopy(exported)
+    exported_initial = next(
+        item for item in forged_receipt_export["episodes"]
+        if item["episode"]["episode_id"] == first_recorder.episode_id
+    )
+    exported_initial["trusted_camera_context"]["native_photo_id"] += 1000
+    forged_receipt_binding = validate_dialogue_binding(manifest, forged_receipt_export)["late-camera-tea"]
+    assert forged_receipt_binding["complete"] is False
+
+    forged_owner_export = deepcopy(exported)
+    exported_owner = next(
+        item for item in forged_owner_export["episodes"]
+        if item["episode"]["episode_id"] == owner_recorder.episode_id
+    )
+    exported_owner["trusted_camera_context"]["operation_id"] = "forged-owner-operation:assistant"
+    forged_owner_binding = validate_dialogue_binding(manifest, forged_owner_export)["late-camera-tea"]
+    assert forged_owner_binding["complete"] is False
+
+    forged_initial_export = deepcopy(exported)
+    forged_initial_item = next(
+        item for item in forged_initial_export["episodes"]
+        if item["episode"]["episode_id"] == first_recorder.episode_id
+    )
+    # Keep the original indexed inbound event intact while forging the saved
+    # self-consistent operation pair at both serialized binding surfaces.
+    for context in (
+        forged_initial_item["episode"]["metadata"]["trusted_camera_context"],
+        forged_initial_item["trusted_camera_context"],
+    ):
+        context.update(logical_turn_id="forged-initial-turn", operation_id="forged-initial-turn:assistant")
+    forged_initial_binding = validate_dialogue_binding(
+        manifest, forged_initial_export
+    )["late-camera-tea"]
+    assert forged_initial_binding["complete"] is False
+
+    forged_initial_authority = deepcopy(exported)
+    forged_initial_authority_item = next(
+        item for item in forged_initial_authority["episodes"]
+        if item["episode"]["episode_id"] == first_recorder.episode_id
+    )
+    forged_initial_authority_item["episode"]["metadata"]["trusted_camera_turn_provenance"] = {
+        "episode_id": first_recorder.episode_id,
+        "source_message_id": None,
+        "logical_turn_id": "forged-initial-turn",
+        "operation_id": "forged-initial-turn:assistant",
+        "principal_id": "telegram:__camera__",
+    }
+    forged_initial_authority_binding = validate_dialogue_binding(
+        manifest, forged_initial_authority
+    )["late-camera-tea"]
+    assert forged_initial_authority_binding["complete"] is False
+
+    for principal in (None, "telegram:foreign"):
+        invalid_principal_export = deepcopy(exported)
+        initial_item = next(
+            item for item in invalid_principal_export["episodes"]
+            if item["episode"]["episode_id"] == first_recorder.episode_id
+        )
+        for context in (initial_item["episode"]["metadata"]["trusted_camera_context"],
+                        initial_item["trusted_camera_context"]):
+            if principal is None:
+                context.pop("source_principal", None)
+            else:
+                context["source_principal"] = principal
+        invalid_principal_binding = validate_dialogue_binding(
+            manifest, invalid_principal_export
+        )["late-camera-tea"]
+        assert invalid_principal_binding["complete"] is False
+
+    forged_root = deepcopy(honcho)
+    forged_root["messages"][-1]["metadata"]["source_message_id"] = "901"
+    forged_root_result = grade_manifest(
+        manifest, forged_root, canonical, now=later,
+        reviewed_turn_sources=binding["reviewed_turn_sources"],
+        reviewed_turn_provenance=binding["reviewed_turn_provenance"],
+    )[0]
+    assert forged_root_result["a1"] == "INCONCLUSIVE"
 
     missing_match_goal = Goal.model_validate({
         **goal_data,
