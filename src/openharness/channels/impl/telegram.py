@@ -78,6 +78,21 @@ def _safe_transcription_error_class(error: TranscriptionError | None) -> str:
     return value if re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", value) else "unknown"
 
 
+_CAMERA_CAPTION_PREFIX_RE = re.compile(
+    r"^Съели ли вы это\? (?:Фото сделано \d{4}-\d{2}-\d{2}\.|Дата съёмки неизвестна\.)\s*"
+)
+
+
+def _current_native_keyboard_question(prompt: str) -> str:
+    """Extract the final displayed question while retaining the full prompt elsewhere."""
+    current = _CAMERA_CAPTION_PREFIX_RE.sub("", prompt, count=1).strip()
+    question_end = current.rfind("?")
+    if question_end < 0:
+        return ""
+    starts = [current.rfind(mark, 0, question_end) for mark in ("\n", ".", "!", "?")]
+    return current[max(starts) + 1 : question_end + 1].strip()
+
+
 def _provider_failure(error: BaseException) -> TranscriptionError:
     if isinstance(error, TranscriptionError):
         return error
@@ -1348,6 +1363,54 @@ class TelegramChannel(BaseChannel):
         # Send media files
         media_paths = list(msg.media or [])
         keyboard = self._build_keyboard(msg.buttons)
+        camera_photo_id = msg.metadata.get("_camera_photo_id")
+        camera_ingress = getattr(self, "_camera_ingress_authority", None)
+        camera_marker = msg.metadata.get("_camera_authority")
+        initial_camera_prompt = (
+            camera_ingress is not None
+            and type(camera_marker) is object
+            and msg.metadata.get("_camera_initial_prompt") is camera_marker
+            and msg.metadata.get("_camera_final") is camera_marker
+            and msg.metadata.get("_camera_edit_existing_photo") is camera_marker
+        )
+        camera_edit_claimed = False
+        if (
+            msg.metadata.get("_camera_edit_existing_photo") is not None
+            and msg.metadata.get("_camera_final") is not None
+            and camera_ingress is not None
+            and keyboard is not None
+            and msg.content
+        ):
+            camera_edit_claimed = await camera_ingress.claim_initial_prompt_edit(msg, chat_id)
+        if (
+            camera_edit_claimed
+            and type(camera_photo_id) is int
+            and camera_photo_id > 0
+        ):
+            caption = str(msg.metadata.get("_camera_caption") or "").strip()
+            edit_caption = "\n\n".join(part for part in (caption, msg.content) if part)
+            if len(edit_caption) <= TELEGRAM_MAX_CAPTION_LEN:
+                try:
+                    await self._app.bot.edit_message_caption(
+                        chat_id=chat_id,
+                        message_id=camera_photo_id,
+                        caption=_markdown_to_telegram_html(edit_caption),
+                        parse_mode="HTML",
+                        reply_markup=keyboard,
+                    )
+                    return self._receipt(msg, [camera_photo_id])
+                except Exception as exc:  # fall back to linked text controls, never resend photo
+                    logger.warning("Camera photo prompt edit failed; sending linked text controls: %s", exc)
+            if not reply_params_for_next_send and camera_edit_claimed:
+                reply_params_for_next_send = ReplyParameters(
+                    message_id=camera_photo_id,
+                    allow_sending_without_reply=True,
+                )
+        if initial_camera_prompt and not camera_edit_claimed:
+            # A queued classifier response can outlive its live photo attempt.
+            # Do not publish a fresh, unlinked question or native keyboard after
+            # the ingress declines the one permitted edit claim.
+            return self._receipt(msg, native_message_ids)
         if (
             len(media_paths) == 1
             and self._get_media_type(media_paths[0]) == "photo"
@@ -1923,6 +1986,12 @@ class TelegramChannel(BaseChannel):
                 option = flat[idx].text
         if not option:
             return
+        offered_options = [btn.text for row in markup.inline_keyboard for btn in row] if markup else []
+        full_prompt = str(
+            getattr(message, "caption", None) or getattr(message, "text", None) or ""
+        )[:2000]
+        reflection_confirmed = False
+        reflection_text = ""
 
         chat_id = message.chat_id
         # Reflect the pick + remove the keyboard so it can't be tapped twice.
@@ -1937,10 +2006,12 @@ class TelegramChannel(BaseChannel):
             )
             picked = option.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
             new_text = (base + f"\n\n✅ {picked}").strip() if base else f"✅ {picked}"
+            reflection_text = new_text
             if is_caption:
                 await query.edit_message_caption(caption=new_text, parse_mode="HTML")
             else:
                 await query.edit_message_text(text=new_text, parse_mode="HTML")
+            reflection_confirmed = True
         except Exception as e:  # noqa: BLE001 — best-effort; at least drop the keyboard
             logger.debug("callback edit failed: %s", e)
             try:
@@ -1960,6 +2031,13 @@ class TelegramChannel(BaseChannel):
                 "native_message_id": message.message_id,
                 "callback_query": True,
                 "callback_data": data,
+                "native_keyboard_options": offered_options[:8],
+                "native_keyboard_selected_index": idx,
+                "native_keyboard_selected_label": option,
+                "native_keyboard_prompt": full_prompt,
+                "native_keyboard_question": _current_native_keyboard_question(full_prompt),
+                "native_keyboard_reflection": reflection_text if reflection_confirmed else "",
+                "native_keyboard_reflection_confirmed": reflection_confirmed,
                 "callback_query_id": getattr(query, "id", None),
                 "user_id": user.id,
                 "username": user.username,

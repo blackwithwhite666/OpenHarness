@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import io
 import json
 import stat
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 import pytest
 from PIL import Image
 from pydantic import ValidationError
@@ -20,6 +22,7 @@ from ohmo.evals.camera_calibration import (
     Reference,
     SOL_PROMPT_VERSION,
     a2_prompt,
+    aggregate_votes,
     calibrate_case,
     calibrate_judge_case,
     checked_image,
@@ -30,8 +33,9 @@ from ohmo.evals.camera_calibration import (
     write_report,
 )
 from ohmo.evals.camera_subscription_results import SubscriptionResults, read_private_json
-from ohmo.evals.nutrition_persistence import Goal, derive_meal_id
-from datetime import date, datetime, timezone
+from ohmo.evals.nutrition_persistence import Goal, derive_meal_id, export_eval_dialogue
+from ohmo.evals.recorder import GatewayEvalRecorder
+from datetime import date, datetime, timedelta, timezone
 
 
 def annotation(record_type="meal_observation", **values):
@@ -82,20 +86,24 @@ def make_case(tmp_path, *, state="consumed", events=None):
 PERSIST_NOW = datetime(2026, 10, 1, 12, tzinfo=timezone.utc)
 
 
-def persistence_evidence(case, *, consumed=True, kcal=400, trace_id="ep-product"):
+def persistence_evidence(
+    case, *, consumed=True, kcal=400, trace_id="ep-product",
+    principal_id="telegram:owner-1",
+):
     from openharness.channels.bus.events import InboundMessage
     from ohmo.gateway.memory_gate import MemoryScope
     from ohmo.gateway.runtime import _build_conversation_turn_metadata
     from ohmo.gateway.turn_context import build_turn_context
 
-    inbound = InboundMessage(channel="telegram", sender_id="owner-1|mutable_name", chat_id="chat-product",
+    principal = principal_id.split(":", 1)[1]
+    inbound = InboundMessage(channel="telegram", sender_id=f"{principal}|mutable_name", chat_id="chat-product",
         content="I ate this.", timestamp=PERSIST_NOW, metadata={"message_id": case.source_message_id})
     turn_context = build_turn_context(inbound, session_id="gateway-session")
     logical_turn_id, _, assistant_metadata = _build_conversation_turn_metadata(
         turn_ctx=turn_context, message=inbound, scope=MemoryScope(case.owner_id, ()))
     goal = Goal(
         case_id=case.case_id, episode_ids=[trace_id], owner_id=case.owner_id,
-        principal_id="telegram:owner-1", workspace_id="workspace-1", eval_workspace="synthetic-evals",
+        principal_id=principal_id, workspace_id="workspace-1", eval_workspace="synthetic-evals",
         peer_id="ohmo", canonical_owner_id=case.owner_id, canonical_login="owner",
         session_id="honcho-session",
         gateway_session_id="gateway-session", source_message_id=case.source_message_id,
@@ -103,7 +111,7 @@ def persistence_evidence(case, *, consumed=True, kcal=400, trace_id="ep-product"
         trajectory_started_at=PERSIST_NOW.replace(hour=11), trajectory_as_of=PERSIST_NOW,
         logical_turn_id=logical_turn_id, trace_episode_id=trace_id,
         operation_id=assistant_metadata["client_op_id"],
-        canonical_meal_id=derive_meal_id(tenant_id=case.owner_id, source_principal="telegram:owner-1",
+        canonical_meal_id=derive_meal_id(tenant_id=case.owner_id, source_principal=principal_id,
                                          gateway_session_id="gateway-session", source_message_id=case.source_message_id),
         expected_consumed=consumed,
         expected_kcal=kcal if consumed else None, expectation_origin="reviewed_user_dialogue",
@@ -139,7 +147,7 @@ def persistence_evidence(case, *, consumed=True, kcal=400, trace_id="ep-product"
     dialogue = [turn.model_dump() for turn in case.dialogue]
     export = {"privacy": "private", "episodes": [{"episode": {"episode_id": trace_id,
               "session_id": "gateway-session", "metadata": {"workspace": "synthetic-evals"}},
-              "principal_id": "telegram:owner-1", "dialogue": dialogue,
+              "principal_id": principal_id, "dialogue": dialogue,
               "dialogue_complete": True, "source_message_ids": [case.source_message_id],
               "turn_provenance": [{"source_message_id": case.source_message_id,
                   "logical_turn_id": logical_turn_id, "operation_id": assistant_metadata["client_op_id"],
@@ -344,6 +352,388 @@ def test_product_a2_refuses_to_fall_back_to_reference_prefix(tmp_path):
     case.dialogue = None
     with pytest.raises(ValueError, match="full dialogue"):
         a2_prompt(case)
+
+
+def test_a2_button_bonus_needs_majority_and_caps_score():
+    votes = [
+        A2Vote(score=5, avoidable_turns=0, repeated_questions=0, reason_codes=["concise"],
+               useful_button_click=True),
+        A2Vote(score=4, avoidable_turns=0, repeated_questions=0, reason_codes=["concise"],
+               useful_button_click=True),
+        A2Vote(score=3, avoidable_turns=0, repeated_questions=0, reason_codes=["concise"],
+               useful_button_click=False),
+    ]
+    assert aggregate_votes(votes)["a2_button_bonus"] == 0
+    aggregate = aggregate_votes(votes, click_evidence=True)
+    assert aggregate["a2_base_score"] == 4
+    assert aggregate["a2_button_bonus"] == 1
+    assert aggregate["a2_scores"] == 5
+    assert aggregate["a2_useful_button_click_votes"] == 2
+    assert aggregate_votes([votes[0], votes[2], votes[2]], click_evidence=True)["a2_button_bonus"] == 0
+    legacy = A2Vote.model_validate({"score": 4, "avoidable_turns": 0,
+                                    "repeated_questions": 0, "reason_codes": ["concise"]})
+    assert not legacy.useful_button_click
+
+
+def test_a2_prompt_uses_actual_recorder_export_callback_facts(tmp_path):
+    from openharness.channels.bus.events import InboundMessage
+
+    case = make_case(tmp_path)
+    case.operation_id = "button-turn:assistant"
+    case.dialogue = [
+        type(case.dialogue[0])(role="assistant", text="На фото две чашки кофе. Ты пила этот кофе?"),
+        type(case.dialogue[0])(role="user", text="Маленькую чашку"),
+        type(case.dialogue[0])(role="assistant", text="Запишу одну маленькую чашку."),
+    ]
+    evidence = case.persistence_evidence
+    evidence["goal"]["operation_id"] = case.operation_id
+    evidence["goal"]["gateway_session_id"] = "gateway-session"
+    callback = InboundMessage(
+        channel="telegram", sender_id="owner-1|Name", chat_id="chat-product",
+        content="Маленькую чашку", timestamp=PERSIST_NOW,
+        metadata={
+            "message_id": case.source_message_id, "native_message_id": 41,
+            "callback_query": True, "callback_data": "ask:0",
+            "native_keyboard_options": ["Маленькую чашку", "Большую чашку", "Обе", "Не пила"],
+            "native_keyboard_selected_index": 0,
+            "native_keyboard_selected_label": "Маленькую чашку",
+            "native_keyboard_prompt": "Ты пила этот кофе?",
+            "_camera_candidate_id": "candidate-1",
+            "_camera_native_binding": "41",
+        },
+    )
+    context = {
+        "kind": "owner_turn", "candidate_id": "candidate-1", "native_photo_id": 41,
+        "tenant_id": case.owner_id, "gateway_session_id": "gateway-session",
+        "recipient_principal": "telegram:owner-1", "source_message_id": case.source_message_id,
+        "principal_id": "telegram:owner-1", "logical_turn_id": "button-turn",
+        "operation_id": case.operation_id,
+    }
+    provenance = {
+        "source_message_id": case.source_message_id, "principal_id": "telegram:owner-1",
+        "logical_turn_id": "button-turn", "operation_id": case.operation_id,
+    }
+    recorder = GatewayEvalRecorder.start(
+        workspace=tmp_path, bundle=SimpleNamespace(session_id="gateway-session", cwd=str(tmp_path)),
+        message=callback, session_key="telegram:chat-product", user_text=callback.content,
+        trusted_turn_provenance=provenance, trusted_camera_context=context,
+    )
+    recorder.record_gateway_final(text="Записано.")
+    recorder.finish(status="completed")
+    evidence["goal"]["episode_ids"] = [recorder.episode_id]
+    evidence["dialogue_export"] = export_eval_dialogue(
+        tmp_path / "evals", episode_ids=[recorder.episode_id]
+    )
+    prompt = a2_prompt(case)
+    assert '"selected_label": "Маленькую чашку"' in prompt
+    assert '"prompt": "Ты пила этот кофе?"' in prompt
+    assert '"options": ["Маленькую чашку", "Большую чашку", "Обе", "Не пила"]' in prompt
+
+    inbound = evidence["dialogue_export"]["episodes"][0]["episode"]["metadata"]["inbound"]["metadata"]
+    original = dict(inbound)
+    for malformed in (
+        {"callback_query": False},
+        {"native_keyboard_selected_index": 7},
+            {"native_message_id": 99},
+            {"native_keyboard_selected_label": "Не пила"},
+            {"callback_data": "foreign:0"},
+    ):
+        inbound.update(original)
+        inbound.update(malformed)
+        prompt_without_click = a2_prompt(case)
+        assert "Native callback evidence:" not in prompt_without_click
+        assert "useful_button_click (boolean)" not in prompt_without_click
+    # A text fallback keyboard can be bound to a different native message ID
+    # than the original photo; the ingress binding proves that target.
+    inbound.update(original)
+    inbound.update(native_message_id=78, _camera_native_binding="78")
+    assert '"native_message_id": 78' in a2_prompt(case)
+
+    # A person-origin trajectory also keeps its verified native button facts.
+    person_case = case.model_copy(update={"origin": "person"})
+    exported_episode = evidence["dialogue_export"]["episodes"][0]
+    exported_episode.pop("trusted_camera_context")
+    assert '"selected_label": "Маленькую чашку"' in a2_prompt(person_case)
+    exported_episode["trusted_camera_context"] = context | {"episode_id": recorder.episode_id}
+
+    exported_context = evidence["dialogue_export"]["episodes"][0]["trusted_camera_context"]
+    exported_context["recipient_principal"] = "telegram:foreign"
+    assert "Native callback evidence:" not in a2_prompt(case)
+
+    # Include an earlier text-fallback question in the same reviewed
+    # trajectory. Its native keyboard target (78) is separate from photo 41.
+    earlier = InboundMessage(
+        channel="telegram", sender_id="owner-1|Name", chat_id="chat-product",
+        content="Маленькую чашку", timestamp=PERSIST_NOW,
+        metadata={
+            "message_id": case.source_message_id, "native_message_id": 78,
+            "callback_query": True, "callback_data": "ask:0",
+            "native_keyboard_options": ["Маленькую чашку", "Большую чашку", "Обе", "Не пила"],
+            "native_keyboard_selected_index": 0,
+            "native_keyboard_selected_label": "Маленькую чашку",
+            "native_keyboard_prompt": "Какую чашку ты выпила?",
+            "_camera_candidate_id": "candidate-1", "_camera_native_binding": "78",
+        },
+    )
+    earlier_context = {
+        **context, "logical_turn_id": "earlier-clarification",
+        "operation_id": "earlier-clarification:assistant",
+    }
+    earlier_provenance = {
+        key: earlier_context[key] for key in (
+            "source_message_id", "principal_id", "logical_turn_id", "operation_id",
+        )
+    }
+    earlier_recorder = GatewayEvalRecorder.start(
+        workspace=tmp_path, bundle=SimpleNamespace(session_id="gateway-session", cwd=str(tmp_path)),
+        message=earlier, session_key="telegram:chat-product", user_text=earlier.content,
+        trusted_turn_provenance=earlier_provenance, trusted_camera_context=earlier_context,
+    )
+    earlier_recorder.record_gateway_final(text="Учла одну маленькую чашку.")
+    earlier_recorder.finish(status="completed")
+    earlier_export = export_eval_dialogue(
+        tmp_path / "evals", episode_ids=[earlier_recorder.episode_id]
+    )
+    evidence["goal"]["episode_ids"].append(earlier_recorder.episode_id)
+    evidence["dialogue_export"]["episodes"].extend(earlier_export["episodes"])
+    full_trajectory_prompt = a2_prompt(case)
+    assert '"native_message_id": 78' in full_trajectory_prompt
+    from ohmo.evals.camera_calibration import _button_click_evidence
+    assert len(_button_click_evidence(case)) == 1
+
+
+def _record_calibration_callback(case, tmp_path, variant):
+    from openharness.channels.bus.events import InboundMessage
+    workspace = tmp_path / "synthetic-evals"
+
+    native_metadata = {
+        "message_id": case.source_message_id, "native_message_id": 41,
+        "callback_query": True, "callback_data": "ask:0",
+        "native_keyboard_options": ["Маленькую чашку", "Большую чашку", "Обе", "Не пила"],
+        "native_keyboard_selected_index": 0,
+        "native_keyboard_selected_label": "Маленькую чашку",
+        "native_keyboard_prompt": "Ты пила этот кофе?",
+        "_camera_candidate_id": "candidate-1", "_camera_native_binding": "41",
+    }
+    if variant == "absent":
+        native_metadata = {"message_id": case.source_message_id}
+    elif variant == "typed":
+        native_metadata["callback_query"] = False
+    elif variant == "offered_only":
+        native_metadata.pop("native_keyboard_selected_index")
+        native_metadata.pop("native_keyboard_selected_label")
+    elif variant == "malformed":
+        native_metadata["native_keyboard_selected_index"] = 9
+    elif variant == "camera_rejected":
+        native_metadata["_camera_ingress_callback_candidate"] = "candidate-1"
+        native_metadata["_camera_ingress_callback_eligible"] = False
+    callback = InboundMessage(
+        channel="telegram", sender_id="owner-1", chat_id="chat-product",
+        content="Маленькую чашку", timestamp=PERSIST_NOW, metadata=native_metadata,
+    )
+    context = {
+        "kind": "owner_turn", "candidate_id": "candidate-1", "native_photo_id": 41,
+        "tenant_id": case.owner_id, "gateway_session_id": "gateway-session",
+        "recipient_principal": "telegram:owner-1", "source_message_id": case.source_message_id,
+        "principal_id": "telegram:owner-1", "logical_turn_id": "button-turn",
+        "operation_id": "button-turn:assistant",
+    }
+    provenance = {key: context[key] for key in (
+        "source_message_id", "principal_id", "logical_turn_id", "operation_id",
+    )}
+    recorder = GatewayEvalRecorder.start(
+        workspace=workspace, bundle=SimpleNamespace(session_id="gateway-session", cwd=str(workspace)),
+        message=callback, session_key="telegram:chat-product", user_text=callback.content,
+        trusted_turn_provenance=provenance,
+        trusted_camera_context=None if variant == "camera_rejected" else context,
+    )
+    recorder.record_gateway_final(text="Учла одну маленькую чашку.")
+    recorder.finish(status="completed")
+    export = export_eval_dialogue(workspace / "evals", episode_ids=[recorder.episode_id])
+    captured = export["episodes"][0]["episode"]["metadata"]["inbound"]
+    if variant == "foreign":
+        captured["metadata"]["message_id"] = "foreign-native-source"
+    # Keep the A1 dialogue fixed while testing A2 with native inbound facts
+    # captured through the maintained recorder/export path.
+    case.persistence_evidence["dialogue_export"]["episodes"][0]["episode"][
+        "metadata"]["inbound"] = captured
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("variant", [
+    "absent", "typed", "offered_only", "malformed", "foreign", "camera_rejected",
+])
+async def test_calibrate_case_never_awards_unproven_click_votes(tmp_path, variant):
+    case = make_case(tmp_path)
+    _record_calibration_callback(case, tmp_path, variant)
+    prompts = []
+
+    async def fake(model, effort, prompt, image):
+        prompts.append(prompt)
+        if "sol" in model:
+            return reference().model_dump_json()
+        return A2Vote(
+            score=5, avoidable_turns=0, repeated_questions=0,
+            reason_codes=["concise"], useful_button_click=True,
+        ).model_dump_json()
+
+    result = await calibrate_case(case, fake, CallBudget(max_calls=4))
+    assert result["a1"] == "PASS" and result["a2"] == "SCORED", result
+    assert result["a2_button_bonus"] == 0
+    assert result["a2_useful_button_click_votes"] == 0
+    assert result["a2_base_score"] == result["a2_scores"] == 5
+    assert len(prompts) == 4
+    assert all("useful_button_click (boolean)" not in prompt for prompt in prompts[1:])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("late", [False, True], ids=["fresh", "late-owned"])
+async def test_actual_not_food_callback_exports_and_scores_without_consumption(tmp_path, late):
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    from openharness.channels.bus.events import InboundMessage
+    from openharness.channels.impl.telegram import TelegramChannel
+    from openharness.config.schema import TelegramConfig
+    from ohmo.gateway.bridge import OhmoGatewayBridge
+    from ohmo.gateway.camera import CAMERA_AUTHORITY
+    from ohmo.evals.nutrition_persistence import export_eval_dialogue
+    from tests.test_ohmo.test_camera_ingress import _admit, _candidate, _ingress
+
+    case = make_case(tmp_path, state="never_recorded", events=[])
+    case.owner_id = "marina"
+    case.prefix = [
+        type(case.prefix[0])(role="user", text="What is shown in this photo?"),
+        type(case.prefix[0])(role="assistant", text="Did you eat it?"),
+    ]
+    case.dialogue = list(case.prefix)
+    case.persistence_evidence = persistence_evidence(
+        case, consumed=False, principal_id="telegram:123",
+    )
+
+    ingress, root, bus, _ = _ingress(tmp_path)
+    request = _candidate(root, classifier_decision="ambiguous")
+    assert (await _admit(ingress, root, "Bearer " + "s" * 40, request))[0] == 202
+    await asyncio.wait_for(bus.consume_inbound(), timeout=1)
+    attempt = ingress._attempts[request["candidate_id"]]
+    photo_id = attempt["photo_id"]
+    other_request = None
+    if late:
+        attempt["admitted_at"] = (
+            datetime.now(timezone.utc) - timedelta(minutes=101)
+        ).isoformat()
+        ingress._save_attempts()
+        other_image = io.BytesIO()
+        Image.new("RGB", (9, 8), "green").save(other_image, format="JPEG")
+        other_request = _candidate(
+            root, index=1, image_bytes=other_image.getvalue(),
+            classifier_decision="food",
+        )
+        assert (await _admit(
+            ingress, root, "Bearer " + "s" * 40, other_request
+        ))[0] == 202
+        await asyncio.wait_for(bus.consume_inbound(), timeout=1)
+
+    channel = TelegramChannel(TelegramConfig(token="token"), bus)
+    channel._start_typing = lambda _chat_id: None
+
+    async def capture_callback(**kwargs):
+        await bus.publish_inbound(InboundMessage(
+            channel="telegram", sender_id=kwargs["sender_id"], chat_id=kwargs["chat_id"],
+            content=kwargs["content"], metadata=kwargs["metadata"],
+        ))
+
+    channel._handle_message = capture_callback
+
+    class Query:
+        data = "ask:2"
+        id = "native-not-food-callback"
+        message = SimpleNamespace(
+            caption="Съели ли вы это? Фото сделано 2026-09-30. Что изображено?",
+            caption_html="Съели ли вы это? Фото сделано 2026-09-30. Что изображено?",
+            text=None, message_id=photo_id, chat_id=123,
+            chat=SimpleNamespace(type="private"),
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("Да, я это съел(а)", callback_data="ask:0")],
+                [InlineKeyboardButton("Нет, не ел(а)", callback_data="ask:1")],
+                [InlineKeyboardButton("Это не еда", callback_data="ask:2")],
+            ]),
+        )
+
+        async def answer(self):
+            pass
+
+        async def edit_message_caption(self, **_kwargs):
+            pass
+
+        async def edit_message_reply_markup(self, **_kwargs):
+            pass
+
+    await channel._on_callback(
+        SimpleNamespace(callback_query=Query(), effective_user=SimpleNamespace(
+            id=123, username=None, first_name="Owner")), None,
+    )
+    callback = await asyncio.wait_for(bus.consume_inbound(), timeout=1)
+    ingress.process_real_inbound(callback)
+    assert callback.metadata["_camera_classifier_feedback"] is CAMERA_AUTHORITY
+    assert callback.metadata["_camera_ingress_callback_eligible"] is True
+    assert "_camera_answer" not in callback.metadata
+    assert "_camera_candidate_id" not in callback.metadata
+    assert callback.media == []
+    assert attempt["classifier_feedback"]["verdict"] == "not_food"
+    assert attempt["classifier_feedback"]["owner_id"] == "123"
+    assert "camera_commit" not in attempt
+    if other_request is not None:
+        other_attempt = ingress._attempts[other_request["candidate_id"]]
+        assert other_attempt["state"] == "photo_sent"
+        assert other_attempt["attention_active"] is True
+        assert "classifier_feedback" not in other_attempt
+        assert "camera_commit" not in other_attempt
+
+    workspace = tmp_path / "grading-workspace"
+    bundle = SimpleNamespace(
+        session_id="gateway-session", cwd=str(workspace),
+        engine=SimpleNamespace(model="synthetic"), tool_registry=None,
+    )
+    runtime_pool = SimpleNamespace(
+        _workspace=workspace,
+        _bundles={"telegram:123": bundle},
+        _gateway_config=SimpleNamespace(camera_ingress=ingress.config, evals_capture=True),
+    )
+    bridge = OhmoGatewayBridge(bus=bus, runtime_pool=runtime_pool, camera_ingress=ingress)
+    episode_id = bridge._record_camera_feedback_export(callback)
+    assert episode_id is not None
+    feedback_export = export_eval_dialogue(workspace / "evals", episode_ids=[episode_id])
+    feedback_episode = feedback_export["episodes"][0]
+    assert "trusted_camera_context" not in feedback_episode
+    assert feedback_episode["episode"]["metadata"]["inbound"]["metadata"][
+        "_camera_feedback_receipt"]["gateway_session_id"] == "gateway-session"
+
+    evidence = case.persistence_evidence
+    evidence["goal"]["eval_workspace"] = str(workspace)
+    evidence["goal"]["episode_ids"].append(episode_id)
+    evidence["dialogue_export"]["episodes"][0]["episode"]["metadata"]["workspace"] = str(workspace)
+    evidence["dialogue_export"]["episodes"].extend(feedback_export["episodes"])
+    case.dialogue.extend(type(case.dialogue[0]).model_validate(turn)
+                         for turn in feedback_episode["dialogue"])
+
+    async def fake(model, effort, prompt, image):
+        if "sol" in model:
+            return Reference(
+                consumption_state="not_consumed", kcal=None,
+                uncertainty="photo is not food",
+            ).model_dump_json()
+        return A2Vote(
+            score=3, avoidable_turns=0, repeated_questions=0,
+            reason_codes=["concise"], useful_button_click=True,
+        ).model_dump_json()
+
+    result = await calibrate_case(case, fake, CallBudget(max_calls=4))
+    assert result["a1"] == "PASS", result
+    assert result["a2_button_bonus"] == 1
+    assert result["a2_base_score"] == 3 and result["a2_scores"] == 4
+    assert result["a2_useful_button_click_votes"] == 3
+    assert evidence["honcho_snapshot"]["messages"] == []
+    assert evidence["telegent_snapshot"]["meals"] == []
+    await ingress.close()
 
 
 @pytest.mark.parametrize("missing", ["reference_prefix", "dialogue"])

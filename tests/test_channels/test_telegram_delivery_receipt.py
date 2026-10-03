@@ -273,7 +273,160 @@ async def test_photo_caption_callback_uses_native_label_and_forwards_native_id(
     assert captured[0].metadata["message_id"] == 55
     assert captured[0].metadata["native_message_id"] == 55
     assert captured[0].metadata["callback_data"] == f"ask:{index}"
+    assert captured[0].metadata["native_keyboard_options"] == [
+        "Да, я это съела", "Нет, не ела", "Это не еда"
+    ]
+    assert captured[0].metadata["native_keyboard_selected_index"] == index
+    assert captured[0].metadata["native_keyboard_selected_label"] == label
     assert captured[0].chat_id == "123"
+
+
+@pytest.mark.asyncio
+async def test_camera_final_edits_verified_photo_instead_of_sending_it_again() -> None:
+    bot = ReceiptBot()
+    edited = []
+
+    async def edit_caption(**kwargs):
+        edited.append(kwargs)
+
+    bot.edit_message_caption = edit_caption
+    channel = _channel(bot)
+    from ohmo.gateway.camera import CAMERA_AUTHORITY
+
+    class Ingress:
+        async def claim_initial_prompt_edit(self, message, chat_id):
+            return (
+                str(chat_id) == "123"
+                and message.metadata.get("_camera_authority") is CAMERA_AUTHORITY
+                and message.metadata.get("_camera_final") is CAMERA_AUTHORITY
+                and message.metadata.get("_camera_edit_existing_photo") is CAMERA_AUTHORITY
+                and message.metadata.get("_camera_initial_prompt") is CAMERA_AUTHORITY
+            )
+
+    channel._camera_ingress_authority = Ingress()
+    receipt = await channel.send(
+        OutboundMessage(
+            channel="telegram", chat_id="123",
+            content="На фото две чашки.\n\nТы пила этот кофе?",
+            buttons=["Маленькую чашку", "Большую чашку", "Обе", "Не пила"],
+            metadata={
+                "_camera_authority": CAMERA_AUTHORITY,
+                "_camera_edit_existing_photo": CAMERA_AUTHORITY, "_camera_final": CAMERA_AUTHORITY,
+                "_camera_initial_prompt": CAMERA_AUTHORITY,
+                "_camera_candidate_id": "candidate-1",
+                "_camera_photo_id": 77,
+                "_camera_caption": "Съели ли вы это? Фото сделано 2026-10-03.",
+            },
+        )
+    )
+    assert len(edited) == 1
+    assert edited[0]["message_id"] == 77
+    assert "Фото сделано 2026-10-03" in edited[0]["caption"]
+    assert [row[0].text for row in edited[0]["reply_markup"].inline_keyboard] == [
+        "Маленькую чашку", "Большую чашку", "Обе", "Не пила"
+    ]
+    assert bot.calls == []
+    assert receipt.native_message_ids == (77,)
+
+
+@pytest.mark.asyncio
+async def test_camera_photo_edit_failure_falls_back_to_linked_text_controls() -> None:
+    bot = ReceiptBot()
+    async def failed_edit(**_kwargs):
+        raise RuntimeError("synthetic caption edit failure")
+    bot.edit_message_caption = failed_edit
+    channel = _channel(bot)
+    from ohmo.gateway.camera import CAMERA_AUTHORITY
+
+    class Ingress:
+        async def claim_initial_prompt_edit(self, message, chat_id):
+            return message.metadata.get("_camera_initial_prompt") is CAMERA_AUTHORITY
+
+    channel._camera_ingress_authority = Ingress()
+    receipt = await channel.send(OutboundMessage(
+        channel="telegram", chat_id="123", content="Ты пила этот кофе?",
+        buttons=["Маленькую чашку", "Большую чашку", "Обе", "Не пила"],
+        metadata={"_camera_authority": CAMERA_AUTHORITY,
+                  "_camera_edit_existing_photo": CAMERA_AUTHORITY,
+                  "_camera_final": CAMERA_AUTHORITY,
+                  "_camera_initial_prompt": CAMERA_AUTHORITY,
+                  "_camera_candidate_id": "candidate-1", "_camera_photo_id": 77,
+                  "_camera_caption": "Съели ли вы это? Фото сделано 2026-10-03."},
+    ))
+    assert [name for name, _ in bot.calls] == ["send_message"]
+    assert bot.calls[0][1]["reply_parameters"].message_id == 77
+    assert receipt.native_message_ids == (78,)
+
+
+@pytest.mark.asyncio
+async def test_camera_edit_marker_without_ingress_authority_cannot_edit() -> None:
+    bot = ReceiptBot()
+    edited = []
+
+    async def edit_caption(**kwargs):
+        edited.append(kwargs)
+
+    bot.edit_message_caption = edit_caption
+    channel = _channel(bot)
+    marker = object()
+    await channel.send(OutboundMessage(
+        channel="telegram", chat_id="123", content="Question?", buttons=["Yes", "No"],
+        metadata={"_camera_authority": marker, "_camera_final": marker,
+                  "_camera_edit_existing_photo": marker, "_camera_candidate_id": "forged",
+                  "_camera_photo_id": 999},
+    ))
+    assert edited == []
+    assert [name for name, _ in bot.calls] == ["send_message"]
+
+
+@pytest.mark.asyncio
+async def test_ordinary_send_with_truthy_camera_markers_is_not_suppressed() -> None:
+    bot = ReceiptBot()
+    channel = _channel(bot)
+
+    class Ingress:
+        async def claim_initial_prompt_edit(self, _message, _chat_id):
+            return False
+
+    channel._camera_ingress_authority = Ingress()
+    await channel.send(OutboundMessage(
+        channel="telegram", chat_id="123", content="Обычный вопрос?", buttons=["Да", "Нет"],
+        metadata={
+            "_camera_authority": True,
+            "_camera_initial_prompt": True,
+            "_camera_final": True,
+            "_camera_edit_existing_photo": True,
+        },
+    ))
+    assert [name for name, _ in bot.calls] == ["send_message"]
+
+
+@pytest.mark.asyncio
+async def test_rejected_stale_camera_prompt_does_not_send_unlinked_question() -> None:
+    from ohmo.gateway.camera import CAMERA_AUTHORITY
+
+    bot = ReceiptBot()
+    channel = _channel(bot)
+
+    class Ingress:
+        async def claim_initial_prompt_edit(self, _message, _chat_id):
+            return False
+
+    channel._camera_ingress_authority = Ingress()
+    receipt = await channel.send(OutboundMessage(
+        channel="telegram", chat_id="123", content="Какая порция?", buttons=["Маленькая"],
+        metadata={
+            "_camera_authority": CAMERA_AUTHORITY,
+            "_camera_initial_prompt": CAMERA_AUTHORITY,
+            "_camera_final": CAMERA_AUTHORITY,
+            "_camera_edit_existing_photo": CAMERA_AUTHORITY,
+            "_camera_candidate_id": "retired-candidate",
+            "_camera_photo_id": 77,
+            "_camera_caption": "Съели ли вы это? Фото сделано 2026-10-03.",
+        },
+    ))
+    assert bot.calls == []
+    assert receipt.native_message_ids == ()
 
 
 @pytest.mark.asyncio
