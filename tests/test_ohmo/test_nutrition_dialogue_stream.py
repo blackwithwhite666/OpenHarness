@@ -411,16 +411,14 @@ async def test_camera_receipt_failure_never_returns_saved_status(
 async def test_context_answer_after_attention_timeout_keeps_capture_and_replay_identity(
     tmp_path, monkeypatch
 ):
-    from datetime import timedelta
-
     ingress, root, bus, _ = _ingress(tmp_path, FakeTelegram())
-    captured = datetime(2026, 9, 27, 7, 0, tzinfo=timezone.utc)
+    captured = (datetime.now(timezone.utc) - timedelta(hours=1)).replace(microsecond=0)
     request = _candidate(root, index=73, capture_time=captured)
     assert (await _admit(ingress, root, "Bearer " + "s" * 40, request))[0] == 202
     await bus.consume_inbound()
     candidate_id = request["candidate_id"]
     attempt = ingress._attempts[candidate_id]
-    attempt["admitted_at"] = (captured - timedelta(minutes=115)).isoformat()
+    attempt["admitted_at"] = (datetime.now(timezone.utc) - timedelta(minutes=115)).isoformat()
     ingress._save_attempts()
     honcho = _Honcho()
     pool = _pool(tmp_path, ingress, honcho, monkeypatch)
@@ -469,7 +467,7 @@ async def test_late_food_identification_then_consumed_quantity_stays_on_original
     tmp_path, monkeypatch
 ):
     ingress, root, bus, _ = _ingress(tmp_path, FakeTelegram())
-    capture = datetime(2026, 9, 27, 7, 0, tzinfo=timezone.utc)
+    capture = (datetime.now(timezone.utc) - timedelta(hours=1)).replace(microsecond=0)
     request = _candidate(root, index=74, capture_time=capture)
     assert (await _admit(ingress, root, "Bearer " + "s" * 40, request))[0] == 202
     await bus.consume_inbound()

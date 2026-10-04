@@ -244,7 +244,7 @@ async def test_context_question_receipt_survives_restart_and_bare_quantity_keeps
     tmp_path, monkeypatch
 ):
     ingress, root, bus, _telegram = _ingress(tmp_path)
-    capture = datetime(2026, 9, 27, 7, tzinfo=timezone.utc)
+    capture = (datetime.now(timezone.utc) - timedelta(hours=1)).replace(microsecond=0)
     request = _candidate(root, index=772, capture_time=capture)
     assert (await _admit(ingress, root, "Bearer " + "s" * 40, request))[0] == 202
     await bus.consume_inbound()
