@@ -4,6 +4,7 @@ import pytest
 from datetime import datetime, timezone
 
 from camera_virtual_user import CameraVirtualUser, OfferedCameraChoices
+from camera_runtime_support import camera_runtime_limits
 from openharness.evals.session_user_simulator import UserTurn
 
 
@@ -23,6 +24,14 @@ class RecordingSimulator:
     def next_turn(self, **kwargs):
         self.request = kwargs
         return UserTurn(self.text, "llm_fallback")
+
+
+@pytest.mark.parametrize(
+    ("native_mode", "expected"),
+    [(True, (8, "medium")), (False, (4, "none"))],
+)
+def test_camera_runtime_limits_are_mode_specific(native_mode, expected):
+    assert camera_runtime_limits(native_mode=native_mode) == expected
 
 
 async def test_camera_user_request_includes_visible_choices_and_owner_goal_without_losing_history():

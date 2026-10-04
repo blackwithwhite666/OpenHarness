@@ -210,6 +210,11 @@ def distinct_offline_clients():
     return OfflineCameraBotApi(), OfflineCameraUserApi()
 
 
+def camera_runtime_limits(*, native_mode: bool) -> tuple[int, str]:
+    """Keep model-backed prototype runs bounded without constraining offline fixtures."""
+    return (8, "medium") if native_mode else (4, "none")
+
+
 def isolated_runtime_loaders(runtime_module):
     """Fail closed for builder, prompt-skill and ambient-catalog loaders."""
     from contextlib import contextmanager
@@ -309,6 +314,7 @@ async def run_camera_runtime_trajectory(
         getattr(bot_client, "synthetic", False) and getattr(user_client, "synthetic", False)
     ):
         raise AssertionError("offline Camera mode accepts only explicit synthetic transports")
+    max_turns, effort = camera_runtime_limits(native_mode=native_mode)
 
     os.environ["OPENHARNESS_CONFIG_DIR"] = str(config_dir or root / "openharness-config")
     os.environ["OPENHARNESS_DATA_DIR"] = str(root / "openharness-data")
@@ -363,8 +369,8 @@ async def run_camera_runtime_trajectory(
             workspace=root,
             provider_profile="codex" if native_mode else "claude-api",
             model="gpt-6-luna" if native_mode else "claude-sonnet-4-6",
-            max_turns=4,
-            effort="none",
+            max_turns=max_turns,
+            effort=effort,
         )
         pool._camera_ingress = ingress
         channel._camera_ingress_authority = ingress
