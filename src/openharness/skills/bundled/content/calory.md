@@ -8,6 +8,42 @@ description: >
 
 # Wellness and nutrition data
 
+## Quick logging and trace contract
+
+Use actual image, label, and user-stated evidence for every estimate; example values below only show the required shape. A directly user-sent (not Camera/source-produced) identifiable food photo from an authenticated configured participant in their own private conversation is intent to log the pictured food as consumed unless they ask for advice/image analysis, it is non-food, or intent is uncertain. A Camera/source-produced photo always requires meaningful affirmative owner confirmation of consumption before writing a consumed meal; an explicit denial means no consumed meal. After confirmation, use the whole shown unit for one identifiable package, labeled unit, or visible portion; explicit quantity or composition overrides it. Do not ask for exact grams merely to log. For uncertain consumption, use `consumption_status: "unknown"`; do not claim it was consumed.
+
+For a new consumed meal, call `trace` with `kind: "trace_finalization"` and `payload.annotations.nutrition` in schema v2: use `record_type: "meal_observation"`, flat `items` with `name`, `quantity_text`, and `energy_kcal_best`, plus the total `energy_kcal_best`. The outer decision-trace payload also needs `schema_version: 1` and a nonempty `trace_event_id` selected for this call; it is only a trace-event identifier, never meal/source/tenant identity or provenance. Add supported range fields when evidence supports a range. Leave `meal_at` and `meal_date` null when no explicit alternative time/date is given; the trusted gateway supplies the default date. Never author identity or provenance fields. Answer the user briefly with the estimated kcal and material assumption; omit internal trace, tool, progress, or plumbing details. Do not say a meal was saved until a trusted append receipt confirms it.
+
+Example only — these illustrative values are not estimates for a real meal; actual estimates must use the turn's evidence:
+```json
+{
+  "kind": "trace_finalization",
+  "payload": {
+    "schema_version": 1,
+    "trace_event_id": "example-trace-event-1",
+    "annotations": {
+      "nutrition": {
+        "schema_version": 2,
+        "record_type": "meal_observation",
+        "basis": ["image", "user_statement"],
+        "consumption_status": "consumed",
+        "meal_at": null,
+        "meal_date": null,
+        "is_estimate": true,
+        "energy_kcal_best": 185,
+        "items": [
+          {
+            "name": "vegetable soup",
+            "quantity_text": "1 bowl",
+            "energy_kcal_best": 185
+          }
+        ]
+      }
+    }
+  }
+}
+```
+
 For health, nutrition, wellness, or activity questions about a configured participant, use `get_wellness_data`. Treat its response as authoritative: identify the participant only by the returned `login`, never by a memory guess or by mapping an id yourself. For wellness reports, request raw weight only with `raw_health_types=["HealthAutoExportMetric_weight_body_mass"]`; preserve that raw-weight rule. Keep basal and active energy aggregate-only by default; request raw HAE energy only when needed to inspect or clarify the reported facts, using `raw_health_types` with `HealthAutoExportMetric_basal_energy_burned` and/or `HealthAutoExportMetric_active_energy` and a bounded interval that stays within the service's 1,000-sample cap. Never request raw energy by default. Filter daily values to the participant's local calendar day and rolling-window values to their exact requested bounds. Observed basal and active energy sums and coverage are factual but do not prove export completeness. For a current/today calorie balance request, use the exact rolling 24 hours ending at trusted `get_time` now: subtract 24 elapsed hours in UTC, then present the window in the participant's timezone. Request and use `energy_intervals` for that exact window only; never substitute, add, prorate, or extrapolate `energy_days`. Explicit historical dates and calendar-day requests keep the existing local-day policy below. If `nutrition_status` is not `complete`, treat nutrition as unavailable or incomplete: an empty nutrition list is never zero intake (never display it as `0 kcal`), and daily intake must never be reconstructed from conversation memory. A nonzero `nutrition_quarantine_count` alone does not invalidate a recent successful sync; use only returned canonical nutrition records. A weight mentioned in chat is conversation-only; there is no durable weight-write tool, so never claim that it was recorded. The gateway supplies the trusted default participant. On an owner turn only, you may select another configured participant with the optional `params.login` selector; never use a numeric participant selector, `user_id`, or legacy `health_types` parameters. Family turns are pinned to the authenticated contact by the gateway.
 
 Separate internal evidence and gate evaluation from ordinary user presentation. Keep all returned `energy_days` facts available internally: `device_id`, `local_day`, `timezone`, `basal_sum`/`basal_unit`, `active_sum`/`active_unit`, `active_points`, `basal_minutes_with_samples`/`day_minutes` as basal X/Y coverage, `next_day_basal_observed`, both conflict counts, `snapshot_revision`, `unresolved_key_count`, `possible_replay_count`, and `legacy_synthetic_count`. Canonical `energy_days` sums are observed sums normalized internally to kJ (`basal_unit=active_unit=kJ`), not raw submitted units, estimates, or settled values. Raw HAE versions retain original submitted units in `sample.unit`/`original_unit` when known; an uncertified legacy point has no authoritative original unit. Keep participant and device binding supplied by the gateway; never identify a participant or device from memory, combine devices, or use conversation memory to reconstruct canonical intake.
