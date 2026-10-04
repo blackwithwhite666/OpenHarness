@@ -13,13 +13,14 @@ from uuid import uuid4
 from ohmo.gateway.camera import CAMERA_AUTHORITY
 
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+_GIT_SHA = re.compile(r"[0-9a-f]{40}\Z")
 
 
 def create_storage_run_dir(root: Path) -> Path:
     """Keep each projection under the ignored worktree root after the run ends."""
-    parent = root / "tmp" / "camera-e2e" / "storage-runs"
+    parent = root / "tmp" / "camera-native-docker" / "storage-runs"
     parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    if parent.resolve() != root.resolve() / "tmp" / "camera-e2e" / "storage-runs":
+    if parent.resolve() != root.resolve() / "tmp" / "camera-native-docker" / "storage-runs":
         raise ValueError("storage root escapes the worktree task directory")
     ignored = subprocess.run(
         ["git", "check-ignore", "--quiet", "--", str(parent)],
@@ -65,19 +66,127 @@ def source_jpeg(path_text: str | None, expected_sha: str | None, root: Path) -> 
     return data
 
 
+class NativeClientPreconditionError(ValueError):
+    """Explicit lead-run profile/client requirement without auth fallback."""
+
+
+def require_isolated_native_settings(settings) -> None:
+    """Reject configured external runtime surfaces before auth resolution."""
+    forbidden = []
+    for name in ("hooks", "mcp_servers", "enabled_plugins"):
+        if getattr(settings, name, None):
+            forbidden.append(name)
+    for name in ("allow_project_plugins", "allow_project_skills"):
+        if getattr(settings, name, False):
+            forbidden.append(name)
+    if getattr(settings, "project_skill_dirs", None):
+        forbidden.append("project_skill_dirs")
+    if forbidden:
+        raise NativeClientPreconditionError(
+            "native Camera settings enable forbidden runtime surfaces: " + ", ".join(forbidden)
+        )
+
+
+def native_profile_clients(settings, *, resolver=None, codex_client_type=None):
+    """Resolve two Codex subscription clients only for explicit native opt-in."""
+    from openharness.api.codex_client import CodexApiClient
+    from openharness.api.resolver import resolve_api_client_from_settings
+
+    resolve = resolver or resolve_api_client_from_settings
+    expected_type = codex_client_type or CodexApiClient
+    require_isolated_native_settings(settings)
+    profile_name, profile = settings.resolve_profile()
+    model = (profile.last_model or "").strip() or profile.default_model
+    if not (
+        profile_name == "codex"
+        and profile.provider == "openai_codex"
+        and profile.auth_source == "codex_subscription"
+        and model == "gpt-6-luna"
+    ):
+        raise NativeClientPreconditionError(
+            "native Camera requires the Codex subscription profile with model gpt-6-luna"
+        )
+    bot_client = resolve(settings)
+    user_client = resolve(settings)
+    if (
+        not isinstance(bot_client, expected_type)
+        or not isinstance(user_client, expected_type)
+        or bot_client is user_client
+    ):
+        raise NativeClientPreconditionError(
+            "native Camera requires two distinct CodexApiClient instances; no provider fallback"
+        )
+    return bot_client, user_client
+
+
+def native_preflight_and_clients(
+    settings,
+    *,
+    scenario: str,
+    source_path: str | None,
+    source_sha256: str | None,
+    root: Path,
+    resolver=None,
+    codex_client_type=None,
+):
+    """Check all non-auth native inputs before either subscription resolution."""
+    if not isinstance(scenario, str) or not scenario.strip():
+        raise NativeClientPreconditionError("native Camera requires a non-empty owner scenario")
+    require_isolated_native_settings(settings)
+    try:
+        source_bytes = source_jpeg(source_path, source_sha256, root)
+    except ValueError as exc:
+        raise NativeClientPreconditionError(f"invalid native Camera source: {exc}") from None
+    if source_bytes is None:
+        raise NativeClientPreconditionError("native Camera requires a bounded JPEG and SHA-256")
+    clients = native_profile_clients(
+        settings, resolver=resolver, codex_client_type=codex_client_type
+    )
+    return clients, source_bytes
+
+
 def unique_honcho_scope() -> tuple[str, str]:
     run_id = uuid4().hex
     return f"camera-joined-{run_id}", f"camera-joined-session-{run_id}"
 
 
-def require_bound_answer(message, candidate_id: str) -> str:
+def verify_source_worktree(
+    path: Path, expected_head: str, *, require_clean: bool
+) -> tuple[str, str]:
+    """Require a full pinned SHA; acceptance also requires a clean source tree."""
+    if not isinstance(expected_head, str) or not _GIT_SHA.fullmatch(expected_head):
+        raise ValueError("Camera source revision must be a lowercase full 40-character Git SHA")
+    root = path.resolve(strict=True)
+    head = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=root, check=True, capture_output=True, text=True
+    ).stdout.strip()
+    dirty = subprocess.run(
+        ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    if not _GIT_SHA.fullmatch(head) or head != expected_head:
+        raise ValueError("Camera source worktree revision changed")
+    if require_clean and dirty:
+        raise ValueError("Camera source worktree has tracked or non-ignored untracked changes")
+    return head, dirty
+
+
+def require_bound_answer(message, candidate_id: str, native_photo_id: int | str = 77) -> str:
     metadata = message.metadata
     turn_id = metadata.get("_camera_turn_id")
+    source_target = (
+        metadata.get("native_message_id")
+        if metadata.get("callback_query")
+        else metadata.get("reply_to_message_id")
+    )
     if not (
         metadata.get("_camera_authority") is CAMERA_AUTHORITY
         and metadata.get("_camera_answer") == "yes"
         and metadata.get("_camera_candidate_id") == candidate_id
-        and metadata.get("reply_to_message_id") == 77
+        and str(source_target) == str(native_photo_id)
         and isinstance(turn_id, str)
         and turn_id
         and len(message.media) == 1
@@ -86,7 +195,9 @@ def require_bound_answer(message, candidate_id: str) -> str:
     return turn_id
 
 
-def select_finalizer_event(messages, candidate_id: str, answer_message_id: str):
+def select_finalizer_event(
+    messages, candidate_id: str, answer_message_id: str, native_photo_id: int | str
+):
     """Reject fixture events and unrelated assistant turns before sync."""
     matches = [
         item
@@ -94,7 +205,7 @@ def select_finalizer_event(messages, candidate_id: str, answer_message_id: str):
         if item.metadata.get("role") == "assistant"
         and item.metadata.get("camera_candidate_id") == candidate_id
         and item.metadata.get("camera_answer_bound") == "yes"
-        and item.metadata.get("camera_reply_to_native_message_id") == "77"
+        and item.metadata.get("camera_reply_to_native_message_id") == str(native_photo_id)
         and item.metadata.get("source_message_id") == answer_message_id
         and item.metadata.get("nutrition_annotation_status") == "recorded"
     ]

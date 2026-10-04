@@ -42,7 +42,7 @@ async def main() -> None:
     source_message_id = f"synthetic-source-{run_id}"
     now = datetime.now(timezone.utc)
     day = now.date().isoformat()
-    scratch_parent = ROOT / "tmp" / "camera-e2e" / "storage-runs"
+    scratch_parent = ROOT / "tmp" / "camera-native-docker" / "storage-runs"
     scratch_parent.mkdir(parents=True, exist_ok=True)
     scratch = Path(tempfile.mkdtemp(prefix="run-", dir=scratch_parent))
     db = NutritionDataStore(scratch / "nutrition.db")

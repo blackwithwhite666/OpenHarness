@@ -1,5 +1,5 @@
 # Official Honcho source must be checked out at 0d85a34917418485b9eb387eacda608bcf2de426.
-# Run with: docker compose -p camera-e2e-probe-20260929 -f tests/camera_e2e_probe/compose.yaml up -d --build --wait
+# Run with: docker compose -p camera-native-e2e-20261003 -f tests/camera_e2e_probe/compose.yaml up -d --build --wait
 services:
   database:
     image: pgvector/pgvector:pg15
@@ -51,6 +51,36 @@ services:
       timeout: 3s
       retries: 12
       start_period: 20s
+
+  camera-runner:
+    build:
+      context: ${CAMERA_OPENHARNESS_WORKTREE:?set CAMERA_OPENHARNESS_WORKTREE to the OpenHarness checkout}
+      dockerfile: tests/camera_e2e_probe/Dockerfile.runner
+    working_dir: /openharness
+    environment:
+      CAMERA_OPENHARNESS_SHA: ${CAMERA_OPENHARNESS_SHA:?set expected OpenHarness Git SHA}
+      CAMERA_TELEGENT_SHA: ${CAMERA_TELEGENT_SHA:?set expected Telegent Git SHA}
+      CAMERA_TELEGENT_WORKTREE: ${CAMERA_TELEGENT_WORKTREE:?set CAMERA_TELEGENT_WORKTREE}
+      CAMERA_ACCEPTANCE: ${CAMERA_ACCEPTANCE:-0}
+      CAMERA_RUN_MODE: ${CAMERA_RUN_MODE:-offline}
+      CAMERA_NATIVE_CONFIG_DIR: ${CAMERA_NATIVE_CONFIG_DIR:-}
+      CAMERA_USER_SCENARIO: ${CAMERA_USER_SCENARIO:-}
+      CAMERA_SOURCE_JPEG: ${CAMERA_SOURCE_JPEG:-}
+      CAMERA_SOURCE_SHA256: ${CAMERA_SOURCE_SHA256:-}
+      CAMERA_HONCHO_URL: http://api:8000
+      OHMO_MEMORY_AUTOINDEX: "0"
+      PYTHONPATH: ${CAMERA_OPENHARNESS_WORKTREE}/src:${CAMERA_OPENHARNESS_WORKTREE}:${CAMERA_TELEGENT_WORKTREE}
+    volumes:
+      - ${CAMERA_OPENHARNESS_WORKTREE:?set CAMERA_OPENHARNESS_WORKTREE}:${CAMERA_OPENHARNESS_WORKTREE}:ro
+      - ${CAMERA_TELEGENT_WORKTREE:?set CAMERA_TELEGENT_WORKTREE}:${CAMERA_TELEGENT_WORKTREE}:ro
+      - /home/blackwithwhite/projects/OpenHarness/.git:/home/blackwithwhite/projects/OpenHarness/.git:ro
+      - /home/blackwithwhite/projects/agents-playgroud/.git:/home/blackwithwhite/projects/agents-playgroud/.git:ro
+      - ${CAMERA_SCRATCH:?set CAMERA_SCRATCH to this worktree's tmp/camera-native-docker}:${CAMERA_OPENHARNESS_WORKTREE}/tmp/camera-native-docker:rw
+    depends_on:
+      api:
+        condition: service_healthy
+    command: ["/opt/venv/bin/python", "${CAMERA_OPENHARNESS_WORKTREE}/tests/camera_e2e_probe/run_joined.py"]
+    profiles: ["camera"]
 
 volumes:
   pgdata:
