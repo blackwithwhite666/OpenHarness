@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import os
 import re
 import subprocess
 import tempfile
+import warnings
 from pathlib import Path
 from uuid import uuid4
+
+from PIL import Image, UnidentifiedImageError
 
 from ohmo.gateway.camera import CAMERA_AUTHORITY
 
@@ -57,10 +61,23 @@ def source_jpeg(path_text: str | None, expected_sha: str | None, root: Path) -> 
         data = path.read_bytes()
     except OSError:
         raise ValueError("private source cannot be read") from None
-    if not (
-        4 <= len(data) <= 10 * 1024 * 1024 and data[:2] == b"\xff\xd8" and data[-2:] == b"\xff\xd9"
-    ):
+    if not 4 <= len(data) <= 10 * 1024 * 1024:
         raise ValueError("private source must be a bounded JPEG")
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            with Image.open(io.BytesIO(data)) as image:
+                if image.format != "JPEG":
+                    raise ValueError("private source must be a JPEG")
+                image.load()
+    except (
+        UnidentifiedImageError,
+        OSError,
+        ValueError,
+        Image.DecompressionBombError,
+        Image.DecompressionBombWarning,
+    ) as exc:
+        raise ValueError("private source must be a decodable bounded JPEG") from exc
     if hashlib.sha256(data).hexdigest() != expected_sha:
         raise ValueError("private source SHA-256 mismatch")
     return data

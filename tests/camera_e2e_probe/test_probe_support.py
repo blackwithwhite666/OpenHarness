@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import io
 import stat
 import subprocess
 import sys
@@ -11,6 +12,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "test_ohmo"))
 
@@ -48,15 +50,35 @@ def test_storage_run_is_persistent_restricted_and_ignored():
     )
 
 
-def test_private_source_requires_explicit_hash_and_ignored_jpeg(tmp_path, monkeypatch):
+def _synthetic_jpeg(*, trailer: bytes = b"") -> bytes:
+    output = io.BytesIO()
+    exif = Image.Exif()
+    exif[0x010F] = "Synthetic Camera"
+    Image.new("RGB", (8, 6), color=(12, 34, 56)).save(output, format="JPEG", exif=exif)
+    return output.getvalue() + trailer
+
+
+def _synthetic_png() -> bytes:
+    output = io.BytesIO()
+    Image.new("RGB", (8, 6), color=(12, 34, 56)).save(output, format="PNG")
+    return output.getvalue()
+
+
+def test_private_source_accepts_appended_data_and_preserves_original_bytes(tmp_path, monkeypatch):
     path = tmp_path / "private.jpg"
-    data = b"\xff\xd8synthetic\xff\xd9"
+    data = _synthetic_jpeg(trailer=b"synthetic appended motion-photo data")
     path.write_bytes(data)
     sha = hashlib.sha256(data).hexdigest()
     monkeypatch.setattr(
         "probe_support.subprocess.run", lambda *args, **kwargs: SimpleNamespace(returncode=0)
     )
-    assert source_jpeg(str(path), sha, tmp_path) == data
+    returned = source_jpeg(str(path), sha, tmp_path)
+    assert returned == data
+    assert hashlib.sha256(returned).hexdigest() == sha
+    assert returned.endswith(b"synthetic appended motion-photo data")
+    with Image.open(io.BytesIO(returned)) as decoded:
+        assert decoded.format == "JPEG"
+        assert decoded.getexif()[0x010F] == "Synthetic Camera"
     with pytest.raises(ValueError, match="requires a path"):
         source_jpeg(str(path), None, tmp_path)
     with pytest.raises(ValueError, match="mismatch"):
@@ -66,6 +88,39 @@ def test_private_source_requires_explicit_hash_and_ignored_jpeg(tmp_path, monkey
     )
     with pytest.raises(ValueError, match="Git-ignored"):
         source_jpeg(str(path), sha, tmp_path)
+
+
+@pytest.mark.parametrize(
+    "data",
+    (
+        b"\xff\xd8synthetic\xff\xd9",
+        _synthetic_jpeg()[:-40],
+        _synthetic_png(),
+    ),
+    ids=("marker-only-junk", "truncated-jpeg", "non-jpeg"),
+)
+def test_private_source_rejects_bytes_that_do_not_decode_as_jpeg(tmp_path, monkeypatch, data):
+    path = tmp_path / "private.jpg"
+    path.write_bytes(data)
+    sha = hashlib.sha256(data).hexdigest()
+    monkeypatch.setattr(
+        "probe_support.subprocess.run", lambda *args, **kwargs: SimpleNamespace(returncode=0)
+    )
+    with pytest.raises(ValueError, match="decodable bounded JPEG"):
+        source_jpeg(str(path), sha, tmp_path)
+
+
+def test_private_source_still_rejects_path_outside_worktree(tmp_path, monkeypatch):
+    root = tmp_path / "worktree"
+    outside = tmp_path / "outside.jpg"
+    root.mkdir()
+    data = _synthetic_jpeg()
+    outside.write_bytes(data)
+    monkeypatch.setattr(
+        "probe_support.subprocess.run", lambda *args, **kwargs: SimpleNamespace(returncode=0)
+    )
+    with pytest.raises(ValueError, match="inside the worktree"):
+        source_jpeg(str(outside), hashlib.sha256(data).hexdigest(), root)
 
 
 def test_each_model_run_has_distinct_honcho_workspace_and_session():
