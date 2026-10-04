@@ -532,6 +532,8 @@ async def test_natural_quantity_after_ttl_finalizes_one_trusted_meal(
     result = await _turn(pool, answer, ingress)
     assert result.metadata["nutrition_append_event_id"] == attempt["camera_commit"]["event_id"]
     assert len(honcho.messages) == 4
+    saved = honcho.messages[-1].metadata["decision_trace"]["annotations"]["nutrition"]
+    assert saved["items"][0]["quantity_text"] == quantity
     await ingress.close()
 
 
@@ -641,3 +643,4 @@ def test_camera_prompt_retrieves_original_image_or_preserves_quantity_uncertaint
     assert "visible image is only a crop" in prompt
     assert "preserve the quantity uncertainty" in prompt
     assert "never treat a partial crop as a confirmed whole plate" in prompt
+    assert "Use the current user's stated food and quantity over ambiguous image inference." in prompt

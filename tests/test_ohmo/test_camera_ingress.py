@@ -644,6 +644,13 @@ async def test_two_cup_model_question_edits_the_exact_original_photo_once(tmp_pa
     assert bot.calls[0][1]["reply_markup"] is None
     assert "Проверенное решение классификатора: food." in synthetic.content
     assert "Добавь вариант «Это не еда»." not in synthetic.content
+    for rule in (
+        "Считай целые продукты, а не кусочки, нарезанные из одного продукта.",
+        "не указывай точное число в варианте, если снимок надёжно его не подтверждает",
+        "не превращает твоё предположительное число в независимое количество, названное владельцем",
+        "Не выспрашивай точные граммы только для обычной записи.",
+    ):
+        assert rule in synthetic.content
 
     class ScriptedRuntime:
         seen = None
