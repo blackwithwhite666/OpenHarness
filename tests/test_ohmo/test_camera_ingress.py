@@ -647,7 +647,8 @@ async def test_two_cup_model_question_edits_the_exact_original_photo_once(tmp_pa
     for rule in (
         "Считай целые продукты, а не кусочки, нарезанные из одного продукта.",
         "не указывай точное число в варианте, если снимок надёжно его не подтверждает",
-        "не превращает твоё предположительное число в независимое количество, названное владельцем",
+        "не превращает твоё предположительное число в независимое количество, "
+        "названное владельцем",
         "Не выспрашивай точные граммы только для обычной записи.",
     ):
         assert rule in synthetic.content
@@ -1086,6 +1087,11 @@ async def test_information_scope_native_callbacks_do_not_authorize_camera_runtim
         ("Всё: 2 яйца и рис с этого фото", "Что из этого вы съели?"),
         ("Всё: я съела яйцо на фото", "Что из этого вы съели?"),
         ("Всё: 125г", "Что из этого вы съели?"),
+        ("Рис и яйца", "Что из этого вы съели?"),
+        ("2 яйца и рис", "Что из этого вы съели?"),
+        ("Рис и 2 яйца", "Что из этого вы съели?"),
+        ("Гречка и три кусочка хлеба", "Что из этого вы съели?"),
+        ("Beans and two pieces of bread", "What did you eat from this?"),
     ],
 )
 async def test_native_consumption_portion_choice_binds_with_full_prompt_context(
@@ -1261,7 +1267,9 @@ async def test_native_quantity_under_analysis_only_keyboard_stays_unbound(tmp_pa
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("label", ["125 г", "2 яблока", "Всю тарелку", "Да"])
+@pytest.mark.parametrize(
+    "label", ["125 г", "2 яблока", "Всю тарелку", "Да", "Рис и 2 яйца"]
+)
 async def test_native_portion_options_under_analysis_only_current_question_stay_unbound(
     tmp_path, label,
 ):
@@ -1355,10 +1363,13 @@ async def test_native_new_caption_with_analysis_question_without_question_mark(
      "Всё: 2 яйца и рис", "Всё: 2 яйца и рис на фото",
      "Всё: 2 яйца и рис с этого фото", "Всё: я съела яйцо на фото",
      "Всё: 125г", "Яйцо и часть риса", "100 грамм", "2 яблока", "125 г",
+     "Рис и 2 яйца", "Гречка и три кусочка хлеба",
+     "Beans and two pieces of bread",
      "три яблока", "три кусочка хлеба", "125г",
      "четыре горсти клубники", "полтора кусочка хлеба", "три горсти", "две чашки",
      "125 г.", "125 г!",
      "Спасибо, я съела всё с этого фото",
+     "Рис и яйца", "2 яйца и рис",
      "3 горсти винограда", "3 handfuls of grapes", "3 горсти клубники",
      "несколько кусочков хлеба",
      "Я съела всю тарелку, посчитай калории",
@@ -1401,8 +1412,14 @@ async def test_camera_context_accepts_short_yes_and_portion_after_attention_expi
      "Всё: файлы", "Всё: 2 сообщения", "Всё: три фотографии",
      "Всё: 3 видео", "Всё: 2 документа", "Всё: 3 кусочка сообщений",
      "Всё: 125xyz часть сообщений", "Всё: 125xyz и часть сообщений",
+     "Рис и 2 неизвестных объекта",
+     "Рис и 125xyz яйца", "Рис и яйца для рецепта",
+     "Рис и яйца от другого фото",
      "Всё: 125xyz2 часть сообщений", "Всё: 125_ часть сообщений",
      "Всё: 125г2 часть сообщений", "Всё: 125г часть сообщений",
+     "Сообщения и 2 фотографии", "Рис и 125xyz2 яйца",
+     "Другой приём пищи и 2 яйца", "Не уверена, что съела рис и 2 яйца",
+     "Рис и 2 яйца, только оценить состав",
      "Немного позже"],
 )
 async def test_camera_context_does_not_treat_photo_status_or_time_as_consumption(tmp_path, text):
@@ -1488,6 +1505,9 @@ def test_context_answer_scope_and_uncertainty_override_leading_yes():
     assert _camera_context_answer_kind("125xyz и часть сообщений") is None
     assert _camera_context_answer_kind("four handfuls messages") is None
     assert _camera_context_answer_kind("2 яблока") == "yes"
+    assert _camera_context_answer_kind("Рис и яйца") == "yes"
+    assert _camera_context_answer_kind("2 яйца и рис") == "yes"
+    assert _camera_context_answer_kind("Рис и 2 яйца") == "yes"
     assert _camera_context_answer_kind("125 г") == "yes"
     assert _camera_context_answer_kind("125г") == "yes"
     assert _camera_context_answer_kind("3 кусочка хлеба") == "yes"
@@ -1637,7 +1657,10 @@ async def test_clarification_native_quantity_accepts_verified_callback(tmp_path)
 
 
 @pytest.mark.asyncio
-async def test_untargeted_answer_never_selects_one_of_multiple_camera_photos_by_state(tmp_path):
+@pytest.mark.parametrize("answer_text", ["да.", "Рис и 2 яйца"])
+async def test_untargeted_answer_never_selects_one_of_multiple_camera_photos_by_state(
+    tmp_path, answer_text,
+):
     ingress, root, bus, _ = _ingress(tmp_path)
     first = _candidate(root, index=0, classifier_decision="food")
     second = _candidate(root, index=1, classifier_decision="food")
@@ -1659,7 +1682,7 @@ async def test_untargeted_answer_never_selects_one_of_multiple_camera_photos_by_
     await asyncio.wait_for(bus.consume_inbound(), timeout=1)
 
     answer = InboundMessage(
-        channel="telegram", sender_id="123", chat_id="123", content="да.",
+        channel="telegram", sender_id="123", chat_id="123", content=answer_text,
         metadata={"is_group": False, "message_id": 813},
     )
     ingress.process_real_inbound(answer)

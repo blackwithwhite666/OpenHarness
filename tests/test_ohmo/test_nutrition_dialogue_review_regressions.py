@@ -644,3 +644,15 @@ def test_camera_prompt_retrieves_original_image_or_preserves_quantity_uncertaint
     assert "preserve the quantity uncertainty" in prompt
     assert "never treat a partial crop as a confirmed whole plate" in prompt
     assert "Use the current user's stated food and quantity over ambiguous image inference." in prompt
+    for rule in (
+        "A whole-portion confirmation does not turn a count you guessed in an option "
+        "into an owner-stated quantity.",
+        "Count whole products, not pieces cut from one.",
+        "use the served cooked weight and matching preparation and unit",
+        "make the total equal the item sum",
+        "identified by readable package labeling",
+        "A readable label may identify hidden package contents",
+        "do not include adjacent unselected packages",
+        "do not include adjacent unselected packages or unseen oil or sauce",
+    ):
+        assert rule in prompt

@@ -239,6 +239,26 @@ _CAMERA_QUANTITY_LEAD_RE = re.compile(
     + rf"(?=\s|$|[.!]|{_CAMERA_QUANTITY_MEASURE}))",
     re.IGNORECASE,
 )
+
+_CAMERA_COMPOSITION_WORD = r"[^\W\d_][\w-]*"
+_CAMERA_COMPOSITION_NOUN_PHRASE = (
+    rf"{_CAMERA_COMPOSITION_WORD}(?:\s+{_CAMERA_COMPOSITION_WORD}){{0,2}}"
+)
+_CAMERA_COMPOSITION_QUANTIFIED_PHRASE = (
+    rf"{_CAMERA_SUPPORTED_QUANTITY_PREFIX}"
+    + rf"(?:\s*{_CAMERA_QUANTITY_MEASURE}\s+|\s+)"
+    + rf"{_CAMERA_COMPOSITION_NOUN_PHRASE}"
+)
+_CAMERA_COMPOSITION_COMPONENT = (
+    rf"(?:{_CAMERA_COMPOSITION_QUANTIFIED_PHRASE}|{_CAMERA_COMPOSITION_NOUN_PHRASE})"
+)
+_CAMERA_COMPOSITION_DESCRIPTION_RE = re.compile(
+    rf"^{_CAMERA_COMPOSITION_COMPONENT}\s+(?:и|and)\s+"
+    + rf"{_CAMERA_COMPOSITION_COMPONENT}[.!?…]*$",
+    re.IGNORECASE,
+)
+
+
 def _clarification_related(text: object) -> bool:
     return bool(
         _classify_answer(text, anchored=False)
@@ -312,10 +332,24 @@ def _camera_whole_portion_payload_excluded(text: str) -> bool:
     return bool(_CAMERA_WHOLE_PORTION_NONFOOD_SUBJECT_RE.search(payload))
 
 
+def _camera_composition_description(text: object) -> bool:
+    if not isinstance(text, str) or not _CAMERA_COMPOSITION_DESCRIPTION_RE.fullmatch(
+        text.strip()
+    ):
+        return False
+    return not (
+        _CAMERA_WHOLE_PORTION_NONFOOD_SUBJECT_RE.search(text)
+        or _CAMERA_UNRELATED_CONTEXT_RE.search(text)
+        or _CLARIFICATION_NEW_MEAL_RE.search(text)
+        or _ANSWER_NEGATED_CONSUMPTION_RE.search(text)
+    )
+
+
 def _camera_affirmation_excluded(text: object) -> bool:
     """Reject uncertainty and deferral; scope words alone lose to explicit eating."""
     if not isinstance(text, str):
         return True
+    composition_description = _camera_composition_description(text)
     if _camera_whole_portion_payload_excluded(text):
         return True
     if _CAMERA_UNCERTAIN_CONSUMPTION_RE.search(text):
@@ -324,6 +358,7 @@ def _camera_affirmation_excluded(text: object) -> bool:
     if (
         _CAMERA_QUANTITY_LEAD_RE.search(text)
         and not _CLARIFICATION_QUANTITY_RE.fullmatch(text.strip())
+        and not composition_description
         and not explicit_consumption
     ):
         return True
@@ -393,6 +428,7 @@ def _native_button_answer_kind(metadata: Mapping[str, object], raw_text: object)
             _NATIVE_WHOLE_PLATE_RE.fullmatch(label.strip())
             or _NATIVE_WHOLE_PORTION_RE.fullmatch(label.strip())
             or _NATIVE_PARTIAL_PORTION_RE.search(label)
+            or _camera_composition_description(label)
         )
     ):
         return "yes"
@@ -486,6 +522,7 @@ def _camera_context_answer_kind(text: object) -> str | None:
         or _NATIVE_WHOLE_PORTION_RE.fullmatch(text.strip())
         or _CONTEXTUAL_PARTIAL_PORTION_RE.fullmatch(text.strip())
         or _CLARIFICATION_QUANTITY_RE.fullmatch(text)
+        or _camera_composition_description(text)
     ):
         return "yes"
     return None
