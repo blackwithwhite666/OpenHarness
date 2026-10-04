@@ -440,7 +440,7 @@ async def run_camera_runtime_trajectory(
         action = await virtual_user.next_camera_action(
             offered=offered,
             transcript=(("assistant", issued.content),),
-            captured_prompts=(initial_message.content,),
+            captured_prompts=(user_scenario,),
             captured_capabilities=(),
             index=0,
             last_turn=None,

@@ -176,24 +176,46 @@ _CONTEXTUAL_PARTIAL_PORTION_RE = re.compile(
     r")\s*[.!?…]*$",
     re.IGNORECASE,
 )
+_CAMERA_UNITLESS_QUANTITY_PREFIX = (
+    r"(?:\d+(?:[.,]\d+)?|полтора|полторы|half|a\s+little|немного)"
+)
+_CAMERA_COUNTED_QUANTITY_PREFIX = (
+    r"(?:one|two|three|four|five|несколько|один|одна|два|две|три|четыре|пять)"
+)
+_CAMERA_SUPPORTED_QUANTITY_PREFIX = (
+    rf"(?:{_CAMERA_UNITLESS_QUANTITY_PREFIX}|{_CAMERA_COUNTED_QUANTITY_PREFIX})"
+)
+_CAMERA_QUANTITY_MEASURE = (
+    r"(?:шт\.?|кусоч\w*|порци\w*|горст\w*|handfuls?|грамм\w*|"
+    r"г(?=\s|$|[.!])|кг|мл|л|pieces?|portions?|grams?|kg|ml|l|cups?|"
+    r"чашк\w*|стакан\w*|яблок\w*|груш\w*|банан\w*)"
+)
+_CAMERA_QUANTITY_QUALIFIER = r"(?:(?:about|around|примерно|около)\s*)?"
+_CAMERA_COUNTED_BERRY_DESCRIPTOR = (
+    r"(?:виноград\w*|ягод\w*|клубник\w*|grapes?|berries|strawberr(?:y|ies))"
+)
 _CLARIFICATION_QUANTITY_RE = re.compile(
-    r"^\s*(?:(?:about|around|примерно|около)\s*)?(?:"
-    r"(?:\d+(?:[.,]\d+)?|полтора|полторы|half|a\s+little|немного)\s*"
-    r"(?:шт\.?|кусоч\w*|порци\w*|горст\w*|handfuls?|грамм\w*|г(?=\s|$)|кг|мл|л|"
-    r"pieces?|portions?|grams?|kg|ml|l|cups?|чашк\w*|стакан\w*|"
-    r"яблок\w*|груш\w*|банан\w*)?"
-    r"|(?:\d+(?:[.,]\d+)?|one|two|three|несколько|один|одна|два|две|три)\s+"
-    r"(?:горст\w*|handfuls?)\s+(?:of\s+)?(?:виноград\w*|ягод\w*|клубник\w*|"
-    r"grapes?|berries|strawberr(?:y|ies))"
-    r"|(?:one|two|three|four|five|несколько|один|одна|два|две|три|четыре|пять)\s*"
-    r"(?:pieces?|portions?|кусоч\w*|порци\w*|груш\w*|яблок\w*|банан\w*)"
-    r"|(?:whole\s+plate|half\s+portion|всю\s+тарелк\w*|цел\w*\s+тарелк\w*|половин\w*\s+порци\w*|часть\s+порци\w*)"
-    r"|(?:маленьк\w*|больш\w*|средн\w*)\s+(?:чашк\w*|стакан\w*|порци\w*)"
-    r")\s*[.!]?\s*$",
+    r"^\s*"
+    + _CAMERA_QUANTITY_QUALIFIER
+    + r"(?:"
+    + rf"{_CAMERA_UNITLESS_QUANTITY_PREFIX}\s*(?:{_CAMERA_QUANTITY_MEASURE})?"
+    + rf"|{_CAMERA_COUNTED_QUANTITY_PREFIX}\s*{_CAMERA_QUANTITY_MEASURE}"
+    + rf"|{_CAMERA_SUPPORTED_QUANTITY_PREFIX}\s+(?:горст\w*|handfuls?)\s+(?:of\s+)?{_CAMERA_COUNTED_BERRY_DESCRIPTOR}"
+    + rf"|{_CAMERA_SUPPORTED_QUANTITY_PREFIX}\s+кусоч\w*\s+хлеб\w*"
+    + r"|немного\s+каш\w*"
+    + r"|(?:whole\s+plate|half\s+portion|всю\s+тарелк\w*|цел\w*\s+тарелк\w*|половин\w*\s+порци\w*|часть\s+порци\w*)"
+    + r"|(?:маленьк\w*|больш\w*|средн\w*)\s+(?:чашк\w*|стакан\w*|порци\w*)"
+    + r")\s*[.!]?\s*$",
     re.IGNORECASE,
 )
-
-
+_CAMERA_QUANTITY_LEAD_RE = re.compile(
+    r"^\s*"
+    + _CAMERA_QUANTITY_QUALIFIER
+    + r"(?:\d+(?:[.,]\d+)?|"
+    + _CAMERA_SUPPORTED_QUANTITY_PREFIX
+    + rf"(?=\s|$|[.!]|{_CAMERA_QUANTITY_MEASURE}))",
+    re.IGNORECASE,
+)
 def _clarification_related(text: object) -> bool:
     return bool(
         _classify_answer(text, anchored=False)
@@ -260,6 +282,12 @@ def _camera_affirmation_excluded(text: object) -> bool:
     if _CAMERA_UNCERTAIN_CONSUMPTION_RE.search(text):
         return True
     explicit_consumption = _camera_explicit_consumption(text)
+    if (
+        _CAMERA_QUANTITY_LEAD_RE.search(text)
+        and not _CLARIFICATION_QUANTITY_RE.fullmatch(text.strip())
+        and not explicit_consumption
+    ):
+        return True
     if _CAMERA_MEDIA_STATUS_RE.search(text) and not explicit_consumption:
         return True
     if _CAMERA_TEMPORAL_CONTEXT_RE.search(text) and not explicit_consumption:

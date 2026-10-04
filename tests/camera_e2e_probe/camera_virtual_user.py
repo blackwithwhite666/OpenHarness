@@ -76,7 +76,10 @@ class CameraVirtualUser:
     ) -> CameraUserAction | None:
         _validate_offered(offered)
         result = self._simulator.next_turn(
-            transcript=transcript,
+            transcript=(
+                *transcript,
+                ("assistant", _render_offered_choices(offered)),
+            ),
             captured_prompts=captured_prompts,
             captured_capabilities=captured_capabilities,
             index=index,
@@ -121,8 +124,15 @@ def _validate_offered(offered: OfferedCameraChoices) -> None:
 
 
 def _matching_choice(text: str, options: Sequence[str]) -> int | None:
-    normalized = " ".join(text.casefold().split())
     for index, option in enumerate(options):
-        if normalized == " ".join(option.casefold().split()):
+        if text == option:
             return index
     return None
+
+
+def _render_offered_choices(offered: OfferedCameraChoices) -> str:
+    """Give the simulator the same visible question and labels as Telegram."""
+    return (
+        f"{offered.question}\n\nВыберите один из предложенных вариантов:\n"
+        + "\n".join(f"• {option}" for option in offered.options)
+    )

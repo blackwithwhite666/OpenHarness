@@ -1165,8 +1165,18 @@ async def test_native_consumption_portion_choice_binds_with_full_prompt_context(
      ("2 фотографии пропали", None), ("2 сообщения пришли", None),
      ("2 фотографии потерялись", None), ("Фотографии пропали 2", None),
      ("2 неизвестных объекта пропали", None),
-     ("2 яблока", "yes"), ("125 г", "yes"),
-     ("3 горсти клубники", "yes"),
+     ("3 кусочка сообщений", None), ("немного фотографий", None),
+     ("три кусочка сообщений", None), ("three pieces messages", None),
+     ("несколько кусочков сообщений", None),
+     ("125г часть сообщений", None), ("125xyz часть сообщений", None),
+     ("125xyz и часть сообщений", None), ("four handfuls messages", None),
+     ("2 яблока", "yes"), ("125 г", "yes"), ("125г", "yes"),
+     ("3 кусочка хлеба", "yes"), ("немного каши", "yes"),
+     ("несколько кусочков хлеба", "yes"),
+     ("три яблока", "yes"), ("три кусочка хлеба", "yes"),
+     ("3 горсти клубники", "yes"), ("четыре горсти клубники", "yes"),
+     ("полтора кусочка хлеба", "yes"), ("три горсти", "yes"),
+     ("две чашки", "yes"), ("125 г.", "yes"), ("125 г!", "yes"),
      ("Я съела всю тарелку, посчитай калории", "yes")],
 )
 async def test_native_nonaffirmative_and_uncertain_choices_do_not_become_consumption(
@@ -1257,8 +1267,12 @@ async def test_native_quantity_accepts_verified_eating_question_that_mentions_ca
 @pytest.mark.parametrize(
     "answer_text",
     ["да", "да.", "Всю тарелку", "Яйцо и часть риса", "100 грамм", "2 яблока", "125 г",
+     "три яблока", "три кусочка хлеба", "125г",
+     "четыре горсти клубники", "полтора кусочка хлеба", "три горсти", "две чашки",
+     "125 г.", "125 г!",
      "Спасибо, я съела всё с этого фото",
      "3 горсти винограда", "3 handfuls of grapes", "3 горсти клубники",
+     "несколько кусочков хлеба",
      "Я съела всю тарелку, посчитай калории",
      "Я съела всю тарелку позже, посчитай калории"],
 )
@@ -1291,6 +1305,10 @@ async def test_camera_context_accepts_short_yes_and_portion_after_attention_expi
     "text",
     ["Часть фотографий пропала", "2 фотографии пропали", "2 сообщения пришли",
      "2 фотографии потерялись", "Фотографии пропали 2", "2 неизвестных объекта пропали",
+     "3 кусочка сообщений", "немного фотографий", "три кусочка сообщений",
+     "three pieces messages", "несколько кусочков сообщений",
+     "125г часть сообщений", "125xyz часть сообщений", "125xyz и часть сообщений",
+     "four handfuls messages",
      "Немного позже"],
 )
 async def test_camera_context_does_not_treat_photo_status_or_time_as_consumption(tmp_path, text):
@@ -1366,8 +1384,29 @@ def test_context_answer_scope_and_uncertainty_override_leading_yes():
     assert _camera_context_answer_kind("2 фотографии потерялись") is None
     assert _camera_context_answer_kind("Фотографии пропали 2") is None
     assert _camera_context_answer_kind("2 неизвестных объекта пропали") is None
+    assert _camera_context_answer_kind("3 кусочка сообщений") is None
+    assert _camera_context_answer_kind("немного фотографий") is None
+    assert _camera_context_answer_kind("три кусочка сообщений") is None
+    assert _camera_context_answer_kind("three pieces messages") is None
+    assert _camera_context_answer_kind("несколько кусочков сообщений") is None
+    assert _camera_context_answer_kind("125г часть сообщений") is None
+    assert _camera_context_answer_kind("125xyz часть сообщений") is None
+    assert _camera_context_answer_kind("125xyz и часть сообщений") is None
+    assert _camera_context_answer_kind("four handfuls messages") is None
     assert _camera_context_answer_kind("2 яблока") == "yes"
     assert _camera_context_answer_kind("125 г") == "yes"
+    assert _camera_context_answer_kind("125г") == "yes"
+    assert _camera_context_answer_kind("3 кусочка хлеба") == "yes"
+    assert _camera_context_answer_kind("немного каши") == "yes"
+    assert _camera_context_answer_kind("три яблока") == "yes"
+    assert _camera_context_answer_kind("три кусочка хлеба") == "yes"
+    assert _camera_context_answer_kind("несколько кусочков хлеба") == "yes"
+    assert _camera_context_answer_kind("четыре горсти клубники") == "yes"
+    assert _camera_context_answer_kind("полтора кусочка хлеба") == "yes"
+    assert _camera_context_answer_kind("три горсти") == "yes"
+    assert _camera_context_answer_kind("две чашки") == "yes"
+    assert _camera_context_answer_kind("125 г.") == "yes"
+    assert _camera_context_answer_kind("125 г!") == "yes"
     assert _camera_context_answer_kind("3 горсти винограда") == "yes"
     assert _camera_context_answer_kind("3 горсти клубники") == "yes"
     assert _camera_context_answer_kind("3 горсти фотографий") is None
