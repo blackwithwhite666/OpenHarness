@@ -229,6 +229,7 @@ async def _actual_native_camera_prompt(
     options: list[str],
     unknown_decision: bool = False,
     selected_index: int | None = 0,
+    source_analysis: str = "На фото еда.",
 ):
     """Run one Camera response through bridge, native Telegram UI and callback ingress."""
     from openharness.channels.impl.telegram import TelegramChannel
@@ -269,7 +270,7 @@ async def _actual_native_camera_prompt(
         async def stream_message(self, message, session_key):
             yield GatewayStreamUpdate(
                 kind="final",
-                text=f"На фото еда. [[ask: {question} | {' | '.join(options)}]]",
+                text=f"{source_analysis} [[ask: {question} | {' | '.join(options)}]]",
                 metadata={},
             )
 
@@ -1104,6 +1105,7 @@ async def test_native_consumption_portion_choice_binds_with_full_prompt_context(
     _, _, receipt, options, clicked, telegram_channel, _ = await _actual_native_camera_prompt(
         ingress, root, bus, request, question=prompt,
         options=[label, "Не ела", "Только оценить состав"], selected_index=0,
+        source_analysis="На фото рис, яйца, гречка, хлеб и фасоль.",
     )
     assert receipt.native_message_ids
     assert clicked is not None
@@ -1363,13 +1365,10 @@ async def test_native_new_caption_with_analysis_question_without_question_mark(
      "Всё: 2 яйца и рис", "Всё: 2 яйца и рис на фото",
      "Всё: 2 яйца и рис с этого фото", "Всё: я съела яйцо на фото",
      "Всё: 125г", "Яйцо и часть риса", "100 грамм", "2 яблока", "125 г",
-     "Рис и 2 яйца", "Гречка и три кусочка хлеба",
-     "Beans and two pieces of bread",
      "три яблока", "три кусочка хлеба", "125г",
      "четыре горсти клубники", "полтора кусочка хлеба", "три горсти", "две чашки",
      "125 г.", "125 г!",
      "Спасибо, я съела всё с этого фото",
-     "Рис и яйца", "2 яйца и рис",
      "3 горсти винограда", "3 handfuls of grapes", "3 горсти клубники",
      "несколько кусочков хлеба",
      "Я съела всю тарелку, посчитай калории",
@@ -1396,6 +1395,126 @@ async def test_camera_context_accepts_short_yes_and_portion_after_attention_expi
     assert answer.metadata["_camera_route"] == "context"
     assert answer.media == [attempt["snapshot"]]
     assert attempt["state"] == "answering"
+    await ingress.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("answer_text", "expected"),
+    [
+        ("Рис и яйца", "yes"),
+        ("2 яйца и рис", "yes"),
+        ("Рис и 2 яйца", "yes"),
+        ("Доброе утро и хорошего дня", None),
+        ("Творог и молоко", None),
+        ("Сообщения и фотографии", None),
+    ],
+)
+async def test_free_text_composition_needs_confirmed_camera_food_context(
+    tmp_path, answer_text, expected,
+):
+    ingress, root, bus, _ = _ingress(tmp_path)
+    request = _candidate(root, classifier_decision="food")
+    _, _, receipt, _, _, _, _ = await _actual_native_camera_prompt(
+        ingress, root, bus, request,
+        question="Что из этого вы съели? Какую порцию учитывать?",
+        options=["Да, съела", "Не ела"],
+        selected_index=None,
+        source_analysis="На фото рис и яйца.",
+    )
+    reloaded = CameraIngress(
+        ingress.config, workspace=tmp_path, bus=MessageBus(), telegram=FakeTelegram()
+    )
+    attempt = reloaded._attempts[request["candidate_id"]]
+    assert receipt.native_message_ids
+    assert attempt["confirmed_camera_context"] == "На фото рис и яйца."
+    attempt["attention_active"] = False
+    attempt["admitted_at"] = (
+        datetime.now(timezone.utc) - timedelta(minutes=31)
+    ).isoformat()
+    reloaded._save_attempts()
+
+    answer = InboundMessage(
+        channel="telegram", sender_id="123", chat_id="123", content=answer_text,
+        metadata={"is_group": False, "message_id": 9011},
+    )
+    reloaded.process_real_inbound(answer)
+    assert answer.metadata.get("_camera_answer") == expected
+    if expected == "yes":
+        assert answer.metadata["_camera_route"] == "context"
+        assert answer.media == [attempt["snapshot"]]
+        assert attempt["state"] == "answering"
+    else:
+        assert answer.metadata.get("_camera_authority") is not CAMERA_AUTHORITY
+        assert answer.media == []
+        assert attempt.get("answer_kind") != "yes"
+    await reloaded.close()
+    await ingress.close()
+
+
+@pytest.mark.asyncio
+async def test_free_text_composition_without_confirmed_prompt_stays_unbound(tmp_path):
+    ingress, root, bus, _ = _ingress(tmp_path)
+    request = _candidate(root, classifier_decision="food")
+    assert (await _admit(ingress, root, "Bearer " + "s" * 40, request))[0] == 202
+    await asyncio.wait_for(bus.consume_inbound(), timeout=1)
+    attempt = ingress._attempts[request["candidate_id"]]
+    attempt["attention_active"] = False
+    attempt["admitted_at"] = (
+        datetime.now(timezone.utc) - timedelta(minutes=31)
+    ).isoformat()
+    ingress._save_attempts()
+
+    answer = InboundMessage(
+        channel="telegram", sender_id="123", chat_id="123", content="Рис и яйца",
+        metadata={"is_group": False, "message_id": 9012},
+    )
+    ingress.process_real_inbound(answer)
+    assert answer.metadata.get("_camera_answer") is None
+    assert answer.metadata.get("_camera_authority") is not CAMERA_AUTHORITY
+    assert answer.media == []
+    assert attempt["state"] == "photo_sent"
+    await ingress.close()
+
+
+@pytest.mark.asyncio
+async def test_interrupted_camera_context_does_not_reauthorize_grounded_composition(tmp_path):
+    ingress, root, bus, _ = _ingress(tmp_path)
+    request = _candidate(root, classifier_decision="food")
+    _, _, receipt, _, _, _, _ = await _actual_native_camera_prompt(
+        ingress, root, bus, request,
+        question="Что из этого вы съели? Какую порцию учитывать?",
+        options=["Да, съела", "Не ела"],
+        selected_index=None,
+        source_analysis="На фото рис и яйца.",
+    )
+    attempt = ingress._attempts[request["candidate_id"]]
+    assert receipt.native_message_ids
+    assert attempt["confirmed_camera_context"] == "На фото рис и яйца."
+    attempt["attention_active"] = False
+    attempt["admitted_at"] = (
+        datetime.now(timezone.utc) - timedelta(minutes=31)
+    ).isoformat()
+    ingress._save_attempts()
+
+    weather = InboundMessage(
+        channel="telegram", sender_id="123", chat_id="123", content="Расскажи о погоде",
+        metadata={"is_group": False, "message_id": 9021},
+    )
+    ingress.process_real_inbound(weather)
+    assert attempt["context_interrupted"] is True
+    assert weather.metadata.get("_camera_answer") is None
+
+    composition = InboundMessage(
+        channel="telegram", sender_id="123", chat_id="123", content="Рис и яйца",
+        metadata={"is_group": False, "message_id": 9022},
+    )
+    ingress.process_real_inbound(composition)
+    assert composition.metadata.get("_camera_answer") is None
+    assert composition.metadata.get("_camera_context_unrelated") is CAMERA_AUTHORITY
+    assert composition.media == []
+    assert attempt["state"] == "photo_sent"
+    assert "answer_turn_id" not in attempt
     await ingress.close()
 
 
@@ -1505,9 +1624,16 @@ def test_context_answer_scope_and_uncertainty_override_leading_yes():
     assert _camera_context_answer_kind("125xyz и часть сообщений") is None
     assert _camera_context_answer_kind("four handfuls messages") is None
     assert _camera_context_answer_kind("2 яблока") == "yes"
-    assert _camera_context_answer_kind("Рис и яйца") == "yes"
-    assert _camera_context_answer_kind("2 яйца и рис") == "yes"
-    assert _camera_context_answer_kind("Рис и 2 яйца") == "yes"
+    assert _camera_context_answer_kind("Рис и яйца") is None
+    assert _camera_context_answer_kind(
+        "Рис и яйца", source_context="На фото рис и яйца."
+    ) == "yes"
+    assert _camera_context_answer_kind(
+        "2 яйца и рис", source_context="На фото рис и яйца."
+    ) == "yes"
+    assert _camera_context_answer_kind(
+        "Доброе утро и хорошего дня", source_context="На фото рис и яйца."
+    ) is None
     assert _camera_context_answer_kind("125 г") == "yes"
     assert _camera_context_answer_kind("125г") == "yes"
     assert _camera_context_answer_kind("3 кусочка хлеба") == "yes"
@@ -1667,6 +1793,7 @@ async def test_untargeted_answer_never_selects_one_of_multiple_camera_photos_by_
     _, _, first_receipt, _, first_yes, _, _ = await _actual_native_camera_prompt(
         ingress, root, bus, first, question="Вы съели это?",
         options=["Да, я съела", "Нет, не ела"], selected_index=0,
+        source_analysis="На фото гречка и хлеб.",
     )
     assert first_receipt.native_message_ids and first_yes is not None
     ingress.complete(first_yes, recorded=False, clarification=True)
@@ -1678,8 +1805,12 @@ async def test_untargeted_answer_never_selects_one_of_multiple_camera_photos_by_
     ingress._sweep_expired_attempts()
     assert first_attempt["attention_active"] is False
 
-    assert (await _admit(ingress, root, "Bearer " + "s" * 40, second))[0] == 202
-    await asyncio.wait_for(bus.consume_inbound(), timeout=1)
+    _, _, second_receipt, _, _, _, _ = await _actual_native_camera_prompt(
+        ingress, root, bus, second, question="Вы съели это? Какую часть учитывать?",
+        options=["Да, съела", "Нет, не ела"], selected_index=None,
+        source_analysis="На фото рис и яйца.",
+    )
+    assert second_receipt.native_message_ids
 
     answer = InboundMessage(
         channel="telegram", sender_id="123", chat_id="123", content=answer_text,

@@ -257,6 +257,11 @@ _CAMERA_COMPOSITION_DESCRIPTION_RE = re.compile(
     + rf"{_CAMERA_COMPOSITION_COMPONENT}[.!?…]*$",
     re.IGNORECASE,
 )
+_CAMERA_COMPOSITION_PARTS_RE = re.compile(
+    r"^\s*(?P<left>.+?)\s+(?:и|and)\s+(?P<right>.+?)[.!?…]*\s*$",
+    re.IGNORECASE,
+)
+_CAMERA_COMPOSITION_TOKEN_RE = re.compile(_CAMERA_COMPOSITION_WORD, re.IGNORECASE)
 
 
 def _clarification_related(text: object) -> bool:
@@ -332,24 +337,49 @@ def _camera_whole_portion_payload_excluded(text: str) -> bool:
     return bool(_CAMERA_WHOLE_PORTION_NONFOOD_SUBJECT_RE.search(payload))
 
 
-def _camera_composition_description(text: object) -> bool:
+def _camera_composition_description(
+    text: object, *, source_context: object = None, require_source_context: bool = False
+) -> bool:
     if not isinstance(text, str) or not _CAMERA_COMPOSITION_DESCRIPTION_RE.fullmatch(
         text.strip()
     ):
         return False
-    return not (
+    if (
         _CAMERA_WHOLE_PORTION_NONFOOD_SUBJECT_RE.search(text)
         or _CAMERA_UNRELATED_CONTEXT_RE.search(text)
         or _CLARIFICATION_NEW_MEAL_RE.search(text)
         or _ANSWER_NEGATED_CONSUMPTION_RE.search(text)
-    )
+    ):
+        return False
+    if not require_source_context:
+        return True
+    if not isinstance(source_context, str):
+        return False
+    parts = _CAMERA_COMPOSITION_PARTS_RE.fullmatch(text.strip())
+    if parts is None:
+        return False
+    context_words = {
+        token.casefold() for token in _CAMERA_COMPOSITION_TOKEN_RE.findall(source_context)
+    }
+    for component in (parts["left"], parts["right"]):
+        if not re.fullmatch(_CAMERA_COMPOSITION_COMPONENT, component.strip(), re.IGNORECASE):
+            return False
+        words = _CAMERA_COMPOSITION_TOKEN_RE.findall(component)
+        if not words or words[-1].casefold() not in context_words:
+            return False
+    return True
 
 
-def _camera_affirmation_excluded(text: object) -> bool:
+def _camera_affirmation_excluded(
+    text: object, *, source_context: object = None, require_composition_source: bool = False
+) -> bool:
     """Reject uncertainty and deferral; scope words alone lose to explicit eating."""
     if not isinstance(text, str):
         return True
-    composition_description = _camera_composition_description(text)
+    composition_description = _camera_composition_description(
+        text, source_context=source_context,
+        require_source_context=require_composition_source,
+    )
     if _camera_whole_portion_payload_excluded(text):
         return True
     if _CAMERA_UNCERTAIN_CONSUMPTION_RE.search(text):
@@ -502,7 +532,9 @@ def _attempt_caption(attempt: dict) -> str:
     )
 
 
-def _camera_context_answer_kind(text: object) -> str | None:
+def _camera_context_answer_kind(
+    text: object, *, source_context: object = None
+) -> str | None:
     """Classify concise text answers only while an unambiguous Camera source is active."""
     if (
         not isinstance(text, str)
@@ -513,7 +545,9 @@ def _camera_context_answer_kind(text: object) -> str | None:
     direct = _classify_answer(text, anchored=True)
     if direct in {"no", "not_food"}:
         return direct
-    if _camera_affirmation_excluded(text):
+    if _camera_affirmation_excluded(
+        text, source_context=source_context, require_composition_source=True
+    ):
         return None
     if direct == "yes":
         return direct
@@ -522,14 +556,16 @@ def _camera_context_answer_kind(text: object) -> str | None:
         or _NATIVE_WHOLE_PORTION_RE.fullmatch(text.strip())
         or _CONTEXTUAL_PARTIAL_PORTION_RE.fullmatch(text.strip())
         or _CLARIFICATION_QUANTITY_RE.fullmatch(text)
-        or _camera_composition_description(text)
+        or _camera_composition_description(
+            text, source_context=source_context, require_source_context=True
+        )
     ):
         return "yes"
     return None
 
 
-def _bare_context_answer(text: object) -> bool:
-    contextual = _camera_context_answer_kind(text)
+def _bare_context_answer(text: object, *, source_context: object = None) -> bool:
+    contextual = _camera_context_answer_kind(text, source_context=source_context)
     explicit = _classify_answer(text, anchored=False)
     return contextual in {"yes", "no"} and explicit != contextual
 
@@ -2131,6 +2167,14 @@ class CameraIngress:
                 or len(value["_camera_caption"]) > 256
             ):
                 raise ValueError("camera attempt caption is invalid")
+            if "confirmed_camera_context" in value and (
+                not isinstance(value["confirmed_camera_context"], str)
+                or not value["confirmed_camera_context"].strip()
+                or len(value["confirmed_camera_context"]) > 2048
+                or value.get("prompt_edit_claimed") is not True
+                or value.get("photo_delivery_confirmed") is not True
+            ):
+                raise ValueError("camera attempt context is invalid")
             # Older tombstones have no capture evidence. Keep them, but never
             # infer a meal time from admission or reply arrival.
             if "capture_time" in value or "capture_time_authority" in value:
@@ -3914,18 +3958,22 @@ class CameraIngress:
                 if bind_denial(candidate_id, attempt, "callback" if callback else "reply"):
                     return
             elif target is None:
-                if _bare_context_answer(raw_text):
-                    active_contexts = [
-                        value for value in self._attempts.values()
-                        if value.get("state") in {
-                            "photo_sent", "clarifying", "answering", "final_queued"
-                        }
-                    ]
-                    if len(active_contexts) == 1 and active_contexts[0].get(
-                        "context_interrupted", False
-                    ):
-                        metadata["_camera_context_unrelated"] = CAMERA_AUTHORITY
-                        return
+                active_contexts = [
+                    value for value in self._attempts.values()
+                    if value.get("state") in {
+                        "photo_sent", "clarifying", "answering", "final_queued"
+                    }
+                ]
+                if (
+                    len(active_contexts) == 1
+                    and _bare_context_answer(
+                        raw_text,
+                        source_context=active_contexts[0].get("confirmed_camera_context"),
+                    )
+                    and active_contexts[0].get("context_interrupted", False)
+                ):
+                    metadata["_camera_context_unrelated"] = CAMERA_AUTHORITY
+                    return
                 contextual_candidates = [
                     (key, value) for key, value in self._attempts.items()
                     if value.get("state") in {
@@ -4012,7 +4060,10 @@ class CameraIngress:
                 # its attention timer has expired.
                 if (
                     not addressable[0][1].get("attention_active", True)
-                    and _camera_context_answer_kind(raw_text) is None
+                    and _camera_context_answer_kind(
+                        raw_text,
+                        source_context=addressable[0][1].get("confirmed_camera_context"),
+                    ) is None
                     and not (
                         addressable[0][1].get("state") == "clarifying"
                         and _clarification_related(raw_text)
@@ -4023,7 +4074,10 @@ class CameraIngress:
                     return
                 pending = addressable
             elif len(addressable) > 1:
-                if _camera_context_answer_kind(raw_text) is not None:
+                if (
+                    _camera_context_answer_kind(raw_text) is not None
+                    or _camera_composition_description(raw_text)
+                ):
                     metadata["_camera_unbound"] = CAMERA_AUTHORITY
                 else:
                     self._interrupt_untargeted_camera_context()
@@ -4033,7 +4087,9 @@ class CameraIngress:
         candidate_id, attempt = pending[0]
         if (
             target is None
-            and _bare_context_answer(raw_text)
+            and _bare_context_answer(
+                raw_text, source_context=attempt.get("confirmed_camera_context")
+            )
             and attempt.get("context_interrupted", False)
         ):
             metadata["_camera_context_unrelated"] = CAMERA_AUTHORITY
@@ -4063,7 +4119,9 @@ class CameraIngress:
                 metadata["_camera_known_consumption_clarification"] = CAMERA_AUTHORITY
             answer = (
                 _native_button_answer_kind(metadata, raw_text)
-                if callback else _camera_context_answer_kind(text)
+                if callback else _camera_context_answer_kind(
+                    text, source_context=attempt.get("confirmed_camera_context")
+                )
             )
             if answer is None:
                 if target is None and _camera_food_context_hint(text):
@@ -4126,9 +4184,13 @@ class CameraIngress:
                 return
             classified = _native_button_answer_kind(metadata, raw_text)
         elif target is not None:
-            classified = _camera_context_answer_kind(raw_text)
+            classified = _camera_context_answer_kind(
+                raw_text, source_context=attempt.get("confirmed_camera_context")
+            )
         else:
-            classified = _camera_context_answer_kind(raw_text)
+            classified = _camera_context_answer_kind(
+                raw_text, source_context=attempt.get("confirmed_camera_context")
+            )
         if classified is None:
             if target is None:
                 if _camera_food_context_hint(raw_text):
@@ -4213,6 +4275,26 @@ class CameraIngress:
                 attempt["state"] = "delivery_unknown"
                 self._save_attempts()
             return
+        if (
+            message.channel == "telegram"
+            and str(message.chat_id) == self.config.chat_id
+            and message.metadata.get("_camera_final") is CAMERA_AUTHORITY
+            and message.metadata.get("_camera_edit_existing_photo") is CAMERA_AUTHORITY
+            and message.metadata.get("_camera_initial_prompt") is CAMERA_AUTHORITY
+            and message.metadata.get("_camera_photo_id") == attempt.get("photo_id")
+            and message.metadata.get("_camera_caption") == _attempt_caption(attempt)
+            and attempt.get("state") == "photo_sent"
+            and attempt.get("photo_delivery_confirmed") is True
+            and attempt.get("prompt_edit_claimed") is True
+            and isinstance(message.content, str)
+            and 0 < len(message.content.strip().split("\n\n", 1)[0].strip()) <= 2048
+        ):
+            # The bridge appends the current question after a blank line. Retain
+            # only the delivered source analysis, so question wording cannot
+            # ground an otherwise arbitrary composition answer.
+            attempt["confirmed_camera_context"] = (
+                message.content.strip().split("\n\n", 1)[0].strip()
+            )
         for native_id in receipt.native_message_ids:
             if native_id not in attempt["reply_ids"]:
                 attempt["reply_ids"].append(native_id)
