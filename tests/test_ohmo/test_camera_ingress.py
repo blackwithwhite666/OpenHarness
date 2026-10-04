@@ -1062,7 +1062,9 @@ async def test_information_scope_native_callbacks_do_not_authorize_camera_runtim
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("label", ["Всё на тарелке", "Яйцо и часть риса"])
+@pytest.mark.parametrize(
+    "label", ["Всё на тарелке", "Всё с тарелки", "Все с тарелки", "Яйцо и часть риса"]
+)
 async def test_native_consumption_portion_choice_binds_with_full_prompt_context(tmp_path, label):
     import tests.test_ohmo.test_camera_f84_joint_runtime as joint_runtime
 
@@ -1266,7 +1268,8 @@ async def test_native_quantity_accepts_verified_eating_question_that_mentions_ca
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "answer_text",
-    ["да", "да.", "Всю тарелку", "Яйцо и часть риса", "100 грамм", "2 яблока", "125 г",
+    ["да", "да.", "Всю тарелку", "Всё с тарелки", "Все с тарелки", "Яйцо и часть риса",
+     "100 грамм", "2 яблока", "125 г",
      "три яблока", "три кусочка хлеба", "125г",
      "четыре горсти клубники", "полтора кусочка хлеба", "три горсти", "две чашки",
      "125 г.", "125 г!",

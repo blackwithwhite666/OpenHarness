@@ -158,7 +158,8 @@ _CLARIFICATION_PLATE_RE = re.compile(
 _NATIVE_WHOLE_PLATE_RE = re.compile(
     r"^(?:everything(?:\s+on\s+(?:the\s+)?plate)?|all(?:\s+of\s+it)?|"
     r"whole\s+plate|the\s+whole\s+plate|"
-    r"всё\s+на\s+тарелк\w*|все\s+на\s+тарелк\w*|всю\s+тарелк\w*|"
+    r"всё\s+на\s+тарелк\w*|все\s+на\s+тарелк\w*|"
+    r"всё\s+с\s+тарелк\w*|все\s+с\s+тарелк\w*|всю\s+тарелк\w*|"
     r"цел\w*\s+тарелк\w*)[.! ]*$",
     re.IGNORECASE,
 )

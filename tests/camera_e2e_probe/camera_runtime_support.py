@@ -280,6 +280,7 @@ async def run_camera_runtime_trajectory(
 ):
     """Run two actual Ohmo turns and the delivered Telegram callback offline."""
     import asyncio
+    import json
     import os
     from datetime import datetime, timezone
     from types import SimpleNamespace
@@ -447,6 +448,21 @@ async def run_camera_runtime_trajectory(
         )
         if action is None:
             raise AssertionError("Camera virtual user produced no owner action")
+        action_observation = root / "camera-virtual-action.json"
+        with action_observation.open("x", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "question": offered.question,
+                    "offered_labels": list(offered.options),
+                    "action_text": action.text,
+                    "callback_id": action.callback_data,
+                },
+                handle,
+                ensure_ascii=False,
+                indent=2,
+            )
+            handle.write("\n")
+        os.chmod(action_observation, 0o600)
         button_ids = {button.callback_data for button in buttons}
         if action.callback_data is not None and action.callback_data not in button_ids:
             raise AssertionError("virtual user selected a callback absent from delivered markup")
