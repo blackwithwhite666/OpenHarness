@@ -894,6 +894,157 @@ def test_eval_export_requires_terminal_finish_event(tmp_path: Path):
     assert malformed["episodes"][0]["dialogue_complete"] is False
 
 
+def test_recorder_terminal_exception_binds_user_only_turn_without_exporting_exception_text(tmp_path: Path):
+    from types import SimpleNamespace
+    from openharness.channels.bus.events import InboundMessage
+    from ohmo.evals.recorder import GatewayEvalRecorder
+
+    message = InboundMessage(channel="telegram", sender_id="owner-1|mutable_name", chat_id="chat-1",
+        content="I drank tea.", timestamp=NOW, metadata={"message_id": "src-tea"})
+    recorder = GatewayEvalRecorder.start(
+        workspace=tmp_path, bundle=SimpleNamespace(session_id="session-1", cwd=str(tmp_path)),
+        message=message, session_key="telegram:chat-1", user_text=message.content or "",
+    )
+    recorder.record_exception(ValueError("secret-token-must-not-export"))
+    recorder.record_resource_snapshot(
+        workspace=tmp_path, bundle=SimpleNamespace(session_id="session-1", cwd=str(tmp_path)),
+        phase="world_after",
+    )
+    recorder.finish(status="exception")
+
+    exported = export_eval_dialogue(tmp_path / "evals", episode_ids=[recorder.episode_id])
+    episode = exported["episodes"][0]
+    assert episode["dialogue"] == [{"role": "user", "text": "I drank tea."}]
+    assert episode["dialogue_complete"] is True
+    marker = episode["terminal_failure"]
+    assert marker["schema_version"] == 1 and marker["episode_id"] == recorder.episode_id
+    assert marker["status"] == "exception"
+    assert marker["finish_event_id"] > marker["exception_event_id"]
+    with sqlite3.connect(tmp_path / "evals" / "evals.sqlite") as connection:
+        indexed = connection.execute(
+            "SELECT id,episode_id,kind,is_error FROM events WHERE id IN (?,?) ORDER BY id",
+            (marker["exception_event_id"], marker["finish_event_id"]),
+        ).fetchall()
+    assert [(row[1], row[2], row[3]) for row in indexed] == [
+        (recorder.episode_id, "exception", 1), (recorder.episode_id, "episode_finished", 1),
+    ]
+    assert "secret-token-must-not-export" not in json.dumps(exported)
+
+    reviewed = Goal.model_validate({**goal().model_dump(mode="json"),
+        "episode_ids": [recorder.episode_id], "trace_episode_id": recorder.episode_id,
+        "eval_workspace": str(tmp_path.resolve())})
+    binding = validate_dialogue_binding(Manifest(schema_version=1, goals=[reviewed]), exported)["tea"]
+    assert binding["complete"] is True
+
+    malformed = json.loads(json.dumps(exported))
+    malformed["episodes"][0]["terminal_failure"]["episode_id"] = "another-episode"
+    assert not validate_dialogue_binding(Manifest(schema_version=1, goals=[reviewed]), malformed)["tea"]["complete"]
+    for change in ("source", "principal", "session", "workspace", "operation"):
+        malformed = json.loads(json.dumps(exported))
+        item = malformed["episodes"][0]
+        if change == "source":
+            item["source_message_ids"] = ["different-source"]
+        elif change == "principal":
+            item["principal_id"] = "telegram:other-owner"
+        elif change == "session":
+            item["episode"]["session_id"] = "different-session"
+        elif change == "workspace":
+            item["episode"]["metadata"]["workspace"] = "different-workspace"
+        else:
+            item["turn_provenance"][0]["operation_id"] = "different-operation:assistant"
+        assert not validate_dialogue_binding(Manifest(schema_version=1, goals=[reviewed]), malformed)["tea"]["complete"]
+
+
+@pytest.mark.parametrize("finish_status,exception_error", [("error", True), ("exception", False)])
+def test_terminal_exception_export_rejects_wrong_status_or_error_flag(tmp_path: Path, finish_status, exception_error):
+    from types import SimpleNamespace
+    from openharness.channels.bus.events import InboundMessage
+    from ohmo.evals.recorder import GatewayEvalRecorder
+
+    message = InboundMessage(channel="telegram", sender_id="owner-1", chat_id="chat-1",
+        content="I drank tea.", timestamp=NOW, metadata={"message_id": "src-tea"})
+    recorder = GatewayEvalRecorder.start(
+        workspace=tmp_path, bundle=SimpleNamespace(session_id="session-1", cwd=str(tmp_path)),
+        message=message, session_key="telegram:chat-1", user_text=message.content or "",
+    )
+    recorder.record_event("exception", payload={"type": "ValueError", "message": "private"},
+                          is_error=exception_error)
+    recorder.finish(status=finish_status)
+    exported = export_eval_dialogue(tmp_path / "evals", episode_ids=[recorder.episode_id])["episodes"][0]
+    assert exported["dialogue_complete"] is False
+    assert "terminal_failure" not in exported
+
+
+def test_terminal_exception_export_rejects_missing_exception(tmp_path: Path):
+    from types import SimpleNamespace
+    from openharness.channels.bus.events import InboundMessage
+    from ohmo.evals.recorder import GatewayEvalRecorder
+
+    message = InboundMessage(channel="telegram", sender_id="owner-1", chat_id="chat-1",
+        content="I drank tea.", timestamp=NOW, metadata={"message_id": "src-tea"})
+    recorder = GatewayEvalRecorder.start(workspace=tmp_path,
+        bundle=SimpleNamespace(session_id="session-1", cwd=str(tmp_path)), message=message,
+        session_key="telegram:chat-1", user_text=message.content or "")
+    recorder.finish(status="exception")
+    exported = export_eval_dialogue(tmp_path / "evals", episode_ids=[recorder.episode_id])["episodes"][0]
+    assert exported["dialogue_complete"] is False
+    assert "terminal_failure" not in exported
+
+
+def test_terminal_exception_export_rejects_indexed_event_disagreement(tmp_path: Path):
+    from types import SimpleNamespace
+    from openharness.channels.bus.events import InboundMessage
+    from ohmo.evals.recorder import GatewayEvalRecorder
+
+    message = InboundMessage(channel="telegram", sender_id="owner-1", chat_id="chat-1",
+        content="I drank tea.", timestamp=NOW, metadata={"message_id": "src-tea"})
+    recorder = GatewayEvalRecorder.start(workspace=tmp_path,
+        bundle=SimpleNamespace(session_id="session-1", cwd=str(tmp_path)), message=message,
+        session_key="telegram:chat-1", user_text=message.content or "")
+    recorder.record_exception(ValueError("private"))
+    recorder.finish(status="exception")
+    with sqlite3.connect(tmp_path / "evals" / "evals.sqlite") as connection:
+        connection.execute("UPDATE events SET kind='gateway_error' WHERE episode_id=? AND kind='exception'",
+                           (recorder.episode_id,))
+    with pytest.raises(ValueError, match="event index does not match"):
+        export_eval_dialogue(tmp_path / "evals", episode_ids=[recorder.episode_id])
+
+
+def test_terminal_exception_does_not_complete_initial_camera_context_without_delivered_assistant(tmp_path: Path):
+    from types import SimpleNamespace
+    from openharness.channels.bus.events import InboundMessage
+    from ohmo.evals.recorder import GatewayEvalRecorder
+    from ohmo.gateway.memory_gate import MemoryScope
+    from ohmo.gateway.runtime import _build_conversation_turn_metadata
+    from ohmo.gateway.turn_context import build_turn_context
+
+    bundle = SimpleNamespace(session_id="session-1", cwd=str(tmp_path))
+    message = InboundMessage(channel="telegram", sender_id="__camera__", chat_id="chat-1",
+        content="Synthetic photo prompt", timestamp=NOW,
+        metadata={"_synthetic": True, "_camera_candidate_id": "candidate-1", "_camera_photo_id": 77})
+    turn_ctx = build_turn_context(message, session_id="session-1")
+    logical, _, assistant = _build_conversation_turn_metadata(
+        turn_ctx=turn_ctx, message=message, scope=MemoryScope("owner-1", ()))
+    context = {"kind": "initial_context", "candidate_id": "candidate-1", "native_photo_id": 77,
+        "tenant_id": "owner-1", "gateway_session_id": "session-1",
+        "recipient_principal": "telegram:owner-1", "source_principal": assistant["source_principal"],
+        "logical_turn_id": logical, "operation_id": assistant["client_op_id"]}
+    recorder = GatewayEvalRecorder.start(workspace=tmp_path, bundle=bundle, message=message,
+        session_key="telegram:chat-1", user_text=message.content or "", trusted_camera_context=context)
+    recorder.record_exception(ValueError("private failure"))
+    recorder.record_resource_snapshot(workspace=tmp_path, bundle=bundle, phase="world_after")
+    recorder.finish(status="exception")
+
+    exported = export_eval_dialogue(tmp_path / "evals", episode_ids=[recorder.episode_id])
+    item = exported["episodes"][0]
+    assert item["dialogue"] == []
+    assert item["dialogue_complete"] is False
+    reviewed = Goal.model_validate({**goal().model_dump(mode="json"),
+        "episode_ids": [recorder.episode_id], "trace_episode_id": recorder.episode_id,
+        "eval_workspace": str(tmp_path.resolve())})
+    assert not validate_dialogue_binding(Manifest(schema_version=1, goals=[reviewed]), exported)["tea"]["complete"]
+
+
 @pytest.mark.parametrize(
     ("event_media_count", "episode_media_count", "expected_complete", "expected_user_text"),
     [
