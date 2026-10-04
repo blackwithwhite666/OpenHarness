@@ -129,18 +129,45 @@ def test_each_model_run_has_distinct_honcho_workspace_and_session():
     assert first[0] != second[0] and first[1] != second[1]
 
 
-def test_source_worktree_requires_full_sha_and_offline_allows_candidate_diffs():
-    root = Path(__file__).resolve().parents[2]
+def test_source_worktree_requires_full_sha_and_offline_allows_candidate_diffs(tmp_path):
+    root = tmp_path / "synthetic-source"
+    root.mkdir()
+    subprocess.run(["git", "init", "-q", str(root)], check=True)
+    source = root / "source.py"
+    source.write_text("value = 1\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(root), "add", "source.py"], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(root),
+            "-c",
+            "user.name=Camera Probe",
+            "-c",
+            "user.email=camera-probe@example.invalid",
+            "commit",
+            "-qm",
+            "fixture",
+        ],
+        check=True,
+    )
     head = subprocess.run(
-        ["git", "rev-parse", "HEAD"], cwd=root, check=True, capture_output=True, text=True
+        ["git", "-C", str(root), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
     ).stdout.strip()
-    assert verify_source_worktree(root, head, require_clean=False)[0] == head
-    with pytest.raises(ValueError, match="tracked or non-ignored untracked"):
-        verify_source_worktree(root, head, require_clean=True)
+    assert verify_source_worktree(root, head, require_clean=True) == (head, "")
     with pytest.raises(ValueError, match="lowercase full 40-character"):
         verify_source_worktree(root, head[:12], require_clean=False)
     with pytest.raises(ValueError, match="revision changed"):
         verify_source_worktree(root, "0" * 40, require_clean=False)
+
+    source.write_text("value = 2\n", encoding="utf-8")
+    candidate_head, dirty = verify_source_worktree(root, head, require_clean=False)
+    assert (candidate_head, dirty) == (head, "M source.py")
+    with pytest.raises(ValueError, match="tracked or non-ignored untracked"):
+        verify_source_worktree(root, head, require_clean=True)
 
 
 def test_source_acceptance_rejects_dirty_untracked_and_content_drift(tmp_path):
