@@ -532,6 +532,8 @@ async def test_natural_quantity_after_ttl_finalizes_one_trusted_meal(
     result = await _turn(pool, answer, ingress)
     assert result.metadata["nutrition_append_event_id"] == attempt["camera_commit"]["event_id"]
     assert len(honcho.messages) == 4
+    saved = honcho.messages[-1].metadata["decision_trace"]["annotations"]["nutrition"]
+    assert saved["items"][0]["quantity_text"] == quantity
     await ingress.close()
 
 
@@ -641,3 +643,27 @@ def test_camera_prompt_retrieves_original_image_or_preserves_quantity_uncertaint
     assert "visible image is only a crop" in prompt
     assert "preserve the quantity uncertainty" in prompt
     assert "never treat a partial crop as a confirmed whole plate" in prompt
+    assert "Use the current user's stated food and quantity over ambiguous image inference." in prompt
+    for rule in (
+        "A whole-portion confirmation does not turn a count you guessed in an option "
+        "into an owner-stated quantity.",
+        "Earlier assistant analysis and any count it proposed are provisional, not "
+        "independent image or owner evidence.",
+        "verify each product count against the current original pixels",
+        "distinguish cut sections of one unit from multiple complete units",
+        "Count whole products, not pieces cut from one.",
+        "continuous foods without an owner-stated weight or measure",
+        "served cooked edible mass or household measure from the visible portion",
+        "useful co-visible scale",
+        "matching typical kcal per unit",
+        "Record the estimated quantity and its assumptions and uncertainty in the nutrition trace.",
+        "most likely central portion, not a precautionary upper bound",
+        "Do not assume a maximal portion or added fats.",
+        "use the served cooked weight and matching preparation and unit",
+        "make the total equal the item sum",
+        "identified by readable package labeling",
+        "A readable label may identify hidden package contents",
+        "do not include adjacent unselected packages",
+        "do not include adjacent unselected packages or unseen oil or sauce",
+    ):
+        assert rule in prompt

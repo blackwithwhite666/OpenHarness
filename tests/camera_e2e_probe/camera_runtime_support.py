@@ -210,6 +210,11 @@ def distinct_offline_clients():
     return OfflineCameraBotApi(), OfflineCameraUserApi()
 
 
+def camera_runtime_limits(*, native_mode: bool) -> tuple[int, str]:
+    """Keep model-backed prototype runs bounded without constraining offline fixtures."""
+    return (8, "medium") if native_mode else (4, "none")
+
+
 def isolated_runtime_loaders(runtime_module):
     """Fail closed for builder, prompt-skill and ambient-catalog loaders."""
     from contextlib import contextmanager
@@ -280,6 +285,7 @@ async def run_camera_runtime_trajectory(
 ):
     """Run two actual Ohmo turns and the delivered Telegram callback offline."""
     import asyncio
+    import json
     import os
     from datetime import datetime, timezone
     from types import SimpleNamespace
@@ -308,6 +314,7 @@ async def run_camera_runtime_trajectory(
         getattr(bot_client, "synthetic", False) and getattr(user_client, "synthetic", False)
     ):
         raise AssertionError("offline Camera mode accepts only explicit synthetic transports")
+    max_turns, effort = camera_runtime_limits(native_mode=native_mode)
 
     os.environ["OPENHARNESS_CONFIG_DIR"] = str(config_dir or root / "openharness-config")
     os.environ["OPENHARNESS_DATA_DIR"] = str(root / "openharness-data")
@@ -362,8 +369,8 @@ async def run_camera_runtime_trajectory(
             workspace=root,
             provider_profile="codex" if native_mode else "claude-api",
             model="gpt-6-luna" if native_mode else "claude-sonnet-4-6",
-            max_turns=4,
-            effort="none",
+            max_turns=max_turns,
+            effort=effort,
         )
         pool._camera_ingress = ingress
         channel._camera_ingress_authority = ingress
@@ -440,13 +447,28 @@ async def run_camera_runtime_trajectory(
         action = await virtual_user.next_camera_action(
             offered=offered,
             transcript=(("assistant", issued.content),),
-            captured_prompts=(initial_message.content,),
+            captured_prompts=(user_scenario,),
             captured_capabilities=(),
             index=0,
             last_turn=None,
         )
         if action is None:
             raise AssertionError("Camera virtual user produced no owner action")
+        action_observation = root / "camera-virtual-action.json"
+        with action_observation.open("x", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "question": offered.question,
+                    "offered_labels": list(offered.options),
+                    "action_text": action.text,
+                    "callback_id": action.callback_data,
+                },
+                handle,
+                ensure_ascii=False,
+                indent=2,
+            )
+            handle.write("\n")
+        os.chmod(action_observation, 0o600)
         button_ids = {button.callback_data for button in buttons}
         if action.callback_data is not None and action.callback_data not in button_ids:
             raise AssertionError("virtual user selected a callback absent from delivered markup")
