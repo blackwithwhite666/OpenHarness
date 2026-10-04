@@ -163,6 +163,10 @@ _NATIVE_WHOLE_PLATE_RE = re.compile(
     r"цел\w*\s+тарелк\w*)[.! ]*$",
     re.IGNORECASE,
 )
+_NATIVE_WHOLE_PORTION_RE = re.compile(
+    r"^(?:всё|все)\s*:\s*\S.{2,}$",
+    re.IGNORECASE,
+)
 _NATIVE_PARTIAL_PORTION_RE = re.compile(
     r"\b(?:part(?:\s+of)?|some\s+of|half(?:\s+of)?|portion|кусоч\w*|"
     r"част\w*|половин\w*|немного)\b",
@@ -190,6 +194,24 @@ _CAMERA_QUANTITY_MEASURE = (
     r"(?:шт\.?|кусоч\w*|порци\w*|горст\w*|handfuls?|грамм\w*|"
     r"г(?=\s|$|[.!])|кг|мл|л|pieces?|portions?|grams?|kg|ml|l|cups?|"
     r"чашк\w*|стакан\w*|яблок\w*|груш\w*|банан\w*)"
+)
+_CAMERA_WHOLE_PORTION_PREFIX_RE = re.compile(
+    r"^\s*(?:всё|все)\s*:\s*(?P<payload>.+?)\s*$", re.IGNORECASE
+)
+_CAMERA_WHOLE_PORTION_SOURCE_SUFFIX_RE = re.compile(
+    r"\s+(?:на\s+фото|с\s+этого\s+фото)\s*[.!?…]*$", re.IGNORECASE
+)
+_CAMERA_WHOLE_PORTION_NONFOOD_SUBJECT_RE = re.compile(
+    r"\b(?:фотограф\w*|фото|снимк\w*|изображен\w*|видео|ролик\w*|"
+    r"аудио|файл\w*|медиа|документ\w*|сообщен\w*|письм\w*|чат\w*|"
+    r"photos?|pictures?|images?|videos?|audio|files?|media|documents?|messages?|emails?|chats?)\b",
+    re.IGNORECASE,
+)
+_CAMERA_WHOLE_PORTION_ATTACHED_MEASURE_RE = re.compile(
+    rf"^(?:{_CAMERA_QUANTITY_MEASURE})(?=$|[\s.!?,;:…])", re.IGNORECASE
+)
+_CAMERA_WHOLE_PORTION_LEADING_NUMBER_RE = re.compile(
+    r"^\s*\d+(?:[.,]\d+)?(?P<tail>.*)$", re.DOTALL
 )
 _CAMERA_QUANTITY_QUALIFIER = r"(?:(?:about|around|примерно|около)\s*)?"
 _CAMERA_COUNTED_BERRY_DESCRIPTOR = (
@@ -276,9 +298,25 @@ def _camera_explicit_consumption(text: object) -> bool:
     )
 
 
+def _camera_whole_portion_payload_excluded(text: str) -> bool:
+    match = _CAMERA_WHOLE_PORTION_PREFIX_RE.match(text)
+    if match is None:
+        return False
+    payload = _CAMERA_WHOLE_PORTION_SOURCE_SUFFIX_RE.sub("", match["payload"]).strip()
+    leading_number = _CAMERA_WHOLE_PORTION_LEADING_NUMBER_RE.match(payload)
+    if leading_number:
+        tail = leading_number["tail"]
+        if tail and not tail[0].isspace() and tail[0] not in ".,!?:;…":
+            if not _CAMERA_WHOLE_PORTION_ATTACHED_MEASURE_RE.match(tail):
+                return True
+    return bool(_CAMERA_WHOLE_PORTION_NONFOOD_SUBJECT_RE.search(payload))
+
+
 def _camera_affirmation_excluded(text: object) -> bool:
     """Reject uncertainty and deferral; scope words alone lose to explicit eating."""
     if not isinstance(text, str):
+        return True
+    if _camera_whole_portion_payload_excluded(text):
         return True
     if _CAMERA_UNCERTAIN_CONSUMPTION_RE.search(text):
         return True
@@ -353,6 +391,7 @@ def _native_button_answer_kind(metadata: Mapping[str, object], raw_text: object)
         )
         and (
             _NATIVE_WHOLE_PLATE_RE.fullmatch(label.strip())
+            or _NATIVE_WHOLE_PORTION_RE.fullmatch(label.strip())
             or _NATIVE_PARTIAL_PORTION_RE.search(label)
         )
     ):
@@ -444,6 +483,7 @@ def _camera_context_answer_kind(text: object) -> str | None:
         return direct
     if (
         _NATIVE_WHOLE_PLATE_RE.fullmatch(text.strip())
+        or _NATIVE_WHOLE_PORTION_RE.fullmatch(text.strip())
         or _CONTEXTUAL_PARTIAL_PORTION_RE.fullmatch(text.strip())
         or _CLARIFICATION_QUANTITY_RE.fullmatch(text)
     ):

@@ -8,7 +8,7 @@ from telegram.error import BadRequest, RetryAfter
 
 from openharness.channels.bus.events import OutboundMessage
 from openharness.channels.bus.queue import MessageBus
-from openharness.channels.impl.telegram import TelegramChannel
+from openharness.channels.impl.telegram import TelegramChannel, _current_native_keyboard_question
 from openharness.config.schema import TelegramConfig
 
 
@@ -55,6 +55,36 @@ def _channel(bot: ReceiptBot) -> TelegramChannel:
     channel = TelegramChannel(TelegramConfig(token="token"), MessageBus())
     channel._app = SimpleNamespace(bot=bot)
     return channel
+
+
+@pytest.mark.parametrize(
+    "caption",
+    [
+        "Съели ли вы это? Фото сделано 2026-10-04.",
+        "Съели ли вы это? Фото сделано 2026-10-04 08:54.",
+        "Съели ли вы это? Фото сделано меньше минуты назад.",
+        "Съели ли вы это? Фото сделано 1 минуту назад.",
+        "Съели ли вы это? Фото сделано 2 минуты назад.",
+        "Съели ли вы это? Фото сделано 30 минут назад.",
+        "Съели ли вы это? Дата съёмки неизвестна.",
+    ],
+)
+def test_camera_caption_prefix_is_removed_before_extracting_native_question(caption):
+    question = "Какую порцию только оценить по составу?"
+    assert _current_native_keyboard_question(f"{caption} {question}") == question
+
+
+@pytest.mark.parametrize(
+    "caption",
+    [
+        "Съели ли вы это? Фото сделано 2026-10-04 08:54.",
+        "Съели ли вы это? Фото сделано 30 минут назад.",
+    ],
+)
+def test_camera_caption_strip_leaves_no_question_when_prompt_has_no_question_mark(caption):
+    assert _current_native_keyboard_question(
+        f"{caption} Какую порцию только оценить по составу"
+    ) == ""
 
 
 @pytest.mark.asyncio

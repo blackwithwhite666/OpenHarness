@@ -968,6 +968,9 @@ async def test_filtered_not_food_option_keeps_actual_native_camera_prompt(tmp_pa
         ("Только рецепт", "Что вы хотите узнать?"),
         ("Только посмотреть", "Что показать?"),
         ("Only information", "What information do you want?"),
+        ("Всё: 2 яйца и рис", "Какую порцию только оценить по составу?"),
+        ("Всё: 2 яйца и рис", "Что изображено на фото?"),
+        ("Всё: 2 яйца и рис", "Какую порцию только оценить по составу"),
     ],
 )
 async def test_information_scope_native_callbacks_do_not_authorize_camera_runtime(
@@ -985,7 +988,9 @@ async def test_information_scope_native_callbacks_do_not_authorize_camera_runtim
     )
     assert native_options == [label, "Нет, не ела"]
     assert clicked is not None
-    assert clicked.metadata["native_keyboard_question"] == question
+    assert clicked.metadata["native_keyboard_question"] == (
+        question if "?" in question else ""
+    )
     assert clicked.metadata["native_keyboard_prompt"].startswith(
         "Съели ли вы это? Фото сделано "
     )
@@ -1063,16 +1068,26 @@ async def test_information_scope_native_callbacks_do_not_authorize_camera_runtim
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "label", ["Всё на тарелке", "Всё с тарелки", "Все с тарелки", "Яйцо и часть риса"]
+    ("label", "prompt"),
+    [
+        ("Всё на тарелке", "На фото яйцо и рис. Вы съели это? Какую часть порции учитывать?"),
+        ("Всё с тарелки", "На фото яйцо и рис. Вы съели это? Какую часть порции учитывать?"),
+        ("Все с тарелки", "На фото яйцо и рис. Вы съели это? Какую часть порции учитывать?"),
+        ("Яйцо и часть риса", "На фото яйцо и рис. Вы съели это? Какую часть порции учитывать?"),
+        ("Всё: 2 яйца и рис", "Что из этого вы съели?"),
+        ("Всё: 2 яйца и рис на фото", "Что из этого вы съели?"),
+        ("Всё: 2 яйца и рис с этого фото", "Что из этого вы съели?"),
+        ("Всё: я съела яйцо на фото", "Что из этого вы съели?"),
+        ("Всё: 125г", "Что из этого вы съели?"),
+    ],
 )
-async def test_native_consumption_portion_choice_binds_with_full_prompt_context(tmp_path, label):
+async def test_native_consumption_portion_choice_binds_with_full_prompt_context(
+    tmp_path, label, prompt,
+):
     import tests.test_ohmo.test_camera_f84_joint_runtime as joint_runtime
 
     ingress, root, bus, _ = _ingress(tmp_path)
     request = _candidate(root, classifier_decision="food", capture_time=joint_runtime.BASE)
-    prompt = (
-        "На фото яйцо и рис. Вы съели это? Какую часть порции учитывать?"
-    )
     _, _, receipt, options, clicked, telegram_channel, _ = await _actual_native_camera_prompt(
         ingress, root, bus, request, question=prompt,
         options=[label, "Не ела", "Только оценить состав"], selected_index=0,
@@ -1163,6 +1178,19 @@ async def test_native_consumption_portion_choice_binds_with_full_prompt_context(
     [("Не ела", "no"), ("Только оценить состав", None), ("Не уверена", None),
      ("Да, только оценить состав", None), ("Да, не уверена", None),
      ("Не помню, ела ли я это", None),
+     ("Всё: не помню, ела ли я это", None), ("Всё: не ела", "no"),
+     ("Всё: сообщения", None), ("Всё: фотографии", None),
+     ("Всё: видео", None), ("Всё: аудио", None), ("Всё: файлы", None),
+     ("Всё: 2 сообщения", None), ("Всё: три фотографии", None),
+     ("Всё: 3 видео", None), ("Всё: 2 документа", None),
+     ("Всё: 3 кусочка сообщений", None),
+     ("Всё: 125xyz часть сообщений", None),
+     ("Всё: 125xyz и часть сообщений", None),
+     ("Всё: 125xyz2 часть сообщений", None),
+     ("Всё: 125_ часть сообщений", None),
+     ("Всё: 125г2 часть сообщений", None),
+     ("Всё: 125г часть сообщений", None),
+     ("Другое количество", None),
      ("Да, немного позже", None), ("Немного позже", None),
      ("2 фотографии пропали", None), ("2 сообщения пришли", None),
      ("2 фотографии потерялись", None), ("Фотографии пропали 2", None),
@@ -1267,9 +1295,59 @@ async def test_native_quantity_accepts_verified_eating_question_that_mentions_ca
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    ("age", "question", "expected"),
+    [
+        (timedelta(hours=2), "Какую порцию только оценить по составу", None),
+        (timedelta(hours=2), "Что из этого вы съели?", "yes"),
+        (timedelta(minutes=30), "Какую порцию только оценить по составу", None),
+        (timedelta(minutes=30), "Что из этого вы съели?", "yes"),
+    ],
+)
+async def test_native_new_caption_with_analysis_question_without_question_mark(
+    tmp_path, age, question, expected,
+):
+    ingress, root, bus, _ = _ingress(tmp_path)
+    request = _candidate(
+        root,
+        classifier_decision="food",
+        capture_time=datetime.now(timezone.utc) - age,
+    )
+    _, _, _, _, clicked, _, _ = await _actual_native_camera_prompt(
+        ingress, root, bus, request,
+        question=question,
+        options=["Всё: 2 яйца и рис", "Другое количество"],
+        selected_index=0,
+    )
+    assert clicked is not None
+    attempt = ingress._attempts[request["candidate_id"]]
+    caption = attempt["_camera_caption"]
+    assert clicked.metadata["native_keyboard_prompt"].startswith(caption)
+    if age == timedelta(hours=2):
+        capture = datetime.fromisoformat(request["capture_time"])
+        assert caption.endswith(capture.strftime("%Y-%m-%d %H:%M."))
+    else:
+        assert "Фото сделано " in caption and "назад." in caption
+    assert clicked.metadata["native_keyboard_question"] == (
+        "" if "?" not in question else question
+    )
+    assert clicked.metadata.get("_camera_answer") == expected
+    if expected is None:
+        assert clicked.metadata.get("_camera_unbound") is CAMERA_AUTHORITY
+        assert clicked.media == []
+        assert attempt["state"] == "photo_sent"
+    else:
+        assert clicked.metadata["_camera_authority"] is CAMERA_AUTHORITY
+        assert clicked.media == [attempt["snapshot"]]
+    await ingress.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
     "answer_text",
-    ["да", "да.", "Всю тарелку", "Всё с тарелки", "Все с тарелки", "Яйцо и часть риса",
-     "100 грамм", "2 яблока", "125 г",
+    ["да", "да.", "Всю тарелку", "Всё с тарелки", "Все с тарелки",
+     "Всё: 2 яйца и рис", "Всё: 2 яйца и рис на фото",
+     "Всё: 2 яйца и рис с этого фото", "Всё: я съела яйцо на фото",
+     "Всё: 125г", "Яйцо и часть риса", "100 грамм", "2 яблока", "125 г",
      "три яблока", "три кусочка хлеба", "125г",
      "четыре горсти клубники", "полтора кусочка хлеба", "три горсти", "две чашки",
      "125 г.", "125 г!",
@@ -1312,6 +1390,12 @@ async def test_camera_context_accepts_short_yes_and_portion_after_attention_expi
      "three pieces messages", "несколько кусочков сообщений",
      "125г часть сообщений", "125xyz часть сообщений", "125xyz и часть сообщений",
      "four handfuls messages",
+     "Всё: сообщения", "Всё: фотографии", "Всё: видео", "Всё: аудио",
+     "Всё: файлы", "Всё: 2 сообщения", "Всё: три фотографии",
+     "Всё: 3 видео", "Всё: 2 документа", "Всё: 3 кусочка сообщений",
+     "Всё: 125xyz часть сообщений", "Всё: 125xyz и часть сообщений",
+     "Всё: 125xyz2 часть сообщений", "Всё: 125_ часть сообщений",
+     "Всё: 125г2 часть сообщений", "Всё: 125г часть сообщений",
      "Немного позже"],
 )
 async def test_camera_context_does_not_treat_photo_status_or_time_as_consumption(tmp_path, text):
