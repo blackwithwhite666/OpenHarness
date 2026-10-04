@@ -647,6 +647,10 @@ def test_camera_prompt_retrieves_original_image_or_preserves_quantity_uncertaint
     for rule in (
         "A whole-portion confirmation does not turn a count you guessed in an option "
         "into an owner-stated quantity.",
+        "Earlier assistant analysis and any count it proposed are provisional, not "
+        "independent image or owner evidence.",
+        "verify each product count against the current original pixels",
+        "distinguish cut sections of one unit from multiple complete units",
         "Count whole products, not pieces cut from one.",
         "use the served cooked weight and matching preparation and unit",
         "make the total equal the item sum",

@@ -262,6 +262,12 @@ _CAMERA_COMPOSITION_PARTS_RE = re.compile(
     re.IGNORECASE,
 )
 _CAMERA_COMPOSITION_TOKEN_RE = re.compile(_CAMERA_COMPOSITION_WORD, re.IGNORECASE)
+_CAMERA_COMPOSITION_OPERATOR_RE = re.compile(
+    r"\b(?:шт\.?|кусоч\w*|порци\w*|горст\w*|handfuls?|грамм\w*|г|кг|мл|л|"
+    r"pieces?|portions?|grams?|kg|ml|cups?|чашк\w*|стакан\w*|част\w*|half|of|"
+    r"маленьк\w*|больш\w*|средн\w*|small|large|big|medium)\b",
+    re.IGNORECASE,
+)
 
 
 def _clarification_related(text: object) -> bool:
@@ -340,8 +346,10 @@ def _camera_whole_portion_payload_excluded(text: str) -> bool:
 def _camera_composition_description(
     text: object, *, source_context: object = None, require_source_context: bool = False
 ) -> bool:
-    if not isinstance(text, str) or not _CAMERA_COMPOSITION_DESCRIPTION_RE.fullmatch(
-        text.strip()
+    if (
+        not isinstance(text, str)
+        or "?" in text
+        or not _CAMERA_COMPOSITION_DESCRIPTION_RE.fullmatch(text.strip())
     ):
         return False
     if (
@@ -364,8 +372,18 @@ def _camera_composition_description(
     for component in (parts["left"], parts["right"]):
         if not re.fullmatch(_CAMERA_COMPOSITION_COMPONENT, component.strip(), re.IGNORECASE):
             return False
-        words = _CAMERA_COMPOSITION_TOKEN_RE.findall(component)
-        if not words or words[-1].casefold() not in context_words:
+        descriptor = re.sub(
+            rf"^\s*{_CAMERA_QUANTITY_QUALIFIER}{_CAMERA_SUPPORTED_QUANTITY_PREFIX}",
+            "",
+            component.strip(),
+            flags=re.IGNORECASE,
+        )
+        descriptor = _CAMERA_COMPOSITION_OPERATOR_RE.sub(" ", descriptor)
+        words = [
+            token.casefold()
+            for token in _CAMERA_COMPOSITION_TOKEN_RE.findall(descriptor)
+        ]
+        if not words or not all(word in context_words for word in words):
             return False
     return True
 

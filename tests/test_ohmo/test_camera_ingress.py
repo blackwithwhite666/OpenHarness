@@ -1408,6 +1408,11 @@ async def test_camera_context_accepts_short_yes_and_portion_after_attention_expi
         ("Доброе утро и хорошего дня", None),
         ("Творог и молоко", None),
         ("Сообщения и фотографии", None),
+        ("Где рис и яйца?", None),
+        ("Где рис и яйца", None),
+        ("Приготовь рис и яйца", None),
+        ("Рис и яйца приготовить", None),
+        ("Отварной рис и яйца", None),
     ],
 )
 async def test_free_text_composition_needs_confirmed_camera_food_context(
@@ -1633,6 +1638,18 @@ def test_context_answer_scope_and_uncertainty_override_leading_yes():
     ) == "yes"
     assert _camera_context_answer_kind(
         "Доброе утро и хорошего дня", source_context="На фото рис и яйца."
+    ) is None
+    assert _camera_context_answer_kind(
+        "Где рис и яйца?", source_context="На фото рис и яйца."
+    ) is None
+    assert _camera_context_answer_kind(
+        "Где рис и яйца", source_context="На фото рис и яйца."
+    ) is None
+    assert _camera_context_answer_kind(
+        "Приготовь рис и яйца", source_context="На фото рис и яйца."
+    ) is None
+    assert _camera_context_answer_kind(
+        "Отварной рис и яйца", source_context="На фото рис и яйца."
     ) is None
     assert _camera_context_answer_kind("125 г") == "yes"
     assert _camera_context_answer_kind("125г") == "yes"
