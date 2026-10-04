@@ -19,6 +19,7 @@ from ohmo.evals.camera_calibration import (
     CallBudget,
     Case,
     JudgeCase,
+    JudgeLabels,
     Reference,
     SOL_PROMPT_VERSION,
     a2_prompt,
@@ -158,6 +159,73 @@ def persistence_evidence(
                 "queried_at": PERSIST_NOW.isoformat(), "meals": meals, "unassigned": []}
     return {"goal": goal.model_dump(mode="json"), "honcho_snapshot": honcho,
             "telegent_snapshot": telegent, "dialogue_export": export}
+
+
+def camera_exception_evidence(case, tmp_path):
+    from openharness.channels.bus.events import InboundMessage
+    from ohmo.gateway.memory_gate import MemoryScope
+    from ohmo.gateway.runtime import _build_conversation_turn_metadata
+    from ohmo.gateway.turn_context import build_turn_context
+
+    workspace = tmp_path / "indexed-camera-store"
+    bundle = SimpleNamespace(session_id="gateway-session", cwd=str(workspace))
+    photo = InboundMessage(channel="telegram", sender_id="__camera__", chat_id="chat-product",
+        content="Photo delivered", timestamp=PERSIST_NOW - timedelta(minutes=1),
+        metadata={"_synthetic": True, "_camera_candidate_id": "candidate-1", "_camera_photo_id": 41})
+    photo_ctx = build_turn_context(photo, session_id="gateway-session")
+    photo_logical, _, photo_assistant = _build_conversation_turn_metadata(
+        turn_ctx=photo_ctx, message=photo, scope=MemoryScope("owner-1", ()))
+    photo_context = {
+        "kind": "initial_context", "candidate_id": "candidate-1", "native_photo_id": 41,
+        "tenant_id": "owner-1", "gateway_session_id": "gateway-session",
+        "recipient_principal": "telegram:owner-1", "source_principal": photo_assistant["source_principal"],
+        "logical_turn_id": photo_logical, "operation_id": photo_assistant["client_op_id"],
+    }
+    photo_recorder = GatewayEvalRecorder.start(workspace=workspace, bundle=bundle, message=photo,
+        session_key="telegram:chat-product", user_text=photo.content or "",
+        trusted_camera_context=photo_context)
+    photo_recorder.record_gateway_final(text="Photo received for review.")
+    photo_recorder.finish(status="completed")
+
+    owner_message = InboundMessage(channel="telegram", sender_id="owner-1|mutable_name",
+        chat_id="chat-product", content="I ate this.", timestamp=PERSIST_NOW,
+        metadata={"message_id": case.source_message_id, "native_message_id": 41,
+                  "_camera_candidate_id": "candidate-1", "_camera_native_binding": "41"})
+    turn_ctx = build_turn_context(owner_message, session_id="gateway-session")
+    logical, _, assistant_metadata = _build_conversation_turn_metadata(
+        turn_ctx=turn_ctx, message=owner_message, scope=MemoryScope("owner-1", ()))
+    provenance = {"source_message_id": case.source_message_id,
+        "principal_id": assistant_metadata["source_principal"], "logical_turn_id": logical,
+        "operation_id": assistant_metadata["client_op_id"]}
+    owner_context = {
+        "kind": "owner_turn", "candidate_id": "candidate-1", "native_photo_id": 41,
+        "tenant_id": "owner-1", "gateway_session_id": "gateway-session",
+        "recipient_principal": "telegram:owner-1", "principal_id": provenance["principal_id"],
+        "source_message_id": case.source_message_id, "logical_turn_id": logical,
+        "operation_id": assistant_metadata["client_op_id"],
+    }
+    owner_recorder = GatewayEvalRecorder.start(workspace=workspace, bundle=bundle,
+        message=owner_message, session_key="telegram:chat-product", user_text=owner_message.content or "",
+        trusted_turn_provenance=provenance, trusted_camera_context=owner_context)
+    owner_recorder.record_gateway_update(text="Checking the save.")
+    owner_recorder.record_exception(ValueError("private exception detail"))
+    owner_recorder.record_resource_snapshot(workspace=workspace, bundle=bundle, phase="world_after")
+    owner_recorder.finish(status="exception")
+
+    export = export_eval_dialogue(workspace / "evals",
+        episode_ids=[photo_recorder.episode_id, owner_recorder.episode_id])
+    case.persistence_evidence["dialogue_export"] = export
+    goal = case.persistence_evidence["goal"]
+    goal["episode_ids"] = [photo_recorder.episode_id, owner_recorder.episode_id]
+    goal["trace_episode_id"] = owner_recorder.episode_id
+    goal["eval_workspace"] = str(workspace.resolve())
+    persisted = case.persistence_evidence["honcho_snapshot"]["messages"][0]
+    persisted["metadata"]["decision_trace_episode_id"] = owner_recorder.episode_id
+    persisted["metadata"]["decision_trace"]["episode_id"] = owner_recorder.episode_id
+    case.dialogue = [type(case.dialogue[0]).model_validate(turn)
+        for episode in export["episodes"] for turn in episode["dialogue"]
+        if turn["role"] in {"user", "assistant"}]
+    return export
 
 
 def set_persisted_kcal(case, kcal):
@@ -347,6 +415,25 @@ async def test_product_a1_does_not_accept_legacy_commit_booleans_without_persist
     assert calls == ["openai/gpt-6.1-sol"]
 
 
+def test_terminal_camera_exception_grades_real_persistence_and_fails_when_save_is_absent(tmp_path):
+    case = make_case(tmp_path)
+    exported = camera_exception_evidence(case, tmp_path)
+    owner = next(item for item in exported["episodes"]
+                 if item.get("trusted_camera_context", {}).get("kind") == "owner_turn")
+    assert owner["dialogue_complete"] is True
+    assert owner["dialogue"] == [
+        {"role": "user", "text": "I ate this."},
+        {"role": "assistant", "text": "Checking the save."},
+    ]
+    assert "private exception detail" not in json.dumps(exported)
+    assert score_a1(case, reference())[0] == "PASS"
+
+    absent = case.model_copy(deep=True)
+    absent.persistence_evidence["honcho_snapshot"]["messages"] = []
+    absent.persistence_evidence["telegent_snapshot"]["meals"] = []
+    assert score_a1(absent, reference())[0] == "FAIL"
+
+
 def test_product_a2_refuses_to_fall_back_to_reference_prefix(tmp_path):
     case = make_case(tmp_path)
     case.dialogue = None
@@ -373,6 +460,93 @@ def test_a2_button_bonus_needs_majority_and_caps_score():
     legacy = A2Vote.model_validate({"score": 4, "avoidable_turns": 0,
                                     "repeated_questions": 0, "reason_codes": ["concise"]})
     assert not legacy.useful_button_click
+
+
+def test_a2_prompt_has_current_friction_rubric_with_or_without_click_evidence(tmp_path):
+    case = make_case(tmp_path)
+    expected = (
+        "technical progress narration", "duplicate saved acknowledgement", "meaningful ambiguity",
+        "known package", "visible-portion estimate", "pending", "seven or more",
+        "No valid native callback evidence", "useful_button_click (boolean)",
+    )
+    prompt = a2_prompt(case)
+    assert all(text in prompt for text in expected)
+    assert "125" not in prompt and "private-1" not in prompt
+
+    goal = case.persistence_evidence["goal"]
+    export_episode = case.persistence_evidence["dialogue_export"]["episodes"][0]
+    export_episode["trusted_camera_context"] = {
+        "kind": "owner_turn", "candidate_id": "candidate-1", "native_photo_id": 41,
+        "tenant_id": "owner-1", "gateway_session_id": "gateway-session",
+        "recipient_principal": "telegram:owner-1", "source_message_id": case.source_message_id,
+        "principal_id": goal["principal_id"], "logical_turn_id": goal["logical_turn_id"],
+        "operation_id": goal["operation_id"], "episode_id": "ep-product",
+    }
+    export_episode["episode"]["metadata"] = {
+        "inbound": {"channel": "telegram", "sender_id": "owner-1", "chat_id": "chat-product",
+                    "metadata": {"message_id": case.source_message_id, "native_message_id": 41,
+                                 "callback_query": True, "callback_data": "ask:0",
+                                 "native_keyboard_options": ["small", "large"],
+                                 "native_keyboard_selected_index": 0, "native_keyboard_selected_label": "small",
+                                 "native_keyboard_prompt": "Which cup?", "_camera_candidate_id": "candidate-1",
+                    "_camera_native_binding": "41"}},
+        "trusted_camera_turn_provenance": {"source_message_id": case.source_message_id,
+            "principal_id": goal["principal_id"], "logical_turn_id": goal["logical_turn_id"],
+            "operation_id": goal["operation_id"], "episode_id": "ep-product"},
+    }
+    prompt_with_click = a2_prompt(case)
+    assert all(text in prompt_with_click for text in expected[:-2])
+    assert "Native callback evidence:" in prompt_with_click
+    assert "useful_button_click must be false" not in prompt_with_click
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("count", [13, 100])
+async def test_judge_scoring_path_accepts_dialogue_sized_counts(tmp_path, count):
+    case = make_judge_case(tmp_path, state="uncertain", labels={
+        "consumption_state": "uncertain", "kcal_min": None, "kcal_max": None,
+        "avoidable_turns": count, "repeated_questions": 0,
+    })
+    case.dialogue = [type(case.dialogue[0])(role="assistant", text="Synthetic public turn.")
+                     for _ in range(100)]
+
+    async def synthetic_call(model, effort, prompt, image):
+        if "sol" in model:
+            return Reference(consumption_state="uncertain", kcal=None,
+                             uncertainty="synthetic schema-path input").model_dump_json()
+        return A2Vote(score=3, avoidable_turns=count, repeated_questions=0,
+                      reason_codes=["avoidable"]).model_dump_json()
+
+    result = await calibrate_judge_case(case, synthetic_call, CallBudget(max_calls=4))
+    assert result["efficiency_quality"] == "PASS"
+    assert result["a2_avoidable_turns"] == count
+
+
+@pytest.mark.asyncio
+async def test_judge_scoring_path_rejects_count_above_dialogue_limit(tmp_path):
+    with pytest.raises(ValidationError):
+        JudgeLabels.model_validate({"consumption_state": "uncertain", "avoidable_turns": 101,
+                                    "repeated_questions": 0})
+    with pytest.raises(ValidationError):
+        A2Vote.model_validate({"score": 0, "avoidable_turns": 101, "repeated_questions": 0,
+                               "reason_codes": ["avoidable"]})
+
+    case = make_judge_case(tmp_path, state="uncertain", labels={
+        "consumption_state": "uncertain", "kcal_min": None, "kcal_max": None,
+        "avoidable_turns": 100, "repeated_questions": 0,
+    })
+    case.dialogue = [type(case.dialogue[0])(role="assistant", text="Synthetic public turn.")
+                     for _ in range(100)]
+
+    async def synthetic_call(model, effort, prompt, image):
+        if "sol" in model:
+            return Reference(consumption_state="uncertain", kcal=None,
+                             uncertainty="synthetic schema-path input").model_dump_json()
+        return json.dumps({"score": 3, "avoidable_turns": 101, "repeated_questions": 0,
+                           "reason_codes": ["avoidable"]})
+
+    result = await calibrate_judge_case(case, synthetic_call, CallBudget(max_calls=4))
+    assert result["efficiency_quality"] == "INCONCLUSIVE"
 
 
 def test_a2_prompt_uses_actual_recorder_export_callback_facts(tmp_path):
@@ -430,6 +604,13 @@ def test_a2_prompt_uses_actual_recorder_export_callback_facts(tmp_path):
     assert '"options": ["Маленькую чашку", "Большую чашку", "Обе", "Не пила"]' in prompt
 
     inbound = evidence["dialogue_export"]["episodes"][0]["episode"]["metadata"]["inbound"]["metadata"]
+    person_native_prompt = inbound["native_keyboard_prompt"]
+    inbound["native_keyboard_prompt"] = (
+        "Съели ли вы это? Фото сделано 2026-09-30 12:45. Что изображено?"
+    )
+    bound_caption_prompt = a2_prompt(case)
+    assert "Native callback evidence:" in bound_caption_prompt
+    assert '"native_message_id": 41' in bound_caption_prompt
     original = dict(inbound)
     for malformed in (
         {"callback_query": False},
@@ -442,7 +623,8 @@ def test_a2_prompt_uses_actual_recorder_export_callback_facts(tmp_path):
         inbound.update(malformed)
         prompt_without_click = a2_prompt(case)
         assert "Native callback evidence:" not in prompt_without_click
-        assert "useful_button_click (boolean)" not in prompt_without_click
+        assert "useful_button_click (boolean)" in prompt_without_click
+        assert "useful_button_click must be false" in prompt_without_click
     # A text fallback keyboard can be bound to a different native message ID
     # than the original photo; the ingress binding proves that target.
     inbound.update(original)
@@ -453,6 +635,7 @@ def test_a2_prompt_uses_actual_recorder_export_callback_facts(tmp_path):
     person_case = case.model_copy(update={"origin": "person"})
     exported_episode = evidence["dialogue_export"]["episodes"][0]
     exported_episode.pop("trusted_camera_context")
+    inbound["native_keyboard_prompt"] = person_native_prompt
     assert '"selected_label": "Маленькую чашку"' in a2_prompt(person_case)
     exported_episode["trusted_camera_context"] = context | {"episode_id": recorder.episode_id}
 
@@ -502,7 +685,7 @@ def test_a2_prompt_uses_actual_recorder_export_callback_facts(tmp_path):
     assert len(_button_click_evidence(case)) == 1
 
 
-def _record_calibration_callback(case, tmp_path, variant):
+def _record_calibration_callback(case, tmp_path, variant, *, prompt=None):
     from openharness.channels.bus.events import InboundMessage
     workspace = tmp_path / "synthetic-evals"
 
@@ -527,6 +710,8 @@ def _record_calibration_callback(case, tmp_path, variant):
     elif variant == "camera_rejected":
         native_metadata["_camera_ingress_callback_candidate"] = "candidate-1"
         native_metadata["_camera_ingress_callback_eligible"] = False
+    if prompt is not None:
+        native_metadata["native_keyboard_prompt"] = prompt
     callback = InboundMessage(
         channel="telegram", sender_id="owner-1", chat_id="chat-product",
         content="Маленькую чашку", timestamp=PERSIST_NOW, metadata=native_metadata,
@@ -545,7 +730,7 @@ def _record_calibration_callback(case, tmp_path, variant):
         workspace=workspace, bundle=SimpleNamespace(session_id="gateway-session", cwd=str(workspace)),
         message=callback, session_key="telegram:chat-product", user_text=callback.content,
         trusted_turn_provenance=provenance,
-        trusted_camera_context=None if variant == "camera_rejected" else context,
+        trusted_camera_context=None if variant in {"camera_missing", "camera_rejected"} else context,
     )
     recorder.record_gateway_final(text="Учла одну маленькую чашку.")
     recorder.finish(status="completed")
@@ -557,6 +742,27 @@ def _record_calibration_callback(case, tmp_path, variant):
     # captured through the maintained recorder/export path.
     case.persistence_evidence["dialogue_export"]["episodes"][0]["episode"][
         "metadata"]["inbound"] = captured
+
+
+@pytest.mark.parametrize("caption", [
+    "Съели ли вы это? Фото сделано 2026-09-30. Что изображено?",
+    "Съели ли вы это? Фото сделано 2026-09-30 12:45. Что изображено?",
+    "Съели ли вы это? Фото сделано 30 минут назад. Что изображено?",
+    "Съели ли вы это? Дата съёмки неизвестна.",
+])
+@pytest.mark.parametrize("variant", ["camera_missing", "camera_rejected"])
+def test_camera_caption_never_uses_fallback_provenance_for_clicks(tmp_path, caption, variant):
+    from ohmo.evals.camera_calibration import _button_click_evidence
+
+    case = make_case(tmp_path)
+    _record_calibration_callback(case, tmp_path, variant, prompt=caption)
+    inbound_metadata = case.persistence_evidence["dialogue_export"]["episodes"][0][
+        "episode"]["metadata"]["inbound"]["metadata"]
+    inbound_metadata["private_secret"] = "must-not-appear-in-prompt"
+    assert _button_click_evidence(case) == []
+    prompt = a2_prompt(case)
+    assert "Native callback evidence:" not in prompt
+    assert "must-not-appear-in-prompt" not in prompt
 
 
 @pytest.mark.asyncio
@@ -583,7 +789,7 @@ async def test_calibrate_case_never_awards_unproven_click_votes(tmp_path, varian
     assert result["a2_useful_button_click_votes"] == 0
     assert result["a2_base_score"] == result["a2_scores"] == 5
     assert len(prompts) == 4
-    assert all("useful_button_click (boolean)" not in prompt for prompt in prompts[1:])
+    assert all("useful_button_click (boolean)" in prompt for prompt in prompts[1:])
 
 
 @pytest.mark.asyncio
@@ -1285,6 +1491,23 @@ async def test_subscription_intake_exact_route_and_exif_bytes(tmp_path):
     assert image_path.read_bytes() == original
     with Image.open(io.BytesIO(original)) as image:
         assert image.getexif()[274] == 6
+
+
+@pytest.mark.asyncio
+async def test_subscription_rejects_historical_a2_prompt_envelope(tmp_path):
+    case = make_case(tmp_path)
+    entries = subscription_entries(case)
+    historical_prompt = (
+        "Judge dialogue efficiency only. Return JSON: score (0..5), avoidable_turns (integer), "
+        "repeated_questions (integer), reason_codes (repeat|avoidable|necessary_clarification|concise). "
+        "A question needed to resolve ambiguous consumption or amount is not avoidable. Dialogue: "
+        + json.dumps([{"role": turn.role, "text": turn.text} for turn in case.dialogue], ensure_ascii=False)
+    )
+    for item in entries[1:]:
+        item["prompt"] = historical_prompt
+    intake = SubscriptionResults(entries, [case])
+    with pytest.raises(ValueError, match="exact requested call"):
+        await calibrate_case(case, intake.call, CallBudget(max_calls=4))
 
 
 @pytest.mark.asyncio

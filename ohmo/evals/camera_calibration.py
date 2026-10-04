@@ -95,8 +95,8 @@ class JudgeLabels(StrictModel):
     kcal_max: float | None = None
     estimate_kcal_min: float | None = None
     estimate_kcal_max: float | None = None
-    avoidable_turns: int = Field(ge=0, le=MAX_PREFIX)
-    repeated_questions: int = Field(ge=0, le=MAX_PREFIX)
+    avoidable_turns: int = Field(ge=0, le=MAX_DIALOGUE)
+    repeated_questions: int = Field(ge=0, le=MAX_DIALOGUE)
     avoidable_tolerance: int = Field(default=0, ge=0, le=MAX_PREFIX)
     repeated_tolerance: int = Field(default=0, ge=0, le=MAX_PREFIX)
 
@@ -159,8 +159,8 @@ class Reference(StrictModel):
 
 class A2Vote(StrictModel):
     score: int = Field(ge=0, le=5)
-    avoidable_turns: int = Field(ge=0, le=MAX_PREFIX)
-    repeated_questions: int = Field(ge=0, le=MAX_PREFIX)
+    avoidable_turns: int = Field(ge=0, le=MAX_DIALOGUE)
+    repeated_questions: int = Field(ge=0, le=MAX_DIALOGUE)
     reason_codes: list[Literal["repeat", "avoidable", "necessary_clarification", "concise"]]
     useful_button_click: bool = False
 
@@ -399,31 +399,34 @@ def a2_prompt(case: Case | JudgeCase) -> str:
         raise ValueError("full dialogue is required before A2 scoring")
     dialogue = [{"role": turn.role, "text": turn.text} for turn in turns]
     click_evidence = _button_click_evidence(case)
-    if not click_evidence:
-        # Keep the exact historical prompt so existing Luna results remain
-        # intake-compatible. Their response schema defaults the new vote to false.
-        return (
-            "Judge dialogue efficiency only. Return JSON: score (0..5), "
-            "avoidable_turns (integer), repeated_questions (integer), reason_codes "
-            "(repeat|avoidable|necessary_clarification|concise). A question needed to "
-            "resolve ambiguous consumption or amount is not avoidable. Dialogue: "
-            + json.dumps(dialogue, ensure_ascii=False)
-        )
-    return (
-        "Judge dialogue efficiency only. Return JSON: score (0..5), "
-        "avoidable_turns (integer), repeated_questions (integer), reason_codes "
-        "(repeat|avoidable|necessary_clarification|concise), useful_button_click (boolean). "
-        "Penalize avoidable turns and repeated questions; report their counts accurately. A question needed to "
-        "resolve ambiguous consumption or amount is not avoidable. Add one point, capped at 5, "
-        "only when the supplied native callback evidence proves a user clicked an actually "
-        "offered option that is relevant to this dialogue. A button attached only to an "
-        "unnecessary repeated or useless question is not useful. Keep this bonus separate: score is "
-        "the base score before the bonus, and useful_button_click reports relevance only. A "
-        "displayed button, typed answer, irrelevant option, or missing/invalid evidence earns "
-        "no point. This score says nothing about persistence. Native callback evidence: "
-        + json.dumps(click_evidence, ensure_ascii=False)
-        + ". Dialogue: " + json.dumps(dialogue, ensure_ascii=False)
+    prompt = (
+        "Judge only the efficiency and user friction of the complete public dialogue. "
+        "Return JSON with score (integer 0..5), avoidable_turns (integer), "
+        "repeated_questions (integer), reason_codes (repeat|avoidable|necessary_clarification|concise), "
+        "and useful_button_click (boolean). Count removable public assistant messages or questions "
+        "as avoidable_turns, including technical progress narration that adds no useful information, "
+        "a separate duplicate saved acknowledgement, duplicate questions, and asking for precise grams "
+        "again when a useful known-unit or visible-portion estimate is available. repeated_questions "
+        "counts the repeated or unnecessary questions already included in avoidable_turns; do not add "
+        "them a second time when choosing the score. Do not count user turns. A necessary Camera owner "
+        "confirmation or a question that resolves a meaningful ambiguity is not avoidable. Unknown exact "
+        "grams alone do not make such a question necessary for a known package. Do not penalize a useful "
+        "substantive estimate, receipt, or notice that a balance remains pending; do not treat honest "
+        "uncertainty by itself as friction. Set the base score from avoidable_turns: 5 for zero, 4 for one, "
+        "3 for two, 2 for three or four, 1 for five or six, and 0 for seven or more or dialogue so "
+        "obstructive that the user cannot complete the task. Count repeated questions accurately and "
+        "choose reason codes that fit the dialogue. This score says nothing about whether data was saved. "
+        "Set useful_button_click true only when the supplied native evidence proves the user clicked an "
+        "actually offered, relevant option. A typed answer, merely offered button, or untrusted or "
+        "irrelevant callback is not a click and earns no bonus; a button attached only to a useless "
+        "or unnecessary repeated question is not relevant. The click bonus is separate from the "
+        "base score, is applied only by the evaluator, and is capped at 5."
     )
+    if click_evidence:
+        prompt += " Native callback evidence: " + json.dumps(click_evidence, ensure_ascii=False) + "."
+    else:
+        prompt += " No valid native callback evidence is supplied, so useful_button_click must be false."
+    return prompt + " Dialogue: " + json.dumps(dialogue, ensure_ascii=False)
 
 
 def _button_click_evidence(case: Case | JudgeCase) -> list[dict[str, Any]]:
@@ -527,15 +530,13 @@ def _button_click_evidence(case: Case | JudgeCase) -> list[dict[str, Any]]:
                 )
                 or feedback_binding
             )
-            # A native Camera photo caption is itself a production fact. If its
-            # trusted Camera receipt context is absent, the tap was rejected or
-            # lost its binding and cannot earn relevance votes through ordinary
-            # Telegram provenance.
-            camera_caption = re.match(
-                r"^Съели ли вы это\? Фото сделано \d{4}-\d{2}-\d{2}\.",
-                md.get("native_keyboard_prompt", "")
-                if isinstance(md.get("native_keyboard_prompt", ""), str) else "",
-            )
+            # Camera captions use either a photo-made date or an explicit
+            # unknown-date sentence. Keep both forms behind the same question
+            # prefix so an unbound Camera click cannot fall back to user provenance.
+            prompt_text = md.get("native_keyboard_prompt", "")
+            camera_caption = isinstance(prompt_text, str) and re.match(
+                r"^\s*Съели ли вы это\?\s*(?:Фото сделано\b|Дата съёмки неизвестна\b)", prompt_text,
+            ) is not None
             if camera_caption and ctx is None and not feedback_binding:
                 camera_callback_facts = False
             if (

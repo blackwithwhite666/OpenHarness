@@ -947,6 +947,58 @@ def _utc_index_timestamp(value: datetime) -> str:
     return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def _indexed_terminal_exception(episode_id: str, events: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Describe only a well-formed indexed exception followed by its terminal finish."""
+    exceptions = [event for event in events if event.get("kind") == "exception"]
+    finishes = [event for event in events if event.get("kind") == "episode_finished"]
+    if len(exceptions) != 1 or len(finishes) != 1 or not events or finishes[0] is not events[-1]:
+        return None
+    exception, finish = exceptions[0], finishes[0]
+    exception_payload = _dict(exception.get("payload")) or {}
+    finish_payload = _dict(finish.get("payload")) or {}
+    exception_id, finish_id = exception.get("_index_id"), finish.get("_index_id")
+    if (type(exception_id) is not int or type(finish_id) is not int
+            or exception_id <= 0 or finish_id <= exception_id
+            or exception.get("episode_id") != episode_id or finish.get("episode_id") != episode_id
+            or exception.get("is_error") is not True or finish.get("is_error") is not True
+            or finish_payload.get("status") != "exception"
+            or not isinstance(exception_payload.get("type"), str)
+            or not exception_payload["type"].strip()
+            or not isinstance(exception_payload.get("message"), str)):
+        return None
+    exception_position = events.index(exception)
+    if any(
+        event.get("kind") != "resource_snapshot"
+        or (_dict(event.get("payload")) or {}).get("phase") != "world_after"
+        for event in events[exception_position + 1:-1]
+    ):
+        return None
+    return {
+        "schema_version": 1,
+        "episode_id": episode_id,
+        "exception_event_id": exception_id,
+        "finish_event_id": finish_id,
+        "status": "exception",
+    }
+
+
+def _valid_terminal_failure_marker(value: object, episode_id: str) -> bool:
+    """Check the narrow export marker shape before it can relax assistant-turn binding."""
+    marker = _dict(value)
+    return bool(
+        marker is not None
+        and set(marker) == {"schema_version", "episode_id", "exception_event_id", "finish_event_id", "status"}
+        and type(marker.get("schema_version")) is int
+        and marker.get("schema_version") == 1
+        and marker.get("episode_id") == episode_id
+        and type(marker.get("exception_event_id")) is int
+        and marker["exception_event_id"] > 0
+        and type(marker.get("finish_event_id")) is int
+        and marker["finish_event_id"] > marker["exception_event_id"]
+        and marker.get("status") == "exception"
+    )
+
+
 def _is_recorded_camera_initial_prompt(episode: dict[str, Any], payload: dict[str, Any]) -> bool:
     """Recognize the recorded synthetic Camera envelope for display omission only."""
     episode_metadata = _dict(episode.get("metadata")) or {}
@@ -1243,6 +1295,7 @@ def export_eval_dialogue(eval_root: str | Path, *, episode_ids: list[str] | None
             if event.get("kind") == "inbound_message"
             and _is_recorded_camera_initial_prompt(episode, _dict(event.get("payload")) or {})), None)
         turns = _dialogue(events, episode=episode, suppress_camera_initial_id=initial_camera_prompt_id)
+        terminal_failure = _indexed_terminal_exception(episode["episode_id"], events)
         public_turns_valid = all(
             _public_turn_input_valid(event, episode)
             for event in events
@@ -1271,20 +1324,23 @@ def export_eval_dialogue(eval_root: str | Path, *, episode_ids: list[str] | None
             "episode": episode,
             "dialogue": turns,
             "dialogue_complete": bool(events) and events[-1].get("kind") == "episode_finished"
-            and (_dict(events[-1].get("payload")) or {}).get("status") in {"completed", "ok", "failed", "error"}
+            and ((_dict(events[-1].get("payload")) or {}).get("status") in {"completed", "ok", "failed", "error"}
+                 or terminal_failure is not None and not is_initial_camera_context)
             and public_turns_valid
             and not camera_context_invalid
-            and any(
+            and (terminal_failure is not None and not is_initial_camera_context or any(
                 event.get("kind") in {"gateway_final", "gateway_error"}
                 and isinstance((_dict(event.get("payload")) or {}).get("text"), str)
                 and bool((_dict(event.get("payload")) or {}).get("text"))
                 for event in events
-            ) and any(event.get("kind") == "inbound_message" for event in events)
+            ))
+            and any(event.get("kind") == "inbound_message" for event in events)
             and (any(turn.get("role") == "user" for turn in turns)
                  or is_initial_camera_context and not any(turn.get("role") == "user" for turn in turns)),
             "source_message_ids": sorted(set(inbound_sources)),
             "turn_provenance": turn_provenance,
             "principal_id": actual_principal,
+            **({"terminal_failure": terminal_failure} if terminal_failure is not None else {}),
             **({"trusted_camera_context": camera_context} if camera_context is not None else {}),
         })
     if not episodes:
@@ -1316,6 +1372,7 @@ def validate_dialogue_binding(manifest: Manifest, export: dict[str, Any]) -> dic
             dialogue = by_id[episode_id].get("dialogue")
             roles = [turn.get("role") for turn in dialogue if isinstance(turn, dict)] if isinstance(dialogue, list) else []
             episode_data = _dict(by_id[episode_id].get("episode")) or {}
+            terminal_failure = _valid_terminal_failure_marker(by_id[episode_id].get("terminal_failure"), episode_id)
             camera_context = _dict(by_id[episode_id].get("trusted_camera_context")) or {}
             initial_camera_context = camera_context.get("kind") == "initial_context"
             inbound = _dict((_dict(episode_data.get("metadata")) or {}).get("inbound")) or {}
@@ -1332,13 +1389,14 @@ def validate_dialogue_binding(manifest: Manifest, export: dict[str, Any]) -> dic
                 )
             )
             public_roles_valid = ("assistant" in roles and "user" not in roles if initial_camera_context
-                                  else "user" in roles and "assistant" in roles)
+                                  else "user" in roles and ("assistant" in roles or terminal_failure))
             principal_valid = (by_id[episode_id].get("principal_id") == goal.principal_id
                                if not initial_camera_context else
                                camera_context.get("recipient_principal") == goal.principal_id
                                and camera_context.get("tenant_id") == goal.owner_id
                                and initial_identity_valid)
             if (by_id[episode_id].get("dialogue_complete") is not True
+                    or ("terminal_failure" in by_id[episode_id] and not terminal_failure)
                     or not public_roles_valid
                     or episode_data.get("session_id") != goal.gateway_session_id
                     or not principal_valid
