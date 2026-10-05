@@ -32,6 +32,7 @@ from ohmo.evals.camera_calibration import (
     score_a1,
     sol_prompt,
     write_report,
+    _score_a1_details,
 )
 from ohmo.evals.camera_subscription_results import SubscriptionResults, read_private_json
 from ohmo.evals.nutrition_persistence import Goal, derive_meal_id, export_eval_dialogue
@@ -81,6 +82,13 @@ def make_case(tmp_path, *, state="consumed", events=None):
         }
     )
     case.persistence_evidence = persistence_evidence(case, consumed=state == "consumed")
+    case.operation_id = case.persistence_evidence["goal"]["operation_id"]
+    case.meal_id = case.persistence_evidence["goal"]["canonical_meal_id"]
+    for item in case.events:
+        item.source_message_id = case.source_message_id
+        item.owner_id = case.owner_id
+        item.operation_id = case.operation_id
+        item.meal_id = case.meal_id
     return case
 
 
@@ -159,6 +167,75 @@ def persistence_evidence(
                 "queried_at": PERSIST_NOW.isoformat(), "meals": meals, "unassigned": []}
     return {"goal": goal.model_dump(mode="json"), "honcho_snapshot": honcho,
             "telegent_snapshot": telegent, "dialogue_export": export}
+
+
+def retracted_persistence_evidence(case):
+    from openharness.channels.bus.events import InboundMessage
+    from ohmo.gateway.memory_gate import MemoryScope
+    from ohmo.gateway.runtime import _build_conversation_turn_metadata
+    from ohmo.gateway.turn_context import build_turn_context
+
+    evidence = persistence_evidence(case, consumed=True)
+    corrected_at = PERSIST_NOW + timedelta(minutes=1)
+    correction = InboundMessage(
+        channel="telegram", sender_id="owner-1|mutable_name", chat_id="chat-product",
+        content="I did not eat this after all.", timestamp=corrected_at,
+        metadata={"message_id": "correction-source-1", "reply_to_message_id": case.source_message_id},
+    )
+    context = build_turn_context(correction, session_id="gateway-session")
+    logical_turn_id, _, assistant_metadata = _build_conversation_turn_metadata(
+        turn_ctx=context, message=correction, scope=MemoryScope(case.owner_id, ()))
+    assistant_metadata.update(
+        tenant_id=case.owner_id,
+        role="assistant",
+        decision_trace_episode_id="ep-correction",
+        decision_trace={"episode_id": "ep-correction", "annotations": {"nutrition": {
+            "schema_version": 2,
+            "record_type": "meal_correction",
+            "consumption_status": "not_consumed",
+            "changed_fields": ["consumption_status"],
+        }}},
+    )
+    assistant_metadata["reply_to_source_message_id"] = case.source_message_id
+    correction_time = corrected_at.isoformat()
+    evidence["honcho_snapshot"]["messages"].append({
+        "id": "persisted-correction-1", "peer_id": "ohmo", "session_id": "honcho-session",
+        "workspace_id": "workspace-1", "created_at": correction_time,
+        "metadata": assistant_metadata,
+    })
+    end = (corrected_at + timedelta(minutes=1)).isoformat()
+    evidence["honcho_snapshot"].update(until=end, queried_at=end)
+    evidence["telegent_snapshot"].update(end=end, queried_at=end, meals=[])
+    goal = evidence["goal"]
+    goal.update(
+        expected_consumed=False,
+        expected_kcal=None,
+        episode_ids=["ep-product", "ep-correction"],
+        trajectory_as_of=end,
+    )
+    evidence["dialogue_export"]["episodes"].append({
+        "episode": {"episode_id": "ep-correction", "session_id": "gateway-session",
+                    "metadata": {"workspace": "synthetic-evals"}},
+        "principal_id": "telegram:owner-1",
+        "dialogue": [
+            {"role": "user", "text": correction.content},
+            {"role": "assistant", "text": "I corrected the saved meal."},
+        ],
+        "dialogue_complete": True,
+        "source_message_ids": ["correction-source-1"],
+        "turn_provenance": [{
+            "source_message_id": "correction-source-1",
+            "logical_turn_id": logical_turn_id,
+            "operation_id": assistant_metadata["client_op_id"],
+            "principal_id": assistant_metadata["source_principal"],
+            "episode_id": "ep-correction",
+        }],
+    })
+    case.dialogue.extend([
+        type(case.dialogue[0])(role="user", text=correction.content),
+        type(case.dialogue[0])(role="assistant", text="I corrected the saved meal."),
+    ])
+    return evidence
 
 
 def camera_exception_evidence(case, tmp_path):
@@ -814,6 +891,8 @@ async def test_actual_not_food_callback_exports_and_scores_without_consumption(t
     case.persistence_evidence = persistence_evidence(
         case, consumed=False, principal_id="telegram:123",
     )
+    case.operation_id = case.persistence_evidence["goal"]["operation_id"]
+    case.meal_id = case.persistence_evidence["goal"]["canonical_meal_id"]
 
     ingress, root, bus, _ = _ingress(tmp_path)
     request = _candidate(root, classifier_decision="ambiguous")
@@ -1131,10 +1210,38 @@ def test_negative_exact_absence_and_retraction(tmp_path):
     )
     case = make_case(tmp_path, state="validly_retracted", events=[observed, correction])
     assert effective_meal(case) == ("validly_retracted", None)
-    case.persistence_evidence = persistence_evidence(case, consumed=False)
-    assert score_a1(case, negative)[0] == "PASS"
+    case.persistence_evidence = retracted_persistence_evidence(case)
+    result = _score_a1_details(case, negative)
+    assert result["a1"] == "PASS", result
+    assert result["persistence_stage"] == "COMPLETE_ABSENCE"
+    assert result["actual_event_ids"] == ["persisted-product-1", "persisted-correction-1"]
     unexpected = make_case(tmp_path, state="consumed")
     assert score_a1(unexpected, negative)[0] == "FAIL"
+
+
+def test_retraction_requires_persisted_consumed_to_denied_history(tmp_path):
+    negative = Reference(consumption_state="not_consumed", kcal=None, uncertainty="nonfood")
+    absent = make_case(tmp_path, state="validly_retracted", events=[])
+    assert score_a1(absent, negative)[0] == "INCONCLUSIVE"
+
+
+@pytest.mark.parametrize(
+    ("case_state", "goal_consumed", "reference_state"),
+    [
+        ("validly_retracted", True, "consumed"),
+        ("consumed", False, "not_consumed"),
+    ],
+)
+def test_reviewed_case_state_must_match_goal_before_scoring(
+    tmp_path, case_state, goal_consumed, reference_state
+):
+    case = make_case(tmp_path, state="consumed" if goal_consumed else "never_recorded", events=[])
+    case.reviewed_state = case_state
+    negative_or_positive_reference = (
+        reference() if reference_state == "consumed"
+        else Reference(consumption_state="not_consumed", kcal=None, uncertainty="nonfood")
+    )
+    assert score_a1(case, negative_or_positive_reference)[0] == "FAIL"
 
 
 def test_replay_dedup_and_authoritative_order(tmp_path):
@@ -1161,6 +1268,7 @@ def test_replay_dedup_and_authoritative_order(tmp_path):
     "break_case",
     [
         lambda c: c.persistence_evidence["honcho_snapshot"].update(complete=False),
+        lambda c: c.persistence_evidence["goal"].update(case_id="foreign"),
         lambda c: c.persistence_evidence["goal"].update(operation_id="foreign"),
         lambda c: c.persistence_evidence["goal"].update(source_message_id="foreign"),
         lambda c: c.persistence_evidence["goal"].update(owner_id="foreign"),
@@ -1169,6 +1277,13 @@ def test_replay_dedup_and_authoritative_order(tmp_path):
 def test_persistence_evidence_incomplete_or_unbound_fails_closed(tmp_path, break_case):
     case = make_case(tmp_path)
     break_case(case)
+    assert score_a1(case, reference())[0] == "INCONCLUSIVE"
+
+
+@pytest.mark.parametrize("identity", ["case_id", "operation_id", "meal_id"])
+def test_persistence_evidence_rejects_outer_case_identity_mismatch(tmp_path, identity):
+    case = make_case(tmp_path)
+    setattr(case, identity, "foreign")
     assert score_a1(case, reference())[0] == "INCONCLUSIVE"
 
 
@@ -1597,6 +1712,7 @@ def test_subscription_cli_writes_only_aggregate_report(tmp_path, monkeypatch):
     for index in range(3):
         case = make_case(tmp_path)
         case.case_id = f"case-{index}"
+        case.persistence_evidence["goal"]["case_id"] = case.case_id
         cases.append(case)
         for item in subscription_entries(case):
             item["padavan_session_id"] += f"-{index}"

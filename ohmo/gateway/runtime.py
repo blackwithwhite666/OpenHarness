@@ -1785,10 +1785,45 @@ class OhmoSessionRuntimePool:
             turn_ctx,
             memory_scope=memory_scope,
         )
-        if camera_authorized and message.metadata.get("_camera_existing_meal_replay") is True:
-            candidate_id = message.metadata.get("_camera_candidate_id")
-            turn_id = message.metadata.get("_camera_turn_id")
+        typed_replay_candidate_id = message.metadata.get("_camera_typed_replay_candidate")
+        typed_replay_candidate = False
+        if (
+            isinstance(typed_replay_candidate_id, str)
+            and message.channel == "telegram"
+            and str(message.chat_id) == self._gateway_config.camera_ingress.chat_id
+            and session_key == self._gateway_config.camera_ingress.session_key
+            and self._gateway_config.camera_ingress.enabled
+            and message.sender_id.split("|", 1)[0] == self._gateway_config.camera_ingress.principal
+        ):
+            typed_attempt = self._camera_ingress._attempts.get(typed_replay_candidate_id)
+            typed_target = message.metadata.get("reply_to_message_id")
+            typed_replay_candidate = bool(
+                isinstance(typed_attempt, dict)
+                and typed_attempt.get("state") == "completed"
+                and isinstance(typed_attempt.get("camera_commit"), Mapping)
+                and isinstance(typed_attempt.get("answer_turn_id"), str)
+                and typed_attempt.get("finalizer_status") == "committed"
+                and not isinstance(typed_attempt.get("camera_correction_commit"), dict)
+                and typed_attempt.get("camera_correction") is None
+                and typed_target is not None
+                and str(typed_target) in {
+                    str(typed_attempt.get("photo_id")),
+                    *map(str, typed_attempt.get("reply_ids", [])),
+                }
+            )
+        completed_replay = (
+            camera_authorized and message.metadata.get("_camera_existing_meal_replay") is True
+        ) or typed_replay_candidate
+        if completed_replay:
+            candidate_id = (
+                typed_replay_candidate_id if typed_replay_candidate
+                else message.metadata.get("_camera_candidate_id")
+            )
             attempt = self._camera_ingress._attempts.get(candidate_id)
+            turn_id = (
+                attempt.get("answer_turn_id") if typed_replay_candidate and isinstance(attempt, dict)
+                else message.metadata.get("_camera_turn_id")
+            )
             commit = attempt.get("camera_commit") if isinstance(attempt, dict) else None
             backend = self._shadow_backend_for_scope(memory_scope)
             try:
@@ -1804,12 +1839,31 @@ class OhmoSessionRuntimePool:
                 receipt = await backend.reconcile_durable_exchange(
                     f"{turn_id}:user", f"{turn_id}:assistant"
                 )
-                selected_label = message.metadata.get("native_keyboard_selected_label")
+                typed_replay = typed_replay_candidate
+                selected_label = (
+                    message.content if typed_replay
+                    else message.metadata.get("native_keyboard_selected_label")
+                )
+                replay_binding = (
+                    message.metadata.get("reply_to_message_id") if typed_replay
+                    else message.metadata.get("_camera_native_binding")
+                )
                 if not isinstance(receipt, ConversationAppendReceipt):
                     raise ConversationReconciliationError(
                         "completed Camera exchange receipt is unavailable"
                     )
                 assistant_metadata = receipt.assistant_metadata
+                committed_binding = (
+                    assistant_metadata.get("camera_reply_to_native_message_id")
+                    if isinstance(assistant_metadata, Mapping) else None
+                )
+                typed_source_ids = (
+                    {
+                        str(attempt.get("photo_id")),
+                        *map(str, attempt.get("reply_ids", [])),
+                    }
+                    if typed_replay and isinstance(attempt, dict) else set()
+                )
                 trace = (
                     assistant_metadata.get("decision_trace")
                     if isinstance(assistant_metadata, Mapping) else None
@@ -1836,22 +1890,28 @@ class OhmoSessionRuntimePool:
                     or receipt.assistant_client_op_id != f"{turn_id}:assistant"
                     or not isinstance(receipt.user_content, str)
                     or not isinstance(selected_label, str)
-                    or receipt.user_content != selected_label
+                    or (not typed_replay and receipt.user_content != selected_label)
                     or assistant_metadata.get("role") != "assistant"
                     or assistant_metadata.get("client_op_id") != f"{turn_id}:assistant"
                     or assistant_metadata.get("logical_turn_id") != turn_id
                     or assistant_metadata.get("camera_candidate_id") != candidate_id
                     or assistant_metadata.get("camera_operation_id") != candidate_id
                     or assistant_metadata.get("camera_answer_bound") != "yes"
-                    or assistant_metadata.get("camera_reply_to_native_message_id")
-                    != message.metadata.get("_camera_native_binding")
+                    or (
+                        str(committed_binding) not in typed_source_ids
+                        if typed_replay
+                        else committed_binding != str(replay_binding)
+                    )
                     or assistant_metadata.get("gateway_session_id") != turn_ctx.session_id
                     or assistant_metadata.get("tenant_id") != memory_scope.private_tenant
                     or assistant_metadata.get("source_principal")
                     != f"telegram:{canonical_principal(message.channel, turn_ctx.principal)}"
                     or assistant_metadata.get("source_message_id")
                     != commit.get("source_message_id")
-                    or assistant_metadata.get("source_message_id") != source_message_id
+                    or (
+                        not typed_replay
+                        and assistant_metadata.get("source_message_id") != source_message_id
+                    )
                     or assistant_metadata.get("ingest_source") != "dropbox_camera"
                     or assistant_metadata.get("confirmation_required") is not True
                     or assistant_metadata.get("is_group") is not False
@@ -1866,18 +1926,30 @@ class OhmoSessionRuntimePool:
                     raise ConversationReconciliationError(
                         "completed Camera receipt did not prove the same saved portion"
                     )
-                self._camera_ingress.recover_legacy_committed_meal(
-                    candidate_id, turn_id, receipt
-                )
-                yield GatewayStreamUpdate(
-                    kind="final",
-                    text="Эта порция уже записана.",
-                    metadata={
-                        "_session_key": session_key,
-                        "camera_reconciled": candidate_id,
-                        "nutrition_append_event_id": receipt.assistant_message_id,
-                    },
-                )
+                if typed_replay and receipt.user_content != selected_label:
+                    # This is a changed reply, not an idempotent repeat. Let the
+                    # established conversation/source-selection flow handle it.
+                    message.metadata.pop("_camera_typed_replay_candidate", None)
+                else:
+                    if typed_replay:
+                        message.metadata.update(
+                            _camera_typed_replay=True,
+                            _camera_candidate_id=candidate_id,
+                            _camera_turn_id=turn_id,
+                        )
+                    self._camera_ingress.recover_legacy_committed_meal(
+                        candidate_id, turn_id, receipt
+                    )
+                    yield GatewayStreamUpdate(
+                        kind="final",
+                        text="Эта порция уже записана.",
+                        metadata={
+                            "_session_key": session_key,
+                            "camera_reconciled": candidate_id,
+                            "nutrition_append_event_id": receipt.assistant_message_id,
+                        },
+                    )
+                    return
             except (ConversationReconciliationError, ValueError):
                 logger.warning("completed Camera replay remains unresolved candidate=%s", candidate_id)
                 yield GatewayStreamUpdate(
@@ -1885,7 +1957,7 @@ class OhmoSessionRuntimePool:
                     text="Не получилось подтвердить запись этой порции. Новая запись не добавлена.",
                     metadata={"_session_key": session_key},
                 )
-            return
+                return
         if camera_authorized and (
             message.metadata.get("_camera_legacy_reconcile") is True
             or message.metadata.get("_camera_reconcile_then_correction") is CAMERA_AUTHORITY

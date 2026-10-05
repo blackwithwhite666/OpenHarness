@@ -281,7 +281,8 @@ def _score_a1_details(case: Case, reference: Reference) -> dict[str, Any]:
                 "persistence_stage": "REFERENCE_UNCERTAIN"}
     try:
         from ohmo.evals.nutrition_persistence import (
-            Goal, Manifest, grade_manifest, validate_dialogue_binding,
+            Goal, Manifest, _event_from_raw, _fold_events, grade_manifest,
+            validate_dialogue_binding,
         )
 
         goal = Goal.model_validate(evidence["goal"])
@@ -300,7 +301,13 @@ def _score_a1_details(case: Case, reference: Reference) -> dict[str, Any]:
         if case.dialogue is None or [turn.model_dump() for turn in case.dialogue] != expected_turns:
             return {"a1": "INCONCLUSIVE", "reason": "full Case dialogue is missing or differs from bound export",
                     "persistence_stage": "DIALOGUE_BINDING_FAILED"}
-        if goal.source_message_id != case.source_message_id or goal.owner_id != case.owner_id:
+        if (
+            goal.case_id != case.case_id
+            or goal.source_message_id != case.source_message_id
+            or goal.owner_id != case.owner_id
+            or goal.operation_id != case.operation_id
+            or goal.canonical_meal_id != case.meal_id
+        ):
             return {"a1": "INCONCLUSIVE", "reason": "reviewed nutrition goal does not bind to product Case identity",
                     "persistence_stage": "CASE_BINDING_FAILED"}
         telegent = evidence["telegent_snapshot"]
@@ -319,6 +326,45 @@ def _score_a1_details(case: Case, reference: Reference) -> dict[str, Any]:
     details["persistence_reason"] = result.get("reason", "")
     if result["a1"] != "PASS":
         return {"a1": result["a1"], "reason": result["reason"], **details}
+    if (case.reviewed_state == "consumed") is not goal.expected_consumed:
+        return {"a1": "FAIL", "reason": "reviewed Case consumption state disagrees with reviewed nutrition goal",
+                **details}
+    actual_event_ids = result.get("actual_event_ids")
+    if case.reviewed_state == "never_recorded":
+        if result.get("stage") != "COMPLETE_ABSENCE" or actual_event_ids != []:
+            return {"a1": "INCONCLUSIVE", "reason": "reviewed never-recorded state is not proved by complete absence",
+                    **details}
+    elif case.reviewed_state == "validly_retracted":
+        try:
+            raw_messages = evidence["honcho_snapshot"]["messages"]
+            by_id = {
+                parsed["event_id"]: parsed
+                for raw in raw_messages
+                if isinstance(raw, dict)
+                if (parsed := _event_from_raw(raw)) is not None
+                and not parsed.get("invalid") and not parsed.get("unannotated")
+            }
+            if not isinstance(actual_event_ids, list) or not actual_event_ids:
+                raise ValueError("no validated persisted source history")
+            history_events = [by_id[event_id] for event_id in actual_event_ids]
+            for event in history_events:
+                event["_created_at"] = event["created_at"]
+            history_events.sort(key=lambda event: (event["_created_at"], event["event_id"]))
+            history = _fold_events(history_events, goal.meal_timezone)["history"]
+            retracted = (
+                len(history) >= 2
+                and history[0]["consumed"] is True
+                and history[-1]["consumed"] is False
+                and any(item["consumed"] is True for item in history[:-1])
+            )
+        except (KeyError, TypeError, ValueError, AttributeError):
+            retracted = False
+        if not retracted:
+            return {"a1": "INCONCLUSIVE", "reason": "reviewed retraction lacks validated consumed-to-not-consumed event history",
+                    **details}
+    elif case.reviewed_state != "consumed":
+        return {"a1": "INCONCLUSIVE", "reason": "reviewed meal state is unsupported by persistence evidence",
+                **details}
     expected_state = "consumed" if goal.expected_consumed else "not_consumed"
     if reference.consumption_state != expected_state:
         return {"a1": "FAIL", "reason": "frozen Sol reference disagrees with reviewed persisted goal", **details}

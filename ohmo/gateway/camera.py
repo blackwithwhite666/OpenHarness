@@ -4019,6 +4019,22 @@ class CameraIngress:
         if intent != "no" and target_matches:
             candidate_id, attempt = target_matches[0]
             if (
+                not callback
+                and intent == "yes"
+                and attempt.get("state") == "completed"
+                and isinstance(attempt.get("camera_commit"), dict)
+                and target is not None
+                and isinstance(attempt.get("answer_turn_id"), str)
+                and attempt.get("finalizer_status") == "committed"
+                and not isinstance(attempt.get("camera_correction_commit"), dict)
+                and attempt.get("camera_correction") is None
+            ):
+                # This is only a runtime lookup hint. Runtime compares the
+                # durable user text before acknowledging a repeat; changed
+                # text continues through ordinary receipt/model handling.
+                metadata["_camera_typed_replay_candidate"] = candidate_id
+                return
+            if (
                 callback
                 and attempt.get("state") == "completed"
                 and isinstance(attempt.get("camera_commit"), dict)

@@ -38,10 +38,13 @@ def _validate_completed_photo_replay(
     existing_event_id: str,
     original_commit: dict[str, Any],
     current_commit: dict[str, Any] | None,
+    typed_replay: bool = False,
 ) -> str:
     """Require a delivered saved-state response tied to the immutable event."""
     if (
-        replay.metadata.get("_camera_existing_meal_replay") is not True
+        replay.metadata.get(
+            "_camera_typed_replay" if typed_replay else "_camera_existing_meal_replay"
+        ) is not True
         or replay.metadata.get("_camera_unbound") is not None
         or replay.metadata.get("_camera_candidate_id") != candidate_id
         or replay.metadata.get("_camera_turn_id") != turn_id
@@ -621,6 +624,8 @@ async def run_camera_runtime_trajectory(
             flush=True,
         )
 
+        initial_finalization_proposals = getattr(bot_client, "finalization_proposals", None)
+
         async def replay_callback():
             if action.callback_data is not None:
                 replay = await invoke_issued_callback()
@@ -648,11 +653,18 @@ async def run_camera_runtime_trajectory(
             existing_event_id=nutrition_event_id,
             original_commit=commit,
             current_commit=current_commit,
+            typed_replay=action.callback_data is None,
         )
         if replay_event_id != nutrition_event_id:
             raise AssertionError("completed-photo replay event identity differs from existing meal")
-        if isinstance(bot_client, OfflineCameraBotApi) and bot_client.finalization_proposals != 1:
-            raise AssertionError("completed-photo replay proposed another nutrition observation")
+        if (
+            isinstance(bot_client, OfflineCameraBotApi)
+            and bot_client.finalization_proposals != initial_finalization_proposals
+        ):
+            raise AssertionError(
+                "completed-photo replay proposed another nutrition observation "
+                f"(before={initial_finalization_proposals}, after={bot_client.finalization_proposals})"
+            )
 
         return {
             "started": first_started,
