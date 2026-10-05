@@ -8,6 +8,7 @@ import io
 import stat
 import subprocess
 import sys
+from contextvars import ContextVar
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -24,9 +25,55 @@ from probe_support import (  # noqa: E402
     require_bound_answer,
     select_finalizer_event,
     source_jpeg,
+    call_wellness_with_synthetic_self,
     unique_honcho_scope,
     verify_source_worktree,
 )
+
+
+class _ProbeWellnessAuthorizationContext:
+    def __init__(self):
+        self._context = ContextVar("probe_wellness_authorized_read", default=None)
+
+    def get(self):
+        return self._context.get()
+
+    def set(self, value):
+        return self._context.set(value)
+
+    def reset(self, token):
+        self._context.reset(token)
+
+
+@pytest.mark.asyncio
+async def test_direct_probe_wellness_read_resets_authority_after_success_and_failure():
+    authorization_context = _ProbeWellnessAuthorizationContext()
+    authorized_read = object()
+
+    class App:
+        async def call_tool(self, name, arguments):
+            assert name == "get_wellness_data"
+            assert arguments == {"params": {"start": "synthetic"}}
+            assert authorization_context.get() is authorized_read
+            return "synthetic result"
+
+    app = App()
+    arguments = {"params": {"start": "synthetic"}}
+    assert await call_wellness_with_synthetic_self(
+        app, authorization_context, lambda _body: authorized_read, arguments
+    ) == "synthetic result"
+    assert authorization_context.get() is None
+
+    class FailingApp(App):
+        async def call_tool(self, name, arguments):
+            await super().call_tool(name, arguments)
+            raise RuntimeError("synthetic tool failure")
+
+    with pytest.raises(RuntimeError, match="synthetic tool failure"):
+        await call_wellness_with_synthetic_self(
+            FailingApp(), authorization_context, lambda _body: authorized_read, arguments
+        )
+    assert authorization_context.get() is None
 
 
 def test_storage_run_is_persistent_restricted_and_ignored():

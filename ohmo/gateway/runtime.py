@@ -5059,10 +5059,11 @@ class OhmoSessionRuntimePool:
         """Choose one invocation actor from live or freshly checked admission."""
         if reminder is not None:
             return self._apply_reminder_wellness_turn(bundle, reminder)
-        actor = _wellness_actor_for_turn(turn_ctx)
-        if actor is not None:
-            return actor
-        return None
+        registry = getattr(bundle, "tool_registry", None)
+        tool = registry.get(_WELLNESS_TOOL_NAME) if registry is not None else None
+        if not isinstance(tool, WellnessLoginInjectingAdapter):
+            return None
+        return _wellness_actor_for_turn(turn_ctx)
 
     def _validated_reminder_wellness_tenant(
         self, reminder: _TrustedReminderWellnessAdmission

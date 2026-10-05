@@ -70,6 +70,10 @@ async def verify_finalizer_event(
     from telegent.health_advisor.nutrition.sync import sync_nutrition_honcho
     from telegent.health_advisor.storage import HealthDataStore
     from telegent.mcp_simple_auth.wellness import register_wellness_tools
+    from probe_support import (
+        call_wellness_with_synthetic_self,
+        synthetic_wellness_self_scope,
+    )
 
     async with HonchoClient(url, "local-auth-disabled", workspace) as client:
         messages = await client.list_recent_message_metadata(
@@ -156,6 +160,9 @@ async def verify_finalizer_event(
         print(f"Finalizer projection retained at {directory}", flush=True)
         db = NutritionDataStore(directory / "nutrition.db")
         health = HealthDataStore(directory / "health.db")
+        participant_registry, authorization_context, authorized_read = (
+            synthetic_wellness_self_scope("synthetic_owner")
+        )
         try:
             app = FastMCP(name="camera-finalizer-probe")
 
@@ -170,18 +177,19 @@ async def verify_finalizer_event(
                 read_only_annotations=ToolAnnotations(readOnlyHint=True),
                 get_health_store=get_health_store,
                 get_nutrition_store=get_nutrition_store,
-                wellness_user_id="synthetic_owner",
+                participant_registry=participant_registry,
+                authorization_context=authorization_context,
             )
 
             async def balance():
-                result = await app.call_tool(
-                    "get_wellness_data",
-                    {
-                        "params": {
-                            "start": (expected_capture_time - timedelta(days=1)).isoformat(),
-                            "end": (expected_capture_time + timedelta(days=1)).isoformat(),
-                        }
-                    },
+                arguments = {
+                    "params": {
+                        "start": (expected_capture_time - timedelta(days=1)).isoformat(),
+                        "end": (expected_capture_time + timedelta(days=1)).isoformat(),
+                    }
+                }
+                result = await call_wellness_with_synthetic_self(
+                    app, authorization_context, authorized_read, arguments
                 )
                 meals = result[1]["nutrition_records"]
                 return meals, sum(meal["energy_kcal_best"] or 0 for meal in meals)
@@ -240,6 +248,10 @@ async def verify_zero_meals_before_answer(
     from telegent.health_advisor.nutrition.sync import sync_nutrition_honcho
     from telegent.health_advisor.storage import HealthDataStore
     from telegent.mcp_simple_auth.wellness import register_wellness_tools
+    from probe_support import (
+        call_wellness_with_synthetic_self,
+        synthetic_wellness_self_scope,
+    )
 
     async with HonchoClient(url, "local-auth-disabled", workspace) as client:
         messages = await client.list_recent_message_metadata(
@@ -281,6 +293,9 @@ async def verify_zero_meals_before_answer(
     directory = create_storage_run_dir(ROOT)
     db = NutritionDataStore(directory / "nutrition.db")
     health = HealthDataStore(directory / "health.db")
+    participant_registry, authorization_context, authorized_read = (
+        synthetic_wellness_self_scope("synthetic_owner")
+    )
     try:
         app = FastMCP(name="camera-before-answer-probe")
 
@@ -295,17 +310,18 @@ async def verify_zero_meals_before_answer(
             read_only_annotations=ToolAnnotations(readOnlyHint=True),
             get_health_store=get_health_store,
             get_nutrition_store=get_nutrition_store,
-            wellness_user_id="synthetic_owner",
+            participant_registry=participant_registry,
+            authorization_context=authorization_context,
         )
         await sync_nutrition_honcho(credentials=credentials, db=db)
-        result = await app.call_tool(
-            "get_wellness_data",
-            {
-                "params": {
-                    "start": (capture_time - timedelta(days=1)).isoformat(),
-                    "end": (capture_time + timedelta(days=1)).isoformat(),
-                }
-            },
+        arguments = {
+            "params": {
+                "start": (capture_time - timedelta(days=1)).isoformat(),
+                "end": (capture_time + timedelta(days=1)).isoformat(),
+            }
+        }
+        result = await call_wellness_with_synthetic_self(
+            app, authorization_context, authorized_read, arguments
         )
         meals = result[1]["nutrition_records"]
         if meals or sum(meal["energy_kcal_best"] or 0 for meal in meals) != 0:

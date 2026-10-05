@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 META_KEY = "io.telegent/wellness-delegation/v1"
-_KID = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
+_KID = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 
 
 @dataclass(frozen=True)
@@ -42,11 +42,11 @@ class WellnessDelegationConfig:
         configured = (kid, issuer, audience, client_id)
         if (
             len(key) < 32
+            or any(len(value) > 512 for value in values if value is not None)
+            or any(ord(char) < 0x20 for value in values for char in value or "")
             or not _KID.fullmatch(kid)
             or any(
-                value != value.strip()
-                or any(char.isspace() or ord(char) < 32 for char in value)
-                for value in configured
+                value != value.strip() for value in configured[1:]
             )
         ):
             raise ValueError("wellness delegation configuration is invalid")

@@ -50,6 +50,8 @@ CAMERA_TELEGENT_WORKTREE="$CAMERA_TELEGENT_WORKTREE" \
 
 The offline run checks fixture upload through the production Telegent Camera submission client, the Ohmo listener and attempt journal, synthetic native receipt handling, and stable replay. It does not call a model or Dropbox/Telegram service. `run_storage_chain.py` writes synthetic observation/correction fixtures to the isolated Honcho API and checks Telegent sync and wellness reads; it does not exercise the Camera owner-answer gate or model finalizer. `run_honcho.py` checks a synthetic nonmeal Honcho message.
 
+The direct wellness-helper reads in `run_storage_chain.py` and in `run_joined.py`'s before-answer and finalizer checks use an explicit synthetic self scope: participant `123` maps to the probe's synthetic owner. Each read installs that authorization only for the call and resets it in `finally`. These are in-process storage/helper checks; they do not establish HTTP or MCP wire authorization. Signed wire authorization has separate focused client and verifier tests.
+
 ## Native subscription acceptance
 
 For native acceptance, configure the existing Codex subscription profile for `gpt-6-luna` with medium reasoning and bind its settings directory read-only. Use a separate native subscription client for the virtual user. `run_joined.py` rejects provider fallback and checks the subscription profile, model, and two distinct clients; it does not validate the configured reasoning effort. Also use a lead-selected clean OpenHarness/Telegent pair. Supply the owner scenario and an approved bounded JPEG with its matching SHA-256. The source JPEG must be Git-ignored and inside the OpenHarness worktree.

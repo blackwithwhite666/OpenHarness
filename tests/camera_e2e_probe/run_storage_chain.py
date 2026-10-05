@@ -32,6 +32,10 @@ from telegent.health_advisor.nutrition.store import NutritionDataStore  # noqa: 
 from telegent.health_advisor.nutrition.sync import sync_nutrition_honcho  # noqa: E402
 from telegent.health_advisor.storage import HealthDataStore  # noqa: E402
 from telegent.mcp_simple_auth.wellness import register_wellness_tools  # noqa: E402
+from probe_support import (  # noqa: E402
+    call_wellness_with_synthetic_self,
+    synthetic_wellness_self_scope,
+)
 
 
 def assert_same_window_bound(actual: str, expected: datetime, *, label: str) -> None:
@@ -87,6 +91,9 @@ async def main() -> None:
     )
     source_id = credentials.sources[0].cursor_source_id
     app = FastMCP(name="camera-storage-probe")
+    participant_registry, authorization_context, authorized_read = (
+        synthetic_wellness_self_scope(owner)
+    )
 
     async def get_health_store() -> HealthDataStore:
         return health
@@ -99,18 +106,19 @@ async def main() -> None:
         read_only_annotations=ToolAnnotations(readOnlyHint=True),
         get_health_store=get_health_store,
         get_nutrition_store=get_nutrition_store,
-        wellness_user_id=owner,
+        participant_registry=participant_registry,
+        authorization_context=authorization_context,
     )
 
     async def balance():
-        result = await app.call_tool(
-            "get_wellness_data",
-            {
-                "params": {
-                    "start": start.isoformat(),
-                    "end": end.isoformat(),
-                }
-            },
+        arguments = {
+            "params": {
+                "start": start.isoformat(),
+                "end": end.isoformat(),
+            }
+        }
+        result = await call_wellness_with_synthetic_self(
+            app, authorization_context, authorized_read, arguments
         )
         payload = result[1]
         meals = payload["nutrition_records"]

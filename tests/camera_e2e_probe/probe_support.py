@@ -9,7 +9,9 @@ import re
 import subprocess
 import tempfile
 import warnings
+from collections.abc import Mapping
 from pathlib import Path
+from types import MappingProxyType
 from uuid import uuid4
 
 from PIL import Image, UnidentifiedImageError
@@ -18,6 +20,55 @@ from ohmo.gateway.camera import CAMERA_AUTHORITY
 
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _GIT_SHA = re.compile(r"[0-9a-f]{40}\Z")
+
+
+def synthetic_wellness_self_scope(user_id: str):
+    """Build explicit in-process self authority for a synthetic owner probe."""
+    from telegent.mcp_simple_auth.wellness import WellnessAuthorizationContext
+    from telegent.mcp_simple_auth.wellness_delegation import AuthorizedWellnessRead
+    from telegent.mcp_simple_auth.wellness_identity import (
+        WellnessParticipant,
+        WellnessParticipantRegistry,
+    )
+
+    registry = WellnessParticipantRegistry(
+        default_participant_id=123,
+        participants={
+            123: WellnessParticipant(123, user_id, "synthetic_owner")
+        },
+    )
+    authorization_context = WellnessAuthorizationContext()
+
+    def authorized_read(body: Mapping[str, object]) -> AuthorizedWellnessRead:
+        params = body.get("params")
+        if not isinstance(params, Mapping):
+            raise ValueError("synthetic wellness probe requires params")
+        frozen_body = MappingProxyType(
+            {"params": MappingProxyType(dict(params))}
+        )
+        return AuthorizedWellnessRead(
+            reader_participant_id=123,
+            target_participant_id=123,
+            target_user_id=user_id,
+            is_self=True,
+            body=frozen_body,
+        )
+
+    return registry, authorization_context, authorized_read
+
+
+async def call_wellness_with_synthetic_self(
+    app,
+    authorization_context,
+    authorized_read,
+    arguments: Mapping[str, object],
+):
+    """Scope one direct helper read and always restore its async-local context."""
+    token = authorization_context.set(authorized_read(arguments))
+    try:
+        return await app.call_tool("get_wellness_data", dict(arguments))
+    finally:
+        authorization_context.reset(token)
 
 
 def create_storage_run_dir(root: Path) -> Path:

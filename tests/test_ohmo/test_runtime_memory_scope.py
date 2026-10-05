@@ -1422,6 +1422,9 @@ async def test_admitted_scheduler_wellness_flows_through_query_engine_to_signed_
     pool._gateway_config = admitted_config
     actor = pool._wellness_actor_for_submission(bundle, None, reminder)
     assert actor is not None and actor.telegram_id == "100"
+    assert pool._wellness_actor_for_submission(
+        SimpleNamespace(tool_registry=None), _context("100", owner=True), None
+    ) is None
 
     class ReminderApi:
         calls = 0

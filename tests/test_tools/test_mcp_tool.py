@@ -279,6 +279,36 @@ def _admitted_context(telegram_id: str = "116870365") -> ToolExecutionContext:
     )
 
 
+def test_wellness_signer_config_matches_verifier_bounds(monkeypatch):
+    from openharness.mcp.wellness_delegation import WellnessDelegationConfig
+
+    _set_synthetic_wellness_config(monkeypatch)
+    padded_secret = " " + "s" * 32 + " "
+    monkeypatch.setenv("WELLNESS_DELEGATION_SIGNING_KEY", padded_secret)
+    monkeypatch.setenv("WELLNESS_DELEGATION_KID", "k" * 64)
+    config = WellnessDelegationConfig.from_env()
+    assert config.kid == "k" * 64
+    assert config.key == padded_secret.encode("utf-8")
+
+    monkeypatch.setenv("WELLNESS_DELEGATION_KID", "k" * 65)
+    with pytest.raises(ValueError):
+        WellnessDelegationConfig.from_env()
+
+    monkeypatch.setenv("WELLNESS_DELEGATION_KID", "test-key")
+    monkeypatch.setenv("WELLNESS_DELEGATION_SIGNING_KEY", "s" * 513)
+    with pytest.raises(ValueError):
+        WellnessDelegationConfig.from_env()
+
+    monkeypatch.setenv("WELLNESS_DELEGATION_SIGNING_KEY", "s" * 32 + "\x01")
+    with pytest.raises(ValueError):
+        WellnessDelegationConfig.from_env()
+
+    monkeypatch.setenv("WELLNESS_DELEGATION_SIGNING_KEY", padded_secret)
+    monkeypatch.setenv("WELLNESS_DELEGATION_ISSUER", "i" * 513)
+    with pytest.raises(ValueError):
+        WellnessDelegationConfig.from_env()
+
+
 def _energy_fixture() -> str:
     return (Path(__file__).parents[1] / "fixtures" / "wellness_energy_days.json").read_text(
         encoding="utf-8"
