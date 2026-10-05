@@ -66,7 +66,7 @@ async def _save_callback_portion(tmp_path, monkeypatch):
     return ingress, bus, request, pool, honcho, portion, saved_final
 
 
-async def _save_typed_confirmation(tmp_path, monkeypatch):
+async def _save_typed_confirmation(tmp_path, monkeypatch, label="Да, я это съела"):
     ingress, root, bus, _ = _ingress(tmp_path, FakeTelegram())
     request = _candidate(root)
     assert (await _admit(ingress, root, "Bearer " + "s" * 40, request))[0] == 202
@@ -75,10 +75,10 @@ async def _save_typed_confirmation(tmp_path, monkeypatch):
     pool = runtime_pool(tmp_path, ingress, honcho, monkeypatch)
     photo_id = ingress._attempts[request["candidate_id"]]["photo_id"]
     answer = InboundMessage(
-        channel="telegram", sender_id="123", chat_id="123", content="Да, я это съела",
+        channel="telegram", sender_id="123", chat_id="123", content=label,
         metadata={"message_id": "typed-camera-first-confirmation",
                   "reply_to_message_id": str(photo_id),
-                  "_telegram_raw_text": "Да, я это съела", "is_group": False,
+                  "_telegram_raw_text": label, "is_group": False,
                   "chat_type": "private"},
     )
     ingress.process_real_inbound(answer)
@@ -88,6 +88,36 @@ async def _save_typed_confirmation(tmp_path, monkeypatch):
     assert saved_final.metadata["nutrition_append_event_id"] == "honcho-2"
     assert len(honcho.messages) == 2
     return ingress, request, pool, honcho, saved_final, answer
+
+
+@pytest.mark.asyncio
+async def test_runtime_reconciles_identical_typed_composition_repeat(
+    tmp_path, monkeypatch
+):
+    label = "Всё: яйцо и рис."
+    ingress, request, pool, honcho, saved_final, _ = await _save_typed_confirmation(
+        tmp_path, monkeypatch, label
+    )
+    attempt = ingress._attempts[request["candidate_id"]]
+    replay = InboundMessage(
+        channel="telegram", sender_id="123", chat_id="123", content=label,
+        metadata={"message_id": "typed-camera-composition-repeat",
+                  "reply_to_message_id": str(attempt["photo_id"]),
+                  "_telegram_raw_text": label, "is_group": False,
+                  "chat_type": "private"},
+    )
+    ingress.process_real_inbound(replay)
+    assert replay.metadata.get("_camera_typed_replay_candidate") == request["candidate_id"]
+    before_turns = len(pool._test_bundle.engine.turns)
+    final = await runtime_turn(pool, replay, ingress)
+    assert final.text == "Эта порция уже записана."
+    assert final.metadata["nutrition_append_event_id"] == saved_final.metadata[
+        "nutrition_append_event_id"
+    ]
+    assert replay.metadata.get("_camera_typed_replay") is True
+    assert len(pool._test_bundle.engine.turns) == before_turns
+    assert len(honcho.messages) == 2
+    await ingress.close()
 
 
 @pytest.mark.asyncio
