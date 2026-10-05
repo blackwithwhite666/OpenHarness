@@ -14,9 +14,6 @@ import hashlib
 import json
 from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-
-
 from openharness.channels.bus.events import (
     InboundMessage, OutboundDeliveryReceipt, OutboundMessage,
 )
@@ -28,6 +25,8 @@ from ohmo.evals.nutrition_persistence import (
 from tests.test_ohmo.test_camera_completed_replay import (
     _native_callback, _save_callback_portion, _save_typed_confirmation,
 )
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 @pytest.mark.asyncio
