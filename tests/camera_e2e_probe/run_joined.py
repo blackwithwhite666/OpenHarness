@@ -561,10 +561,12 @@ async def main() -> None:
             if producer_replay.duplicate_suppression != 1:
                 raise AssertionError("post-finalization producer replay was not suppressed")
             if (
-                not trajectory["owner_replay_unbound"]
-                or trajectory["owner_replay_event_id"] is not None
+                not trajectory["owner_replay_saved_status"]
+                or "уже записана" not in trajectory["owner_replay_saved_status"].casefold()
+                or not trajectory["owner_replay_delivery_confirmed"]
+                or trajectory["owner_replay_event_id"] != event_id
             ):
-                raise AssertionError("completed-photo owner replay was not consumed as unbound")
+                raise AssertionError("completed-photo replay did not confirm the existing meal")
             await verify_finalizer_event(
                 url=honcho_url,
                 workspace=workspace,

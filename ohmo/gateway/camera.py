@@ -4017,7 +4017,34 @@ class CameraIngress:
                     elif bind_denial(candidate_id, attempt, "context"):
                         return
         if intent != "no" and target_matches:
-            _, attempt = target_matches[0]
+            candidate_id, attempt = target_matches[0]
+            if (
+                callback
+                and attempt.get("state") == "completed"
+                and isinstance(attempt.get("camera_commit"), dict)
+                and target is not None
+                and _native_button_answer_kind(metadata, raw_text) == "yes"
+                and isinstance(attempt.get("answer_turn_id"), str)
+                and attempt.get("finalizer_status") == "committed"
+                and _source_message_id(metadata.get("callback_query_id")) is not None
+                and not isinstance(attempt.get("camera_correction_commit"), dict)
+                and attempt.get("camera_correction") is None
+            ):
+                # A completed affirmative callback may be a deliberate second
+                # tap of the same portion. Runtime must reconcile the exact
+                # saved exchange and compare its durable user text before
+                # reporting the existing meal; ingress alone cannot assert it.
+                metadata.update(
+                    _camera_authority=CAMERA_AUTHORITY,
+                    _camera_candidate_id=candidate_id,
+                    _camera_answer="yes",
+                    _camera_turn_id=attempt["answer_turn_id"],
+                    _camera_route="callback",
+                    _camera_native_binding=str(target),
+                    _camera_existing_meal_replay=True,
+                    _camera_ingress_callback_eligible=True,
+                )
+                return
             if (
                 attempt.get("state") in {"completed", "delivery_unknown"}
                 and (

@@ -1785,6 +1785,107 @@ class OhmoSessionRuntimePool:
             turn_ctx,
             memory_scope=memory_scope,
         )
+        if camera_authorized and message.metadata.get("_camera_existing_meal_replay") is True:
+            candidate_id = message.metadata.get("_camera_candidate_id")
+            turn_id = message.metadata.get("_camera_turn_id")
+            attempt = self._camera_ingress._attempts.get(candidate_id)
+            commit = attempt.get("camera_commit") if isinstance(attempt, dict) else None
+            backend = self._shadow_backend_for_scope(memory_scope)
+            try:
+                if (
+                    backend is None
+                    or not isinstance(candidate_id, str)
+                    or not isinstance(turn_id, str)
+                    or not isinstance(commit, Mapping)
+                ):
+                    raise ConversationReconciliationError(
+                        "completed Camera meal receipt is unavailable"
+                    )
+                receipt = await backend.reconcile_durable_exchange(
+                    f"{turn_id}:user", f"{turn_id}:assistant"
+                )
+                selected_label = message.metadata.get("native_keyboard_selected_label")
+                if not isinstance(receipt, ConversationAppendReceipt):
+                    raise ConversationReconciliationError(
+                        "completed Camera exchange receipt is unavailable"
+                    )
+                assistant_metadata = receipt.assistant_metadata
+                trace = (
+                    assistant_metadata.get("decision_trace")
+                    if isinstance(assistant_metadata, Mapping) else None
+                )
+                annotations = trace.get("annotations") if isinstance(trace, Mapping) else None
+                nutrition = annotations.get("nutrition") if isinstance(annotations, Mapping) else None
+                if (
+                    not isinstance(assistant_metadata, Mapping)
+                    or not isinstance(trace, Mapping)
+                    or not isinstance(annotations, Mapping)
+                    or not isinstance(nutrition, Mapping)
+                ):
+                    raise ConversationReconciliationError(
+                        "completed Camera receipt lacks validated nutrition evidence"
+                    )
+                validated = NutritionAnnotationV2.model_validate(nutrition)
+                source_message_id = _normalize_source_message_ref(
+                    message.metadata.get("message_id")
+                )
+                if (
+                    receipt.assistant_message_id != commit.get("event_id")
+                    or receipt.assistant_client_op_id != commit.get("client_op_id")
+                    or receipt.user_client_op_id != f"{turn_id}:user"
+                    or receipt.assistant_client_op_id != f"{turn_id}:assistant"
+                    or not isinstance(receipt.user_content, str)
+                    or not isinstance(selected_label, str)
+                    or receipt.user_content != selected_label
+                    or assistant_metadata.get("role") != "assistant"
+                    or assistant_metadata.get("client_op_id") != f"{turn_id}:assistant"
+                    or assistant_metadata.get("logical_turn_id") != turn_id
+                    or assistant_metadata.get("camera_candidate_id") != candidate_id
+                    or assistant_metadata.get("camera_operation_id") != candidate_id
+                    or assistant_metadata.get("camera_answer_bound") != "yes"
+                    or assistant_metadata.get("camera_reply_to_native_message_id")
+                    != message.metadata.get("_camera_native_binding")
+                    or assistant_metadata.get("gateway_session_id") != turn_ctx.session_id
+                    or assistant_metadata.get("tenant_id") != memory_scope.private_tenant
+                    or assistant_metadata.get("source_principal")
+                    != f"telegram:{canonical_principal(message.channel, turn_ctx.principal)}"
+                    or assistant_metadata.get("source_message_id")
+                    != commit.get("source_message_id")
+                    or assistant_metadata.get("source_message_id") != source_message_id
+                    or assistant_metadata.get("ingest_source") != "dropbox_camera"
+                    or assistant_metadata.get("confirmation_required") is not True
+                    or assistant_metadata.get("is_group") is not False
+                    or assistant_metadata.get("is_forwarded") is not False
+                    or validated.record_type != "meal_observation"
+                    or validated.consumption_status != "consumed"
+                    or "image" not in validated.basis
+                    or validated.meal_at != self._camera_ingress._attempt_capture_time(attempt)
+                    or validated.meal_date is not None
+                    or validated.explicit_new_consumption
+                ):
+                    raise ConversationReconciliationError(
+                        "completed Camera receipt did not prove the same saved portion"
+                    )
+                self._camera_ingress.recover_legacy_committed_meal(
+                    candidate_id, turn_id, receipt
+                )
+                yield GatewayStreamUpdate(
+                    kind="final",
+                    text="Эта порция уже записана.",
+                    metadata={
+                        "_session_key": session_key,
+                        "camera_reconciled": candidate_id,
+                        "nutrition_append_event_id": receipt.assistant_message_id,
+                    },
+                )
+            except (ConversationReconciliationError, ValueError):
+                logger.warning("completed Camera replay remains unresolved candidate=%s", candidate_id)
+                yield GatewayStreamUpdate(
+                    kind="error",
+                    text="Не получилось подтвердить запись этой порции. Новая запись не добавлена.",
+                    metadata={"_session_key": session_key},
+                )
+            return
         if camera_authorized and (
             message.metadata.get("_camera_legacy_reconcile") is True
             or message.metadata.get("_camera_reconcile_then_correction") is CAMERA_AUTHORITY
