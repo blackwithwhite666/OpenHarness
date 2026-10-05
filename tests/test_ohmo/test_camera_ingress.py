@@ -1165,6 +1165,7 @@ async def test_native_consumption_portion_choice_binds_with_full_prompt_context(
     ingress.note_assistant_receipt(final_message, final_receipt)
     assert attempt["state"] == "completed"
     rows_before_replay = len(server.rows)
+    model_calls_before_replay = len(bundle.engine.messages)
     replay = await _native_callback(
         bus, label=label, target=clicked.metadata["message_id"],
         options=options, prompt=clicked.metadata["native_keyboard_prompt"],
@@ -1173,11 +1174,24 @@ async def test_native_consumption_portion_choice_binds_with_full_prompt_context(
     assert "_camera_authority" not in replay.metadata
     assert "_camera_candidate_id" not in replay.metadata
     ingress.process_real_inbound(replay)
-    assert replay.metadata.get("_camera_answer") is None
-    assert replay.metadata["_camera_unbound"] is CAMERA_AUTHORITY
+    assert replay.metadata["_camera_answer"] == "yes"
+    assert replay.metadata["_camera_existing_meal_replay"] is True
+    runtime_replay, replay_ctx, _ = joint_runtime.inbound(
+        pool, replay.metadata["message_id"], replay.content,
+        when=joint_runtime.BASE + timedelta(minutes=102),
+        metadata_extra=replay.metadata,
+    )
+    assert not replay_ctx.camera_authorized
+    replay_updates = [
+        update async for update in pool.stream_message(runtime_replay, "telegram:123")
+    ]
+    replay_final = next(update for update in replay_updates if update.kind == "final")
+    assert replay_final.text == "Эта порция уже записана."
+    assert replay_final.metadata["nutrition_append_event_id"] == committed_event_id
     assert attempt["state"] == "completed"
     assert attempt["camera_commit"]["event_id"] == committed_event_id
     assert len(server.rows) == rows_before_replay
+    assert len(bundle.engine.messages) == model_calls_before_replay
     assert sum(
         row["metadata"].get("role") == "assistant"
         and row["metadata"].get("camera_candidate_id") == request["candidate_id"]

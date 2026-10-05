@@ -30,6 +30,7 @@ from ohmo.gateway.camera import (
     CAMERA_CONTEXT_QUESTION_AUTHORITY,
     COALESCED_ATTACHMENT_PROVENANCE_AUTHORITY,
     RetainedAttachmentEvidence,
+    _validate_camera_portion_correction_annotation,
 )
 from ohmo.gateway.config import load_gateway_config
 from ohmo.gateway.group_tool import (
@@ -1666,6 +1667,24 @@ class OhmoSessionRuntimePool:
     def _with_camera_turn_context(
         cls, prompt: str, message: InboundMessage, capture_time: datetime | None
     ) -> str:
+        if message.metadata.get("_camera_portion_correction") is CAMERA_AUTHORITY:
+            previous = message.metadata.get("_camera_prior_portion_label")
+            selected = message.metadata.get("native_keyboard_selected_label")
+            if not isinstance(previous, str) or not isinstance(selected, str):
+                return prompt
+            return (
+                prompt + "\n\n# Verified Camera portion correction\n"
+                "The authenticated owner changed the selected portion for the same "
+                "already-recorded Camera meal. The original saved selection was "
+                f"{previous!r}; the owner's current native selection is {selected!r}. "
+                "Use the retained original photo and correct only the existing meal. "
+                "Finalize a sparse schema-v2 `meal_correction`; omit "
+                "`consumption_status` so the saved consumed status stays unchanged. "
+                "Include `items` and every recalculated nutrition field in "
+                "`changed_fields`, and provide replacements only for masked fields. "
+                "Keep the original meal date and time unchanged. Do not append a second "
+                "meal observation or describe the old portion as saved again."
+            )
         if message.metadata.get("_camera_context_hint") is CAMERA_AUTHORITY:
             prompt += (
                 "\n\n# Camera food context only\n"
@@ -1870,6 +1889,12 @@ class OhmoSessionRuntimePool:
                 )
                 annotations = trace.get("annotations") if isinstance(trace, Mapping) else None
                 nutrition = annotations.get("nutrition") if isinstance(annotations, Mapping) else None
+                changed_native_portion = (
+                    not typed_replay
+                    and isinstance(receipt.user_content, str)
+                    and isinstance(selected_label, str)
+                    and receipt.user_content != selected_label
+                )
                 if (
                     not isinstance(assistant_metadata, Mapping)
                     or not isinstance(trace, Mapping)
@@ -1890,7 +1915,6 @@ class OhmoSessionRuntimePool:
                     or receipt.assistant_client_op_id != f"{turn_id}:assistant"
                     or not isinstance(receipt.user_content, str)
                     or not isinstance(selected_label, str)
-                    or (not typed_replay and receipt.user_content != selected_label)
                     or assistant_metadata.get("role") != "assistant"
                     or assistant_metadata.get("client_op_id") != f"{turn_id}:assistant"
                     or assistant_metadata.get("logical_turn_id") != turn_id
@@ -1930,6 +1954,10 @@ class OhmoSessionRuntimePool:
                     # This is a changed reply, not an idempotent repeat. Let the
                     # established conversation/source-selection flow handle it.
                     message.metadata.pop("_camera_typed_replay_candidate", None)
+                elif changed_native_portion:
+                    self._camera_ingress.authorize_recovered_camera_portion_correction(
+                        message, candidate_id, turn_id, receipt, selected_label
+                    )
                 else:
                     if typed_replay:
                         message.metadata.update(
@@ -2880,10 +2908,14 @@ class OhmoSessionRuntimePool:
             return
         reply = str(guard_state["reply"] or "")
 
+        camera_portion_correction = (
+            message.metadata.get("_camera_portion_correction") is CAMERA_AUTHORITY
+        )
         camera_yes = (
             turn_ctx.camera_authorized
             and message.metadata.get("_camera_answer") == "yes"
             and message.metadata.get("_camera_authority") is CAMERA_AUTHORITY
+            and not camera_portion_correction
         )
         camera_clarification = bool(
             camera_yes
@@ -2969,16 +3001,27 @@ class OhmoSessionRuntimePool:
             )
             camera_ingress = getattr(self, "_camera_ingress", None)
             camera_commit = None
+            camera_correction_commit = None
             if camera_ingress is not None and turn_ctx.camera_authorized:
                 candidate_id = message.metadata.get("_camera_candidate_id")
                 attempt = camera_ingress._attempts.get(candidate_id)
                 if isinstance(attempt, dict):
                     camera_commit = attempt.get("camera_commit")
+                    camera_correction_commit = attempt.get("camera_correction_commit")
             camera_meal_saved = bool(
                 append_receipt is not None
                 and isinstance(camera_commit, dict)
                 and camera_commit.get("event_id") == append_receipt.assistant_message_id
                 and camera_commit.get("client_op_id") == append_receipt.assistant_client_op_id
+            )
+            camera_correction_saved = bool(
+                camera_portion_correction
+                and append_receipt is not None
+                and isinstance(camera_correction_commit, dict)
+                and camera_correction_commit.get("event_id") == append_receipt.assistant_message_id
+                and camera_correction_commit.get("client_op_id") == append_receipt.assistant_client_op_id
+                and camera_correction_commit.get("target_event_id")
+                == message.metadata.get("_camera_original_event_id")
             )
             ordinary_meal_saved = bool(
                 ordinary_meal and append_receipt is not None
@@ -3136,7 +3179,7 @@ class OhmoSessionRuntimePool:
             if camera_ingress is not None and turn_ctx.camera_authorized:
                 camera_ingress.complete(
                     message,
-                    recorded=camera_meal_saved,
+                    recorded=camera_meal_saved or camera_correction_saved,
                     clarification=(
                         camera_clarification
                         or message.metadata.get("_camera_context_question")
@@ -3157,6 +3200,12 @@ class OhmoSessionRuntimePool:
             if camera_meal_saved and isinstance(camera_commit, dict):
                 metadata.update(
                     nutrition_append_event_id=camera_commit["event_id"],
+                    nutrition_sync_status="pending",
+                )
+            elif camera_correction_saved and isinstance(camera_correction_commit, dict):
+                reply = "Изменение сохранено; баланс обновляется."
+                metadata.update(
+                    nutrition_append_event_id=camera_correction_commit["event_id"],
                     nutrition_sync_status="pending",
                 )
             elif camera_yes and finalizer_nutrition is not None:
@@ -3324,11 +3373,21 @@ class OhmoSessionRuntimePool:
             and message.metadata.get("_camera_answer") in {"yes", "no"}
             and message.metadata.get("_camera_authority") is CAMERA_AUTHORITY
         )
-        camera_yes = camera_bound_answer and message.metadata.get("_camera_answer") == "yes"
+        camera_portion_correction = (
+            message.metadata.get("_camera_portion_correction") is CAMERA_AUTHORITY
+        )
+        camera_yes = (
+            camera_bound_answer
+            and message.metadata.get("_camera_answer") == "yes"
+            and not camera_portion_correction
+        )
         camera_correction = (
             message.metadata.get("_camera_authority") is CAMERA_AUTHORITY
             and message.metadata.get("_camera_correction") is CAMERA_AUTHORITY
-            and message.metadata.get("_camera_answer") == "no"
+            and (
+                message.metadata.get("_camera_answer") == "no"
+                or camera_portion_correction
+            )
         )
         selected_binding = message.metadata.get("_selected_source_binding")
         camera_context_question = (
@@ -3441,7 +3500,9 @@ class OhmoSessionRuntimePool:
             if not isinstance(target, dict) or annotation is None:
                 raise ValueError("Camera denial requires a retained committed meal target")
             assert validated is not None
-            if (
+            if camera_portion_correction:
+                _validate_camera_portion_correction_annotation(annotation)
+            elif (
                 validated.record_type != "meal_correction"
                 or validated.consumption_status != "not_consumed"
                 or "consumption_status" not in validated.changed_fields

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -263,7 +264,7 @@ async def test_runtime_transport_retry_survives_camera_journal_restart(tmp_path,
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "failure", ["missing", "invalid", "foreign", "stale", "changed_portion"]
+    "failure", ["missing", "invalid", "foreign", "stale"]
 )
 async def test_runtime_replay_never_claims_saved_without_exact_receipt(
     tmp_path, monkeypatch, failure
@@ -299,9 +300,8 @@ async def test_runtime_replay_never_claims_saved_without_exact_receipt(
     pool._shadow_backend_for_scope = lambda _scope: SimpleNamespace(
         reconcile_durable_exchange=altered_receipt
     )
-    label = "1 кусочек" if failure == "changed_portion" else "2 кусочка"
     replay = await _native_callback(
-        bus, label=label,
+        bus, label="2 кусочка",
         target=ingress._attempts[request["candidate_id"]]["reply_ids"][0],
         options=["1 кусочек", "2 кусочка", "Половину порции"],
         prompt="Вы съели это? Сколько примерно вы съели?",
@@ -319,6 +319,109 @@ async def test_runtime_replay_never_claims_saved_without_exact_receipt(
     assert len(honcho.messages) == 4
     assert ingress._attempts[request["candidate_id"]]["camera_commit"]["event_id"] == "honcho-4"
     assert saved_portion.metadata["_camera_turn_id"] == replay.metadata["_camera_turn_id"]
+    await ingress.close()
+
+
+@pytest.mark.asyncio
+async def test_changed_native_portion_appends_a_bound_immutable_correction(
+    tmp_path, monkeypatch
+):
+    from openharness.engine.stream_events import AssistantTextDelta
+    from openharness.evals import TRACE_FINALIZATION
+
+    ingress, bus, request, pool, honcho, saved_portion, saved_final = (
+        await _save_callback_portion(tmp_path, monkeypatch)
+    )
+    attempt = ingress._attempts[request["candidate_id"]]
+    original_event_id = saved_final.metadata["nutrition_append_event_id"]
+
+    def row_state(item):
+        return (
+            item.id, item.content, item.peer_id, item.session_id,
+            json.loads(json.dumps(item.metadata, ensure_ascii=False, allow_nan=False)),
+            item.created_at, item.workspace_id, item.token_count,
+        )
+
+    original_rows = [row_state(item) for item in honcho.messages]
+    original_meal = next(
+        item for item in honcho.messages
+        if item.id == original_event_id
+    )
+    assert (
+        original_meal.metadata["decision_trace"]["annotations"]["nutrition"]
+        ["consumption_status"] == "consumed"
+    )
+    engine = pool._test_bundle.engine
+    turns_before_correction = len(engine.turns)
+
+    async def correction_turn(user_message):
+        engine.messages.append(user_message)
+        engine.turns.append((user_message.text, [], saved_portion.timestamp))
+        engine.decision_trace_recorder.record(
+            TRACE_FINALIZATION,
+            {
+                "schema_version": 1,
+                "trace_event_id": "camera-portion-correction",
+                "annotations": {
+                    "nutrition": {
+                        "schema_version": 2,
+                        "record_type": "meal_correction",
+                        "changed_fields": ["items", "energy_kcal_best"],
+                        "items": [{
+                            "name": "Мягкий творог Синтетик 5%, упаковка 125 г",
+                            "quantity_text": "1 piece",
+                            "energy_kcal_best": 53,
+                        }],
+                        "energy_kcal_best": 53,
+                    }
+                },
+            },
+        )
+        yield AssistantTextDelta(text="Уменьшила учтённую порцию.")
+
+    engine.submit_message = correction_turn
+    changed = await _native_callback(
+        bus, label="1 кусочек", target=attempt["reply_ids"][0],
+        options=["1 кусочек", "2 кусочка", "Половину порции"],
+        prompt="Вы съели это? Сколько примерно вы съели?",
+    )
+    changed.metadata["callback_query_id"] = "changed-native-portion-correction"
+    ingress.process_real_inbound(changed)
+    assert changed.metadata.get("_camera_existing_meal_replay") is True
+    final = await runtime_turn(pool, changed, ingress)
+
+    assert final.text == "Изменение сохранено; баланс обновляется."
+    assert final.metadata["nutrition_append_event_id"] != original_event_id
+    assert len(engine.turns) == turns_before_correction + 1
+    assert len(honcho.messages) == len(original_rows) + 2
+    assert [row_state(item) for item in honcho.messages[:len(original_rows)]] == original_rows
+    correction_user, correction_assistant = honcho.messages[-2:]
+    assert correction_user.metadata["client_op_id"] == f"{changed.metadata['_camera_turn_id']}:user"
+    assert correction_assistant.metadata["camera_correction_bound"] is True
+    assert correction_assistant.metadata["camera_original_event_id"] == original_event_id
+    stored = correction_assistant.metadata["decision_trace"]["annotations"]["nutrition"]
+    assert stored["record_type"] == "meal_correction"
+    assert "consumption_status" not in stored
+    assert stored["changed_fields"] == ["items", "energy_kcal_best"]
+    assert stored["items"][0]["quantity_text"] == "1 piece"
+    assert stored["energy_kcal_best"] == 53
+    assert "meal_at" not in stored and "meal_date" not in stored
+    nutrition_types = [
+        item.metadata["decision_trace"]["annotations"]["nutrition"]["record_type"]
+        for item in honcho.messages
+        if item.metadata.get("role") == "assistant"
+        and isinstance(item.metadata.get("decision_trace"), dict)
+        and isinstance(item.metadata["decision_trace"].get("annotations"), dict)
+        and isinstance(
+            item.metadata["decision_trace"]["annotations"].get("nutrition"), dict
+        )
+    ]
+    assert nutrition_types.count("meal_observation") == 1
+    assert nutrition_types.count("meal_correction") == 1
+    assert attempt["camera_correction_commit"]["target_event_id"] == original_event_id
+    assert attempt["camera_commit"]["event_id"] == original_event_id
+    assert saved_portion.metadata["_camera_turn_id"] == attempt["answer_turn_id"]
+    assert attempt["camera_correction"] == "completed"
     await ingress.close()
 
 

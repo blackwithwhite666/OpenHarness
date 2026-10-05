@@ -633,6 +633,21 @@ def _validate_camera_correction_annotation(value: Mapping[str, object]):
     return NutritionAnnotationV2.model_validate(normalized)
 
 
+def _validate_camera_portion_correction_annotation(value: Mapping[str, object]):
+    """Validate a sparse quantity patch that preserves the saved meal status/date."""
+    from ohmo.evals.nutrition_trace import NutritionAnnotationV2
+
+    annotation = NutritionAnnotationV2.model_validate(value)
+    if (
+        annotation.record_type != "meal_correction"
+        or "consumption_status" in annotation.model_fields_set
+        or "items" not in annotation.changed_fields
+        or {"consumption_status", "meal_at", "meal_date"} & set(annotation.changed_fields)
+    ):
+        raise ValueError("Camera portion change must preserve the saved meal status and date")
+    return annotation
+
+
 class CameraCandidateRequest(BaseModel):
     """The frozen Camera request allowlist; no producer-authored destination or prompt."""
 
@@ -1966,6 +1981,87 @@ class CameraIngress:
         self._save_attempts()
         return correction_turn
 
+    def authorize_recovered_camera_portion_correction(
+        self, message: InboundMessage, candidate_id: str, original_turn: str,
+        receipt: object, selected_label: str,
+    ) -> str:
+        """Bind a changed native portion to a fresh correction operation."""
+        attempt = self._attempts.get(candidate_id)
+        original = attempt.get("camera_commit") if attempt is not None else None
+        metadata = getattr(receipt, "assistant_metadata", None)
+        assistant_id = getattr(receipt, "assistant_message_id", None)
+        assistant_op = getattr(receipt, "assistant_client_op_id", None)
+        trace = metadata.get("decision_trace") if isinstance(metadata, Mapping) else None
+        annotations = trace.get("annotations") if isinstance(trace, Mapping) else None
+        nutrition = annotations.get("nutrition") if isinstance(annotations, Mapping) else None
+        from ohmo.evals.nutrition_trace import NutritionAnnotationV2
+
+        try:
+            validated = NutritionAnnotationV2.model_validate(nutrition)
+        except (TypeError, ValueError):
+            validated = None
+        if (
+            not isinstance(original, dict)
+            or attempt.get("state") != "completed"
+            or attempt.get("finalizer_status") != "committed"
+            or attempt.get("camera_correction") is not None
+            or isinstance(attempt.get("camera_correction_commit"), dict)
+            or original.get("candidate_id") != candidate_id
+            or original.get("event_id") != assistant_id
+            or original.get("client_op_id") != assistant_op
+            or original.get("client_op_id") != f"{original_turn}:assistant"
+            or getattr(receipt, "user_client_op_id", None) != f"{original_turn}:user"
+            or not isinstance(metadata, Mapping)
+            or metadata.get("role") != "assistant"
+            or metadata.get("logical_turn_id") != original_turn
+            or metadata.get("tenant_id") != self.config.tenant_id
+            or metadata.get("source_principal") != f"telegram:{self.config.principal}"
+            or metadata.get("camera_candidate_id") != candidate_id
+            or metadata.get("camera_operation_id") != candidate_id
+            or metadata.get("camera_answer_bound") != "yes"
+            or metadata.get("source_message_id") != original.get("source_message_id")
+            or _source_message_id(message.metadata.get("message_id"))
+            != original.get("source_message_id")
+            or not isinstance(getattr(receipt, "user_content", None), str)
+            or receipt.user_content == selected_label
+            or message.metadata.get("_camera_authority") is not CAMERA_AUTHORITY
+            or message.metadata.get("_camera_existing_meal_replay") is not True
+            or message.metadata.get("native_keyboard_selected_label") != selected_label
+            or not _CLARIFICATION_QUANTITY_RE.fullmatch(selected_label.strip())
+            or message.metadata.get("native_keyboard_reflection_confirmed") is not True
+            or message.metadata.get("_camera_native_binding")
+            not in {str(attempt.get("photo_id")), *map(str, attempt.get("reply_ids", []))}
+            or not isinstance(message.metadata.get("callback_query_id"), str)
+            or message.metadata.get("callback_query_id") == ""
+            or message.channel != "telegram"
+            or str(message.chat_id) != self.config.chat_id
+            or message.sender_id.split("|", 1)[0] != self.config.principal
+            or validated is None
+            or validated.record_type != "meal_observation"
+            or validated.consumption_status != "consumed"
+            or "image" not in validated.basis
+            or validated.meal_at != self._attempt_capture_time(attempt)
+            or validated.meal_date is not None
+            or validated.explicit_new_consumption
+        ):
+            raise ValueError("Changed Camera portion is not bound to its saved owner meal")
+
+        correction_turn = uuid4().hex
+        attempt["camera_correction"] = "answering"
+        attempt["camera_correction_turn_id"] = correction_turn
+        self._save_attempts()
+        message.metadata.pop("_camera_existing_meal_replay", None)
+        message.metadata.update(
+            _camera_candidate_id=candidate_id,
+            _camera_answer="yes",
+            _camera_correction=CAMERA_AUTHORITY,
+            _camera_portion_correction=CAMERA_AUTHORITY,
+            _camera_turn_id=correction_turn,
+            _camera_prior_portion_label=receipt.user_content,
+            _camera_original_event_id=assistant_id,
+        )
+        return correction_turn
+
     def mark_reconciled_meal_ready(self, candidate_id: str, turn_id: str) -> None:
         attempt = self._attempts.get(candidate_id)
         if (
@@ -2035,7 +2131,8 @@ class CameraIngress:
             or metadata.get("source_principal") != f"telegram:{original.get('principal')}"
             or metadata.get("camera_candidate_id") != candidate_id
             or metadata.get("camera_operation_id") != candidate_id
-            or metadata.get("camera_answer_bound") != "no"
+            or metadata.get("camera_answer_bound")
+            != ("yes" if message.metadata.get("_camera_portion_correction") is CAMERA_AUTHORITY else "no")
             or metadata.get("camera_correction_bound") is not True
             or metadata.get("camera_original_event_id") != original.get("event_id")
             or metadata.get("ingest_source") != "dropbox_camera"
@@ -2046,14 +2143,23 @@ class CameraIngress:
         trace = metadata.get("decision_trace")
         annotations = trace.get("annotations") if isinstance(trace, Mapping) else None
         nutrition = annotations.get("nutrition") if isinstance(annotations, Mapping) else None
-        if (
-            not isinstance(nutrition, Mapping)
-            or nutrition.get("record_type") != "meal_correction"
-            or nutrition.get("consumption_status") != "not_consumed"
-            or "consumption_status" not in nutrition.get("changed_fields", [])
-        ):
-            raise ValueError("Camera correction receipt is not a validated denial patch")
-        observed_annotation = _validate_camera_correction_annotation(nutrition)
+        portion_correction = message.metadata.get("_camera_portion_correction") is CAMERA_AUTHORITY
+        changed_fields = nutrition.get("changed_fields", []) if isinstance(nutrition, Mapping) else []
+        valid_patch = (
+            "consumption_status" not in nutrition
+            and "items" in changed_fields
+            and not {"consumption_status", "meal_at", "meal_date"} & set(changed_fields)
+            if portion_correction and isinstance(nutrition, Mapping)
+            else isinstance(nutrition, Mapping)
+            and nutrition.get("consumption_status") == "not_consumed"
+            and "consumption_status" in changed_fields
+        )
+        if not isinstance(nutrition, Mapping) or nutrition.get("record_type") != "meal_correction" or not valid_patch:
+            raise ValueError("Camera correction receipt is not a validated meal patch")
+        observed_annotation = (
+            _validate_camera_portion_correction_annotation(nutrition)
+            if portion_correction else _validate_camera_correction_annotation(nutrition)
+        )
         if expected_nutrition is not None:
             expected_annotation = _validate_camera_correction_annotation(expected_nutrition)
             expected_changes = list(expected_annotation.changed_fields)
@@ -2103,7 +2209,8 @@ class CameraIngress:
             not isinstance(original, dict)
             or metadata.get("_camera_authority") is not CAMERA_AUTHORITY
             or metadata.get("_camera_correction") is not CAMERA_AUTHORITY
-            or metadata.get("_camera_answer") != "no"
+            or metadata.get("_camera_answer")
+            != ("yes" if metadata.get("_camera_portion_correction") is CAMERA_AUTHORITY else "no")
             or attempt.get("state") not in {"answering", "final_queued", "completed", "delivery_unknown"}
             or attempt.get("camera_correction") != "answering"
             or attempt.get("camera_correction_turn_id") != turn_id
