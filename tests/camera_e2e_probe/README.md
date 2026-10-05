@@ -1,53 +1,80 @@
-# Camera E2E probe (2026-09-29)
+# Camera E2E probe
 
-This is a runnable Docker E2E prototype across OpenHarness `10da6cd238790433766cdb0c7f0c5312ea4bb50a`, Telegent `1ba62eebe1c0ff4e197361fefd9f6e94d50e946b`, and official Honcho `0d85a34917418485b9eb387eacda608bcf2de426`. The deterministic storage leg proves exact synthetic Honcho event IDs in Telegent's current meal and wellness read. A later bounded live Camera owner-answer run also finalized a consumed image meal with trusted capture time and reached the exact Telegent current-meal and wellness projection. These checks establish the technical chain, not food-estimate quality or automatic intake.
+This probe joins the Telegent Camera fixture/client, the OpenHarness Camera listener and runtime, an isolated official Honcho API, and Telegent's nutrition projection. The offline mode uses fixture clients and synthetic data. Native mode is a separately authorized acceptance run using the configured Codex subscription and a separate virtual user client. Neither mode is a food-estimate quality claim.
 
-## Setup and commands
+## Current setup
 
-The tracked `compose.yaml` builds the official Honcho source after verifying its pinned SHA. Always pass the unique `-p` project name shown below. Only API, PostgreSQL/pgvector, and Redis run. PostgreSQL and Redis have project volumes and no host ports. The API receives a dynamic loopback port. Honcho message embeddings and deriver are disabled to avoid unrelated external model calls; API writes still use PostgreSQL. The former ignored `tmp/camera-e2e/compose.yaml` was the initial stand definition; the tracked file is the reproducible version. Do not run `down -v` or remove the task-local RocksDB directories.
+Use two clean linked worktrees: one for this OpenHarness checkout and one for Telegent. Set each expected SHA to the exact 40-character commit checked out in that worktree. Use the existing pinned official Honcho checkout; the Compose file builds it and verifies the source SHA. The examples below use placeholders for local paths, selected SHAs, private source inputs, and the dynamically mapped API port.
 
 ```sh
-git -C tmp/camera-honcho-src rev-parse HEAD # must equal 0d85a34917418485b9eb387eacda608bcf2de426
-export CAMERA_HONCHO_SOURCE="$PWD/tmp/camera-honcho-src"
-docker compose -p camera-e2e-probe-20260929 -f tests/camera_e2e_probe/compose.yaml up -d --build --wait --wait-timeout 900
-docker compose -p camera-e2e-probe-20260929 -f tests/camera_e2e_probe/compose.yaml port api 8000
-curl -fsS http://127.0.0.1:PORT/health
-CAMERA_HONCHO_URL=http://127.0.0.1:PORT .venv/bin/python tests/camera_e2e_probe/run_honcho.py
-CAMERA_TELEGENT_WORKTREE=/path/to/telegent .venv/bin/python tests/camera_e2e_probe/run_joined.py
-CAMERA_TELEGENT_WORKTREE=/path/to/telegent CAMERA_HONCHO_URL=http://127.0.0.1:PORT .venv/bin/python tests/camera_e2e_probe/run_storage_chain.py
-# For one authorized live trajectory only (requires OPENROUTER_API_KEY):
-CAMERA_TELEGENT_WORKTREE=/path/to/telegent CAMERA_HONCHO_URL=http://127.0.0.1:PORT CAMERA_RUN_MODEL=1 .venv/bin/python tests/camera_e2e_probe/run_joined.py
-# Optional private positive trajectory, only after lead authorization:
-CAMERA_TELEGENT_WORKTREE=/path/to/telegent CAMERA_HONCHO_URL=http://127.0.0.1:PORT CAMERA_SOURCE_JPEG="$PWD/tmp/private/photo.jpg" CAMERA_SOURCE_SHA256=<lowercase-sha256> CAMERA_RUN_POSITIVE=1 .venv/bin/python tests/camera_e2e_probe/run_joined.py
+export CAMERA_OPENHARNESS_WORKTREE=/path/to/clean/openharness-worktree
+export CAMERA_TELEGENT_WORKTREE=/path/to/clean/telegent-worktree
+export CAMERA_HONCHO_SOURCE=/path/to/official-honcho-at-pinned-sha
+export CAMERA_OPENHARNESS_SHA=REPLACE_WITH_OPENHARNESS_40_HEX_COMMIT
+export CAMERA_TELEGENT_SHA=REPLACE_WITH_TELEGENT_40_HEX_COMMIT
+export CAMERA_ACCEPTANCE=1
+export CAMERA_HONCHO_SOURCE_SHA=0d85a34917418485b9eb387eacda608bcf2de426
+export CAMERA_SCRATCH="$CAMERA_OPENHARNESS_WORKTREE/tmp/camera-native-docker"
+export CAMERA_PROJECT=camera-e2e-unique-run-name
+
+test "$(git -C "$CAMERA_OPENHARNESS_WORKTREE" rev-parse HEAD)" = "$CAMERA_OPENHARNESS_SHA"
+test -z "$(git -C "$CAMERA_OPENHARNESS_WORKTREE" status --porcelain)"
+test "$(git -C "$CAMERA_TELEGENT_WORKTREE" rev-parse HEAD)" = "$CAMERA_TELEGENT_SHA"
+test -z "$(git -C "$CAMERA_TELEGENT_WORKTREE" status --porcelain)"
+test "$(git -C "$CAMERA_HONCHO_SOURCE" rev-parse HEAD)" = "$CAMERA_HONCHO_SOURCE_SHA"
+
+docker compose -p "$CAMERA_PROJECT" -f "$CAMERA_OPENHARNESS_WORKTREE/tests/camera_e2e_probe/compose.yaml" up -d --build --wait --wait-timeout 900
+docker compose -p "$CAMERA_PROJECT" -f "$CAMERA_OPENHARNESS_WORKTREE/tests/camera_e2e_probe/compose.yaml" port api 8000
+# Copy the numeric port printed above into CAMERA_API_PORT.
+export CAMERA_API_PORT=REPLACE_WITH_MAPPED_API_PORT
+export CAMERA_HONCHO_URL="http://127.0.0.1:$CAMERA_API_PORT"
+curl -fsS "$CAMERA_HONCHO_URL/health"
 ```
 
-OpenHarness test dependencies were installed locally from `uv.lock` with `uv sync --locked --extra dev`. The same virtualenv received Telegent's lockfile-pinned `rocksdict`, `lxml`, `ruamel.yaml`, `deepseek-tokenizer`, `fastapi`, and `prometheus-client` for this probe. Telegent production dependencies were not changed. This is a bounded test environment, not a complete `poetry install` of Telegent.
+Compose starts the official Honcho API, PostgreSQL/pgvector, and Redis. PostgreSQL and Redis use project-scoped volumes; the API is bound to a dynamic loopback port. Honcho embeddings and its deriver are disabled. Keep the project and its volumes after a run; do not run `down -v` or delete probe data.
 
-`run_joined.py` uses Telegent's fixture source and pipeline, its real `CameraSubmissionClient` multipart HTTP request, the real Ohmo Camera listener and journal, and the existing `FakeTelegram` native receipt seam. Its synthetic classifier and route attestation are fixtures, so it does **not** validate a live DeepSeek classifier. Telegent and Ohmo run as host processes; Dropbox and Telegram are mocked. It asserts candidate ID, original JPEG SHA-256 and bytes, native photo ID 77, and zero additional sends after replay. The listener routes the production client's fixed VPN origin to a local socket without changing the multipart body.
+Run the offline functional probe and storage checks from the OpenHarness worktree's existing locked test environment. Substitute the mapped API port reported by Compose.
 
-The optional private source must be a Git-ignored JPEG inside this worktree and match the separately supplied SHA-256. The positive path runs the same fixture producer and fake Telegram receipt, then sends a native reply to photo 77 through `CameraIngress.process_real_inbound` and a second Luna runtime turn. Set `CAMERA_OWNER_REPLY` to override the default synthetic reply. Each model run gets a fresh Honcho workspace and session. As in `GatewayService`, the runner connects its Camera ingress to the runtime pool so the owner-answer turn can resolve the admitted capture evidence. The positive path reads the real assistant event and requires recorded nutrition v2 metadata, matching Camera binding and source message ID, a consumed image meal with kcal, `meal_at` equal to the exact aware instant from the validated ingress attempt, and no `meal_date`. It then checks the exact server event ID in Telegent's current meal and wellness read, with a wellness interval centered on that capture instant, plus stable replay. The Honcho sync cursor still starts near the answer commit. The runner never authors a meal event. An earlier live positive reached a consumed image Honcho event with kcal but no `meal_at` or `meal_date`; exact Telegent sync copied it into `UNASSIGNED`, outside daily balance. The gateway repair carries validated capture evidence through its attempt journal and requires authoritative `meal_at` at Camera consumed commit. In the subsequent bounded positive run at ignored `tmp/camera-e2e/storage-runs/finalizer-ow8u8jq4`, `run_joined.py` exited 0: the model-created Honcho event `HgnxWvJPprlPhuM72gLd2` was consumed image nutrition with trusted `meal_at`, no `meal_date`, and 140 kcal. Exact-ID Telegent sync, current meal, and wellness at ignored `tmp/camera-e2e/storage-runs/finalizer-nj3d5ypm` showed 140 kcal. Replay stayed stable, native photo ID was 77, and duplicate sends were 0. The verified lead image-action path and local SHA do not attest the bytes received by the remote model upload.
+```sh
+cd "$CAMERA_OPENHARNESS_WORKTREE"
+export CAMERA_RUN_MODE=offline
+CAMERA_TELEGENT_WORKTREE="$CAMERA_TELEGENT_WORKTREE" \
+  CAMERA_OPENHARNESS_SHA="$CAMERA_OPENHARNESS_SHA" \
+  CAMERA_TELEGENT_SHA="$CAMERA_TELEGENT_SHA" \
+  CAMERA_ACCEPTANCE=1 CAMERA_RUN_MODE=offline CAMERA_HONCHO_URL="$CAMERA_HONCHO_URL" \
+  .venv/bin/python tests/camera_e2e_probe/run_joined.py
+CAMERA_HONCHO_URL="$CAMERA_HONCHO_URL" .venv/bin/python tests/camera_e2e_probe/run_honcho.py
+CAMERA_TELEGENT_WORKTREE="$CAMERA_TELEGENT_WORKTREE" \
+  CAMERA_HONCHO_URL="$CAMERA_HONCHO_URL" .venv/bin/python tests/camera_e2e_probe/run_storage_chain.py
+```
 
-The preceding bounded positive probe, retained under ignored `tmp/camera-e2e/storage-runs/finalizer-297wvj23`, exited 1. Its first model turn finalized the image analysis. The owner confirmation bound to the admitted capture instant, but the second model trace described the meal as unrecorded and supplied no nutrition annotation. The durable append correctly raised `ValueError: Camera confirmation requires a validated meal observation`; that probe established no successful meal record or exact projection. The focused prompt repair gives only a verified bound owner confirmation a trusted consumed-meal stage instruction before inference. Missing annotation rejection remains a RED historical probe, not a successful result.
+The offline run checks fixture upload through the production Telegent Camera submission client, the Ohmo listener and attempt journal, synthetic native receipt handling, and stable replay. It does not call a model or Dropbox/Telegram service. `run_storage_chain.py` writes synthetic observation/correction fixtures to the isolated Honcho API and checks Telegent sync and wellness reads; it does not exercise the Camera owner-answer gate or model finalizer. `run_honcho.py` checks a synthetic nonmeal Honcho message.
 
-`run_honcho.py` creates and reads back one synthetic nonmeal message via Ohmo's real Honcho v3 client. Direct PostgreSQL query confirmed exactly one row for its operation ID. The message is intentionally not labeled a meal.
+## Native subscription acceptance
 
-`run_storage_chain.py` uses Ohmo's existing `HonchoClient.create_messages` path to append a schema-v2 observation and an immutable correction to the real Honcho API. Its nutrition finalization envelope is fixture-authored and validated with Ohmo's v2 model. **It does not exercise the Camera owner-answer gate or model finalizer.** It captures server-returned IDs, calls Telegent's real `sync_nutrition_honcho` into a fresh task-local RocksDB projection, checks `get_record_by_event_id`, the current meal's `event_ids` and `latest_event_id`, and calls the product's `get_wellness_data` MCP tool. The fixture assigns 320 kcal to a consumed meal; the correction targets it through `reply_to_source_message_id`, sets `not_consumed` and all energy fields to zero. Both syncs are replayed and must leave the cursor, meal projection, meal count, and effective kcal stable. Each run uses a new synthetic workspace and leaves its RocksDB directory intact under ignored `tmp/camera-e2e/storage-runs/`.
+For native acceptance, configure the existing Codex subscription profile for `gpt-6-luna` with medium reasoning and bind its settings directory read-only. Use a separate native subscription client for the virtual user. `run_joined.py` rejects provider fallback and checks the subscription profile, model, and two distinct clients; it does not validate the configured reasoning effort. Also use a lead-selected clean OpenHarness/Telegent pair. Supply the owner scenario and an approved bounded JPEG with its matching SHA-256. The source JPEG must be Git-ignored and inside the OpenHarness worktree.
 
-## Result matrix
+```sh
+export CAMERA_RUN_MODE=native
+export CAMERA_NATIVE_CONFIG_DIR=/read-only/path/to/existing/native-settings
+export CAMERA_USER_SCENARIO='Describe the synthetic or approved meal and confirm the offered portion.'
+export CAMERA_SOURCE_JPEG="$CAMERA_OPENHARNESS_WORKTREE/tmp/<approved-private-image>.jpg"
+export CAMERA_SOURCE_SHA256=REPLACE_WITH_LOWERCASE_SHA256
 
-| Boundary | Result | Evidence |
-| --- | --- | --- |
-| Isolated Honcho API and PostgreSQL | PASS | API `/health` returned 200; all three services healthy; v3 message readback and PostgreSQL count = 1. |
-| Telegent fixture source → Camera HTTP → Ohmo ingress → Telegram receipt | PASS | `run_joined.py` exit 0; JPEG bytes and candidate ID match; photo ID 77; replay sends = 0. |
-| Fixture-authored meal observation → real Honcho API → real Telegent sync → wellness read | PASS | Four fresh runs. Server IDs `1EGZRt4vP7wlJnU6LXHYe`, `N2bVUbBRnKlHkkKinf3uh`, `myaxPOs5rvBbW6X_9NQ2h`, and `7JJyipJ9L8_4XALSTTZp-` were exact record/current-meal IDs; one current meal and 320 kcal each time. |
-| Observation replay | PASS | Cursor and current meal stayed stable; one current meal and 320 kcal. |
-| Immutable correction and replay | PASS | New IDs `6DRORQE0SimsRCii1B_Pz`, `61e6PGJnS6_t2EhhoqTsV`, `jPdcV7mrz-2biCKtU8xJn`, and `T_cFasjeqRSrlyrWG5zlD` joined their respective original IDs in `event_ids`; originals remained unchanged; `latest_event_id` changed to correction; wellness read was one current meal and 0 kcal, stable on replay. |
-| Real Ohmo runtime `openai/gpt-6-luna` | PASS, bounded positive | `run_joined.py` exited 0 at `finalizer-ow8u8jq4`; the model-created consumed-image Honcho event `HgnxWvJPprlPhuM72gLd2` carries 140 kcal and trusted `meal_at`, with no `meal_date`. Earlier synthetic attempts without a final answer remain historical failures. |
-| Photo-only automatic meal write | EXPECTED FAIL | Existing answer gate rejects classifier-only and unbound turns; focused gate test passed. No owner answer was supplied to the live trajectory. |
-| Explicit bound answer → model finalizer → real Honcho meal event → Telegent projection | PASS, technical chain | Exact event ID `HgnxWvJPprlPhuM72gLd2` appears in current meal and wellness at `finalizer-nj3d5ypm`, 140 kcal; replay stable, photo ID 77, duplicate sends 0. Earlier missing-date `UNASSIGNED` and missing-annotation rejection remain RED history. This does not establish food quality within ±10%. |
+CAMERA_TELEGENT_WORKTREE="$CAMERA_TELEGENT_WORKTREE" \
+  CAMERA_OPENHARNESS_SHA="$CAMERA_OPENHARNESS_SHA" \
+  CAMERA_TELEGENT_SHA="$CAMERA_TELEGENT_SHA" \
+  CAMERA_ACCEPTANCE=1 CAMERA_RUN_MODE=native \
+  CAMERA_NATIVE_CONFIG_DIR="$CAMERA_NATIVE_CONFIG_DIR" \
+  CAMERA_USER_SCENARIO="$CAMERA_USER_SCENARIO" \
+  CAMERA_SOURCE_JPEG="$CAMERA_SOURCE_JPEG" \
+  CAMERA_SOURCE_SHA256="$CAMERA_SOURCE_SHA256" \
+  CAMERA_HONCHO_URL="$CAMERA_HONCHO_URL" \
+  .venv/bin/python tests/camera_e2e_probe/run_joined.py
+```
 
-The OpenRouter public catalog listed `openai/gpt-6-luna`. A credential was present in the environment, but exact billed tokens and cost were not available from the earlier run. The `run_honcho.py` message write was local and incurred no model usage. The local capability table sends Luna images natively. OpenHarness uses Chat Completions for OpenRouter tool calls; the [official GPT-6 guide](https://developers.openai.com/api/docs/guides/latest-model) documents Luna function calling on that API with `reasoning_effort="none"`. The runner passes explicit `none` effort and retains the four-turn cap. The successful 140 kcal runtime has no Sol ideal for food-quality comparison. Automatic source-aware intake and contextual late replies remain future work.
+The native run uses the already configured Codex subscription and a distinct virtual user client. Do not add OpenRouter, API-key fallback, or other provider credentials. The runner validates the exact source pair before and after the run, captures server-returned event identity, checks trusted Camera source/capture bindings, and verifies the current meal and wellness projection. Probe outputs and local projections stay under the OpenHarness worktree's ignored `tmp/camera-native-docker/` tree. Preserve those outputs and existing service volumes for review.
 
-Focused results: OpenHarness admission test 1 passed; answer-gate tests 2 passed; Telegent producer and sync tests 2 passed. The Telegent focused coverage artifact measured 60.84% for `camera_submission.py` and 69.86% for `nutrition/sync.py` (64.48% combined). Its initial coverage-enabled pytest process was interrupted after both tests passed because the repository-wide coverage report expanded to 109,447 statements; the clean `--no-cov` rerun exited 0.
+## Historical evidence
 
-For this storage extension, the final exact-event script exited 0 on four fresh synthetic workspaces; `run_honcho.py` and `run_joined.py` both exited 0. Focused OpenHarness and Telegent regression selections passed 2/2 each with `--no-cov`; no new coverage percentage was collected. The lead's focused ingress/nutrition selection passed 143 tests. A separate, narrowly selected API, QueryEngine native Luna, multimodal, gateway effort, and grader/support gate passed 103 tests in 4.64 seconds. These distinct selections total 246 focused passes, with no coverage percentage. An earlier grader/support selection passed 54 tests; it is not added to that total. A broader unrelated class selection was interrupted after 7 partial passes in 115.22 seconds and is not a completed gate. `ruff check tests/camera_e2e_probe`, `git diff --check`, and tracked Compose `config --quiet` passed before this documentation update. The lead subsequently verified the Honcho source at clean pinned SHA `0d85a34917418485b9eb387eacda608bcf2de426` and ran tracked Compose `up -d --build --wait --wait-timeout 900`, which exited 0. The build reused cache, Compose kept the identical existing containers, and all three services were healthy on loopback API port `32769`; existing volumes were retained. This does not establish fresh containers or a clean database. The existing stand originated from the ignored Compose definition.
+Results from September 2026 are historical prototype evidence, not current acceptance. Earlier offline checks exercised the synthetic Telegent-to-Ohmo upload and Honcho-to-Telegent storage chain. A bounded native Luna run also exercised a Camera owner answer and exact event projection. Separate earlier runs exposed missing capture-time propagation and missing finalizer annotations; those failures led to later repairs. None of these historical runs establishes current source-pair acceptance, a clean database, or nutrition estimate accuracy. Consult the retained private run artifacts through the lead; do not copy private event identifiers, source paths, images, or dialogue into this public README.

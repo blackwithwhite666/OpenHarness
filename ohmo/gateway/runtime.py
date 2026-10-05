@@ -1799,6 +1799,83 @@ class OhmoSessionRuntimePool:
             if camera_authorized and message.sender_id == "__camera__"
             else self._resolve_turn_memory_scope(turn_ctx)
         )
+
+        def start_camera_fast_replay_eval(
+            *, typed_candidate: bool = False, candidate_id: object = None,
+            operation_turn_id: object = None,
+        ) -> GatewayEvalRecorder | None:
+            """Start ordinary capture for a receipt-verified Camera fast reply."""
+            if not (camera_authorized or typed_candidate) or not _evals_capture_enabled(
+                self._gateway_config
+            ):
+                return None
+            capture_message = message
+            capture_turn_ctx = turn_ctx
+            if typed_candidate and not camera_authorized:
+                attempt = self._camera_ingress._attempts.get(candidate_id)
+                if (
+                    not isinstance(candidate_id, str)
+                    or not isinstance(operation_turn_id, str)
+                    or not isinstance(attempt, dict)
+                    or attempt.get("candidate_id", candidate_id) != candidate_id
+                    or attempt.get("state") != "completed"
+                    or not isinstance(attempt.get("camera_commit"), Mapping)
+                ):
+                    return None
+                capture_message = replace(
+                    message,
+                    metadata={
+                        **message.metadata,
+                        "_camera_authority": CAMERA_AUTHORITY,
+                        "_camera_candidate_id": candidate_id,
+                        "_camera_turn_id": operation_turn_id,
+                    },
+                )
+                capture_turn_ctx = replace(turn_ctx, camera_authorized=True)
+            logical_turn_id, _, assistant_metadata = _build_conversation_turn_metadata(
+                turn_ctx=capture_turn_ctx, message=capture_message, scope=memory_scope
+            )
+            provenance, context = _camera_eval_capture_provenance(
+                message=capture_message,
+                turn_ctx=capture_turn_ctx,
+                scope=memory_scope,
+                camera_config=getattr(self._gateway_config, "camera_ingress", None),
+                camera_ingress=getattr(self, "_camera_ingress", None),
+                logical_turn_id=logical_turn_id or "",
+                assistant_metadata=assistant_metadata,
+            )
+            if provenance is None or context is None:
+                return None
+            return GatewayEvalRecorder.start(
+                workspace=self._workspace,
+                bundle=bundle,
+                message=capture_message,
+                session_key=session_key,
+                user_text=command_prompt,
+                user_goal=user_prompt,
+                trusted_turn_provenance=provenance,
+                trusted_camera_context=context,
+            )
+
+        def finish_camera_fast_replay_eval(
+            recorder: GatewayEvalRecorder | None, update: GatewayStreamUpdate
+        ) -> None:
+            if recorder is None:
+                return
+            if update.kind == "error":
+                recorder.record_gateway_error(text=update.text, metadata=update.metadata)
+                status = "error"
+            else:
+                recorder.record_gateway_final(text=update.text, metadata=update.metadata)
+                status = "completed"
+            try:
+                recorder.record_resource_snapshot(
+                    workspace=self._workspace, bundle=bundle, phase="world_after"
+                )
+            except Exception:
+                logger.exception("ohmo eval world_after snapshot failed")
+            recorder.finish(status=status)
+
         self._configure_turn_memory_surfaces(
             bundle,
             turn_ctx,
@@ -2043,6 +2120,7 @@ class OhmoSessionRuntimePool:
                         "latest Camera correction did not prove the selected saved portion"
                     )
                 if receipt.user_content == selected_label:
+                    fast_eval_recorder = start_camera_fast_replay_eval()
                     if not latest_is_operation:
                         message.metadata.update(
                             _camera_authority=CAMERA_AUTHORITY,
@@ -2056,7 +2134,7 @@ class OhmoSessionRuntimePool:
                         self._camera_ingress.record_committed_correction(
                             message, receipt, nutrition
                         )
-                    yield GatewayStreamUpdate(
+                    fast_update = GatewayStreamUpdate(
                         kind="final",
                         text=(
                             "Эта порция уже записана."
@@ -2070,6 +2148,8 @@ class OhmoSessionRuntimePool:
                             **self._camera_final_delivery_metadata(message),
                         },
                     )
+                    finish_camera_fast_replay_eval(fast_eval_recorder, fast_update)
+                    yield fast_update
                     return
                 if typed_correction_replay:
                     for key in (
@@ -2097,12 +2177,15 @@ class OhmoSessionRuntimePool:
                         "changed Camera selection is not a verified offered quantity"
                     )
             except (ConversationReconciliationError, ValueError, TypeError):
+                fast_eval_recorder = start_camera_fast_replay_eval()
                 logger.warning("completed Camera correction replay unresolved candidate=%s", candidate_id)
-                yield GatewayStreamUpdate(
+                fast_update = GatewayStreamUpdate(
                     kind="error",
                     text="Не получилось подтвердить запись этой порции. Новая запись не добавлена.",
                     metadata={"_session_key": session_key},
                 )
+                finish_camera_fast_replay_eval(fast_eval_recorder, fast_update)
+                yield fast_update
                 return
         if completed_replay:
             candidate_id = (
@@ -2230,6 +2313,11 @@ class OhmoSessionRuntimePool:
                         message, candidate_id, turn_id, receipt, selected_label
                     )
                 else:
+                    fast_eval_recorder = start_camera_fast_replay_eval(
+                        typed_candidate=typed_replay,
+                        candidate_id=candidate_id,
+                        operation_turn_id=turn_id,
+                    )
                     if typed_replay:
                         message.metadata.update(
                             _camera_typed_replay=True,
@@ -2239,7 +2327,7 @@ class OhmoSessionRuntimePool:
                     self._camera_ingress.recover_legacy_committed_meal(
                         candidate_id, turn_id, receipt
                     )
-                    yield GatewayStreamUpdate(
+                    fast_update = GatewayStreamUpdate(
                         kind="final",
                         text="Эта порция уже записана.",
                         metadata={
@@ -2248,14 +2336,23 @@ class OhmoSessionRuntimePool:
                             "nutrition_append_event_id": receipt.assistant_message_id,
                         },
                     )
+                    finish_camera_fast_replay_eval(fast_eval_recorder, fast_update)
+                    yield fast_update
                     return
             except (ConversationReconciliationError, ValueError):
                 logger.warning("completed Camera replay remains unresolved candidate=%s", candidate_id)
-                yield GatewayStreamUpdate(
+                fast_eval_recorder = start_camera_fast_replay_eval(
+                    typed_candidate=typed_replay_candidate,
+                    candidate_id=candidate_id,
+                    operation_turn_id=turn_id,
+                )
+                fast_update = GatewayStreamUpdate(
                     kind="error",
                     text="Не получилось подтвердить запись этой порции. Новая запись не добавлена.",
                     metadata={"_session_key": session_key},
                 )
+                finish_camera_fast_replay_eval(fast_eval_recorder, fast_update)
+                yield fast_update
                 return
         if camera_authorized and (
             message.metadata.get("_camera_legacy_reconcile") is True
