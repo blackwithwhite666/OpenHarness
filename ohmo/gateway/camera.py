@@ -1974,6 +1974,7 @@ class CameraIngress:
         ):
             raise ValueError("Camera denial is not bound to a recovered owner operation")
         attempt["camera_correction"] = "answering"
+        attempt["camera_correction_kind"] = "denial"
         message.metadata.pop("_camera_legacy_reconcile", None)
         message.metadata.pop("_camera_reconcile_then_correction", None)
         message.metadata["_camera_correction"] = CAMERA_AUTHORITY
@@ -2000,32 +2001,81 @@ class CameraIngress:
             validated = NutritionAnnotationV2.model_validate(nutrition)
         except (TypeError, ValueError):
             validated = None
+        latest_correction = attempt.get("camera_correction_commit") if attempt else None
+        latest_metadata = metadata if isinstance(metadata, Mapping) else {}
+        latest_turn = (
+            latest_correction.get("client_op_id", "").removesuffix(":assistant")
+            if isinstance(latest_correction, dict) else None
+        )
+        prior_correction = bool(
+            isinstance(original, dict)
+            and isinstance(latest_correction, dict)
+            and latest_correction.get("kind") == "portion"
+            and attempt.get("camera_correction") == "completed"
+            and attempt.get("camera_correction_turn_id") == latest_turn
+            and latest_correction.get("target_event_id") == original.get("event_id")
+            and latest_correction.get("target_source_message_id") == original.get("source_message_id")
+            and latest_correction.get("event_id") == assistant_id
+            and latest_correction.get("client_op_id") == assistant_op
+            and latest_metadata.get("source_message_id") == latest_correction.get("source_message_id")
+            and latest_metadata.get("camera_original_event_id") == original.get("event_id")
+            and latest_metadata.get("camera_correction_bound") is True
+            and latest_metadata.get("camera_answer_bound") == "yes"
+            and latest_metadata.get("reply_to_source_message_id") == original.get("source_message_id")
+            and latest_metadata.get("camera_candidate_id") == candidate_id
+            and latest_metadata.get("camera_operation_id") == candidate_id
+            and latest_metadata.get("tenant_id") == self.config.tenant_id
+            and latest_metadata.get("source_principal") == f"telegram:{self.config.principal}"
+            and latest_metadata.get("ingest_source") == "dropbox_camera"
+            and latest_metadata.get("confirmation_required") is True
+        )
+        if prior_correction:
+            try:
+                _validate_camera_portion_correction_annotation(nutrition)
+            except (TypeError, ValueError):
+                prior_correction = False
+        prior_original = bool(
+            isinstance(original, dict)
+            and original.get("event_id") == assistant_id
+            and original.get("client_op_id") == assistant_op
+            and assistant_op == f"{original_turn}:assistant"
+            and getattr(receipt, "user_client_op_id", None) == f"{original_turn}:user"
+            and isinstance(metadata, Mapping)
+            and metadata.get("logical_turn_id") == original_turn
+            and metadata.get("source_message_id") == original.get("source_message_id")
+            and _source_message_id(message.metadata.get("message_id"))
+            == original.get("source_message_id")
+            and validated is not None
+            and validated.record_type == "meal_observation"
+            and validated.consumption_status == "consumed"
+            and "image" in validated.basis
+            and validated.meal_at == self._attempt_capture_time(attempt)
+            and validated.meal_date is None
+            and not validated.explicit_new_consumption
+        )
         if (
             not isinstance(original, dict)
             or attempt.get("state") != "completed"
             or attempt.get("finalizer_status") != "committed"
-            or attempt.get("camera_correction") is not None
-            or isinstance(attempt.get("camera_correction_commit"), dict)
+            or (attempt.get("camera_correction") is not None and not prior_correction)
+            or (isinstance(latest_correction, dict) and not prior_correction)
             or original.get("candidate_id") != candidate_id
-            or original.get("event_id") != assistant_id
-            or original.get("client_op_id") != assistant_op
-            or original.get("client_op_id") != f"{original_turn}:assistant"
-            or getattr(receipt, "user_client_op_id", None) != f"{original_turn}:user"
+            or not (prior_original or prior_correction)
             or not isinstance(metadata, Mapping)
             or metadata.get("role") != "assistant"
-            or metadata.get("logical_turn_id") != original_turn
+            or metadata.get("logical_turn_id") != (latest_turn if prior_correction else original_turn)
             or metadata.get("tenant_id") != self.config.tenant_id
             or metadata.get("source_principal") != f"telegram:{self.config.principal}"
             or metadata.get("camera_candidate_id") != candidate_id
             or metadata.get("camera_operation_id") != candidate_id
             or metadata.get("camera_answer_bound") != "yes"
-            or metadata.get("source_message_id") != original.get("source_message_id")
-            or _source_message_id(message.metadata.get("message_id"))
-            != original.get("source_message_id")
             or not isinstance(getattr(receipt, "user_content", None), str)
             or receipt.user_content == selected_label
             or message.metadata.get("_camera_authority") is not CAMERA_AUTHORITY
-            or message.metadata.get("_camera_existing_meal_replay") is not True
+            or not (
+                message.metadata.get("_camera_existing_meal_replay") is True
+                or message.metadata.get("_camera_correction_replay") is CAMERA_AUTHORITY
+            )
             or message.metadata.get("native_keyboard_selected_label") != selected_label
             or not _CLARIFICATION_QUANTITY_RE.fullmatch(selected_label.strip())
             or message.metadata.get("native_keyboard_reflection_confirmed") is not True
@@ -2037,20 +2087,17 @@ class CameraIngress:
             or str(message.chat_id) != self.config.chat_id
             or message.sender_id.split("|", 1)[0] != self.config.principal
             or validated is None
-            or validated.record_type != "meal_observation"
-            or validated.consumption_status != "consumed"
-            or "image" not in validated.basis
-            or validated.meal_at != self._attempt_capture_time(attempt)
-            or validated.meal_date is not None
-            or validated.explicit_new_consumption
         ):
             raise ValueError("Changed Camera portion is not bound to its saved owner meal")
 
         correction_turn = uuid4().hex
         attempt["camera_correction"] = "answering"
         attempt["camera_correction_turn_id"] = correction_turn
+        attempt["camera_correction_kind"] = "portion"
         self._save_attempts()
         message.metadata.pop("_camera_existing_meal_replay", None)
+        message.metadata.pop("_camera_correction_replay", None)
+        message.metadata.pop("_camera_correction_replay_typed", None)
         message.metadata.update(
             _camera_candidate_id=candidate_id,
             _camera_answer="yes",
@@ -2058,7 +2105,7 @@ class CameraIngress:
             _camera_portion_correction=CAMERA_AUTHORITY,
             _camera_turn_id=correction_turn,
             _camera_prior_portion_label=receipt.user_content,
-            _camera_original_event_id=assistant_id,
+            _camera_original_event_id=original["event_id"],
         )
         return correction_turn
 
@@ -2118,7 +2165,7 @@ class CameraIngress:
         if (
             not isinstance(metadata, Mapping)
             or not isinstance(original, dict)
-            or attempt.get("camera_correction") != "answering"
+            or attempt.get("camera_correction") not in {"answering", "delivery_unknown"}
             or attempt.get("camera_correction_turn_id") != turn_id
             or not isinstance(assistant_id, str) or not assistant_id
             or not isinstance(assistant_op, str) or not assistant_op
@@ -2181,9 +2228,14 @@ class CameraIngress:
             "client_op_id": assistant_op,
             "target_event_id": original["event_id"],
             "target_source_message_id": original["source_message_id"],
+            "kind": "portion" if portion_correction else "denial",
         }
         previous_correction = attempt.get("camera_correction_commit")
-        if isinstance(previous_correction, dict) and previous_correction != correction:
+        if (
+            isinstance(previous_correction, dict)
+            and previous_correction.get("client_op_id") == assistant_op
+            and previous_correction != correction
+        ):
             raise ValueError("Camera operation has conflicting correction commit evidence")
         attempt["camera_correction_commit"] = correction
         attempt["camera_correction"] = "final_queued"
@@ -2212,7 +2264,7 @@ class CameraIngress:
             or metadata.get("_camera_answer")
             != ("yes" if metadata.get("_camera_portion_correction") is CAMERA_AUTHORITY else "no")
             or attempt.get("state") not in {"answering", "final_queued", "completed", "delivery_unknown"}
-            or attempt.get("camera_correction") != "answering"
+            or attempt.get("camera_correction") not in {"answering", "delivery_unknown"}
             or attempt.get("camera_correction_turn_id") != turn_id
             or not isinstance(turn_id, str)
             or not turn_id
@@ -3856,6 +3908,38 @@ class CameraIngress:
             intent = None
         if target is None and intent is None:
             intent = _camera_context_answer_kind(raw_text)
+        if not callback and target_matches and intent is None and isinstance(raw_text, str):
+            candidate_id, attempt = target_matches[0]
+            latest = attempt.get("camera_correction_commit")
+            pending_portion = (
+                attempt.get("camera_correction") in {"answering", "final_queued", "delivery_unknown"}
+                and attempt.get("camera_correction_kind") == "portion"
+            )
+            completed_portion = (
+                attempt.get("camera_correction") == "completed"
+                and isinstance(latest, dict)
+                and latest.get("kind") == "portion"
+            )
+            if (
+                _CLARIFICATION_QUANTITY_RE.fullmatch(raw_text.strip())
+                and attempt.get("state") == "completed"
+                and isinstance(attempt.get("camera_commit"), dict)
+                and (pending_portion or completed_portion)
+            ):
+                turn_id = (
+                    attempt.get("camera_correction_turn_id") if pending_portion
+                    else latest.get("client_op_id", "").removesuffix(":assistant")
+                )
+                if isinstance(turn_id, str) and turn_id:
+                    metadata.update(
+                        _camera_authority=CAMERA_AUTHORITY,
+                        _camera_candidate_id=candidate_id,
+                        _camera_answer="yes",
+                        _camera_turn_id=turn_id,
+                        _camera_correction_replay=CAMERA_AUTHORITY,
+                        _camera_correction_replay_typed=True,
+                    )
+                    return
         if intent == "not_food":
             if not callback or len(target_matches) != 1:
                 metadata["_camera_unbound"] = CAMERA_AUTHORITY
@@ -3993,12 +4077,43 @@ class CameraIngress:
                 return False
             correction_state = attempt.get("camera_correction")
             original_turn = attempt.get("answer_turn_id") or attempt.get("final_turn_id")
-            if has_commit and correction_state is None:
+            latest_correction = attempt.get("camera_correction_commit")
+            latest_is_portion = (
+                isinstance(latest_correction, dict)
+                and latest_correction.get("kind") == "portion"
+            )
+            latest_is_denial = (
+                isinstance(latest_correction, dict)
+                and latest_correction.get("kind") == "denial"
+            )
+            if has_commit and correction_state == "completed" and latest_is_denial:
+                correction_turn = latest_correction.get("client_op_id", "").removesuffix(":assistant")
+                metadata.update(
+                    _camera_authority=CAMERA_AUTHORITY,
+                    _camera_candidate_id=candidate_id,
+                    _camera_answer="no",
+                    _camera_correction=CAMERA_AUTHORITY,
+                    _camera_turn_id=correction_turn,
+                    _camera_route=route,
+                    _camera_correction_replay=CAMERA_AUTHORITY,
+                    **({"_camera_correction_replay_typed": True} if not callback else {}),
+                )
+                if target is not None:
+                    metadata["_camera_native_binding"] = str(target)
+                return True
+            if has_commit and (correction_state is None or (
+                correction_state == "completed" and latest_is_portion
+            )):
                 correction_turn = attempt.get("camera_correction_turn_id")
-                if not isinstance(correction_turn, str) or not correction_turn:
+                if (
+                    not isinstance(correction_turn, str)
+                    or not correction_turn
+                    or correction_state == "completed"
+                ):
                     correction_turn = uuid4().hex
                     attempt["camera_correction_turn_id"] = correction_turn
                 attempt["camera_correction"] = "answering"
+                attempt["camera_correction_kind"] = "denial"
                 self._save_attempts()
                 metadata.update(
                     _camera_authority=CAMERA_AUTHORITY,
@@ -4133,13 +4248,36 @@ class CameraIngress:
                 and target is not None
                 and isinstance(attempt.get("answer_turn_id"), str)
                 and attempt.get("finalizer_status") == "committed"
-                and not isinstance(attempt.get("camera_correction_commit"), dict)
-                and attempt.get("camera_correction") is None
+                and (
+                    attempt.get("camera_correction") is None
+                    or (
+                        attempt.get("camera_correction") == "completed"
+                        and isinstance(attempt.get("camera_correction_commit"), dict)
+                        and attempt["camera_correction_commit"].get("kind") == "portion"
+                    )
+                    or (
+                        attempt.get("camera_correction") in {
+                            "answering", "final_queued", "delivery_unknown"
+                        }
+                        and attempt.get("camera_correction_kind") == "portion"
+                    )
+                )
             ):
                 # This is only a runtime lookup hint. Runtime compares the
                 # durable user text before acknowledging a repeat; changed
                 # text continues through ordinary receipt/model handling.
-                metadata["_camera_typed_replay_candidate"] = candidate_id
+                correction = attempt.get("camera_correction_commit")
+                if isinstance(correction, dict) and correction.get("kind") == "portion":
+                    metadata.update(
+                        _camera_authority=CAMERA_AUTHORITY,
+                        _camera_candidate_id=candidate_id,
+                        _camera_answer="yes",
+                        _camera_turn_id=correction.get("client_op_id", "").removesuffix(":assistant"),
+                        _camera_correction_replay=CAMERA_AUTHORITY,
+                        _camera_correction_replay_typed=True,
+                    )
+                else:
+                    metadata["_camera_typed_replay_candidate"] = candidate_id
                 return
             if (
                 callback
@@ -4150,13 +4288,58 @@ class CameraIngress:
                 and isinstance(attempt.get("answer_turn_id"), str)
                 and attempt.get("finalizer_status") == "committed"
                 and _source_message_id(metadata.get("callback_query_id")) is not None
-                and not isinstance(attempt.get("camera_correction_commit"), dict)
-                and attempt.get("camera_correction") is None
+                and (
+                    attempt.get("camera_correction") is None
+                    or (
+                        attempt.get("camera_correction") == "completed"
+                        and isinstance(attempt.get("camera_correction_commit"), dict)
+                        and attempt["camera_correction_commit"].get("kind") == "portion"
+                    )
+                    or (
+                        attempt.get("camera_correction") in {
+                            "answering", "final_queued", "delivery_unknown"
+                        }
+                        and attempt.get("camera_correction_kind") == "portion"
+                    )
+                )
             ):
                 # A completed affirmative callback may be a deliberate second
                 # tap of the same portion. Runtime must reconcile the exact
                 # saved exchange and compare its durable user text before
                 # reporting the existing meal; ingress alone cannot assert it.
+                correction = attempt.get("camera_correction_commit")
+                correction_turn = (
+                    correction.get("client_op_id", "").removesuffix(":assistant")
+                    if isinstance(correction, dict) else None
+                )
+                correction_kind = attempt.get("camera_correction_kind")
+                if (
+                    attempt.get("camera_correction") in {
+                        "answering", "final_queued", "delivery_unknown"
+                    }
+                    and correction_kind == "portion"
+                ):
+                    correction_turn = attempt.get("camera_correction_turn_id")
+                elif isinstance(correction, dict) and correction.get("kind") == "portion":
+                    correction_kind = "portion"
+                    correction_turn = correction.get("client_op_id", "").removesuffix(":assistant")
+                if correction_kind == "portion":
+                    metadata.update(
+                        _camera_authority=CAMERA_AUTHORITY,
+                        _camera_candidate_id=candidate_id,
+                        _camera_answer="yes",
+                        _camera_correction=CAMERA_AUTHORITY,
+                        _camera_turn_id=correction_turn,
+                        _camera_route="callback",
+                        _camera_native_binding=str(target),
+                        **(
+                            {"_camera_portion_correction": CAMERA_AUTHORITY}
+                            if correction_kind == "portion" else {}
+                        ),
+                        _camera_correction_replay=CAMERA_AUTHORITY,
+                        _camera_ingress_callback_eligible=True,
+                    )
+                    return
                 metadata.update(
                     _camera_authority=CAMERA_AUTHORITY,
                     _camera_candidate_id=candidate_id,
