@@ -78,6 +78,7 @@ class _Engine:
         self.messages: list = []
         self.turns: list[tuple[str, list[str], datetime]] = []
         self.pool = None
+        self.wellness_actors = []
 
     def set_decision_trace_recorder(self, recorder) -> None:
         self.decision_trace_recorder = recorder
@@ -85,7 +86,8 @@ class _Engine:
     def set_system_prompt(self, prompt: str) -> None:
         del prompt
 
-    async def submit_message(self, _user_message):
+    async def submit_message(self, _user_message, *, wellness_actor=None):
+        self.wellness_actors.append(wellness_actor)
         self.messages.append(_user_message)
         message = self.pool._active_message
         self.turns.append((message.content, list(message.media), message.timestamp))

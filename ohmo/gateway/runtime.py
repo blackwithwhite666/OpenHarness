@@ -119,6 +119,7 @@ from openharness.engine.stream_events import (
 )
 from openharness.prompts import build_runtime_system_prompt
 from openharness.tools.mcp_tool import McpToolAdapter, WellnessLoginInjectingAdapter
+from openharness.mcp.wellness_delegation import TrustedWellnessActor
 from openharness.ui.runtime import (
     RuntimeBundle,
     _last_user_text,
@@ -228,6 +229,21 @@ def _trusted_inbound_event_time(message: InboundMessage) -> datetime | None:
     if normalized is None:
         return None
     return datetime.fromisoformat(normalized)
+
+
+def _wellness_actor_for_turn(turn_ctx: TurnContext | None) -> TrustedWellnessActor | None:
+    """Capture a numeric principal only from a private Telegram admission."""
+    if turn_ctx is None or turn_ctx.channel.strip().lower() != "telegram":
+        return None
+    principal = canonical_principal(turn_ctx.channel, turn_ctx.principal)
+    if (
+        turn_ctx.is_private is not True
+        or not principal.isascii()
+        or not principal.isdigit()
+        or principal.startswith("0")
+    ):
+        return None
+    return TrustedWellnessActor(principal)
 
 
 @dataclass(frozen=True)
@@ -936,6 +952,16 @@ def _reminder_wellness_tenants(config) -> WellnessTenantResolver:
 _SCHEDULER_SENDER = "__scheduler__"
 
 
+@dataclass(frozen=True)
+class _TrustedReminderWellnessAdmission:
+    """Immutable result of validating one internal scheduler delivery."""
+
+    reminder_id: str
+    wellness_tenant: str
+    wellness_principal: str
+    private_chat_id: str
+
+
 def _is_real_user_turn(message: InboundMessage) -> bool:
     """Return whether todo lifecycle rules may act on this inbound turn."""
     metadata = message.metadata or {}
@@ -955,7 +981,9 @@ def _todo_unresolved_text(snapshot: list[dict[str, str]]) -> str:
     )
 
 
-def _trusted_reminder_wellness(message: InboundMessage) -> dict[str, str | None] | None:
+def _trusted_reminder_wellness(
+    message: InboundMessage,
+) -> _TrustedReminderWellnessAdmission | None:
     """Return a scheduler-stamped wellness-only reminder scope.
 
     The scheduler supplies the authenticated creator principal and the runtime
@@ -964,29 +992,44 @@ def _trusted_reminder_wellness(message: InboundMessage) -> dict[str, str | None]
     if str(message.channel).strip().lower() != "telegram":
         return None
     metadata = message.metadata or {}
-    if message.sender_id != _SCHEDULER_SENDER or not metadata.get("_synthetic"):
+    if message.sender_id != _SCHEDULER_SENDER or metadata.get("_synthetic") is not True:
         return None
-    reminder_id = str(metadata.get("_reminder_id") or "").strip()
-    created_by = str(metadata.get("_reminder_created_by") or "").strip()
-    principal = str(metadata.get("_reminder_wellness_principal") or "").strip()
-    tenant = str(metadata.get("_reminder_wellness_tenant") or "").strip()
+    reminder_id = metadata.get("_reminder_id")
+    created_by = metadata.get("_reminder_created_by")
+    principal = metadata.get("_reminder_wellness_principal")
+    tenant = metadata.get("_reminder_wellness_tenant")
+    if not all(isinstance(item, str) for item in (reminder_id, created_by, principal, tenant)):
+        return None
+    reminder_id = reminder_id.strip()
+    created_by = created_by.strip()
+    principal = principal.strip()
+    tenant = tenant.strip()
     if not reminder_id or not created_by or not principal or not tenant:
         return None
     chat_id = str(message.chat_id).strip()
     canonical_created_by = canonical_principal("telegram", created_by)
     canonical_principal_id = canonical_principal("telegram", principal)
     if (
-        not canonical_created_by.isdigit()
+        not canonical_created_by.isascii()
+        or not canonical_created_by.isdigit()
+        or canonical_created_by.startswith("0")
         or canonical_created_by != chat_id
+        or not chat_id.isascii()
+        or not chat_id.isdigit()
+        or chat_id.startswith("0")
         or not canonical_principal_id.isdigit()
         or canonical_principal_id != canonical_created_by
+        or principal != created_by
+        or message.session_key_override != f"telegram:reminder:{reminder_id}"
+        or _is_group_message(message)
     ):
         return None
-    return {
-        "reminder_id": reminder_id,
-        "wellness_tenant": tenant,
-        "wellness_principal": principal,
-    }
+    return _TrustedReminderWellnessAdmission(
+        reminder_id=reminder_id,
+        wellness_tenant=tenant,
+        wellness_principal=principal,
+        private_chat_id=chat_id,
+    )
 
 
 class OhmoSessionRuntimePool:
@@ -2574,8 +2617,6 @@ class OhmoSessionRuntimePool:
             system_prompt, user_photo_meal_at, known_repeat=user_photo_repeat
         )
         bundle.engine.set_system_prompt(system_prompt)
-        if wellness_reminder is not None:
-            self._apply_reminder_wellness_turn(bundle, wellness_reminder)
         logger.debug(
             "ohmo turn identity principal=%s owner=%s private=%s channel=%s chat_id=%s session_id=%s",
             turn_ctx.principal,
@@ -2751,6 +2792,7 @@ class OhmoSessionRuntimePool:
                             camera_meal_at=camera_meal_at,
                             user_photo_meal_at=user_photo_meal_at,
                             user_photo_repeat=user_photo_repeat,
+                            wellness_reminder=wellness_reminder,
                         )
                     ):
                         yield update
@@ -2783,6 +2825,7 @@ class OhmoSessionRuntimePool:
                             camera_meal_at=camera_meal_at,
                             user_photo_meal_at=user_photo_meal_at,
                             user_photo_repeat=user_photo_repeat,
+                            wellness_reminder=wellness_reminder,
                         )
                     ):
                         yield update
@@ -2805,6 +2848,7 @@ class OhmoSessionRuntimePool:
                         camera_meal_at=camera_meal_at,
                         user_photo_meal_at=user_photo_meal_at,
                         user_photo_repeat=user_photo_repeat,
+                        wellness_reminder=wellness_reminder,
                     )
                 ):
                     yield update
@@ -2824,6 +2868,7 @@ class OhmoSessionRuntimePool:
                     camera_meal_at=camera_meal_at,
                     user_photo_meal_at=user_photo_meal_at,
                     user_photo_repeat=user_photo_repeat,
+                    wellness_reminder=wellness_reminder,
                 )
             ):
                 yield update
@@ -2862,6 +2907,7 @@ class OhmoSessionRuntimePool:
         camera_meal_at: datetime | None = None,
         user_photo_meal_at: datetime | None = None,
         user_photo_repeat: bool = False,
+        wellness_reminder: _TrustedReminderWellnessAdmission | None = None,
     ):
         if result.refresh_runtime:
             bundle = await self._refresh_bundle(
@@ -2908,6 +2954,7 @@ class OhmoSessionRuntimePool:
                     camera_meal_at=camera_meal_at,
                     user_photo_meal_at=user_photo_meal_at,
                     user_photo_repeat=user_photo_repeat,
+                    wellness_reminder=wellness_reminder,
                 ):
                     yield update
             finally:
@@ -3041,6 +3088,7 @@ class OhmoSessionRuntimePool:
         camera_meal_at: datetime | None = None,
         user_photo_meal_at: datetime | None = None,
         user_photo_repeat: bool = False,
+        wellness_reminder: _TrustedReminderWellnessAdmission | None = None,
     ):
         message.metadata.pop("_selected_source_binding", None)
         todo_error = getattr(bundle, "_todo_runtime_error", None)
@@ -3164,7 +3212,16 @@ class OhmoSessionRuntimePool:
             on_attachment_loaded=bind_loaded_attachment,
         )
         try:
-            async for event in bundle.engine.submit_message(user_message):
+            admitted_actor = self._wellness_actor_for_submission(
+                bundle, turn_ctx, wellness_reminder
+            )
+            if admitted_actor is None:
+                turn_events = bundle.engine.submit_message(user_message)
+            else:
+                turn_events = bundle.engine.submit_message(
+                    user_message, wellness_actor=admitted_actor
+                )
+            async for event in turn_events:
                 if isinstance(event, ErrorEvent) and _should_retry_without_image_input(
                     event.message,
                     [*bundle.engine.messages, user_message]
@@ -4913,34 +4970,56 @@ class OhmoSessionRuntimePool:
     def _apply_reminder_wellness_turn(
         self,
         bundle: RuntimeBundle,
-        reminder: dict[str, str | None],
-    ) -> None:
-        """Bind wellness for an auto-delivered current-chat reminder."""
-        tenant = self._validated_reminder_wellness_tenant(reminder)
-        principal = (
-            canonical_principal("telegram", reminder.get("wellness_principal") or "")
-            if tenant is not None
-            else None
-        )
-        self._bind_wellness_principal(bundle, principal)
-
-    def _validated_reminder_wellness_tenant(self, reminder: dict[str, str | None]) -> str | None:
-        tenant = reminder.get("wellness_tenant")
-        principal = reminder.get("wellness_principal")
-        if not tenant or not principal:
+        reminder: _TrustedReminderWellnessAdmission,
+    ) -> TrustedWellnessActor | None:
+        """Mint invocation authority after current scheduler and tenant checks."""
+        if type(reminder) is not _TrustedReminderWellnessAdmission:
             return None
-        canonical = canonical_principal("telegram", principal)
+        tenant = self._validated_reminder_wellness_tenant(reminder)
+        if tenant is None:
+            return None
+        principal = canonical_principal("telegram", reminder.wellness_principal)
+        if principal != reminder.private_chat_id:
+            return None
+        registry = getattr(bundle, "tool_registry", None)
+        tool = registry.get(_WELLNESS_TOOL_NAME) if registry is not None else None
+        if not isinstance(tool, WellnessLoginInjectingAdapter):
+            return None
+        return TrustedWellnessActor(principal)
+
+    def _wellness_actor_for_submission(
+        self,
+        bundle: RuntimeBundle,
+        turn_ctx: TurnContext | None,
+        reminder: _TrustedReminderWellnessAdmission | None,
+    ) -> TrustedWellnessActor | None:
+        """Choose one invocation actor from live or freshly checked admission."""
+        if reminder is not None:
+            return self._apply_reminder_wellness_turn(bundle, reminder)
+        actor = _wellness_actor_for_turn(turn_ctx)
+        if actor is not None:
+            return actor
+        return None
+
+    def _validated_reminder_wellness_tenant(
+        self, reminder: _TrustedReminderWellnessAdmission
+    ) -> str | None:
+        if type(reminder) is not _TrustedReminderWellnessAdmission:
+            return None
+        canonical = canonical_principal("telegram", reminder.wellness_principal)
+        if canonical != reminder.private_chat_id:
+            return None
         resolved = _reminder_wellness_tenants(self._gateway_config).resolve(canonical)
-        if resolved is None or resolved != tenant:
+        if resolved is None or resolved != reminder.wellness_tenant:
             logger.warning(
                 "ohmo reminder wellness rejected tenant=%r principal=%s resolved=%r reminder_id=%s",
-                tenant,
+                reminder.wellness_tenant,
                 canonical,
                 resolved,
-                reminder.get("reminder_id"),
+                reminder.reminder_id,
             )
             return None
-        return tenant
+        return reminder.wellness_tenant
 
     def _bind_wellness_turn(
         self,

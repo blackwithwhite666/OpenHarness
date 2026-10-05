@@ -284,6 +284,7 @@ class QueryContext:
     max_turns: int | None = 200
     hook_executor: HookExecutor | None = None
     tool_metadata: dict[str, object] | None = None
+    wellness_actor: object | None = None
     decision_trace_recorder: DecisionTraceRecorderLike | None = None
 
 
@@ -527,6 +528,10 @@ def _tool_execution_metadata(
         **base,
         **(context.tool_metadata or {}),
     }
+    # Authority is invocation-only. Never restore it from mutable/persisted metadata.
+    metadata.pop("wellness_trusted_actor", None)
+    if context.wellness_actor is not None:
+        metadata["wellness_trusted_actor"] = context.wellness_actor
     if context.decision_trace_recorder is not None:
         metadata[DECISION_TRACE_RECORDER_METADATA_KEY] = context.decision_trace_recorder
     return metadata

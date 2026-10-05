@@ -1,6 +1,7 @@
 """Tests for MCP tool adapters — input model generation and argument serialization."""
 
 import copy
+import asyncio
 import json
 from datetime import datetime
 from pathlib import Path
@@ -24,7 +25,6 @@ from openharness.tools.mcp_tool import (
 )
 from openharness.tools.read_mcp_resource_tool import ReadMcpResourceTool
 from openharness.untrusted import UNTRUSTED_BANNER
-from openharness.skills.bundled import get_bundled_skills
 
 
 class _FakeMcpManager:
@@ -246,11 +246,37 @@ async def test_list_mcp_resources_fences_server_supplied_descriptions():
 class _RecordingMcpManager:
     def __init__(self, tool_output: str = "wellness payload") -> None:
         self.tool_output = tool_output
-        self.calls: list[tuple[str, str, dict]] = []
+        self.calls: list[tuple[str, str, dict, dict | None]] = []
 
     async def call_tool(self, server_name: str, tool_name: str, arguments: dict) -> str:
-        self.calls.append((server_name, tool_name, arguments))
+        self.calls.append((server_name, tool_name, arguments, None))
         return self.tool_output
+
+    async def call_tool_result(
+        self, server_name: str, tool_name: str, arguments: dict, *, meta=None
+    ) -> McpToolCallResult:
+        self.calls.append((server_name, tool_name, arguments, meta))
+        return McpToolCallResult(output=self.tool_output)
+
+
+def _set_synthetic_wellness_config(monkeypatch) -> None:
+    for name, value in {
+        "WELLNESS_DELEGATION_SIGNING_KEY": "synthetic-secret-" + "x" * 32,
+        "WELLNESS_DELEGATION_KID": "test-key",
+        "WELLNESS_DELEGATION_ISSUER": "oh-test",
+        "WELLNESS_DELEGATION_AUDIENCE": "tg-test",
+        "WELLNESS_DELEGATION_CLIENT_ID": "oh-client",
+    }.items():
+        monkeypatch.setenv(name, value)
+
+
+def _admitted_context(telegram_id: str = "116870365") -> ToolExecutionContext:
+    from openharness.mcp.wellness_delegation import TrustedWellnessActor
+
+    return ToolExecutionContext(
+        cwd=Path("."),
+        metadata={"wellness_trusted_actor": TrustedWellnessActor(telegram_id)},
+    )
 
 
 def _energy_fixture() -> str:
@@ -460,273 +486,198 @@ def _wellness_ref_delegate(manager: _RecordingMcpManager) -> McpToolAdapter:
 
 
 class TestWellnessLoginInjectingAdapter:
-    """OHMO-scoped wellness login selector and trusted identity binding."""
-
     def test_legacy_identity_fields_are_hidden_from_model_schema(self):
-        delegate = _wellness_delegate(_RecordingMcpManager())
-        adapter = WellnessLoginInjectingAdapter(delegate)
-
-        schema = adapter.input_model.model_json_schema()
-        serialized = json.dumps(schema)
-        assert "login" in serialized
+        adapter = WellnessLoginInjectingAdapter(_wellness_delegate(_RecordingMcpManager()))
+        serialized = json.dumps(adapter.input_model.model_json_schema())
         for field in ("user_id", "health_types", "participant_id"):
             assert field not in serialized
-            assert field not in json.dumps(adapter.to_api_schema())
 
-    async def test_energy_days_response_is_factual_and_unmodified(self):
-        manager = _RecordingMcpManager(tool_output=_energy_fixture())
+    async def test_missing_turn_actor_fails_closed(self, monkeypatch):
+        _set_synthetic_wellness_config(monkeypatch)
+        manager = _RecordingMcpManager()
         adapter = WellnessLoginInjectingAdapter(_wellness_delegate(manager))
-        adapter.set_trusted_principal("116870365", owner_turn=True)
+        adapter.set_trusted_principal("116870365", trusted_login="must_not_be_used", owner_turn=True)
+        result = await adapter.execute(adapter.input_model(params={"interval": "7d"}),
+                                       ToolExecutionContext(cwd=Path(".")))
+        assert result.is_error
+        assert manager.calls == []
 
-        result = await adapter.execute(
-            adapter.input_model(params={"start": "2026-09-20", "end": "2026-09-21"}),
-            ToolExecutionContext(cwd=Path(".")),
-        )
-
+    async def test_admitted_actor_signs_final_args_without_contact_or_role_injection(self, monkeypatch):
+        from openharness.mcp.wellness_delegation import META_KEY, TrustedWellnessActor
+        _set_synthetic_wellness_config(monkeypatch)
+        manager = _RecordingMcpManager()
+        adapter = WellnessLoginInjectingAdapter(_wellness_delegate(manager))
+        context = ToolExecutionContext(cwd=Path("."),
+            metadata={"wellness_trusted_actor": TrustedWellnessActor("116870365")})
+        result = await adapter.execute(adapter.input_model(params={"login": "reader", "interval": "7d"}),
+                                       context)
         assert result.is_error is False
-        returned = json.loads(result.output.split("\n\n", 1)[1])
-        assert returned == json.loads(_energy_fixture())
-        assert "energy_intervals" not in returned
-        skill = next(skill for skill in get_bundled_skills() if skill.name == "calory")
-        assert "never substitute, add, prorate, or extrapolate `energy_days`" in skill.content
+        assert manager.calls[-1][2]["params"] == {"login": "reader", "interval": "7d"}
+        token = manager.calls[-1][3][META_KEY]
+        assert isinstance(token, str)
+        assert token not in result.output
+        header, claims, signature = token.split(".")
+        import base64
+        import hashlib
+        import hmac
+        decoded_header = json.loads(base64.urlsafe_b64decode(header + "=" * (-len(header) % 4)))
+        decoded = json.loads(base64.urlsafe_b64decode(claims + "=" * (-len(claims) % 4)))
+        assert decoded_header == {"alg": "HS256", "kid": "test-key", "typ": "JWT"}
+        assert set(decoded) == {
+            "schema_version", "iss", "aud", "azp", "sub", "iat", "exp",
+            "tool", "body_sha256",
+        }
+        assert decoded["schema_version"] == 1
+        assert decoded["iss"] == "oh-test" and decoded["aud"] == "tg-test"
+        assert decoded["azp"] == "oh-client" and decoded["tool"] == "get_wellness_data"
+        assert decoded["exp"] - decoded["iat"] == 60
+        assert decoded["sub"] == "telegram:116870365"
+        assert decoded["body_sha256"] == hashlib.sha256(
+            json.dumps(manager.calls[-1][2], sort_keys=True, separators=(",", ":"),
+                       ensure_ascii=False).encode()).hexdigest()
+        signed = f"{header}.{claims}".encode("ascii")
+        actual = base64.urlsafe_b64decode(signature + "=" * (-len(signature) % 4))
+        assert hmac.compare_digest(actual, hmac.new(
+            ("synthetic-secret-" + "x" * 32).encode(), signed, hashlib.sha256
+        ).digest())
 
-    async def test_current_window_call_preserves_exact_bounds_and_interval_result(self):
+    async def test_two_admitted_readers_share_adapter_without_identity_crossing(self, monkeypatch):
+        from openharness.mcp.wellness_delegation import META_KEY
+
+        _set_synthetic_wellness_config(monkeypatch)
+
+        class InterleavingManager(_RecordingMcpManager):
+            async def call_tool_result(self, server_name, tool_name, arguments, *, meta=None):
+                await asyncio.sleep(0)
+                self.calls.append((server_name, tool_name, arguments, meta))
+                return McpToolCallResult(output="{}")
+
+        manager = InterleavingManager(tool_output="{}")
+        adapter = WellnessLoginInjectingAdapter(_wellness_delegate(manager))
+        await asyncio.gather(
+            adapter.execute(adapter.input_model(params={"login": "reader-a"}),
+                            _admitted_context("101")),
+            adapter.execute(adapter.input_model(params={"login": "reader-b"}),
+                            _admitted_context("202")),
+        )
+        claims_by_login = {}
+        import base64
+        for _, _, body, meta in manager.calls:
+            token = meta[META_KEY]
+            encoded_claims = token.split(".")[1]
+            claims = json.loads(base64.urlsafe_b64decode(
+                encoded_claims + "=" * (-len(encoded_claims) % 4)
+            ))
+            claims_by_login[body["params"]["login"]] = claims["sub"]
+        assert claims_by_login == {"reader-a": "telegram:101", "reader-b": "telegram:202"}
+
+    async def test_rolling_interval_bounds_and_json_response_are_preserved(self, monkeypatch):
+        _set_synthetic_wellness_config(monkeypatch)
         payload = Path(__file__).parents[1].joinpath(
             "fixtures", "wellness_energy_intervals.json"
         ).read_text(encoding="utf-8")
         manager = _RecordingMcpManager(tool_output=payload)
         adapter = WellnessLoginInjectingAdapter(_wellness_ref_delegate(manager))
-        adapter.set_trusted_principal("990000001", trusted_login="synthetic_owner", owner_turn=True)
-        skill = next(skill for skill in get_bundled_skills() if skill.name == "calory")
-        assert "use the exact rolling 24 hours ending at trusted `get_time` now" in skill.content
-
         start = "2026-10-01T05:00:00+00:00"
         end = "2026-10-02T05:00:00+00:00"
         result = await adapter.execute(
             adapter.input_model(params={"start": start, "end": end}),
-            ToolExecutionContext(cwd=Path(".")),
+            _admitted_context(),
         )
-
         assert result.is_error is False
-        assert manager.calls == [
-            ("worfalomey", "get_wellness_data", {
-                "params": {"login": "synthetic_owner", "start": start, "end": end}
-            })
-        ]
         returned = json.loads(result.output.split("\n\n", 1)[1])
-        assert returned["linked_device_ids"] == ["watch-1"]
+        assert returned == json.loads(payload)
         assert returned["interval"] == {"start": start, "end": end}
+        assert returned["linked_device_ids"] == ["watch-1"]
         assert returned["energy_snapshot_revision"] == 8
         assert returned["nutrition_unassigned_records"] == []
         interval = returned["energy_intervals"][0]
         day = returned["energy_days"][0]
-        assert set(interval) == {
-            "device_id", "start", "end", "timezone", "basal_sum", "basal_unit",
-            "basal_points", "basal_minutes_with_samples", "active_sum", "active_unit",
-            "active_points", "basal_conflicting_timestamps", "active_conflicting_timestamps",
-            "snapshot_revision", "unresolved_key_count", "possible_replay_count",
-            "legacy_synthetic_count",
-        }
         assert interval["start"] == start and interval["end"] == end
         assert interval["timezone"] == "Europe/Moscow"
         assert interval["device_id"] == day["device_id"]
-        assert interval["snapshot_revision"] == day["snapshot_revision"]
-        assert interval["snapshot_revision"] == returned["energy_snapshot_revision"]
+        assert interval["snapshot_revision"] == day["snapshot_revision"] == 8
         assert interval["basal_sum"] != day["basal_sum"]
         assert interval["basal_minutes_with_samples"] < 24 * 60
         assert interval["possible_replay_count"] == 1
         assert interval["basal_sum"] / 4.184 == pytest.approx(1900.0956022944565)
         assert interval["active_sum"] / 4.184 == pytest.approx(90.0)
+        assert manager.calls[-1][2]["params"] == {"start": start, "end": end}
 
-    async def test_yesterday_call_preserves_local_calendar_bounds(self):
+    async def test_calendar_bounds_and_omitted_login_are_not_rewritten(self, monkeypatch):
+        _set_synthetic_wellness_config(monkeypatch)
         manager = _RecordingMcpManager(tool_output=_energy_fixture())
         adapter = WellnessLoginInjectingAdapter(_wellness_ref_delegate(manager))
-        adapter.set_trusted_principal("990000001", trusted_login="synthetic_owner", owner_turn=True)
-        skill = next(skill for skill in get_bundled_skills() if skill.name == "calory")
-        assert "Explicit historical dates and calendar-day requests keep the existing local-day policy" in skill.content
-
         start = "2026-10-01T00:00:00+03:00"
         end = "2026-10-02T00:00:00+03:00"
         result = await adapter.execute(
             adapter.input_model(params={"start": start, "end": end}),
-            ToolExecutionContext(cwd=Path(".")),
+            _admitted_context(),
         )
-
         assert result.is_error is False
-        assert manager.calls[0][2] == {
-            "params": {"login": "synthetic_owner", "start": start, "end": end}
+        assert manager.calls[-1][2]["params"] == {"start": start, "end": end}
+        assert json.loads(result.output.split("\n\n", 1)[1]) == json.loads(_energy_fixture())
+
+    async def test_foreign_health_reason_and_empty_health_arrays_survive_json_formatter(self, monkeypatch):
+        _set_synthetic_wellness_config(monkeypatch)
+        payload = {
+            "health_authorized": False,
+            "health_authorization_reason": (
+                "Nutrition-only permission. Health and energy are not available for this reader."
+            ),
+            "energy_days": [],
+            "nutrition_status": "complete",
         }
+        manager = _RecordingMcpManager(tool_output=json.dumps(payload))
+        adapter = WellnessLoginInjectingAdapter(_wellness_delegate(manager))
+        result = await adapter.execute(
+            adapter.input_model(params={"login": "reader"}), _admitted_context()
+        )
         returned = json.loads(result.output.split("\n\n", 1)[1])
-        assert returned["energy_days"]
-        assert "energy_intervals" not in returned
+        assert returned == payload
 
-    async def test_current_schema_omitted_login_has_no_stale_extra(self):
+    async def test_explicit_null_login_remains_distinct_from_omission(self, monkeypatch):
+        from openharness.mcp.wellness_delegation import META_KEY
+
+        _set_synthetic_wellness_config(monkeypatch)
         manager = _RecordingMcpManager()
         adapter = WellnessLoginInjectingAdapter(_wellness_delegate(manager))
-        adapter.set_trusted_principal("116870365", owner_turn=True)
-
-        result = await adapter.execute(
-            adapter.input_model(params={"start": "2026-08-09", "end": "2026-08-09"}),
-            ToolExecutionContext(cwd=Path(".")),
-        )
-
-        assert result.is_error is False
-        assert manager.calls[0][2]["params"] == {
-            "start": "2026-08-09",
-            "end": "2026-08-09",
-        }
-
-    async def test_owner_normalizes_selected_login(self):
-        manager = _RecordingMcpManager()
-        adapter = WellnessLoginInjectingAdapter(_wellness_delegate(manager))
-        adapter.set_trusted_principal("116870365", owner_turn=True)
-
         await adapter.execute(
-            adapter.input_model(params={"login": "  @Marina_Lipina  ", "interval": "7d"}),
-            ToolExecutionContext(cwd=Path(".")),
+            adapter.input_model(params={"login": None}), _admitted_context()
         )
+        await adapter.execute(adapter.input_model(params={}), _admitted_context())
+        explicit, omitted = manager.calls
+        assert explicit[2]["params"] == {"login": None}
+        assert omitted[2]["params"] == {}
+        assert explicit[3][META_KEY] != omitted[3][META_KEY]
 
-        assert manager.calls[-1][2]["params"]["login"] == "marina_lipina"
-
-    async def test_owner_rejects_invalid_selected_login_without_mcp_call(self):
-        manager = _RecordingMcpManager()
-        adapter = WellnessLoginInjectingAdapter(_wellness_delegate(manager))
-        adapter.set_trusted_principal("116870365", trusted_login="dmitry_owner", owner_turn=True)
-
-        result = await adapter.execute(
-            adapter.input_model(params={"login": "Marina-Lipina", "interval": "7d"}),
-            ToolExecutionContext(cwd=Path(".")),
-        )
-
-        assert result.is_error is True
-        assert "params.login" in result.output
-        assert manager.calls == []
-
-    async def test_owner_omitted_login_uses_trusted_contact_username(self):
-        manager = _RecordingMcpManager()
-        adapter = WellnessLoginInjectingAdapter(_wellness_delegate(manager))
-        adapter.set_trusted_principal("116870365", trusted_login="Dmitry_Example", owner_turn=True)
-
-        await adapter.execute(
-            adapter.input_model(params={"interval": "7d"}),
-            ToolExecutionContext(cwd=Path(".")),
-        )
-
-        assert manager.calls[-1][2]["params"]["login"] == "dmitry_example"
-
-    async def test_owner_omitted_login_without_contact_username_is_safe(self):
-        manager = _RecordingMcpManager()
-        adapter = WellnessLoginInjectingAdapter(_wellness_delegate(manager))
-        adapter.set_trusted_principal("116870365", owner_turn=True)
-
-        await adapter.execute(
-            adapter.input_model(params={"interval": "7d"}),
-            ToolExecutionContext(cwd=Path(".")),
-        )
-
-        assert manager.calls[-1][2]["params"] == {"interval": "7d"}
-
-    async def test_family_overrides_model_login_with_trusted_contact(self):
-        manager = _RecordingMcpManager()
-        adapter = WellnessLoginInjectingAdapter(_wellness_delegate(manager))
-        adapter.set_trusted_principal("200", trusted_login="Marina_Lipina", family_turn=True)
-
-        await adapter.execute(
-            adapter.input_model(params={"login": "mallory", "interval": "7d"}),
-            ToolExecutionContext(cwd=Path(".")),
-        )
-
-        assert manager.calls[-1][2]["params"]["login"] == "marina_lipina"
-
-    async def test_family_without_trusted_username_fails_closed(self):
-        manager = _RecordingMcpManager()
-        adapter = WellnessLoginInjectingAdapter(_wellness_delegate(manager))
-        adapter.set_trusted_principal("200", family_turn=True)
-
-        result = await adapter.execute(
-            adapter.input_model(params={"login": "mallory", "interval": "7d"}),
-            ToolExecutionContext(cwd=Path(".")),
-        )
-
-        assert result.is_error is True
-        assert "no usable username" in result.output
-        assert manager.calls == []
-
-    async def test_family_with_invalid_trusted_username_fails_closed(self):
-        manager = _RecordingMcpManager()
-        adapter = WellnessLoginInjectingAdapter(_wellness_delegate(manager))
-        adapter.set_trusted_principal("200", trusted_login="Marina-Lipina", family_turn=True)
-
-        result = await adapter.execute(
-            adapter.input_model(params={"interval": "7d"}),
-            ToolExecutionContext(cwd=Path(".")),
-        )
-
-        assert result.is_error is True
-        assert "no usable username" in result.output
-        assert manager.calls == []
-
-    async def test_strips_all_legacy_identity_fields(self):
+    async def test_hidden_legacy_fields_are_stripped_after_model_dump(self, monkeypatch):
+        _set_synthetic_wellness_config(monkeypatch)
         manager = _RecordingMcpManager()
         adapter = WellnessLoginInjectingAdapter(_wellness_ref_delegate(manager))
-        adapter.set_trusted_principal("100", owner_turn=True)
 
         class LegacyArguments(BaseModel):
             params: dict[str, object]
 
-        arguments = LegacyArguments(
-            params={
-                "interval": "7d",
-                "participant_id": 116870365,
-                "user_id": "mallory",
-                "health_types": ["weight"],
-            }
+        result = await adapter.execute(
+            LegacyArguments(params={
+                "interval": "7d", "participant_id": 116870365,
+                "user_id": "model-value", "health_types": ["weight"],
+            }),
+            _admitted_context(),
         )
-        result = await adapter.execute(arguments, ToolExecutionContext(cwd=Path(".")))
-
         assert result.is_error is False
-        assert manager.calls[-1][2]["params"] == {"interval": "7d"}
+        assert manager.calls[-1][2] == {"params": {"interval": "7d"}}
 
-    async def test_missing_identity_clears_stale_binding(self):
-        manager = _RecordingMcpManager()
-        adapter = WellnessLoginInjectingAdapter(_wellness_delegate(manager))
-        adapter.set_trusted_principal("100", owner_turn=True)
-        await adapter.execute(
-            adapter.input_model(params={"interval": "7d"}),
-            ToolExecutionContext(cwd=Path(".")),
-        )
-        adapter.set_trusted_principal(None)
-
-        result = await adapter.execute(
-            adapter.input_model(params={"interval": "7d"}),
-            ToolExecutionContext(cwd=Path(".")),
-        )
-        assert result.is_error is True
-        assert len(manager.calls) == 1
-
-    async def test_non_telegram_principal_fails_closed(self):
-        manager = _RecordingMcpManager()
-        adapter = WellnessLoginInjectingAdapter(_wellness_delegate(manager))
-        adapter.set_trusted_principal("100", channel="feishu", owner_turn=True)
-
-        result = await adapter.execute(
-            adapter.input_model(params={"interval": "7d"}),
-            ToolExecutionContext(cwd=Path(".")),
-        )
-
-        assert result.is_error is True
-        assert manager.calls == []
-
-    def test_resolves_fastmcp_params_ref_without_mutating_delegate_schema(self):
+    def test_ref_resolution_does_not_mutate_the_source_schema(self):
         delegate = _wellness_ref_delegate(_RecordingMcpManager())
-        original_schema = copy.deepcopy(delegate._tool_info.input_schema)
+        original = copy.deepcopy(delegate._tool_info.input_schema)
         adapter = WellnessLoginInjectingAdapter(delegate)
-
-        serialized = json.dumps(adapter.input_model.model_json_schema())
-        assert "user_id" not in serialized
-        assert "health_types" not in serialized
-        assert "participant_id" not in serialized
-        assert delegate._tool_info.input_schema == original_schema
+        schema = json.dumps(adapter.input_model.model_json_schema())
+        assert "login" in schema
+        for field in ("user_id", "participant_id", "health_types"):
+            assert field not in schema
+        assert delegate._tool_info.input_schema == original
 
     @pytest.mark.parametrize(
         "ref,definitions",
@@ -736,28 +687,69 @@ class TestWellnessLoginInjectingAdapter:
         ],
     )
     def test_rejects_unsupported_or_broken_params_ref(self, ref, definitions):
-        manager = _RecordingMcpManager()
-        delegate = _wellness_ref_delegate(manager)
+        delegate = _wellness_ref_delegate(_RecordingMcpManager())
         delegate._tool_info.input_schema["properties"]["params"] = {"$ref": ref}
         delegate._tool_info.input_schema["$defs"] = definitions
-
         with pytest.raises(ValueError, match="JSON Schema reference"):
             WellnessLoginInjectingAdapter(delegate)
 
-    async def test_ref_schema_owner_selection_and_family_override(self):
+    async def test_invalid_body_or_actor_fails_before_transport(self, monkeypatch):
+        from openharness.mcp.wellness_delegation import TrustedWellnessActor
+
+        _set_synthetic_wellness_config(monkeypatch)
         manager = _RecordingMcpManager()
-        adapter = WellnessLoginInjectingAdapter(_wellness_ref_delegate(manager))
-        adapter.set_trusted_principal("100", owner_turn=True)
-
-        await adapter.execute(
-            adapter.input_model(params={"interval": "7d", "login": "@Marina_Lipina"}),
-            ToolExecutionContext(cwd=Path(".")),
+        adapter = WellnessLoginInjectingAdapter(_wellness_delegate(manager))
+        bad_actor_context = ToolExecutionContext(
+            cwd=Path("."), metadata={"wellness_trusted_actor": TrustedWellnessActor("001")}
         )
-        assert manager.calls[-1][2]["params"] == {
-            "interval": "7d",
-            "login": "marina_lipina",
-        }
+        result = await adapter.execute(
+            adapter.input_model(params={"interval": "7d"}), bad_actor_context
+        )
+        assert result.is_error is True
+        assert manager.calls == []
 
+    async def test_missing_private_config_denies_before_transport(self, monkeypatch):
+        from openharness.mcp.wellness_delegation import TrustedWellnessActor
+
+        for name in (
+            "WELLNESS_DELEGATION_SIGNING_KEY", "WELLNESS_DELEGATION_KID",
+            "WELLNESS_DELEGATION_ISSUER", "WELLNESS_DELEGATION_AUDIENCE",
+            "WELLNESS_DELEGATION_CLIENT_ID",
+        ):
+            monkeypatch.delenv(name, raising=False)
+        manager = _RecordingMcpManager()
+        adapter = WellnessLoginInjectingAdapter(_wellness_delegate(manager))
+        context = ToolExecutionContext(
+            cwd=Path("."),
+            metadata={"wellness_trusted_actor": TrustedWellnessActor("116870365")},
+        )
+        result = await adapter.execute(
+            adapter.input_model(params={"interval": "7d"}), context
+        )
+        assert result.is_error is True
+        assert manager.calls == []
+
+    def test_canonical_body_rejects_python_coercions_and_nonfinite_values(self):
+        from openharness.mcp.wellness_delegation import canonical_body
+
+        for body in ({1: "value"}, {"value": (1, 2)}, {"value": float("nan")}):
+            with pytest.raises(ValueError):
+                canonical_body(body)
+
+    async def test_transport_error_is_reported_without_token(self, monkeypatch):
+        _set_synthetic_wellness_config(monkeypatch)
+
+        class FailingManager(_RecordingMcpManager):
+            async def call_tool_result(self, *args, **kwargs):
+                raise McpServerNotConnectedError("synthetic transport failure")
+
+        adapter = WellnessLoginInjectingAdapter(_wellness_delegate(FailingManager()))
+        result = await adapter.execute(
+            adapter.input_model(params={"interval": "7d"}), _admitted_context()
+        )
+        assert result.is_error is True
+        assert "synthetic transport failure" in result.output
+        assert "synthetic-secret" not in result.output
 
 class TestInputModelFromSchema:
     """Verify _input_model_from_schema maps JSON Schema types correctly."""
