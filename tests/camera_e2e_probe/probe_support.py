@@ -213,6 +213,15 @@ def native_preflight_and_clients(
     return clients, source_bytes
 
 
+def native_person_source_clients(settings, *, scenario: str, resolver=None, codex_client_type=None):
+    """Apply the existing Luna subscription/no-fallback gate to source turns."""
+    if not isinstance(scenario, str) or not scenario.strip():
+        raise NativeClientPreconditionError("native person-source run requires a public scenario")
+    return native_profile_clients(
+        settings, resolver=resolver, codex_client_type=codex_client_type
+    )
+
+
 def unique_honcho_scope() -> tuple[str, str]:
     run_id = uuid4().hex
     return f"camera-joined-{run_id}", f"camera-joined-session-{run_id}"
@@ -240,6 +249,22 @@ def verify_source_worktree(
     if require_clean and dirty:
         raise ValueError("Camera source worktree has tracked or non-ignored untracked changes")
     return head, dirty
+
+
+def verify_source_tree_pin(path: Path, expected_head: str) -> tuple[Path, str, str]:
+    """Return the exact clean caller-selected Git checkout, commit, and tree object."""
+    root = path.resolve(strict=True)
+    head, _dirty = verify_source_worktree(root, expected_head, require_clean=True)
+    tree = subprocess.run(
+        ["git", "rev-parse", "HEAD^{tree}"],
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    if not _GIT_SHA.fullmatch(tree):
+        raise ValueError("source worktree tree object is invalid")
+    return root, head, tree
 
 
 def require_bound_answer(message, candidate_id: str, native_photo_id: int | str = 77) -> str:

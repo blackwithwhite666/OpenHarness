@@ -196,6 +196,75 @@ class OfflineCameraUserApi:
         )
 
 
+class OfflinePersonSourceApi:
+    """Synthetic person-source fixture: one tool call, then a final response."""
+
+    synthetic = True
+
+    def __init__(self, *, outcome: str = "meal", basis: str = "image") -> None:
+        if outcome not in {"meal", "nonfood"}:
+            raise ValueError("offline person-source outcome must be meal or nonfood")
+        self.outcome = outcome
+        if basis not in {"image", "text"}:
+            raise ValueError("offline person-source basis must be image or text")
+        self.basis = basis
+        self.calls = 0
+
+    async def stream_message(self, request: ApiMessageRequest) -> AsyncIterator[ApiMessageCompleteEvent]:
+        del request
+        self.calls += 1
+        if self.outcome == "nonfood":
+            message = ConversationMessage(
+                role="assistant",
+                content=[TextBlock(text="This does not appear to be food, so I did not save a meal.")],
+            )
+            stop_reason = "end_turn"
+        elif self.calls > 1:
+            message = ConversationMessage(
+                role="assistant",
+                content=[TextBlock(text="I recorded the synthetic person-source meal.")],
+            )
+            stop_reason = "end_turn"
+        else:
+            message = ConversationMessage(
+                role="assistant",
+                content=[
+                    ToolUseBlock(
+                        name="trace",
+                        input={
+                            "kind": "trace_finalization",
+                            "payload": {
+                                "schema_version": 1,
+                                "trace_event_id": f"offline-person-source-{self.calls}",
+                                "annotations": {
+                                    "nutrition": {
+                                        "schema_version": 2,
+                                        "record_type": "meal_observation",
+                                        "basis": [self.basis],
+                                        "consumption_status": "consumed",
+                                        "is_estimate": True,
+                                        "energy_kcal_best": 125,
+                                        "items": [{
+                                            "name": "synthetic fixture food",
+                                            "quantity_text": "one fixture serving",
+                                            "energy_kcal_best": 125,
+                                        }],
+                                        "assumptions": ["synthetic fixture; not an estimate"],
+                                    }
+                                },
+                            },
+                        },
+                    )
+                ],
+            )
+            stop_reason = "tool_use"
+        yield ApiMessageCompleteEvent(
+            message=message,
+            usage=UsageSnapshot(input_tokens=1, output_tokens=1),
+            stop_reason=stop_reason,
+        )
+
+
 class OfflineTelegramBot:
     """Telegram bot-shaped transport recorder; no polling or network methods."""
 
