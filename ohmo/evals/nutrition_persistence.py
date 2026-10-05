@@ -359,6 +359,159 @@ def _is_receipt_reconciled_retry(goal: Goal, event: dict[str, Any], turn: dict[s
     )
 
 
+def _is_camera_receipt_reconciled_retry(
+    goal: Goal, event: dict[str, Any], turn: dict[str, Any], accepted_turn: dict[str, Any],
+    principal: Any, initial_context: dict[str, Any] | None,
+) -> bool:
+    """Prove a Camera replay against its validated export context and receipt."""
+    camera = _dict(turn.get("trusted_camera_context"))
+    accepted_camera = _dict(accepted_turn.get("trusted_camera_context"))
+    accepted_final = _dict(accepted_turn.get("gateway_final_metadata"))
+    replay_final = _dict(turn.get("gateway_final_metadata"))
+    native_click = _dict(turn.get("camera_native_click_evidence"))
+    accepted_native_click = _dict(accepted_turn.get("camera_native_click_evidence"))
+    execution = _dict(accepted_final.get("nutrition_finalization")) if accepted_final else None
+    # _event_from_raw has already validated and normalized this persisted row.
+    # Revalidating its full model dump loses the sparse changed_fields field set
+    # on corrections and falsely rejects an otherwise valid v2 annotation.
+    original_annotation = _dict(event.get("annotation"))
+    executed_annotation = _validated_nutrition_annotation(
+        execution.get("annotation") if execution else None
+    )
+    if (camera is None or accepted_camera is None or initial_context is None
+            or accepted_final is None or replay_final is None or execution is None
+            or original_annotation is None or executed_annotation is None):
+        return False
+    initial_created = turn.get("trusted_camera_initial_created_at")
+    owner_created = accepted_turn.get("trusted_camera_episode_created_at")
+    replay_created = turn.get("trusted_camera_episode_created_at")
+    try:
+        initial_time = _parse_time(initial_created)
+        owner_time = _parse_time(owner_created)
+        replay_time = _parse_time(replay_created)
+        event_time = event.get("created_at")
+        event_time = event_time if isinstance(event_time, datetime) else _parse_time(event_time)
+    except (TypeError, ValueError):
+        return False
+    identity_fields = ("candidate_id", "native_photo_id", "tenant_id",
+                       "gateway_session_id", "recipient_principal")
+    correction_operation_retry = (
+        event.get("annotation", {}).get("record_type") == "meal_correction"
+        and event.get("trace_episode_id") == accepted_turn.get("episode_id")
+        and event.get("trace_episode_id") != goal.trace_episode_id
+        and event.get("source_message_id") == goal.source_message_id
+        and event.get("reply_to_source_message_id") == goal.source_message_id
+        and accepted_turn.get("source_message_id") == goal.source_message_id
+        and accepted_turn.get("logical_turn_id") == event.get("logical_turn_id")
+        and accepted_turn.get("operation_id") == event.get("operation_id")
+        and accepted_camera.get("episode_id") == accepted_turn.get("episode_id")
+        and accepted_camera.get("source_message_id") == goal.source_message_id
+        and accepted_camera.get("logical_turn_id") == event.get("logical_turn_id")
+        and accepted_camera.get("operation_id") == event.get("operation_id")
+        and camera.get("logical_turn_id") == event.get("logical_turn_id")
+        and camera.get("operation_id") == event.get("operation_id")
+    )
+    native_correction_retry = (
+        correction_operation_retry
+        and camera.get("source_message_id") == goal.source_message_id
+        and native_click is not None and accepted_native_click is not None
+        and _normalized_telegram_target(native_click.get("message_id")) == goal.source_message_id
+        and _normalized_telegram_target(native_click.get("native_message_id")) == goal.source_message_id
+        and _normalized_telegram_target(native_click.get("_camera_native_binding")) == goal.source_message_id
+        and accepted_native_click.get("callback_query") is True
+        and native_click.get("callback_query") is True
+        and accepted_native_click.get("_camera_route") == "callback"
+        and native_click.get("_camera_route") == "callback"
+        and accepted_native_click.get("_camera_ingress_callback_eligible") is True
+        and accepted_native_click.get("_camera_candidate_id") == accepted_camera.get("candidate_id")
+        and native_click.get("_camera_candidate_id") == camera.get("candidate_id")
+        and all(accepted_native_click.get(field) == native_click.get(field) for field in (
+            "message_id", "native_message_id", "_camera_native_binding", "callback_data",
+            "native_keyboard_options", "native_keyboard_selected_index",
+            "native_keyboard_selected_label", "native_keyboard_reflection_confirmed",
+            "native_keyboard_reflection",
+        ))
+    )
+    typed_selection = turn.get("typed_camera_replay_selection")
+    typed_correction_retry = (
+        correction_operation_retry
+        and camera.get("source_message_id") == turn.get("source_message_id")
+        and camera.get("source_message_id") != goal.source_message_id
+        and native_click is None
+        and _camera_typed_selection_matches_owner_input(
+            typed_selection, accepted_turn.get("camera_owner_selection"))
+    )
+    correction_retry = native_correction_retry or typed_correction_retry
+    return (
+        type(execution.get("schema_version")) is int
+        and execution.get("schema_version") == 1
+        and event.get("event_id") == accepted_final.get("nutrition_append_event_id")
+        and accepted_final.get("nutrition_append_event_id") == replay_final.get("nutrition_append_event_id")
+        and executed_annotation == original_annotation
+        and event.get("owner_id") == goal.owner_id
+        and event.get("principal_id") == goal.principal_id == principal
+        and (event.get("trace_episode_id") == goal.trace_episode_id or correction_retry)
+        and event.get("source_message_id") == goal.source_message_id
+        and (correction_retry or event.get("logical_turn_id") == goal.logical_turn_id)
+        and (correction_retry or event.get("operation_id") == goal.operation_id)
+        and (correction_retry or accepted_turn.get("episode_id") == goal.trace_episode_id)
+        and accepted_turn.get("source_message_id") == goal.source_message_id
+        and (correction_retry or accepted_turn.get("logical_turn_id") == goal.logical_turn_id)
+        and (correction_retry or accepted_turn.get("operation_id") == goal.operation_id)
+        and accepted_turn.get("principal_id") == goal.principal_id
+        and camera.get("kind") == "owner_turn"
+        and accepted_camera.get("kind") == "owner_turn"
+        and camera.get("episode_id") == turn.get("episode_id")
+        and accepted_camera.get("episode_id") == accepted_turn.get("episode_id")
+        and camera.get("episode_id") != accepted_camera.get("episode_id")
+        and turn.get("episode_id") != accepted_turn.get("episode_id")
+        and camera.get("source_message_id") == turn.get("source_message_id")
+        and (camera.get("source_message_id") != goal.source_message_id or (
+            native_click is not None
+            and accepted_native_click is not None
+            and native_click.get("_camera_candidate_id") == camera.get("candidate_id")
+            and native_click.get("callback_query") is True
+            and native_click.get("_camera_route") == "callback"
+            and (correction_retry or native_click.get("_camera_existing_meal_replay") is True)
+            and native_click.get("_camera_ingress_callback_eligible") is True
+            and isinstance(native_click.get("callback_query_id"), str)
+            and bool(native_click.get("callback_query_id").strip())
+            and accepted_native_click.get("callback_query") is True
+            and accepted_native_click.get("_camera_route") == "callback"
+            and isinstance(accepted_native_click.get("callback_query_id"), str)
+            and bool(accepted_native_click.get("callback_query_id").strip())
+            and _normalized_telegram_target(native_click.get("message_id")) == goal.source_message_id
+            and _normalized_telegram_target(native_click.get("native_message_id")) == goal.source_message_id
+            and _normalized_telegram_target(native_click.get("_camera_native_binding")) == goal.source_message_id
+            and _normalized_telegram_target(accepted_native_click.get("message_id")) == goal.source_message_id
+            and _normalized_telegram_target(accepted_native_click.get("native_message_id")) == goal.source_message_id
+            and _normalized_telegram_target(accepted_native_click.get("_camera_native_binding")) == goal.source_message_id
+        ))
+        and accepted_camera.get("source_message_id") == goal.source_message_id
+        and camera.get("principal_id") == principal == goal.principal_id
+        and accepted_camera.get("principal_id") == goal.principal_id
+        and (correction_retry or camera.get("logical_turn_id") == accepted_camera.get("logical_turn_id") == goal.logical_turn_id)
+        and (correction_retry or camera.get("operation_id") == accepted_camera.get("operation_id") == goal.operation_id)
+        and (correction_retry or turn.get("logical_turn_id") == goal.logical_turn_id)
+        and (correction_retry or turn.get("operation_id") == goal.operation_id)
+        and turn.get("principal_id") == principal == goal.principal_id
+        and initial_context.get("kind") == "initial_context"
+        and initial_context.get("episode_id") == accepted_turn.get("trusted_camera_initial_episode_id")
+        and initial_context.get("episode_id") == turn.get("trusted_camera_initial_episode_id")
+        and all(camera.get(field) == accepted_camera.get(field) == initial_context.get(field)
+                for field in identity_fields)
+        and camera.get("tenant_id") == goal.owner_id
+        and camera.get("gateway_session_id") == goal.gateway_session_id
+        and camera.get("recipient_principal") == goal.principal_id
+        and accepted_camera.get("source_message_id") in accepted_turn.get(
+            "trusted_camera_source_message_ids", []
+        )
+        and camera.get("source_message_id") in turn.get("trusted_camera_source_message_ids", [])
+        and initial_context.get("source_principal")
+        and initial_time < owner_time <= event_time < replay_time
+    )
+
+
 def _grade_one(goal: Goal, honcho: dict[str, Any], telegent: dict[str, Any], *, now: datetime,
                grace_seconds: int, reviewed_turn_sources: dict[str, list[str]] | None = None,
                reviewed_turn_provenance: dict[str, list[dict[str, Any]]] | None = None) -> dict[str, Any]:
@@ -432,6 +585,9 @@ def _grade_one(goal: Goal, honcho: dict[str, Any], telegent: dict[str, Any], *, 
         context for turn in reviewed_turns
         if isinstance((context := turn.get("trusted_camera_initial_context")), dict)
     ]
+    camera_initial_contexts = [context for context in reviewed_camera_contexts
+                               if context.get("kind") == "initial_context"]
+    camera_initial_context = camera_initial_contexts[0] if len(camera_initial_contexts) == 1 else None
     reviewed_logical_turns.update(context.get("logical_turn_id") for context in reviewed_camera_contexts
                                   if isinstance(context.get("logical_turn_id"), str))
     reviewed_operations.update(context.get("operation_id") for context in reviewed_camera_contexts
@@ -612,7 +768,8 @@ def _grade_one(goal: Goal, honcho: dict[str, Any], telegent: dict[str, Any], *, 
         export_identity_matches = False
         if reviewed_turn_edge:
             linked_turns = [(episode, turn) for episode, turn in reviewed_turn_bindings
-                            if (turn.get("source_message_id") == source_id
+                            if ((turn.get("source_message_id") == source_id
+                                 and episode == trace_episode)
                                 or turn.get("logical_turn_id") == logical_turn
                                 or turn.get("operation_id") == operation)]
             exact_turns = [(episode, turn) for episode, turn in linked_turns
@@ -625,9 +782,15 @@ def _grade_one(goal: Goal, honcho: dict[str, Any], telegent: dict[str, Any], *, 
             export_identity_matches = (
                 len(exact_turns) == 1
                 and len(exact_turns) + len(retry_turns) == len(linked_turns)
-                and all(_is_receipt_reconciled_retry(
-                            goal, event, turn, exact_turns[0][1], relevant_principal)
-                        for _, turn in retry_turns)
+                and all(
+                    _is_receipt_reconciled_retry(
+                        goal, event, turn, exact_turns[0][1], relevant_principal)
+                    or _is_camera_receipt_reconciled_retry(
+                        goal, event, turn, exact_turns[0][1], relevant_principal,
+                        camera_initial_context,
+                    )
+                    for _, turn in retry_turns
+                )
             )
             if not export_identity_matches:
                 return {**base, "a1": "INCONCLUSIVE", "stage": "HONCHO_TURN_BINDING_MISMATCH",
@@ -705,10 +868,59 @@ def _grade_one(goal: Goal, honcho: dict[str, Any], telegent: dict[str, Any], *, 
                     or expected_turn.get("principal_id") != event["principal_id"]):
                 return {**base, "a1": "INCONCLUSIVE", "stage": "HONCHO_TURN_BINDING_MISMATCH",
                         "reason": "persisted turn operation differs from gateway-derived exported identity"}
+            camera_context = _dict(expected_turn.get("trusted_camera_context")) or {}
+            if (record_type == "meal_correction" and camera_context.get("kind") == "owner_turn"):
+                final = _dict(expected_turn.get("gateway_final_metadata"))
+                execution = _dict(final.get("nutrition_finalization")) if final else None
+                executed = _validated_nutrition_annotation(
+                    execution.get("annotation") if execution else None
+                )
+                if (final is None or execution is None
+                        or type(execution.get("schema_version")) is not int
+                        or execution.get("schema_version") != 1
+                        or final.get("nutrition_append_event_id") != event.get("event_id")
+                        or executed is None or executed != event.get("annotation")):
+                    return {**base, "a1": "INCONCLUSIVE", "stage": "HONCHO_TURN_BINDING_MISMATCH",
+                            "reason": "Camera correction lacks its exact executed finalizer and append receipt"}
         elif event["trace_episode_id"] != goal.trace_episode_id:
             return {**base, "a1": "INCONCLUSIVE", "stage": "HONCHO_TURN_BINDING_MISSING",
                     "reason": "correction turn has no exported gateway-derived operation identity"}
         selected.append(event)
+    for _, turn in reviewed_turn_bindings:
+        typed_selection = turn.get("typed_camera_replay_selection")
+        if not isinstance(typed_selection, str):
+            continue
+        typed_final = _dict(turn.get("gateway_final_metadata"))
+        matching_corrections = [event for event in selected
+            if event.get("annotation", {}).get("record_type") == "meal_correction"
+            and event.get("source_message_id") == goal.source_message_id
+            and event.get("reply_to_source_message_id") == goal.source_message_id
+            and event.get("logical_turn_id") == turn.get("logical_turn_id")
+            and event.get("operation_id") == turn.get("operation_id")]
+        if (len(matching_corrections) != 1 or typed_final is None
+                or typed_final.get("nutrition_append_event_id")
+                    != matching_corrections[0].get("event_id")
+                or not _camera_typed_selection_matches_owner_input(
+                    typed_selection, turn.get("camera_owner_selection"))):
+            return {**base, "a1": "INCONCLUSIVE", "stage": "HONCHO_TURN_BINDING_MISMATCH",
+                    "reason": "typed Camera replay does not retain its current correction operation, quantity, and receipt"}
+    camera_correction_turns: dict[str, set[str]] = {}
+    for episode_id, turn in reviewed_turn_bindings:
+        context = _dict(turn.get("trusted_camera_context")) or {}
+        if (context.get("kind") == "owner_turn"
+                and context.get("source_message_id") == goal.source_message_id
+                and turn.get("source_message_id") == goal.source_message_id
+                and turn.get("operation_id") != goal.operation_id):
+            if isinstance(turn.get("operation_id"), str):
+                camera_correction_turns.setdefault(turn["operation_id"], set()).add(episode_id)
+    for operation_id, episode_ids in camera_correction_turns.items():
+        accepted_corrections = [event for event in selected
+            if (_dict(event.get("annotation")) or {}).get("record_type") == "meal_correction"
+            and event.get("operation_id") == operation_id
+            and event.get("trace_episode_id") in episode_ids]
+        if len(accepted_corrections) != 1:
+            return {**base, "a1": "INCONCLUSIVE", "stage": "HONCHO_TURN_BINDING_MISMATCH",
+                    "reason": "Camera correction operation lacks one matching persisted correction event"}
     try:
         for event in selected:
             event["_created_at"] = event["created_at"]
@@ -1018,6 +1230,108 @@ def _is_recorded_camera_initial_prompt(episode: dict[str, Any], payload: dict[st
         "message_id", "source_message_id", "reply_to_message_id"))
 
 
+_CAMERA_CALLBACK_EXPORT_FIELDS = (
+    "callback_query", "callback_query_id", "callback_data", "native_message_id",
+    "message_id", "native_keyboard_options", "native_keyboard_selected_index",
+    "native_keyboard_selected_label", "native_keyboard_prompt", "native_keyboard_question",
+    "native_keyboard_reflection_confirmed", "native_keyboard_reflection", "_camera_route",
+    "_camera_existing_meal_replay", "_camera_ingress_callback_eligible",
+    "_camera_candidate_id", "_camera_native_binding",
+)
+_CAMERA_CALLBACK_SHAPE_FIELDS = frozenset(_CAMERA_CALLBACK_EXPORT_FIELDS) - {
+    "message_id", "_camera_candidate_id",
+}
+_CAMERA_NATIVE_CLICK_FIELDS = _CAMERA_CALLBACK_SHAPE_FIELDS - {
+    "callback_query", "_camera_route", "_camera_existing_meal_replay",
+    "_camera_ingress_callback_eligible",
+}
+
+
+def _has_camera_callback_shape(metadata: dict[str, Any]) -> bool:
+    return any(field in metadata for field in _CAMERA_CALLBACK_SHAPE_FIELDS)
+
+
+def _has_native_camera_click_evidence(metadata: dict[str, Any]) -> bool:
+    return (
+        metadata.get("callback_query") is True
+        or metadata.get("_camera_route") == "callback"
+        or metadata.get("_camera_existing_meal_replay") is True
+        or metadata.get("_camera_ingress_callback_eligible") is True
+        or any(field in metadata for field in _CAMERA_NATIVE_CLICK_FIELDS)
+    )
+
+
+def _validated_typed_camera_replay_selection(
+    item: dict[str, Any], goal: Goal, context: dict[str, Any],
+) -> str | None:
+    """Return only a source-bound, native-free typed correction selection."""
+    episode = _dict(item.get("episode")) or {}
+    episode_metadata = _dict(episode.get("metadata")) or {}
+    inbound = _dict(episode_metadata.get("inbound")) or {}
+    metadata = _dict(inbound.get("metadata")) or {}
+    dialogue = item.get("dialogue")
+    user_texts = [turn.get("text") for turn in dialogue
+                  if isinstance(turn, dict) and turn.get("role") == "user"] if isinstance(dialogue, list) else []
+    source_id = metadata.get("message_id")
+    if type(source_id) is int and source_id > 0:
+        source_id = str(source_id)
+    raw_text = metadata.get("_telegram_raw_text")
+    if (context.get("kind") != "owner_turn"
+            or metadata.get("_camera_correction_replay_typed") is not True
+            or _has_camera_callback_shape(metadata)
+            or _has_native_camera_click_evidence(metadata)
+            or inbound.get("channel") != "telegram"
+            or _inbound_principal(inbound) != goal.principal_id
+            or metadata.get("_camera_candidate_id") != context.get("candidate_id")
+            or metadata.get("_camera_turn_id") != context.get("logical_turn_id")
+            or not isinstance(source_id, str) or not source_id
+            or source_id != context.get("source_message_id")
+            or _normalized_telegram_target(metadata.get("reply_to_message_id"))
+                != goal.source_message_id
+            or metadata.get("is_group") is not False
+            or metadata.get("chat_type", "private") != "private"
+            or source_id == goal.source_message_id
+            or not isinstance(raw_text, str) or user_texts != [raw_text]):
+        return None
+    return raw_text
+
+
+def _camera_typed_selection_matches_owner_input(selection: object, owner_selection: object) -> bool:
+    """Bind a typed repeat to the accepted owner input, not generated item wording."""
+    return isinstance(selection, str) and isinstance(owner_selection, str) and selection == owner_selection
+
+
+def _validated_camera_owner_input_selection(
+    item: dict[str, Any], goal: Goal, context: dict[str, Any],
+    click_evidence: dict[str, Any] | None,
+) -> str | None:
+    """Read the accepted selection from its exact exported owner input."""
+    if click_evidence is not None:
+        label = click_evidence.get("label")
+        return label if isinstance(label, str) else None
+    episode = _dict(item.get("episode")) or {}
+    inbound = _dict((_dict(episode.get("metadata")) or {}).get("inbound")) or {}
+    metadata = _dict(inbound.get("metadata")) or {}
+    texts = [turn.get("text") for turn in item.get("dialogue", [])
+             if isinstance(turn, dict) and turn.get("role") == "user"]
+    source_id = metadata.get("message_id")
+    if type(source_id) is int and source_id > 0:
+        source_id = str(source_id)
+    raw_text = metadata.get("_telegram_raw_text")
+    if raw_text is None:
+        raw_text = inbound.get("user_text")
+    if (inbound.get("channel") != "telegram" or _inbound_principal(inbound) != goal.principal_id
+            or source_id != context.get("source_message_id")
+            or metadata.get("_camera_candidate_id") != context.get("candidate_id")
+            or metadata.get("_camera_turn_id") != context.get("logical_turn_id")
+            or metadata.get("is_group") is not False
+            or metadata.get("chat_type", "private") != "private"
+            or _has_native_camera_click_evidence(metadata)
+            or not isinstance(raw_text, str) or texts != [raw_text]):
+        return None
+    return raw_text
+
+
 def _exported_camera_context(episode: dict[str, Any], events: list[dict[str, Any]]) -> dict[str, Any] | None:
     episode_metadata = _dict(episode.get("metadata")) or {}
     context = _dict(episode_metadata.get("trusted_camera_context"))
@@ -1031,7 +1345,10 @@ def _exported_camera_context(episode: dict[str, Any], events: list[dict[str, Any
             or context.get("gateway_session_id") != episode.get("session_id")
             or type(photo_id) is not int or photo_id <= 0):
         return None
-    inbound = next((event for event in events if event.get("kind") == "inbound_message"), None)
+    indexed_inbounds = [event for event in events if event.get("kind") == "inbound_message"]
+    if len(indexed_inbounds) != 1:
+        return None
+    inbound = indexed_inbounds[0]
     payload = _dict(inbound.get("payload")) if inbound else None
     channel_metadata = _dict(payload.get("metadata")) if payload else None
     if (payload is None or channel_metadata is None
@@ -1059,6 +1376,29 @@ def _exported_camera_context(episode: dict[str, Any], events: list[dict[str, Any
             "logical_turn_id", "operation_id")}
     if context.get("kind") != "owner_turn":
         return None
+    recorded_inbound = _dict(episode_metadata.get("inbound")) or {}
+    recorded_metadata = _dict(recorded_inbound.get("metadata")) or {}
+    typed_replay_marked = (
+        channel_metadata.get("_camera_correction_replay_typed") is True
+        or recorded_metadata.get("_camera_correction_replay_typed") is True
+    )
+    if typed_replay_marked:
+        typed_fields = ("message_id", "reply_to_message_id", "_telegram_raw_text",
+                        "_camera_correction_replay_typed", "_camera_candidate_id",
+                        "_camera_turn_id", "is_group", "chat_type")
+        if (channel_metadata.get("_camera_correction_replay_typed") is not True
+                or recorded_metadata.get("_camera_correction_replay_typed") is not True
+                or _has_camera_callback_shape(channel_metadata)
+                or _has_camera_callback_shape(recorded_metadata)
+                or not _indexed_camera_callback_matches(episode, payload)
+                or any((field in recorded_metadata) != (field in channel_metadata)
+                       or recorded_metadata.get(field) != channel_metadata.get(field)
+                       for field in typed_fields)):
+            return None
+    if (_has_camera_callback_shape(channel_metadata)
+            or _has_camera_callback_shape(recorded_metadata)):
+        if not _indexed_camera_callback_matches(episode, payload):
+            return None
     turn = _dict(episode_metadata.get("trusted_camera_turn_provenance")) or {}
     source_id = channel_metadata.get("message_id")
     if isinstance(source_id, int) and not isinstance(source_id, bool):
@@ -1076,6 +1416,91 @@ def _exported_camera_context(episode: dict[str, Any], events: list[dict[str, Any
         "kind", "episode_id", "candidate_id", "native_photo_id", "tenant_id",
         "gateway_session_id", "recipient_principal", "source_message_id", "principal_id",
         "logical_turn_id", "operation_id")}
+
+
+def _indexed_camera_callback_matches(episode: dict[str, Any], payload: dict[str, Any]) -> bool:
+    """Require the recorded episode and indexed inbound to retain the same click data."""
+    episode_metadata = _dict(episode.get("metadata")) or {}
+    recorded = _dict(episode_metadata.get("inbound"))
+    indexed = _dict(payload.get("metadata"))
+    recorded_metadata = _dict(recorded.get("metadata")) if recorded else None
+    if recorded is None or indexed is None or recorded_metadata is None:
+        return False
+    if any(recorded.get(field) != payload.get(field) for field in ("channel", "sender_id", "chat_id")):
+        return False
+    return all(
+        (field in recorded_metadata) == (field in indexed)
+        and recorded_metadata.get(field) == indexed.get(field)
+        for field in _CAMERA_CALLBACK_EXPORT_FIELDS
+    )
+
+
+def _normalized_telegram_target(value: Any) -> str | None:
+    """Normalize positive Telegram message IDs for comparison without rewriting them."""
+    if type(value) is int and value > 0:
+        return str(value)
+    if (isinstance(value, str) and value.isascii() and value.isdecimal()
+            and value and not value.startswith("0")):
+        return value
+    return None
+
+
+def _validated_native_camera_click(
+    item: dict[str, Any], goal: Goal, context: dict[str, Any], *, replay: bool,
+    target_source: str | None = None,
+) -> dict[str, Any] | None:
+    """Validate one recorded callback and its original selected keyboard option."""
+    episode = _dict(item.get("episode")) or {}
+    inbound = _dict((_dict(episode.get("metadata")) or {}).get("inbound")) or {}
+    click = _dict(inbound.get("metadata")) or {}
+    options = click.get("native_keyboard_options")
+    index = click.get("native_keyboard_selected_index")
+    label = click.get("native_keyboard_selected_label")
+    callback_id = click.get("callback_query_id")
+    target = _normalized_telegram_target(target_source or goal.source_message_id)
+    reflected_label = (label.replace("&", "&amp;").replace("<", "&lt;")
+                       .replace(">", "&gt;")) if isinstance(label, str) else None
+    user_texts = [turn.get("text") for turn in item.get("dialogue", [])
+                  if isinstance(turn, dict) and turn.get("role") == "user"]
+    if (target is None or inbound.get("channel") != "telegram"
+            or _inbound_principal(inbound) != goal.principal_id
+            or click.get("callback_query") is not True
+            or click.get("_camera_route") != "callback"
+            or (replay and (click.get("_camera_existing_meal_replay") is not True
+                            or click.get("_camera_ingress_callback_eligible") is not True))
+            or not isinstance(callback_id, str) or not callback_id.strip()
+            or click.get("_camera_candidate_id") != context.get("candidate_id")
+            or _normalized_telegram_target(click.get("message_id")) != target
+            or _normalized_telegram_target(click.get("native_message_id")) != target
+            or _normalized_telegram_target(click.get("_camera_native_binding")) != target
+            or not isinstance(options, list) or not 2 <= len(options) <= 8
+            or any(not isinstance(option, str) or not option.strip() for option in options)
+            or type(index) is not int or not 0 <= index < len(options)
+            or not isinstance(label, str) or options[index] != label
+            or click.get("callback_data") != f"ask:{index}"
+            or user_texts != [label]
+            or click.get("native_keyboard_reflection_confirmed") is not True
+            or not isinstance(click.get("native_keyboard_reflection"), str)
+            or f"✅ {reflected_label}" not in click["native_keyboard_reflection"]):
+        return None
+    return {
+        "target": target,
+        "callback_query_id": callback_id,
+        "options": options,
+        "index": index,
+        "label": label,
+        "callback_data": click.get("callback_data"),
+        "native_keyboard_prompt": click.get("native_keyboard_prompt"),
+        "native_keyboard_question": click.get("native_keyboard_question"),
+        "_camera_candidate_id": click.get("_camera_candidate_id"),
+        "_camera_route": click.get("_camera_route"),
+        "_camera_existing_meal_replay": click.get("_camera_existing_meal_replay"),
+        "_camera_ingress_callback_eligible": click.get("_camera_ingress_callback_eligible"),
+        "message_id": click.get("message_id"),
+        "native_message_id": click.get("native_message_id"),
+        "_camera_native_binding": click.get("_camera_native_binding"),
+        "callback_query": click.get("callback_query"),
+    }
 
 
 def _canonical_local_day(meal: dict[str, Any], timezone_name: str) -> str | None:
@@ -1348,6 +1773,188 @@ def export_eval_dialogue(eval_root: str | Path, *, episode_ids: list[str] | None
     return {"privacy": "private", "exported_at": datetime.now(timezone.utc).isoformat(), "episodes": episodes}
 
 
+def _validated_camera_owner_turns(
+    goal: Goal, by_id: dict[str, dict[str, Any]], selected_camera_contexts: list[dict[str, Any]],
+    initial_contexts: list[dict[str, Any]], matching_initials: list[tuple[str, dict[str, Any]]],
+    turn_provenance: dict[str, list[dict[str, Any]]],
+) -> tuple[bool, str | None, list[dict[str, Any]]]:
+    """Bind Camera owner/replay contexts to exact exported turns and one initial receipt."""
+    if len(initial_contexts) != 1:
+        return False, "include the initial Camera context episode matching this photo receipt", []
+    if len(matching_initials) != 1:
+        return False, "initial Camera context does not match the owner photo receipt", []
+    initial_episode_id, initial = matching_initials[0]
+    if (initial_episode_id not in goal.episode_ids
+            or len([context for context in selected_camera_contexts
+                    if context.get("kind") == "owner_turn"]) != len(goal.episode_ids) - 1):
+        return False, "selected Camera provenance is missing an owner-turn context", []
+    initial_episode = _dict(by_id.get(initial_episode_id, {}).get("episode")) or {}
+    try:
+        initial_time = _parse_time(initial_episode.get("created_at"))
+    except (TypeError, ValueError):
+        return False, "initial Camera receipt chronology is missing or invalid", []
+    if (initial.get("kind") != "initial_context" or initial.get("episode_id") != initial_episode_id
+            or initial.get("tenant_id") != goal.owner_id
+            or initial.get("gateway_session_id") != goal.gateway_session_id
+            or initial.get("recipient_principal") != goal.principal_id):
+        return False, "initial Camera receipt identity does not match the Goal scope", []
+    identity_fields = ("candidate_id", "native_photo_id", "tenant_id",
+                       "gateway_session_id", "recipient_principal")
+    owner_contexts = [context for context in selected_camera_contexts
+                      if context.get("kind") == "owner_turn"]
+    if len(owner_contexts) != len(selected_camera_contexts) - 1:
+        return False, "selected Camera provenance contains an unsupported context kind", []
+    root_contexts = [context for context in owner_contexts
+                     if context.get("episode_id") == goal.trace_episode_id]
+    if len(root_contexts) != 1:
+        return False, "Camera source episode lacks one unique owner-turn receipt", []
+    root_context = root_contexts[0]
+    if (root_context.get("source_message_id") != goal.source_message_id
+            or root_context.get("principal_id") != goal.principal_id
+            or root_context.get("logical_turn_id") != goal.logical_turn_id
+            or root_context.get("operation_id") != goal.operation_id
+            or goal.operation_id != f"{goal.logical_turn_id}:assistant"):
+        return False, "Camera owner-turn receipt does not match the reviewed original source turn", []
+    if any(root_context.get(field) != initial.get(field) for field in identity_fields):
+        return False, "Camera owner-turn receipt differs from the initial photo identity", []
+    try:
+        root_episode = _dict(by_id.get(goal.trace_episode_id, {}).get("episode")) or {}
+        root_time = _parse_time(root_episode.get("created_at"))
+    except (TypeError, ValueError):
+        return False, "Camera owner-turn chronology is missing or invalid", []
+    if initial_time >= root_time:
+        return False, "initial Camera receipt does not precede the owner turn", []
+
+    validated = []
+    seen_episode_ids = set()
+    for context in owner_contexts:
+        episode_id = context.get("episode_id")
+        item = by_id.get(episode_id) if isinstance(episode_id, str) else None
+        episode = _dict(item.get("episode")) if item else None
+        source_id = context.get("source_message_id")
+        if (item is None or episode is None or episode_id not in goal.episode_ids
+                or episode_id in seen_episode_ids or not isinstance(source_id, str) or not source_id
+                or source_id not in item.get("source_message_ids", [])
+                or episode.get("session_id") != goal.gateway_session_id
+                or item.get("principal_id") != goal.principal_id
+                or context.get("principal_id") != goal.principal_id
+                or context.get("tenant_id") != goal.owner_id
+                or context.get("gateway_session_id") != goal.gateway_session_id
+                or context.get("recipient_principal") != goal.principal_id
+                or any(context.get(field) != initial.get(field) for field in identity_fields)
+                or not isinstance(context.get("logical_turn_id"), str)
+                or context.get("operation_id") != f"{context.get('logical_turn_id')}:assistant"):
+            return False, "Camera owner/replay context conflicts with its exported episode or Goal", []
+        if episode_id == goal.trace_episode_id:
+            if source_id != goal.source_message_id:
+                return False, "Camera owner-turn source differs from the reviewed original", []
+        elif source_id == goal.source_message_id:
+            # Only a retry of the original accepted operation needs the native
+            # existing-meal replay marker. A fresh correction, and its cached
+            # repeat, use their own operation and receipt instead.
+            original_operation_retry = context.get("operation_id") == goal.operation_id
+            replay_click = _validated_native_camera_click(
+                item, goal, context, replay=original_operation_retry
+            )
+            if replay_click is None:
+                return False, "Camera same-source callback lacks a validated native target", []
+            # A new callback operation can be a correction. Its own persisted
+            # correction event and append receipt are checked by the ordinary
+            # history grader; a cached repeat must match that operation's click.
+            prior_same_operation = [record for record in validated
+                if record["turn"].get("operation_id") == context.get("operation_id")]
+            if prior_same_operation:
+                prior_click = prior_same_operation[-1].get("native_click")
+                if (prior_click is None or any(prior_click.get(field) != replay_click.get(field)
+                        for field in ("target", "options", "index", "label", "callback_data"))):
+                    return False, "Camera replay selection differs from its accepted operation", []
+        else:
+            inbound = _dict((_dict(episode.get("metadata")) or {}).get("inbound")) or {}
+            click = _dict(inbound.get("metadata")) or {}
+            if _has_native_camera_click_evidence(click):
+                try:
+                    context_time = _parse_time(episode.get("created_at"))
+                except (TypeError, ValueError):
+                    return False, "Camera owner/replay episode chronology is missing or invalid", []
+                clarification_click = _validated_native_camera_click(
+                    item, goal, context, replay=False, target_source=source_id
+                )
+                if (context_time >= root_time or clarification_click is None
+                        or _normalized_telegram_target(source_id)
+                        != _normalized_telegram_target(initial.get("native_photo_id"))):
+                    return False, "Camera native replay target differs from the reviewed original", []
+        matching_turns = [turn for turn in turn_provenance.get(episode_id, [])
+                          if turn.get("episode_id") == episode_id
+                          and turn.get("source_message_id") == source_id
+                          and turn.get("logical_turn_id") == context.get("logical_turn_id")
+                          and turn.get("operation_id") == context.get("operation_id")
+                          and turn.get("principal_id") == context.get("principal_id")]
+        if len(matching_turns) != 1:
+            return False, "Camera context is not bound to one exact exported gateway turn", []
+        try:
+            episode_time = _parse_time(episode.get("created_at"))
+        except (TypeError, ValueError):
+            return False, "Camera owner/replay episode chronology is missing or invalid", []
+        if episode_id != goal.trace_episode_id:
+            if episode_time <= initial_time:
+                return False, "Camera owner turn does not follow the initial photo receipt", []
+            if episode_time > root_time and context.get("operation_id") == goal.operation_id:
+                # A same-operation post-root context is a retry and must be
+                # tied to the root selection below by the ordinary receipt check.
+                root_click = _validated_native_camera_click(
+                    by_id[goal.trace_episode_id], goal, root_context, replay=False
+                )
+                if (source_id == goal.source_message_id
+                        and (click_evidence := _validated_native_camera_click(
+                            item, goal, context, replay=True
+                        )) is not None
+                        and root_click is not None
+                        and any(click_evidence.get(field) != root_click.get(field) for field in (
+                            "target", "options", "index", "label", "callback_data",
+                        ))):
+                    return False, "Camera replay selection differs from the original accepted operation", []
+        click_evidence = None
+        if source_id == goal.source_message_id:
+            click_evidence = _validated_native_camera_click(
+                item, goal, context,
+                replay=(episode_id != goal.trace_episode_id
+                        and context.get("operation_id") == goal.operation_id),
+            )
+        elif _has_native_camera_click_evidence(
+                _dict((_dict((_dict(episode.get("metadata")) or {}).get("inbound")) or {}).get("metadata")) or {}):
+            click_evidence = _validated_native_camera_click(
+                item, goal, context, replay=False, target_source=source_id
+            )
+        typed_selection = _validated_typed_camera_replay_selection(item, goal, context)
+        prior_same_operation = [record for record in validated
+            if record["context"].get("operation_id") == context.get("operation_id")]
+        owner_selection = _validated_camera_owner_input_selection(
+            item, goal, context, click_evidence
+        )
+        if context.get("operation_id") != goal.operation_id and typed_selection is not None:
+            if not prior_same_operation:
+                return False, "Camera correction repeat lacks its accepted owner selection", []
+            accepted_selection = prior_same_operation[-1].get("owner_selection")
+            if not _camera_typed_selection_matches_owner_input(
+                    typed_selection, accepted_selection):
+                return False, "Camera correction repeat differs from its accepted owner selection", []
+            owner_selection = accepted_selection
+        if (source_id != goal.source_message_id and prior_same_operation
+                and context.get("operation_id") != goal.operation_id
+                and click_evidence is None and typed_selection is None):
+            return False, "Camera correction repeat lacks a bound typed source and selected quantity", []
+        validated.append({
+            "episode_id": episode_id, "turn": matching_turns[0], "context": context,
+            "episode_created_at": episode.get("created_at"),
+            "source_message_ids": list(item.get("source_message_ids", [])),
+            **({"owner_selection": owner_selection} if owner_selection is not None else {}),
+            **({"native_click": click_evidence} if click_evidence is not None else {}),
+            **({"typed_selection": typed_selection} if typed_selection is not None else {}),
+        })
+        seen_episode_ids.add(episode_id)
+    return True, None, validated
+
+
 def validate_dialogue_binding(manifest: Manifest, export: dict[str, Any]) -> dict[str, dict[str, Any]]:
     """Require every reviewed target to bind to a complete exported user dialogue."""
     raw_episodes = export.get("episodes")
@@ -1454,30 +2061,14 @@ def validate_dialogue_binding(manifest: Manifest, export: dict[str, Any]) -> dic
                     and initial.get("recipient_principal") == goal.principal_id
                         == root_camera_context.get("recipient_principal")):
                 matching_initials.append((episode_id, initial))
+        validated_camera_turns = []
         if camera_owner_turn:
-            initial_episode_id, initial = matching_initials[0] if len(matching_initials) == 1 else (None, {})
-            initial_episode = _dict(by_id.get(initial_episode_id, {}).get("episode")) or {}
-            chronology_valid = (
-                initial_episode_id is not None
-                and _parse_time(initial_episode.get("created_at"))
-                < _parse_time(root_episode.get("created_at"))
+            camera_context_bound, camera_context_reason, validated_camera_turns = (
+                _validated_camera_owner_turns(
+                    goal, by_id, selected_camera_contexts, initial_contexts,
+                    matching_initials, turn_provenance,
+                )
             )
-            camera_context_bound = (
-                len(matching_initials) == 1 and root_camera_context.get("kind") == "owner_turn"
-                and chronology_valid
-                and root_camera_context.get("source_message_id") == goal.source_message_id
-                and root_camera_context.get("logical_turn_id") == goal.logical_turn_id
-                and root_camera_context.get("operation_id") == goal.operation_id
-            )
-            if not camera_context_bound:
-                if not matching_initials:
-                    camera_context_reason = (
-                        "include the initial Camera context episode matching this photo receipt"
-                    )
-                elif len(matching_initials) > 1:
-                    camera_context_reason = "multiple matching initial Camera contexts make the source ambiguous"
-                else:
-                    camera_context_reason = "matching initial Camera context is incomplete or out of order"
         elif initial_contexts:
             camera_context_bound = False
             camera_context_reason = "initial Camera context is not bound to a Camera owner turn"
@@ -1485,6 +2076,27 @@ def validate_dialogue_binding(manifest: Manifest, export: dict[str, Any]) -> dic
             camera_context_bound = True
         good = not missing and not incomplete and source_bound and root_identity_bound and camera_context_bound
         if good and initial_contexts:
+            initial_episode_id, initial_context = matching_initials[0]
+            initial_episode = _dict(by_id[initial_episode_id].get("episode")) or {}
+            for camera_turn in validated_camera_turns:
+                turns = turn_provenance.get(camera_turn["episode_id"], [])
+                for index, turn in enumerate(turns):
+                    if turn is camera_turn["turn"]:
+                        turns[index] = {
+                            **turn,
+                            "trusted_camera_context": camera_turn["context"],
+                            "trusted_camera_initial_episode_id": initial_episode_id,
+                            "trusted_camera_initial_created_at": initial_episode.get("created_at"),
+                            "trusted_camera_episode_created_at": camera_turn["episode_created_at"],
+                            "trusted_camera_source_message_ids": camera_turn["source_message_ids"],
+                            **({"camera_owner_selection": camera_turn["owner_selection"]}
+                               if "owner_selection" in camera_turn else {}),
+                            **({"typed_camera_replay_selection": camera_turn["typed_selection"]}
+                               if "typed_selection" in camera_turn else {}),
+                            **({"camera_native_click_evidence": camera_turn["native_click"]}
+                               if "native_click" in camera_turn else {}),
+                        }
+                        break
             for episode_id in goal.episode_ids:
                 if episode_id not in by_id:
                     continue
@@ -1498,8 +2110,8 @@ def validate_dialogue_binding(manifest: Manifest, export: dict[str, Any]) -> dic
                                            camera_context_reason or
                                            "missing episodes, partial transcript, or source-message mismatch"),
                                 "episode_ids": goal.episode_ids,
-                                "reviewed_turn_sources": turn_sources,
-                                "reviewed_turn_provenance": turn_provenance}
+                                "reviewed_turn_sources": turn_sources if good else {},
+                                "reviewed_turn_provenance": turn_provenance if good else {}}
     return result
 
 
