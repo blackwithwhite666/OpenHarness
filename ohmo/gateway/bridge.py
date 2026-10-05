@@ -106,7 +106,7 @@ def _extract_ask(text: str) -> tuple[str, str, list[str]]:
     return clean, question, options[:8]  # Telegram keyboards: keep it sane
 
 
-def _format_gateway_error(exc: Exception) -> str:
+def _format_gateway_error(exc: Exception, *, camera_context: bool = False) -> str:
     """Return a short, user-facing gateway error message."""
     message = str(exc).strip() or exc.__class__.__name__
     lowered = message.lower()
@@ -125,11 +125,17 @@ def _format_gateway_error(exc: Exception) -> str:
             "[ohmo gateway error] Authentication is not configured for the current "
             "gateway profile. Run `oh setup` or `ohmo config`."
         )
-    if "api key" in lowered or "auth" in lowered or "credential" in lowered:
+    if (
+        "api key" in lowered
+        or "oauth" in lowered
+        or re.search(r"\b(?:auth|authenticat\w*|authoriz\w*|credential\w*|unauthori[sz]ed|401)\b", lowered)
+    ):
         return (
             "[ohmo gateway error] Authentication failed for the current gateway "
             "profile. Check `oh auth status` and `ohmo config`."
         )
+    if camera_context and isinstance(exc, ValueError) and lowered.startswith("camera "):
+        return "Не удалось подтвердить запись этой порции."
     return f"[ohmo gateway error] {message}"
 
 
@@ -808,7 +814,11 @@ class OhmoGatewayBridge:
                 session_key,
                 _content_snippet(message.content),
             )
-            reply = _format_gateway_error(exc)
+            camera_error_context = (
+                message.metadata.get("_camera_authority") is CAMERA_AUTHORITY
+                and message.metadata.get("_camera_answer") == "yes"
+            )
+            reply = _format_gateway_error(exc, camera_context=camera_error_context)
         if not reply:
             if delivered_assistant_updates and not stream_error:
                 await self._bus.publish_outbound(
