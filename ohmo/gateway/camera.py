@@ -268,6 +268,17 @@ _CAMERA_COMPOSITION_OPERATOR_RE = re.compile(
     r"маленьк\w*|больш\w*|средн\w*|small|large|big|medium)\b",
     re.IGNORECASE,
 )
+_CAMERA_PORTION_CHOICE_PREFIX_RE = re.compile(
+    r"^\s*(?:весь|вся|всё|все|оба|обе|всю|часть|половин\w*)\s+",
+    re.IGNORECASE,
+)
+_CAMERA_PORTION_CHOICE_COMPONENT_RE = re.compile(
+    r"^\s*(?:весь|вся|всё|все|оба|обе|всю|часть|половин\w*)\s+"
+    + rf"{_CAMERA_COMPOSITION_NOUN_PHRASE}\s+(?:и|and)\s+"
+    + rf"(?:весь|вся|всё|все|оба|обе|всю|часть|половин\w*)\s+"
+    + rf"{_CAMERA_COMPOSITION_NOUN_PHRASE}[.!?…]*\s*$",
+    re.IGNORECASE,
+)
 
 
 def _clarification_related(text: object) -> bool:
@@ -384,6 +395,46 @@ def _camera_composition_description(
             for token in _CAMERA_COMPOSITION_TOKEN_RE.findall(descriptor)
         ]
         if not words or not all(word in context_words for word in words):
+            return False
+    return True
+
+
+def _camera_contextual_portion_choice(text: object, source_context: object) -> bool:
+    """Accept a food choice only when both named portions match the photo context."""
+    if (
+        not isinstance(text, str)
+        or not isinstance(source_context, str)
+        or not _CAMERA_PORTION_CHOICE_COMPONENT_RE.fullmatch(text)
+        or "?" in text
+        or _CAMERA_WHOLE_PORTION_NONFOOD_SUBJECT_RE.search(text)
+        or _CAMERA_UNRELATED_CONTEXT_RE.search(text)
+        or _CLARIFICATION_NEW_MEAL_RE.search(text)
+        or _ANSWER_NEGATED_CONSUMPTION_RE.search(text)
+        or _CAMERA_ANALYSIS_ONLY_QUESTION_RE.search(text)
+    ):
+        return False
+    parts = _CAMERA_COMPOSITION_PARTS_RE.fullmatch(
+        _CAMERA_PORTION_CHOICE_PREFIX_RE.sub("", text.strip(), count=1)
+    )
+    if parts is None:
+        return False
+    context_words = [
+        token.casefold() for token in _CAMERA_COMPOSITION_TOKEN_RE.findall(source_context)
+    ]
+    for component in (parts["left"], parts["right"]):
+        component = _CAMERA_PORTION_CHOICE_PREFIX_RE.sub("", component.strip(), count=1)
+        words = [token.casefold() for token in _CAMERA_COMPOSITION_TOKEN_RE.findall(component)]
+        if not words or not all(
+            any(
+                word == source
+                or (len(word) >= 3 and 0 < len(source) - len(word) <= 3
+                    and source.startswith(word))
+                or (len(source) >= 3 and 0 < len(word) - len(source) <= 3
+                    and word.startswith(source))
+                for source in context_words
+            )
+            for word in words
+        ):
             return False
     return True
 
@@ -551,7 +602,7 @@ def _attempt_caption(attempt: dict) -> str:
 
 
 def _camera_context_answer_kind(
-    text: object, *, source_context: object = None
+    text: object, *, source_context: object = None, source_question: object = None
 ) -> str | None:
     """Classify concise text answers only while an unambiguous Camera source is active."""
     if (
@@ -569,10 +620,18 @@ def _camera_context_answer_kind(
         return None
     if direct == "yes":
         return direct
+    # An answer such as a food/portion phrase is implicit: it can only answer
+    # a consumption question. A delivered analysis-only question does not
+    # grant that meaning. Explicit consumption statements above remain valid.
+    if isinstance(source_question, str) and _CAMERA_ANALYSIS_ONLY_QUESTION_RE.search(
+        source_question
+    ):
+        return None
     if (
         _NATIVE_WHOLE_PLATE_RE.fullmatch(text.strip())
         or _NATIVE_WHOLE_PORTION_RE.fullmatch(text.strip())
         or _CONTEXTUAL_PARTIAL_PORTION_RE.fullmatch(text.strip())
+        or _camera_contextual_portion_choice(text, source_context)
         or _CLARIFICATION_QUANTITY_RE.fullmatch(text)
         or _camera_composition_description(
             text, source_context=source_context, require_source_context=True
@@ -2352,6 +2411,15 @@ class CameraIngress:
                 or value.get("photo_delivery_confirmed") is not True
             ):
                 raise ValueError("camera attempt context is invalid")
+            if "confirmed_camera_question" in value and (
+                not isinstance(value["confirmed_camera_question"], str)
+                or not value["confirmed_camera_question"].strip()
+                or len(value["confirmed_camera_question"]) > 2048
+                or "confirmed_camera_context" not in value
+                or value.get("prompt_edit_claimed") is not True
+                or value.get("photo_delivery_confirmed") is not True
+            ):
+                raise ValueError("camera attempt question is invalid")
             # Older tombstones have no capture evidence. Keep them, but never
             # infer a meal time from admission or reply arrival.
             if "capture_time" in value or "capture_time_authority" in value:
@@ -4453,6 +4521,7 @@ class CameraIngress:
             metadata["_camera_context_unrelated"] = CAMERA_AUTHORITY
             return
         if attempt["state"] == "clarifying":
+            context_origin = attempt.get("answer_kind") == "context"
             source_id = _source_message_id(metadata.get("message_id"))
             if source_id is not None and source_id == attempt.get("clarification_source_message_id"):
                 metadata.update(
@@ -4471,23 +4540,51 @@ class CameraIngress:
                 metadata["_camera_unbound"] = CAMERA_AUTHORITY
                 return
             if callback:
+                if context_origin:
+                    metadata["_camera_unbound"] = CAMERA_AUTHORITY
+                    return
                 # This journal state exists only after a confirmed consumed
-                # answer; it makes portion options safe even when the follow-up
-                # itself asks only which size.
+                # answer; context-only clarification does not establish that.
                 metadata["_camera_known_consumption_clarification"] = CAMERA_AUTHORITY
             answer = (
                 _native_button_answer_kind(metadata, raw_text)
                 if callback else _camera_context_answer_kind(
-                    text, source_context=attempt.get("confirmed_camera_context")
+                    text,
+                    source_context=attempt.get("confirmed_camera_context"),
+                    source_question=(
+                        attempt.get("confirmed_camera_question") if context_origin else None
+                    ),
                 )
             )
+            if context_origin and not callback and _classify_answer(
+                text, anchored=False
+            ) != "yes":
+                # Only an explicit new eating statement can move a context-only
+                # clarification into consumption. Portion/food phrases remain
+                # context-only even though the attempt is in ``clarifying``.
+                answer = None
             if answer is None:
+                if (
+                    target is None
+                    and context_origin
+                    and isinstance(attempt.get("confirmed_camera_question"), str)
+                    and _CAMERA_ANALYSIS_ONLY_QUESTION_RE.search(
+                        attempt["confirmed_camera_question"]
+                    )
+                    and _camera_contextual_portion_choice(
+                        text, attempt.get("confirmed_camera_context")
+                    )
+                ):
+                    self._bind_context_question(message, candidate_id, attempt)
+                    return
                 if target is None and _camera_food_context_hint(text):
                     self._bind_context_question(message, candidate_id, attempt)
                     return
                 if target is None:
                     self._interrupt_untargeted_camera_context()
                     metadata["_camera_context_unrelated"] = CAMERA_AUTHORITY
+                elif context_origin:
+                    metadata["_camera_unbound"] = CAMERA_AUTHORITY
                 return
             if callback and len(target_matches) == 1:
                 metadata["_camera_ingress_callback_eligible"] = True
@@ -4543,14 +4640,33 @@ class CameraIngress:
             classified = _native_button_answer_kind(metadata, raw_text)
         elif target is not None:
             classified = _camera_context_answer_kind(
-                raw_text, source_context=attempt.get("confirmed_camera_context")
+                raw_text,
+                source_context=attempt.get("confirmed_camera_context"),
+                source_question=attempt.get("confirmed_camera_question"),
             )
         else:
             classified = _camera_context_answer_kind(
-                raw_text, source_context=attempt.get("confirmed_camera_context")
+                raw_text,
+                source_context=attempt.get("confirmed_camera_context"),
+                source_question=attempt.get("confirmed_camera_question"),
             )
         if classified is None:
             if target is None:
+                if (
+                    isinstance(attempt.get("confirmed_camera_question"), str)
+                    and _CAMERA_ANALYSIS_ONLY_QUESTION_RE.search(
+                        attempt["confirmed_camera_question"]
+                    )
+                    and _camera_contextual_portion_choice(
+                        raw_text, attempt.get("confirmed_camera_context")
+                    )
+                ):
+                    # Keep a source-related food/portion phrase in the
+                    # context-only lane when the delivered question asks for
+                    # analysis. It must not become an unrelated turn, or a
+                    # consumption answer.
+                    self._bind_context_question(message, candidate_id, attempt)
+                    return
                 if _camera_food_context_hint(raw_text):
                     self._bind_context_question(message, candidate_id, attempt)
                     return
@@ -4648,11 +4764,15 @@ class CameraIngress:
             and 0 < len(message.content.strip().split("\n\n", 1)[0].strip()) <= 2048
         ):
             # The bridge appends the current question after a blank line. Retain
-            # only the delivered source analysis, so question wording cannot
-            # ground an otherwise arbitrary composition answer.
-            attempt["confirmed_camera_context"] = (
-                message.content.strip().split("\n\n", 1)[0].strip()
+            # the source analysis separately from the question: only source
+            # analysis may ground food terms, while the question controls
+            # whether an implicit answer is authorized.
+            delivered_context, separator, delivered_question = message.content.strip().partition(
+                "\n\n"
             )
+            attempt["confirmed_camera_context"] = delivered_context.strip()
+            if separator and 0 < len(delivered_question.strip()) <= 2048:
+                attempt["confirmed_camera_question"] = delivered_question.strip()
         for native_id in receipt.native_message_ids:
             if native_id not in attempt["reply_ids"]:
                 attempt["reply_ids"].append(native_id)
