@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import os
 from datetime import datetime, timezone
 from io import BytesIO
 from pathlib import Path
@@ -303,8 +304,9 @@ async def test_offline_person_source_meal_finalizes_with_text_after_one_trace():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("initialization_failure", [False, True])
 async def test_person_source_turn_uses_real_bridge_and_preserves_unthreaded_source(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, initialization_failure
 ):
     import ohmo.evals.adapter as eval_adapter
     import ohmo.gateway.config as gateway_config
@@ -318,6 +320,19 @@ async def test_person_source_turn_uses_real_bridge_and_preserves_unthreaded_sour
         sent_at=datetime(2026, 10, 5, 11, tzinfo=timezone.utc),
         text="Tea with lunch",
     )
+    environment = {
+        "OPENHARNESS_CONFIG_DIR": "/sentinel/config",
+        "OPENHARNESS_DATA_DIR": None,
+        "OPENHARNESS_LOGS_DIR": "/sentinel/logs",
+        "OPENHARNESS_PROFILE": None,
+        "OHMO_MEMORY_AUTOINDEX": "sentinel-index",
+        "OHMO_MEMORY_JUDGE": None,
+    }
+    for key, value in environment.items():
+        if value is None:
+            monkeypatch.delenv(key, raising=False)
+        else:
+            monkeypatch.setenv(key, value)
 
     class Episode:
         def model_dump(self, mode):
@@ -348,6 +363,8 @@ async def test_person_source_turn_uses_real_bridge_and_preserves_unthreaded_sour
 
     class RuntimePool:
         def __init__(self, **_kwargs):
+            if initialization_failure:
+                raise RuntimeError("injected runtime initialization failure")
             self.ordered = []
 
         async def get_bundle(self, session_key, latest_user_prompt=None):
@@ -377,17 +394,30 @@ async def test_person_source_turn_uses_real_bridge_and_preserves_unthreaded_sour
         before_calls.append(cutoff)
         return [{"id": "non-nutrition-before", "metadata": {"kind": "ordinary"}}]
 
-    result = await run_person_source_turn(
-        root=tmp_path,
-        message=message,
-        owner_id="synthetic_owner",
-        honcho_url="http://unused.invalid",
-        workspace="synthetic-workspace",
-        session="synthetic-session",
-        bot_client=SimpleNamespace(synthetic=True),
-        native_mode=False,
-        before_turn=before_turn,
-    )
+    if initialization_failure:
+        with pytest.raises(RuntimeError, match="injected runtime initialization failure"):
+            await run_person_source_turn(
+                root=tmp_path, message=message, owner_id="synthetic_owner",
+                honcho_url="http://unused.invalid", workspace="synthetic-workspace",
+                session="synthetic-session", bot_client=SimpleNamespace(synthetic=True),
+                native_mode=False, before_turn=before_turn,
+            )
+    else:
+        result = await run_person_source_turn(
+            root=tmp_path,
+            message=message,
+            owner_id="synthetic_owner",
+            honcho_url="http://unused.invalid",
+            workspace="synthetic-workspace",
+            session="synthetic-session",
+            bot_client=SimpleNamespace(synthetic=True),
+            native_mode=False,
+            before_turn=before_turn,
+        )
+    assert all(os.environ.get(key) == value for key, value in environment.items())
+    assert all((key in os.environ) == (value is not None) for key, value in environment.items())
+    if initialization_failure:
+        return
     assert result["save"] == {
         "saved": True,
         "event_id": "synthetic-event-id",

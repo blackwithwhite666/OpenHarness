@@ -82,6 +82,42 @@ async def run_person_source_turn(
     before_turn=None,
 ) -> dict:
     """Run one person message, deliver real bridge output, and capture eval episode IDs."""
+    environment_keys = (
+        "OPENHARNESS_CONFIG_DIR",
+        "OPENHARNESS_DATA_DIR",
+        "OPENHARNESS_LOGS_DIR",
+        "OPENHARNESS_PROFILE",
+        "OHMO_MEMORY_AUTOINDEX",
+        "OHMO_MEMORY_JUDGE",
+    )
+    previous_environment = {key: os.environ.get(key) for key in environment_keys}
+    previously_present = {key for key in environment_keys if key in os.environ}
+    try:
+        return await _run_person_source_turn_with_environment(
+            root=root,
+            message=message,
+            owner_id=owner_id,
+            honcho_url=honcho_url,
+            workspace=workspace,
+            session=session,
+            bot_client=bot_client,
+            native_mode=native_mode,
+            config_dir=config_dir,
+            before_turn=before_turn,
+        )
+    finally:
+        for key in environment_keys:
+            if key in previously_present:
+                os.environ[key] = previous_environment[key]
+            else:
+                os.environ.pop(key, None)
+
+
+async def _run_person_source_turn_with_environment(
+    *, root: Path, message, owner_id: str, honcho_url: str, workspace: str,
+    session: str, bot_client, native_mode: bool, config_dir: Path | None = None,
+    before_turn=None,
+) -> dict:
     from openharness.api.codex_client import CodexApiClient
     from openharness.config.paths import get_config_file_path
     from ohmo.gateway.bridge import OhmoGatewayBridge
