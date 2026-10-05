@@ -77,7 +77,7 @@ class LoadConversationImageTool(BaseTool):
             f"{ref.attachment_id} ({ref.media_type}, {ref.byte_size} bytes)."
         )
         if isinstance(verified_source_time, str) and verified_source_time:
-            output += f" Verified original Telegram photo send time (UTC): {verified_source_time}."
+            output += f" Verified source conversation message received time (UTC): {verified_source_time}."
         return ToolResult(
             output=output,
             metadata={

@@ -4240,9 +4240,16 @@ class CameraIngress:
                         return
         if intent != "no" and target_matches:
             candidate_id, attempt = target_matches[0]
+            completed_typed_yes = intent == "yes" or (
+                intent is None
+                and _camera_context_answer_kind(
+                    raw_text,
+                    source_context=attempt.get("confirmed_camera_context"),
+                ) == "yes"
+            )
             if (
                 not callback
-                and intent == "yes"
+                and completed_typed_yes
                 and attempt.get("state") == "completed"
                 and isinstance(attempt.get("camera_commit"), dict)
                 and target is not None

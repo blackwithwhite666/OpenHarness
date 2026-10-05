@@ -3143,6 +3143,22 @@ class OhmoSessionRuntimePool:
         previous_group_request = self._set_group_request_context(bundle, message, session_key)
         active_turn = {"active": True}
         attempted_attachment_ids: set[str] = set()
+        successful_attachment_ids: set[str] = set()
+        successful_source_bindings: dict[str, Mapping[str, object]] = {}
+        camera_original_attachment_ids: set[str] = set()
+        if camera_meal_at is not None:
+            ingress = getattr(self, "_camera_ingress", None)
+            candidate_id = message.metadata.get("_camera_candidate_id")
+            attempt = ingress._attempts.get(candidate_id) if ingress is not None else None
+            admitted_image_sha256 = (
+                attempt.get("image_sha256") if isinstance(attempt, dict) else None
+            )
+            if (
+                isinstance(candidate_id, str)
+                and isinstance(admitted_image_sha256, str)
+                and re.fullmatch(r"[0-9a-f]{64}", admitted_image_sha256)
+            ):
+                camera_original_attachment_ids = {admitted_image_sha256}
 
         def restore_independent_time_default() -> None:
             if recorder is None:
@@ -3162,7 +3178,12 @@ class OhmoSessionRuntimePool:
         def bind_loaded_attachment(attachment_id: str) -> str | None:
             if not active_turn["active"]:
                 return None
-            if len(attempted_attachment_ids) != 1 or attachment_id not in attempted_attachment_ids:
+            if camera_meal_at is not None:
+                successful_attachment_ids.add(attachment_id)
+            if (
+                attachment_id not in attempted_attachment_ids
+                or (camera_meal_at is None and len(attempted_attachment_ids) != 1)
+            ):
                 message.metadata.pop("_selected_source_binding", None)
                 restore_independent_time_default()
                 return None
@@ -3192,10 +3213,16 @@ class OhmoSessionRuntimePool:
                 message.metadata.pop("_selected_source_binding", None)
                 restore_independent_time_default()
                 return None
+            if camera_meal_at is not None:
+                successful_source_bindings[attachment_id] = dict(binding)
+                if len(successful_attachment_ids) != 1:
+                    message.metadata.pop("_selected_source_binding", None)
+                    restore_independent_time_default()
+                    return None
             message.metadata["_selected_source_binding"] = (
                 _SELECTED_SOURCE_AUTHORITY, binding
             )
-            if recorder is not None:
+            if recorder is not None and camera_meal_at is None:
                 recorder.set_authoritative_nutrition_meal_at(
                     datetime.fromisoformat(stamped_time), preserve_explicit=True,
                     historical_photo=True,
@@ -3423,6 +3450,9 @@ class OhmoSessionRuntimePool:
                 recorder=recorder,
                 user_text=message.content or user_prompt,
                 assistant_text=reply,
+                camera_loaded_attachment_ids=frozenset(successful_attachment_ids),
+                camera_original_attachment_ids=frozenset(camera_original_attachment_ids),
+                camera_loaded_source_bindings=dict(successful_source_bindings),
             )
             camera_ingress = getattr(self, "_camera_ingress", None)
             camera_commit = None
@@ -3787,6 +3817,9 @@ class OhmoSessionRuntimePool:
         recorder: GatewayEvalRecorder | None = None,
         user_text: str,
         assistant_text: str,
+        camera_loaded_attachment_ids: frozenset[str] = frozenset(),
+        camera_original_attachment_ids: frozenset[str] = frozenset(),
+        camera_loaded_source_bindings: Mapping[str, Mapping[str, object]] | None = None,
     ) -> ConversationAppendReceipt | None:
         # A Camera analysis turn is model-visible, but the producer is not the
         # configured account. Do not append it as if the user wrote it.
@@ -3890,6 +3923,36 @@ class OhmoSessionRuntimePool:
             )
             if trusted_meal_at is None:
                 raise ValueError("Camera consumed meal requires trusted capture time")
+            if annotation is not None and camera_loaded_attachment_ids:
+                current_message_id = _normalize_source_message_ref(
+                    message.metadata.get("message_id")
+                )
+                if (
+                    len(camera_loaded_attachment_ids) != 1
+                    or camera_loaded_attachment_ids != camera_original_attachment_ids
+                ):
+                    raise ValueError(
+                        "Camera consumed meal selected an image outside the admitted original"
+                    )
+                loaded_id = next(iter(camera_loaded_attachment_ids))
+                loaded_binding = (camera_loaded_source_bindings or {}).get(loaded_id)
+                if loaded_binding is not None:
+                    if (
+                        loaded_binding.get("attachment_id") != loaded_id
+                        or loaded_binding.get("source_message_id") != current_message_id
+                        or loaded_binding.get("append_source_message_id") != current_message_id
+                        or not isinstance(memory_scope, MemoryScope)
+                        or loaded_binding.get("tenant_id") != memory_scope.private_tenant
+                        or loaded_binding.get("gateway_session_id") != turn_ctx.session_id
+                        or loaded_binding.get("source_principal")
+                        != f"telegram:{canonical_principal('telegram', turn_ctx.principal)}"
+                    ):
+                        raise ValueError(
+                            "Camera consumed meal selected an image with a conflicting source"
+                        )
+                    message.metadata["_selected_source_binding"] = (
+                        _SELECTED_SOURCE_AUTHORITY, loaded_binding
+                    )
             if annotation is None:
                 if (
                     recorder is None

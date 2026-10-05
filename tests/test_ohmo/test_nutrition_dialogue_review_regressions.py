@@ -19,6 +19,7 @@ from openharness.tools.mcp_tool import McpToolAdapter
 from ohmo.attachment_store import AttachmentStore
 from ohmo.conversation_image_tool import LoadConversationImageInput, LoadConversationImageTool
 from ohmo.gateway.camera import CAMERA_AUTHORITY, CameraIngress
+import ohmo.gateway.runtime as runtime_module
 from ohmo.gateway.runtime import OhmoSessionRuntimePool, _build_inbound_user_message
 from ohmo.workspace import initialize_workspace
 from tests.test_ohmo.test_camera_ingress import FakeTelegram, _admit, _candidate, _ingress
@@ -37,6 +38,8 @@ class _ScriptedEngine:
         self.decision_trace_recorder = None
         self.tool_metadata = {}
         self.messages = []
+        self.load_attachment_ids = []
+        self.loaded_results = []
 
     def set_decision_trace_recorder(self, recorder):
         self.decision_trace_recorder = recorder
@@ -50,6 +53,14 @@ class _ScriptedEngine:
         self.decision_trace_recorder.trace_requirement_signals(
             self.pool._active_message.content
         )
+        for attachment_id in self.load_attachment_ids:
+            tool = self.pool._test_bundle.tool_registry.get("load_conversation_image")
+            assert tool is not None
+            result = await tool.execute(
+                LoadConversationImageInput(attachment_id=attachment_id),
+                ToolExecutionContext(cwd=self.pool._workspace),
+            )
+            self.loaded_results.append(result)
         if getattr(self, "read_wellness", False):
             tool = self.pool._test_bundle.tool_registry.get(
                 "mcp__worfalomey__get_wellness_data"
@@ -317,9 +328,9 @@ async def test_retry_cannot_claim_consumption_from_new_trace_when_receipt_is_unk
     await ingress.close()
 
 
-async def _open_camera(tmp_path, *, index: int = 811):
+async def _open_camera(tmp_path, *, index: int = 811, capture_time=None):
     ingress, root, bus, telegram = _ingress(tmp_path, FakeTelegram())
-    request = _candidate(root, index=index)
+    request = _candidate(root, index=index, capture_time=capture_time)
     assert (await _admit(ingress, root, "Bearer " + "s" * 40, request))[0] == 202
     await bus.consume_inbound()
     return ingress, root, bus, telegram, request
@@ -387,6 +398,64 @@ async def test_crash_after_question_append_reconciles_as_clarification(tmp_path,
     assert "camera_commit" not in attempt
     assert len(honcho.messages) == 2
     await reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_camera_capture_time_survives_loading_its_image_before_finalization(
+    tmp_path, monkeypatch
+):
+    from ohmo.gateway.runtime import _build_inbound_user_message as build_user_message
+
+    capture_time = datetime.fromisoformat("2026-10-04T08:49:10+03:00")
+    ingress, _root, _bus, _telegram, request = await _open_camera(
+        tmp_path, index=810, capture_time=capture_time
+    )
+    honcho = _Honcho()
+    pool = _pool(tmp_path, ingress, honcho, monkeypatch)
+    pool._attachment_store = AttachmentStore(pool._workspace)
+    pool._test_bundle.tool_registry = ToolRegistry()
+    del pool._register_conversation_image_tool
+    monkeypatch.setattr(runtime_module, "_build_inbound_user_message", build_user_message)
+
+    answer = _owner_message("Да, я это съела", 8102)
+    answer.timestamp = datetime.fromisoformat("2026-10-05T07:49:54+00:00")
+    ingress.process_real_inbound(answer)
+    assert answer.metadata.get("_camera_answer") == "yes"
+    source_user = build_user_message(
+        answer, pool._attachment_store, session_key=ingress.config.session_key
+    )
+    source_ref = next(
+        block for block in source_user.content if isinstance(block, AttachmentRefBlock)
+    )
+
+    nutrition = _consumed_trace()["annotations"]["nutrition"]
+    nutrition.update(
+        basis=["image"], energy_kcal_best=215,
+        items=[{"name": "oatmeal", "quantity_text": "1 bowl"}],
+    )
+    engine = _ScriptedEngine(pool, [(_trace(nutrition), "Записала порцию: 215 ккал.")])
+    engine.load_attachment_ids = [source_ref.attachment_id]
+    pool._test_bundle.engine = engine
+
+    final = await _turn(pool, answer, ingress)
+    attempt = ingress._attempts[request["candidate_id"]]
+    assert len(engine.loaded_results) == 1
+    assert engine.loaded_results[0].is_error is False
+    assert "Verified source conversation message received time (UTC)" in engine.loaded_results[0].output
+    assert final.text == "Записала порцию: 215 ккал.\nЗаписано. Баланс обновляется."
+    event_id = final.metadata["nutrition_append_event_id"]
+    assert attempt["camera_commit"]["event_id"] == event_id
+    assert len(honcho.messages) == 2
+    saved = honcho.messages[-1].metadata["decision_trace"]["annotations"]["nutrition"]
+    assert datetime.fromisoformat(saved["meal_at"]) == capture_time
+    assert saved.get("meal_date") is None
+    assert saved["items"][0]["quantity_text"] == "1 bowl"
+    assert saved["energy_kcal_best"] == 215
+    assert sum(
+        message.metadata.get("client_op_id") == attempt["camera_commit"]["client_op_id"]
+        for message in honcho.messages
+    ) == 1
+    await ingress.close()
 
 
 @pytest.mark.asyncio
