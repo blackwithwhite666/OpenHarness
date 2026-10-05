@@ -577,6 +577,119 @@ def _multi_operation_camera_fixture():
     ]}
 
 
+def _two_photo_camera_fixture():
+    goal, export, honcho, snapshot = _native_repeat_fixture()
+    first_initial = export["episodes"][0]
+    second_id = "camera-initial-second-photo"
+    second = deepcopy(first_initial)
+    second["episode"]["episode_id"] = second_id
+    second["episode"]["created_at"] = "2026-10-01T10:30:00+00:00"
+    second["episode"]["metadata"]["inbound"]["timestamp"] = "2026-10-01T10:30:00+00:00"
+    second_turn = _derive_exported_turn_provenance(
+        second["episode"], second["episode"]["metadata"]["inbound"]
+    )
+    assert second_turn is not None
+    context = second["trusted_camera_context"]
+    context.update(episode_id=second_id, candidate_id="synthetic-second-candidate",
+                   native_photo_id=78, source_principal=second_turn["principal_id"],
+                   logical_turn_id=second_turn["logical_turn_id"],
+                   operation_id=second_turn["operation_id"])
+    second["episode"]["metadata"]["trusted_camera_context"] = deepcopy(context)
+    inbound_metadata = second["episode"]["metadata"]["inbound"]["metadata"]
+    inbound_metadata.update(_camera_candidate_id="synthetic-second-candidate", _camera_photo_id=78)
+    goal = goal.model_copy(update={"episode_ids": [
+        INITIAL_ID, second_id, OWNER_ID, REPLAY_ID,
+    ]})
+    export["episodes"].insert(1, second)
+    for context in (first_initial["trusted_camera_context"], context):
+        honcho["messages"].append({
+            "id": f"synthetic-context-{context['episode_id']}",
+            "peer_id": "ohmo",
+            "session_id": "synthetic-honcho-session",
+            "workspace_id": "synthetic-workspace",
+            "created_at": first_initial["episode"]["created_at"] if context["episode_id"] == INITIAL_ID
+                         else second["episode"]["created_at"],
+            "content": "Synthetic Camera context receipt.",
+            "metadata": {
+                "role": "assistant", "tenant_id": OWNER,
+                "gateway_session_id": SESSION,
+                "client_op_id": context["operation_id"],
+                "source_principal": context["source_principal"],
+                "logical_turn_id": context["logical_turn_id"],
+                "decision_trace_episode_id": context["episode_id"],
+                "decision_trace": {"episode_id": context["episode_id"], "annotations": {}},
+            },
+        })
+    honcho["messages"].sort(key=lambda message: message["created_at"])
+    return goal, export, second_id, honcho, snapshot
+
+
+def test_camera_goal_selects_one_receipt_among_multiple_initial_photos():
+    goal, export, second_id, honcho, snapshot = _two_photo_camera_fixture()
+    manifest = Manifest(schema_version=1, goals=[goal])
+    binding = validate_dialogue_binding(manifest, export)[goal.case_id]
+    assert binding["complete"] is True, binding
+
+    result, normal_binding, canonical = _grade_fixture((goal, export, honcho, snapshot))
+    assert normal_binding["complete"] is True, normal_binding
+    assert canonical["complete"] is True
+    assert result["a1"] == "PASS", result
+
+    wrong_root_receipt = deepcopy(normal_binding["reviewed_turn_provenance"])
+    wrong_root_receipt[OWNER_ID][0]["trusted_camera_initial_episode_id"] = second_id
+    wrong_receipt_result = grade_manifest(
+        Manifest(schema_version=1, goals=[goal]), honcho, canonical, now=NOW,
+        reviewed_turn_sources=normal_binding["reviewed_turn_sources"],
+        reviewed_turn_provenance=wrong_root_receipt,
+    )[0]
+    assert wrong_receipt_result["a1"] != "PASS", wrong_receipt_result
+    missing_root_receipt = deepcopy(normal_binding["reviewed_turn_provenance"])
+    missing_root_receipt[OWNER_ID][0].pop("trusted_camera_initial_episode_id")
+    missing_receipt_result = grade_manifest(
+        Manifest(schema_version=1, goals=[goal]), honcho, canonical, now=NOW,
+        reviewed_turn_sources=normal_binding["reviewed_turn_sources"],
+        reviewed_turn_provenance=missing_root_receipt,
+    )[0]
+    assert missing_receipt_result["a1"] != "PASS", missing_receipt_result
+
+    no_retry = deepcopy(export)
+    no_retry["episodes"] = [episode for episode in no_retry["episodes"]
+                            if episode["episode"]["episode_id"] != REPLAY_ID]
+    no_retry_goal = goal.model_copy(update={
+        "episode_ids": [INITIAL_ID, second_id, OWNER_ID],
+    })
+    no_retry_fixture = (no_retry_goal, no_retry, honcho, snapshot)
+    no_retry_result, no_retry_binding, no_retry_canonical = _grade_fixture(no_retry_fixture)
+    assert no_retry_binding["complete"] is True, no_retry_binding
+    assert no_retry_canonical["complete"] is True
+    assert no_retry_result["a1"] == "PASS", no_retry_result
+    assert len(honcho["messages"]) == 3
+
+    ambiguous = deepcopy(export)
+    first_context = ambiguous["episodes"][0]["trusted_camera_context"]
+    second = next(item for item in ambiguous["episodes"]
+                  if item["episode"]["episode_id"] == second_id)
+    second_context = second["trusted_camera_context"]
+    second_context.update(candidate_id=first_context["candidate_id"],
+                          native_photo_id=first_context["native_photo_id"])
+    second["episode"]["metadata"]["trusted_camera_context"] = deepcopy(second_context)
+    second["episode"]["metadata"]["inbound"]["metadata"].update(
+        _camera_candidate_id=first_context["candidate_id"],
+        _camera_photo_id=first_context["native_photo_id"],
+    )
+    duplicate_binding = validate_dialogue_binding(manifest, ambiguous)[goal.case_id]
+    assert duplicate_binding["complete"] is False
+    assert duplicate_binding["reason"] == "multiple initial Camera receipts match the owner photo"
+
+    foreign_scope = deepcopy(export)
+    foreign = next(item for item in foreign_scope["episodes"]
+                   if item["episode"]["episode_id"] == second_id)
+    foreign["trusted_camera_context"]["tenant_id"] = "different-owner"
+    foreign["episode"]["metadata"]["trusted_camera_context"]["tenant_id"] = "different-owner"
+    scope_binding = validate_dialogue_binding(manifest, foreign_scope)[goal.case_id]
+    assert scope_binding["complete"] is False
+
+
 def test_camera_history_binds_clarification_and_correction_to_their_own_operations():
     goal, export = _multi_operation_camera_fixture()
     manifest = Manifest(schema_version=1, goals=[goal])

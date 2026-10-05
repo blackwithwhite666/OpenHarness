@@ -587,7 +587,23 @@ def _grade_one(goal: Goal, honcho: dict[str, Any], telegent: dict[str, Any], *, 
     ]
     camera_initial_contexts = [context for context in reviewed_camera_contexts
                                if context.get("kind") == "initial_context"]
-    camera_initial_context = camera_initial_contexts[0] if len(camera_initial_contexts) == 1 else None
+    root_owner_turns = [turn for turn in reviewed_turns
+                        if (turn.get("episode_id") == goal.trace_episode_id
+                            and turn.get("source_message_id") == goal.source_message_id
+                            and turn.get("logical_turn_id") == goal.logical_turn_id
+                            and turn.get("operation_id") == goal.operation_id
+                            and turn.get("principal_id") == goal.principal_id)]
+    bound_initial_ids = {
+        turn.get("trusted_camera_initial_episode_id") for turn in root_owner_turns
+        if isinstance(turn.get("trusted_camera_initial_episode_id"), str)
+    }
+    bound_initial_contexts = [context for context in camera_initial_contexts
+                              if context.get("episode_id") in bound_initial_ids]
+    camera_initial_context = (
+        bound_initial_contexts[0]
+        if len(root_owner_turns) == 1 and len(bound_initial_ids) == 1
+        and len(bound_initial_contexts) == 1 else None
+    )
     reviewed_logical_turns.update(context.get("logical_turn_id") for context in reviewed_camera_contexts
                                   if isinstance(context.get("logical_turn_id"), str))
     reviewed_operations.update(context.get("operation_id") for context in reviewed_camera_contexts
@@ -1778,16 +1794,52 @@ def _validated_camera_owner_turns(
     initial_contexts: list[dict[str, Any]], matching_initials: list[tuple[str, dict[str, Any]]],
     turn_provenance: dict[str, list[dict[str, Any]]],
 ) -> tuple[bool, str | None, list[dict[str, Any]]]:
-    """Bind Camera owner/replay contexts to exact exported turns and one initial receipt."""
-    if len(initial_contexts) != 1:
+    """Bind Camera owner/replay contexts to exact turns and one matching photo receipt."""
+    if not initial_contexts:
         return False, "include the initial Camera context episode matching this photo receipt", []
-    if len(matching_initials) != 1:
+    if not matching_initials:
         return False, "initial Camera context does not match the owner photo receipt", []
+    if len(matching_initials) > 1:
+        return False, "multiple initial Camera receipts match the owner photo", []
     initial_episode_id, initial = matching_initials[0]
+    owner_contexts = [context for context in selected_camera_contexts
+                      if context.get("kind") == "owner_turn"]
     if (initial_episode_id not in goal.episode_ids
-            or len([context for context in selected_camera_contexts
-                    if context.get("kind") == "owner_turn"]) != len(goal.episode_ids) - 1):
+            or len(owner_contexts) != len(goal.episode_ids) - len(initial_contexts)
+            or len(owner_contexts) + len(initial_contexts) != len(selected_camera_contexts)):
         return False, "selected Camera provenance is missing an owner-turn context", []
+    initial_ids = set()
+    initial_identity_fields = (
+        "kind", "episode_id", "candidate_id", "native_photo_id", "tenant_id",
+        "gateway_session_id", "recipient_principal", "source_principal",
+        "logical_turn_id", "operation_id",
+    )
+    for receipt in initial_contexts:
+        receipt_id = receipt.get("episode_id")
+        receipt_item = by_id.get(receipt_id) if isinstance(receipt_id, str) else None
+        receipt_episode = _dict(receipt_item.get("episode")) if receipt_item else None
+        receipt_metadata = _dict(receipt_episode.get("metadata")) if receipt_episode else None
+        recorded_receipt = _dict(receipt_metadata.get("trusted_camera_context")) if receipt_metadata else None
+        try:
+            receipt_time = _parse_time(receipt_episode.get("created_at") if receipt_episode else None)
+        except (TypeError, ValueError):
+            return False, "initial Camera receipt chronology is missing or invalid", []
+        if (receipt_id not in goal.episode_ids or receipt_id in initial_ids
+                or receipt != _dict(receipt_item.get("trusted_camera_context"))
+                or recorded_receipt is None
+                or any(recorded_receipt.get(field) != receipt.get(field)
+                       for field in initial_identity_fields)
+                or receipt.get("kind") != "initial_context"
+                or not isinstance(receipt.get("candidate_id"), str) or not receipt["candidate_id"]
+                or type(receipt.get("native_photo_id")) is not int or receipt["native_photo_id"] <= 0
+                or receipt.get("tenant_id") != goal.owner_id
+                or receipt.get("gateway_session_id") != goal.gateway_session_id
+                or receipt.get("recipient_principal") != goal.principal_id):
+            return False, "initial Camera receipt identity does not match its exported episode or owner scope", []
+        if (receipt_id != initial_episode_id
+                and not goal.trajectory_started_at <= receipt_time <= goal.trajectory_as_of):
+            return False, "additional initial Camera receipt falls outside the reviewed trajectory", []
+        initial_ids.add(receipt_id)
     initial_episode = _dict(by_id.get(initial_episode_id, {}).get("episode")) or {}
     try:
         initial_time = _parse_time(initial_episode.get("created_at"))
@@ -1800,10 +1852,6 @@ def _validated_camera_owner_turns(
         return False, "initial Camera receipt identity does not match the Goal scope", []
     identity_fields = ("candidate_id", "native_photo_id", "tenant_id",
                        "gateway_session_id", "recipient_principal")
-    owner_contexts = [context for context in selected_camera_contexts
-                      if context.get("kind") == "owner_turn"]
-    if len(owner_contexts) != len(selected_camera_contexts) - 1:
-        return False, "selected Camera provenance contains an unsupported context kind", []
     root_contexts = [context for context in owner_contexts
                      if context.get("episode_id") == goal.trace_episode_id]
     if len(root_contexts) != 1:

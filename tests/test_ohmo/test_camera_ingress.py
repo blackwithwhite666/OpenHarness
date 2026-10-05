@@ -8420,7 +8420,7 @@ async def test_real_camera_initial_signal_is_captured_as_context_without_fake_so
         Manifest(schema_version=1, goals=[binding_goal]), reversed_export
     )["camera-tea"]
     assert reversed_binding["complete"] is False
-    assert "out of order" in reversed_binding["reason"]
+    assert reversed_binding["reason"] == "initial Camera receipt does not precede the owner turn"
 
     annotation_row = {"id": "honcho-camera-event", "peer_id": "ohmo", "session_id": "honcho-session",
         "workspace_id": "workspace-1", "created_at": now.isoformat(), "content": "persisted meal",
@@ -8486,8 +8486,16 @@ async def test_late_reply_binds_its_matching_initial_context_among_two_camera_ph
         def now(cls, tz=None):
             return cls.current.astimezone(tz) if tz is not None else cls.current.replace(tzinfo=None)
 
+    class TwoPhotoReceiptTelegram(FakeTelegram):
+        async def send_camera_photo(self, **kwargs):
+            await super().send_camera_photo(**kwargs)
+            return OutboundDeliveryReceipt(
+                channel="telegram", chat_id=kwargs["chat_id"],
+                native_message_ids=(900 + len(self.calls),),
+            )
+
     monkeypatch.setattr(camera_module, "datetime", ControlledDatetime)
-    ingress, root, bus, _ = _ingress(tmp_path)
+    ingress, root, bus, _ = _ingress(tmp_path, TwoPhotoReceiptTelegram())
     scope = MemoryScope(ingress.config.tenant_id, ())
 
     async def admit_initial(index: int):
@@ -8516,6 +8524,7 @@ async def test_late_reply_binds_its_matching_initial_context_among_two_camera_ph
         return request, message, turn_ctx, recorder
 
     first_request, first, first_ctx, first_recorder = await admit_initial(0)
+    first_photo_id = first.metadata["_camera_photo_id"]
     first_recorder.record_gateway_update(text="Checking the first photo")
     first_recorder.record_gateway_final(text="Did you eat or drink this first photo?")
     first_recorder.finish(status="completed")
@@ -8523,6 +8532,8 @@ async def test_late_reply_binds_its_matching_initial_context_among_two_camera_ph
 
     ControlledDatetime.current += timedelta(minutes=31)
     second_request, second, second_ctx, second_recorder = await admit_initial(1)
+    second_photo_id = second.metadata["_camera_photo_id"]
+    assert first_photo_id != second_photo_id
     second_recorder.record_gateway_final(text="Did you eat this second photo?")
     second_recorder.finish(status="completed")
     ingress.complete(second, recorded=False)
@@ -8533,6 +8544,7 @@ async def test_late_reply_binds_its_matching_initial_context_among_two_camera_ph
         metadata={"message_id": 900, "reply_to_message_id": first.metadata["_camera_photo_id"],
                   "_telegram_raw_text": "Да, я это съел"},
     )
+    assert reply.metadata["reply_to_message_id"] == first_photo_id
     ingress.process_real_inbound(reply)
     assert reply.metadata["_camera_candidate_id"] == first_request["candidate_id"]
     assert reply.metadata["_camera_candidate_id"] != second_request["candidate_id"]
@@ -8549,6 +8561,7 @@ async def test_late_reply_binds_its_matching_initial_context_among_two_camera_ph
         logical_turn_id=owner_logical, assistant_metadata=owner_assistant,
     )
     assert owner_turn is not None and owner_context["candidate_id"] == first_request["candidate_id"]
+    assert owner_context["native_photo_id"] == first_photo_id
     owner_recorder = GatewayEvalRecorder.start(
         workspace=tmp_path,
         bundle=SimpleNamespace(session_id="camera-session", cwd=str(tmp_path)),
