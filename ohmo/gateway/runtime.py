@@ -3490,6 +3490,58 @@ class OhmoSessionRuntimePool:
             and selected_binding[0] is _SELECTED_SOURCE_AUTHORITY
             or requested_correction and native_reply_authorized
         )
+        if message.metadata.get("_camera_ordinary_date_correction") is CAMERA_AUTHORITY:
+            ingress = getattr(self, "_camera_ingress", None)
+            camera_config = self._gateway_config.camera_ingress
+            retained = [
+                attempt for attempt in getattr(ingress, "_attempts", {}).values()
+                if native_reply_target is not None
+                and native_reply_target in {
+                    str(attempt.get("photo_id")),
+                    *map(str, attempt.get("reply_ids", [])),
+                }
+            ]
+            attempt = retained[0] if len(retained) == 1 else None
+            latest = attempt.get("camera_correction_commit") if isinstance(attempt, dict) else None
+            retained_meal = bool(
+                ingress is not None
+                and camera_config.enabled
+                and str(message.chat_id) == camera_config.chat_id
+                and message.sender_id.split("|", 1)[0] == camera_config.principal
+                and session_key == camera_config.session_key
+                and len(retained) == 1
+                and isinstance(attempt, dict)
+                and attempt.get("state") == "completed"
+                and attempt.get("finalizer_status") == "committed"
+                and isinstance(attempt.get("camera_commit"), dict)
+                and (
+                    attempt.get("camera_correction") is None
+                    or (
+                        attempt.get("camera_correction") == "completed"
+                        and isinstance(latest, dict)
+                        and latest.get("kind") == "portion"
+                    )
+                )
+            )
+            changed_fields = (
+                set(finalizer_nutrition.changed_fields)
+                if finalizer_nutrition is not None else set()
+            )
+            if (
+                not native_reply_authorized
+                or not ordinary_correction
+                or not retained_meal
+                or finalizer_nutrition is None
+                or finalizer_nutrition.record_type != "meal_correction"
+                or not changed_fields
+                or not changed_fields <= {"meal_at", "meal_date"}
+                or not changed_fields & {"meal_at", "meal_date"}
+                or ("meal_at" in changed_fields and finalizer_nutrition.meal_at is None)
+                or ("meal_date" in changed_fields and finalizer_nutrition.meal_date is None)
+            ):
+                raise ValueError(
+                    "Camera source-bound date correction requires an explicit date-only correction"
+                )
         if camera_clarification:
             # A context-bound but unconfirmed answer may be an unrelated owner
             # turn. Preserve the model's ordinary response while keeping the

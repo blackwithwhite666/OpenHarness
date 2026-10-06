@@ -4251,6 +4251,35 @@ class CameraIngress:
             intent = None
         if target is None and intent is None:
             intent = _camera_context_answer_kind(raw_text)
+        if (
+            not callback
+            and target is not None
+            and len(target_matches) == 1
+            and intent is None
+            and isinstance(raw_text, str)
+            and _CLARIFICATION_EXPLICIT_DATE_RE.search(raw_text)
+        ):
+            _, attempt = target_matches[0]
+            latest_correction = attempt.get("camera_correction_commit")
+            retained_meal = (
+                attempt.get("state") == "completed"
+                and attempt.get("finalizer_status") == "committed"
+                and isinstance(attempt.get("camera_commit"), dict)
+                and (
+                    attempt.get("camera_correction") is None
+                    or (
+                        attempt.get("camera_correction") == "completed"
+                        and isinstance(latest_correction, dict)
+                        and latest_correction.get("kind") == "portion"
+                    )
+                )
+            )
+            if retained_meal:
+                # Keep an explicit date correction on the ordinary owner
+                # reply path. This marker admits only its date correction
+                # finalizer; it does not authorize a Camera answer or save.
+                metadata["_camera_ordinary_date_correction"] = CAMERA_AUTHORITY
+                return
         if not callback and target_matches and intent is None and isinstance(raw_text, str):
             candidate_id, attempt = target_matches[0]
             latest = attempt.get("camera_correction_commit")

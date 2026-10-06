@@ -372,6 +372,224 @@ async def test_context_repeat_rejects_foreign_owner_and_new_active_source(tmp_pa
 
 
 @pytest.mark.asyncio
+async def test_completed_camera_meal_accepts_bound_owner_date_correction(
+    tmp_path, monkeypatch,
+):
+    from openharness.evals import TRACE_FINALIZATION
+    from openharness.engine.stream_events import AssistantTextDelta
+
+    ingress, root, bus, _ = _ingress(tmp_path, FakeTelegram())
+    request = _candidate(root)
+    assert (await _admit(ingress, root, "Bearer " + "s" * 40, request))[0] == 202
+    await bus.consume_inbound()
+    honcho = RuntimeHoncho()
+    pool = runtime_pool(tmp_path, ingress, honcho, monkeypatch)
+    engine = pool._test_bundle.engine
+
+    async def scripted_submit(user_message, *, wellness_actor=None):
+        del wellness_actor
+        engine.messages.append(user_message)
+        message = pool._active_message
+        engine.turns.append((message.content, list(message.media), message.timestamp))
+        recorder = engine.decision_trace_recorder
+        recorder.trace_requirement_signals(message.content)
+        if message.content == "Да, я съела только часть":
+            yield AssistantTextDelta(text="Сколько примерно вы съели?")
+            return
+        if message.content == "2 кусочка":
+            nutrition = {
+                "schema_version": 2,
+                "record_type": "meal_observation",
+                "basis": ["image", "owner_statement"],
+                "consumption_status": "consumed",
+                "is_estimate": True,
+                "energy_kcal_best": 125,
+                "items": [{
+                    "name": "synthetic meal",
+                    "quantity_text": "original 125 kcal portion",
+                    "energy_kcal_best": 125,
+                }],
+            }
+            text = "Записано. Баланс обновляется."
+        elif message.content == "1 кусочек":
+            nutrition = {
+                "schema_version": 2,
+                "record_type": "meal_correction",
+                "changed_fields": ["items", "energy_kcal_best"],
+                "items": [{
+                    "name": "synthetic meal",
+                    "quantity_text": "corrected 53 kcal portion",
+                    "energy_kcal_best": 53,
+                }],
+                "energy_kcal_best": 53,
+            }
+            text = "Изменение сохранено; баланс обновляется."
+        else:
+            nutrition = {
+                "schema_version": 2,
+                "record_type": "meal_correction",
+                "changed_fields": ["meal_at"],
+                "meal_at": "2026-10-05T18:45:00+00:00",
+            }
+            text = "Исправила дату приёма пищи."
+        recorder.record(TRACE_FINALIZATION, {
+            "schema_version": 1,
+            "trace_event_id": f"g9-{message.metadata['message_id']}",
+            "annotations": {"nutrition": nutrition},
+        })
+        yield AssistantTextDelta(text=text)
+
+    async def invalid_meal_submit(user_message, *, wellness_actor=None):
+        del wellness_actor
+        engine.messages.append(user_message)
+        message = pool._active_message
+        engine.turns.append((message.content, list(message.media), message.timestamp))
+        recorder = engine.decision_trace_recorder
+        recorder.trace_requirement_signals(message.content)
+        recorder.record(TRACE_FINALIZATION, {
+            "schema_version": 1,
+            "trace_event_id": "g9-date-correction-cannot-duplicate-meal",
+            "annotations": {"nutrition": {
+                "schema_version": 2,
+                "record_type": "meal_observation",
+                "basis": ["owner_statement"],
+                "consumption_status": "consumed",
+                "is_estimate": True,
+                "energy_kcal_best": 999,
+                "items": [{
+                    "name": "must not be appended",
+                    "quantity_text": "extra meal",
+                    "energy_kcal_best": 999,
+                }],
+            }},
+        })
+        yield AssistantTextDelta(text="Записала ещё один приём пищи.")
+
+    engine.submit_message = scripted_submit
+    attempt = ingress._attempts[request["candidate_id"]]
+    photo_id = attempt["photo_id"]
+    first = await _native_callback(
+        bus, label="Да, я съела только часть", target=photo_id,
+        options=["Да, я съела только часть", "Нет, не ела"],
+        prompt="Съели ли вы это?",
+    )
+    first.metadata["callback_query_id"] = "g9-first-meal"
+    ingress.process_real_inbound(first)
+    await runtime_turn(pool, first, ingress)
+
+    quantity = await _native_callback(
+        bus, label="2 кусочка", target=attempt["reply_ids"][-1],
+        options=["1 кусочек", "2 кусочка", "Половину порции"],
+        prompt="Сколько примерно вы съели?",
+    )
+    quantity.metadata["callback_query_id"] = "g9-quantity"
+    ingress.process_real_inbound(quantity)
+    saved = await runtime_turn(pool, quantity, ingress)
+    original_event_id = saved.metadata["nutrition_append_event_id"]
+    original_row = next(row for row in honcho.messages if row.id == original_event_id)
+    original_nutrition = original_row.metadata["decision_trace"]["annotations"]["nutrition"]
+    assert original_nutrition["energy_kcal_best"] == 125
+    capture_time = attempt["camera_commit"]["meal_at"]
+    assert original_nutrition["meal_at"].replace("Z", "+00:00") == capture_time.replace(
+        "Z", "+00:00"
+    )
+
+    portion = await _native_callback(
+        bus, label="1 кусочек", target=attempt["reply_ids"][0],
+        options=["1 кусочек", "2 кусочка", "Половину порции"],
+        prompt="Сколько примерно вы съели?",
+    )
+    portion.metadata["callback_query_id"] = "g9-portion-correction"
+    ingress.process_real_inbound(portion)
+    portion_final = await runtime_turn(pool, portion, ingress)
+    portion_event_id = portion_final.metadata["nutrition_append_event_id"]
+    portion_row = next(row for row in honcho.messages if row.id == portion_event_id)
+    portion_nutrition = portion_row.metadata["decision_trace"]["annotations"]["nutrition"]
+    assert portion_nutrition["record_type"] == "meal_correction"
+    assert portion_nutrition["changed_fields"] == ["items", "energy_kcal_best"]
+    assert portion_nutrition["energy_kcal_best"] == 53
+    assert "meal_at" not in portion_nutrition and "meal_date" not in portion_nutrition
+
+    before_date = [
+        (row.id, row.content, dict(row.metadata)) for row in honcho.messages
+    ]
+    foreign_date = InboundMessage(
+        channel="telegram", sender_id="other-owner", chat_id="123",
+        content="Это было 2026-10-05 в 18:45 UTC",
+        metadata={"message_id": "g9-foreign-date", "reply_to_message_id": str(photo_id)},
+    )
+    ingress.process_real_inbound(foreign_date)
+    assert foreign_date.metadata.get("_camera_ordinary_date_correction") is None
+    stale_date = InboundMessage(
+        channel="telegram", sender_id="123", chat_id="123",
+        content="Это было 2026-10-05 в 18:45 UTC",
+        metadata={"message_id": "g9-stale-date", "reply_to_message_id": "999999"},
+    )
+    ingress.process_real_inbound(stale_date)
+    assert stale_date.metadata.get("_camera_ordinary_date_correction") is None
+    assert stale_date.metadata.get("_camera_authority") is not CAMERA_AUTHORITY
+    date_reply = InboundMessage(
+        channel="telegram", sender_id="123", chat_id="123",
+        content="Это было 2026-10-05 в 18:45 UTC",
+        metadata={
+            "message_id": "g9-explicit-date-reply",
+            "reply_to_message_id": str(photo_id),
+            "_telegram_raw_text": "Это было 2026-10-05 в 18:45 UTC",
+            "is_group": False,
+            "chat_type": "private",
+        },
+    )
+    ingress.process_real_inbound(date_reply)
+    assert date_reply.metadata.get("_camera_ordinary_date_correction") is CAMERA_AUTHORITY
+    assert date_reply.metadata.get("_camera_unbound") is None
+    assert date_reply.metadata.get("_camera_authority") is not CAMERA_AUTHORITY
+    date_final = await runtime_turn(pool, date_reply, ingress)
+    assert date_final.metadata["nutrition_append_event_id"]
+    assert date_final.metadata["nutrition_append_event_id"] not in {
+        original_event_id, portion_event_id,
+    }
+    assert len(honcho.messages) == len(before_date) + 2
+    assert [
+        (row.id, row.content, dict(row.metadata)) for row in honcho.messages[:len(before_date)]
+    ] == before_date
+    date_assistant = honcho.messages[-1]
+    date_nutrition = date_assistant.metadata["decision_trace"]["annotations"]["nutrition"]
+    assert date_nutrition["record_type"] == "meal_correction"
+    assert date_nutrition["changed_fields"] == ["meal_at"]
+    assert date_nutrition["meal_at"].replace("Z", "+00:00") == "2026-10-05T18:45:00+00:00"
+    assert date_assistant.metadata["reply_to_source_message_id"] == str(photo_id)
+    assert sum(
+        row.metadata.get("decision_trace", {}).get("annotations", {})
+        .get("nutrition", {}).get("record_type") == "meal_observation"
+        for row in honcho.messages
+    ) == 1
+    assert attempt["camera_commit"]["event_id"] == original_event_id
+
+    rows_after_valid_date = [
+        (row.id, row.content, dict(row.metadata)) for row in honcho.messages
+    ]
+    malformed_date = InboundMessage(
+        channel="telegram", sender_id="123", chat_id="123",
+        content="Это было 2026-10-05 в 18:45 UTC",
+        metadata={
+            "message_id": "g9-date-must-not-save-another-meal",
+            "reply_to_message_id": str(photo_id),
+            "_telegram_raw_text": "Это было 2026-10-05 в 18:45 UTC",
+            "is_group": False,
+            "chat_type": "private",
+        },
+    )
+    ingress.process_real_inbound(malformed_date)
+    engine.submit_message = invalid_meal_submit
+    with pytest.raises(ValueError, match="explicit date-only correction"):
+        await runtime_turn(pool, malformed_date, ingress)
+    assert [
+        (row.id, row.content, dict(row.metadata)) for row in honcho.messages
+    ] == rows_after_valid_date
+    await ingress.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("receipt_failure", ["missing", "foreign"])
 async def test_typed_repeat_never_claims_saved_without_its_exact_receipt(
     tmp_path, monkeypatch, receipt_failure
