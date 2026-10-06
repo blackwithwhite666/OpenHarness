@@ -567,7 +567,7 @@ async def test_codex_client_total_timeout_stops_slow_drip(monkeypatch):
 
     client = CodexApiClient(
         _fake_codex_token(),
-        stall_timeout_seconds=0.03,
+        stall_timeout_seconds=None,
         attempt_timeout_seconds=0.06,
     )
     started = time.monotonic()
@@ -686,7 +686,7 @@ async def test_codex_client_does_not_retry_total_timeout_after_text_delta(monkey
 
     client = CodexApiClient(
         _fake_codex_token(),
-        stall_timeout_seconds=0.03,
+        stall_timeout_seconds=None,
         attempt_timeout_seconds=0.06,
     )
     events: list[Any] = []
