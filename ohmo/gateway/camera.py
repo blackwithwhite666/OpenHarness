@@ -187,7 +187,18 @@ _CLARIFICATION_NEW_MEAL_RE = re.compile(
     r"\b(?:нов(?:ый|ая|ое|ые)|друг(?:ой|ая|ое|ие)|не\s+тот|не\s+это|tomorrow|another|different)\b",
     re.IGNORECASE,
 )
-_CLARIFICATION_EXPLICIT_DATE_RE = re.compile(r"\b20\d{2}-\d{2}-\d{2}\b")
+_CAMERA_DATE_CORRECTION_RE = re.compile(
+    r"\b20\d{2}-\d{2}-\d{2}\b|"
+    r"\b(?:вчера|позавчера|сегодня|yesterday|today|day\s+before\s+yesterday)\b|"
+    r"\b(?:в\s+)?прошл(?:ый|ую|ом|ое|ые)\s+"
+    r"(?:понедельник\w*|вторник\w*|сред\w*|четверг\w*|пятниц\w*|"
+    r"суббот\w*|воскресень\w*|день\w*|недел\w*|месяц\w*)\b|"
+    r"\b\d{1,2}\s+(?:январ\w*|феврал\w*|март\w*|апрел\w*|ма\w*|июн\w*|"
+    r"июл\w*|август\w*|сентябр\w*|октябр\w*|ноябр\w*|декабр\w*|"
+    r"january|february|march|april|may|june|july|august|september|october|"
+    r"november|december)\b",
+    re.IGNORECASE,
+)
 _CAMERA_UNRELATED_CONTEXT_RE = re.compile(
     r"\b(?:weather|погод\w*|спасибо|благодар\w*|thanks?|payment|оплат\w*|перевод\w*|"
     r"деньг\w*|сч[её]т\w*|карт\w*|рубл\w*|валют\w*|invoice|transfer|bank)\b",
@@ -786,7 +797,7 @@ def _camera_context_answer_kind(
     if (
         not isinstance(text, str)
         or _CLARIFICATION_NEW_MEAL_RE.search(text)
-        or _CLARIFICATION_EXPLICIT_DATE_RE.search(text)
+        or _CAMERA_DATE_CORRECTION_RE.search(text)
     ):
         return None
     direct = _classify_answer(text, anchored=True)
@@ -4216,7 +4227,7 @@ class CameraIngress:
             and _classify_answer(raw_text, anchored=False) == "yes"
             and (
                 _CLARIFICATION_NEW_MEAL_RE.search(str(raw_text))
-                or _CLARIFICATION_EXPLICIT_DATE_RE.search(str(raw_text))
+                or _CAMERA_DATE_CORRECTION_RE.search(str(raw_text))
             )
         ):
             self._interrupt_untargeted_camera_context()
@@ -4255,9 +4266,8 @@ class CameraIngress:
             not callback
             and target is not None
             and len(target_matches) == 1
-            and intent is None
             and isinstance(raw_text, str)
-            and _CLARIFICATION_EXPLICIT_DATE_RE.search(raw_text)
+            and _CAMERA_DATE_CORRECTION_RE.search(raw_text)
         ):
             _, attempt = target_matches[0]
             latest_correction = attempt.get("camera_correction_commit")
@@ -4275,6 +4285,11 @@ class CameraIngress:
                 )
             )
             if retained_meal:
+                if _CLARIFICATION_NEW_MEAL_RE.search(raw_text):
+                    # A reply to an old Camera source cannot select a different
+                    # meal as the target of its date correction.
+                    metadata["_camera_unbound"] = CAMERA_AUTHORITY
+                    return
                 # Keep an explicit date correction on the ordinary owner
                 # reply path. This marker admits only its date correction
                 # finalizer; it does not authorize a Camera answer or save.

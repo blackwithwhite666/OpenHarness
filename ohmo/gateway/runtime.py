@@ -3589,15 +3589,88 @@ class OhmoSessionRuntimePool:
                 and camera_commit.get("event_id") == append_receipt.assistant_message_id
                 and camera_commit.get("client_op_id") == append_receipt.assistant_client_op_id
             )
+            correction_kind = (
+                "portion" if camera_portion_correction else
+                "denial" if (
+                    message.metadata.get("_camera_correction") is CAMERA_AUTHORITY
+                    and message.metadata.get("_camera_answer") == "no"
+                ) else None
+            )
+            correction_metadata = (
+                append_receipt.assistant_metadata
+                if append_receipt is not None
+                and isinstance(append_receipt.assistant_metadata, Mapping) else {}
+            )
+            candidate_id = message.metadata.get("_camera_candidate_id")
+            original_event_id = camera_commit.get("event_id") if isinstance(camera_commit, dict) else None
+            original_source_id = (
+                camera_commit.get("source_message_id") if isinstance(camera_commit, dict) else None
+            )
             camera_correction_saved = bool(
-                camera_portion_correction
+                correction_kind is not None
                 and append_receipt is not None
                 and isinstance(camera_correction_commit, dict)
+                and isinstance(camera_commit, dict)
+                and camera_commit.get("candidate_id") == candidate_id
+                and camera_correction_commit.get("kind") == correction_kind
                 and camera_correction_commit.get("event_id") == append_receipt.assistant_message_id
                 and camera_correction_commit.get("client_op_id") == append_receipt.assistant_client_op_id
-                and camera_correction_commit.get("target_event_id")
-                == message.metadata.get("_camera_original_event_id")
+                and camera_correction_commit.get("source_message_id")
+                == correction_metadata.get("source_message_id")
+                and correction_metadata.get("source_message_id")
+                == _normalize_source_message_ref(message.metadata.get("message_id"))
+                and append_receipt.user_client_op_id
+                == f"{camera_correction_commit.get('client_op_id', '').removesuffix(':assistant')}:user"
+                and camera_correction_commit.get("target_event_id") == original_event_id
+                and camera_correction_commit.get("target_source_message_id") == original_source_id
+                and correction_metadata.get("role") == "assistant"
+                and correction_metadata.get("client_op_id") == append_receipt.assistant_client_op_id
+                and correction_metadata.get("camera_candidate_id") == candidate_id
+                and correction_metadata.get("camera_operation_id") == candidate_id
+                and correction_metadata.get("camera_original_event_id") == original_event_id
+                and correction_metadata.get("reply_to_source_message_id") == original_source_id
+                and correction_metadata.get("camera_answer_bound")
+                == ("yes" if correction_kind == "portion" else "no")
+                and correction_metadata.get("camera_correction_bound") is True
+                and correction_metadata.get("gateway_session_id") == turn_ctx.session_id
+                and isinstance(memory_scope, MemoryScope)
+                and correction_metadata.get("tenant_id") == memory_scope.private_tenant
+                and correction_metadata.get("source_principal")
+                == f"telegram:{canonical_principal(message.channel, turn_ctx.principal)}"
+                and correction_metadata.get("ingest_source") == "dropbox_camera"
+                and correction_metadata.get("confirmation_required") is True
             )
+            if camera_correction_saved:
+                stored_trace = correction_metadata.get("decision_trace")
+                stored_annotations = (
+                    stored_trace.get("annotations") if isinstance(stored_trace, Mapping) else None
+                )
+                stored_nutrition = (
+                    stored_annotations.get("nutrition")
+                    if isinstance(stored_annotations, Mapping) else None
+                )
+                try:
+                    stored_correction = NutritionAnnotationV2.model_validate(stored_nutrition)
+                except (TypeError, ValueError):
+                    camera_correction_saved = False
+                else:
+                    camera_correction_saved = bool(
+                        stored_correction.record_type == "meal_correction"
+                        and (
+                            (
+                                correction_kind == "denial"
+                                and stored_correction.consumption_status == "not_consumed"
+                                and "consumption_status" in stored_correction.changed_fields
+                            )
+                            or (
+                                correction_kind == "portion"
+                                and stored_correction.consumption_status == "unknown"
+                                and "items" in stored_correction.changed_fields
+                                and not {"consumption_status", "meal_at", "meal_date"}
+                                & set(stored_correction.changed_fields)
+                            )
+                        )
+                    )
             ordinary_meal_saved = bool(
                 ordinary_meal and append_receipt is not None
                 and isinstance(append_receipt.assistant_metadata, Mapping)
@@ -3777,12 +3850,15 @@ class OhmoSessionRuntimePool:
                     nutrition_append_event_id=camera_commit["event_id"],
                     nutrition_sync_status="pending",
                 )
-            elif camera_correction_saved and isinstance(camera_correction_commit, dict):
-                reply = "Изменение сохранено; баланс обновляется."
-                metadata.update(
-                    nutrition_append_event_id=camera_correction_commit["event_id"],
-                    nutrition_sync_status="pending",
-                )
+            elif message.metadata.get("_camera_correction") is CAMERA_AUTHORITY:
+                if camera_correction_saved and isinstance(camera_correction_commit, dict):
+                    reply = "Изменение сохранено; баланс обновляется."
+                    metadata.update(
+                        nutrition_append_event_id=camera_correction_commit["event_id"],
+                        nutrition_sync_status="pending",
+                    )
+                else:
+                    reply = "Не удалось подтвердить сохранение изменения."
             elif camera_yes and finalizer_nutrition is not None:
                 reply = "Не удалось подтвердить сохранение записи."
             elif ordinary_meal:

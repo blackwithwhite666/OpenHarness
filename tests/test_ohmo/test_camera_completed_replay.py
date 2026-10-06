@@ -217,6 +217,49 @@ async def test_changed_typed_reply_reaches_existing_runtime_flow(
                   "chat_type": "private"},
     )
     ingress.process_real_inbound(changed)
+    if changed_text == "Я съела это вчера":
+        assert changed.metadata.get("_camera_typed_replay_candidate") is None
+        if reply_to_photo:
+            from openharness.evals import TRACE_FINALIZATION
+            from openharness.engine.stream_events import AssistantTextDelta
+
+            assert changed.metadata.get("_camera_ordinary_date_correction") is CAMERA_AUTHORITY
+            assert changed.metadata.get("_camera_unbound") is None
+            engine = pool._test_bundle.engine
+
+            async def date_correction(user_message, *, wellness_actor=None):
+                del wellness_actor
+                engine.messages.append(user_message)
+                engine.turns.append((changed.content, [], changed.timestamp))
+                recorder = engine.decision_trace_recorder
+                recorder.trace_requirement_signals(changed.content)
+                recorder.record(TRACE_FINALIZATION, {
+                    "schema_version": 1,
+                    "trace_event_id": "changed-date-typed-repeat",
+                    "annotations": {"nutrition": {
+                        "schema_version": 2,
+                        "record_type": "meal_correction",
+                        "changed_fields": ["meal_date"],
+                        "meal_date": "2026-10-05",
+                    }},
+                })
+                yield AssistantTextDelta(text="Изменение сохранено; баланс обновляется.")
+
+            engine.submit_message = date_correction
+            result = await runtime_turn(pool, changed, ingress)
+            assert result.metadata["nutrition_append_event_id"] == honcho.messages[-1].id
+            assert honcho.messages[-1].metadata["decision_trace"]["annotations"]["nutrition"][
+                "changed_fields"
+            ] == ["meal_date"]
+        else:
+            assert changed.metadata.get("_camera_ordinary_date_correction") is None
+            turns_before = len(pool._test_bundle.engine.turns)
+            result = await runtime_turn(pool, changed, ingress)
+            assert result.text != "Эта порция уже записана."
+            assert result.metadata.get("nutrition_append_event_id") is None
+            assert len(pool._test_bundle.engine.turns) == turns_before + 1
+        await ingress.close()
+        return
     assert changed.metadata.get("_camera_typed_replay_candidate") == request["candidate_id"]
     result = await runtime_turn(pool, changed, ingress)
     assert changed.metadata.get("_camera_typed_replay_candidate") is None
@@ -586,6 +629,390 @@ async def test_completed_camera_meal_accepts_bound_owner_date_correction(
     assert [
         (row.id, row.content, dict(row.metadata)) for row in honcho.messages
     ] == rows_after_valid_date
+    await ingress.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("date_text", "field", "value"),
+    [
+        ("Это было вчера", "meal_date", "2026-10-05"),
+        ("Да, это было 2026-10-05 в 18:45 UTC", "meal_at", "2026-10-05T18:45:00+00:00"),
+    ],
+)
+async def test_completed_camera_natural_and_affirmative_date_corrections_are_date_only(
+    tmp_path, monkeypatch, date_text, field, value,
+):
+    from openharness.evals import TRACE_FINALIZATION
+    from openharness.engine.stream_events import AssistantTextDelta
+
+    ingress, request, pool, honcho, _, _ = await _save_typed_confirmation(tmp_path, monkeypatch)
+    attempt = ingress._attempts[request["candidate_id"]]
+    engine = pool._test_bundle.engine
+    message = InboundMessage(
+        channel="telegram", sender_id="123", chat_id="123", content=date_text,
+        metadata={"message_id": f"date-correction-{field}",
+                  "reply_to_message_id": str(attempt["photo_id"]),
+                  "_telegram_raw_text": date_text, "is_group": False,
+                  "chat_type": "private"},
+    )
+
+    async def date_only_submit(user_message, *, wellness_actor=None):
+        del wellness_actor
+        engine.messages.append(user_message)
+        engine.turns.append((message.content, [], message.timestamp))
+        recorder = engine.decision_trace_recorder
+        recorder.trace_requirement_signals(message.content)
+        annotation = {
+            "schema_version": 2,
+            "record_type": "meal_correction",
+            "changed_fields": [field],
+            field: value,
+        }
+        recorder.record(TRACE_FINALIZATION, {
+            "schema_version": 1,
+            "trace_event_id": f"date-only-{field}",
+            "annotations": {"nutrition": annotation},
+        })
+        yield AssistantTextDelta(text="Изменение сохранено; баланс обновляется.")
+
+    engine.submit_message = date_only_submit
+    before = [(row.id, row.content, dict(row.metadata)) for row in honcho.messages]
+    ingress.process_real_inbound(message)
+    assert message.metadata.get("_camera_ordinary_date_correction") is CAMERA_AUTHORITY
+    assert message.metadata.get("_camera_unbound") is None
+    final = await runtime_turn(pool, message, ingress)
+
+    assert final.text == "Изменение сохранено; баланс обновляется."
+    assert final.metadata["nutrition_append_event_id"] == honcho.messages[-1].id
+    assert len(honcho.messages) == len(before) + 2
+    assert [(row.id, row.content, dict(row.metadata)) for row in honcho.messages[:len(before)]] == before
+    corrected = honcho.messages[-1]
+    stored = corrected.metadata["decision_trace"]["annotations"]["nutrition"]
+    assert stored["record_type"] == "meal_correction"
+    assert stored["changed_fields"] == [field]
+    observed = stored[field].replace("Z", "+00:00") if field == "meal_at" else stored[field]
+    assert observed == value
+    assert not {"items", "energy_kcal_best", "consumption_status"} & set(stored)
+    assert corrected.metadata["reply_to_source_message_id"] == str(attempt["photo_id"])
+    await ingress.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("trace_kind", ["new_meal", "quantity_correction"])
+async def test_camera_date_correction_rejects_meal_or_quantity_trace(
+    tmp_path, monkeypatch, trace_kind,
+):
+    from openharness.evals import TRACE_FINALIZATION
+    from openharness.engine.stream_events import AssistantTextDelta
+
+    ingress, request, pool, honcho, _, _ = await _save_typed_confirmation(tmp_path, monkeypatch)
+    attempt = ingress._attempts[request["candidate_id"]]
+    engine = pool._test_bundle.engine
+    text = "Да, это было 2026-10-05 в 18:45 UTC"
+    message = InboundMessage(
+        channel="telegram", sender_id="123", chat_id="123", content=text,
+        metadata={"message_id": f"bad-date-trace-{trace_kind}",
+                  "reply_to_message_id": str(attempt["photo_id"]),
+                  "_telegram_raw_text": text, "is_group": False,
+                  "chat_type": "private"},
+    )
+
+    async def incompatible_submit(user_message, *, wellness_actor=None):
+        del wellness_actor
+        engine.messages.append(user_message)
+        engine.turns.append((message.content, [], message.timestamp))
+        recorder = engine.decision_trace_recorder
+        recorder.trace_requirement_signals(message.content)
+        nutrition = (
+            {
+                "schema_version": 2, "record_type": "meal_observation",
+                "basis": ["owner_statement"], "consumption_status": "consumed",
+                "is_estimate": True, "energy_kcal_best": 999,
+                "items": [{"name": "must not be appended", "quantity_text": "new meal",
+                           "energy_kcal_best": 999}],
+            }
+            if trace_kind == "new_meal" else
+            {
+                "schema_version": 2, "record_type": "meal_correction",
+                "changed_fields": ["items", "energy_kcal_best"],
+                "energy_kcal_best": 53,
+                "items": [{"name": "wrong quantity", "quantity_text": "1 piece",
+                           "energy_kcal_best": 53}],
+            }
+        )
+        recorder.record(TRACE_FINALIZATION, {
+            "schema_version": 1,
+            "trace_event_id": f"bad-date-{trace_kind}",
+            "annotations": {"nutrition": nutrition},
+        })
+        yield AssistantTextDelta(text="Записано. Баланс обновлён: 999 ккал.")
+
+    engine.submit_message = incompatible_submit
+    before = [(row.id, row.content, dict(row.metadata)) for row in honcho.messages]
+    ingress.process_real_inbound(message)
+    assert message.metadata.get("_camera_ordinary_date_correction") is CAMERA_AUTHORITY
+    with pytest.raises(ValueError, match="explicit date-only correction"):
+        await runtime_turn(pool, message, ingress)
+    assert [(row.id, row.content, dict(row.metadata)) for row in honcho.messages] == before
+    await ingress.close()
+
+
+@pytest.mark.asyncio
+async def test_date_correction_source_must_be_unique_owner_reply_to_retained_meal(
+    tmp_path, monkeypatch,
+):
+    ingress, request, _, _, _, _ = await _save_typed_confirmation(tmp_path, monkeypatch)
+    attempt = ingress._attempts[request["candidate_id"]]
+    probes = [
+        InboundMessage(
+            channel="telegram", sender_id="123", chat_id="123", content="Это было вчера",
+            metadata={"message_id": "date-source-missing", "_telegram_raw_text": "Это было вчера"},
+        ),
+        InboundMessage(
+            channel="telegram", sender_id="other-owner", chat_id="123", content="Это было вчера",
+            metadata={"message_id": "date-source-foreign",
+                      "reply_to_message_id": str(attempt["photo_id"]),
+                      "_telegram_raw_text": "Это было вчера"},
+        ),
+        InboundMessage(
+            channel="telegram", sender_id="123", chat_id="123", content="Это было вчера",
+            metadata={"message_id": "date-source-stale", "reply_to_message_id": "999999",
+                      "_telegram_raw_text": "Это было вчера"},
+        ),
+    ]
+    for message in probes:
+        ingress.process_real_inbound(message)
+        assert message.metadata.get("_camera_ordinary_date_correction") is None
+        assert message.metadata.get("_camera_typed_replay_candidate") is None
+
+    conflicting = InboundMessage(
+        channel="telegram", sender_id="123", chat_id="123",
+        content="Это другой приём пищи, было 2026-10-05 в 18:45 UTC",
+        metadata={"message_id": "date-source-conflict",
+                  "reply_to_message_id": str(attempt["photo_id"]),
+                  "_telegram_raw_text": "Это другой приём пищи, было 2026-10-05 в 18:45 UTC"},
+    )
+    ingress.process_real_inbound(conflicting)
+    assert conflicting.metadata.get("_camera_ordinary_date_correction") is None
+    assert conflicting.metadata.get("_camera_unbound") is CAMERA_AUTHORITY
+    await ingress.close()
+
+
+@pytest.mark.asyncio
+async def test_durable_camera_denial_replaces_stale_status_and_replay_is_truthful(
+    tmp_path, monkeypatch,
+):
+    from openharness.evals import TRACE_FINALIZATION
+    from openharness.engine.stream_events import AssistantTextDelta
+    from ohmo.evals.nutrition_persistence import _fold_events
+
+    ingress, bus, request, pool, honcho, _, saved_final = await _save_callback_portion(
+        tmp_path, monkeypatch
+    )
+    attempt = ingress._attempts[request["candidate_id"]]
+    original_event = saved_final.metadata["nutrition_append_event_id"]
+    engine = pool._test_bundle.engine
+
+    async def denial_submit(user_message, *, wellness_actor=None):
+        del wellness_actor
+        engine.messages.append(user_message)
+        engine.turns.append((user_message.text, [], pool._active_message.timestamp))
+        recorder = engine.decision_trace_recorder
+        recorder.trace_requirement_signals(user_message.text)
+        recorder.record(TRACE_FINALIZATION, {
+            "schema_version": 1,
+            "trace_event_id": "durable-denial-status",
+            "annotations": {"nutrition": {
+                "schema_version": 2, "record_type": "meal_correction",
+                "changed_fields": ["consumption_status", "energy_kcal_best"],
+                "consumption_status": "not_consumed", "energy_kcal_best": 0,
+            }},
+        })
+        yield AssistantTextDelta(
+            text="Не удалось подтвердить сохранение изменения. Записано. Баланс обновлён: 105 ккал."
+        )
+
+    engine.submit_message = denial_submit
+    denial = await _native_callback(
+        bus, label="Нет, не ела", target=attempt["photo_id"],
+        options=["Да, я это съела", "Нет, не ела"], prompt="Съели ли вы это?",
+    )
+    denial.metadata["callback_query_id"] = "g11-denial"
+    ingress.process_real_inbound(denial)
+    before_rows = len(honcho.messages)
+    original_rows = [(row.id, row.content, dict(row.metadata)) for row in honcho.messages]
+    denial_final = await runtime_turn(pool, denial, ingress)
+    commit = attempt["camera_correction_commit"]
+    assert commit["kind"] == "denial"
+    assert commit["target_event_id"] == original_event
+    assert denial_final.text == "Изменение сохранено; баланс обновляется."
+    assert "105 ккал" not in denial_final.text
+    assert denial_final.metadata["nutrition_append_event_id"] == commit["event_id"]
+    assert denial_final.metadata["nutrition_sync_status"] == "pending"
+    assert attempt["camera_commit"]["event_id"] == original_event
+    assert len(honcho.messages) == before_rows + 2
+    assert [(row.id, row.content, dict(row.metadata)) for row in honcho.messages[:before_rows]] == original_rows
+
+    denial_row = honcho.messages[-1]
+    assert denial_row.id == commit["event_id"]
+    assert denial_row.metadata["camera_candidate_id"] == request["candidate_id"]
+    assert denial_row.metadata["camera_operation_id"] == request["candidate_id"]
+    assert denial_row.metadata["camera_answer_bound"] == "no"
+    assert denial_row.metadata["camera_correction_bound"] is True
+    assert denial_row.metadata["camera_original_event_id"] == original_event
+    assert denial_row.metadata["client_op_id"] == commit["client_op_id"]
+    denied_nutrition = denial_row.metadata["decision_trace"]["annotations"]["nutrition"]
+    assert denied_nutrition["record_type"] == "meal_correction"
+    assert denied_nutrition["consumption_status"] == "not_consumed"
+    assert denied_nutrition["energy_kcal_best"] == 0
+
+    restarted, _, _, _ = _ingress(tmp_path, FakeTelegram())
+    pool._camera_ingress = restarted
+    repeat = await _native_callback(
+        bus, label="Нет, не ела",
+        target=restarted._attempts[request["candidate_id"]]["photo_id"],
+        options=["Да, я это съела", "Нет, не ела"], prompt="Съели ли вы это?",
+    )
+    repeat.metadata["callback_query_id"] = "g11-denial"
+    restarted.process_real_inbound(repeat)
+    rows_before_repeat = len(honcho.messages)
+    repeat_final = await runtime_turn(pool, repeat, restarted)
+    assert repeat_final.text == "Исправление уже записано."
+    assert repeat_final.metadata["nutrition_append_event_id"] == commit["event_id"]
+    assert len(honcho.messages) == rows_before_repeat
+    fold_input = []
+    for row in honcho.messages:
+        nutrition = row.metadata.get("decision_trace", {}).get("annotations", {}).get("nutrition")
+        if isinstance(nutrition, dict):
+            fold_input.append({"event_id": row.id, "root_source_message_id": attempt["camera_commit"]["source_message_id"],
+                               "_created_at": row.created_at, "annotation": nutrition})
+    folded = _fold_events(fold_input)
+    assert folded["consumed"] is False
+    assert folded["energy_kcal_best"] == 0
+    assert folded["latest_event_id"] == commit["event_id"]
+    await ingress.close()
+    await restarted.close()
+
+
+@pytest.mark.asyncio
+async def test_dated_new_meal_without_camera_reply_keeps_ordinary_source_binding(
+    tmp_path, monkeypatch,
+):
+    from openharness.evals import TRACE_FINALIZATION
+    from openharness.engine.stream_events import AssistantTextDelta
+
+    ingress, request, pool, honcho, _, _ = await _save_typed_confirmation(tmp_path, monkeypatch)
+    original_event = ingress._attempts[request["candidate_id"]]["camera_commit"]["event_id"]
+    engine = pool._test_bundle.engine
+    text = "Да, я съела другой приём пищи вчера"
+    message = InboundMessage(
+        channel="telegram", sender_id="123", chat_id="123", content=text,
+        metadata={"message_id": "ordinary-new-meal-with-date",
+                  "_telegram_raw_text": text, "is_group": False,
+                  "chat_type": "private"},
+    )
+
+    async def ordinary_meal_submit(user_message, *, wellness_actor=None):
+        del wellness_actor
+        engine.messages.append(user_message)
+        engine.turns.append((message.content, [], message.timestamp))
+        recorder = engine.decision_trace_recorder
+        recorder.trace_requirement_signals(message.content)
+        recorder.record(TRACE_FINALIZATION, {
+            "schema_version": 1,
+            "trace_event_id": "ordinary-new-dated-meal",
+            "annotations": {"nutrition": {
+                "schema_version": 2, "record_type": "meal_observation",
+                "basis": ["owner_statement"], "consumption_status": "consumed",
+                "is_estimate": True, "meal_date": "2026-10-05",
+                "energy_kcal_best": 340,
+                "items": [{"name": "ordinary new meal", "quantity_text": "one meal",
+                           "energy_kcal_best": 340}],
+            }},
+        })
+        yield AssistantTextDelta(text="Приём пищи записан.")
+
+    engine.submit_message = ordinary_meal_submit
+    ingress.process_real_inbound(message)
+    assert message.metadata.get("_camera_ordinary_date_correction") is None
+    assert message.metadata.get("_camera_typed_replay_candidate") is None
+    assert message.metadata.get("_camera_unbound") is None
+    final = await runtime_turn(pool, message, ingress)
+    assert final.metadata["nutrition_append_event_id"] == honcho.messages[-1].id
+    ordinary_row = honcho.messages[-1]
+    stored = ordinary_row.metadata["decision_trace"]["annotations"]["nutrition"]
+    assert stored["record_type"] == "meal_observation"
+    assert ordinary_row.metadata["source_message_id"] == "ordinary-new-meal-with-date"
+    assert ordinary_row.metadata["ingest_source"] == "telegram"
+    assert ordinary_row.metadata["confirmation_required"] is False
+    assert ordinary_row.metadata.get("camera_candidate_id") is None
+    assert ingress._attempts[request["candidate_id"]]["camera_commit"]["event_id"] == original_event
+    await ingress.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("receipt_failure", ["missing", "foreign", "append_failure"])
+async def test_camera_denial_never_claims_saved_without_valid_receipt(
+    tmp_path, monkeypatch, receipt_failure,
+):
+    from dataclasses import replace
+
+    from openharness.evals import TRACE_FINALIZATION
+    from openharness.engine.stream_events import AssistantTextDelta
+
+    ingress, bus, request, pool, honcho, _, _ = await _save_callback_portion(tmp_path, monkeypatch)
+    attempt = ingress._attempts[request["candidate_id"]]
+    engine = pool._test_bundle.engine
+
+    async def denial_submit(user_message, *, wellness_actor=None):
+        del wellness_actor
+        engine.messages.append(user_message)
+        engine.turns.append((user_message.text, [], pool._active_message.timestamp))
+        recorder = engine.decision_trace_recorder
+        recorder.trace_requirement_signals(user_message.text)
+        recorder.record(TRACE_FINALIZATION, {
+            "schema_version": 1,
+            "trace_event_id": f"invalid-denial-receipt-{receipt_failure}",
+            "annotations": {"nutrition": {
+                "schema_version": 2, "record_type": "meal_correction",
+                "changed_fields": ["consumption_status", "energy_kcal_best"],
+                "consumption_status": "not_consumed", "energy_kcal_best": 0,
+            }},
+        })
+        yield AssistantTextDelta(text="Изменение сохранено; баланс обновляется.")
+
+    engine.submit_message = denial_submit
+    denial = await _native_callback(
+        bus, label="Нет, не ела", target=attempt["photo_id"],
+        options=["Да, я это съела", "Нет, не ела"], prompt="Съели ли вы это?",
+    )
+    denial.metadata["callback_query_id"] = f"g11-invalid-{receipt_failure}"
+    ingress.process_real_inbound(denial)
+    before = len(honcho.messages)
+    backend = pool._shadow_backend_for_scope(None)
+    append_exchange = backend.append_exchange
+
+    async def failed_or_corrupt_append(*args, **kwargs):
+        if receipt_failure == "append_failure":
+            raise OSError("synthetic denial append failure")
+        if receipt_failure == "missing":
+            return None
+        receipt = await append_exchange(*args, **kwargs)
+        return replace(receipt, assistant_metadata={
+            **receipt.assistant_metadata, "tenant_id": "foreign-owner",
+        })
+
+    monkeypatch.setattr(backend, "append_exchange", failed_or_corrupt_append)
+    expected_error = OSError if receipt_failure == "append_failure" else ValueError
+    with pytest.raises(expected_error):
+        await runtime_turn(pool, denial, ingress)
+    assert attempt.get("camera_correction_commit") is None
+    assert denial.metadata.get("nutrition_append_event_id") is None
+    if receipt_failure == "foreign":
+        assert len(honcho.messages) == before + 2
+    else:
+        assert len(honcho.messages) == before
     await ingress.close()
 
 
