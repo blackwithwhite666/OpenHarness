@@ -1076,6 +1076,34 @@ async def test_information_scope_native_callbacks_do_not_authorize_camera_runtim
 
 
 @pytest.mark.asyncio
+async def test_native_preparation_quantity_callback_does_not_authorize_consumption(tmp_path):
+    ingress, root, bus, _ = _ingress(tmp_path)
+    request = _candidate(root, classifier_decision="food")
+    _, final, receipt, options, clicked, _, _ = await _actual_native_camera_prompt(
+        ingress,
+        root,
+        bus,
+        request,
+        question="Какую порцию приготовить?",
+        options=["100 грамм", "200 грамм"],
+        selected_index=0,
+        source_analysis="Собака съела рис.",
+    )
+    assert options == ["100 грамм", "200 грамм"]
+    assert clicked is not None
+    assert clicked.metadata["native_keyboard_question"] == "Какую порцию приготовить?"
+    assert final.content.endswith("Какую порцию приготовить?")
+    assert receipt.native_message_ids == (77,)
+    assert clicked.metadata.get("_camera_answer") is None
+    assert clicked.metadata.get("_camera_authority") is not CAMERA_AUTHORITY
+    assert clicked.metadata.get("_camera_unbound") is CAMERA_AUTHORITY
+    assert clicked.metadata["_camera_ingress_callback_eligible"] is False
+    assert clicked.media == []
+    assert ingress._attempts[request["candidate_id"]]["state"] == "photo_sent"
+    await ingress.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("label", "prompt"),
     [
@@ -1619,7 +1647,10 @@ async def test_unrelated_untargeted_turn_blocks_later_bare_camera_confirmation(
 
 
 def test_context_answer_scope_and_uncertainty_override_leading_yes():
-    from ohmo.gateway.camera import _camera_context_answer_kind
+    from ohmo.gateway.camera import (
+        _camera_context_answer_kind,
+        _camera_question_asks_owner_consumption,
+    )
 
     assert _camera_context_answer_kind("Да, только оценить состав") is None
     assert _camera_context_answer_kind("Да, не уверена") is None
@@ -1628,6 +1659,76 @@ def test_context_answer_scope_and_uncertainty_override_leading_yes():
     assert _camera_context_answer_kind("Да, немного позже") is None
     assert _camera_context_answer_kind("Я съела всю тарелку, посчитай калории") == "yes"
     assert _camera_context_answer_kind("Не помню, ела ли я это") is None
+    assert _camera_context_answer_kind(
+        "Рис и яйцо. Съел всю порцию на тарелке, но точный вес не знаю."
+    ) == "yes"
+    assert _camera_context_answer_kind("Точный вес не знаю, но съел всю порцию.") == "yes"
+    assert _camera_context_answer_kind("Вес неизвестен, но съела всю порцию.") == "yes"
+    assert _camera_context_answer_kind(
+        "Я съела всё, но не знаю точный вес порции."
+    ) == "yes"
+    assert _camera_context_answer_kind(
+        "I ate the whole portion, but I don't know its exact weight."
+    ) == "yes"
+    assert _camera_context_answer_kind(
+        "I drank the whole glass, but I don't know its exact weight."
+    ) == "yes"
+    assert _camera_context_answer_kind(
+        "The dog ate it, but I do not know its exact weight."
+    ) is None
+    assert _camera_context_answer_kind(
+        "He ate the food, but its weight is unknown."
+    ) is None
+    for other_eater in (
+        "Он съел всю порцию, но точный вес не знаю.",
+        "Ребёнок съел это, но вес не знаю.",
+        "Собака съела рис, но точный вес не знаю.",
+        "Съела собака рис, но точный вес не знаю.",
+        "Точный вес не знаю. Собака съела рис.",
+    ):
+        assert _camera_context_answer_kind(other_eater) is None
+    assert _camera_context_answer_kind("Не знаю, ела ли я это.") is None
+    assert _camera_context_answer_kind(
+        "Только оценить состав; не знаю, ела ли я это."
+    ) is None
+    assert _camera_context_answer_kind("Отложу ответ, позже уточню.") is None
+    assert _camera_context_answer_kind(
+        "Съел всю порцию, но не уверен, что это было именно с этой фотографии."
+    ) is None
+    assert _camera_context_answer_kind("Съел котлету, но точный вес не знаю.") == "yes"
+    assert _camera_context_answer_kind("Съел котлеты, но вес не знаю.") == "yes"
+    assert _camera_context_answer_kind("Кот съел котлету, но вес не знаю.") is None
+    assert _camera_question_asks_owner_consumption("Сколько котлет вы съели?") is True
+    assert _camera_question_asks_owner_consumption("Сколько кот съел?") is False
+    assert _camera_question_asks_owner_consumption(
+        "Какую порцию учесть в калориях?"
+    ) is True
+    assert _camera_question_asks_owner_consumption(
+        "Какую часть порции учитывать?"
+    ) is True
+    assert _camera_question_asks_owner_consumption("Какую порцию приготовить?") is False
+    assert _camera_question_asks_owner_consumption(
+        "Какую порцию только оценить по составу?"
+    ) is False
+    assert _camera_question_asks_owner_consumption(
+        "Какую порцию приготовить, чтобы учесть калории?"
+    ) is False
+    assert _camera_question_asks_owner_consumption(
+        "Какую порцию коту учесть в калориях?"
+    ) is False
+    assert _camera_question_asks_owner_consumption(
+        "Какую порцию котлет учесть в калориях?"
+    ) is True
+    assert _camera_question_asks_owner_consumption(
+        "Какую порцию готового блюда учесть в калориях?"
+    ) is True
+    assert _camera_question_asks_owner_consumption("Which portion should I log?") is True
+    assert _camera_question_asks_owner_consumption(
+        "Which portion should I log for the dog?"
+    ) is False
+    assert _camera_context_answer_kind(
+        "I ate it, but I'm not sure it was from this photo."
+    ) is None
     assert _camera_context_answer_kind("2 фотографии пропали") is None
     assert _camera_context_answer_kind("2 сообщения пришли") is None
     assert _camera_context_answer_kind("2 фотографии потерялись") is None
@@ -1995,6 +2096,87 @@ async def test_native_plum_scope_commits_one_camera_portion_without_extra_yes(tm
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("targeted", [True, False], ids=["reply-to-photo", "contextual"])
+@pytest.mark.parametrize(
+    "phrase",
+    [
+        "Рис и яйцо. Съел всю порцию на тарелке, но точный вес не знаю.",
+        "Я съела всё, но не знаю точный вес порции.",
+        "I ate the whole portion, but I don't know its exact weight.",
+    ],
+    ids=["observed-russian", "russian-paraphrase", "english-paraphrase"],
+)
+async def test_unknown_weight_does_not_cancel_explicit_camera_consumption(
+    tmp_path, targeted, phrase,
+):
+    import tests.test_ohmo.test_camera_f84_joint_runtime as joint_runtime
+
+    ingress, root, bus, _ = _ingress(tmp_path)
+    request = _candidate(root, classifier_decision="food", capture_time=joint_runtime.BASE)
+    _, _, photo_receipt, _, _, telegram_channel, _ = await _actual_native_camera_prompt(
+        ingress, root, bus, request,
+        question="Что из этого вы съели?\n\nЧто вы съели?",
+        options=["Да, съел(а)", "Нет, не ел(а)"],
+        selected_index=None,
+        source_analysis="На тарелке — рис и яйцо.",
+    )
+    metadata = {"is_group": False, "message_id": 9055, "_telegram_raw_text": phrase}
+    if targeted:
+        metadata["reply_to_message_id"] = str(photo_receipt.native_message_ids[0])
+    answer = InboundMessage(
+        channel="telegram", sender_id="123", chat_id="123", content=phrase,
+        metadata=metadata,
+    )
+    ingress.process_real_inbound(answer)
+    assert answer.metadata.get("_camera_answer") == "yes"
+    assert answer.metadata.get("_camera_route") == ("reply" if targeted else "context")
+    assert answer.media == [ingress._attempts[request["candidate_id"]]["snapshot"]]
+
+    pool, bundle, server, client = joint_runtime.setup(
+        str(tmp_path / f"unknown-weight-{targeted}")
+    )
+    _configure_joint_camera_runtime(pool, bundle, ingress)
+    runtime_message, _, _ = joint_runtime.inbound(
+        pool, answer.metadata["message_id"], phrase,
+        when=joint_runtime.BASE + timedelta(minutes=1), media=answer.media,
+        metadata_extra=answer.metadata,
+    )
+    bundle.engine.annotation = joint_runtime.observation(
+        meal_at=joint_runtime.BASE,
+        energy_kcal_best=380,
+        items=[
+            {"name": "rice", "quantity_text": "one portion", "energy_kcal_best": 250},
+            {"name": "egg", "quantity_text": "one", "energy_kcal_best": 130},
+        ],
+    )
+    bundle.engine.answer = "Записала съеденную порцию риса и яйца."
+    updates = [update async for update in pool.stream_message(runtime_message, "telegram:123")]
+    await bundle.review_backend.await_pending()
+    final = next(update for update in updates if update.kind == "final")
+    assert final.metadata.get("_camera_final") is CAMERA_AUTHORITY
+    assert final.metadata.get("nutrition_sync_status") == "pending"
+    meal_rows = [
+        row for row in server.rows
+        if row.get("metadata", {}).get("role") == "assistant"
+        and row.get("metadata", {}).get("camera_candidate_id") == request["candidate_id"]
+        and row.get("metadata", {}).get("decision_trace", {})
+        .get("annotations", {}).get("nutrition", {}).get("record_type") == "meal_observation"
+    ]
+    assert len(meal_rows) == 1
+    assert meal_rows[0]["metadata"]["camera_route"] == ("reply" if targeted else "context")
+    assert meal_rows[0]["metadata"]["source_message_id"] == "9055"
+    final_message = OutboundMessage(
+        channel="telegram", chat_id="123", content=final.text, metadata=final.metadata,
+    )
+    receipt = await telegram_channel.send(final_message)
+    assert receipt is not None and receipt.native_message_ids
+    ingress.note_assistant_receipt(final_message, receipt)
+    assert ingress._attempts[request["candidate_id"]]["state"] == "completed"
+    await client.aclose()
+    await ingress.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("targeted", [True, False], ids=["reply-to-photo", "contextual"])
 async def test_native_food_portion_phrase_finalizes_once_and_replay_adds_no_event(
     tmp_path, targeted,
 ):
@@ -2281,22 +2463,29 @@ async def test_native_explicit_consumption_still_binds_after_analysis_question(t
     await ingress.close()
 
 
-async def _actual_context_origin_camera_clarification(tmp_path):
+async def _actual_context_origin_camera_clarification(
+    tmp_path, *, original_question="Какую порцию только оценить по составу?",
+    source_phrase="Весь рис и оба яйца.",
+    clarification_narrative="По составу это рис и яйца.",
+    clarification_question="Какую порцию только оценить по составу?",
+    clarification_options=("Весь рис и оба яйца", "Часть риса и оба яйца"),
+):
     import tests.test_ohmo.test_camera_f84_joint_runtime as joint_runtime
 
     ingress, root, bus, _ = _ingress(tmp_path)
     request = _candidate(root, classifier_decision="food", capture_time=joint_runtime.BASE)
     _, _, _, _, _, telegram_channel, _ = await _actual_native_camera_prompt(
         ingress, root, bus, request,
-        question="Какую порцию только оценить по составу?",
+        question=original_question,
         options=["Весь рис и оба яйца", "Часть риса и оба яйца"],
         selected_index=None,
         source_analysis="На тарелке — рис и два варёных яйца.",
     )
     phrase = "Весь рис и оба яйца."
+    initial_phrase = source_phrase
     source_answer = InboundMessage(
-        channel="telegram", sender_id="123", chat_id="123", content=phrase,
-        metadata={"is_group": False, "message_id": 9040, "_telegram_raw_text": phrase},
+        channel="telegram", sender_id="123", chat_id="123", content=initial_phrase,
+        metadata={"is_group": False, "message_id": 9040, "_telegram_raw_text": initial_phrase},
     )
     ingress.process_real_inbound(source_answer)
     assert source_answer.metadata.get("_camera_context_question") is CAMERA_CONTEXT_QUESTION_AUTHORITY
@@ -2305,7 +2494,7 @@ async def _actual_context_origin_camera_clarification(tmp_path):
     pool, bundle, server, client = joint_runtime.setup(str(tmp_path / "context-origin-runtime"))
     _configure_joint_camera_runtime(pool, bundle, ingress)
     runtime_message, _, _ = joint_runtime.inbound(
-        pool, source_answer.metadata["message_id"], phrase,
+        pool, source_answer.metadata["message_id"], initial_phrase,
         when=joint_runtime.BASE + timedelta(minutes=1), media=source_answer.media,
         metadata_extra=source_answer.metadata,
     )
@@ -2314,9 +2503,8 @@ async def _actual_context_origin_camera_clarification(tmp_path):
     ) is CAMERA_CONTEXT_QUESTION_AUTHORITY
     bundle.engine.annotation = None
     bundle.engine.answer = (
-        "По составу это рис и яйца. "
-        "[[ask: Какую порцию только оценить по составу? | Весь рис и оба яйца | "
-        "Часть риса и оба яйца]]"
+        f"{clarification_narrative} [[ask: {clarification_question} | "
+        f"{' | '.join(clarification_options)}]]"
     )
     bridge = OhmoGatewayBridge(bus=bus, runtime_pool=pool, camera_ingress=ingress)
     await bridge._process_message(runtime_message, "telegram:123")
@@ -2327,7 +2515,7 @@ async def _actual_context_origin_camera_clarification(tmp_path):
         break
     else:
         pytest.fail("Camera clarification final was not delivered after progress frames")
-    assert final_message.buttons == ["Весь рис и оба яйца", "Часть риса и оба яйца"]
+    assert final_message.buttons == list(clarification_options)
     assert final_message.metadata.get("_camera_final") is CAMERA_AUTHORITY
     assert final_message.metadata.get("nutrition_sync_status") is None
     final_receipt = await telegram_channel.send(final_message)
@@ -2338,6 +2526,12 @@ async def _actual_context_origin_camera_clarification(tmp_path):
     assert attempt["state"] == "clarifying"
     assert attempt["answer_kind"] == "context"
     assert attempt["context_question_turn_id"] == source_answer.metadata["_camera_turn_id"]
+    delivered_question = attempt["confirmed_clarification_question"]
+    assert delivered_question["turn_id"] == attempt["context_question_turn_id"]
+    assert delivered_question["text"] == clarification_question
+    assert str(final_receipt.native_message_ids[0]) in {
+        str(native_id) for native_id in delivered_question["receipt_ids"]
+    }
     assert "camera_commit" not in attempt
     assert not any(
         row.get("metadata", {}).get("camera_candidate_id") == request["candidate_id"]
@@ -2355,23 +2549,121 @@ async def _actual_context_origin_camera_clarification(tmp_path):
     assert str(final_receipt.native_message_ids[0]) in {
         str(reply_id) for reply_id in attempt["reply_ids"]
     }
+    assert attempt["confirmed_clarification_question"] == delivered_question
     return (
-        ingress, request, bus, telegram_channel, final_receipt, attempt,
+        ingress, request, bus, telegram_channel, final_message, final_receipt, attempt,
         pool, bundle, server, client, phrase,
     )
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("route", ["targeted", "contextual", "callback"])
+@pytest.mark.parametrize(
+    "question,expected",
+    [
+        ("Сколько риса вы съели?", "yes"),
+        ("Какую порцию учесть в калориях?", "yes"),
+        ("Какую часть порции учитывать?", "yes"),
+        ("Какую порцию приготовить?", None),
+        ("Какую порцию приготовить, чтобы учесть калории?", None),
+        ("Какую порцию коту учесть в калориях?", None),
+        ("Какую порцию котлет учесть в калориях?", "yes"),
+        ("Какую порцию готового блюда учесть в калориях?", "yes"),
+        ("Which portion should I log?", "yes"),
+        ("Which portion should I log for the dog?", None),
+        ("Which portion should I log for my child?", None),
+        ("Какую порцию только оценить по составу?", None),
+        ("Какую порцию съел кот?", None),
+    ],
+    ids=[
+        "current-owner-consumption-question",
+        "current-calorie-logging-question",
+        "current-portion-count-question",
+        "narrative-does-not-grant-prep-question",
+        "preparation-plus-logging-does-not-grant-meal",
+        "other-eater-logging-question-does-not-grant-owner-meal",
+        "cutlet-food-does-not-look-like-cat-subject",
+        "cooked-food-description-remains-owner-logging-question",
+        "english-owner-logging-question",
+        "english-dog-beneficiary-does-not-grant-owner-meal",
+        "english-child-beneficiary-does-not-grant-owner-meal",
+        "analysis-question-does-not-grant-meal",
+        "third-party-question-does-not-grant-owner-meal",
+    ],
+)
+async def test_clarification_authority_uses_displayed_owner_question_only(
+    tmp_path, route, question, expected,
+):
+    narrative = "Собака съела рис."
+    options = ("100 грамм", "200 грамм")
+    (
+        ingress, request, _bus, _telegram_channel, final_message, receipt, attempt,
+        _pool, _bundle, server, client, _phrase,
+    ) = await _actual_context_origin_camera_clarification(
+        tmp_path,
+        clarification_narrative=narrative,
+        clarification_question=question,
+        clarification_options=options,
+    )
+    assert attempt["confirmed_clarification_question"]["text"] == question
+    assert narrative not in attempt["confirmed_clarification_question"]["text"]
+    target = int(receipt.native_message_ids[0])
+    if route == "callback":
+        answer = await _native_callback(
+            _bus, label="100 грамм", target=target,
+            options=list(options), prompt=final_message.content,
+        )
+        assert answer.metadata["native_keyboard_question"] == question
+    else:
+        metadata = {"is_group": False, "message_id": 9044, "_telegram_raw_text": "100 грамм"}
+        if route == "targeted":
+            metadata["reply_to_message_id"] = str(target)
+        answer = InboundMessage(
+            channel="telegram", sender_id="123", chat_id="123",
+            content="100 грамм", metadata=metadata,
+        )
+    ingress.process_real_inbound(answer)
+    assert answer.metadata.get("_camera_answer") == expected
+    if expected == "yes":
+        assert answer.metadata.get("_camera_authority") is CAMERA_AUTHORITY
+        assert answer.metadata.get("_camera_candidate_id") == request["candidate_id"]
+    else:
+        assert answer.metadata.get("_camera_authority") is not CAMERA_AUTHORITY
+        if route == "callback":
+            assert answer.metadata.get("_camera_unbound") is CAMERA_AUTHORITY
+            assert answer.metadata.get("_camera_ingress_callback_eligible") is False
+    assert not any(
+        row.get("metadata", {}).get("camera_candidate_id") == request["candidate_id"]
+        and row.get("metadata", {}).get("decision_trace", {})
+        .get("annotations", {}).get("nutrition", {}).get("record_type") == "meal_observation"
+        for row in server.rows
+    )
+    await client.aclose()
+    await ingress.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("targeted", [True, False], ids=["reply-to-context-answer", "contextual"])
+@pytest.mark.parametrize(
+    "original_question,source_phrase",
+    [
+        ("Какую порцию только оценить по составу?", "Весь рис и оба яйца."),
+        ("", "только виноград"),
+        ("Что из этого вы съели?", "только виноград"),
+    ],
+    ids=["analysis-origin", "no-original-question", "consuming-original-question"],
+)
 async def test_context_origin_clarification_cannot_turn_implicit_portion_into_meal(
-    tmp_path, targeted,
+    tmp_path, targeted, original_question, source_phrase,
 ):
     import tests.test_ohmo.test_camera_f84_joint_runtime as joint_runtime
 
     (
-        ingress, request, bus, _telegram_channel, context_receipt, attempt,
+        ingress, request, bus, _telegram_channel, _context_final, context_receipt, attempt,
         pool, bundle, server, client, phrase,
-    ) = await _actual_context_origin_camera_clarification(tmp_path)
+    ) = await _actual_context_origin_camera_clarification(
+        tmp_path, original_question=original_question, source_phrase=source_phrase
+    )
     context_message_id = str(context_receipt.native_message_ids[0])
 
     callback = await _native_callback(
@@ -2449,6 +2741,57 @@ async def test_context_origin_clarification_cannot_turn_implicit_portion_into_me
 
 
 @pytest.mark.asyncio
+async def test_context_question_transition_clears_scoped_clarification_before_restart(tmp_path):
+    (
+        ingress, request, bus, telegram_channel, stale_final, stale_receipt, attempt,
+        _pool_instance, _bundle, server, client, _portion_phrase,
+    ) = await _actual_context_origin_camera_clarification(tmp_path)
+    previous_context_turn = attempt["context_question_turn_id"]
+    assert "confirmed_clarification_question" in attempt
+
+    followup_text = "только рис"
+    followup = InboundMessage(
+        channel="telegram", sender_id="123", chat_id="123", content=followup_text,
+        metadata={"is_group": False, "message_id": 9043, "_telegram_raw_text": followup_text},
+    )
+    ingress.process_real_inbound(followup)
+    assert followup.metadata.get("_camera_context_question") is CAMERA_CONTEXT_QUESTION_AUTHORITY
+    assert followup.metadata.get("_camera_answer") is None
+    assert followup.metadata.get("_camera_turn_id") != previous_context_turn
+    assert attempt["state"] == "answering"
+    assert attempt["answer_kind"] == "context"
+    assert "confirmed_clarification_question" not in attempt
+
+    # A late receipt replay from the old turn cannot restore its question scope.
+    ingress.note_assistant_receipt(stale_final, stale_receipt)
+    assert "confirmed_clarification_question" not in attempt
+    assert not any(
+        row.get("metadata", {}).get("camera_candidate_id") == request["candidate_id"]
+        and row.get("metadata", {}).get("decision_trace", {})
+        .get("annotations", {}).get("nutrition", {}).get("record_type") == "meal_observation"
+        for row in server.rows
+    )
+
+    await ingress.close()
+    reopened = type(ingress)(
+        ingress.config, workspace=tmp_path, bus=bus, telegram=telegram_channel
+    )
+    persisted = reopened._attempts[request["candidate_id"]]
+    assert persisted["state"] == "answering"
+    assert persisted["answer_kind"] == "context"
+    assert persisted["answer_turn_id"] == followup.metadata["_camera_turn_id"]
+    assert persisted["confirmed_camera_context"] == attempt["confirmed_camera_context"]
+    assert "confirmed_clarification_question" not in persisted
+    assert not any(
+        row.get("metadata", {}).get("camera_candidate_id") == request["candidate_id"]
+        and row.get("metadata", {}).get("nutrition_append_event_id")
+        for row in server.rows
+    )
+    await client.aclose()
+    await reopened.close()
+
+
+@pytest.mark.asyncio
 async def test_known_consumption_clarification_keeps_quantity_after_analysis_question(tmp_path):
     ingress, root, bus, _ = _ingress(tmp_path)
     request = _candidate(root, classifier_decision="food")
@@ -2520,7 +2863,7 @@ async def test_context_origin_clarification_accepts_explicit_new_eating_statemen
     import tests.test_ohmo.test_camera_f84_joint_runtime as joint_runtime
 
     (
-        ingress, request, _bus, telegram_channel, context_receipt, attempt,
+        ingress, request, _bus, telegram_channel, _context_final, context_receipt, attempt,
         pool, bundle, server, client, _portion_phrase,
     ) = await _actual_context_origin_camera_clarification(tmp_path)
     phrase = "Я съела рис и яйца."
@@ -9069,8 +9412,16 @@ async def test_real_camera_initial_signal_is_captured_as_context_without_fake_so
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "base",
+    [
+        datetime(2026, 10, 6, 10, 0, tzinfo=timezone.utc),
+        datetime(2026, 10, 5, 23, 50, tzinfo=timezone.utc),
+    ],
+    ids=["same-day", "cross-midnight"],
+)
 async def test_late_reply_binds_its_matching_initial_context_among_two_camera_photos(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch, base: datetime
 ):
     from copy import deepcopy
     from datetime import date
@@ -9083,8 +9434,7 @@ async def test_late_reply_binds_its_matching_initial_context_among_two_camera_ph
         _build_conversation_turn_metadata, _camera_eval_capture_provenance,
     )
     from ohmo.gateway.turn_context import build_turn_context
-
-    base = datetime.now(timezone.utc).replace(microsecond=0)
+    from openharness.evals import models as eval_models
 
     class ControlledDatetime(datetime):
         current = base
@@ -9102,6 +9452,7 @@ async def test_late_reply_binds_its_matching_initial_context_among_two_camera_ph
             )
 
     monkeypatch.setattr(camera_module, "datetime", ControlledDatetime)
+    monkeypatch.setattr(eval_models, "datetime", ControlledDatetime)
     ingress, root, bus, _ = _ingress(tmp_path, TwoPhotoReceiptTelegram())
     scope = MemoryScope(ingress.config.tenant_id, ())
 
@@ -9109,6 +9460,7 @@ async def test_late_reply_binds_its_matching_initial_context_among_two_camera_ph
         request = _candidate(root, index=index, capture_time=ControlledDatetime.current)
         assert (await _admit(ingress, root, "Bearer " + "s" * 40, request))[0] == 202
         message = await asyncio.wait_for(bus.consume_inbound(), timeout=1)
+        message.timestamp = ControlledDatetime.current
         turn_ctx = replace(
             build_turn_context(message, session_id="camera-session", owner_principals=("123",)),
             camera_authorized=True,
@@ -9145,6 +9497,7 @@ async def test_late_reply_binds_its_matching_initial_context_among_two_camera_ph
     second_recorder.finish(status="completed")
     ingress.complete(second, recorded=False)
 
+    ControlledDatetime.current += timedelta(seconds=1)
     reply = InboundMessage(
         channel="telegram", sender_id="123|synthetic-owner", chat_id="123",
         content="Yes, I drank the first one, 25 kcal", timestamp=ControlledDatetime.current,
@@ -9218,6 +9571,22 @@ async def test_late_reply_binds_its_matching_initial_context_among_two_camera_ph
     exported = export_eval_dialogue(
         tmp_path / "evals", episode_ids=goal_data["episode_ids"]
     )
+    episode_times = {
+        episode["episode"]["episode_id"]: datetime.fromisoformat(
+            episode["episode"]["created_at"]
+        )
+        for episode in exported["episodes"]
+    }
+    assert episode_times == {
+        first_recorder.episode_id: base,
+        second_recorder.episode_id: base + timedelta(minutes=31),
+        owner_recorder.episode_id: reply.timestamp,
+    }
+    assert (
+        episode_times[first_recorder.episode_id]
+        < episode_times[second_recorder.episode_id]
+        < episode_times[owner_recorder.episode_id]
+    )
     binding = validate_dialogue_binding(manifest, exported)["late-camera-tea"]
     assert binding["complete"] is True
     public_turns = [turn for episode in exported["episodes"] for turn in episode["dialogue"]]
@@ -9251,7 +9620,8 @@ async def test_late_reply_binds_its_matching_initial_context_among_two_camera_ph
     day_start = datetime.combine(reply.timestamp.date(), datetime.min.time(), timezone.utc)
     honcho = {
         "complete": True, "workspace_id": "workspace-1", "session_id": "honcho-session",
-        "owner_id": ingress.config.tenant_id, "since": day_start.isoformat(),
+        "owner_id": ingress.config.tenant_id,
+        "since": min(day_start, reviewed_goal.trajectory_started_at).isoformat(),
         "until": later.isoformat(), "queried_at": later.isoformat(),
         "messages": [*initial_rows, food],
     }

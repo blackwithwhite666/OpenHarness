@@ -68,13 +68,31 @@ _ANSWER_EXPLICIT_NO_RE = re.compile(
 )
 _ANSWER_ANCHORED_NO_RE = re.compile(r"^(?:нет|no)\b", re.IGNORECASE)
 _ANSWER_CONSUMPTION_RE = re.compile(
-    r"\b(?:я\s+)?(?:съел(?:а|и)?|ел(?:а|и)?|поел(?:а|и)?|выпил(?:а|и)?|употребил(?:а|и)?)\b",
+    r"\b(?:я\s+)?(?:съел(?:а|и)?|ел(?:а|и)?|поел(?:а|и)?|выпил(?:а|и)?|употребил(?:а|и)?)\b"
+    r"|\bi\s+(?:ate|drank|have\s+(?:eaten|drunk)|had\s+(?:eaten|drunk))\b",
+    re.IGNORECASE,
+)
+_RUSSIAN_NON_OWNER_EATER = (
+    r"(?:он|она|они|реб[её]н\w*|дети|малыш\w*|муж|жена|сын|дочь|мама|папа|"
+    r"отец|мать|брат|сестр\w*|друг|подруг\w*|коллег\w*|сосед\w*|человек|"
+    r"собак\w*|п[её]с(?:а|у|ом|е|ы|ов|ам|ами|ах)?|"
+    r"кот(?:а|у|ом|е|ы|ов|ам|ами|ах)?|кошк\w*|щен\w*|питом\w*|лошад\w*)"
+)
+_RUSSIAN_OTHER_EATER_PREFIX_RE = re.compile(
+    rf"(?:\b(?:мой|моя|моё|мои|наш|наша|наше|наши|этот|эта|эти|тот|та|то|его|её|их)\s+)?"
+    rf"\b{_RUSSIAN_NON_OWNER_EATER}(?:\s+[\w-]+){{0,2}}\s*$",
+    re.IGNORECASE,
+)
+_RUSSIAN_OTHER_EATER_SUFFIX_RE = re.compile(
+    rf"^\s*(?:(?:мой|моя|моё|мои|наш|наша|наше|наши|этот|эта|эти|тот|та|то|его|её|их)\s+)?"
+    rf"{_RUSSIAN_NON_OWNER_EATER}\b",
     re.IGNORECASE,
 )
 _ANSWER_NEGATED_CONSUMPTION_RE = re.compile(
     r"\b(?:я\s+)?не\s+(?:съел[аи]?|ел[аи]?|поел[аи]?|выпил[аи]?|употребил[аи]?)\b"
     r"|\bничего\s+не\s+(?:съел[аи]?|ел[аи]?|пил[аи]?)\b"
-    r"|\b(?:i\s+)?(?:did\s+not|didn't|never)\s+(?:eat|have|drink)\b",
+    r"|\b(?:i\s+)?(?:did\s+not|didn't|never)\s+(?:eat|ate|eaten|have|had|drink|drank|drunk)\b"
+    r"|\b(?:i\s+)?(?:have\s+not|haven't|had\s+not|hadn't)\s+(?:eaten|drunk)\b",
     re.IGNORECASE,
 )
 _ANSWER_ANCHORED_YES_RE = re.compile(
@@ -91,6 +109,25 @@ _CAMERA_PORTION_QUESTION_RE = re.compile(
     r"сколько\s+(?:съел\w*|порци\w*|учитывать))\b",
     re.IGNORECASE,
 )
+_CAMERA_PORTION_LOGGING_QUESTION_RE = re.compile(
+    r"\b(?:учесть|учитывать|посчитать|считать|записать|добавить|"
+    r"count|log|track|include)\b",
+    re.IGNORECASE,
+)
+_CAMERA_PREPARATION_QUESTION_RE = re.compile(
+    r"\b(?:приготовить|готовить|сварить|варить|запечь|пожарить|сделать|"
+    r"prepare|cook|make)\b",
+    re.IGNORECASE,
+)
+_RUSSIAN_OTHER_EATER_MENTION_RE = re.compile(
+    rf"\b{_RUSSIAN_NON_OWNER_EATER}\b", re.IGNORECASE
+)
+_ENGLISH_OTHER_EATER_BENEFICIARY_RE = re.compile(
+    r"\bfor\s+(?:(?:the|a|my|our|his|her|their)\s+)*"
+    r"(?:dog|cat|pet|child|kid|son|daughter|husband|wife|mother|father|"
+    r"parent|friend|him|her|them|someone\s+else|another\s+person)\b",
+    re.IGNORECASE,
+)
 _CAMERA_ANALYSIS_ONLY_QUESTION_RE = re.compile(
     r"\b(?:только|лишь)\s+(?:оцен\w*|разобрат\w*|посмотр\w*|узнать|"
     r"состав\w*|рецепт\w*|информац\w*)\b|"
@@ -100,6 +137,39 @@ _CAMERA_ANALYSIS_ONLY_QUESTION_RE = re.compile(
     r"(?:composition|ingredients?|recipe|nutrition\s+facts|information)\b",
     re.IGNORECASE,
 )
+
+
+def _camera_question_asks_owner_consumption(text: object) -> bool:
+    if (
+        not isinstance(text, str)
+        or _CAMERA_ANALYSIS_ONLY_QUESTION_RE.search(text)
+    ):
+        return False
+    consumption_verb = re.compile(
+        r"\b(?:съел(?:а|и)?|ел(?:а|и)?|пил(?:а|и)?|выпил(?:а|и)?)\b",
+        re.IGNORECASE,
+    )
+    consumption_question = _CAMERA_CONSUMPTION_QUESTION_RE.search(text) is not None
+    portion_logging_question = (
+        _CAMERA_PORTION_QUESTION_RE.search(text) is not None
+        and _CAMERA_PORTION_LOGGING_QUESTION_RE.search(text) is not None
+    )
+    if portion_logging_question and (
+        _CAMERA_PREPARATION_QUESTION_RE.search(text)
+        or _RUSSIAN_OTHER_EATER_MENTION_RE.search(text)
+        or _ENGLISH_OTHER_EATER_BENEFICIARY_RE.search(text)
+    ):
+        return False
+    if not (consumption_question or portion_logging_question):
+        return False
+    for match in consumption_verb.finditer(text):
+        clause_prefix = re.split(r"[.!?;]\s*", text[:match.start()])[-1]
+        if (
+            _RUSSIAN_OTHER_EATER_PREFIX_RE.search(clause_prefix)
+            or _RUSSIAN_OTHER_EATER_SUFFIX_RE.search(text[match.end():])
+        ):
+            return False
+    return True
 _PORTION_BUTTON_RE = re.compile(
     r"^(?:(?:только|лишь)\s+)?(?:маленьк\w*|больш\w*|small|large|big)\s+"
     r"(?:чашк\w*|кружк\w*|cup)s?[.! ]*$|^(?:обе|оба|обе\s+чашки|both(?:\s+cups?)?)[.! ]*$",
@@ -140,7 +210,23 @@ _CAMERA_TEMPORAL_CONTEXT_RE = re.compile(
 )
 _CAMERA_UNCERTAIN_CONSUMPTION_RE = re.compile(
     r"\b(?:не\s+(?:уверен\w*|знаю|помню)|неизвестн\w*|сомнева\w*|затрудня\w*|"
-    r"unsure|uncertain|unknown|don't\s+know)\b",
+    r"unsure|uncertain|unknown|don't\s+know|do\s+not\s+know|not\s+sure|"
+    r"don't\s+remember|do\s+not\s+remember)\b",
+    re.IGNORECASE,
+)
+_CAMERA_AMOUNT_UNCERTAINTY_RE = re.compile(
+    r"\b(?:точн\w*\s+)?(?:вес|масса|количеств\w*|калори\w*|ккал)"
+    r"(?:\s+(?:порци\w*|блюд\w*))?\s+(?:не\s+знаю|неизвестн\w*|"
+    r"не\s+уверен\w*|сомнева\w*)\b|"
+    r"\b(?:не\s+знаю|неизвестн\w*|не\s+уверен\w*|сомнева\w*)\s+"
+    r"(?:(?:точн\w*|его|её|их|the|its|exact)\s+){0,2}"
+    r"(?:вес|масса|количеств\w*|калори\w*|ккал)\b|"
+    r"\b(?:точный\s+)?(?:weight|amount|quantity|calories?|kcal|energy\s+estimate)"
+    r"\s+(?:is\s+)?(?:unknown|uncertain|unsure|not\s+known|not\s+sure)\b|"
+    r"\b(?:i\s+)?(?:don't\s+know|do\s+not\s+know|am\s+unsure|am\s+uncertain|"
+    r"am\s+not\s+sure|i'?m\s+not\s+sure|not\s+sure)\s+(?:of\s+)?"
+    r"(?:(?:the|its|a|exact)\s+){0,2}"
+    r"(?:weight|amount|quantity|calories?|kcal|energy\s+estimate)\b",
     re.IGNORECASE,
 )
 _CAMERA_FOOD_CONTEXT_RE = re.compile(
@@ -275,7 +361,7 @@ _CAMERA_PORTION_CHOICE_PREFIX_RE = re.compile(
 _CAMERA_PORTION_CHOICE_COMPONENT_RE = re.compile(
     r"^\s*(?:весь|вся|всё|все|оба|обе|всю|часть|половин\w*)\s+"
     + rf"{_CAMERA_COMPOSITION_NOUN_PHRASE}\s+(?:и|and)\s+"
-    + rf"(?:весь|вся|всё|все|оба|обе|всю|часть|половин\w*)\s+"
+    + r"(?:весь|вся|всё|все|оба|обе|всю|часть|половин\w*)\s+"
     + rf"{_CAMERA_COMPOSITION_NOUN_PHRASE}[.!?…]*\s*$",
     re.IGNORECASE,
 )
@@ -322,7 +408,7 @@ def _classify_answer(text: object, *, anchored: bool) -> str | None:
         return "no"
     if _ANSWER_NEGATED_CONSUMPTION_RE.search(answer) or _ANSWER_EXPLICIT_NO_RE.search(answer):
         return "no"
-    if _ANSWER_CONSUMPTION_RE.search(answer):
+    if _camera_explicit_consumption(answer):
         return "yes"
     if anchored:
         if _ANSWER_ANCHORED_NO_RE.search(answer):
@@ -334,10 +420,19 @@ def _classify_answer(text: object, *, anchored: bool) -> str | None:
 
 def _camera_explicit_consumption(text: object) -> bool:
     answer = text if isinstance(text, str) else ""
-    return bool(
-        _ANSWER_CONSUMPTION_RE.search(answer)
-        and not _ANSWER_NEGATED_CONSUMPTION_RE.search(answer)
-    )
+    if not answer or _ANSWER_NEGATED_CONSUMPTION_RE.search(answer):
+        return False
+    for match in _ANSWER_CONSUMPTION_RE.finditer(answer):
+        if match.group().casefold().startswith(("я ", "i ")):
+            return True
+        clause_prefix = re.split(r"[.!?;]\s*", answer[:match.start()])[-1]
+        if (
+            _RUSSIAN_OTHER_EATER_PREFIX_RE.search(clause_prefix)
+            or _RUSSIAN_OTHER_EATER_SUFFIX_RE.search(answer[match.end():])
+        ):
+            continue
+        return True
+    return False
 
 
 def _camera_whole_portion_payload_excluded(text: str) -> bool:
@@ -451,9 +546,16 @@ def _camera_affirmation_excluded(
     )
     if _camera_whole_portion_payload_excluded(text):
         return True
-    if _CAMERA_UNCERTAIN_CONSUMPTION_RE.search(text):
-        return True
     explicit_consumption = _camera_explicit_consumption(text)
+    if _CAMERA_UNCERTAIN_CONSUMPTION_RE.search(text):
+        amount_uncertainty_removed = _CAMERA_AMOUNT_UNCERTAINTY_RE.sub(" ", text)
+        amount_is_the_only_uncertainty = (
+            explicit_consumption
+            and _CAMERA_AMOUNT_UNCERTAINTY_RE.search(text) is not None
+            and _CAMERA_UNCERTAIN_CONSUMPTION_RE.search(amount_uncertainty_removed) is None
+        )
+        if not amount_is_the_only_uncertainty:
+            return True
     if (
         _CAMERA_QUANTITY_LEAD_RE.search(text)
         and not _CLARIFICATION_QUANTITY_RE.fullmatch(text.strip())
@@ -480,7 +582,6 @@ def _native_button_answer_kind(metadata: Mapping[str, object], raw_text: object)
     label = metadata.get("native_keyboard_selected_label")
     data = metadata.get("callback_data")
     question = metadata.get("native_keyboard_question")
-    prompt = metadata.get("native_keyboard_prompt")
     reflection = metadata.get("native_keyboard_reflection_confirmed")
     reflected_text = metadata.get("native_keyboard_reflection")
     if (
@@ -504,25 +605,18 @@ def _native_button_answer_kind(metadata: Mapping[str, object], raw_text: object)
         return None
     if direct == "yes":
         return direct
-    eating_prompt = " ".join(
-        value for value in (question, prompt) if isinstance(value, str)
-    )
     current_question = question if isinstance(question, str) else ""
     if _CAMERA_ANALYSIS_ONLY_QUESTION_RE.search(current_question):
         return None
     if (
         isinstance(question, str)
-        and _CAMERA_CONSUMPTION_QUESTION_RE.search(question)
+        and _camera_question_asks_owner_consumption(question)
         and _ANSWER_ANCHORED_YES_RE.match(label.strip())
         and any(_classify_answer(option, anchored=True) == "no" for option in options)
     ):
         return "yes"
     if (
-        _CAMERA_CONSUMPTION_QUESTION_RE.search(eating_prompt)
-        and (
-            _CAMERA_CONSUMPTION_QUESTION_RE.search(current_question)
-            or _CAMERA_PORTION_QUESTION_RE.search(current_question)
-        )
+        _camera_question_asks_owner_consumption(current_question)
         and (
             _NATIVE_WHOLE_PLATE_RE.fullmatch(label.strip())
             or _NATIVE_WHOLE_PORTION_RE.fullmatch(label.strip())
@@ -533,7 +627,7 @@ def _native_button_answer_kind(metadata: Mapping[str, object], raw_text: object)
         return "yes"
     if (
         isinstance(question, str)
-        and _CAMERA_CONSUMPTION_QUESTION_RE.search(question)
+        and _camera_question_asks_owner_consumption(question)
         and re.match(r"^(?:только|лишь|only|just)\b", label.strip(), re.IGNORECASE)
         and _camera_food_context_hint(label)
     ):
@@ -543,7 +637,7 @@ def _native_button_answer_kind(metadata: Mapping[str, object], raw_text: object)
             metadata.get("_camera_known_consumption_clarification") is CAMERA_AUTHORITY
             or (
                 isinstance(question, str)
-                and _CAMERA_CONSUMPTION_QUESTION_RE.search(question)
+                and _camera_question_asks_owner_consumption(question)
             )
         )
         and _PORTION_BUTTON_RE.fullmatch(label.strip())
@@ -553,14 +647,10 @@ def _native_button_answer_kind(metadata: Mapping[str, object], raw_text: object)
         # unbound. The selected label is still preserved for portion parsing.
         return "yes"
     if (
-        (metadata.get("_camera_known_consumption_clarification") is CAMERA_AUTHORITY
-         or (
-             _CAMERA_CONSUMPTION_QUESTION_RE.search(eating_prompt)
-             and (
-                 _CAMERA_CONSUMPTION_QUESTION_RE.search(current_question)
-                 or _CAMERA_PORTION_QUESTION_RE.search(current_question)
-             )
-         ))
+        (
+            metadata.get("_camera_known_consumption_clarification") is CAMERA_AUTHORITY
+            or _camera_question_asks_owner_consumption(current_question)
+        )
         and _CLARIFICATION_QUANTITY_RE.fullmatch(label.strip())
     ):
         # A selected quantity is meaningful only under a verified eating
@@ -652,6 +742,17 @@ def _source_message_id(value: object) -> str | None:
         return None
     rendered = str(value).strip()
     return rendered or None
+
+
+def _camera_displayed_question(message: OutboundMessage) -> str | None:
+    """Use Telegram's own extraction rule for the question it displays."""
+    content = message.content.strip() if isinstance(message.content, str) else ""
+    if not content:
+        return None
+    from openharness.channels.impl.telegram import _current_native_keyboard_question
+
+    question = _current_native_keyboard_question(content)
+    return question if 0 < len(question) <= 2048 else None
 
 
 def _attempt_age_seconds(attempt: dict, now: datetime) -> float:
@@ -2420,6 +2521,31 @@ class CameraIngress:
                 or value.get("photo_delivery_confirmed") is not True
             ):
                 raise ValueError("camera attempt question is invalid")
+            if "confirmed_clarification_question" in value:
+                question = value["confirmed_clarification_question"]
+                reply_ids = {str(item) for item in value.get("reply_ids", [])}
+                if (
+                    not isinstance(question, dict)
+                    or set(question) != {"text", "turn_id", "receipt_ids"}
+                    or not isinstance(question["text"], str)
+                    or not question["text"].strip()
+                    or len(question["text"]) > 2048
+                    or not isinstance(question["turn_id"], str)
+                    or not question["turn_id"]
+                    or question["turn_id"] != value.get("context_question_turn_id")
+                    or value.get("state") != "clarifying"
+                    or value.get("answer_kind") != "context"
+                    or not isinstance(question["receipt_ids"], list)
+                    or not 1 <= len(question["receipt_ids"]) <= 8
+                    or any(
+                        not isinstance(native_id, int)
+                        or isinstance(native_id, bool)
+                        or native_id <= 0
+                        or str(native_id) not in reply_ids
+                        for native_id in question["receipt_ids"]
+                    )
+                ):
+                    raise ValueError("camera clarification question is invalid")
             # Older tombstones have no capture evidence. Keep them, but never
             # infer a meal time from admission or reply arrival.
             if "capture_time" in value or "capture_time_authority" in value:
@@ -4539,37 +4665,75 @@ class CameraIngress:
             if _CLARIFICATION_NEW_MEAL_RE.search(text):
                 metadata["_camera_unbound"] = CAMERA_AUTHORITY
                 return
+            clarification_scope = attempt.get("confirmed_clarification_question")
+            current_clarification_question = (
+                clarification_scope.get("text")
+                if context_origin
+                and isinstance(clarification_scope, dict)
+                and clarification_scope.get("turn_id")
+                == attempt.get("context_question_turn_id")
+                and isinstance(clarification_scope.get("receipt_ids"), list)
+                and all(
+                    str(native_id) in {str(item) for item in attempt.get("reply_ids", [])}
+                    for native_id in clarification_scope["receipt_ids"]
+                )
+                else None
+            )
             if callback:
-                if context_origin:
+                if context_origin and not (
+                    isinstance(current_clarification_question, str)
+                    and target is not None
+                    and str(target) in {
+                        str(native_id)
+                        for native_id in clarification_scope.get("receipt_ids", [])
+                    }
+                    and isinstance(metadata.get("native_keyboard_question"), str)
+                    and metadata["native_keyboard_question"].strip().casefold()
+                    == current_clarification_question.strip().casefold()
+                    and _camera_question_asks_owner_consumption(
+                        current_clarification_question
+                    )
+                    and not _CAMERA_ANALYSIS_ONLY_QUESTION_RE.search(
+                        current_clarification_question
+                    )
+                ):
                     metadata["_camera_unbound"] = CAMERA_AUTHORITY
                     return
                 # This journal state exists only after a confirmed consumed
                 # answer; context-only clarification does not establish that.
-                metadata["_camera_known_consumption_clarification"] = CAMERA_AUTHORITY
+                if not context_origin:
+                    metadata["_camera_known_consumption_clarification"] = CAMERA_AUTHORITY
             answer = (
                 _native_button_answer_kind(metadata, raw_text)
                 if callback else _camera_context_answer_kind(
                     text,
                     source_context=attempt.get("confirmed_camera_context"),
                     source_question=(
-                        attempt.get("confirmed_camera_question") if context_origin else None
+                        current_clarification_question if context_origin else None
                     ),
                 )
             )
-            if context_origin and not callback and _classify_answer(
-                text, anchored=False
-            ) != "yes":
-                # Only an explicit new eating statement can move a context-only
-                # clarification into consumption. Portion/food phrases remain
-                # context-only even though the attempt is in ``clarifying``.
+            if context_origin and not callback and _classify_answer(text, anchored=False) != "yes" and not (
+                isinstance(current_clarification_question, str)
+                and _camera_question_asks_owner_consumption(
+                    current_clarification_question
+                )
+                and not _CAMERA_ANALYSIS_ONLY_QUESTION_RE.search(current_clarification_question)
+            ):
+                # Implicit quantity binds only to the current delivered consuming
+                # clarification, never merely to an old question or clarifying state.
                 answer = None
             if answer is None:
+                context_question = (
+                    current_clarification_question
+                    if context_origin else attempt.get("confirmed_camera_question")
+                )
                 if (
                     target is None
                     and context_origin
-                    and isinstance(attempt.get("confirmed_camera_question"), str)
+                    and isinstance(context_question, str)
                     and _CAMERA_ANALYSIS_ONLY_QUESTION_RE.search(
-                        attempt["confirmed_camera_question"]
+                        context_question
                     )
                     and _camera_contextual_portion_choice(
                         text, attempt.get("confirmed_camera_context")
@@ -4776,6 +4940,23 @@ class CameraIngress:
         for native_id in receipt.native_message_ids:
             if native_id not in attempt["reply_ids"]:
                 attempt["reply_ids"].append(native_id)
+        delivered_question = _camera_displayed_question(message)
+        if (
+            message.channel == "telegram"
+            and str(message.chat_id) == self.config.chat_id
+            and message.metadata.get("_camera_final") is CAMERA_AUTHORITY
+            and attempt.get("state") == "clarifying"
+            and attempt.get("answer_kind") == "context"
+            and isinstance(turn_id, str)
+            and turn_id == attempt.get("context_question_turn_id")
+            and isinstance(delivered_question, str)
+            and 1 <= len(receipt.native_message_ids) <= 8
+        ):
+            attempt["confirmed_clarification_question"] = {
+                "text": delivered_question,
+                "turn_id": turn_id,
+                "receipt_ids": list(receipt.native_message_ids),
+            }
         if final and is_correction:
             attempt["camera_correction"] = "completed"
             if attempt["state"] in {"final_queued", "delivery_unknown"}:
@@ -4846,6 +5027,7 @@ class CameraIngress:
                 )
                 if is_context_question:
                     attempt["context_question_turn_id"] = turn_id
+                    attempt.pop("confirmed_clarification_question", None)
                 self._save_attempts()
             return
         if message.metadata.get("_camera_answer") == "no" or recorded:
@@ -4890,6 +5072,7 @@ class CameraIngress:
         answer: str, target: object, route: str,
     ) -> None:
         attempt["state"] = "answering"
+        attempt.pop("confirmed_clarification_question", None)
         attempt["answer_turn_id"] = uuid4().hex
         attempt["answer_kind"] = answer
         attempt["answer_source_message_id"] = _source_message_id(
@@ -4939,6 +5122,7 @@ class CameraIngress:
             finalizer_status="context_question_pending",
             attention_active=False,
         )
+        attempt.pop("confirmed_clarification_question", None)
         try:
             self._save_attempts()
         except OSError:

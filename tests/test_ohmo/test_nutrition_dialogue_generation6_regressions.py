@@ -4,6 +4,7 @@ import copy
 from datetime import datetime, timedelta, timezone
 
 import pytest
+from openharness.channels.bus.events import OutboundDeliveryReceipt, OutboundMessage
 
 from tests.test_ohmo.test_nutrition_dialogue_review_regressions import (
     _open_camera,
@@ -371,6 +372,22 @@ async def test_second_context_question_replay_uses_its_operation_and_then_quanti
     assert len(honcho.messages) == 4
     assert reopened._attempts[candidate]["state"] == "clarifying"
     assert reopened._attempts[candidate]["context_question_turn_id"] == second_turn
+    assert "confirmed_clarification_question" not in reopened._attempts[candidate]
+    cached_final = replay_updates[0]
+    reopened.note_assistant_receipt(
+        OutboundMessage(
+            channel="telegram", chat_id="123", content=cached_final.text,
+            metadata=cached_final.metadata,
+        ),
+        OutboundDeliveryReceipt(
+            channel="telegram", chat_id="123", native_message_ids=(8814,),
+        ),
+    )
+    confirmed_question = reopened._attempts[candidate]["confirmed_clarification_question"]
+    assert confirmed_question["turn_id"] == second_turn
+    assert "Сколько клубники вы съели?" in confirmed_question["text"]
+    assert confirmed_question["receipt_ids"] == [8814]
+    assert len(honcho.messages) == 4
 
     trace = _consumed_trace()
     trace["annotations"]["nutrition"].update(
