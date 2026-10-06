@@ -572,18 +572,30 @@ def validate_trace_finalization_annotations(
                 exclude_unset=sparse_correction,
             )
         except ValidationError as exc:
-            validation_error = exc.errors()[0] if exc.errors() else None
-            if validation_error is None:
+            validation_errors = exc.errors()
+            if not validation_errors:
                 raise DecisionTraceValidationError(
                     "trace_finalization annotations.nutrition is invalid"
                 ) from exc
 
-            location = validation_error.get("loc", ())
-            message = validation_error.get("msg", "invalid nutrition annotation")
-            if location:
+            # Keep legacy v1 error wording stable. For v2, return every
+            # independent field error so callers can repair the payload once.
+            if model is not NutritionAnnotationV2:
+                validation_errors = validation_errors[:1]
+            details = []
+            for validation_error in validation_errors:
+                location = validation_error.get("loc", ())
+                message = validation_error.get("msg", "invalid nutrition annotation")
                 field_path = ".".join(str(part) for part in location)
-                raise DecisionTraceValidationError(f"{field_path}: {message}") from exc
-            raise DecisionTraceValidationError(message) from exc
+                details.append(f"{field_path}: {message}" if field_path else message)
+            suffix = (
+                "; supported energy fields are energy_kcal_min, energy_kcal_max, "
+                "and energy_kcal_best"
+                if model is NutritionAnnotationV2
+                and any(error.get("type") == "extra_forbidden" for error in validation_errors)
+                else ""
+            )
+            raise DecisionTraceValidationError("; ".join(details) + suffix) from exc
 
     validated = dict(payload)
     validated["annotations"] = validated_annotations

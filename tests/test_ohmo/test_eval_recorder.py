@@ -34,6 +34,8 @@ from openharness.evals import (
 )
 
 from ohmo.evals import GatewayEvalRecorder, get_eval_store
+from openharness.tools.base import ToolExecutionContext
+from openharness.tools.trace_tool import DECISION_TRACE_RECORDER_METADATA_KEY, TraceTool, TraceToolInput
 
 
 def _new_recorder(
@@ -436,6 +438,92 @@ def test_gateway_eval_recorder_finalization_status_records_invalid_then_later_va
     [recorded] = list(store.iter_events("ep-recorder"))
     assert recorded.kind == TRACE_FINALIZATION
     assert recorded.payload["annotations"]["nutrition"]["energy_kcal_min"] == 10.0
+
+
+@pytest.mark.asyncio
+async def test_trace_tool_reports_all_v2_errors_then_records_corrected_meal_once(tmp_path: Path) -> None:
+    recorder, store = _new_recorder(tmp_path)
+    context = ToolExecutionContext(
+        cwd=tmp_path,
+        metadata={DECISION_TRACE_RECORDER_METADATA_KEY: recorder.decision_trace_recorder},
+    )
+
+    invalid = TraceToolInput(
+        kind=TRACE_FINALIZATION,
+        payload=_finalization_payload(
+            {
+                "nutrition": {
+                    "schema_version": 2,
+                    "record_type": "meal_observation",
+                    "consumption_status": "consumed",
+                    "energy_kcal_range": [200, 300],
+                    "items": [
+                        {"name": "oats", "quantity_text": "1 bowl", "energy_kcal_range": [200, 300]}
+                    ],
+                }
+            }
+        ),
+    )
+    rejected = await TraceTool().execute(invalid, context)
+    assert rejected.is_error
+    assert "items.0.energy_kcal_range" in rejected.output
+    assert "energy_kcal_range: Extra inputs are not permitted" in rejected.output
+    assert "energy_kcal_min, energy_kcal_max, and energy_kcal_best" in rejected.output
+    assert "200" not in rejected.output
+    assert store.count_events("ep-recorder") == 0
+    assert recorder.decision_trace_envelope is None
+
+    corrected = TraceToolInput(
+        kind=TRACE_FINALIZATION,
+        payload=_finalization_payload(
+            {
+                "nutrition": {
+                    "schema_version": 2,
+                    "record_type": "meal_observation",
+                    "consumption_status": "consumed",
+                    "energy_kcal_min": 200,
+                    "energy_kcal_max": 300,
+                    "energy_kcal_best": 250,
+                    "items": [
+                        {
+                            "name": "oats",
+                            "quantity_text": "1 bowl",
+                            "energy_kcal_min": 200,
+                            "energy_kcal_max": 300,
+                            "energy_kcal_best": 250,
+                        }
+                    ],
+                }
+            }
+        ),
+    )
+    recorded = await TraceTool().execute(corrected, context)
+    assert not recorded.is_error
+    assert "Recorded decision trace event" in recorded.output
+    assert store.count_events("ep-recorder") == 1
+    assert recorder.nutrition_annotation_status == "recorded"
+
+
+@pytest.mark.parametrize(
+    "nutrition",
+    [
+        {"notes": "private owner identity", "energy_kcal_best": 100},
+        {"owner_id": "private-owner", "energy_kcal_best": 100},
+        {"energy_kcal_best": -1},
+    ],
+)
+def test_gateway_recorder_v2_rejects_unknown_or_invalid_fields_without_recording(
+    tmp_path: Path, nutrition: dict[str, Any]
+) -> None:
+    recorder, store = _new_recorder(tmp_path)
+    with pytest.raises(DecisionTraceValidationError):
+        recorder.decision_trace_recorder.record(
+            TRACE_FINALIZATION,
+            _finalization_payload(
+                {"nutrition": {"schema_version": 2, "record_type": "meal_observation", **nutrition}}
+            ),
+        )
+    assert store.count_events("ep-recorder") == 0
 
 
 def test_gateway_recorder_accepts_and_persists_sparse_v2_correction(tmp_path: Path) -> None:

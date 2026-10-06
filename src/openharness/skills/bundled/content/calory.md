@@ -12,7 +12,7 @@ description: >
 
 Use current pixels, labels, and owner statements. A directly sent identifiable food photo from an authenticated configured participant in their private conversation means log as consumed unless they ask advice or image analysis, it is nonfood, or intent is uncertain. A Camera/source photo needs meaningful affirmative owner confirmation; denial means no log. Default to the whole identifiable package, labeled unit, or visible portion; owner quantity/composition overrides. Do not require exact grams. Mark uncertain consumption `unknown`; do not claim it was consumed.
 
-For a consumed meal, call `trace` with `kind: "trace_finalization"` and `payload.annotations.nutrition` schema v2: `record_type: "meal_observation"`, flat items (`name`, `quantity_text`, `energy_kcal_best`) and total `energy_kcal_best`. Outer payload needs `schema_version: 1` and a fresh nonempty `trace_event_id`; it identifies only this trace event, never meal/source/tenant identity or provenance. Add supported ranges. Without explicit alternatives, leave `meal_at`/`meal_date` null; trusted gateway supplies date/source identity. Never author identity/provenance. Reply briefly in kcal with a material assumption; omit tool details. Claim saved only after trusted append receipt.
+For a consumed meal, call `trace` with `kind: "trace_finalization"` and `payload.annotations.nutrition` schema v2: `record_type: "meal_observation"`, flat items (`name`, `quantity_text`, `energy_kcal_min`, `energy_kcal_max`, `energy_kcal_best`) and matching total fields. Use only these range names; never send `energy_kcal_range` or a `notes` field. Set `basis` only from evidence actually used. Outer payload needs `schema_version: 1` and a fresh nonempty `trace_event_id` identifying only this trace; never author meal/source/tenant identity or provenance. Without explicit alternatives, leave `meal_at`/`meal_date` null; trusted gateway supplies date/source identity. Reply briefly in kcal with a material assumption; omit tool details. Claim saved only after trusted append receipt.
 
 Estimate supported portions. Check whole-product counts against original pixels; cut pieces aren't extra, and assistant guesses aren't evidence. Without a stated measure, infer plausible cooked edible mass or household measure from visible portion and scale; distinguish cooked from dry. Use typical food/preparation kcal. Record quantity and visual basis/uncertainty; use the central portion and supported range, not a precautionary maximum. Add no unseen foods, oil, or sauce. Owner quantities/corrections control; whole-portion confirmation doesn't make a guessed amount owner-stated.
 Ensure item kcal match food/preparation/quantity; total equals item sum. Labels may identify hidden contents; exclude adjacent packages.
@@ -20,30 +20,13 @@ Ensure item kcal match food/preparation/quantity; total equals item sum. Labels 
 Example only — illustrative values, not an estimate for a real meal:
 ```json
 {
-  "kind": "trace_finalization",
-  "payload": {
-    "schema_version": 1,
-    "trace_event_id": "example-trace-event-1",
-    "annotations": {
-      "nutrition": {
-        "schema_version": 2,
-        "record_type": "meal_observation",
-        "basis": ["image", "user_statement"],
-        "consumption_status": "consumed",
-        "meal_at": null,
-        "meal_date": null,
-        "is_estimate": true,
-        "energy_kcal_best": 185,
-        "items": [
-          {
-            "name": "vegetable soup",
-            "quantity_text": "1 bowl",
-            "energy_kcal_best": 185
-          }
-        ]
-      }
-    }
-  }
+ "kind": "trace_finalization", "payload": {"schema_version": 1,
+ "trace_event_id": "example-trace-event-1", "annotations": {"nutrition": {
+ "schema_version": 2, "record_type": "meal_observation", "basis": ["image", "user_statement"],
+ "consumption_status": "consumed",
+ "energy_kcal_min": 150, "energy_kcal_max": 220, "energy_kcal_best": 185,
+ "items": [{"name": "vegetable soup", "quantity_text": "1 bowl",
+ "energy_kcal_min": 150, "energy_kcal_max": 220, "energy_kcal_best": 185}]}}}
 }
 ```
 
