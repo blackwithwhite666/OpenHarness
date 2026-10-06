@@ -105,9 +105,10 @@ def build_ohmo_system_prompt(
             (
                 "Routine meal-estimation/logging exception: For routine "
                 "meal-estimation or meal-logging dialogue under the `calory` "
-                "skill, you may call the tools needed to answer or record the "
-                "meal without a separate pre-tool line, including loading the "
-                "`calory` skill and finalizing a valid nutrition trace. Follow "
+                "skill, do not emit separate user-visible narration for routine "
+                "calory skill loading, meal estimation, meal logging, or nutrition "
+                "trace finalization. A separate user-visible line is only for a "
+                "necessary action outside routine calory work. Follow "
                 "the `calory` skill's existing "
                 "rules for Camera affirmative confirmation versus the directly "
                 "sent person-photo default, uncertainty and meaningful "
