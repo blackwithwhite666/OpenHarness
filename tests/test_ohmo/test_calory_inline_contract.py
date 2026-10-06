@@ -56,6 +56,17 @@ def test_bundled_calory_trace_example_survives_default_engine_preview(tmp_path, 
     assert preview_match is not None
     preview = preview_match.group(1)
     assert preview == result.output[:3000]
+    for required_guidance in (
+        "A Camera/source photo needs meaningful affirmative owner confirmation",
+        "whole identifiable package, labeled unit, or visible portion",
+        "cooked edible mass or household measure",
+        "`quantity_text`",
+        "visual basis/uncertainty",
+        "central portion",
+        "Add no unseen foods, oil, or sauce",
+        "trusted append receipt",
+    ):
+        assert required_guidance in preview
 
     specimen = re.search(r"```json\n(.*?)\n```", preview, re.DOTALL)
     assert specimen is not None, "complete trace-call specimen must fit in the default preview"
