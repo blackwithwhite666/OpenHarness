@@ -77,6 +77,13 @@ class OfflineCameraBotApi:
     def __init__(self) -> None:
         self.calls = 0
         self.finalization_proposals = 0
+        self._queued_correction: dict[str, Any] | None = None
+
+    def queue_correction(self, nutrition: dict[str, Any]) -> None:
+        """Queue one synthetic trace for the next real runtime correction turn."""
+        if self._queued_correction is not None:
+            raise AssertionError("offline correction queue is already occupied")
+        self._queued_correction = nutrition
 
     async def stream_message(
         self, request: ApiMessageRequest
@@ -104,7 +111,29 @@ class OfflineCameraBotApi:
             for block in message.content
         )
         owner_confirmed = owner_turn is not None and SYNTHETIC_BUTTON_LABEL in owner_turn.text
-        if tool_result_seen:
+        if self._queued_correction is not None and not tool_result_seen:
+            nutrition = self._queued_correction
+            self._queued_correction = None
+            self.finalization_proposals += 1
+            message = ConversationMessage(
+                role="assistant",
+                content=[
+                    ToolUseBlock(
+                        name="trace",
+                        input={
+                            "kind": "trace_finalization",
+                            "payload": {
+                                "schema_version": 1,
+                                "trace_event_id": f"offline-camera-correction-{self.calls}",
+                                "annotations": {"nutrition": nutrition},
+                            },
+                        },
+                    )
+                ],
+            )
+            stop_reason = "tool_use"
+        elif tool_result_seen:
+            stop_reason = "end_turn"
             message = ConversationMessage(
                 role="assistant",
                 content=[
@@ -118,6 +147,7 @@ class OfflineCameraBotApi:
                 ],
             )
         elif owner_confirmed:
+            stop_reason = "tool_use"
             self.finalization_proposals += 1
             message = ConversationMessage(
                 role="assistant",
@@ -155,6 +185,7 @@ class OfflineCameraBotApi:
                 ],
             )
         else:
+            stop_reason = "end_turn"
             message = ConversationMessage(
                 role="assistant",
                 content=[
@@ -171,7 +202,7 @@ class OfflineCameraBotApi:
         yield ApiMessageCompleteEvent(
             message=message,
             usage=UsageSnapshot(input_tokens=1, output_tokens=1),
-            stop_reason="tool_use" if owner_confirmed and not tool_result_seen else "end_turn",
+            stop_reason=stop_reason,
         )
 
 
@@ -401,18 +432,25 @@ async def run_camera_runtime_trajectory(
     config_dir=None,
     user_scenario: str = "synthetic offline owner selects the exact offered confirmation",
     typed_reply_mode: str = "reply",
+    before_owner_action=None,
+    restart_before_owner_action: bool = False,
+    restart_before_replay: bool = False,
+    expect_append_failure: bool = False,
+    after_save=None,
 ):
     """Run two actual Ohmo turns and the delivered Telegram callback offline."""
     import asyncio
     import json
     import os
-    from datetime import datetime, timezone
+    from datetime import datetime, timedelta, timezone
     from types import SimpleNamespace
 
     from openharness.api.codex_client import CodexApiClient
     from openharness.config.paths import get_config_file_path
     from openharness.evals.session_user_simulator import LlmUserSimulator
     from ohmo.gateway.bridge import OhmoGatewayBridge
+    import ohmo.gateway.camera as camera_module
+    from ohmo.gateway.camera import CameraIngress
     import ohmo.gateway.runtime as gateway_runtime
     from ohmo.gateway.config import save_gateway_config
     from ohmo.gateway.models import GatewayConfig
@@ -485,19 +523,57 @@ async def run_camera_runtime_trajectory(
     gateway_runtime.build_runtime = injected_build_runtime
     pool = None
     try:
-        pool = OhmoSessionRuntimePool(
-            cwd=root,
-            workspace=root,
-            provider_profile="codex" if native_mode else "claude-api",
-            model="gpt-6-luna" if native_mode else "claude-sonnet-4-6",
-            max_turns=max_turns,
-            effort=effort,
-        )
-        pool._camera_ingress = ingress
-        channel._camera_ingress_authority = ingress
-        channel._start_typing = lambda _chat_id: None
-        channel._stop_typing = lambda _chat_id: None
-        ingress._telegram = channel
+        def new_pool(current_ingress):
+            current_pool = OhmoSessionRuntimePool(
+                cwd=root,
+                workspace=root,
+                provider_profile="codex" if native_mode else "claude-api",
+                model="gpt-6-luna" if native_mode else "claude-sonnet-4-6",
+                max_turns=max_turns,
+                effort=effort,
+            )
+            current_pool._camera_ingress = current_ingress
+            return current_pool
+
+        def bind_ingress(current_ingress):
+            channel._camera_ingress_authority = current_ingress
+            channel._start_typing = lambda _chat_id: None
+            channel._stop_typing = lambda _chat_id: None
+            current_ingress._telegram = channel
+
+        async def restart_runtime_and_camera(*, advance_minutes: int = 0):
+            nonlocal pool, ingress, bridge
+            previous_ingress = ingress
+            if pool is not None:
+                await pool.aclose()
+            await previous_ingress.close()
+            if advance_minutes:
+                controlled_now[0] += timedelta(minutes=advance_minutes)
+            ingress = CameraIngress(
+                previous_ingress.config,
+                workspace=root,
+                bus=bus,
+                telegram=channel,
+            )
+            bind_ingress(ingress)
+            pool = new_pool(ingress)
+            bridge = OhmoGatewayBridge(bus=bus, runtime_pool=pool, camera_ingress=ingress)
+            if ingress._state_path != previous_ingress._state_path:
+                raise AssertionError("Camera restart changed the journal path")
+            return ingress, pool
+
+        class ControlledCameraDatetime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                now = controlled_now[0]
+                return now.astimezone(tz) if tz is not None else now.replace(tzinfo=None)
+
+        controlled_now = [datetime.now(timezone.utc)]
+        controlled_clock_start = controlled_now[0]
+        original_camera_datetime = camera_module.datetime
+        camera_module.datetime = ControlledCameraDatetime
+        pool = new_pool(ingress)
+        bind_ingress(ingress)
         bridge = OhmoGatewayBridge(bus=bus, runtime_pool=pool, camera_ingress=ingress)
         simulator = LlmUserSimulator(
             api_client=user_client,
@@ -575,6 +651,13 @@ async def run_camera_runtime_trajectory(
         )
         if before_answer is not None:
             await before_answer(first_started)
+        if restart_before_owner_action:
+            controlled_now[0] += timedelta(minutes=31)
+            ingress._sweep_expired_attempts()
+        if before_owner_action is not None:
+            await before_owner_action(process_and_deliver, ingress, pool)
+        if restart_before_owner_action:
+            await restart_runtime_and_camera()
         action = await virtual_user.next_camera_action(
             offered=offered,
             transcript=(("assistant", issued.content),),
@@ -638,7 +721,11 @@ async def run_camera_runtime_trajectory(
             answer = await invoke_issued_callback()
         else:
             typed_source_id = "offline-camera-typed-1"
-            typed_received_at = datetime.now(timezone.utc)
+            typed_received_at = (
+                controlled_now[0]
+                if restart_before_owner_action
+                else datetime.now(timezone.utc)
+            )
             answer = action.to_inbound_message(
                 sender_id="123",
                 chat_id="123",
@@ -712,7 +799,32 @@ async def run_camera_runtime_trajectory(
             )
             handle.write("\n")
         os.chmod(action_observation, 0o600)
-        _, final_receipt, nutrition_event_id = await process_and_deliver(answer, answer.session_key)
+        final_delivered, final_receipt, nutrition_event_id = await process_and_deliver(
+            answer, answer.session_key
+        )
+        final_text = next(
+            (item.content for item, _ in reversed(final_delivered) if item.content), ""
+        )
+        if expect_append_failure:
+            if nutrition_event_id is not None or final_receipt is not None:
+                raise AssertionError("failed Honcho append returned a saved event or receipt")
+            if any(
+                phrase in final_text.casefold()
+                for phrase in ("записано", "уже записана", "saved", "recorded")
+            ):
+                raise AssertionError("failed Honcho append returned a public Saved claim")
+            return {
+                "started": first_started,
+                "answer": answer,
+                "capture_time": capture_time,
+                "event_id": None,
+                "receipt": None,
+                "owner_failure_text": final_text,
+                "native_photo_id": native_photo,
+                "source_candidate_id": candidate_id,
+                "ingress": ingress,
+                "camera_clock_advanced": controlled_now[0] - controlled_clock_start,
+            }
         if not isinstance(nutrition_event_id, str) or not nutrition_event_id:
             raise AssertionError("runtime did not return its durable nutrition event ID")
         commit = ingress._attempts[candidate_id].get("camera_commit")
@@ -720,6 +832,15 @@ async def run_camera_runtime_trajectory(
             raise AssertionError("runtime nutrition event ID differs from Camera durable receipt")
         if final_receipt is None:
             raise AssertionError("owner turn did not deliver a native final receipt")
+
+        after_save_result = None
+        if after_save is not None:
+            after_save_result = await after_save(
+                process_and_deliver, ingress, pool, candidate_id, answer, commit
+            )
+
+        if restart_before_replay:
+            await restart_runtime_and_camera()
         action_label = "Telegram callback" if action.callback_data is not None else "typed reply"
         mode_label = "NATIVE OPT-IN" if native_mode else "OFFLINE SYNTHETIC"
         print(
@@ -779,6 +900,7 @@ async def run_camera_runtime_trajectory(
             "capture_time": capture_time,
             "event_id": nutrition_event_id,
             "receipt": commit,
+            "final_status_text": final_text,
             "native_photo_id": native_photo,
             "keyboard_message_id": native_photo,
             "source_candidate_id": candidate_id,
@@ -792,6 +914,12 @@ async def run_camera_runtime_trajectory(
             "owner_replay_saved_status": replay_status,
             "owner_replay_delivery_confirmed": replay_delivery_receipt is not None,
             "owner_replay_event_id": replay_event_id,
+            "ingress": ingress,
+            "restarted_before_owner_action": restart_before_owner_action,
+            "restarted_before_replay": restart_before_replay,
+            "controlled_camera_time": controlled_now[0],
+            "camera_clock_advanced": controlled_now[0] - controlled_clock_start,
+            "after_save_result": after_save_result,
         }
     finally:
         try:
@@ -799,6 +927,7 @@ async def run_camera_runtime_trajectory(
                 await pool.aclose()
         finally:
             try:
+                camera_module.datetime = original_camera_datetime
                 gateway_runtime.build_runtime = saved_builder
             finally:
                 isolation_stack.close()
