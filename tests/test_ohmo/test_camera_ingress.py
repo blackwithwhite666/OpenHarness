@@ -1582,16 +1582,34 @@ async def test_contextual_partial_quantity_requires_trusted_consumption_source(
     [
         ("Часть напитка — 125 г.", "На фото открытая упаковка гречки."),
         ("Часть икры — 125 г.", "На фото рис и яйца."),
+        ("Часть сливок — 125 г.", "На фото сливочное масло."),
+        ("Часть сыра — 125 г.", "На фото сырой рис."),
+        ("Часть сыра — 125 г.", "На фото сырого риса."),
+        ("Часть сыра — 125 г.", "На фото сырая морковь."),
+        ("Часть сыра — 125 г.", "На фото сырое яблоко."),
+        ("Часть сыра — 125 г.", "На фото сырые овощи."),
+        (
+            "Часть сыра — 125 г.",
+            "На фото рис; описание говорит о сыром рисе.",
+        ),
         (
             "Часть салфетки — 125 г.",
             "На фото открытая упаковка гречки и салфетка.",
         ),
+        ("Часть полотенца — 125 г.", "На фото рис, рядом полотенце."),
+        ("Часть полотенца — 125 г.", "На фото рис, рядом полотенца."),
         (
             "Part of table, 125 grams.",
             "On the table is a package of buckwheat.",
         ),
     ],
-    ids=["short-prefix-drink", "short-prefix-caviar", "background-napkin", "background-table"],
+    ids=[
+        "short-prefix-drink", "short-prefix-caviar", "cream-butter-prefix-collision",
+        "raw-rice-adjective-noun-collision", "raw-rice-inflected-adjective-collision",
+        "raw-feminine-adjective-collision", "raw-neuter-adjective-collision",
+        "raw-plural-adjective-collision", "raw-prepositional-adjective-noun-overlap",
+        "background-napkin", "background-towel", "background-towel-inflection", "background-table",
+    ],
 )
 async def test_contextual_partial_quantity_rejects_unrelated_subjects_at_ingress(
     tmp_path, targeted, text, source_analysis,
@@ -1619,6 +1637,50 @@ async def test_contextual_partial_quantity_rejects_unrelated_subjects_at_ingress
     assert answer.metadata.get("_camera_candidate_id") is None
     assert answer.media == []
     assert attempt["state"] == "photo_sent"
+    await ingress.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("targeted", [True, False], ids=["reply-to-photo", "contextual"])
+@pytest.mark.parametrize(
+    ("text", "source_analysis"),
+    [
+        ("Часть упаковки — примерно 125 г.", "На фото открытой упаковки гречки."),
+        ("Часть риса — 125 г.", "На фото рис."),
+        ("Часть сыра — 125 г.", "На фото сыр."),
+        ("Часть зеленого яблока — примерно 125 г.", "На фото зеленое яблоко."),
+    ],
+    ids=[
+        "package-inflection-approximate", "rice-inflection", "cheese-inflection",
+        "adjective-noun-agreement",
+    ],
+)
+async def test_contextual_partial_quantity_accepts_grounded_inflections_at_ingress(
+    tmp_path, targeted, text, source_analysis,
+):
+    ingress, root, bus, _ = _ingress(tmp_path)
+    request = _candidate(root, classifier_decision="food")
+    await _actual_native_camera_prompt(
+        ingress, root, bus, request,
+        question="Сколько съели?",
+        options=["Всю упаковку", "Часть упаковки", "Только попробовать", "Ещё не ели"],
+        selected_index=None,
+        source_analysis=source_analysis,
+    )
+    attempt = ingress._attempts[request["candidate_id"]]
+    metadata = {"is_group": False, "message_id": "grounded-portion-answer"}
+    if targeted:
+        metadata["reply_to_message_id"] = str(attempt["photo_id"])
+    answer = InboundMessage(
+        channel="telegram", sender_id="123", chat_id="123", content=text,
+        metadata={**metadata, "_telegram_raw_text": text},
+    )
+    ingress.process_real_inbound(answer)
+    assert answer.metadata.get("_camera_answer") == "yes"
+    assert answer.metadata.get("_camera_authority") is CAMERA_AUTHORITY
+    assert answer.metadata.get("_camera_candidate_id") == request["candidate_id"]
+    assert len(answer.media) == 1
+    assert attempt["state"] == "answering"
     await ingress.close()
 
 

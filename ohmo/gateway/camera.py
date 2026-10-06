@@ -290,7 +290,8 @@ _CAMERA_CONTEXTUAL_PARTIAL_QUANTITY_RE = re.compile(
     re.IGNORECASE,
 )
 _CAMERA_CONTEXTUAL_PARTIAL_NONFOOD_SUBJECT_RE = re.compile(
-    r"\b(?:салфет\w*|napkins?|tables?|стол(?:а|у|ом|е|ы|ов|ам|ами|ах)?)\b",
+    r"\b(?:салфет\w*|полотенц\w*|towels?|napkins?|tables?|"
+    r"стол(?:а|у|ом|е|ы|ов|ам|ами|ах)?)\b",
     re.IGNORECASE,
 )
 _CAMERA_WHOLE_PORTION_PREFIX_RE = re.compile(
@@ -572,20 +573,49 @@ def _camera_contextual_partial_quantity(text: object, source_context: object) ->
     subject_words = [
         token.casefold() for token in _CAMERA_COMPOSITION_TOKEN_RE.findall(match["subject"])
     ]
+    def inflection_forms(word: str) -> set[tuple[str, str]]:
+        adjective_endings = (
+            "ого", "ому", "ему", "ыми", "ими", "ые", "ие", "ый", "ий", "ая", "яя",
+            "ое", "ее", "ой", "ою", "ею", "ей", "ом", "ем",
+        )
+        noun_endings = (
+            "ами", "ями", "ов", "ев", "ей", "ам", "ям", "ах", "ях", "ом", "ем",
+            "ы", "и", "а", "я", "у", "ю", "е", "о", "s",
+        )
+        forms = {("exact", word)}
+        overlapping_case_endings = set(adjective_endings) & set(noun_endings)
+        if any(
+            len(word) - len(ending) >= 3 and word.endswith(ending)
+            for ending in overlapping_case_endings
+        ):
+            # Endings such as -ом and -ем can be either adjective or noun
+            # inflections. Without stronger evidence, preserve exact matching only.
+            return forms
+        adjective_stems = {
+            word[:-len(ending)]
+            for ending in adjective_endings
+            if len(word) - len(ending) >= 3 and word.endswith(ending)
+        }
+        if adjective_stems:
+            # Prefer a recognized adjective reading over shorter noun suffixes
+            # and the bare-noun fallback (e.g. сырая must not become сыр + а).
+            forms.update(("adjective", stem) for stem in adjective_stems)
+            return forms
+
+        # Only words without a recognized adjective ending can supply a noun
+        # lemma. This keeps сыр (cheese) matchable to сыра, but сырой (raw) apart.
+        forms.add(("noun", word))
+        forms.update(
+            ("noun", word[:-len(ending)])
+            for ending in noun_endings
+            if len(word) - len(ending) >= 3 and word.endswith(ending)
+        )
+        return forms
+
     return bool(subject_words) and all(
         any(
             word == source
-            or (
-                len(word) >= 3
-                and 0 < len(source) - len(word) <= 3
-                and source.startswith(word)
-            )
-            or (
-                len(source) >= 3
-                and 0 < len(word) - len(source) <= 3
-                and word.startswith(source)
-            )
-            or (len(word) >= 5 and len(source) >= 5 and word[:5] == source[:5])
+            or bool(inflection_forms(word) & inflection_forms(source))
             for source in context_words
         )
         for word in subject_words
