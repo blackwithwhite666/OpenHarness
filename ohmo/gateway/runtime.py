@@ -4400,8 +4400,10 @@ class OhmoSessionRuntimePool:
                     event,
                     model=str(bundle.current_settings().model or ""),
                 )
-            if not reply_parts:
-                reply_parts.append(event.message.text.strip())
+            if not any(part.strip() for part in reply_parts):
+                completed_text = event.message.text.strip()
+                if completed_text:
+                    reply_parts.append(completed_text)
 
     async def _save_snapshot(
         self, bundle: RuntimeBundle, session_key: str, user_prompt: str

@@ -506,7 +506,13 @@ async def test_runtime_replay_never_claims_saved_without_exact_receipt(
 async def test_changed_native_portion_appends_a_bound_immutable_correction(
     tmp_path, monkeypatch
 ):
-    from openharness.engine.stream_events import AssistantTextDelta
+    from openharness.api.usage import UsageSnapshot
+    from openharness.engine.messages import ConversationMessage, TextBlock, ToolUseBlock
+    from openharness.engine.stream_events import (
+        AssistantTurnComplete,
+        ToolExecutionCompleted,
+        ToolExecutionStarted,
+    )
     from openharness.evals import TRACE_FINALIZATION
 
     ingress, bus, request, pool, honcho, saved_portion, saved_final = (
@@ -532,32 +538,55 @@ async def test_changed_native_portion_appends_a_bound_immutable_correction(
         ["consumption_status"] == "consumed"
     )
     engine = pool._test_bundle.engine
+    pool._test_bundle.current_settings = lambda: SimpleNamespace(model="offline-camera-fixture")
     turns_before_correction = len(engine.turns)
 
     async def correction_turn(user_message):
         engine.messages.append(user_message)
         engine.turns.append((user_message.text, [], saved_portion.timestamp))
-        engine.decision_trace_recorder.record(
-            TRACE_FINALIZATION,
-            {
+        tool_id = "toolu-camera-portion-correction"
+        tool_input = {
+            "kind": "trace_finalization",
+            "payload": {
                 "schema_version": 1,
                 "trace_event_id": "camera-portion-correction",
-                "annotations": {
-                    "nutrition": {
-                        "schema_version": 2,
-                        "record_type": "meal_correction",
-                        "changed_fields": ["items", "energy_kcal_best"],
-                        "items": [{
-                            "name": "Мягкий творог Синтетик 5%, упаковка 125 г",
-                            "quantity_text": "1 piece",
-                            "energy_kcal_best": 53,
-                        }],
+                "annotations": {"nutrition": {
+                    "schema_version": 2,
+                    "record_type": "meal_correction",
+                    "changed_fields": ["items", "energy_kcal_best"],
+                    "items": [{
+                        "name": "Мягкий творог Синтетик 5%, упаковка 125 г",
+                        "quantity_text": "1 piece",
                         "energy_kcal_best": 53,
-                    }
-                },
+                    }],
+                    "energy_kcal_best": 53,
+                }},
             },
+        }
+        engine.decision_trace_recorder.record(
+            TRACE_FINALIZATION, tool_input["payload"]
         )
-        yield AssistantTextDelta(text="Уменьшила учтённую порцию.")
+        # The query engine completes the tool-use API message before it makes
+        # the follow-up call that supplies the user-facing assistant final.
+        yield AssistantTurnComplete(
+            message=ConversationMessage(role="assistant", content=[
+                ToolUseBlock(id=tool_id, name="trace", input=tool_input),
+            ]),
+            usage=UsageSnapshot(),
+        )
+        yield ToolExecutionStarted(
+            tool_name="trace", tool_input=tool_input, tool_call_id=tool_id,
+        )
+        yield ToolExecutionCompleted(
+            tool_name="trace", output="trace accepted", is_error=False,
+            tool_call_id=tool_id,
+        )
+        yield AssistantTurnComplete(
+            message=ConversationMessage(role="assistant", content=[
+                TextBlock(text="Уменьшила учтённую порцию."),
+            ]),
+            usage=UsageSnapshot(),
+        )
 
     engine.submit_message = correction_turn
     changed = await _native_callback(
