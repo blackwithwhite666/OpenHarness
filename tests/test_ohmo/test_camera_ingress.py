@@ -9573,7 +9573,7 @@ async def test_late_reply_binds_its_matching_initial_context_among_two_camera_ph
     )
     episode_times = {
         episode["episode"]["episode_id"]: datetime.fromisoformat(
-            episode["episode"]["created_at"]
+            episode["episode"]["created_at"].replace("Z", "+00:00")
         )
         for episode in exported["episodes"]
     }
