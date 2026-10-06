@@ -1960,7 +1960,97 @@ def test_inbound_event_id_uses_channel_message_id() -> None:
         metadata={"message_id": 123},
     )
     assert _event_id_for_inbound_message(ordinary) == _event_id_for_inbound_message(ordinary)
-    assert _event_id_for_inbound_message(ordinary).startswith("ohmo-event-")
+    assert _event_id_for_inbound_message(ordinary) == (
+        "ohmo-event-c97b1c8878f9220cc2d52cfeab1c941db8ac11ebbe227bf5c52b39028feabc0d"
+    )
+    ordinary_photo = InboundMessage(
+        channel="telegram",
+        sender_id="42",
+        chat_id="42",
+        content="",
+        media=["/synthetic/photo.jpg"],
+        metadata={"message_id": 123},
+    )
+    assert _event_id_for_inbound_message(ordinary_photo) == _event_id_for_inbound_message(ordinary)
+
+
+def test_callback_event_ids_distinguish_clicks_after_intervening_text() -> None:
+    def callback(query_id: object) -> InboundMessage:
+        return InboundMessage(
+            channel="telegram",
+            sender_id="42",
+            chat_id="42",
+            content="Да",
+            metadata={
+                "message_id": 77,
+                "native_message_id": 77,
+                "callback_query": True,
+                "callback_query_id": query_id,
+            },
+        )
+
+    first = _build_inbound_user_message(callback("q-portion"))
+    intervening_text = _build_inbound_user_message(
+        InboundMessage(
+            channel="telegram",
+            sender_id="42",
+            chat_id="42",
+            content="Это было вчера",
+            metadata={"message_id": 78},
+        )
+    )
+    second = _build_inbound_user_message(callback("q-denial"))
+    assert first.event_id != second.event_id
+    assert _event_id_for_inbound_message(callback("q-denial")) != _event_id_for_inbound_message(
+        InboundMessage(
+            channel="telegram",
+            sender_id="43",
+            chat_id="42",
+            content="Да",
+            metadata={
+                "message_id": 77,
+                "callback_query": True,
+                "callback_query_id": "q-denial",
+            },
+        )
+    )
+    assert _event_id_for_inbound_message(callback("q-denial")) != _event_id_for_inbound_message(
+        InboundMessage(
+            channel="telegram",
+            sender_id="42",
+            chat_id="other-chat",
+            content="Да",
+            metadata={
+                "message_id": 77,
+                "callback_query": True,
+                "callback_query_id": "q-denial",
+            },
+        )
+    )
+
+    engine = object.__new__(QueryEngine)
+    engine._messages = []
+    engine._durable_message_transform = None
+    engine._prepare_idempotent_user_turn(first)
+    engine._prepare_idempotent_user_turn(intervening_text)
+    engine._prepare_idempotent_user_turn(second)
+
+    # The same Telegram callback delivered again remains an idempotent retry.
+    assert _event_id_for_inbound_message(callback("q-denial")) == second.event_id
+    engine._prepare_idempotent_user_turn(_build_inbound_user_message(callback("q-denial")))
+
+
+@pytest.mark.parametrize("callback_id", [None, "", " \t ", " q-id ", 17, True])
+def test_callback_event_id_rejects_missing_or_malformed_query_id(callback_id) -> None:
+    message = InboundMessage(
+        channel="telegram",
+        sender_id="42",
+        chat_id="42",
+        content="Да",
+        metadata={"message_id": 77, "callback_query": True, "callback_query_id": callback_id},
+    )
+    with pytest.raises(ValueError, match="callback_query_id"):
+        _event_id_for_inbound_message(message)
 
 
 @pytest.mark.asyncio

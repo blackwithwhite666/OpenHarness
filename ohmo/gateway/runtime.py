@@ -6135,6 +6135,26 @@ def _build_inbound_user_message(
 def _event_id_for_inbound_message(message: InboundMessage) -> str | None:
     """Derive idempotency only from gateway-validated channel identifiers."""
     metadata = message.metadata or {}
+    if metadata.get("callback_query") is True:
+        callback_query_id = metadata.get("callback_query_id")
+        if (
+            not isinstance(callback_query_id, str)
+            or not callback_query_id.strip()
+            or callback_query_id != callback_query_id.strip()
+            or len(callback_query_id) > 512
+            or any(ord(character) < 32 or ord(character) == 127 for character in callback_query_id)
+        ):
+            raise ValueError("callback_query_id is missing or malformed")
+        seed = "\x00".join(
+            (
+                str(message.channel).strip().lower(),
+                str(message.chat_id),
+                canonical_principal(message.channel, str(message.sender_id)),
+                "callback-query",
+                callback_query_id,
+            )
+        ).encode("utf-8")
+        return f"ohmo-event-{hashlib.sha256(seed).hexdigest()}"
     source_message_id = next(
         (
             normalized
