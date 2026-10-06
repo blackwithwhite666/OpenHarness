@@ -19,6 +19,12 @@ RUN uv pip install --python /opt/build/.venv/bin/python --no-deps \
     'tokenizers==0.22.1' \
     'fastapi==0.141.1' \
     'prometheus-client==0.25.0'
+RUN printf '%s\n' 'Authlib==1.6.12 --hash=sha256:e9229ad7fde610b139dd12f5edbe97eab9ee78bfb85691247e767727850b99ab' \
+    > /tmp/authlib-requirements.txt \
+    && uv pip install --python /opt/build/.venv/bin/python --no-deps \
+        --require-hashes --index-url https://pypi.org/simple \
+        -r /tmp/authlib-requirements.txt \
+    && rm /tmp/authlib-requirements.txt
 RUN ln -s /opt/build/.venv /opt/venv
 WORKDIR /openharness
 CMD ["/opt/venv/bin/python", "tests/camera_e2e_probe/run_joined.py"]

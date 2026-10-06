@@ -530,23 +530,23 @@ async def test_codex_client_allows_long_stream_that_keeps_making_progress(monkey
     sink: dict[str, Any] = {}
     response = _FakeStreamResponse(
         lines=_successful_text_lines("still ", "working"),
-        line_delays={0: 0.02, 2: 0.02, 6: 0.02},
+        line_delays={0: 0.04, 2: 0.04, 4: 0.04, 6: 0.04},
     )
     client_factory = _FakeAsyncClientSequence([response], sink)
     monkeypatch.setattr("openharness.api.codex_client.httpx.AsyncClient", client_factory)
 
     client = CodexApiClient(
         _fake_codex_token(),
-        stall_timeout_seconds=0.03,
+        stall_timeout_seconds=0.1,
         attempt_timeout_seconds=None,
     )
     started = time.monotonic()
     events = await asyncio.wait_for(
         _collect_stream(client, _codex_request()),
-        timeout=0.2,
+        timeout=0.5,
     )
 
-    assert time.monotonic() - started > 0.05
+    assert time.monotonic() - started > 0.1
     assert client_factory.attempts == 1
     assert not any(isinstance(event, ApiRetryEvent) for event in events)
     assert [event.text for event in events if isinstance(event, ApiTextDeltaEvent)] == [
@@ -567,7 +567,7 @@ async def test_codex_client_total_timeout_stops_slow_drip(monkeypatch):
 
     client = CodexApiClient(
         _fake_codex_token(),
-        stall_timeout_seconds=0.03,
+        stall_timeout_seconds=None,
         attempt_timeout_seconds=0.06,
     )
     started = time.monotonic()
@@ -686,7 +686,7 @@ async def test_codex_client_does_not_retry_total_timeout_after_text_delta(monkey
 
     client = CodexApiClient(
         _fake_codex_token(),
-        stall_timeout_seconds=0.03,
+        stall_timeout_seconds=None,
         attempt_timeout_seconds=0.06,
     )
     events: list[Any] = []

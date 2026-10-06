@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+import hashlib
+import json
+from collections.abc import AsyncIterator, Mapping, Sequence
 from typing import Any
 
 from openharness.api.client import (
@@ -26,6 +28,155 @@ SYNTHETIC_OPTIONS = (
     "Нет, не ел(а)",
     "Это не еда",
 )
+
+
+def e5_raw_honcho_row_fingerprint(row: Mapping[str, Any]) -> str:
+    """Fingerprint content and metadata from list_messages_in_window raw rows."""
+    row_id = row.get("id")
+    content = row.get("content")
+    metadata = row.get("metadata")
+    created_at = row.get("created_at")
+    if (
+        not isinstance(row_id, str) or not row_id
+        or not isinstance(content, str)
+        or not isinstance(metadata, Mapping)
+        or not isinstance(created_at, str) or not created_at
+    ):
+        raise AssertionError("E5 immutability check requires a full raw Honcho row")
+    snapshot = {
+        "id": row_id,
+        "content": content,
+        "metadata": metadata,
+        "created_at": created_at,
+    }
+    try:
+        encoded = json.dumps(
+            snapshot, sort_keys=True, ensure_ascii=False, allow_nan=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (RecursionError, TypeError, ValueError) as error:
+        raise AssertionError("E5 raw Honcho row is not stable bounded JSON") from error
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def assert_e5_raw_honcho_row_unchanged(
+    before: Mapping[str, Any], after: Mapping[str, Any]
+) -> None:
+    """Compare actual persisted raw content, metadata, and creation time."""
+    if e5_raw_honcho_row_fingerprint(before) != e5_raw_honcho_row_fingerprint(after):
+        raise AssertionError("E5 immutable original raw Honcho row changed")
+
+
+def validate_e5_date_source_link(
+    *, date_metadata: Mapping[str, Any], original_metadata: Mapping[str, Any],
+    expected_date_source_id: str,
+) -> None:
+    """Validate the ordinary date route's trusted owner/session/reply source link."""
+    source_id = original_metadata.get("source_message_id")
+    date_source_id = date_metadata.get("source_message_id")
+    provenance_keys = ("tenant_id", "source_principal", "gateway_session_id")
+    if (
+        not isinstance(source_id, str) or not source_id
+        or not isinstance(date_source_id, str) or not date_source_id
+        or date_source_id != expected_date_source_id
+        or date_source_id == source_id
+        or date_metadata.get("reply_to_source_message_id") != source_id
+        or original_metadata.get("is_group") is not False
+        or original_metadata.get("is_forwarded") is not False
+        or date_metadata.get("is_group") is not False
+        or date_metadata.get("is_forwarded") is not False
+        or any(
+            not isinstance(original_metadata.get(key), str)
+            or not original_metadata.get(key)
+            or date_metadata.get(key) != original_metadata.get(key)
+            for key in provenance_keys
+        )
+    ):
+        raise AssertionError("E5 ordinary date event is not linked to the trusted owner/source/session")
+
+
+def validate_e5_unique_original_event_ids(
+    *, observed_event_ids: Sequence[str], expected_original_event_id: str
+) -> None:
+    """Require the scoped Honcho read to contain exactly the retained original meal."""
+    if list(observed_event_ids) != [expected_original_event_id]:
+        raise AssertionError("E5 Honcho read does not contain the one original runtime observation")
+
+
+def validate_e5_denial_receipt(
+    *,
+    correction_commit: Mapping[str, Any],
+    outbound_event_id: str | None,
+    candidate_id: str,
+    original_event_id: str,
+    original_metadata: Mapping[str, Any],
+    honcho_row: Any,
+) -> str:
+    """Resolve a denial append from its Camera receipt and matching Honcho row."""
+    metadata = honcho_row.get("metadata") if isinstance(honcho_row, Mapping) else None
+    row_id = honcho_row.get("id") if isinstance(honcho_row, Mapping) else None
+    event_id = correction_commit.get("event_id")
+    source_id = correction_commit.get("source_message_id")
+    client_op_id = correction_commit.get("client_op_id")
+    original_source_id = original_metadata.get("source_message_id")
+    trace = metadata.get("decision_trace") if isinstance(metadata, Mapping) else None
+    annotations = trace.get("annotations") if isinstance(trace, Mapping) else None
+    nutrition = annotations.get("nutrition") if isinstance(annotations, Mapping) else None
+    changed_fields = nutrition.get("changed_fields") if isinstance(nutrition, Mapping) else None
+    if (
+        correction_commit.get("kind") != "denial"
+        or not isinstance(event_id, str) or not event_id
+        or not isinstance(source_id, str) or not source_id
+        or not isinstance(client_op_id, str) or not client_op_id
+        or correction_commit.get("target_event_id") != original_event_id
+        or correction_commit.get("target_source_message_id") != original_source_id
+        or (outbound_event_id is not None and outbound_event_id != event_id)
+        or row_id != event_id
+        or not isinstance(original_source_id, str) or not original_source_id
+        or not isinstance(metadata, Mapping)
+        or metadata.get("source_message_id") != source_id
+        or metadata.get("reply_to_source_message_id") != original_source_id
+        or metadata.get("client_op_id") != client_op_id
+        or metadata.get("camera_candidate_id") != candidate_id
+        or metadata.get("camera_operation_id") != candidate_id
+        or metadata.get("camera_original_event_id") != original_event_id
+        or metadata.get("camera_answer_bound") != "no"
+        or metadata.get("camera_correction_bound") is not True
+        or any(
+            not isinstance(original_metadata.get(key), str)
+            or not original_metadata.get(key)
+            or metadata.get(key) != original_metadata.get(key)
+            for key in ("tenant_id", "source_principal", "gateway_session_id")
+        )
+        or metadata.get("is_group") is not False
+        or metadata.get("is_forwarded") is not False
+        or not isinstance(nutrition, Mapping)
+        or nutrition.get("record_type") != "meal_correction"
+        or nutrition.get("consumption_status") != "not_consumed"
+        or nutrition.get("energy_kcal_best") != 0
+        or not isinstance(changed_fields, list)
+        or "consumption_status" not in changed_fields
+    ):
+        raise AssertionError("E5 denial Camera receipt does not match its durable Honcho correction")
+    return event_id
+
+
+def validate_e5_post_correction_replay(
+    *, status: str | None, delivery_receipt: Any, event_id: str | None,
+    expected_event_id: str, original_commit: Mapping[str, Any],
+    current_commit: Mapping[str, Any] | None,
+) -> str:
+    """Require replay to report the latest correction without replacing the meal."""
+    if (
+        not isinstance(status, str)
+        or "исправление уже записано" not in status.casefold()
+        or delivery_receipt is None
+        or not isinstance(expected_event_id, str) or not expected_event_id
+        or event_id != expected_event_id
+        or current_commit != original_commit
+    ):
+        raise AssertionError("post-denial replay did not confirm its durable correction")
+    return status
 
 
 def _validate_completed_photo_replay(
@@ -77,6 +228,13 @@ class OfflineCameraBotApi:
     def __init__(self) -> None:
         self.calls = 0
         self.finalization_proposals = 0
+        self._queued_correction: dict[str, Any] | None = None
+
+    def queue_correction(self, nutrition: dict[str, Any]) -> None:
+        """Queue one synthetic trace for the next real runtime correction turn."""
+        if self._queued_correction is not None:
+            raise AssertionError("offline correction queue is already occupied")
+        self._queued_correction = nutrition
 
     async def stream_message(
         self, request: ApiMessageRequest
@@ -104,7 +262,29 @@ class OfflineCameraBotApi:
             for block in message.content
         )
         owner_confirmed = owner_turn is not None and SYNTHETIC_BUTTON_LABEL in owner_turn.text
-        if tool_result_seen:
+        if self._queued_correction is not None and not tool_result_seen:
+            nutrition = self._queued_correction
+            self._queued_correction = None
+            self.finalization_proposals += 1
+            message = ConversationMessage(
+                role="assistant",
+                content=[
+                    ToolUseBlock(
+                        name="trace",
+                        input={
+                            "kind": "trace_finalization",
+                            "payload": {
+                                "schema_version": 1,
+                                "trace_event_id": f"offline-camera-correction-{self.calls}",
+                                "annotations": {"nutrition": nutrition},
+                            },
+                        },
+                    )
+                ],
+            )
+            stop_reason = "tool_use"
+        elif tool_result_seen:
+            stop_reason = "end_turn"
             message = ConversationMessage(
                 role="assistant",
                 content=[
@@ -118,6 +298,7 @@ class OfflineCameraBotApi:
                 ],
             )
         elif owner_confirmed:
+            stop_reason = "tool_use"
             self.finalization_proposals += 1
             message = ConversationMessage(
                 role="assistant",
@@ -155,6 +336,7 @@ class OfflineCameraBotApi:
                 ],
             )
         else:
+            stop_reason = "end_turn"
             message = ConversationMessage(
                 role="assistant",
                 content=[
@@ -171,7 +353,7 @@ class OfflineCameraBotApi:
         yield ApiMessageCompleteEvent(
             message=message,
             usage=UsageSnapshot(input_tokens=1, output_tokens=1),
-            stop_reason="tool_use" if owner_confirmed and not tool_result_seen else "end_turn",
+            stop_reason=stop_reason,
         )
 
 
@@ -325,6 +507,14 @@ def camera_runtime_limits(*, native_mode: bool) -> tuple[int, str]:
     return (8, "medium") if native_mode else (4, "none")
 
 
+def camera_typed_reply_mode(value: str | None) -> str:
+    """Validate the joined runner's typed route before it creates clients."""
+    mode = "reply" if value is None else value
+    if mode not in {"reply", "context"}:
+        raise ValueError("CAMERA_TYPED_REPLY_MODE must be reply or context")
+    return mode
+
+
 def isolated_runtime_loaders(runtime_module):
     """Fail closed for builder, prompt-skill and ambient-catalog loaders."""
     from contextlib import contextmanager
@@ -392,18 +582,26 @@ async def run_camera_runtime_trajectory(
     before_answer=None,
     config_dir=None,
     user_scenario: str = "synthetic offline owner selects the exact offered confirmation",
+    typed_reply_mode: str = "reply",
+    before_owner_action=None,
+    restart_before_owner_action: bool = False,
+    restart_before_replay: bool = False,
+    expect_append_failure: bool = False,
+    after_save=None,
 ):
     """Run two actual Ohmo turns and the delivered Telegram callback offline."""
     import asyncio
     import json
     import os
-    from datetime import datetime, timezone
+    from datetime import datetime, timedelta, timezone
     from types import SimpleNamespace
 
     from openharness.api.codex_client import CodexApiClient
     from openharness.config.paths import get_config_file_path
     from openharness.evals.session_user_simulator import LlmUserSimulator
     from ohmo.gateway.bridge import OhmoGatewayBridge
+    import ohmo.gateway.camera as camera_module
+    from ohmo.gateway.camera import CameraIngress
     import ohmo.gateway.runtime as gateway_runtime
     from ohmo.gateway.config import save_gateway_config
     from ohmo.gateway.models import GatewayConfig
@@ -411,6 +609,8 @@ async def run_camera_runtime_trajectory(
     import openharness.ui.runtime as openharness_runtime
     from probe_support import NativeClientPreconditionError
 
+    if typed_reply_mode not in {"reply", "context"}:
+        raise ValueError("CAMERA_TYPED_REPLY_MODE must be reply or context")
     if bot_client is user_client:
         raise AssertionError("Camera bot and virtual-user clients must be separate")
     native_mode = os.environ.get("CAMERA_RUN_MODE") == "native"
@@ -474,19 +674,57 @@ async def run_camera_runtime_trajectory(
     gateway_runtime.build_runtime = injected_build_runtime
     pool = None
     try:
-        pool = OhmoSessionRuntimePool(
-            cwd=root,
-            workspace=root,
-            provider_profile="codex" if native_mode else "claude-api",
-            model="gpt-6-luna" if native_mode else "claude-sonnet-4-6",
-            max_turns=max_turns,
-            effort=effort,
-        )
-        pool._camera_ingress = ingress
-        channel._camera_ingress_authority = ingress
-        channel._start_typing = lambda _chat_id: None
-        channel._stop_typing = lambda _chat_id: None
-        ingress._telegram = channel
+        def new_pool(current_ingress):
+            current_pool = OhmoSessionRuntimePool(
+                cwd=root,
+                workspace=root,
+                provider_profile="codex" if native_mode else "claude-api",
+                model="gpt-6-luna" if native_mode else "claude-sonnet-4-6",
+                max_turns=max_turns,
+                effort=effort,
+            )
+            current_pool._camera_ingress = current_ingress
+            return current_pool
+
+        def bind_ingress(current_ingress):
+            channel._camera_ingress_authority = current_ingress
+            channel._start_typing = lambda _chat_id: None
+            channel._stop_typing = lambda _chat_id: None
+            current_ingress._telegram = channel
+
+        async def restart_runtime_and_camera(*, advance_minutes: int = 0):
+            nonlocal pool, ingress, bridge
+            previous_ingress = ingress
+            if pool is not None:
+                await pool.aclose()
+            await previous_ingress.close()
+            if advance_minutes:
+                controlled_now[0] += timedelta(minutes=advance_minutes)
+            ingress = CameraIngress(
+                previous_ingress.config,
+                workspace=root,
+                bus=bus,
+                telegram=channel,
+            )
+            bind_ingress(ingress)
+            pool = new_pool(ingress)
+            bridge = OhmoGatewayBridge(bus=bus, runtime_pool=pool, camera_ingress=ingress)
+            if ingress._state_path != previous_ingress._state_path:
+                raise AssertionError("Camera restart changed the journal path")
+            return ingress, pool
+
+        class ControlledCameraDatetime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                now = controlled_now[0]
+                return now.astimezone(tz) if tz is not None else now.replace(tzinfo=None)
+
+        controlled_now = [datetime.now(timezone.utc)]
+        controlled_clock_start = controlled_now[0]
+        original_camera_datetime = camera_module.datetime
+        camera_module.datetime = ControlledCameraDatetime
+        pool = new_pool(ingress)
+        bind_ingress(ingress)
         bridge = OhmoGatewayBridge(bus=bus, runtime_pool=pool, camera_ingress=ingress)
         simulator = LlmUserSimulator(
             api_client=user_client,
@@ -494,15 +732,25 @@ async def run_camera_runtime_trajectory(
             system_prompt=(
                 "You are the Camera owner described here. Answer as that person, using the "
                 "actual question and choices in the conversation. Preserve denial, amount, "
-                "and time qualifiers. Do not invent details.\n\n" + user_scenario
+                "and time qualifiers. Do not invent details."
+                + (
+                    " Answer in natural typed words, not by repeating an offered label."
+                    if typed_reply_mode == "context" else ""
+                )
+                + "\n\n" + user_scenario
                 if native_mode
-                else "You are a synthetic offline owner; select the exact offered answer."
+                else (
+                    "You are a synthetic offline owner; answer with a meaningful typed "
+                    "consumption and portion statement, not an exact offered label."
+                    if typed_reply_mode == "context"
+                    else "You are a synthetic offline owner; select the exact offered answer."
+                )
             ),
         )
         from camera_virtual_user import CameraVirtualUser, OfferedCameraChoices
         from probe_support import require_bound_answer
 
-        virtual_user = CameraVirtualUser(simulator)
+        virtual_user = CameraVirtualUser(simulator, typed_reply_mode=typed_reply_mode)
 
         async def process_and_deliver(message, session_key):
             await bridge._process_message(message, session_key)
@@ -514,7 +762,10 @@ async def run_camera_runtime_trajectory(
                 receipt = await channel.send(outbound)
                 ingress.note_assistant_receipt(outbound, receipt)
                 delivered.append((outbound, receipt))
-                if outbound.metadata.get("nutrition_append_event_id"):
+                if (
+                    "nutrition_append_event_id" in outbound.metadata
+                    and outbound.metadata["nutrition_append_event_id"] is not None
+                ):
                     nutrition_event_id = outbound.metadata["nutrition_append_event_id"]
                     final_receipt = receipt
             return delivered, final_receipt, nutrition_event_id
@@ -554,6 +805,13 @@ async def run_camera_runtime_trajectory(
         )
         if before_answer is not None:
             await before_answer(first_started)
+        if restart_before_owner_action:
+            controlled_now[0] += timedelta(minutes=31)
+            ingress._sweep_expired_attempts()
+        if before_owner_action is not None:
+            await before_owner_action(process_and_deliver, ingress, pool)
+        if restart_before_owner_action:
+            await restart_runtime_and_camera()
         action = await virtual_user.next_camera_action(
             offered=offered,
             transcript=(("assistant", issued.content),),
@@ -564,21 +822,6 @@ async def run_camera_runtime_trajectory(
         )
         if action is None:
             raise AssertionError("Camera virtual user produced no owner action")
-        action_observation = root / "camera-virtual-action.json"
-        with action_observation.open("x", encoding="utf-8") as handle:
-            json.dump(
-                {
-                    "question": offered.question,
-                    "offered_labels": list(offered.options),
-                    "action_text": action.text,
-                    "callback_id": action.callback_data,
-                },
-                handle,
-                ensure_ascii=False,
-                indent=2,
-            )
-            handle.write("\n")
-        os.chmod(action_observation, 0o600)
         button_ids = {button.callback_data for button in buttons}
         if action.callback_data is not None and action.callback_data not in button_ids:
             raise AssertionError("virtual user selected a callback absent from delivered markup")
@@ -631,23 +874,37 @@ async def run_camera_runtime_trajectory(
         if action.callback_data is not None:
             answer = await invoke_issued_callback()
         else:
+            typed_source_id = "offline-camera-typed-1"
+            typed_received_at = (
+                controlled_now[0]
+                if restart_before_owner_action
+                else datetime.now(timezone.utc)
+            )
             answer = action.to_inbound_message(
                 sender_id="123",
                 chat_id="123",
-                source_message_id="offline-camera-typed-1",
-                received_at=datetime.now(timezone.utc),
+                source_message_id=typed_source_id,
+                received_at=typed_received_at,
             )
         ingress.process_real_inbound(answer)
-        require_bound_answer(answer, candidate_id, native_photo)
+        actual_route = "callback" if action.callback_data is not None else action.typed_reply_mode
+        require_bound_answer(
+            answer, candidate_id, native_photo, expected_route=actual_route,
+            trusted_turn_id=(
+                ingress._attempts[candidate_id].get("answer_turn_id")
+                if actual_route == "context" else None
+            ),
+        )
         if (
             (
                 action.callback_data is not None
                 and answer.metadata.get("native_message_id") != native_photo
             )
-            or (
-                action.callback_data is None
-                and str(answer.metadata.get("reply_to_message_id")) != str(native_photo)
-            )
+            or (action.callback_data is None and actual_route == "reply"
+                and str(answer.metadata.get("reply_to_message_id")) != str(native_photo))
+            or (action.callback_data is None and actual_route == "context"
+                and ("reply_to_message_id" in answer.metadata
+                     or "native_message_id" in answer.metadata))
             or (
                 action.callback_data is not None
                 and answer.metadata.get("native_keyboard_options")
@@ -675,7 +932,53 @@ async def run_camera_runtime_trajectory(
         capture_time = ingress.trusted_capture_time_for_answer(answer)
         if capture_time is None:
             raise AssertionError("Camera callback has no trusted capture time")
-        _, final_receipt, nutrition_event_id = await process_and_deliver(answer, answer.session_key)
+        action_observation = root / "camera-virtual-action.json"
+        with action_observation.open("x", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "question": offered.question,
+                    "offered_labels": list(offered.options),
+                    "action_text": action.text,
+                    "callback_id": action.callback_data,
+                    "route": actual_route,
+                    "typed_reply_mode": action.typed_reply_mode,
+                    "source_message_id": answer.metadata.get("message_id"),
+                    "native_photo_id": answer.metadata.get("_camera_photo_id", native_photo),
+                    "reply_to_message_id_present": "reply_to_message_id" in answer.metadata,
+                    "capture_time": capture_time.isoformat(),
+                },
+                handle,
+                ensure_ascii=False,
+                indent=2,
+            )
+            handle.write("\n")
+        os.chmod(action_observation, 0o600)
+        final_delivered, final_receipt, nutrition_event_id = await process_and_deliver(
+            answer, answer.session_key
+        )
+        final_text = next(
+            (item.content for item, _ in reversed(final_delivered) if item.content), ""
+        )
+        if expect_append_failure:
+            if nutrition_event_id is not None or final_receipt is not None:
+                raise AssertionError("failed Honcho append returned a saved event or receipt")
+            if any(
+                phrase in final_text.casefold()
+                for phrase in ("записано", "уже записана", "saved", "recorded")
+            ):
+                raise AssertionError("failed Honcho append returned a public Saved claim")
+            return {
+                "started": first_started,
+                "answer": answer,
+                "capture_time": capture_time,
+                "event_id": None,
+                "receipt": None,
+                "owner_failure_text": final_text,
+                "native_photo_id": native_photo,
+                "source_candidate_id": candidate_id,
+                "ingress": ingress,
+                "camera_clock_advanced": controlled_now[0] - controlled_clock_start,
+            }
         if not isinstance(nutrition_event_id, str) or not nutrition_event_id:
             raise AssertionError("runtime did not return its durable nutrition event ID")
         commit = ingress._attempts[candidate_id].get("camera_commit")
@@ -683,10 +986,20 @@ async def run_camera_runtime_trajectory(
             raise AssertionError("runtime nutrition event ID differs from Camera durable receipt")
         if final_receipt is None:
             raise AssertionError("owner turn did not deliver a native final receipt")
+
+        after_save_result = None
+        if after_save is not None:
+            after_save_result = await after_save(
+                process_and_deliver, ingress, pool, candidate_id, answer, commit
+            )
+
+        if restart_before_replay:
+            await restart_runtime_and_camera()
         action_label = "Telegram callback" if action.callback_data is not None else "typed reply"
         mode_label = "NATIVE OPT-IN" if native_mode else "OFFLINE SYNTHETIC"
         print(
-            f"{mode_label} virtual-user {action_label} + real Ohmo finalizer completed; "
+            f"{mode_label} virtual-user {action_label} route={actual_route} "
+            f"source={answer.metadata.get('message_id')} + real Ohmo finalizer completed; "
             f"event={nutrition_event_id} capture_date={capture_time.date().isoformat()} "
             f"bot_calls={getattr(bot_client, 'calls', 'native')} "
             f"user_calls={getattr(user_client, 'calls', 'native')}",
@@ -708,24 +1021,45 @@ async def run_camera_runtime_trajectory(
             ingress.process_real_inbound(replay)
             return replay
 
-        replay = await replay_callback()
-        replay_delivered, replay_delivery_receipt, replay_event_id = await process_and_deliver(
-            replay, replay.session_key
+        latest_replay = (
+            after_save_result.get("post_correction_replay")
+            if isinstance(after_save_result, dict) else None
         )
-        current_commit = ingress._attempts[candidate_id].get("camera_commit")
-        replay_status = _validate_completed_photo_replay(
-            replay=replay,
-            candidate_id=candidate_id,
-            turn_id=answer.metadata["_camera_turn_id"],
-            delivered=replay_delivered,
-            delivery_receipt=replay_delivery_receipt,
-            existing_event_id=nutrition_event_id,
-            original_commit=commit,
-            current_commit=current_commit,
-            typed_replay=action.callback_data is None,
-        )
-        if replay_event_id != nutrition_event_id:
-            raise AssertionError("completed-photo replay event identity differs from existing meal")
+        if isinstance(latest_replay, dict):
+            # The E5 join has already replayed the most recent denial through
+            # Telegram -> CameraIngress -> runtime. Replaying the original
+            # affirmative response here would test stale state and risk a
+            # fixture-triggered resurrection of the corrected meal.
+            replay_status = latest_replay.get("status")
+            replay_delivery_receipt = latest_replay.get("delivery_receipt")
+            replay_event_id = latest_replay.get("event_id")
+            replay_status = validate_e5_post_correction_replay(
+                status=replay_status,
+                delivery_receipt=replay_delivery_receipt,
+                event_id=replay_event_id,
+                expected_event_id=latest_replay.get("expected_event_id"),
+                original_commit=commit,
+                current_commit=ingress._attempts[candidate_id].get("camera_commit"),
+            )
+        else:
+            replay = await replay_callback()
+            replay_delivered, replay_delivery_receipt, replay_event_id = await process_and_deliver(
+                replay, replay.session_key
+            )
+            current_commit = ingress._attempts[candidate_id].get("camera_commit")
+            replay_status = _validate_completed_photo_replay(
+                replay=replay,
+                candidate_id=candidate_id,
+                turn_id=answer.metadata["_camera_turn_id"],
+                delivered=replay_delivered,
+                delivery_receipt=replay_delivery_receipt,
+                existing_event_id=nutrition_event_id,
+                original_commit=commit,
+                current_commit=current_commit,
+                typed_replay=action.callback_data is None,
+            )
+            if replay_event_id != nutrition_event_id:
+                raise AssertionError("completed-photo replay event identity differs from existing meal")
         if (
             isinstance(bot_client, OfflineCameraBotApi)
             and bot_client.finalization_proposals != initial_finalization_proposals
@@ -741,18 +1075,26 @@ async def run_camera_runtime_trajectory(
             "capture_time": capture_time,
             "event_id": nutrition_event_id,
             "receipt": commit,
+            "final_status_text": final_text,
             "native_photo_id": native_photo,
             "keyboard_message_id": native_photo,
             "source_candidate_id": candidate_id,
             "bot": channel,
             "bot_transport": fake_bot,
             "action": action,
+            "route": actual_route,
             "markup": markup,
             "caption": edit.get("caption"),
             "replay_callback": replay_callback,
             "owner_replay_saved_status": replay_status,
             "owner_replay_delivery_confirmed": replay_delivery_receipt is not None,
             "owner_replay_event_id": replay_event_id,
+            "ingress": ingress,
+            "restarted_before_owner_action": restart_before_owner_action,
+            "restarted_before_replay": restart_before_replay,
+            "controlled_camera_time": controlled_now[0],
+            "camera_clock_advanced": controlled_now[0] - controlled_clock_start,
+            "after_save_result": after_save_result,
         }
     finally:
         try:
@@ -760,6 +1102,7 @@ async def run_camera_runtime_trajectory(
                 await pool.aclose()
         finally:
             try:
+                camera_module.datetime = original_camera_datetime
                 gateway_runtime.build_runtime = saved_builder
             finally:
                 isolation_stack.close()

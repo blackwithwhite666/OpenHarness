@@ -137,6 +137,75 @@ async def test_camera_user_uses_only_offered_choices_and_keeps_media_provenance(
     assert inbound.metadata["_camera_virtual_media_source_ids"] == ("candidate-1",)
 
 
+async def test_context_mode_keeps_visible_choices_and_typed_text_without_reply_metadata():
+    offered = OfferedCameraChoices(
+        question="Вы съели это? Какую часть порции учитывать?",
+        options=("Всю порцию", "Половину порции", "Не ела"),
+        callback_ids=("ask:0", "ask:1", "ask:2"),
+        native_message_id="77",
+        media_source_ids=("candidate-1",),
+    )
+    utterance = "Я съела примерно половину порции"
+    reply_simulator = RecordingSimulator(utterance)
+    context_simulator = RecordingSimulator(utterance)
+    common = dict(
+        offered=offered, transcript=(("user", "Вот фотография"),),
+        captured_prompts=("Use the actual food amount.",),
+        captured_capabilities=(("camera-photo", "telegram-reply"),), index=0,
+        last_turn=None,
+    )
+    reply_action = await CameraVirtualUser(reply_simulator).next_camera_action(**common)
+    context_action = await CameraVirtualUser(
+        context_simulator, typed_reply_mode="context",
+    ).next_camera_action(**common)
+
+    assert reply_simulator.request["transcript"] == context_simulator.request["transcript"]
+    assert context_action.text == utterance
+    assert context_action.callback_data is None
+    assert context_action.typed_reply_mode == "context"
+    assert context_action.reply_to_message_id is None
+    assert reply_action.reply_to_message_id == "77"
+    received_at = datetime.now(timezone.utc)
+    inbound = context_action.to_inbound_message(
+        sender_id="123", chat_id="123", source_message_id="context-source-1",
+        received_at=received_at,
+    )
+    assert inbound.content == utterance
+    assert inbound.timestamp is received_at
+    assert inbound.metadata["message_id"] == "context-source-1"
+    assert "reply_to_message_id" not in inbound.metadata
+    assert "native_message_id" not in inbound.metadata
+    assert inbound.metadata["_camera_virtual_media_source_ids"] == ("candidate-1",)
+
+
+@pytest.mark.parametrize("mode", ["", "reply-to-anything", None])
+def test_camera_user_rejects_unknown_typed_reply_mode(mode):
+    with pytest.raises(ValueError, match="reply or context"):
+        CameraVirtualUser(FixedUser("typed answer"), typed_reply_mode=mode)
+
+
+async def test_context_mode_keeps_native_callback_selection():
+    offered = OfferedCameraChoices(
+        question="Did you eat this?",
+        options=("Да, я это съел(а)", "Нет, не ел(а)"),
+        callback_ids=("ask:0", "ask:1"),
+        native_message_id="77",
+        media_source_ids=("candidate-1",),
+    )
+    action = await CameraVirtualUser(
+        FixedUser("Да, я это съел(а)"), typed_reply_mode="context",
+    ).next_camera_action(
+        offered=offered, transcript=(), captured_prompts=(),
+        captured_capabilities=(), index=0, last_turn=None,
+    )
+    assert action.callback_data == "ask:0"
+    with pytest.raises(ValueError, match="actual Telegram callback handler"):
+        action.to_inbound_message(
+            sender_id="123", chat_id="123", source_message_id="context-source",
+            received_at=datetime.now(timezone.utc),
+        )
+
+
 @pytest.mark.parametrize(
     "choices",
     [

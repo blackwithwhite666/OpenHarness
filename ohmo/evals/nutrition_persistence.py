@@ -2370,6 +2370,7 @@ async def read_honcho_messages(*, base_url: str, api_key: str, workspace: str, s
 
 async def read_telegent_wellness(*, owner_login: str, start: datetime, end: datetime,
                                  server_config: object | None = None, server_name: str = "telegent",
+                                 reader_id: str | None = None,
                                  mcp_url: str | None = None, token: str | None = None) -> dict[str, Any]:
     """Call get_wellness_data via configured OAuth MCP manager, or synthetic static transport tests."""
     if start.tzinfo is None or end.tzinfo is None or end < start:
@@ -2381,16 +2382,33 @@ async def read_telegent_wellness(*, owner_login: str, start: datetime, end: date
         if server_config is not None:
             from openharness.mcp.client import McpClientManager
             from openharness.mcp.types import McpHttpServerConfig
+            from openharness.mcp.wellness_delegation import (
+                TrustedWellnessActor, WellnessDelegationConfig, sign_wellness_call,
+            )
 
-            if not isinstance(server_config, McpHttpServerConfig):
-                return {"complete": False, "error": "selected Telegent MCP server is not HTTP"}
+            if (not isinstance(server_config, McpHttpServerConfig)
+                    or server_config.oauth is None
+                    or not isinstance(reader_id, str) or not reader_id.isascii()
+                    or not reader_id.isdigit() or reader_id.startswith("0")):
+                return {"complete": False, "error": "live Telegent reader identity or OAuth server is invalid"}
+            try:
+                delegation = WellnessDelegationConfig.from_env()
+                if delegation.client_id != server_config.oauth.client_id:
+                    raise ValueError("wellness delegation client does not match OAuth server")
+            except (TypeError, ValueError):
+                return {"complete": False, "error": "live Telegent signing configuration is invalid"}
             manager = McpClientManager({server_name: server_config})
             try:
                 await manager.connect_all()
                 statuses = manager.list_statuses()
                 if not statuses or statuses[0].state != "connected":
                     return {"complete": False, "error": "Telegent MCP server unavailable"}
-                tool_result = await manager.call_tool_result(server_name, "get_wellness_data", arguments)
+                meta = sign_wellness_call(
+                    delegation, TrustedWellnessActor(reader_id), arguments,
+                )
+                tool_result = await manager.call_tool_result(
+                    server_name, "get_wellness_data", arguments, meta=meta,
+                )
                 raw_output = tool_result.output
                 tool_error = tool_result.is_error
             finally:
@@ -2597,6 +2615,7 @@ def main() -> None:
     parser.add_argument("--until")
     parser.add_argument("--telegent-server", default="telegent")
     parser.add_argument("--telegent-login")
+    parser.add_argument("--telegent-reader-id")
     parser.add_argument("--start")
     parser.add_argument("--end")
     parser.add_argument("--grace-seconds", type=int, default=300)
@@ -2612,6 +2631,16 @@ def main() -> None:
         if not isinstance(honcho, dict) or not isinstance(telegent, dict):
             parser.error("snapshots must be JSON objects")
     else:
+        reader_id = args.telegent_reader_id
+        if (not isinstance(reader_id, str) or not reader_id.isascii()
+                or not reader_id.isdigit() or reader_id.startswith("0")):
+            parser.error("live mode requires --telegent-reader-id with a canonical positive Telegram ID")
+        try:
+            from openharness.mcp.wellness_delegation import WellnessDelegationConfig
+
+            signing = WellnessDelegationConfig.from_env()
+        except ValueError:
+            parser.error("live Telegent signing configuration is incomplete or invalid")
         goals = manifest.goals
         if len({(item.owner_id, item.session_id, item.workspace_id, item.peer_id,
                  item.principal_id, item.canonical_owner_id, item.canonical_login)
@@ -2635,6 +2664,9 @@ def main() -> None:
         telegent_config = server_configs.get(args.telegent_server)
         if telegent_config is None:
             parser.error("selected Telegent MCP server is absent from configured OpenHarness settings")
+        if (not hasattr(telegent_config, "oauth") or telegent_config.oauth is None
+                or signing.client_id != telegent_config.oauth.client_id):
+            parser.error("selected Telegent OAuth client does not match signing configuration")
         honcho = asyncio.run(read_honcho_messages(
             base_url=args.honcho_base_url,
             api_key=os.environ["OHMO_NUTRITION_AUDIT_HONCHO_TOKEN"],
@@ -2645,6 +2677,7 @@ def main() -> None:
         telegent = asyncio.run(read_telegent_wellness(
             server_config=telegent_config, server_name=args.telegent_server,
             owner_login=args.telegent_login,
+            reader_id=reader_id,
             start=datetime.fromisoformat(args.start), end=datetime.fromisoformat(args.end),
         ))
     results = []

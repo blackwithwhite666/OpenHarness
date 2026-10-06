@@ -187,7 +187,18 @@ _CLARIFICATION_NEW_MEAL_RE = re.compile(
     r"\b(?:нов(?:ый|ая|ое|ые)|друг(?:ой|ая|ое|ие)|не\s+тот|не\s+это|tomorrow|another|different)\b",
     re.IGNORECASE,
 )
-_CLARIFICATION_EXPLICIT_DATE_RE = re.compile(r"\b20\d{2}-\d{2}-\d{2}\b")
+_CAMERA_DATE_CORRECTION_RE = re.compile(
+    r"\b20\d{2}-\d{2}-\d{2}\b|"
+    r"\b(?:вчера|позавчера|сегодня|yesterday|today|day\s+before\s+yesterday)\b|"
+    r"\b(?:в\s+)?прошл(?:ый|ую|ом|ое|ые)\s+"
+    r"(?:понедельник\w*|вторник\w*|сред\w*|четверг\w*|пятниц\w*|"
+    r"суббот\w*|воскресень\w*|день\w*|недел\w*|месяц\w*)\b|"
+    r"\b\d{1,2}\s+(?:январ\w*|феврал\w*|март\w*|апрел\w*|ма\w*|июн\w*|"
+    r"июл\w*|август\w*|сентябр\w*|октябр\w*|ноябр\w*|декабр\w*|"
+    r"january|february|march|april|may|june|july|august|september|october|"
+    r"november|december)\b",
+    re.IGNORECASE,
+)
 _CAMERA_UNRELATED_CONTEXT_RE = re.compile(
     r"\b(?:weather|погод\w*|спасибо|благодар\w*|thanks?|payment|оплат\w*|перевод\w*|"
     r"деньг\w*|сч[её]т\w*|карт\w*|рубл\w*|валют\w*|invoice|transfer|bank)\b",
@@ -786,7 +797,7 @@ def _camera_context_answer_kind(
     if (
         not isinstance(text, str)
         or _CLARIFICATION_NEW_MEAL_RE.search(text)
-        or _CLARIFICATION_EXPLICIT_DATE_RE.search(text)
+        or _CAMERA_DATE_CORRECTION_RE.search(text)
     ):
         return None
     direct = _classify_answer(text, anchored=True)
@@ -2104,6 +2115,60 @@ class CameraIngress:
             return None
         return self._attempt_capture_time(attempt)
 
+    def is_completed_context_typed_repeat(
+        self, message: InboundMessage, candidate_id: str,
+    ) -> bool:
+        """Validate a source-only repeat against one completed owner operation."""
+        metadata = message.metadata
+        if (
+            not self.config.enabled
+            or message.channel != "telegram"
+            or str(message.chat_id) != self.config.chat_id
+            or message.sender_id.split("|", 1)[0] != self.config.principal
+            or metadata.get("callback_query") is True
+            or "reply_to_message_id" in metadata
+            or "native_message_id" in metadata
+            or _source_message_id(metadata.get("message_id")) is None
+        ):
+            return False
+        attempt = self._attempts.get(candidate_id)
+        if not isinstance(attempt, dict) or attempt.get("state") != "completed":
+            return False
+        if any(
+            other_id != candidate_id
+            and other.get("state") in {
+                "admitted", "photo_sent", "clarifying", "answering", "final_queued"
+            }
+            and other.get("attention_active", True)
+            for other_id, other in self._attempts.items()
+        ):
+            return False
+        commit = attempt.get("camera_commit")
+        source_context = attempt.get("confirmed_camera_context")
+        if (
+            not isinstance(commit, dict)
+            or attempt.get("answer_route") != "context"
+            or attempt.get("context_interrupted", False)
+            or not isinstance(attempt.get("answer_turn_id"), str)
+            or attempt.get("finalizer_status") != "committed"
+            or (
+                attempt.get("camera_correction") is not None
+                and not (
+                    attempt.get("camera_correction") == "completed"
+                    and isinstance(attempt.get("camera_correction_commit"), dict)
+                    and attempt["camera_correction_commit"].get("kind") == "portion"
+                )
+            )
+            or _source_message_id(metadata.get("message_id"))
+            == _source_message_id(commit.get("source_message_id"))
+            or _camera_context_answer_kind(
+                metadata.get("_telegram_raw_text", message.content),
+                source_context=source_context,
+            ) != "yes"
+        ):
+            return False
+        return True
+
     def record_committed_meal(
         self,
         message: InboundMessage,
@@ -2973,9 +3038,12 @@ class CameraIngress:
     def _interrupt_untargeted_camera_context(self) -> None:
         changed = False
         for attempt in self._attempts.values():
-            if attempt.get("state") in {"photo_sent", "clarifying"} and not attempt.get(
-                "context_interrupted", False
-            ):
+            interruptible = attempt.get("state") in {"photo_sent", "clarifying"} or (
+                attempt.get("state") == "completed"
+                and attempt.get("answer_route") == "context"
+                and isinstance(attempt.get("camera_commit"), dict)
+            )
+            if interruptible and not attempt.get("context_interrupted", False):
                 attempt["context_interrupted"] = True
                 changed = True
         if changed:
@@ -4108,6 +4176,7 @@ class CameraIngress:
         ):
             return
         metadata = message.metadata
+        owner_supplied_media = bool(message.media)
         self._sweep_expired_attempts()
         target = (
             metadata.get("native_message_id")
@@ -4122,7 +4191,9 @@ class CameraIngress:
                 str(value.get("photo_id")), *map(str, value.get("reply_ids", []))
             }
         ]
-        if target is None and message.media:
+        # Only media present on entry is a new owner source. Camera snapshots
+        # attached below for retained context are enrichment, not interruption.
+        if owner_supplied_media:
             self._interrupt_untargeted_camera_context()
         # Persist a production-owned eligibility fact for calibration. The
         # callback's visible text is never enough to turn a stale Camera tap
@@ -4156,7 +4227,7 @@ class CameraIngress:
             and _classify_answer(raw_text, anchored=False) == "yes"
             and (
                 _CLARIFICATION_NEW_MEAL_RE.search(str(raw_text))
-                or _CLARIFICATION_EXPLICIT_DATE_RE.search(str(raw_text))
+                or _CAMERA_DATE_CORRECTION_RE.search(str(raw_text))
             )
         ):
             self._interrupt_untargeted_camera_context()
@@ -4191,6 +4262,40 @@ class CameraIngress:
             intent = None
         if target is None and intent is None:
             intent = _camera_context_answer_kind(raw_text)
+        if (
+            not callback
+            and target is not None
+            and len(target_matches) == 1
+            and intent in {None, "yes"}
+            and isinstance(raw_text, str)
+            and _CAMERA_DATE_CORRECTION_RE.search(raw_text)
+        ):
+            _, attempt = target_matches[0]
+            latest_correction = attempt.get("camera_correction_commit")
+            retained_meal = (
+                attempt.get("state") == "completed"
+                and attempt.get("finalizer_status") == "committed"
+                and isinstance(attempt.get("camera_commit"), dict)
+                and (
+                    attempt.get("camera_correction") is None
+                    or (
+                        attempt.get("camera_correction") == "completed"
+                        and isinstance(latest_correction, dict)
+                        and latest_correction.get("kind") == "portion"
+                    )
+                )
+            )
+            if retained_meal:
+                if _CLARIFICATION_NEW_MEAL_RE.search(raw_text):
+                    # A reply to an old Camera source cannot select a different
+                    # meal as the target of its date correction.
+                    metadata["_camera_unbound"] = CAMERA_AUTHORITY
+                    return
+                # Keep an explicit date correction on the ordinary owner
+                # reply path. This marker admits only its date correction
+                # finalizer; it does not authorize a Camera answer or save.
+                metadata["_camera_ordinary_date_correction"] = CAMERA_AUTHORITY
+                return
         if not callback and target_matches and intent is None and isinstance(raw_text, str):
             candidate_id, attempt = target_matches[0]
             latest = attempt.get("camera_correction_commit")
@@ -4521,6 +4626,22 @@ class CameraIngress:
                         return
                     elif bind_denial(candidate_id, attempt, "context"):
                         return
+        if intent != "no" and not target_matches and target is None and not callback:
+            completed_context = [
+                (key, value) for key, value in self._attempts.items()
+                if value.get("state") == "completed"
+                and self.is_completed_context_typed_repeat(message, key)
+            ]
+            if len(completed_context) == 1:
+                candidate_id, attempt = completed_context[0]
+                metadata.update(
+                    _camera_typed_replay_candidate=candidate_id,
+                    _camera_route="context",
+                )
+                return
+            if len(completed_context) > 1:
+                metadata["_camera_unbound"] = CAMERA_AUTHORITY
+                return
         if intent != "no" and target_matches:
             candidate_id, attempt = target_matches[0]
             completed_typed_yes = intent == "yes" or (
@@ -4535,7 +4656,7 @@ class CameraIngress:
                 and completed_typed_yes
                 and attempt.get("state") == "completed"
                 and isinstance(attempt.get("camera_commit"), dict)
-                and target is not None
+                and (target is not None or self.is_completed_context_typed_repeat(message, candidate_id))
                 and isinstance(attempt.get("answer_turn_id"), str)
                 and attempt.get("finalizer_status") == "committed"
                 and (
@@ -4567,7 +4688,11 @@ class CameraIngress:
                         _camera_correction_replay_typed=True,
                     )
                 else:
-                    metadata["_camera_typed_replay_candidate"] = candidate_id
+                    metadata.update(
+                        _camera_typed_replay_candidate=candidate_id,
+                        _camera_route="reply",
+                        _camera_native_binding=str(target),
+                    )
                 return
             if (
                 callback
@@ -4934,6 +5059,10 @@ class CameraIngress:
         attempt["attention_active"] = False
         attempt["answer_turn_id"] = uuid4().hex
         attempt["answer_kind"] = classified
+        attempt["answer_route"] = (
+            "callback" if metadata.get("callback_query") else
+            "reply" if target is not None else "context"
+        )
         attempt["answer_source_message_id"] = _source_message_id(metadata.get("message_id"))
         attempt["finalizer_status"] = "pending"
         try:

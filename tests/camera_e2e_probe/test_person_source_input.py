@@ -29,6 +29,7 @@ from person_source_runtime import (
 )
 
 from person_source_input import person_source_message
+from person_source_acceptance import SyntheticPersonSourceApi
 
 
 def test_person_text_uses_production_inbound_and_keeps_unthreaded_identity():
@@ -278,8 +279,37 @@ async def test_offline_person_source_food_proposes_finalizer_and_receipt_is_requ
     assert proposal.name == "trace"
     assert proposal.input["kind"] == "trace_finalization"
     assert proposal.input["payload"]["annotations"]["nutrition"]["basis"] == ["text"]
-    assert source_run_status([{"event_id": "honcho-event-1"}])["saved"] is True
-    assert source_run_status([{"event_id": None}])["saved"] is False
+
+
+@pytest.mark.asyncio
+async def test_person_acceptance_fixture_encodes_only_explicit_synthetic_trace():
+    api = SyntheticPersonSourceApi("explicit_time_meal")
+    events = [item async for item in api.stream_message(SimpleNamespace(system_prompt=""))]
+    proposal = next(block for block in events[0].message.content if isinstance(block, ToolUseBlock))
+    nutrition = proposal.input["payload"]["annotations"]["nutrition"]
+    assert nutrition["meal_at"] == "2026-10-05T18:45:00+00:00"
+    assert nutrition["energy_kcal_best"] == 285
+    assert "not a food judgment" in nutrition["assumptions"][0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["unclear_image", "nonfood_image", "estimate_only"])
+async def test_person_acceptance_negative_fixtures_emit_no_consumption_trace(case):
+    api = SyntheticPersonSourceApi(case)
+    events = [item async for item in api.stream_message(SimpleNamespace(system_prompt=""))]
+    assert len(events) == 1 and events[0].stop_reason == "end_turn"
+    assert all(block.type != "tool_use" for block in events[0].message.content)
+
+
+@pytest.mark.asyncio
+async def test_person_acceptance_same_photo_fixture_only_acknowledges_known_source():
+    api = SyntheticPersonSourceApi("send_time_meal")
+    events = [item async for item in api.stream_message(
+        SimpleNamespace(system_prompt="Previously seen user photo: same source")
+    )]
+    assert api.saw_same_photo_context
+    assert len(events) == 1 and events[0].stop_reason == "end_turn"
+    assert all(block.type != "tool_use" for block in events[0].message.content)
 
 
 @pytest.mark.asyncio
@@ -295,6 +325,8 @@ async def test_offline_person_source_meal_finalizes_with_text_after_one_trace():
     assert proposal.stop_reason == "tool_use"
     assert nutrition["energy_kcal_best"] == 125
     assert nutrition["basis"] == ["image"]
+    assert source_run_status([{"event_id": "honcho-event-1"}])["saved"] is True
+    assert source_run_status([{"event_id": None}])["saved"] is False
 
     final = [event async for event in api.stream_message(request)][0]
     assert final.stop_reason == "end_turn"

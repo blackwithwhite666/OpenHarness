@@ -1,9 +1,21 @@
 from __future__ import annotations
 
-import pytest
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
-from camera_runtime_support import OfflineCameraBotApi, isolated_runtime_loaders
+import httpx
+import pytest
+
+from camera_runtime_support import (
+    OfflineCameraBotApi,
+    assert_e5_raw_honcho_row_unchanged,
+    e5_raw_honcho_row_fingerprint,
+    isolated_runtime_loaders,
+    validate_e5_date_source_link,
+    validate_e5_denial_receipt,
+    validate_e5_post_correction_replay,
+    validate_e5_unique_original_event_ids,
+)
 from openharness.config.settings import ProviderProfile, Settings
 from openharness.engine.messages import ConversationMessage, ToolResultBlock, ToolUseBlock
 from probe_support import (
@@ -15,6 +27,283 @@ from probe_support import (
 
 class FakeCodexClient:
     pass
+
+
+def _e5_original_metadata():
+    return {
+        "tenant_id": "tenant-owner-123",
+        "source_principal": "telegram:123",
+        "gateway_session_id": "session-owner-123",
+        "source_message_id": "77",
+        "is_group": False,
+        "is_forwarded": False,
+    }
+
+
+def test_e5_date_event_accepts_actual_reply_to_source_binding_without_camera_extras():
+    original = _e5_original_metadata()
+    date_metadata = {
+        **original,
+        "source_message_id": "date-message-91",
+        "reply_to_source_message_id": "77",
+    }
+
+    validate_e5_date_source_link(
+        date_metadata=date_metadata,
+        original_metadata=original,
+        expected_date_source_id="date-message-91",
+    )
+
+
+def test_e5_requires_one_exact_original_event_for_the_reply_source():
+    validate_e5_unique_original_event_ids(
+        observed_event_ids=["original-meal-1"],
+        expected_original_event_id="original-meal-1",
+    )
+
+
+@pytest.mark.parametrize("observed_event_ids", [[], ["original-meal-1", "duplicate-meal"]])
+def test_e5_date_source_does_not_pass_when_original_event_is_missing_or_ambiguous(
+    observed_event_ids,
+):
+    with pytest.raises(AssertionError, match="one original runtime observation"):
+        validate_e5_unique_original_event_ids(
+            observed_event_ids=observed_event_ids,
+            expected_original_event_id="original-meal-1",
+        )
+
+
+@pytest.mark.asyncio
+async def test_e5_immutability_uses_the_full_raw_honcho_reader_shape():
+    from ohmo.memory_service.honcho_client import HonchoClient
+
+    created_at = "2026-10-06T12:00:00+00:00"
+    persisted_row = {
+        "id": "original-meal-1",
+        "peer_id": "ohmo",
+        "session_id": "session-owner-123",
+        "workspace_id": "workspace-1",
+        "created_at": created_at,
+        "content": "Persisted assistant meal text",
+        "metadata": {
+            "gateway_session_id": "session-owner-123",
+            "source_message_id": "77",
+            "decision_trace": {"annotations": {"nutrition": {
+                "record_type": "meal_observation",
+                "consumption_status": "consumed",
+                "energy_kcal_best": 125,
+            }}},
+        },
+    }
+
+    def handler(request):
+        assert request.url.path.endswith("sessions/session-owner-123/messages/list")
+        page = int(request.url.params["page"])
+        size = int(request.url.params["size"])
+        return httpx.Response(200, json={
+            "items": [persisted_row], "page": page, "size": size, "pages": 1, "total": 1,
+        })
+
+    since = datetime(2026, 10, 6, 11, tzinfo=timezone.utc)
+    until = datetime(2026, 10, 6, 13, tzinfo=timezone.utc)
+    client = HonchoClient(
+        "https://honcho.fixture", "synthetic-token", "workspace-1",
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        metadata_rows = await client.list_recent_message_metadata(
+            "session-owner-123", expected_peer_id="ohmo", since=since, until=until,
+        )
+        assert len(metadata_rows) == 1
+        assert not hasattr(metadata_rows[0], "content")
+
+        raw_rows = await client.list_messages_in_window(
+            "session-owner-123", expected_peer_id="ohmo", since=since, until=until,
+        )
+    finally:
+        await client.aclose()
+
+    assert len(raw_rows) == 1
+    assert raw_rows[0] == persisted_row
+    assert raw_rows[0]["content"] == "Persisted assistant meal text"
+    assert raw_rows[0]["metadata"] == persisted_row["metadata"]
+    assert raw_rows[0]["created_at"] == created_at
+    assert e5_raw_honcho_row_fingerprint(raw_rows[0]) == e5_raw_honcho_row_fingerprint(
+        dict(raw_rows[0])
+    )
+    for changed_field, changed_value in (
+        ("content", "changed persisted content"),
+        ("metadata", {"source_message_id": "different"}),
+        ("created_at", "2026-10-06T12:00:01+00:00"),
+    ):
+        changed = dict(raw_rows[0])
+        changed[changed_field] = changed_value
+        with pytest.raises(AssertionError, match="immutable original raw Honcho row"):
+            assert_e5_raw_honcho_row_unchanged(raw_rows[0], changed)
+
+
+@pytest.mark.parametrize(
+    ("override", "missing"),
+    [
+        ({"source_principal": "telegram:foreign"}, None),
+        ({"gateway_session_id": "foreign-session"}, None),
+        ({"tenant_id": "foreign-tenant"}, None),
+        ({"reply_to_source_message_id": "999"}, None),
+        ({"source_message_id": "foreign-date-message"}, None),
+        ({"is_group": True}, None),
+        ({"is_forwarded": True}, None),
+        ({}, "reply_to_source_message_id"),
+        ({}, "source_message_id"),
+    ],
+)
+def test_e5_date_event_rejects_untrusted_or_missing_reply_source(override, missing):
+    original = _e5_original_metadata()
+    date_metadata = {
+        **original,
+        "source_message_id": "date-message-91",
+        "reply_to_source_message_id": "77",
+    }
+    date_metadata.update(override)
+    if missing:
+        date_metadata.pop(missing)
+
+    with pytest.raises(AssertionError, match="trusted owner/source/session"):
+        validate_e5_date_source_link(
+            date_metadata=date_metadata,
+            original_metadata=original,
+            expected_date_source_id="date-message-91",
+        )
+
+
+def _e5_denial_fixture():
+    original = _e5_original_metadata()
+    commit = {
+        "kind": "denial",
+        "event_id": "assistant-denial-8",
+        "source_message_id": "owner-denial-10",
+        "client_op_id": "turn-denial:assistant",
+        "target_event_id": "original-meal-1",
+        "target_source_message_id": "77",
+    }
+    metadata = {
+        **original,
+        "source_message_id": "owner-denial-10",
+        "reply_to_source_message_id": "77",
+        "client_op_id": "turn-denial:assistant",
+        "camera_candidate_id": "candidate-123",
+        "camera_operation_id": "candidate-123",
+        "camera_original_event_id": "original-meal-1",
+        "camera_answer_bound": "no",
+        "camera_correction_bound": True,
+        "decision_trace": {"annotations": {"nutrition": {
+            "record_type": "meal_correction",
+            "changed_fields": ["consumption_status", "energy_kcal_best"],
+            "consumption_status": "not_consumed",
+            "energy_kcal_best": 0,
+        }}},
+    }
+    row = {
+        "id": "assistant-denial-8",
+        "peer_id": "ohmo",
+        "session_id": "session-owner-123",
+        "workspace_id": "workspace-1",
+        "created_at": "2026-10-06T12:01:00+00:00",
+        "content": "Persisted denial correction",
+        "metadata": metadata,
+    }
+    return original, commit, row
+
+
+@pytest.mark.parametrize("outbound_event_id", [None, "assistant-denial-8"])
+def test_e5_denial_receipt_uses_actual_durable_event_when_public_id_is_absent(
+    outbound_event_id,
+):
+    original, commit, row = _e5_denial_fixture()
+
+    event_id = validate_e5_denial_receipt(
+        correction_commit=commit,
+        outbound_event_id=outbound_event_id,
+        candidate_id="candidate-123",
+        original_event_id="original-meal-1",
+        original_metadata=original,
+        honcho_row=row,
+    )
+
+    assert event_id == "assistant-denial-8"
+
+
+@pytest.mark.parametrize(
+    ("commit_override", "metadata_override", "outbound_event_id"),
+    [
+        ({"kind": "portion"}, {}, None),
+        ({"target_event_id": "foreign-event"}, {}, None),
+        ({"target_source_message_id": "999"}, {}, None),
+        ({}, {"source_principal": "telegram:foreign"}, None),
+        ({}, {"gateway_session_id": "foreign-session"}, None),
+        ({}, {"source_message_id": "foreign-source"}, None),
+        ({}, {"reply_to_source_message_id": "999"}, None),
+        ({}, {"decision_trace": {"annotations": {"nutrition": {
+            "record_type": "meal_correction", "changed_fields": ["items"],
+            "consumption_status": "not_consumed", "energy_kcal_best": 0,
+        }}}}, None),
+        ({}, {}, "different-outbound-event"),
+        ({}, {}, ""),
+    ],
+)
+def test_e5_denial_receipt_rejects_mismatched_commit_or_honcho_row(
+    commit_override, metadata_override, outbound_event_id,
+):
+    original, commit, row = _e5_denial_fixture()
+    commit.update(commit_override)
+    row["metadata"].update(metadata_override)
+
+    with pytest.raises(AssertionError, match="durable Honcho correction"):
+        validate_e5_denial_receipt(
+            correction_commit=commit,
+            outbound_event_id=outbound_event_id,
+            candidate_id="candidate-123",
+            original_event_id="original-meal-1",
+            original_metadata=original,
+            honcho_row=row,
+        )
+
+
+def test_e5_replay_oracle_tracks_denial_without_resurrecting_original_meal():
+    original_commit = {"event_id": "original-meal-1", "client_op_id": "original:assistant"}
+
+    status = validate_e5_post_correction_replay(
+        status="Исправление уже записано.",
+        delivery_receipt=object(),
+        event_id="assistant-denial-8",
+        expected_event_id="assistant-denial-8",
+        original_commit=original_commit,
+        current_commit=original_commit.copy(),
+    )
+
+    assert status == "Исправление уже записано."
+
+
+@pytest.mark.parametrize(
+    ("status", "event_id", "delivery_receipt", "current_commit"),
+    [
+        ("Запись уже записана.", "assistant-denial-8", object(), {"event_id": "original-meal-1"}),
+        ("Исправление уже записано.", "original-meal-1", object(), {"event_id": "original-meal-1"}),
+        ("Исправление уже записано.", "assistant-denial-8", None, {"event_id": "original-meal-1"}),
+        ("Исправление уже записано.", "assistant-denial-8", object(), {"event_id": "resurrected"}),
+    ],
+)
+def test_e5_replay_oracle_rejects_stale_or_unverified_final_status(
+    status, event_id, delivery_receipt, current_commit,
+):
+    with pytest.raises(AssertionError, match="post-denial replay"):
+        validate_e5_post_correction_replay(
+            status=status,
+            delivery_receipt=delivery_receipt,
+            event_id=event_id,
+            expected_event_id="assistant-denial-8",
+            original_commit={"event_id": "original-meal-1"},
+            current_commit=current_commit,
+        )
 
 
 def _native_settings() -> Settings:

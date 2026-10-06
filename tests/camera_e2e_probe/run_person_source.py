@@ -119,6 +119,10 @@ async def main() -> None:
             continuation_client, CodexApiClient
         ):
             raise AssertionError("native clients must both be Codex subscription clients")
+    elif os.environ.get("CAMERA_PERSON_SOURCE_CASE"):
+        from person_source_acceptance import SyntheticPersonSourceApi
+
+        bot_client = SyntheticPersonSourceApi(os.environ["CAMERA_PERSON_SOURCE_CASE"])
     else:
         bot_client = OfflinePersonSourceApi(
             outcome=os.environ.get("CAMERA_OFFLINE_OUTCOME", "meal"),
@@ -169,10 +173,40 @@ async def main() -> None:
             config_dir=native_config,
             before_turn=read_before,
         )
+        replay_trajectory = None
+        after_first_result = None
+        if os.environ.get("CAMERA_PERSON_SOURCE_CASE") == "send_time_meal":
+            first_completed_at = datetime.fromisoformat(trajectory["completed_at"])
+            try:
+                after_first_result = {
+                    "status": "complete",
+                    "rows": await honcho_history_snapshot(
+                        honcho, session=session, since=lower, until=first_completed_at
+                    ),
+                }
+            except Exception as exc:
+                after_first_result = {
+                    "status": "error", "rows": None,
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            replay_trajectory = await run_person_source_turn(
+                root=root,
+                message=message,
+                owner_id=owner_id,
+                honcho_url=honcho_url,
+                workspace=workspace,
+                session=session,
+                bot_client=bot_client,
+                native_mode=native,
+                config_dir=native_config,
+                before_turn=read_before,
+            )
         before_result = trajectory["before_evidence"]
         before = before_result.get("rows") or []
         before_until = datetime.fromisoformat(trajectory["before_until"])
-        completed_at = datetime.fromisoformat(trajectory["completed_at"])
+        completed_at = datetime.fromisoformat(
+            (replay_trajectory or trajectory)["completed_at"]
+        )
         try:
             after_result = {
                 "status": "complete",
@@ -193,7 +227,9 @@ async def main() -> None:
         "wellness": None,
     }
     projected_rows: list[dict] = []
-    if expected_event:
+    person_case = os.environ.get("CAMERA_PERSON_SOURCE_CASE")
+    person_acceptance = person_case is not None
+    if expected_event or person_acceptance:
         try:
             from mcp.server.fastmcp.server import FastMCP
             from mcp.types import ToolAnnotations
@@ -240,10 +276,14 @@ async def main() -> None:
             )
             try:
                 await sync_nutrition_honcho(credentials=credentials, db=database)
-                record = database.get_record_by_event_id(owner_id, expected_event)
+                record = database.get_record_by_event_id(owner_id, expected_event) if expected_event else None
                 meal = database.get_current_meal(owner_id, record.meal_id) if record else None
-                day_start = sent_at - timedelta(days=1)
-                day_end = sent_at + timedelta(days=1)
+                event_time = (
+                    record.nutrition.meal_at or record.capture_time
+                    if record else sent_at
+                )
+                day_start = event_time - timedelta(days=1)
+                day_end = event_time + timedelta(days=1)
                 wellness_result = await call_wellness_with_synthetic_self(
                     app,
                     authorization,
@@ -255,9 +295,34 @@ async def main() -> None:
                     (row for row in projected_rows if row.get("latest_event_id") == expected_event),
                     None,
                 )
+                records_before_close = list(database.iter_records(owner_id))
+                meals_before_close = list(database.iter_current_meals(owner_id))
+                reopened_record = None
+                reopened_meal = None
+                database.close()
+                database = NutritionDataStore(root / "nutrition.db")
+                reopened_records = list(database.iter_records(owner_id))
+                reopened_meals = list(database.iter_current_meals(owner_id))
+                reopened_record = (
+                    database.get_record_by_event_id(owner_id, expected_event)
+                    if expected_event else None
+                )
+                reopened_meal = (
+                    database.get_current_meal(owner_id, reopened_record.meal_id)
+                    if reopened_record else None
+                )
                 projection = {
-                    "status": "projected" if record is not None and meal is not None else "missing",
+                    "status": (
+                        "projected"
+                        if expected_event and reopened_record is not None and reopened_meal is not None
+                        else "complete_absence"
+                        if person_acceptance and not reopened_records and not reopened_meals
+                        and before_result["status"] == after_result["status"] == "complete"
+                        and not new_nutrition_event_ids(before, after)
+                        else "missing"
+                    ),
                     "event_id": expected_event,
+                    "store_reopened": True,
                     "event": record.model_dump(mode="json") if record else None,
                     "effective_meal": meal.model_dump(mode="json") if meal else None,
                     "effective_meal_date": meal.local_day(ZoneInfo("UTC")) if meal else None,
@@ -267,6 +332,16 @@ async def main() -> None:
                     ),
                     "wellness": projected_row,
                     "all_wellness_rows": projected_rows,
+                    "new_nutrition_event_ids": new_nutrition_event_ids(before, after),
+                    "records_before_close": [row.model_dump(mode="json") for row in records_before_close],
+                    "current_meals_before_close": [row.model_dump(mode="json") for row in meals_before_close],
+                    "reopened_records": [row.model_dump(mode="json") for row in reopened_records],
+                    "reopened_current_meals": [row.model_dump(mode="json") for row in reopened_meals],
+                    "reopened_event": reopened_record.model_dump(mode="json") if reopened_record else None,
+                    "reopened_effective_meal": reopened_meal.model_dump(mode="json") if reopened_meal else None,
+                    "reopened_effective_meal_date": (
+                        reopened_meal.local_day(ZoneInfo("UTC")) if reopened_meal else None
+                    ),
                 }
             finally:
                 health.close()
@@ -299,22 +374,42 @@ async def main() -> None:
         )
         projection["observed_nutrition_event_ids"] = observed
 
+    replay_result = None
+    if replay_trajectory is not None:
+        replay_after = (replay_trajectory.get("before_evidence") or {}).get("rows") or []
+        replay_result = {
+            "same_source": (
+                replay_trajectory.get("source_message_id") == trajectory.get("source_message_id")
+                and hashlib.sha256(source_jpeg(source_path, source_digest, ROOT) or b"").hexdigest()
+                == source_digest
+            ),
+            "fixture_saw_known_photo_context": getattr(bot_client, "saw_same_photo_context", False),
+            "save": replay_trajectory["save"],
+            "new_nutrition_event_ids": new_nutrition_event_ids(
+                after_first_result.get("rows") or [], replay_after
+            ) if after_first_result else [],
+            "event_count_after_replay": len(new_nutrition_event_ids(before, after)),
+            "after_first_status": after_first_result["status"] if after_first_result else "missing",
+            "after_first": (after_first_result or {}).get("rows"),
+            "after_replay": after,
+        }
+
     artifact = {
         "mode": mode,
         "persistence_chain_complete": bool(
             trajectory["save"]["saved"]
-            and projection["status"] == "projected"
+            and projection["status"] in {"projected", "projected_and_reopened"}
             and any(row["id"] == expected_event for row in after)
         ),
         "native_persistence_chain_complete": bool(
             native
             and trajectory["save"]["saved"]
-            and projection["status"] == "projected"
+            and projection["status"] in {"projected", "projected_and_reopened"}
             and any(row["id"] == expected_event for row in after)
         ),
         "source_pair": source_pair,
         "interaction_boundary": {
-            "runtime_turns": 1,
+            "runtime_turns": 2 if replay_trajectory is not None else 1,
             "virtual_user_continuation": "not_run",
             "continuation_client": "preflighted_unused" if native else "not_created",
             "public_scenario_use": "retained_in_artifact_only",
@@ -341,6 +436,7 @@ async def main() -> None:
             key: value for key, value in trajectory.items()
             if key not in {"runtime_episodes", "before_evidence"}
         },
+        "replay": replay_result,
         "runtime_episodes": trajectory["runtime_episodes"],
         "honcho": {
             "before_status": before_result["status"],

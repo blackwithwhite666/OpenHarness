@@ -97,13 +97,16 @@ OHMO_NUTRITION_AUDIT_HONCHO_TOKEN=... python -m ohmo.evals.nutrition_persistence
   --honcho-base-url https://honcho.example --honcho-workspace workspace-id \
   --honcho-session ohmo --honcho-owner synthetic-owner \
   --since 2026-10-01T07:00:00+00:00 --until 2026-10-01T09:00:00+00:00 \
-  --telegent-server wellness --telegent-login synthetic \
+  --telegent-server wellness --telegent-login synthetic --telegent-reader-id 123456789 \
   --start 2026-09-30T21:00:00+00:00 --end 2026-10-01T09:00:00+00:00
 ```
 
 The live Telegent reader selects only the named HTTP server from OpenHarness
 settings and uses `McpClientManager`, preserving configured headers and OAuth
-refresh. Telegent credentials are not copied into audit flags or output. The
+refresh. Live mode also requires the current operator's canonical positive
+Telegram ID and valid wellness signing configuration bound to the selected
+OAuth client. The reader ID is supplied explicitly; it is not inferred from the
+goal owner or target login. Telegent credentials are not copied into audit flags or output. The
 returned interval and normalized login are checked against the request; both
 canonical collections and every record needed for absence/current-state checks
 are validated. The only token environment variable above is for Honcho.

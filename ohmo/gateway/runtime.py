@@ -1950,11 +1950,21 @@ class OhmoSessionRuntimePool:
                         and typed_attempt["camera_correction_commit"].get("kind") == "portion"
                     )
                 )
-                and typed_target is not None
-                and str(typed_target) in {
-                    str(typed_attempt.get("photo_id")),
-                    *map(str, typed_attempt.get("reply_ids", [])),
-                }
+                and (
+                    (
+                        typed_target is not None
+                        and str(typed_target) in {
+                            str(typed_attempt.get("photo_id")),
+                            *map(str, typed_attempt.get("reply_ids", [])),
+                        }
+                    )
+                    or (
+                        typed_target is None
+                        and self._camera_ingress.is_completed_context_typed_repeat(
+                            message, typed_replay_candidate_id,
+                        )
+                    )
+                )
             )
         completed_replay = (
             camera_authorized and message.metadata.get("_camera_existing_meal_replay") is True
@@ -2256,6 +2266,13 @@ class OhmoSessionRuntimePool:
                     f"{turn_id}:user", f"{turn_id}:assistant"
                 )
                 typed_replay = typed_replay_candidate
+                context_typed_replay = bool(
+                    typed_replay
+                    and message.metadata.get("_camera_route") == "context"
+                    and self._camera_ingress.is_completed_context_typed_repeat(
+                        message, candidate_id,
+                    )
+                )
                 selected_label = (
                     message.content if typed_replay
                     else message.metadata.get("native_keyboard_selected_label")
@@ -2279,6 +2296,61 @@ class OhmoSessionRuntimePool:
                         *map(str, attempt.get("reply_ids", [])),
                     }
                     if typed_replay and isinstance(attempt, dict) else set()
+                )
+                retained_source_ids = (
+                    {
+                        str(attempt.get("photo_id")),
+                        *map(str, attempt.get("reply_ids", [])),
+                    }
+                    if isinstance(attempt, dict) else set()
+                )
+                original_route = (
+                    assistant_metadata.get("camera_route")
+                    if isinstance(assistant_metadata, Mapping) else None
+                )
+                original_context_receipt = bool(
+                    original_route == "context"
+                    and isinstance(assistant_metadata, Mapping)
+                    and "camera_reply_to_native_message_id" not in assistant_metadata
+                )
+                original_source_bound_receipt = bool(
+                    original_route in {"reply", "callback"}
+                    and committed_binding is not None
+                    and str(committed_binding) in retained_source_ids
+                )
+                current_route = message.metadata.get("_camera_route")
+                current_binding_is_retained = (
+                    replay_binding is not None
+                    and str(replay_binding) in retained_source_ids
+                )
+                trusted_explicit_source_replay = bool(
+                    current_binding_is_retained
+                    and (
+                        (typed_replay and current_route == "reply")
+                        or (
+                            camera_authorized
+                            and message.metadata.get("_camera_existing_meal_replay") is True
+                            and current_route in {"reply", "callback"}
+                        )
+                    )
+                )
+                replay_receipt_route_valid = bool(
+                    (
+                        original_context_receipt
+                        and (context_typed_replay or trusted_explicit_source_replay)
+                    )
+                    or (
+                        original_source_bound_receipt
+                        and (
+                            str(committed_binding) in typed_source_ids
+                            if typed_replay
+                            else committed_binding == str(replay_binding)
+                        )
+                    )
+                )
+                durable_replay = bool(
+                    typed_replay
+                    or message.metadata.get("_camera_existing_meal_replay") is True
                 )
                 trace = (
                     assistant_metadata.get("decision_trace")
@@ -2318,11 +2390,7 @@ class OhmoSessionRuntimePool:
                     or assistant_metadata.get("camera_candidate_id") != candidate_id
                     or assistant_metadata.get("camera_operation_id") != candidate_id
                     or assistant_metadata.get("camera_answer_bound") != "yes"
-                    or (
-                        str(committed_binding) not in typed_source_ids
-                        if typed_replay
-                        else committed_binding != str(replay_binding)
-                    )
+                    or not replay_receipt_route_valid
                     or assistant_metadata.get("gateway_session_id") != turn_ctx.session_id
                     or assistant_metadata.get("tenant_id") != memory_scope.private_tenant
                     or assistant_metadata.get("source_principal")
@@ -2330,7 +2398,7 @@ class OhmoSessionRuntimePool:
                     or assistant_metadata.get("source_message_id")
                     != commit.get("source_message_id")
                     or (
-                        not typed_replay
+                        not durable_replay
                         and assistant_metadata.get("source_message_id") != source_message_id
                     )
                     or assistant_metadata.get("ingest_source") != "dropbox_camera"
@@ -3422,6 +3490,58 @@ class OhmoSessionRuntimePool:
             and selected_binding[0] is _SELECTED_SOURCE_AUTHORITY
             or requested_correction and native_reply_authorized
         )
+        if message.metadata.get("_camera_ordinary_date_correction") is CAMERA_AUTHORITY:
+            ingress = getattr(self, "_camera_ingress", None)
+            camera_config = self._gateway_config.camera_ingress
+            retained = [
+                attempt for attempt in getattr(ingress, "_attempts", {}).values()
+                if native_reply_target is not None
+                and native_reply_target in {
+                    str(attempt.get("photo_id")),
+                    *map(str, attempt.get("reply_ids", [])),
+                }
+            ]
+            attempt = retained[0] if len(retained) == 1 else None
+            latest = attempt.get("camera_correction_commit") if isinstance(attempt, dict) else None
+            retained_meal = bool(
+                ingress is not None
+                and camera_config.enabled
+                and str(message.chat_id) == camera_config.chat_id
+                and message.sender_id.split("|", 1)[0] == camera_config.principal
+                and session_key == camera_config.session_key
+                and len(retained) == 1
+                and isinstance(attempt, dict)
+                and attempt.get("state") == "completed"
+                and attempt.get("finalizer_status") == "committed"
+                and isinstance(attempt.get("camera_commit"), dict)
+                and (
+                    attempt.get("camera_correction") is None
+                    or (
+                        attempt.get("camera_correction") == "completed"
+                        and isinstance(latest, dict)
+                        and latest.get("kind") == "portion"
+                    )
+                )
+            )
+            changed_fields = (
+                set(finalizer_nutrition.changed_fields)
+                if finalizer_nutrition is not None else set()
+            )
+            if (
+                not native_reply_authorized
+                or not ordinary_correction
+                or not retained_meal
+                or finalizer_nutrition is None
+                or finalizer_nutrition.record_type != "meal_correction"
+                or not changed_fields
+                or not changed_fields <= {"meal_at", "meal_date"}
+                or not changed_fields & {"meal_at", "meal_date"}
+                or ("meal_at" in changed_fields and finalizer_nutrition.meal_at is None)
+                or ("meal_date" in changed_fields and finalizer_nutrition.meal_date is None)
+            ):
+                raise ValueError(
+                    "Camera source-bound date correction requires an explicit date-only correction"
+                )
         if camera_clarification:
             # A context-bound but unconfirmed answer may be an unrelated owner
             # turn. Preserve the model's ordinary response while keeping the
@@ -3469,15 +3589,88 @@ class OhmoSessionRuntimePool:
                 and camera_commit.get("event_id") == append_receipt.assistant_message_id
                 and camera_commit.get("client_op_id") == append_receipt.assistant_client_op_id
             )
+            correction_kind = (
+                "portion" if camera_portion_correction else
+                "denial" if (
+                    message.metadata.get("_camera_correction") is CAMERA_AUTHORITY
+                    and message.metadata.get("_camera_answer") == "no"
+                ) else None
+            )
+            correction_metadata = (
+                append_receipt.assistant_metadata
+                if append_receipt is not None
+                and isinstance(append_receipt.assistant_metadata, Mapping) else {}
+            )
+            candidate_id = message.metadata.get("_camera_candidate_id")
+            original_event_id = camera_commit.get("event_id") if isinstance(camera_commit, dict) else None
+            original_source_id = (
+                camera_commit.get("source_message_id") if isinstance(camera_commit, dict) else None
+            )
             camera_correction_saved = bool(
-                camera_portion_correction
+                correction_kind is not None
                 and append_receipt is not None
                 and isinstance(camera_correction_commit, dict)
+                and isinstance(camera_commit, dict)
+                and camera_commit.get("candidate_id") == candidate_id
+                and camera_correction_commit.get("kind") == correction_kind
                 and camera_correction_commit.get("event_id") == append_receipt.assistant_message_id
                 and camera_correction_commit.get("client_op_id") == append_receipt.assistant_client_op_id
-                and camera_correction_commit.get("target_event_id")
-                == message.metadata.get("_camera_original_event_id")
+                and camera_correction_commit.get("source_message_id")
+                == correction_metadata.get("source_message_id")
+                and correction_metadata.get("source_message_id")
+                == _normalize_source_message_ref(message.metadata.get("message_id"))
+                and append_receipt.user_client_op_id
+                == f"{camera_correction_commit.get('client_op_id', '').removesuffix(':assistant')}:user"
+                and camera_correction_commit.get("target_event_id") == original_event_id
+                and camera_correction_commit.get("target_source_message_id") == original_source_id
+                and correction_metadata.get("role") == "assistant"
+                and correction_metadata.get("client_op_id") == append_receipt.assistant_client_op_id
+                and correction_metadata.get("camera_candidate_id") == candidate_id
+                and correction_metadata.get("camera_operation_id") == candidate_id
+                and correction_metadata.get("camera_original_event_id") == original_event_id
+                and correction_metadata.get("reply_to_source_message_id") == original_source_id
+                and correction_metadata.get("camera_answer_bound")
+                == ("yes" if correction_kind == "portion" else "no")
+                and correction_metadata.get("camera_correction_bound") is True
+                and correction_metadata.get("gateway_session_id") == turn_ctx.session_id
+                and isinstance(memory_scope, MemoryScope)
+                and correction_metadata.get("tenant_id") == memory_scope.private_tenant
+                and correction_metadata.get("source_principal")
+                == f"telegram:{canonical_principal(message.channel, turn_ctx.principal)}"
+                and correction_metadata.get("ingest_source") == "dropbox_camera"
+                and correction_metadata.get("confirmation_required") is True
             )
+            if camera_correction_saved:
+                stored_trace = correction_metadata.get("decision_trace")
+                stored_annotations = (
+                    stored_trace.get("annotations") if isinstance(stored_trace, Mapping) else None
+                )
+                stored_nutrition = (
+                    stored_annotations.get("nutrition")
+                    if isinstance(stored_annotations, Mapping) else None
+                )
+                try:
+                    stored_correction = NutritionAnnotationV2.model_validate(stored_nutrition)
+                except (TypeError, ValueError):
+                    camera_correction_saved = False
+                else:
+                    camera_correction_saved = bool(
+                        stored_correction.record_type == "meal_correction"
+                        and (
+                            (
+                                correction_kind == "denial"
+                                and stored_correction.consumption_status == "not_consumed"
+                                and "consumption_status" in stored_correction.changed_fields
+                            )
+                            or (
+                                correction_kind == "portion"
+                                and stored_correction.consumption_status == "unknown"
+                                and "items" in stored_correction.changed_fields
+                                and not {"consumption_status", "meal_at", "meal_date"}
+                                & set(stored_correction.changed_fields)
+                            )
+                        )
+                    )
             ordinary_meal_saved = bool(
                 ordinary_meal and append_receipt is not None
                 and isinstance(append_receipt.assistant_metadata, Mapping)
@@ -3657,12 +3850,15 @@ class OhmoSessionRuntimePool:
                     nutrition_append_event_id=camera_commit["event_id"],
                     nutrition_sync_status="pending",
                 )
-            elif camera_correction_saved and isinstance(camera_correction_commit, dict):
-                reply = "Изменение сохранено; баланс обновляется."
-                metadata.update(
-                    nutrition_append_event_id=camera_correction_commit["event_id"],
-                    nutrition_sync_status="pending",
-                )
+            elif message.metadata.get("_camera_correction") is CAMERA_AUTHORITY:
+                if camera_correction_saved and isinstance(camera_correction_commit, dict):
+                    reply = "Изменение сохранено; баланс обновляется."
+                    metadata.update(
+                        nutrition_append_event_id=camera_correction_commit["event_id"],
+                        nutrition_sync_status="pending",
+                    )
+                else:
+                    reply = "Не удалось подтвердить сохранение изменения."
             elif camera_yes and finalizer_nutrition is not None:
                 reply = "Не удалось подтвердить сохранение записи."
             elif ordinary_meal:
@@ -4332,8 +4528,10 @@ class OhmoSessionRuntimePool:
                     event,
                     model=str(bundle.current_settings().model or ""),
                 )
-            if not reply_parts:
-                reply_parts.append(event.message.text.strip())
+            if not any(part.strip() for part in reply_parts):
+                completed_text = event.message.text.strip()
+                if completed_text:
+                    reply_parts.append(completed_text)
 
     async def _save_snapshot(
         self, bundle: RuntimeBundle, session_key: str, user_prompt: str
@@ -6013,6 +6211,26 @@ def _build_inbound_user_message(
 def _event_id_for_inbound_message(message: InboundMessage) -> str | None:
     """Derive idempotency only from gateway-validated channel identifiers."""
     metadata = message.metadata or {}
+    if metadata.get("callback_query") is True:
+        callback_query_id = metadata.get("callback_query_id")
+        if (
+            not isinstance(callback_query_id, str)
+            or not callback_query_id.strip()
+            or callback_query_id != callback_query_id.strip()
+            or len(callback_query_id) > 512
+            or any(ord(character) < 32 or ord(character) == 127 for character in callback_query_id)
+        ):
+            raise ValueError("callback_query_id is missing or malformed")
+        seed = "\x00".join(
+            (
+                str(message.channel).strip().lower(),
+                str(message.chat_id),
+                canonical_principal(message.channel, str(message.sender_id)),
+                "callback-query",
+                callback_query_id,
+            )
+        ).encode("utf-8")
+        return f"ohmo-event-{hashlib.sha256(seed).hexdigest()}"
     source_message_id = next(
         (
             normalized

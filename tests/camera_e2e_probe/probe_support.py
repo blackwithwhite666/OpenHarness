@@ -267,40 +267,97 @@ def verify_source_tree_pin(path: Path, expected_head: str) -> tuple[Path, str, s
     return root, head, tree
 
 
-def require_bound_answer(message, candidate_id: str, native_photo_id: int | str = 77) -> str:
+def require_bound_answer(
+    message, candidate_id: str, native_photo_id: int | str = 77,
+    *, expected_route: str | None = None, trusted_turn_id: str | None = None,
+) -> str:
     metadata = message.metadata
     turn_id = metadata.get("_camera_turn_id")
-    source_target = (
-        metadata.get("native_message_id")
-        if metadata.get("callback_query")
-        else metadata.get("reply_to_message_id")
-    )
-    if not (
+    route = metadata.get("_camera_route")
+    trusted_photo_id = metadata.get("_camera_photo_id")
+    common_binding = (
         metadata.get("_camera_authority") is CAMERA_AUTHORITY
         and metadata.get("_camera_answer") == "yes"
         and metadata.get("_camera_candidate_id") == candidate_id
-        and str(source_target) == str(native_photo_id)
         and isinstance(turn_id, str)
         and turn_id
+        and (
+            (expected_route != "context" and trusted_turn_id is None)
+            or (isinstance(trusted_turn_id, str) and turn_id == trusted_turn_id)
+        )
         and len(message.media) == 1
-    ):
+    )
+    if expected_route is not None and route != expected_route:
+        raise AssertionError("Camera owner reply used a different route than requested")
+    route_binding = False
+    if route == "context":
+        route_binding = (
+            trusted_photo_id == native_photo_id
+            and "reply_to_message_id" not in metadata
+            and "native_message_id" not in metadata
+            and metadata.get("callback_query") is not True
+        )
+    elif route == "reply":
+        route_binding = (
+            trusted_photo_id == native_photo_id
+            and str(metadata.get("reply_to_message_id")) == str(native_photo_id)
+            and metadata.get("callback_query") is not True
+        )
+    elif route == "callback":
+        route_binding = (
+            metadata.get("callback_query") is True
+            and str(metadata.get("native_message_id")) == str(native_photo_id)
+        )
+    if not (common_binding and route_binding):
         raise AssertionError("Camera owner reply was not bound to the native photo")
     return turn_id
 
 
 def select_finalizer_event(
-    messages, candidate_id: str, answer_message_id: str, native_photo_id: int | str
+    messages, candidate_id: str, answer_message_id: str, native_photo_id: int | str,
+    *, expected_route: str = "reply", expected_capture_time=None,
+    expected_event_id: str | None = None,
 ):
     """Reject fixture events and unrelated assistant turns before sync."""
+    if expected_route not in {"reply", "context", "callback"}:
+        raise ValueError("Camera finalizer route must be reply, context, or callback")
+
+    def route_binding(metadata):
+        if metadata.get("camera_route") != expected_route:
+            return False
+        binding = metadata.get("camera_reply_to_native_message_id")
+        if expected_route == "context":
+            return "camera_reply_to_native_message_id" not in metadata
+        return binding == str(native_photo_id)
+
+    def capture_matches(metadata):
+        if expected_capture_time is None:
+            return True
+        trace = metadata.get("decision_trace")
+        annotations = trace.get("annotations") if isinstance(trace, Mapping) else None
+        nutrition = annotations.get("nutrition") if isinstance(annotations, Mapping) else None
+        meal_at = nutrition.get("meal_at") if isinstance(nutrition, Mapping) else None
+        if isinstance(meal_at, str):
+            from datetime import datetime
+
+            try:
+                meal_at = datetime.fromisoformat(meal_at)
+            except ValueError:
+                return False
+        return meal_at == expected_capture_time
+
     matches = [
         item
         for item in messages
         if item.metadata.get("role") == "assistant"
         and item.metadata.get("camera_candidate_id") == candidate_id
         and item.metadata.get("camera_answer_bound") == "yes"
-        and item.metadata.get("camera_reply_to_native_message_id") == str(native_photo_id)
+        and item.metadata.get("camera_operation_id") == candidate_id
+        and route_binding(item.metadata)
         and item.metadata.get("source_message_id") == answer_message_id
         and item.metadata.get("nutrition_annotation_status") == "recorded"
+        and capture_matches(item.metadata)
+        and (expected_event_id is None or item.id == expected_event_id)
     ]
     if len(matches) != 1:
         raise AssertionError("expected exactly one validated finalizer meal event")
