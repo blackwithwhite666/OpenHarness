@@ -58,7 +58,8 @@ def test_bundled_calory_trace_example_survives_default_engine_preview(tmp_path, 
     assert preview == result.output[:3000]
     for required_guidance in (
         "A Camera/source photo needs meaningful affirmative owner confirmation",
-        "whole identifiable package, labeled unit, or visible portion",
+        "Identifiable single unit: count its whole original unit, even if bitten or partly eaten, unless the owner states a partial amount",
+        "Estimate visible portions only if no whole unit is identifiable",
         "cooked edible mass or household measure",
         "`quantity_text`",
         "`energy_kcal_min`, `energy_kcal_max`, `energy_kcal_best`",
