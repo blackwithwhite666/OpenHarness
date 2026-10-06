@@ -46,6 +46,7 @@ from openharness.config.schema import TelegramConfig  # noqa: E402
 from camera_runtime_support import (  # noqa: E402
     distinct_offline_clients,
     OfflineTelegramBot,
+    camera_typed_reply_mode,
     run_camera_runtime_trajectory,
 )
 
@@ -58,6 +59,7 @@ async def verify_finalizer_event(
     candidate_id: str,
     answer_message_id: str,
     native_photo_id: int,
+    expected_route: str,
     expected_event_id: str,
     started: datetime,
     expected_capture_time: datetime,
@@ -82,7 +84,12 @@ async def verify_finalizer_event(
             since=started - timedelta(minutes=1),
             until=datetime.now(timezone.utc) + timedelta(minutes=1),
         )
-    event = select_finalizer_event(messages, candidate_id, answer_message_id, native_photo_id)
+    event = select_finalizer_event(
+        messages, candidate_id, answer_message_id, native_photo_id,
+        expected_route=expected_route,
+        expected_capture_time=expected_capture_time,
+        expected_event_id=expected_event_id,
+    )
     consumed_events = []
     for item in messages:
         trace_item = item.metadata.get("decision_trace")
@@ -122,12 +129,17 @@ async def verify_finalizer_event(
         "camera_candidate_id": candidate_id,
         "source_message_id": answer_message_id,
         "camera_operation_id": candidate_id,
-        "camera_reply_to_native_message_id": str(native_photo_id),
+        "camera_route": expected_route,
         "source_image_attachment_count": 1,
     }
     binding_mismatches = [
         key for key, expected in expected_bindings.items() if event.metadata.get(key) != expected
     ]
+    if expected_route == "context":
+        if "camera_reply_to_native_message_id" in event.metadata:
+            binding_mismatches.append("camera_reply_to_native_message_id")
+    elif event.metadata.get("camera_reply_to_native_message_id") != str(native_photo_id):
+        binding_mismatches.append("camera_reply_to_native_message_id")
     if (
         not isinstance(event.metadata.get("gateway_session_id"), str)
         or not event.metadata["gateway_session_id"]
@@ -387,6 +399,10 @@ async def main() -> None:
     mode = os.environ.get("CAMERA_RUN_MODE", "offline")
     if mode not in {"offline", "native"}:
         raise RuntimeError("CAMERA_RUN_MODE must be offline or native")
+    try:
+        typed_reply_mode = camera_typed_reply_mode(os.environ.get("CAMERA_TYPED_REPLY_MODE"))
+    except ValueError as exc:
+        raise RuntimeError(str(exc)) from None
     if mode == "native" and not acceptance:
         raise RuntimeError(
             "native Camera requires CAMERA_ACCEPTANCE=1 on a clean exact source pair"
@@ -569,6 +585,7 @@ async def main() -> None:
                 before_answer=before_answer,
                 config_dir=run_config,
                 user_scenario=user_scenario,
+                typed_reply_mode=typed_reply_mode,
             )
             event_id = trajectory["event_id"]
             if event_id != trajectory["receipt"].get("event_id"):
@@ -590,6 +607,7 @@ async def main() -> None:
                 candidate_id=candidate_id,
                 answer_message_id=str(trajectory["answer"].metadata["message_id"]),
                 native_photo_id=trajectory["native_photo_id"],
+                expected_route=trajectory["route"],
                 expected_event_id=event_id,
                 started=trajectory["started"],
                 expected_capture_time=trajectory["capture_time"],
@@ -602,6 +620,7 @@ async def main() -> None:
             print(
                 f"PASS {label} full functional Camera trajectory; candidate={candidate_id} "
                 f"event={event_id} capture_date={trajectory['capture_time'].date().isoformat()} "
+                f"route={trajectory['route']} source={trajectory['answer'].metadata.get('message_id')} "
                 f"kcal={125 if mode == 'offline' else 'native'} producer+owner replay stable "
                 f"producer_image_sha256={hashlib.sha256(source_bytes).hexdigest()} "
                 f"photo_id={trajectory['native_photo_id']} bot_api_calls="

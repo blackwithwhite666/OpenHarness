@@ -317,7 +317,9 @@ async def test_real_inbound_binding_and_no_fixture_authored_event(tmp_path):
                 "role": "assistant",
                 "nutrition_annotation_status": "recorded",
                 "camera_candidate_id": request["candidate_id"],
+                "camera_operation_id": request["candidate_id"],
                 "camera_answer_bound": "yes",
+                "camera_route": "reply",
                 "camera_reply_to_native_message_id": "77",
                 "source_message_id": "78",
             },
@@ -328,5 +330,116 @@ async def test_real_inbound_binding_and_no_fixture_authored_event(tmp_path):
         )
         with pytest.raises(AssertionError, match="finalizer meal event"):
             select_finalizer_event([real], request["candidate_id"], "79", 77)
+    finally:
+        await ingress.close()
+
+
+def test_context_finalizer_event_selection_requires_context_receipt_and_capture():
+    from datetime import datetime, timezone
+
+    capture_time = datetime(2026, 10, 1, 12, 0, tzinfo=timezone.utc)
+    event = SimpleNamespace(
+        id="context-event",
+        metadata={
+            "role": "assistant", "nutrition_annotation_status": "recorded",
+            "camera_candidate_id": "candidate-1", "camera_operation_id": "candidate-1",
+            "camera_answer_bound": "yes", "camera_route": "context",
+            "source_message_id": "owner-source-2", "tenant_id": "synthetic_owner",
+            "source_principal": "telegram:123",
+            "source_image_attachment_count": 1,
+            "decision_trace": {"annotations": {"nutrition": {
+                "meal_at": capture_time.isoformat(),
+            }}},
+        },
+    )
+    assert select_finalizer_event(
+        [event], "candidate-1", "owner-source-2", 77,
+        expected_route="context", expected_capture_time=capture_time,
+        expected_event_id="context-event",
+    ) is event
+
+    for change in (
+        {"camera_route": "reply", "camera_reply_to_native_message_id": "999"},
+        {"camera_reply_to_native_message_id": "77"},
+        {"source_message_id": "foreign-source"},
+        {"camera_candidate_id": "foreign-candidate"},
+    ):
+        corrupt = SimpleNamespace(id=event.id, metadata={**event.metadata, **change})
+        with pytest.raises(AssertionError, match="finalizer meal event"):
+            select_finalizer_event(
+                [corrupt], "candidate-1", "owner-source-2", 77,
+                expected_route="context", expected_capture_time=capture_time,
+            )
+    with pytest.raises(AssertionError, match="finalizer meal event"):
+        select_finalizer_event(
+            [event], "candidate-1", "owner-source-2", 77,
+            expected_route="context", expected_capture_time=capture_time,
+            expected_event_id="different-event",
+        )
+
+
+@pytest.mark.asyncio
+async def test_real_context_answer_binds_trusted_photo_without_reply_target(tmp_path):
+    import copy
+
+    ingress, root, bus, _ = _ingress(tmp_path)
+    request = _candidate(root)
+    try:
+        assert (await _admit(ingress, root, "Bearer " + "s" * 40, request))[0] == 202
+        await asyncio.wait_for(bus.consume_inbound(), timeout=1)
+        answer = InboundMessage(
+            channel="telegram",
+            sender_id="123",
+            chat_id="123",
+            content="Я съела примерно половину порции",
+            metadata={"message_id": 78, "is_group": False, "chat_type": "private"},
+        )
+        ingress.process_real_inbound(answer)
+        assert "reply_to_message_id" not in answer.metadata
+        assert "native_message_id" not in answer.metadata
+        assert answer.metadata["_camera_route"] == "context"
+        assert answer.metadata["_camera_photo_id"] == 77
+        assert answer.metadata["_camera_candidate_id"] == request["candidate_id"]
+        trusted_turn_id = ingress._attempts[request["candidate_id"]]["answer_turn_id"]
+        assert answer.metadata["_camera_turn_id"] == trusted_turn_id
+        assert require_bound_answer(
+            answer, request["candidate_id"], expected_route="context",
+            trusted_turn_id=trusted_turn_id,
+        ) == answer.metadata["_camera_turn_id"]
+        assert len(answer.media) == 1
+        assert ingress.trusted_capture_time_for_answer(answer) == ingress._attempt_capture_time(
+            ingress._attempts[request["candidate_id"]]
+        )
+
+        for key, value in (
+            ("_camera_authority", None),
+            ("_camera_candidate_id", "foreign-candidate"),
+            ("_camera_photo_id", 999),
+            ("_camera_turn_id", "foreign-turn"),
+        ):
+            forged = copy.copy(answer)
+            forged.metadata = dict(answer.metadata)
+            forged.media = list(answer.media)
+            forged.metadata[key] = value
+            with pytest.raises(AssertionError, match="not bound"):
+                require_bound_answer(
+                    forged, request["candidate_id"], expected_route="context",
+                    trusted_turn_id=trusted_turn_id,
+                )
+
+        unsigned = InboundMessage(
+            channel="telegram", sender_id="123", chat_id="123",
+            content=answer.content,
+            metadata={
+                "message_id": 79,
+                "_camera_virtual_media_source_ids": (request["candidate_id"],),
+            },
+        )
+        unsigned.media.append(answer.media[0])
+        with pytest.raises(AssertionError, match="different route|not bound"):
+            require_bound_answer(
+                unsigned, request["candidate_id"], expected_route="context",
+                trusted_turn_id=trusted_turn_id,
+            )
     finally:
         await ingress.close()

@@ -325,6 +325,14 @@ def camera_runtime_limits(*, native_mode: bool) -> tuple[int, str]:
     return (8, "medium") if native_mode else (4, "none")
 
 
+def camera_typed_reply_mode(value: str | None) -> str:
+    """Validate the joined runner's typed route before it creates clients."""
+    mode = "reply" if value is None else value
+    if mode not in {"reply", "context"}:
+        raise ValueError("CAMERA_TYPED_REPLY_MODE must be reply or context")
+    return mode
+
+
 def isolated_runtime_loaders(runtime_module):
     """Fail closed for builder, prompt-skill and ambient-catalog loaders."""
     from contextlib import contextmanager
@@ -392,6 +400,7 @@ async def run_camera_runtime_trajectory(
     before_answer=None,
     config_dir=None,
     user_scenario: str = "synthetic offline owner selects the exact offered confirmation",
+    typed_reply_mode: str = "reply",
 ):
     """Run two actual Ohmo turns and the delivered Telegram callback offline."""
     import asyncio
@@ -411,6 +420,8 @@ async def run_camera_runtime_trajectory(
     import openharness.ui.runtime as openharness_runtime
     from probe_support import NativeClientPreconditionError
 
+    if typed_reply_mode not in {"reply", "context"}:
+        raise ValueError("CAMERA_TYPED_REPLY_MODE must be reply or context")
     if bot_client is user_client:
         raise AssertionError("Camera bot and virtual-user clients must be separate")
     native_mode = os.environ.get("CAMERA_RUN_MODE") == "native"
@@ -494,15 +505,25 @@ async def run_camera_runtime_trajectory(
             system_prompt=(
                 "You are the Camera owner described here. Answer as that person, using the "
                 "actual question and choices in the conversation. Preserve denial, amount, "
-                "and time qualifiers. Do not invent details.\n\n" + user_scenario
+                "and time qualifiers. Do not invent details."
+                + (
+                    " Answer in natural typed words, not by repeating an offered label."
+                    if typed_reply_mode == "context" else ""
+                )
+                + "\n\n" + user_scenario
                 if native_mode
-                else "You are a synthetic offline owner; select the exact offered answer."
+                else (
+                    "You are a synthetic offline owner; answer with a meaningful typed "
+                    "consumption and portion statement, not an exact offered label."
+                    if typed_reply_mode == "context"
+                    else "You are a synthetic offline owner; select the exact offered answer."
+                )
             ),
         )
         from camera_virtual_user import CameraVirtualUser, OfferedCameraChoices
         from probe_support import require_bound_answer
 
-        virtual_user = CameraVirtualUser(simulator)
+        virtual_user = CameraVirtualUser(simulator, typed_reply_mode=typed_reply_mode)
 
         async def process_and_deliver(message, session_key):
             await bridge._process_message(message, session_key)
@@ -564,21 +585,6 @@ async def run_camera_runtime_trajectory(
         )
         if action is None:
             raise AssertionError("Camera virtual user produced no owner action")
-        action_observation = root / "camera-virtual-action.json"
-        with action_observation.open("x", encoding="utf-8") as handle:
-            json.dump(
-                {
-                    "question": offered.question,
-                    "offered_labels": list(offered.options),
-                    "action_text": action.text,
-                    "callback_id": action.callback_data,
-                },
-                handle,
-                ensure_ascii=False,
-                indent=2,
-            )
-            handle.write("\n")
-        os.chmod(action_observation, 0o600)
         button_ids = {button.callback_data for button in buttons}
         if action.callback_data is not None and action.callback_data not in button_ids:
             raise AssertionError("virtual user selected a callback absent from delivered markup")
@@ -631,23 +637,33 @@ async def run_camera_runtime_trajectory(
         if action.callback_data is not None:
             answer = await invoke_issued_callback()
         else:
+            typed_source_id = "offline-camera-typed-1"
+            typed_received_at = datetime.now(timezone.utc)
             answer = action.to_inbound_message(
                 sender_id="123",
                 chat_id="123",
-                source_message_id="offline-camera-typed-1",
-                received_at=datetime.now(timezone.utc),
+                source_message_id=typed_source_id,
+                received_at=typed_received_at,
             )
         ingress.process_real_inbound(answer)
-        require_bound_answer(answer, candidate_id, native_photo)
+        actual_route = "callback" if action.callback_data is not None else action.typed_reply_mode
+        require_bound_answer(
+            answer, candidate_id, native_photo, expected_route=actual_route,
+            trusted_turn_id=(
+                ingress._attempts[candidate_id].get("answer_turn_id")
+                if actual_route == "context" else None
+            ),
+        )
         if (
             (
                 action.callback_data is not None
                 and answer.metadata.get("native_message_id") != native_photo
             )
-            or (
-                action.callback_data is None
-                and str(answer.metadata.get("reply_to_message_id")) != str(native_photo)
-            )
+            or (action.callback_data is None and actual_route == "reply"
+                and str(answer.metadata.get("reply_to_message_id")) != str(native_photo))
+            or (action.callback_data is None and actual_route == "context"
+                and ("reply_to_message_id" in answer.metadata
+                     or "native_message_id" in answer.metadata))
             or (
                 action.callback_data is not None
                 and answer.metadata.get("native_keyboard_options")
@@ -675,6 +691,27 @@ async def run_camera_runtime_trajectory(
         capture_time = ingress.trusted_capture_time_for_answer(answer)
         if capture_time is None:
             raise AssertionError("Camera callback has no trusted capture time")
+        action_observation = root / "camera-virtual-action.json"
+        with action_observation.open("x", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "question": offered.question,
+                    "offered_labels": list(offered.options),
+                    "action_text": action.text,
+                    "callback_id": action.callback_data,
+                    "route": actual_route,
+                    "typed_reply_mode": action.typed_reply_mode,
+                    "source_message_id": answer.metadata.get("message_id"),
+                    "native_photo_id": answer.metadata.get("_camera_photo_id", native_photo),
+                    "reply_to_message_id_present": "reply_to_message_id" in answer.metadata,
+                    "capture_time": capture_time.isoformat(),
+                },
+                handle,
+                ensure_ascii=False,
+                indent=2,
+            )
+            handle.write("\n")
+        os.chmod(action_observation, 0o600)
         _, final_receipt, nutrition_event_id = await process_and_deliver(answer, answer.session_key)
         if not isinstance(nutrition_event_id, str) or not nutrition_event_id:
             raise AssertionError("runtime did not return its durable nutrition event ID")
@@ -686,7 +723,8 @@ async def run_camera_runtime_trajectory(
         action_label = "Telegram callback" if action.callback_data is not None else "typed reply"
         mode_label = "NATIVE OPT-IN" if native_mode else "OFFLINE SYNTHETIC"
         print(
-            f"{mode_label} virtual-user {action_label} + real Ohmo finalizer completed; "
+            f"{mode_label} virtual-user {action_label} route={actual_route} "
+            f"source={answer.metadata.get('message_id')} + real Ohmo finalizer completed; "
             f"event={nutrition_event_id} capture_date={capture_time.date().isoformat()} "
             f"bot_calls={getattr(bot_client, 'calls', 'native')} "
             f"user_calls={getattr(user_client, 'calls', 'native')}",
@@ -747,6 +785,7 @@ async def run_camera_runtime_trajectory(
             "bot": channel,
             "bot_transport": fake_bot,
             "action": action,
+            "route": actual_route,
             "markup": markup,
             "caption": edit.get("caption"),
             "replay_callback": replay_callback,

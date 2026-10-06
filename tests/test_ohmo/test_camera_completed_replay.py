@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -66,7 +67,9 @@ async def _save_callback_portion(tmp_path, monkeypatch):
     return ingress, bus, request, pool, honcho, portion, saved_final
 
 
-async def _save_typed_confirmation(tmp_path, monkeypatch, label="Да, я это съела"):
+async def _save_typed_confirmation(
+    tmp_path, monkeypatch, label="Да, я это съела", *, reply_to_photo=True,
+):
     ingress, root, bus, _ = _ingress(tmp_path, FakeTelegram())
     request = _candidate(root)
     assert (await _admit(ingress, root, "Bearer " + "s" * 40, request))[0] == 202
@@ -77,7 +80,7 @@ async def _save_typed_confirmation(tmp_path, monkeypatch, label="Да, я это
     answer = InboundMessage(
         channel="telegram", sender_id="123", chat_id="123", content=label,
         metadata={"message_id": "typed-camera-first-confirmation",
-                  "reply_to_message_id": str(photo_id),
+                  **({"reply_to_message_id": str(photo_id)} if reply_to_photo else {}),
                   "_telegram_raw_text": label, "is_group": False,
                   "chat_type": "private"},
     )
@@ -196,16 +199,20 @@ async def test_runtime_reconciles_identical_typed_reply_without_native_click_mar
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("changed_text", ["Я съела другую порцию", "Я съела это вчера"])
+@pytest.mark.parametrize("reply_to_photo", [True, False])
 async def test_changed_typed_reply_reaches_existing_runtime_flow(
-    tmp_path, monkeypatch, changed_text
+    tmp_path, monkeypatch, changed_text, reply_to_photo,
 ):
-    ingress, request, pool, honcho, _, _ = await _save_typed_confirmation(tmp_path, monkeypatch)
+    ingress, request, pool, honcho, _, _ = await _save_typed_confirmation(
+        tmp_path, monkeypatch, reply_to_photo=reply_to_photo,
+    )
     attempt = ingress._attempts[request["candidate_id"]]
     turns_before = len(pool._test_bundle.engine.turns)
     changed = InboundMessage(
         channel="telegram", sender_id="123", chat_id="123", content=changed_text,
         metadata={"message_id": "typed-camera-changed-reply",
-                  "reply_to_message_id": str(attempt["photo_id"]),
+                  **({"reply_to_message_id": str(attempt["photo_id"])}
+                     if reply_to_photo else {}),
                   "_telegram_raw_text": changed_text, "is_group": False,
                   "chat_type": "private"},
     )
@@ -214,10 +221,153 @@ async def test_changed_typed_reply_reaches_existing_runtime_flow(
     result = await runtime_turn(pool, changed, ingress)
     assert changed.metadata.get("_camera_typed_replay_candidate") is None
     assert result.text != "Эта порция уже записана."
-    assert changed.metadata["reply_to_message_id"] == str(attempt["photo_id"])
+    if reply_to_photo:
+        assert changed.metadata["reply_to_message_id"] == str(attempt["photo_id"])
+    else:
+        assert "reply_to_message_id" not in changed.metadata
     assert len(pool._test_bundle.engine.turns) == turns_before + 1
     assert len(honcho.messages) == 2
     assert attempt["camera_commit"]["event_id"] == "honcho-2"
+    await ingress.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "receipt_failure", ["missing", "foreign", "stale", "bad_native_route", "wrong_native_target"],
+)
+async def test_context_repeat_rejects_missing_or_misbound_original_receipt(
+    tmp_path, monkeypatch, receipt_failure,
+):
+    ingress, request, pool, honcho, _, first_answer = await _save_typed_confirmation(
+        tmp_path, monkeypatch, reply_to_photo=False,
+    )
+    backend = pool._shadow_backend_for_scope(None)
+    reconcile = backend.reconcile_durable_exchange
+
+    async def altered_receipt(user_op, assistant_op):
+        receipt = await reconcile(user_op, assistant_op)
+        if receipt_failure == "missing":
+            return None
+        from dataclasses import replace
+
+        metadata = dict(receipt.assistant_metadata)
+        if receipt_failure == "foreign":
+            metadata["tenant_id"] = "another-owner"
+        elif receipt_failure == "stale":
+            metadata["source_message_id"] = "old-source"
+        elif receipt_failure == "bad_native_route":
+            metadata["camera_route"] = "reply"
+            metadata["camera_reply_to_native_message_id"] = "999"
+        elif receipt_failure == "wrong_native_target":
+            metadata["camera_reply_to_native_message_id"] = "999"
+        return replace(receipt, assistant_metadata=metadata)
+
+    pool._shadow_backend_for_scope = lambda _scope: SimpleNamespace(
+        reconcile_durable_exchange=altered_receipt
+    )
+    replay = InboundMessage(
+        channel="telegram", sender_id="123", chat_id="123", content=first_answer.content,
+        metadata={"message_id": "context-repeat-bad-receipt",
+                  "_telegram_raw_text": first_answer.content,
+                  "is_group": False, "chat_type": "private"},
+    )
+    ingress.process_real_inbound(replay)
+    pool._active_message = replay
+    updates = [
+        update async for update in pool.stream_message(replay, ingress.config.session_key)
+    ]
+    assert not any(update.kind == "final" and update.text == "Эта порция уже записана." for update in updates)
+    assert len(honcho.messages) == 2
+    assert ingress._attempts[request["candidate_id"]]["camera_commit"]["event_id"] == "honcho-2"
+    await ingress.close()
+
+
+@pytest.mark.asyncio
+async def test_new_owner_photo_interrupts_completed_context_repeat(tmp_path, monkeypatch):
+    ingress, request, pool, honcho, saved_final, first_answer = await _save_typed_confirmation(
+        tmp_path, monkeypatch, reply_to_photo=False,
+    )
+    attempt = ingress._attempts[request["candidate_id"]]
+    unrelated_photo = InboundMessage(
+        channel="telegram", sender_id="123", chat_id="123", content="new photo",
+        metadata={"message_id": "unrelated-photo-after-save", "is_group": False,
+                  "chat_type": "private"},
+    )
+    unrelated_photo.media.append("owner-new-photo.jpg")
+    ingress.process_real_inbound(unrelated_photo)
+    assert unrelated_photo.media == ["owner-new-photo.jpg"]
+    assert attempt["context_interrupted"] is True
+
+    replay = InboundMessage(
+        channel="telegram", sender_id="123", chat_id="123", content=first_answer.content,
+        metadata={"message_id": "context-repeat-after-new-photo",
+                  "_telegram_raw_text": first_answer.content,
+                  "is_group": False, "chat_type": "private"},
+    )
+    ingress.process_real_inbound(replay)
+    assert replay.metadata.get("_camera_typed_replay_candidate") is None
+    before_turns = len(pool._test_bundle.engine.turns)
+    result = await runtime_turn(pool, replay, ingress)
+    assert result.text != "Эта порция уже записана."
+    assert len(pool._test_bundle.engine.turns) == before_turns + 1
+    assert attempt["camera_commit"]["event_id"] == saved_final.metadata[
+        "nutrition_append_event_id"
+    ]
+    assert len(honcho.messages) == 2
+    await ingress.close()
+
+
+@pytest.mark.asyncio
+async def test_context_repeat_reconciles_after_journal_restart(tmp_path, monkeypatch):
+    ingress, request, pool, honcho, saved_final, first_answer = await _save_typed_confirmation(
+        tmp_path, monkeypatch, reply_to_photo=False,
+    )
+    restarted, _, _, _ = _ingress(tmp_path, FakeTelegram())
+    pool._camera_ingress = restarted
+    replay = InboundMessage(
+        channel="telegram", sender_id="123", chat_id="123", content=first_answer.content,
+        metadata={"message_id": "context-repeat-after-restart",
+                  "_telegram_raw_text": first_answer.content,
+                  "is_group": False, "chat_type": "private"},
+    )
+    restarted.process_real_inbound(replay)
+    assert replay.metadata.get("_camera_typed_replay_candidate") == request["candidate_id"]
+    result = await runtime_turn(pool, replay, restarted)
+    assert result.text == "Эта порция уже записана."
+    assert result.metadata["nutrition_append_event_id"] == saved_final.metadata[
+        "nutrition_append_event_id"
+    ]
+    assert len(honcho.messages) == 2
+    await ingress.close()
+    await restarted.close()
+
+
+@pytest.mark.asyncio
+async def test_context_repeat_rejects_foreign_owner_and_new_active_source(tmp_path, monkeypatch):
+    ingress, request, pool, honcho, _, first_answer = await _save_typed_confirmation(
+        tmp_path, monkeypatch, reply_to_photo=False,
+    )
+    foreign = InboundMessage(
+        channel="telegram", sender_id="other-owner", chat_id="123",
+        content=first_answer.content,
+        metadata={"message_id": "foreign-context-repeat",
+                  "_telegram_raw_text": first_answer.content},
+    )
+    ingress.process_real_inbound(foreign)
+    assert foreign.metadata.get("_camera_typed_replay_candidate") is None
+
+    root = Path(tmp_path)
+    newer = _candidate(root, index=1)
+    assert (await _admit(ingress, root, "Bearer " + "s" * 40, newer))[0] == 202
+    ambiguous = InboundMessage(
+        channel="telegram", sender_id="123", chat_id="123", content=first_answer.content,
+        metadata={"message_id": "context-repeat-with-new-source",
+                  "_telegram_raw_text": first_answer.content},
+    )
+    ingress.process_real_inbound(ambiguous)
+    assert ambiguous.metadata.get("_camera_typed_replay_candidate") is None
+    assert ambiguous.metadata.get("_camera_existing_meal_replay") is None
+    assert len(honcho.messages) == 2
     await ingress.close()
 
 
@@ -573,6 +723,37 @@ def test_completed_same_option_callback_routes_to_verified_existing_meal(tmp_pat
         assert receipt.user_content == "Да, я это съел(а)"
         await ingress.close()
         await restarted.close()
+
+    asyncio.run(run())
+
+
+def test_context_source_identical_typed_repeat_uses_saved_receipt(tmp_path, monkeypatch):
+    async def run():
+        ingress, request, pool, honcho, saved_final, first_answer = (
+            await _save_typed_confirmation(
+                tmp_path, monkeypatch, "Да, я это съела", reply_to_photo=False,
+            )
+        )
+        attempt = ingress._attempts[request["candidate_id"]]
+        replay = InboundMessage(
+            channel="telegram", sender_id="123", chat_id="123",
+            content="Да, я это съела",
+            metadata={"message_id": "context-camera-repeat-2",
+                      "_telegram_raw_text": "Да, я это съела",
+                      "is_group": False, "chat_type": "private"},
+        )
+        ingress.process_real_inbound(replay)
+        assert replay.metadata.get("_camera_typed_replay_candidate") == request["candidate_id"]
+        assert "reply_to_message_id" not in replay.metadata
+        before = [(item.id, item.content) for item in honcho.messages]
+        final = await runtime_turn(pool, replay, ingress)
+        assert final.text == "Эта порция уже записана."
+        assert [(item.id, item.content) for item in honcho.messages] == before
+        assert len(honcho.messages) == 2
+        assert attempt["camera_commit"]["event_id"] == saved_final.metadata[
+            "nutrition_append_event_id"
+        ]
+        await ingress.close()
 
     asyncio.run(run())
 

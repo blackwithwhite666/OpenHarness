@@ -1950,11 +1950,21 @@ class OhmoSessionRuntimePool:
                         and typed_attempt["camera_correction_commit"].get("kind") == "portion"
                     )
                 )
-                and typed_target is not None
-                and str(typed_target) in {
-                    str(typed_attempt.get("photo_id")),
-                    *map(str, typed_attempt.get("reply_ids", [])),
-                }
+                and (
+                    (
+                        typed_target is not None
+                        and str(typed_target) in {
+                            str(typed_attempt.get("photo_id")),
+                            *map(str, typed_attempt.get("reply_ids", [])),
+                        }
+                    )
+                    or (
+                        typed_target is None
+                        and self._camera_ingress.is_completed_context_typed_repeat(
+                            message, typed_replay_candidate_id,
+                        )
+                    )
+                )
             )
         completed_replay = (
             camera_authorized and message.metadata.get("_camera_existing_meal_replay") is True
@@ -2256,6 +2266,13 @@ class OhmoSessionRuntimePool:
                     f"{turn_id}:user", f"{turn_id}:assistant"
                 )
                 typed_replay = typed_replay_candidate
+                context_typed_replay = bool(
+                    typed_replay
+                    and message.metadata.get("_camera_route") == "context"
+                    and self._camera_ingress.is_completed_context_typed_repeat(
+                        message, candidate_id,
+                    )
+                )
                 selected_label = (
                     message.content if typed_replay
                     else message.metadata.get("native_keyboard_selected_label")
@@ -2319,9 +2336,16 @@ class OhmoSessionRuntimePool:
                     or assistant_metadata.get("camera_operation_id") != candidate_id
                     or assistant_metadata.get("camera_answer_bound") != "yes"
                     or (
-                        str(committed_binding) not in typed_source_ids
-                        if typed_replay
-                        else committed_binding != str(replay_binding)
+                        (
+                            assistant_metadata.get("camera_route") != "context"
+                            or committed_binding is not None
+                        )
+                        if context_typed_replay
+                        else (
+                            str(committed_binding) not in typed_source_ids
+                            if typed_replay
+                            else committed_binding != str(replay_binding)
+                        )
                     )
                     or assistant_metadata.get("gateway_session_id") != turn_ctx.session_id
                     or assistant_metadata.get("tenant_id") != memory_scope.private_tenant

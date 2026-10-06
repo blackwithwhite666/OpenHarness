@@ -24,7 +24,8 @@ class OfferedCameraChoices:
 class CameraUserAction:
     text: str
     callback_data: str | None
-    reply_to_message_id: str
+    reply_to_message_id: str | None
+    typed_reply_mode: str
     media_source_ids: tuple[str, ...]
 
     def to_inbound_message(
@@ -41,19 +42,23 @@ class CameraUserAction:
             raise ValueError("Camera callbacks must use the actual Telegram callback handler")
         if not source_message_id.strip() or received_at.tzinfo is None:
             raise ValueError("typed Camera replies need a source ID and aware receive time")
+        metadata = {
+            "message_id": source_message_id,
+            "_telegram_raw_text": self.text,
+            "_camera_virtual_media_source_ids": self.media_source_ids,
+            "is_group": False,
+            "chat_type": "private",
+        }
+        if self.typed_reply_mode == "reply":
+            metadata["reply_to_message_id"] = self.reply_to_message_id
+        elif self.typed_reply_mode != "context":
+            raise ValueError("typed Camera reply mode must be reply or context")
         return InboundMessage(
             channel=channel,
             sender_id=sender_id,
             chat_id=chat_id,
             content=self.text,
-            metadata={
-                "message_id": source_message_id,
-                "reply_to_message_id": self.reply_to_message_id,
-                "_telegram_raw_text": self.text,
-                "_camera_virtual_media_source_ids": self.media_source_ids,
-                "is_group": False,
-                "chat_type": "private",
-            },
+            metadata=metadata,
             timestamp=received_at,
         )
 
@@ -61,8 +66,11 @@ class CameraUserAction:
 class CameraVirtualUser:
     """Translate one existing simulator turn into an offered callback or typed reply."""
 
-    def __init__(self, simulator: UserSimulator) -> None:
+    def __init__(self, simulator: UserSimulator, *, typed_reply_mode: str = "reply") -> None:
+        if typed_reply_mode not in {"reply", "context"}:
+            raise ValueError("typed Camera reply mode must be reply or context")
         self._simulator = simulator
+        self._typed_reply_mode = typed_reply_mode
 
     async def next_camera_action(
         self,
@@ -92,10 +100,17 @@ class CameraVirtualUser:
         if not text:
             return None
         choice = _matching_choice(text, offered.options)
+        callback_data = offered.callback_ids[choice] if choice is not None else None
+        typed_reply_mode = self._typed_reply_mode
         return CameraUserAction(
             text=offered.options[choice] if choice is not None else text,
-            callback_data=offered.callback_ids[choice] if choice is not None else None,
-            reply_to_message_id=offered.native_message_id,
+            callback_data=callback_data,
+            reply_to_message_id=(
+                offered.native_message_id
+                if callback_data is not None or typed_reply_mode == "reply"
+                else None
+            ),
+            typed_reply_mode=typed_reply_mode,
             media_source_ids=offered.media_source_ids,
         )
 

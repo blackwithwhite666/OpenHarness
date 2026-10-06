@@ -369,6 +369,13 @@ def test_missing_reviewed_episode_writes_inconclusive_snapshot_cli_report(tmp_pa
 
     from ohmo.evals.nutrition_persistence import main
 
+    for name in (
+        "WELLNESS_DELEGATION_SIGNING_KEY", "WELLNESS_DELEGATION_KID",
+        "WELLNESS_DELEGATION_ISSUER", "WELLNESS_DELEGATION_AUDIENCE",
+        "WELLNESS_DELEGATION_CLIENT_ID",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
     manifest_path = tmp_path / "manifest.json"
     export_path = tmp_path / "dialogue.json"
     honcho_path = tmp_path / "honcho.json"
@@ -391,6 +398,73 @@ def test_missing_reviewed_episode_writes_inconclusive_snapshot_cli_report(tmp_pa
     assert report["cases"][0]["a1"] == "INCONCLUSIVE"
     assert report["cases"][0]["stage"] == "DIALOGUE_BINDING_FAILED"
     assert report["dialogue_binding"]["tea"]["complete"] is False
+
+
+@pytest.mark.parametrize("failure", [
+    "missing-reader", "invalid-reader", "incomplete-signer", "oauth-client-mismatch",
+])
+def test_live_cli_preflight_rejects_invalid_signing_inputs_before_readers(
+    tmp_path, monkeypatch, failure,
+):
+    import sys
+    from types import SimpleNamespace
+
+    import ohmo.evals.nutrition_persistence as persistence
+    import openharness.config as oh_config
+    from openharness.mcp.types import McpHttpServerConfig, McpOAuthConfig
+
+    manifest_path = tmp_path / "manifest.json"
+    export_path = tmp_path / "dialogue.json"
+    manifest_path.write_text(Manifest(schema_version=1, goals=[goal()]).model_dump_json())
+    export_path.write_text(json.dumps({"privacy": "private", "episodes": []}))
+
+    settings_client = "different-client" if failure == "oauth-client-mismatch" else "synthetic-client"
+    config = McpHttpServerConfig(url="https://synthetic.invalid/mcp",
+        oauth=McpOAuthConfig(token_url="https://synthetic.invalid/token", client_id=settings_client,
+                             token_file=str(tmp_path / "unused-token.json")))
+    monkeypatch.setattr(oh_config, "load_settings", lambda: SimpleNamespace(
+        mcp_servers={"telegent": config}))
+
+    def live_reader_must_not_run(*args, **kwargs):
+        pytest.fail("preflight rejection must happen before either live reader")
+
+    monkeypatch.setattr(persistence, "read_honcho_messages", live_reader_must_not_run)
+    monkeypatch.setattr(persistence, "read_telegent_wellness", live_reader_must_not_run)
+    monkeypatch.setenv("OHMO_NUTRITION_AUDIT_HONCHO_TOKEN", "synthetic-honcho-token")
+    signing_values = {
+        "WELLNESS_DELEGATION_SIGNING_KEY": "s" * 32,
+        "WELLNESS_DELEGATION_KID": "synthetic-kid",
+        "WELLNESS_DELEGATION_ISSUER": "synthetic-issuer",
+        "WELLNESS_DELEGATION_AUDIENCE": "synthetic-audience",
+        "WELLNESS_DELEGATION_CLIENT_ID": "synthetic-client",
+    }
+    if failure == "incomplete-signer":
+        signing_values.pop("WELLNESS_DELEGATION_SIGNING_KEY")
+    for name in (
+        "WELLNESS_DELEGATION_SIGNING_KEY", "WELLNESS_DELEGATION_KID",
+        "WELLNESS_DELEGATION_ISSUER", "WELLNESS_DELEGATION_AUDIENCE",
+        "WELLNESS_DELEGATION_CLIENT_ID",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    for name, value in signing_values.items():
+        monkeypatch.setenv(name, value)
+
+    argv = [
+        "nutrition-persistence", str(manifest_path), str(tmp_path / "report.json"),
+        "--dialogue-export", str(export_path),
+        "--honcho-base-url", "https://honcho.invalid",
+        "--honcho-workspace", "workspace-1", "--honcho-session", "session-1",
+        "--honcho-owner", "owner-1", "--since", "2026-10-01T00:00:00+00:00",
+        "--until", "2026-10-01T12:00:00+00:00", "--telegent-server", "telegent",
+        "--telegent-login", "owner", "--start", "2026-10-01T00:00:00+00:00",
+        "--end", "2026-10-01T12:00:00+00:00",
+    ]
+    if failure not in {"missing-reader"}:
+        argv.extend(["--telegent-reader-id", "not-an-id" if failure == "invalid-reader" else "101"])
+    monkeypatch.setattr(sys, "argv", argv)
+    with pytest.raises(SystemExit) as exc:
+        persistence.main()
+    assert exc.value.code == 2
 
 
 @pytest.mark.parametrize("actual,verdict", [
@@ -1376,9 +1450,22 @@ async def test_telegent_mcp_reader_parses_fixture_and_hides_transport_errors(mon
 
 @pytest.mark.asyncio
 async def test_telegent_live_reader_uses_selected_configured_oauth_manager(monkeypatch, tmp_path):
+    import base64
+    import hashlib
+    import hmac
     import json
     import openharness.mcp.client as mcp_client
     from openharness.mcp.types import McpHttpServerConfig, McpOAuthConfig
+    from openharness.mcp.wellness_delegation import META_KEY
+
+    for name, value in {
+        "WELLNESS_DELEGATION_SIGNING_KEY": "s" * 32,
+        "WELLNESS_DELEGATION_KID": "synthetic-kid",
+        "WELLNESS_DELEGATION_ISSUER": "synthetic-issuer",
+        "WELLNESS_DELEGATION_AUDIENCE": "synthetic-audience",
+        "WELLNESS_DELEGATION_CLIENT_ID": "synthetic-client",
+    }.items():
+        monkeypatch.setenv(name, value)
 
     requested = {"login": "synthetic", "start": NOW.replace(hour=0).isoformat(),
                  "end": NOW.isoformat()}
@@ -1393,6 +1480,7 @@ async def test_telegent_live_reader_uses_selected_configured_oauth_manager(monke
             assert config.headers == {"X-Tenant": "synthetic"}
             assert config.oauth.client_id == "synthetic-client"
             self.closed = False
+            monkeypatch.setattr(FakeManager, "last", self, raising=False)
 
         async def connect_all(self):
             return None
@@ -1400,9 +1488,25 @@ async def test_telegent_live_reader_uses_selected_configured_oauth_manager(monke
         def list_statuses(self):
             return [type("Status", (), {"state": "connected"})()]
 
-        async def call_tool_result(self, server, name, args):
+        async def call_tool_result(self, server, name, args, *, meta=None):
             assert server == "wellness-selected" and name == "get_wellness_data"
             assert args["params"] == requested
+            assert isinstance(meta, dict) and META_KEY in meta
+            token = meta[META_KEY]
+            header_part, claims_part, signature_part = token.split(".")
+            def decode(part):
+                return json.loads(base64.urlsafe_b64decode(
+                    part + "=" * (-len(part) % 4)))
+            signing_input = f"{header_part}.{claims_part}".encode("ascii")
+            expected_signature = hmac.new(b"s" * 32, signing_input, hashlib.sha256).digest()
+            actual_signature = base64.urlsafe_b64decode(
+                signature_part + "=" * (-len(signature_part) % 4))
+            claims = decode(claims_part)
+            assert hmac.compare_digest(expected_signature, actual_signature)
+            assert claims["sub"] == "telegram:101"
+            assert claims["body_sha256"] == hashlib.sha256(json.dumps(
+                args, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+            ).encode()).hexdigest()
             return type("Result", (), {"output": json.dumps(response), "is_error": False})()
 
         async def close(self):
@@ -1413,10 +1517,214 @@ async def test_telegent_live_reader_uses_selected_configured_oauth_manager(monke
         oauth=McpOAuthConfig(token_url="https://synthetic.invalid/token", client_id="synthetic-client",
                              token_file=str(tmp_path / "token.json")))
     result = await read_telegent_wellness(server_config=config, server_name="wellness-selected",
-        owner_login="synthetic", start=NOW.replace(hour=0), end=NOW)
+        owner_login="synthetic", reader_id="101", start=NOW.replace(hour=0), end=NOW)
     assert result["complete"] is True
     assert result["start"] == requested["start"] and result["end"] == requested["end"]
     assert result["meals"] == [] and result["unassigned"] == []
+    assert FakeManager.last.closed is True
+
+
+@pytest.mark.asyncio
+async def test_telegent_live_reader_signs_after_delayed_connection(monkeypatch):
+    import base64
+    import hashlib
+    import hmac
+    import json
+    import openharness.mcp.client as mcp_client
+    import openharness.mcp.wellness_delegation as delegation_module
+    from openharness.mcp.types import McpHttpServerConfig, McpOAuthConfig
+    from openharness.mcp.wellness_delegation import META_KEY
+
+    key = b"d" * 32
+    for name, value in {
+        "WELLNESS_DELEGATION_SIGNING_KEY": key.decode(),
+        "WELLNESS_DELEGATION_KID": "delayed-kid",
+        "WELLNESS_DELEGATION_ISSUER": "delayed-issuer",
+        "WELLNESS_DELEGATION_AUDIENCE": "delayed-audience",
+        "WELLNESS_DELEGATION_CLIENT_ID": "delayed-client",
+    }.items():
+        monkeypatch.setenv(name, value)
+
+    clock = {"now": 1_791_277_200}
+    sequence = []
+    signer = delegation_module.sign_wellness_call
+
+    def clocked_signer(config, actor, body):
+        sequence.append(("sign", clock["now"]))
+        return signer(config, actor, body, now=clock["now"])
+
+    monkeypatch.setattr(delegation_module, "sign_wellness_call", clocked_signer)
+
+    class DelayedManager:
+        closed = False
+
+        def __init__(self, configs):
+            assert list(configs) == ["delayed"]
+
+        async def connect_all(self):
+            clock["now"] += 120
+            sequence.append(("connected", clock["now"]))
+
+        def list_statuses(self):
+            sequence.append(("status", clock["now"]))
+            return [type("Status", (), {"state": "connected"})()]
+
+        async def call_tool_result(self, server, name, body, *, meta=None):
+            assert server == "delayed" and name == "get_wellness_data"
+            token = meta[META_KEY]
+            header_part, claims_part, signature_part = token.split(".")
+            def decode(part):
+                return json.loads(base64.urlsafe_b64decode(
+                    part + "=" * (-len(part) % 4)))
+            signing_input = f"{header_part}.{claims_part}".encode("ascii")
+            expected = hmac.new(key, signing_input, hashlib.sha256).digest()
+            supplied = base64.urlsafe_b64decode(
+                signature_part + "=" * (-len(signature_part) % 4))
+            claims = decode(claims_part)
+            assert hmac.compare_digest(expected, supplied)
+            assert claims["sub"] == "telegram:101"
+            assert claims["iat"] == clock["now"]
+            assert claims["exp"] > clock["now"]
+            assert claims["exp"] - claims["iat"] == 60
+            assert claims["body_sha256"] == hashlib.sha256(json.dumps(
+                body, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+            ).encode()).hexdigest()
+            sequence.append(("call", clock["now"]))
+            response = {"login": "synthetic", "user_id": "target-user",
+                "interval": {"start": body["params"]["start"], "end": body["params"]["end"]},
+                "nutrition_status": "complete", "nutrition_records": [],
+                "nutrition_unassigned_records": []}
+            return type("Result", (), {"output": json.dumps(response), "is_error": False})()
+
+        async def close(self):
+            DelayedManager.closed = True
+
+    monkeypatch.setattr(mcp_client, "McpClientManager", DelayedManager)
+    config = McpHttpServerConfig(url="https://delayed.invalid/mcp",
+        oauth=McpOAuthConfig(token_url="https://delayed.invalid/token", client_id="delayed-client",
+                             token_file="/tmp/unused.json"))
+    result = await read_telegent_wellness(server_config=config, server_name="delayed",
+        owner_login="synthetic", reader_id="101", start=NOW.replace(hour=0), end=NOW)
+    assert result["complete"] is True
+    assert [item[0] for item in sequence] == ["connected", "status", "sign", "call"]
+    assert DelayedManager.closed is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reader_id", [None, "0", "01", "١٢", "+12", " "])
+async def test_telegent_live_reader_rejects_invalid_reader_before_manager(monkeypatch, reader_id):
+    import openharness.mcp.client as mcp_client
+    from openharness.mcp.types import McpHttpServerConfig, McpOAuthConfig
+
+    class NoTransport:
+        def __init__(self, configs):
+            pytest.fail("invalid reader must fail before transport")
+
+    monkeypatch.setattr(mcp_client, "McpClientManager", NoTransport)
+    config = McpHttpServerConfig(url="https://synthetic.invalid/mcp",
+        oauth=McpOAuthConfig(token_url="https://synthetic.invalid/token", client_id="synthetic-client",
+                             token_file="/tmp/unused.json"))
+    result = await read_telegent_wellness(server_config=config, reader_id=reader_id,
+        owner_login="synthetic", start=NOW.replace(hour=0), end=NOW)
+    assert result["complete"] is False
+    assert "identity" in result["error"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["incomplete-signer", "wrong-client"])
+async def test_telegent_live_reader_rejects_signer_mismatch_before_manager(
+    monkeypatch, failure,
+):
+    import openharness.mcp.client as mcp_client
+    from openharness.mcp.types import McpHttpServerConfig, McpOAuthConfig
+
+    class NoTransport:
+        def __init__(self, configs):
+            pytest.fail("invalid signer binding must fail before transport")
+
+    monkeypatch.setattr(mcp_client, "McpClientManager", NoTransport)
+    values = {
+        "WELLNESS_DELEGATION_SIGNING_KEY": "s" * 32,
+        "WELLNESS_DELEGATION_KID": "synthetic-kid",
+        "WELLNESS_DELEGATION_ISSUER": "synthetic-issuer",
+        "WELLNESS_DELEGATION_AUDIENCE": "synthetic-audience",
+        "WELLNESS_DELEGATION_CLIENT_ID": "synthetic-client",
+    }
+    if failure == "incomplete-signer":
+        values.pop("WELLNESS_DELEGATION_SIGNING_KEY")
+    for name, value in values.items():
+        monkeypatch.setenv(name, value)
+    if failure == "incomplete-signer":
+        monkeypatch.delenv("WELLNESS_DELEGATION_SIGNING_KEY", raising=False)
+    config = McpHttpServerConfig(url="https://synthetic.invalid/mcp",
+        oauth=McpOAuthConfig(token_url="https://synthetic.invalid/token", client_id="oauth-client",
+                             token_file="/tmp/unused.json"))
+    result = await read_telegent_wellness(server_config=config, reader_id="101",
+        owner_login="synthetic", start=NOW.replace(hour=0), end=NOW)
+    assert result["complete"] is False
+    assert result["error"] == "live Telegent signing configuration is invalid"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["tool-error", "cancelled", "signing-failure"])
+async def test_telegent_live_reader_closes_manager_on_error_and_cancellation(
+    monkeypatch, outcome,
+):
+    import asyncio
+    import openharness.mcp.client as mcp_client
+    import openharness.mcp.wellness_delegation as delegation_module
+    from openharness.mcp.types import McpHttpServerConfig, McpOAuthConfig
+
+    for name, value in {
+        "WELLNESS_DELEGATION_SIGNING_KEY": "s" * 32,
+        "WELLNESS_DELEGATION_KID": "synthetic-kid",
+        "WELLNESS_DELEGATION_ISSUER": "synthetic-issuer",
+        "WELLNESS_DELEGATION_AUDIENCE": "synthetic-audience",
+        "WELLNESS_DELEGATION_CLIENT_ID": "synthetic-client",
+    }.items():
+        monkeypatch.setenv(name, value)
+    if outcome == "signing-failure":
+        def fail_signing(*args, **kwargs):
+            raise ValueError("private signing failure text")
+
+        monkeypatch.setattr(delegation_module, "sign_wellness_call", fail_signing)
+
+    class FailingManager:
+        closed = False
+
+        def __init__(self, configs):
+            FailingManager.closed = False
+
+        async def connect_all(self):
+            pass
+
+        def list_statuses(self):
+            return [type("Status", (), {"state": "connected"})()]
+
+        async def call_tool_result(self, *args, **kwargs):
+            if outcome == "cancelled":
+                raise asyncio.CancelledError
+            return type("Result", (), {"output": "private-token-text", "is_error": True})()
+
+        async def close(self):
+            FailingManager.closed = True
+
+    monkeypatch.setattr(mcp_client, "McpClientManager", FailingManager)
+    config = McpHttpServerConfig(url="https://synthetic.invalid/mcp",
+        oauth=McpOAuthConfig(token_url="https://synthetic.invalid/token", client_id="synthetic-client",
+                             token_file="/tmp/unused.json"))
+    arguments = dict(server_config=config, reader_id="101", owner_login="synthetic",
+                     start=NOW.replace(hour=0), end=NOW)
+    if outcome == "cancelled":
+        with pytest.raises(asyncio.CancelledError):
+            await read_telegent_wellness(**arguments)
+    else:
+        result = await read_telegent_wellness(**arguments)
+        if outcome == "tool-error":
+            assert result == {"complete": False, "error": "Telegent canonical read failed"}
+        else:
+            assert result == {"complete": False, "error": "Telegent MCP read unavailable or malformed"}
+    assert FailingManager.closed is True
 
 
 def test_exact_replay_deduplicates_and_cross_workspace_event_is_inconclusive():
