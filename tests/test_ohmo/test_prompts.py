@@ -535,7 +535,15 @@ def test_ohmo_prompt_contracts_pre_tool_action_purpose(tmp_path: Path) -> None:
     prompt = build_ohmo_system_prompt(tmp_path, workspace=workspace)
 
     assert "Action purpose" in prompt
-    # The contract: one short user-visible line before every tool call.
+    # Routine nutrition turns can reach their useful answer without redundant
+    # narration; other tool calls retain the bounded action-purpose contract.
+    assert "For routine meal-estimation or meal-logging dialogue under the `calory` skill" in prompt
+    assert "including loading the `calory` skill and finalizing a valid nutrition trace" in prompt
+    assert "without a separate pre-tool line" in prompt
+    assert "Use the final reply for the useful estimate or receipt-gated saved result" in prompt
+    assert "ask a necessary, meaningful clarification directly" in prompt
+    assert "For all other tool calls" in prompt
+    # The contract for other tasks: one short user-visible line before tool use.
     assert "before every tool call" in prompt
     assert "user's language" in prompt
     # The hard bound the runtime enforces when it truncates narration.
