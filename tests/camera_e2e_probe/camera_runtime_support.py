@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping, Sequence
 from typing import Any
 
 from openharness.api.client import (
@@ -26,6 +26,117 @@ SYNTHETIC_OPTIONS = (
     "Нет, не ел(а)",
     "Это не еда",
 )
+
+
+def validate_e5_date_source_link(
+    *, date_metadata: Mapping[str, Any], original_metadata: Mapping[str, Any],
+    expected_date_source_id: str,
+) -> None:
+    """Validate the ordinary date route's trusted owner/session/reply source link."""
+    source_id = original_metadata.get("source_message_id")
+    date_source_id = date_metadata.get("source_message_id")
+    provenance_keys = ("tenant_id", "source_principal", "gateway_session_id")
+    if (
+        not isinstance(source_id, str) or not source_id
+        or not isinstance(date_source_id, str) or not date_source_id
+        or date_source_id != expected_date_source_id
+        or date_source_id == source_id
+        or date_metadata.get("reply_to_source_message_id") != source_id
+        or original_metadata.get("is_group") is not False
+        or original_metadata.get("is_forwarded") is not False
+        or date_metadata.get("is_group") is not False
+        or date_metadata.get("is_forwarded") is not False
+        or any(
+            not isinstance(original_metadata.get(key), str)
+            or not original_metadata.get(key)
+            or date_metadata.get(key) != original_metadata.get(key)
+            for key in provenance_keys
+        )
+    ):
+        raise AssertionError("E5 ordinary date event is not linked to the trusted owner/source/session")
+
+
+def validate_e5_unique_original_event_ids(
+    *, observed_event_ids: Sequence[str], expected_original_event_id: str
+) -> None:
+    """Require the scoped Honcho read to contain exactly the retained original meal."""
+    if list(observed_event_ids) != [expected_original_event_id]:
+        raise AssertionError("E5 Honcho read does not contain the one original runtime observation")
+
+
+def validate_e5_denial_receipt(
+    *,
+    correction_commit: Mapping[str, Any],
+    outbound_event_id: str | None,
+    candidate_id: str,
+    original_event_id: str,
+    original_metadata: Mapping[str, Any],
+    honcho_row: Any,
+) -> str:
+    """Resolve a denial append from its Camera receipt and matching Honcho row."""
+    metadata = getattr(honcho_row, "metadata", None)
+    event_id = correction_commit.get("event_id")
+    source_id = correction_commit.get("source_message_id")
+    client_op_id = correction_commit.get("client_op_id")
+    original_source_id = original_metadata.get("source_message_id")
+    trace = metadata.get("decision_trace") if isinstance(metadata, Mapping) else None
+    annotations = trace.get("annotations") if isinstance(trace, Mapping) else None
+    nutrition = annotations.get("nutrition") if isinstance(annotations, Mapping) else None
+    changed_fields = nutrition.get("changed_fields") if isinstance(nutrition, Mapping) else None
+    if (
+        correction_commit.get("kind") != "denial"
+        or not isinstance(event_id, str) or not event_id
+        or not isinstance(source_id, str) or not source_id
+        or not isinstance(client_op_id, str) or not client_op_id
+        or correction_commit.get("target_event_id") != original_event_id
+        or correction_commit.get("target_source_message_id") != original_source_id
+        or (outbound_event_id is not None and outbound_event_id != event_id)
+        or getattr(honcho_row, "id", None) != event_id
+        or not isinstance(original_source_id, str) or not original_source_id
+        or not isinstance(metadata, Mapping)
+        or metadata.get("source_message_id") != source_id
+        or metadata.get("reply_to_source_message_id") != original_source_id
+        or metadata.get("client_op_id") != client_op_id
+        or metadata.get("camera_candidate_id") != candidate_id
+        or metadata.get("camera_operation_id") != candidate_id
+        or metadata.get("camera_original_event_id") != original_event_id
+        or metadata.get("camera_answer_bound") != "no"
+        or metadata.get("camera_correction_bound") is not True
+        or any(
+            not isinstance(original_metadata.get(key), str)
+            or not original_metadata.get(key)
+            or metadata.get(key) != original_metadata.get(key)
+            for key in ("tenant_id", "source_principal", "gateway_session_id")
+        )
+        or metadata.get("is_group") is not False
+        or metadata.get("is_forwarded") is not False
+        or not isinstance(nutrition, Mapping)
+        or nutrition.get("record_type") != "meal_correction"
+        or nutrition.get("consumption_status") != "not_consumed"
+        or nutrition.get("energy_kcal_best") != 0
+        or not isinstance(changed_fields, list)
+        or "consumption_status" not in changed_fields
+    ):
+        raise AssertionError("E5 denial Camera receipt does not match its durable Honcho correction")
+    return event_id
+
+
+def validate_e5_post_correction_replay(
+    *, status: str | None, delivery_receipt: Any, event_id: str | None,
+    expected_event_id: str, original_commit: Mapping[str, Any],
+    current_commit: Mapping[str, Any] | None,
+) -> str:
+    """Require replay to report the latest correction without replacing the meal."""
+    if (
+        not isinstance(status, str)
+        or "исправление уже записано" not in status.casefold()
+        or delivery_receipt is None
+        or not isinstance(expected_event_id, str) or not expected_event_id
+        or event_id != expected_event_id
+        or current_commit != original_commit
+    ):
+        raise AssertionError("post-denial replay did not confirm its durable correction")
+    return status
 
 
 def _validate_completed_photo_replay(
@@ -611,7 +722,10 @@ async def run_camera_runtime_trajectory(
                 receipt = await channel.send(outbound)
                 ingress.note_assistant_receipt(outbound, receipt)
                 delivered.append((outbound, receipt))
-                if outbound.metadata.get("nutrition_append_event_id"):
+                if (
+                    "nutrition_append_event_id" in outbound.metadata
+                    and outbound.metadata["nutrition_append_event_id"] is not None
+                ):
                     nutrition_event_id = outbound.metadata["nutrition_append_event_id"]
                     final_receipt = receipt
             return delivered, final_receipt, nutrition_event_id
@@ -867,24 +981,45 @@ async def run_camera_runtime_trajectory(
             ingress.process_real_inbound(replay)
             return replay
 
-        replay = await replay_callback()
-        replay_delivered, replay_delivery_receipt, replay_event_id = await process_and_deliver(
-            replay, replay.session_key
+        latest_replay = (
+            after_save_result.get("post_correction_replay")
+            if isinstance(after_save_result, dict) else None
         )
-        current_commit = ingress._attempts[candidate_id].get("camera_commit")
-        replay_status = _validate_completed_photo_replay(
-            replay=replay,
-            candidate_id=candidate_id,
-            turn_id=answer.metadata["_camera_turn_id"],
-            delivered=replay_delivered,
-            delivery_receipt=replay_delivery_receipt,
-            existing_event_id=nutrition_event_id,
-            original_commit=commit,
-            current_commit=current_commit,
-            typed_replay=action.callback_data is None,
-        )
-        if replay_event_id != nutrition_event_id:
-            raise AssertionError("completed-photo replay event identity differs from existing meal")
+        if isinstance(latest_replay, dict):
+            # The E5 join has already replayed the most recent denial through
+            # Telegram -> CameraIngress -> runtime. Replaying the original
+            # affirmative response here would test stale state and risk a
+            # fixture-triggered resurrection of the corrected meal.
+            replay_status = latest_replay.get("status")
+            replay_delivery_receipt = latest_replay.get("delivery_receipt")
+            replay_event_id = latest_replay.get("event_id")
+            replay_status = validate_e5_post_correction_replay(
+                status=replay_status,
+                delivery_receipt=replay_delivery_receipt,
+                event_id=replay_event_id,
+                expected_event_id=latest_replay.get("expected_event_id"),
+                original_commit=commit,
+                current_commit=ingress._attempts[candidate_id].get("camera_commit"),
+            )
+        else:
+            replay = await replay_callback()
+            replay_delivered, replay_delivery_receipt, replay_event_id = await process_and_deliver(
+                replay, replay.session_key
+            )
+            current_commit = ingress._attempts[candidate_id].get("camera_commit")
+            replay_status = _validate_completed_photo_replay(
+                replay=replay,
+                candidate_id=candidate_id,
+                turn_id=answer.metadata["_camera_turn_id"],
+                delivered=replay_delivered,
+                delivery_receipt=replay_delivery_receipt,
+                existing_event_id=nutrition_event_id,
+                original_commit=commit,
+                current_commit=current_commit,
+                typed_replay=action.callback_data is None,
+            )
+            if replay_event_id != nutrition_event_id:
+                raise AssertionError("completed-photo replay event identity differs from existing meal")
         if (
             isinstance(bot_client, OfflineCameraBotApi)
             and bot_client.finalization_proposals != initial_finalization_proposals
