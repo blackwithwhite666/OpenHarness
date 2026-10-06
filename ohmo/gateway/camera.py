@@ -281,6 +281,18 @@ _CAMERA_QUANTITY_MEASURE = (
     r"г(?=\s|$|[.!])|кг|мл|л|pieces?|portions?|grams?|kg|ml|l|cups?|"
     r"чашк\w*|стакан\w*|яблок\w*|груш\w*|банан\w*)"
 )
+_CAMERA_CONTEXTUAL_PARTIAL_QUANTITY_RE = re.compile(
+    r"^\s*(?:часть|половин\w*|кусоч\w*|part(?:\s+of)?|half(?:\s+of)?)\s+"
+    r"(?P<subject>[\w-]+(?:\s+[\w-]+){0,2})\s*[,—:;]\s*"
+    + rf"(?P<quantity>(?:(?:about|around|примерно|около)\s*)?"
+      rf"(?:\d+(?:[.,]\d+)?|полтора|полторы)\s*(?:{_CAMERA_QUANTITY_MEASURE}))"
+      r"\s*[.!…]*$",
+    re.IGNORECASE,
+)
+_CAMERA_CONTEXTUAL_PARTIAL_NONFOOD_SUBJECT_RE = re.compile(
+    r"\b(?:салфет\w*|napkins?|tables?|стол(?:а|у|ом|е|ы|ов|ам|ами|ах)?)\b",
+    re.IGNORECASE,
+)
 _CAMERA_WHOLE_PORTION_PREFIX_RE = re.compile(
     r"^\s*(?:всё|все)\s*:\s*(?P<payload>.+?)\s*$", re.IGNORECASE
 )
@@ -534,6 +546,52 @@ def _camera_contextual_portion_choice(text: object, source_context: object) -> b
     return True
 
 
+def _camera_contextual_partial_quantity(text: object, source_context: object) -> bool:
+    """Accept a stated partial amount only when its food/container is pictured."""
+    if (
+        not isinstance(text, str)
+        or not isinstance(source_context, str)
+        or "?" in text
+        or _CAMERA_WHOLE_PORTION_NONFOOD_SUBJECT_RE.search(text)
+        or _CAMERA_UNRELATED_CONTEXT_RE.search(text)
+        or _CLARIFICATION_NEW_MEAL_RE.search(text)
+        or _ANSWER_NEGATED_CONSUMPTION_RE.search(text)
+        or _CAMERA_ANALYSIS_ONLY_QUESTION_RE.search(text)
+    ):
+        return False
+    match = _CAMERA_CONTEXTUAL_PARTIAL_QUANTITY_RE.fullmatch(text)
+    if (
+        match is None
+        or _CAMERA_CONTEXTUAL_PARTIAL_NONFOOD_SUBJECT_RE.search(match["subject"])
+        or not _CLARIFICATION_QUANTITY_RE.fullmatch(match["quantity"])
+    ):
+        return False
+    context_words = [
+        token.casefold() for token in _CAMERA_COMPOSITION_TOKEN_RE.findall(source_context)
+    ]
+    subject_words = [
+        token.casefold() for token in _CAMERA_COMPOSITION_TOKEN_RE.findall(match["subject"])
+    ]
+    return bool(subject_words) and all(
+        any(
+            word == source
+            or (
+                len(word) >= 3
+                and 0 < len(source) - len(word) <= 3
+                and source.startswith(word)
+            )
+            or (
+                len(source) >= 3
+                and 0 < len(word) - len(source) <= 3
+                and word.startswith(source)
+            )
+            or (len(word) >= 5 and len(source) >= 5 and word[:5] == source[:5])
+            for source in context_words
+        )
+        for word in subject_words
+    )
+
+
 def _camera_affirmation_excluded(
     text: object, *, source_context: object = None, require_composition_source: bool = False
 ) -> bool:
@@ -721,6 +779,7 @@ def _camera_context_answer_kind(
         _NATIVE_WHOLE_PLATE_RE.fullmatch(text.strip())
         or _NATIVE_WHOLE_PORTION_RE.fullmatch(text.strip())
         or _CONTEXTUAL_PARTIAL_PORTION_RE.fullmatch(text.strip())
+        or _camera_contextual_partial_quantity(text, source_context)
         or _camera_contextual_portion_choice(text, source_context)
         or _CLARIFICATION_QUANTITY_RE.fullmatch(text)
         or _camera_composition_description(

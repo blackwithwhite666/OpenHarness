@@ -1525,6 +1525,104 @@ async def test_free_text_composition_without_confirmed_prompt_stays_unbound(tmp_
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("text", "question", "target_kind", "sender", "expected"),
+    [
+        ("Часть упаковки — 125 г?", "Сколько съели?", "photo", "123", None),
+        (
+            "Не уверена, что съела часть упаковки — 125 г.",
+            "Сколько съели?", "photo", "123", None,
+        ),
+        ("Не съела часть упаковки — 125 г.", "Сколько съели?", "photo", "123", "no"),
+        ("Часть фотографий — 125 г.", "Сколько съели?", "photo", "123", None),
+        ("Часть молока — 125 г.", "Сколько съели?", "photo", "123", None),
+        ("Часть упаковки — 125 г.", "Какую порцию только оценить?", "photo", "123", None),
+        ("Часть упаковки — 125 г.", "Сколько съели?", "wrong", "123", None),
+        ("Часть упаковки — 125 г.", "Сколько съели?", "photo", "456", None),
+    ],
+)
+async def test_contextual_partial_quantity_requires_trusted_consumption_source(
+    tmp_path, text, question, target_kind, sender, expected,
+):
+    ingress, root, bus, _ = _ingress(tmp_path)
+    request = _candidate(root, classifier_decision="food")
+    _, _, _, _, _, _, _ = await _actual_native_camera_prompt(
+        ingress, root, bus, request,
+        question=question,
+        options=["Всю упаковку", "Часть упаковки", "Только попробовать", "Ещё не ели"],
+        selected_index=None,
+        source_analysis="На фото открытая упаковка гречки.",
+    )
+    attempt = ingress._attempts[request["candidate_id"]]
+    reply_target = (
+        str(attempt["photo_id"]) if target_kind == "photo"
+        else "an-unrelated-message"
+    )
+    answer = InboundMessage(
+        channel="telegram", sender_id=sender, chat_id="123", content=text,
+        metadata={
+            "is_group": False,
+            "message_id": "typed-package-answer",
+            "reply_to_message_id": reply_target,
+            "_telegram_raw_text": text,
+        },
+    )
+    ingress.process_real_inbound(answer)
+    assert answer.metadata.get("_camera_answer") == expected
+    if expected != "yes":
+        assert answer.metadata.get("_camera_answer") != "yes"
+        assert answer.media == []
+    await ingress.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("targeted", [True, False], ids=["reply-to-photo", "contextual"])
+@pytest.mark.parametrize(
+    ("text", "source_analysis"),
+    [
+        ("Часть напитка — 125 г.", "На фото открытая упаковка гречки."),
+        ("Часть икры — 125 г.", "На фото рис и яйца."),
+        (
+            "Часть салфетки — 125 г.",
+            "На фото открытая упаковка гречки и салфетка.",
+        ),
+        (
+            "Part of table, 125 grams.",
+            "On the table is a package of buckwheat.",
+        ),
+    ],
+    ids=["short-prefix-drink", "short-prefix-caviar", "background-napkin", "background-table"],
+)
+async def test_contextual_partial_quantity_rejects_unrelated_subjects_at_ingress(
+    tmp_path, targeted, text, source_analysis,
+):
+    ingress, root, bus, _ = _ingress(tmp_path)
+    request = _candidate(root, classifier_decision="food")
+    await _actual_native_camera_prompt(
+        ingress, root, bus, request,
+        question="Сколько съели?",
+        options=["Всю упаковку", "Часть упаковки", "Только попробовать", "Ещё не ели"],
+        selected_index=None,
+        source_analysis=source_analysis,
+    )
+    attempt = ingress._attempts[request["candidate_id"]]
+    metadata = {"is_group": False, "message_id": "unrelated-portion-answer"}
+    if targeted:
+        metadata["reply_to_message_id"] = str(attempt["photo_id"])
+    answer = InboundMessage(
+        channel="telegram", sender_id="123", chat_id="123", content=text,
+        metadata={**metadata, "_telegram_raw_text": text},
+    )
+    ingress.process_real_inbound(answer)
+    assert answer.metadata.get("_camera_answer") != "yes"
+    assert answer.metadata.get("_camera_authority") is not CAMERA_AUTHORITY
+    assert answer.metadata.get("_camera_candidate_id") is None
+    assert answer.media == []
+    assert attempt["state"] == "photo_sent"
+    await ingress.close()
+
+
+@pytest.mark.asyncio
 async def test_interrupted_camera_context_does_not_reauthorize_grounded_composition(tmp_path):
     ingress, root, bus, _ = _ingress(tmp_path)
     request = _candidate(root, classifier_decision="food")
@@ -1937,7 +2035,9 @@ async def test_clarification_native_quantity_accepts_verified_callback(tmp_path)
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("answer_text", ["да.", "Рис и 2 яйца"])
+@pytest.mark.parametrize(
+    "answer_text", ["да.", "Рис и 2 яйца", "Часть упаковки — 125 г."]
+)
 async def test_untargeted_answer_never_selects_one_of_multiple_camera_photos_by_state(
     tmp_path, answer_text,
 ):
@@ -1973,7 +2073,7 @@ async def test_untargeted_answer_never_selects_one_of_multiple_camera_photos_by_
     ingress.process_real_inbound(answer)
     assert answer.metadata.get("_camera_answer") is None
     assert answer.metadata.get("_camera_candidate_id") is None
-    assert answer.metadata["_camera_unbound"] is CAMERA_AUTHORITY
+    assert answer.media == []
     assert ingress._attempts[first["candidate_id"]]["state"] == "clarifying"
     assert ingress._attempts[second["candidate_id"]]["state"] == "photo_sent"
     await ingress.close()
@@ -2177,8 +2277,45 @@ async def test_unknown_weight_does_not_cancel_explicit_camera_consumption(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("targeted", [True, False], ids=["reply-to-photo", "contextual"])
+@pytest.mark.parametrize(
+    ("phrase", "question", "source_analysis", "offered_options", "quantity_text"),
+    [
+        (
+            "Весь рис и оба яйца.",
+            "Какую порцию вы съели?",
+            "На тарелке — смесь белого и дикого риса и два разрезанных пополам варёных яйца; рядом упаковка острой горчицы.",
+            ["Весь рис и оба яйца", "Часть риса и оба яйца", "Только часть блюда", "Ещё не ел(а)"],
+            "one portion of rice and two eggs",
+        ),
+        (
+            "Часть упаковки — 125 г.",
+            "Сколько съели?",
+            "На фото открытая упаковка гречки.",
+            ["Всю упаковку", "Часть упаковки", "Только попробовала", "Ещё не ела"],
+            "125 г из упаковки гречки",
+        ),
+        (
+            "Половину упаковки, примерно 90 грамм.",
+            "Какую порцию вы съели?",
+            "На фото открытая упаковка чечевицы.",
+            ["Всю упаковку", "Часть упаковки", "Только попробовала", "Ещё не ела"],
+            "примерно половина упаковки, 90 грамм",
+        ),
+        (
+            "Часть столового винограда — 125 г.",
+            "Сколько съели?",
+            "На фото гроздь столового винограда.",
+            ["Всю упаковку", "Часть упаковки", "Только попробовала", "Ещё не ела"],
+            "125 г столового винограда",
+        ),
+    ],
+    ids=[
+        "whole-food-choice", "typed-package-weight", "typed-package-fraction",
+        "typed-table-grapes",
+    ],
+)
 async def test_native_food_portion_phrase_finalizes_once_and_replay_adds_no_event(
-    tmp_path, targeted,
+    tmp_path, targeted, phrase, question, source_analysis, offered_options, quantity_text,
 ):
     import tests.test_ohmo.test_camera_f84_joint_runtime as joint_runtime
 
@@ -2186,28 +2323,33 @@ async def test_native_food_portion_phrase_finalizes_once_and_replay_adds_no_even
     request = _candidate(root, classifier_decision="food", capture_time=joint_runtime.BASE)
     _, _, receipt, options, _, telegram_channel, _ = await _actual_native_camera_prompt(
         ingress, root, bus, request,
-        question="Какую порцию вы съели?",
-        options=["Весь рис и оба яйца", "Часть риса и оба яйца", "Только часть блюда", "Ещё не ел(а)"],
+        question=question,
+        options=offered_options,
         selected_index=None,
-        source_analysis="На тарелке — смесь белого и дикого риса и два разрезанных пополам варёных яйца; рядом упаковка острой горчицы.",
+        source_analysis=source_analysis,
     )
-    assert options == [
-        "Весь рис и оба яйца", "Часть риса и оба яйца", "Только часть блюда", "Ещё не ел(а)"
-    ]
+    assert options == offered_options
+    assert receipt.native_message_ids
     attempt = ingress._attempts[request["candidate_id"]]
-    assert attempt["confirmed_camera_context"].startswith("На тарелке")
-    phrase = "Весь рис и оба яйца."
+    assert attempt["confirmed_camera_context"] == source_analysis
     owner_metadata = {"is_group": False, "message_id": 9031, "_telegram_raw_text": phrase}
     if targeted:
-        owner_metadata["reply_to_message_id"] = str(receipt.native_message_ids[0])
+        owner_metadata["reply_to_message_id"] = str(attempt["photo_id"])
     answer = InboundMessage(
         channel="telegram", sender_id="123", chat_id="123", content=phrase,
         metadata=dict(owner_metadata),
     )
     ingress.process_real_inbound(answer)
     assert answer.metadata["_camera_answer"] == "yes"
+    assert answer.metadata["_camera_authority"] is CAMERA_AUTHORITY
+    assert answer.metadata["_camera_candidate_id"] == request["candidate_id"]
     assert answer.metadata["_camera_route"] == ("reply" if targeted else "context")
+    assert answer.content == phrase
+    assert answer.metadata["_telegram_raw_text"] == phrase
     assert answer.media == [attempt["snapshot"]]
+    assert ingress.trusted_capture_time_for_answer(answer) == joint_runtime.BASE
+    if targeted:
+        assert answer.metadata["_camera_native_binding"] == str(attempt["photo_id"])
     assert attempt["state"] == "answering"
 
     pool, bundle, server, client = joint_runtime.setup(str(tmp_path / f"portion-{targeted}"))
@@ -2221,8 +2363,7 @@ async def test_native_food_portion_phrase_finalizes_once_and_replay_adds_no_even
         meal_at=datetime.fromisoformat(request["capture_time"]),
         energy_kcal_best=430,
         items=[
-            {"name": "rice", "quantity_text": "one portion", "energy_kcal_best": 250},
-            {"name": "boiled eggs", "quantity_text": "two", "energy_kcal_best": 180},
+            {"name": "pictured food", "quantity_text": quantity_text, "energy_kcal_best": 430},
         ],
     )
     bundle.engine.answer = "Записала съеденную порцию."
@@ -2250,6 +2391,8 @@ async def test_native_food_portion_phrase_finalizes_once_and_replay_adds_no_even
     assert {row["metadata"].get("role") for row in camera_history_rows} == {
         "user", "assistant"
     }
+    user_rows = [row for row in camera_history_rows if row["metadata"].get("role") == "user"]
+    assert len(user_rows) == 1 and user_rows[0]["content"] == phrase
     event_rows = saved_camera_meal_events()
     assert len(event_rows) == 1
     saved_metadata = event_rows[0]["metadata"]
@@ -2267,9 +2410,10 @@ async def test_native_food_portion_phrase_finalizes_once_and_replay_adds_no_even
     assert datetime.fromisoformat(saved_nutrition["meal_at"]) == datetime.fromisoformat(
         request["capture_time"]
     )
+    assert saved_nutrition["items"][0]["quantity_text"] == quantity_text
     if targeted:
         assert saved_metadata["camera_reply_to_native_message_id"] == str(
-            receipt.native_message_ids[0]
+            attempt["photo_id"]
         )
     else:
         assert "camera_reply_to_native_message_id" not in saved_metadata
@@ -2277,6 +2421,7 @@ async def test_native_food_portion_phrase_finalizes_once_and_replay_adds_no_even
     assert attempt["finalizer_status"] == "committed"
     event_id = attempt["camera_commit"]["event_id"]
     assert event_rows[0]["id"] == event_id
+    assert final.metadata["nutrition_append_event_id"] == event_id
 
     final_message = OutboundMessage(
         channel="telegram", chat_id="123", content=final.text, metadata=final.metadata,
