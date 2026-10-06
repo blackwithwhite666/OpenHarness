@@ -2297,6 +2297,61 @@ class OhmoSessionRuntimePool:
                     }
                     if typed_replay and isinstance(attempt, dict) else set()
                 )
+                retained_source_ids = (
+                    {
+                        str(attempt.get("photo_id")),
+                        *map(str, attempt.get("reply_ids", [])),
+                    }
+                    if isinstance(attempt, dict) else set()
+                )
+                original_route = (
+                    assistant_metadata.get("camera_route")
+                    if isinstance(assistant_metadata, Mapping) else None
+                )
+                original_context_receipt = bool(
+                    original_route == "context"
+                    and isinstance(assistant_metadata, Mapping)
+                    and "camera_reply_to_native_message_id" not in assistant_metadata
+                )
+                original_source_bound_receipt = bool(
+                    original_route in {"reply", "callback"}
+                    and committed_binding is not None
+                    and str(committed_binding) in retained_source_ids
+                )
+                current_route = message.metadata.get("_camera_route")
+                current_binding_is_retained = (
+                    replay_binding is not None
+                    and str(replay_binding) in retained_source_ids
+                )
+                trusted_explicit_source_replay = bool(
+                    current_binding_is_retained
+                    and (
+                        (typed_replay and current_route == "reply")
+                        or (
+                            camera_authorized
+                            and message.metadata.get("_camera_existing_meal_replay") is True
+                            and current_route in {"reply", "callback"}
+                        )
+                    )
+                )
+                replay_receipt_route_valid = bool(
+                    (
+                        original_context_receipt
+                        and (context_typed_replay or trusted_explicit_source_replay)
+                    )
+                    or (
+                        original_source_bound_receipt
+                        and (
+                            str(committed_binding) in typed_source_ids
+                            if typed_replay
+                            else committed_binding == str(replay_binding)
+                        )
+                    )
+                )
+                durable_replay = bool(
+                    typed_replay
+                    or message.metadata.get("_camera_existing_meal_replay") is True
+                )
                 trace = (
                     assistant_metadata.get("decision_trace")
                     if isinstance(assistant_metadata, Mapping) else None
@@ -2335,18 +2390,7 @@ class OhmoSessionRuntimePool:
                     or assistant_metadata.get("camera_candidate_id") != candidate_id
                     or assistant_metadata.get("camera_operation_id") != candidate_id
                     or assistant_metadata.get("camera_answer_bound") != "yes"
-                    or (
-                        (
-                            assistant_metadata.get("camera_route") != "context"
-                            or committed_binding is not None
-                        )
-                        if context_typed_replay
-                        else (
-                            str(committed_binding) not in typed_source_ids
-                            if typed_replay
-                            else committed_binding != str(replay_binding)
-                        )
-                    )
+                    or not replay_receipt_route_valid
                     or assistant_metadata.get("gateway_session_id") != turn_ctx.session_id
                     or assistant_metadata.get("tenant_id") != memory_scope.private_tenant
                     or assistant_metadata.get("source_principal")
@@ -2354,7 +2398,7 @@ class OhmoSessionRuntimePool:
                     or assistant_metadata.get("source_message_id")
                     != commit.get("source_message_id")
                     or (
-                        not typed_replay
+                        not durable_replay
                         and assistant_metadata.get("source_message_id") != source_message_id
                     )
                     or assistant_metadata.get("ingest_source") != "dropbox_camera"

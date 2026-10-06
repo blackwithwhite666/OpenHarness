@@ -4165,6 +4165,7 @@ class CameraIngress:
         ):
             return
         metadata = message.metadata
+        owner_supplied_media = bool(message.media)
         self._sweep_expired_attempts()
         target = (
             metadata.get("native_message_id")
@@ -4179,7 +4180,9 @@ class CameraIngress:
                 str(value.get("photo_id")), *map(str, value.get("reply_ids", []))
             }
         ]
-        if target is None and message.media:
+        # Only media present on entry is a new owner source. Camera snapshots
+        # attached below for retained context are enrichment, not interruption.
+        if owner_supplied_media:
             self._interrupt_untargeted_camera_context()
         # Persist a production-owned eligibility fact for calibration. The
         # callback's visible text is never enough to turn a stale Camera tap
@@ -4640,7 +4643,11 @@ class CameraIngress:
                         _camera_correction_replay_typed=True,
                     )
                 else:
-                    metadata["_camera_typed_replay_candidate"] = candidate_id
+                    metadata.update(
+                        _camera_typed_replay_candidate=candidate_id,
+                        _camera_route="reply",
+                        _camera_native_binding=str(target),
+                    )
                 return
             if (
                 callback

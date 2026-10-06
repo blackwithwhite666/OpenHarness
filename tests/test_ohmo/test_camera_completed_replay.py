@@ -735,6 +735,7 @@ def test_context_source_identical_typed_repeat_uses_saved_receipt(tmp_path, monk
             )
         )
         attempt = ingress._attempts[request["candidate_id"]]
+        assert attempt.get("context_interrupted", False) is False
         replay = InboundMessage(
             channel="telegram", sender_id="123", chat_id="123",
             content="Да, я это съела",
@@ -756,6 +757,220 @@ def test_context_source_identical_typed_repeat_uses_saved_receipt(tmp_path, monk
         await ingress.close()
 
     asyncio.run(run())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reply_target", ["unrelated", "old_camera_photo"])
+async def test_new_owner_photo_reply_interrupts_context_replay_after_journal_reload(
+    tmp_path, monkeypatch, reply_target,
+):
+    ingress, request, pool, honcho, saved_final, first_answer = await _save_typed_confirmation(
+        tmp_path, monkeypatch, reply_to_photo=False,
+    )
+    attempt = ingress._attempts[request["candidate_id"]]
+    target = "999" if reply_target == "unrelated" else str(attempt["photo_id"])
+    new_photo = InboundMessage(
+        channel="telegram", sender_id="123", chat_id="123", content="new owner photo",
+        metadata={"message_id": f"new-owner-photo-{reply_target}",
+                  "reply_to_message_id": target, "is_group": False, "chat_type": "private"},
+        media=["new-owner-photo.jpg"],
+    )
+    ingress.process_real_inbound(new_photo)
+    assert new_photo.media == ["new-owner-photo.jpg"]
+    assert attempt["context_interrupted"] is True
+
+    restarted, _, _, _ = _ingress(tmp_path, FakeTelegram())
+    pool._camera_ingress = restarted
+    assert restarted._attempts[request["candidate_id"]]["context_interrupted"] is True
+    replay = InboundMessage(
+        channel="telegram", sender_id="123", chat_id="123", content=first_answer.content,
+        metadata={"message_id": f"generic-repeat-after-{reply_target}-photo",
+                  "_telegram_raw_text": first_answer.content,
+                  "is_group": False, "chat_type": "private"},
+    )
+    restarted.process_real_inbound(replay)
+    assert replay.metadata.get("_camera_typed_replay_candidate") is None
+    before_turns = len(pool._test_bundle.engine.turns)
+    result = await runtime_turn(pool, replay, restarted)
+    assert result.text != "Эта порция уже записана."
+    assert len(pool._test_bundle.engine.turns) == before_turns + 1
+    assert len(honcho.messages) == 2
+    assert restarted._attempts[request["candidate_id"]]["camera_commit"]["event_id"] == saved_final.metadata[
+        "nutrition_append_event_id"
+    ]
+    await ingress.close()
+    await restarted.close()
+
+
+@pytest.mark.asyncio
+async def test_foreign_owner_photo_reply_does_not_interrupt_context_replay(tmp_path, monkeypatch):
+    ingress, request, pool, honcho, saved_final, first_answer = await _save_typed_confirmation(
+        tmp_path, monkeypatch, reply_to_photo=False,
+    )
+    attempt = ingress._attempts[request["candidate_id"]]
+    foreign_photo = InboundMessage(
+        channel="telegram", sender_id="other-owner", chat_id="123", content="foreign photo",
+        metadata={"message_id": "foreign-photo", "reply_to_message_id": str(attempt["photo_id"])},
+        media=["foreign-photo.jpg"],
+    )
+    ingress.process_real_inbound(foreign_photo)
+    assert attempt.get("context_interrupted", False) is False
+    replay = InboundMessage(
+        channel="telegram", sender_id="123", chat_id="123", content=first_answer.content,
+        metadata={"message_id": "same-owner-repeat-after-foreign-photo",
+                  "_telegram_raw_text": first_answer.content,
+                  "is_group": False, "chat_type": "private"},
+    )
+    ingress.process_real_inbound(replay)
+    assert replay.metadata.get("_camera_typed_replay_candidate") == request["candidate_id"]
+    result = await runtime_turn(pool, replay, ingress)
+    assert result.text == "Эта порция уже записана."
+    assert len(honcho.messages) == 2
+    await ingress.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("current_route", ["reply", "callback"])
+@pytest.mark.parametrize("after_new_photo", [False, True])
+async def test_context_origin_receipt_reconciles_explicit_source_route_after_restart(
+    tmp_path, monkeypatch, current_route, after_new_photo,
+):
+    ingress, request, pool, honcho, saved_final, first_answer = await _save_typed_confirmation(
+        tmp_path, monkeypatch, reply_to_photo=False,
+    )
+    original = honcho.messages[1]
+    assert original.metadata["camera_route"] == "context"
+    assert "camera_reply_to_native_message_id" not in original.metadata
+    attempt = ingress._attempts[request["candidate_id"]]
+    if after_new_photo:
+        new_photo = InboundMessage(
+            channel="telegram", sender_id="123", chat_id="123", content="new owner photo",
+            metadata={"message_id": f"new-photo-before-{current_route}",
+                      "reply_to_message_id": str(attempt["photo_id"]),
+                      "is_group": False, "chat_type": "private"},
+            media=["new-owner-photo.jpg"],
+        )
+        ingress.process_real_inbound(new_photo)
+        assert attempt["context_interrupted"] is True
+    restarted, _, bus, _ = _ingress(tmp_path, FakeTelegram())
+    pool._camera_ingress = restarted
+    assert restarted._attempts[request["candidate_id"]].get("context_interrupted", False) is after_new_photo
+    if current_route == "reply":
+        replay = InboundMessage(
+            channel="telegram", sender_id="123", chat_id="123", content=first_answer.content,
+            metadata={"message_id": "context-origin-explicit-reply-replay",
+                      "reply_to_message_id": str(attempt["photo_id"]),
+                      "_telegram_raw_text": first_answer.content,
+                      "is_group": False, "chat_type": "private"},
+        )
+    else:
+        replay = await _native_callback(
+            bus, label=first_answer.content, target=attempt["photo_id"],
+            options=[first_answer.content, "Нет, не ела"], prompt="Вы съели это?",
+        )
+        replay.metadata["callback_query_id"] = "context-origin-callback-replay"
+    restarted.process_real_inbound(replay)
+    if current_route == "reply":
+        assert replay.metadata.get("_camera_typed_replay_candidate") == request["candidate_id"]
+        assert replay.metadata.get("_camera_route") == "reply"
+    else:
+        assert replay.metadata.get("_camera_existing_meal_replay") is True
+        assert replay.metadata.get("_camera_ingress_callback_eligible") is True
+    before_turns = len(pool._test_bundle.engine.turns)
+    result = await runtime_turn(pool, replay, restarted)
+    assert result.text == "Эта порция уже записана."
+    assert result.metadata["nutrition_append_event_id"] == saved_final.metadata[
+        "nutrition_append_event_id"
+    ]
+    assert len(honcho.messages) == 2
+    assert len(pool._test_bundle.engine.turns) == before_turns
+    assert restarted._attempts[request["candidate_id"]]["camera_commit"]["event_id"] == saved_final.metadata[
+        "nutrition_append_event_id"
+    ]
+    await ingress.close()
+    await restarted.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("current_route", ["reply", "callback"])
+@pytest.mark.parametrize(
+    "receipt_failure",
+    ["missing", "foreign_owner", "foreign_session", "stale_source", "bad_operation",
+     "bad_capture_time", "bad_original_route", "bad_original_native_binding",
+     "present_null_native_binding"],
+)
+async def test_cross_route_context_receipt_stays_fail_closed_after_journal_restart(
+    tmp_path, monkeypatch, current_route, receipt_failure,
+):
+    ingress, request, pool, honcho, _, first_answer = await _save_typed_confirmation(
+        tmp_path, monkeypatch, reply_to_photo=False,
+    )
+    attempt = ingress._attempts[request["candidate_id"]]
+    restarted, _, bus, _ = _ingress(tmp_path, FakeTelegram())
+    pool._camera_ingress = restarted
+    if current_route == "reply":
+        replay = InboundMessage(
+            channel="telegram", sender_id="123", chat_id="123", content=first_answer.content,
+            metadata={"message_id": f"bad-cross-route-{receipt_failure}",
+                      "reply_to_message_id": str(attempt["photo_id"]),
+                      "_telegram_raw_text": first_answer.content,
+                      "is_group": False, "chat_type": "private"},
+        )
+    else:
+        replay = await _native_callback(
+            bus, label=first_answer.content, target=attempt["photo_id"],
+            options=[first_answer.content, "Нет, не ела"], prompt="Вы съели это?",
+        )
+        replay.metadata["callback_query_id"] = f"bad-cross-route-{receipt_failure}"
+    restarted.process_real_inbound(replay)
+    backend = pool._shadow_backend_for_scope(None)
+    reconcile = backend.reconcile_durable_exchange
+
+    async def altered_receipt(user_op, assistant_op):
+        receipt = await reconcile(user_op, assistant_op)
+        if receipt_failure == "missing":
+            return None
+        from dataclasses import replace
+
+        assistant_metadata = dict(receipt.assistant_metadata)
+        trace = dict(assistant_metadata.get("decision_trace", {}))
+        annotations = dict(trace.get("annotations", {}))
+        nutrition = dict(annotations.get("nutrition", {}))
+        if receipt_failure == "foreign_owner":
+            assistant_metadata["tenant_id"] = "another-owner"
+        elif receipt_failure == "foreign_session":
+            assistant_metadata["gateway_session_id"] = "another-session"
+        elif receipt_failure == "stale_source":
+            assistant_metadata["source_message_id"] = "stale-source"
+        elif receipt_failure == "bad_operation":
+            assistant_metadata["camera_operation_id"] = "another-operation"
+        elif receipt_failure == "bad_capture_time":
+            nutrition["meal_at"] = "2025-01-01T00:00:00+00:00"
+            annotations["nutrition"] = nutrition
+            trace["annotations"] = annotations
+            assistant_metadata["decision_trace"] = trace
+        elif receipt_failure == "bad_original_route":
+            assistant_metadata["camera_route"] = "reply"
+        elif receipt_failure == "bad_original_native_binding":
+            assistant_metadata["camera_reply_to_native_message_id"] = "999"
+        elif receipt_failure == "present_null_native_binding":
+            assistant_metadata["camera_reply_to_native_message_id"] = None
+        return replace(receipt, assistant_metadata=assistant_metadata)
+
+    pool._shadow_backend_for_scope = lambda _scope: SimpleNamespace(
+        reconcile_durable_exchange=altered_receipt
+    )
+    pool._active_message = replay
+    updates = [update async for update in pool.stream_message(replay, restarted.config.session_key)]
+    assert not any(
+        update.kind == "final" and update.text == "Эта порция уже записана."
+        for update in updates
+    )
+    assert any(update.kind == "error" for update in updates)
+    assert len(honcho.messages) == 2
+    assert restarted._attempts[request["candidate_id"]]["camera_commit"]["event_id"] == "honcho-2"
+    await ingress.close()
+    await restarted.close()
 
 
 def test_completed_meal_does_not_rebind_different_photo_owner_or_callback(tmp_path):
