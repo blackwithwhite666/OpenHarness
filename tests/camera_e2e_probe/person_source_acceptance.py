@@ -27,8 +27,8 @@ from probe_support import create_storage_run_dir
 _CASES = {
     "send_time_meal": {
         "sent_at": "2026-10-06T08:30:00+00:00",
-        "text": "I ate the food in this picture.",
-        "owner_scenario": "A synthetic owner says they ate the pictured meal.",
+        "text": "",
+        "owner_scenario": "A synthetic person sends an ordinary food photo without a caption or extra confirmation.",
         "expect_meal_at": "2026-10-06T08:30:00+00:00",
         "expected_kcal": 285,
         "replay": True,
