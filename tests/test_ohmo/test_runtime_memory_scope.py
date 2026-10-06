@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 from dataclasses import replace
 from datetime import datetime, timezone
@@ -23,6 +24,7 @@ from ohmo.gateway.runtime import (
     _logical_turn_id_for_conversation,
     _message_identity_for_turn,
     _trusted_reminder_wellness,
+    _wellness_actor_for_turn,
 )
 from ohmo.gateway.turn_context import TurnContext
 from ohmo.memory_backend import CatalogMemoryBackend, ShadowMemoryBackend
@@ -32,11 +34,42 @@ from ohmo.memory_tool import OhmoMemoryTool, OhmoMemoryToolInput
 from ohmo.reminders.tool import RemindCreateTool
 from ohmo.workspace import initialize_workspace
 from openharness.channels.bus.events import InboundMessage
-from openharness.engine.messages import ConversationMessage
+from openharness.engine.messages import ConversationMessage, TextBlock, ToolUseBlock
+from openharness.engine.query import QueryContext, _tool_execution_metadata
+from openharness.engine.query_engine import QueryEngine
+from openharness.api.client import ApiMessageCompleteEvent
+from openharness.api.usage import UsageSnapshot
+from openharness.config.settings import PermissionSettings
 from openharness.evals import TRACE_FINALIZATION, DecisionTraceValidationError
+from openharness.mcp.client import McpToolCallResult
 from openharness.mcp.types import McpToolInfo
+from openharness.permissions import PermissionChecker, PermissionMode
 from openharness.tools.base import ToolExecutionContext, ToolRegistry
 from openharness.tools.mcp_tool import McpToolAdapter, WellnessLoginInjectingAdapter
+
+
+def test_wellness_actor_flows_only_from_private_telegram_admission():
+    from openharness.mcp.wellness_delegation import TrustedWellnessActor
+
+    admitted = TurnContext(
+        principal="116870365", is_owner=False, is_private=True, channel="telegram",
+        chat_id="chat", session_id="session",
+    )
+    actor = _wellness_actor_for_turn(admitted)
+    assert actor == TrustedWellnessActor("116870365")
+    assert _wellness_actor_for_turn(replace(admitted, is_private=False)) is None
+    assert _wellness_actor_for_turn(replace(admitted, channel="feishu")) is None
+    assert _wellness_actor_for_turn(replace(admitted, principal="001")) is None
+
+    query_context = QueryContext(
+        api_client=None, tool_registry=None, permission_checker=None, cwd=Path("."),
+        model="model", system_prompt="", max_tokens=1,
+        tool_metadata={"wellness_trusted_actor": TrustedWellnessActor("999")},
+        wellness_actor=actor,
+    )
+    assert _tool_execution_metadata(query_context, {})["wellness_trusted_actor"] == actor
+    no_actor = replace(query_context, wellness_actor=None)
+    assert "wellness_trusted_actor" not in _tool_execution_metadata(no_actor, {})
 
 
 class _FakeHoncho:
@@ -764,14 +797,47 @@ async def test_denied_family_turn_has_no_authoritative_memory_surface(
 
 class _RecordingMcpManager:
     def __init__(self) -> None:
-        self.calls: list[tuple[str, str, dict]] = []
+        self.calls: list[tuple[str, str, dict, dict | None]] = []
 
     async def call_tool(self, server_name: str, tool_name: str, arguments: dict) -> str:
-        self.calls.append((server_name, tool_name, arguments))
+        self.calls.append((server_name, tool_name, arguments, None))
         return "wellness payload"
+
+    async def call_tool_result(
+        self, server_name: str, tool_name: str, arguments: dict, *, meta=None
+    ) -> McpToolCallResult:
+        self.calls.append((server_name, tool_name, arguments, meta))
+        return McpToolCallResult(output="wellness payload")
 
 
 _WELLNESS_TOOL_NAME = "mcp__worfalomey__get_wellness_data"
+
+
+def _set_signed_wellness_config(monkeypatch) -> None:
+    for name, value in {
+        "WELLNESS_DELEGATION_SIGNING_KEY": "synthetic-test-secret-" + "x" * 32,
+        "WELLNESS_DELEGATION_KID": "runtime-test-key",
+        "WELLNESS_DELEGATION_ISSUER": "oh-test",
+        "WELLNESS_DELEGATION_AUDIENCE": "tg-test-resource",
+        "WELLNESS_DELEGATION_CLIENT_ID": "oh-test-client",
+    }.items():
+        monkeypatch.setenv(name, value)
+
+
+def _wellness_tool_context(turn_ctx: TurnContext) -> ToolExecutionContext:
+    return ToolExecutionContext(
+        cwd=Path("."),
+        metadata={"wellness_trusted_actor": _wellness_actor_for_turn(turn_ctx)},
+    )
+
+
+def _wellness_token_subject(meta: dict | None) -> str | None:
+    token = (meta or {}).get("io.telegent/wellness-delegation/v1")
+    if not isinstance(token, str):
+        return None
+    encoded = token.split(".")[1]
+    claims = json.loads(base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)))
+    return claims.get("sub")
 
 
 def _wellness_bundle() -> tuple[SimpleNamespace, _RecordingMcpManager]:
@@ -815,9 +881,10 @@ def _wellness_contact_store(workspace: Path) -> ContactStore:
     return store
 
 
-async def test_wellness_tool_binds_trusted_logins_and_never_leaks_across_turns(
-    tmp_path: Path,
+async def test_wellness_tool_signs_each_admitted_reader_without_login_injection(
+    tmp_path: Path, monkeypatch,
 ) -> None:
+    _set_signed_wellness_config(monkeypatch)
     workspace = tmp_path / ".ohmo-home"
     initialize_workspace(workspace)
     _seed_catalog(workspace)
@@ -844,22 +911,20 @@ async def test_wellness_tool_binds_trusted_logins_and_never_leaks_across_turns(
 
     owner_result = await tool.execute(
         tool.input_model(params={"interval": "7d", "user_id": "mallory"}),
-        ToolExecutionContext(cwd=tmp_path),
+        _wellness_tool_context(owner_ctx),
     )
     assert owner_result.is_error is False
-    assert manager.calls[-1][2]["params"] == {
-        "interval": "7d",
-        "login": "dmitry_owner",
-    }
+    assert manager.calls[-1][2]["params"] == {"interval": "7d"}
+    assert _wellness_token_subject(manager.calls[-1][3]) == "telegram:100"
 
     owner_result = await tool.execute(
         tool.input_model(params={"interval": "7d", "login": "@Marina_Lipina"}),
-        ToolExecutionContext(cwd=tmp_path),
+        _wellness_tool_context(owner_ctx),
     )
     assert owner_result.is_error is False
     assert manager.calls[-1][2]["params"] == {
         "interval": "7d",
-        "login": "marina_lipina",
+        "login": "@Marina_Lipina",
     }
 
     marina_scope = pool._resolve_turn_memory_scope(marina_ctx)
@@ -868,24 +933,25 @@ async def test_wellness_tool_binds_trusted_logins_and_never_leaks_across_turns(
     tool = bundle.tool_registry.get(_WELLNESS_TOOL_NAME)
     marina_result = await tool.execute(
         tool.input_model(params={"interval": "7d", "login": "mallory"}),
-        ToolExecutionContext(cwd=tmp_path),
+        _wellness_tool_context(marina_ctx),
     )
     assert marina_result.is_error is False
     assert manager.calls[-1][2]["params"] == {
         "interval": "7d",
-        "login": "marina_lipina",
+        "login": "mallory",
     }
+    assert _wellness_token_subject(manager.calls[-1][3]) == "telegram:200"
 
     assert pool._resolve_turn_memory_scope(unknown_ctx) is None
     pool._configure_turn_memory_surfaces(bundle, unknown_ctx, memory_scope=None)
     tool = bundle.tool_registry.get(_WELLNESS_TOOL_NAME)
-    calls_before = len(manager.calls)
     denied_result = await tool.execute(
         tool.input_model(params={"interval": "7d"}),
-        ToolExecutionContext(cwd=tmp_path),
+        _wellness_tool_context(unknown_ctx),
     )
-    assert denied_result.is_error is True
-    assert len(manager.calls) == calls_before
+    assert denied_result.is_error is False
+    assert manager.calls[-1][2]["params"] == {"interval": "7d"}
+    assert _wellness_token_subject(manager.calls[-1][3]) == "telegram:999"
 
 
 async def test_empty_identity_registries_preserve_the_single_backend_for_every_turn(
@@ -1287,7 +1353,7 @@ def test_trusted_auto_reminder_wellness_keeps_current_chat_scope() -> None:
         sender_id="__scheduler__",
         chat_id="100",
         content="self-check",
-        session_key_override="telegram:100",
+        session_key_override="telegram:reminder:r1",
         metadata={
             "_synthetic": True,
             "_reminder_id": "r1",
@@ -1297,14 +1363,17 @@ def test_trusted_auto_reminder_wellness_keeps_current_chat_scope() -> None:
         },
     )
     trusted = _trusted_reminder_wellness(message)
-    assert trusted == {
-        "reminder_id": "r1",
-        "wellness_tenant": "owner",
-        "wellness_principal": "100|dmitry",
-    }
+    assert trusted is not None
+    assert trusted.reminder_id == "r1"
+    assert trusted.wellness_tenant == "owner"
+    assert trusted.wellness_principal == "100|dmitry"
+    assert trusted.private_chat_id == "100"
 
 
-async def test_auto_reminder_wellness_is_revalidated_and_injected(tmp_path: Path) -> None:
+async def test_admitted_scheduler_wellness_flows_through_query_engine_to_signed_tool(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    _set_signed_wellness_config(monkeypatch)
     workspace = tmp_path / ".ohmo-home"
     initialize_workspace(workspace)
     _seed_catalog(workspace)
@@ -1329,23 +1398,81 @@ async def test_auto_reminder_wellness_is_revalidated_and_injected(tmp_path: Path
                 "_reminder_wellness_principal": "100|dmitry",
                 "_reminder_wellness_tenant": "owner",
             },
+            session_key_override="telegram:reminder:r1",
         )
     )
     assert reminder is not None
 
     pool._configure_turn_memory_surfaces(bundle, None, memory_scope=None)
-    pool._apply_reminder_wellness_turn(bundle, reminder)
     tool = bundle.tool_registry.get(_WELLNESS_TOOL_NAME)
     assert isinstance(tool, WellnessLoginInjectingAdapter)
-    result = await tool.execute(
-        tool.input_model(params={"interval": "7d"}),
-        ToolExecutionContext(cwd=tmp_path),
+
+    # The scheduler admission is not durable authority: a changed current
+    # registry entry revokes it before actor creation.
+    admitted_config = pool._gateway_config
+    pool._gateway_config = _family_config(
+        owner_principals=(), family_principals={"100": "other"},
+        enabled_memory_tenants=("other",),
     )
-    assert result.is_error is False
-    assert manager.calls[-1][2]["params"] == {
-        "interval": "7d",
-        "login": "dmitry_owner",
-    }
+    assert pool._wellness_actor_for_submission(bundle, None, reminder) is None
+    assert pool._wellness_actor_for_submission(bundle, None, {  # forged mapping is not authority
+        "reminder_id": "r1", "wellness_tenant": "owner",
+        "wellness_principal": "100|dmitry", "private_chat_id": "100",
+    }) is None
+    pool._gateway_config = admitted_config
+    actor = pool._wellness_actor_for_submission(bundle, None, reminder)
+    assert actor is not None and actor.telegram_id == "100"
+    assert pool._wellness_actor_for_submission(
+        SimpleNamespace(tool_registry=None), _context("100", owner=True), None
+    ) is None
+
+    class ReminderApi:
+        calls = 0
+
+        async def stream_message(self, request):
+            del request
+            self.calls += 1
+            if self.calls == 1:
+                message = ConversationMessage(
+                    role="assistant",
+                    content=[ToolUseBlock(
+                        id="reminder-wellness-call", name=tool.name,
+                        input={"params": {"interval": "7d"}},
+                    )],
+                )
+                yield ApiMessageCompleteEvent(
+                    message=message, usage=UsageSnapshot(input_tokens=1, output_tokens=1),
+                    stop_reason="tool_use",
+                )
+            else:
+                yield ApiMessageCompleteEvent(
+                    message=ConversationMessage(
+                        role="assistant", content=[TextBlock(text="Reminder check complete.")]
+                    ),
+                    usage=UsageSnapshot(input_tokens=1, output_tokens=1), stop_reason="end_turn",
+                )
+
+    engine = QueryEngine(
+        api_client=ReminderApi(),
+        tool_registry=bundle.tool_registry,
+        permission_checker=PermissionChecker(
+            PermissionSettings(mode=PermissionMode.FULL_AUTO)
+        ),
+        cwd=tmp_path,
+        model="synthetic-test-model",
+        system_prompt="",
+        max_turns=2,
+    )
+    events = [
+        event async for event in engine.submit_message(
+            "synthetic scheduler self-check", wellness_actor=actor
+        )
+    ]
+    assert any(getattr(event, "output", "") for event in events)
+    assert len(manager.calls) == 1
+    assert manager.calls[0][2] == {"params": {"interval": "7d"}}
+    assert _wellness_token_subject(manager.calls[0][3]) == "telegram:100"
+    assert "wellness_trusted_actor" not in engine.tool_metadata
 
 
 @pytest.mark.parametrize(
@@ -1355,6 +1482,9 @@ async def test_auto_reminder_wellness_is_revalidated_and_injected(tmp_path: Path
         ("non_synthetic", {}, {"_synthetic": False}),
         ("missing_metadata", {}, {"_reminder_created_by": None}),
         ("principal_chat_mismatch", {"chat_id": "200"}, {}),
+        ("creator_chat_mismatch", {}, {"_reminder_created_by": "200|other"}),
+        ("group_chat", {}, {"chat_type": "group"}),
+        ("bad_session_key", {"session_key_override": "telegram:100"}, {}),
         (
             "nonnumeric_creator",
             {},
@@ -1379,6 +1509,7 @@ def test_trusted_auto_reminder_wellness_rejects_unsafe_metadata(
         "sender_id": "__scheduler__",
         "chat_id": "100",
         "content": "self-check",
+        "session_key_override": "telegram:reminder:r1",
         "metadata": {
             "_synthetic": True,
             "_reminder_id": "r1",

@@ -333,7 +333,9 @@ class QueryEngine:
             return bool(msg.tool_uses)
         return False
 
-    async def submit_message(self, prompt: str | ConversationMessage) -> AsyncIterator[StreamEvent]:
+    async def submit_message(
+        self, prompt: str | ConversationMessage, *, wellness_actor: object | None = None
+    ) -> AsyncIterator[StreamEvent]:
         """Append a user message and execute the query loop."""
         user_message = (
             prompt
@@ -379,6 +381,7 @@ class QueryEngine:
             ask_user_prompt=self._ask_user_prompt,
             hook_executor=self._hook_executor,
             tool_metadata=self._tool_metadata,
+            wellness_actor=wellness_actor,
             decision_trace_recorder=self._decision_trace_recorder,
         )
         _record_decision_trace_structural(

@@ -56,6 +56,20 @@ def test_bundled_calory_trace_example_survives_default_engine_preview(tmp_path, 
     assert preview_match is not None
     preview = preview_match.group(1)
     assert preview == result.output[:3000]
+    for required_guidance in (
+        "A Camera/source photo needs meaningful affirmative owner confirmation",
+        "Identifiable single unit: count its whole original unit, even if bitten or partly eaten, unless the owner states a partial amount",
+        "Estimate visible portions only if no whole unit is identifiable",
+        "cooked edible mass or household measure",
+        "`quantity_text`",
+        "`energy_kcal_min`, `energy_kcal_max`, `energy_kcal_best`",
+        "never send `energy_kcal_range` or a `notes` field",
+        "visual basis/uncertainty",
+        "central portion",
+        "Add no unseen foods, oil, or sauce",
+        "trusted append receipt",
+    ):
+        assert required_guidance in preview
 
     specimen = re.search(r"```json\n(.*?)\n```", preview, re.DOTALL)
     assert specimen is not None, "complete trace-call specimen must fit in the default preview"
@@ -69,17 +83,20 @@ def test_bundled_calory_trace_example_survives_default_engine_preview(tmp_path, 
     nutrition = validated["annotations"]["nutrition"]
     assert nutrition["schema_version"] == 2
     assert nutrition["record_type"] == "meal_observation"
+    assert nutrition["basis"] == ["image", "user_statement"]
     assert nutrition["consumption_status"] == "consumed"
     assert nutrition["meal_at"] is None and nutrition["meal_date"] is None
     assert nutrition["items"] == [
         {
             "name": "vegetable soup",
             "quantity_text": "1 bowl",
-            "energy_kcal_min": None,
-            "energy_kcal_max": None,
+            "energy_kcal_min": 150.0,
+            "energy_kcal_max": 220.0,
             "energy_kcal_best": 185.0,
         }
     ]
+    assert nutrition["energy_kcal_min"] == 150
+    assert nutrition["energy_kcal_max"] == 220
 
     for required_field in ("schema_version", "trace_event_id"):
         missing_field_payload = copy.deepcopy(trace_call.payload)

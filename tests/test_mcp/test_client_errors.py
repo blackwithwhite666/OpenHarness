@@ -204,11 +204,51 @@ async def test_call_tool_timeout_reconnects_and_retries_once(monkeypatch):
     connect = AsyncMock(side_effect=_connect)
     monkeypatch.setattr(manager, "_connect_server", connect)
 
-    assert await manager.call_tool("slow", "tool", {}) == "recovered"
+    args = {"params": {"start": "2026-10-01", "end": "2026-10-02"}}
+    meta = {"io.telegent/wellness-delegation/v1": "same-signed-token"}
+    result = await manager.call_tool_result("slow", "get_wellness_data", args, meta=meta)
+    assert result.output == "recovered"
     assert closed.is_set()
     assert stale_session.call_tool.await_count == 1
     assert replacement.call_tool.await_count == 1
+    assert stale_session.call_tool.await_args.kwargs["meta"] == meta
+    assert replacement.call_tool.await_args.kwargs["meta"] == meta
+    assert replacement.call_tool.await_args.args[1] == args
     connect.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_interleaved_readers_keep_body_and_metadata_paired_on_shared_session():
+    manager = McpClientManager(
+        {"wellness": McpStdioServerConfig(command="unused", args=[])}
+    )
+    session = AsyncMock()
+    entered = 0
+    release = asyncio.Event()
+    received = []
+
+    async def _call(name, arguments, **kwargs):
+        nonlocal entered
+        received.append((name, arguments, kwargs.get("meta")))
+        entered += 1
+        if entered == 2:
+            release.set()
+        await release.wait()
+        return _text_result("ok")
+
+    session.call_tool.side_effect = _call
+    await _install_owned_session(manager, "wellness", session)
+    body_a = {"params": {"login": "reader-a"}}
+    body_b = {"params": {"login": "reader-b"}}
+    meta_a = {"io.telegent/wellness-delegation/v1": "token-a"}
+    meta_b = {"io.telegent/wellness-delegation/v1": "token-b"}
+    await asyncio.gather(
+        manager.call_tool_result("wellness", "get_wellness_data", body_a, meta=meta_a),
+        manager.call_tool_result("wellness", "get_wellness_data", body_b, meta=meta_b),
+    )
+    assert len(received) == 2
+    assert ("get_wellness_data", body_a, meta_a) in received
+    assert ("get_wellness_data", body_b, meta_b) in received
 
 
 @pytest.mark.asyncio
@@ -230,10 +270,18 @@ async def test_call_tool_closed_transport_reconnects_and_retries(monkeypatch, ca
     monkeypatch.setattr(manager, "_connect_server", connect)
 
     with caplog.at_level(logging.WARNING, logger=_LOGGER):
-        assert await manager.call_tool("flaky", "tool", {}) == "ok"
+        body = {"params": {"interval": "7d"}}
+        metadata = {"io.telegent/wellness-delegation/v1": "retry-token"}
+        result = await manager.call_tool_result(
+            "flaky", "get_wellness_data", body, meta=metadata
+        )
+        assert result.output == "ok"
 
     assert stale_session.call_tool.await_count == 1
     assert replacement.call_tool.await_count == 1
+    assert stale_session.call_tool.await_args.kwargs["meta"] == metadata
+    assert replacement.call_tool.await_args.kwargs["meta"] == metadata
+    assert replacement.call_tool.await_args.args[1] == body
     connect.assert_awaited_once()
     reconnect_logs = [
         record.getMessage()

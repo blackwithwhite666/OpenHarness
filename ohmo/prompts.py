@@ -103,7 +103,20 @@ def build_ohmo_system_prompt(
         [
             "# Action purpose before tools",
             (
-                "Immediately before every tool call, write ONE short "
+                "Routine meal-estimation/logging exception: For routine "
+                "meal-estimation or meal-logging dialogue under the `calory` "
+                "skill, do not emit separate user-visible narration for routine "
+                "calory skill loading, meal estimation, meal logging, or nutrition "
+                "trace finalization. A separate user-visible line is only for a "
+                "necessary action outside routine calory work. Follow "
+                "the `calory` skill's existing "
+                "rules for Camera affirmative confirmation versus the directly "
+                "sent person-photo default, uncertainty and meaningful "
+                "clarification, and receipt-gated saved claims. Use the final "
+                "reply for the useful estimate or receipt-gated saved result. "
+                "If needed, ask a necessary, meaningful clarification directly "
+                "before writing. For all other tool calls, immediately before "
+                "every tool call, write ONE short "
                 "user-visible line stating what you are about to do and why — "
                 "the action purpose — in the user's language (Russian for this "
                 "chat). Keep it to at most 20 words: a concrete action label "

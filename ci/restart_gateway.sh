@@ -10,6 +10,9 @@ PID_FILE="${OHMO_GATEWAY_PID_FILE:-$WORKSPACE/gateway.pid}"
 MAX_WAIT="${OHMO_GATEWAY_STOP_MAX_WAIT:-60}"
 INTERVAL="${OHMO_GATEWAY_STOP_INTERVAL:-1}"
 START_DELAY="${OHMO_GATEWAY_START_DELAY:-3}"
+DELEGATION_ENV_FILE="${OHMO_WELLNESS_DELEGATION_ENV_FILE:-$HOME/.config/openharness/wellness-delegation.env}"
+UNIT_DIR="${OHMO_GATEWAY_UNIT_DIR:-$HOME/.config/systemd/user}"
+DROPIN="$UNIT_DIR/$UNIT.d/20-wellness-delegation.conf"
 
 export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=${XDG_RUNTIME_DIR}/bus}"
@@ -18,6 +21,31 @@ export PATH="$HOME/.local/bin:$PATH"
 die() {
   echo "gateway-restart: $*" >&2
   exit 1
+}
+
+install_wellness_delegation_dropin() {
+  [[ -f "$DELEGATION_ENV_FILE" && ! -L "$DELEGATION_ENV_FILE" && -r "$DELEGATION_ENV_FILE" && -s "$DELEGATION_ENV_FILE" ]] \
+    || die "wellness delegation environment file is missing or unreadable; provision $DELEGATION_ENV_FILE before deployment"
+  local mode owner_uid service_uid
+  mode="$(stat -c '%a' "$DELEGATION_ENV_FILE" 2>/dev/null)" \
+    || die "cannot check wellness delegation environment file permissions"
+  [[ "$mode" == "600" ]] \
+    || die "wellness delegation environment file must have mode 600"
+  owner_uid="$(stat -c '%u' "$DELEGATION_ENV_FILE" 2>/dev/null)" \
+    || die "cannot check wellness delegation environment file owner"
+  service_uid="$(id -u)" \
+    || die "cannot check gateway service user"
+  [[ "$owner_uid" == "$service_uid" ]] \
+    || die "wellness delegation environment file must be owned by the gateway service user"
+
+  mkdir -p "$(dirname "$DROPIN")"
+  local tmp
+  tmp="$(mktemp "$DROPIN.XXXXXX")"
+  chmod 600 "$tmp"
+  printf '[Service]\nEnvironmentFile=%s\n' "$DELEGATION_ENV_FILE" > "$tmp"
+  chmod 644 "$tmp"
+  mv -f "$tmp" "$DROPIN"
+  systemctl --user daemon-reload
 }
 
 is_workspace_gateway_args() {
@@ -75,6 +103,7 @@ wait_for_workspace_gateway_exit() {
   done
 }
 
+install_wellness_delegation_dropin
 systemctl --user stop "$UNIT"
 validate_pid_file
 ohmo gateway stop --workspace "$WORKSPACE"

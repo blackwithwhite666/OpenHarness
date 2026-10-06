@@ -68,13 +68,31 @@ _ANSWER_EXPLICIT_NO_RE = re.compile(
 )
 _ANSWER_ANCHORED_NO_RE = re.compile(r"^(?:нет|no)\b", re.IGNORECASE)
 _ANSWER_CONSUMPTION_RE = re.compile(
-    r"\b(?:я\s+)?(?:съел(?:а|и)?|ел(?:а|и)?|поел(?:а|и)?|выпил(?:а|и)?|употребил(?:а|и)?)\b",
+    r"\b(?:я\s+)?(?:съел(?:а|и)?|ел(?:а|и)?|поел(?:а|и)?|выпил(?:а|и)?|употребил(?:а|и)?)\b"
+    r"|\bi\s+(?:ate|drank|have\s+(?:eaten|drunk)|had\s+(?:eaten|drunk))\b",
+    re.IGNORECASE,
+)
+_RUSSIAN_NON_OWNER_EATER = (
+    r"(?:он|она|они|реб[её]н\w*|дети|малыш\w*|муж|жена|сын|дочь|мама|папа|"
+    r"отец|мать|брат|сестр\w*|друг|подруг\w*|коллег\w*|сосед\w*|человек|"
+    r"собак\w*|п[её]с(?:а|у|ом|е|ы|ов|ам|ами|ах)?|"
+    r"кот(?:а|у|ом|е|ы|ов|ам|ами|ах)?|кошк\w*|щен\w*|питом\w*|лошад\w*)"
+)
+_RUSSIAN_OTHER_EATER_PREFIX_RE = re.compile(
+    rf"(?:\b(?:мой|моя|моё|мои|наш|наша|наше|наши|этот|эта|эти|тот|та|то|его|её|их)\s+)?"
+    rf"\b{_RUSSIAN_NON_OWNER_EATER}(?:\s+[\w-]+){{0,2}}\s*$",
+    re.IGNORECASE,
+)
+_RUSSIAN_OTHER_EATER_SUFFIX_RE = re.compile(
+    rf"^\s*(?:(?:мой|моя|моё|мои|наш|наша|наше|наши|этот|эта|эти|тот|та|то|его|её|их)\s+)?"
+    rf"{_RUSSIAN_NON_OWNER_EATER}\b",
     re.IGNORECASE,
 )
 _ANSWER_NEGATED_CONSUMPTION_RE = re.compile(
     r"\b(?:я\s+)?не\s+(?:съел[аи]?|ел[аи]?|поел[аи]?|выпил[аи]?|употребил[аи]?)\b"
     r"|\bничего\s+не\s+(?:съел[аи]?|ел[аи]?|пил[аи]?)\b"
-    r"|\b(?:i\s+)?(?:did\s+not|didn't|never)\s+(?:eat|have|drink)\b",
+    r"|\b(?:i\s+)?(?:did\s+not|didn't|never)\s+(?:eat|ate|eaten|have|had|drink|drank|drunk)\b"
+    r"|\b(?:i\s+)?(?:have\s+not|haven't|had\s+not|hadn't)\s+(?:eaten|drunk)\b",
     re.IGNORECASE,
 )
 _ANSWER_ANCHORED_YES_RE = re.compile(
@@ -91,6 +109,25 @@ _CAMERA_PORTION_QUESTION_RE = re.compile(
     r"сколько\s+(?:съел\w*|порци\w*|учитывать))\b",
     re.IGNORECASE,
 )
+_CAMERA_PORTION_LOGGING_QUESTION_RE = re.compile(
+    r"\b(?:учесть|учитывать|посчитать|считать|записать|добавить|"
+    r"count|log|track|include)\b",
+    re.IGNORECASE,
+)
+_CAMERA_PREPARATION_QUESTION_RE = re.compile(
+    r"\b(?:приготовить|готовить|сварить|варить|запечь|пожарить|сделать|"
+    r"prepare|cook|make)\b",
+    re.IGNORECASE,
+)
+_RUSSIAN_OTHER_EATER_MENTION_RE = re.compile(
+    rf"\b{_RUSSIAN_NON_OWNER_EATER}\b", re.IGNORECASE
+)
+_ENGLISH_OTHER_EATER_BENEFICIARY_RE = re.compile(
+    r"\bfor\s+(?:(?:the|a|my|our|his|her|their)\s+)*"
+    r"(?:dog|cat|pet|child|kid|son|daughter|husband|wife|mother|father|"
+    r"parent|friend|him|her|them|someone\s+else|another\s+person)\b",
+    re.IGNORECASE,
+)
 _CAMERA_ANALYSIS_ONLY_QUESTION_RE = re.compile(
     r"\b(?:только|лишь)\s+(?:оцен\w*|разобрат\w*|посмотр\w*|узнать|"
     r"состав\w*|рецепт\w*|информац\w*)\b|"
@@ -100,6 +137,39 @@ _CAMERA_ANALYSIS_ONLY_QUESTION_RE = re.compile(
     r"(?:composition|ingredients?|recipe|nutrition\s+facts|information)\b",
     re.IGNORECASE,
 )
+
+
+def _camera_question_asks_owner_consumption(text: object) -> bool:
+    if (
+        not isinstance(text, str)
+        or _CAMERA_ANALYSIS_ONLY_QUESTION_RE.search(text)
+    ):
+        return False
+    consumption_verb = re.compile(
+        r"\b(?:съел(?:а|и)?|ел(?:а|и)?|пил(?:а|и)?|выпил(?:а|и)?)\b",
+        re.IGNORECASE,
+    )
+    consumption_question = _CAMERA_CONSUMPTION_QUESTION_RE.search(text) is not None
+    portion_logging_question = (
+        _CAMERA_PORTION_QUESTION_RE.search(text) is not None
+        and _CAMERA_PORTION_LOGGING_QUESTION_RE.search(text) is not None
+    )
+    if portion_logging_question and (
+        _CAMERA_PREPARATION_QUESTION_RE.search(text)
+        or _RUSSIAN_OTHER_EATER_MENTION_RE.search(text)
+        or _ENGLISH_OTHER_EATER_BENEFICIARY_RE.search(text)
+    ):
+        return False
+    if not (consumption_question or portion_logging_question):
+        return False
+    for match in consumption_verb.finditer(text):
+        clause_prefix = re.split(r"[.!?;]\s*", text[:match.start()])[-1]
+        if (
+            _RUSSIAN_OTHER_EATER_PREFIX_RE.search(clause_prefix)
+            or _RUSSIAN_OTHER_EATER_SUFFIX_RE.search(text[match.end():])
+        ):
+            return False
+    return True
 _PORTION_BUTTON_RE = re.compile(
     r"^(?:(?:только|лишь)\s+)?(?:маленьк\w*|больш\w*|small|large|big)\s+"
     r"(?:чашк\w*|кружк\w*|cup)s?[.! ]*$|^(?:обе|оба|обе\s+чашки|both(?:\s+cups?)?)[.! ]*$",
@@ -140,7 +210,23 @@ _CAMERA_TEMPORAL_CONTEXT_RE = re.compile(
 )
 _CAMERA_UNCERTAIN_CONSUMPTION_RE = re.compile(
     r"\b(?:не\s+(?:уверен\w*|знаю|помню)|неизвестн\w*|сомнева\w*|затрудня\w*|"
-    r"unsure|uncertain|unknown|don't\s+know)\b",
+    r"unsure|uncertain|unknown|don't\s+know|do\s+not\s+know|not\s+sure|"
+    r"don't\s+remember|do\s+not\s+remember)\b",
+    re.IGNORECASE,
+)
+_CAMERA_AMOUNT_UNCERTAINTY_RE = re.compile(
+    r"\b(?:точн\w*\s+)?(?:вес|масса|количеств\w*|калори\w*|ккал)"
+    r"(?:\s+(?:порци\w*|блюд\w*))?\s+(?:не\s+знаю|неизвестн\w*|"
+    r"не\s+уверен\w*|сомнева\w*)\b|"
+    r"\b(?:не\s+знаю|неизвестн\w*|не\s+уверен\w*|сомнева\w*)\s+"
+    r"(?:(?:точн\w*|его|её|их|the|its|exact)\s+){0,2}"
+    r"(?:вес|масса|количеств\w*|калори\w*|ккал)\b|"
+    r"\b(?:точный\s+)?(?:weight|amount|quantity|calories?|kcal|energy\s+estimate)"
+    r"\s+(?:is\s+)?(?:unknown|uncertain|unsure|not\s+known|not\s+sure)\b|"
+    r"\b(?:i\s+)?(?:don't\s+know|do\s+not\s+know|am\s+unsure|am\s+uncertain|"
+    r"am\s+not\s+sure|i'?m\s+not\s+sure|not\s+sure)\s+(?:of\s+)?"
+    r"(?:(?:the|its|a|exact)\s+){0,2}"
+    r"(?:weight|amount|quantity|calories?|kcal|energy\s+estimate)\b",
     re.IGNORECASE,
 )
 _CAMERA_FOOD_CONTEXT_RE = re.compile(
@@ -194,6 +280,19 @@ _CAMERA_QUANTITY_MEASURE = (
     r"(?:шт\.?|кусоч\w*|порци\w*|горст\w*|handfuls?|грамм\w*|"
     r"г(?=\s|$|[.!])|кг|мл|л|pieces?|portions?|grams?|kg|ml|l|cups?|"
     r"чашк\w*|стакан\w*|яблок\w*|груш\w*|банан\w*)"
+)
+_CAMERA_CONTEXTUAL_PARTIAL_QUANTITY_RE = re.compile(
+    r"^\s*(?:часть|половин\w*|кусоч\w*|part(?:\s+of)?|half(?:\s+of)?)\s+"
+    r"(?P<subject>[\w-]+(?:\s+[\w-]+){0,2})\s*[,—:;]\s*"
+    + rf"(?P<quantity>(?:(?:about|around|примерно|около)\s*)?"
+      rf"(?:\d+(?:[.,]\d+)?|полтора|полторы)\s*(?:{_CAMERA_QUANTITY_MEASURE}))"
+      r"\s*[.!…]*$",
+    re.IGNORECASE,
+)
+_CAMERA_CONTEXTUAL_PARTIAL_NONFOOD_SUBJECT_RE = re.compile(
+    r"\b(?:салфет\w*|полотенц\w*|towels?|napkins?|tables?|"
+    r"стол(?:а|у|ом|е|ы|ов|ам|ами|ах)?)\b",
+    re.IGNORECASE,
 )
 _CAMERA_WHOLE_PORTION_PREFIX_RE = re.compile(
     r"^\s*(?:всё|все)\s*:\s*(?P<payload>.+?)\s*$", re.IGNORECASE
@@ -268,6 +367,17 @@ _CAMERA_COMPOSITION_OPERATOR_RE = re.compile(
     r"маленьк\w*|больш\w*|средн\w*|small|large|big|medium)\b",
     re.IGNORECASE,
 )
+_CAMERA_PORTION_CHOICE_PREFIX_RE = re.compile(
+    r"^\s*(?:весь|вся|всё|все|оба|обе|всю|часть|половин\w*)\s+",
+    re.IGNORECASE,
+)
+_CAMERA_PORTION_CHOICE_COMPONENT_RE = re.compile(
+    r"^\s*(?:весь|вся|всё|все|оба|обе|всю|часть|половин\w*)\s+"
+    + rf"{_CAMERA_COMPOSITION_NOUN_PHRASE}\s+(?:и|and)\s+"
+    + r"(?:весь|вся|всё|все|оба|обе|всю|часть|половин\w*)\s+"
+    + rf"{_CAMERA_COMPOSITION_NOUN_PHRASE}[.!?…]*\s*$",
+    re.IGNORECASE,
+)
 
 
 def _clarification_related(text: object) -> bool:
@@ -311,7 +421,7 @@ def _classify_answer(text: object, *, anchored: bool) -> str | None:
         return "no"
     if _ANSWER_NEGATED_CONSUMPTION_RE.search(answer) or _ANSWER_EXPLICIT_NO_RE.search(answer):
         return "no"
-    if _ANSWER_CONSUMPTION_RE.search(answer):
+    if _camera_explicit_consumption(answer):
         return "yes"
     if anchored:
         if _ANSWER_ANCHORED_NO_RE.search(answer):
@@ -323,10 +433,19 @@ def _classify_answer(text: object, *, anchored: bool) -> str | None:
 
 def _camera_explicit_consumption(text: object) -> bool:
     answer = text if isinstance(text, str) else ""
-    return bool(
-        _ANSWER_CONSUMPTION_RE.search(answer)
-        and not _ANSWER_NEGATED_CONSUMPTION_RE.search(answer)
-    )
+    if not answer or _ANSWER_NEGATED_CONSUMPTION_RE.search(answer):
+        return False
+    for match in _ANSWER_CONSUMPTION_RE.finditer(answer):
+        if match.group().casefold().startswith(("я ", "i ")):
+            return True
+        clause_prefix = re.split(r"[.!?;]\s*", answer[:match.start()])[-1]
+        if (
+            _RUSSIAN_OTHER_EATER_PREFIX_RE.search(clause_prefix)
+            or _RUSSIAN_OTHER_EATER_SUFFIX_RE.search(answer[match.end():])
+        ):
+            continue
+        return True
+    return False
 
 
 def _camera_whole_portion_payload_excluded(text: str) -> bool:
@@ -388,6 +507,121 @@ def _camera_composition_description(
     return True
 
 
+def _camera_contextual_portion_choice(text: object, source_context: object) -> bool:
+    """Accept a food choice only when both named portions match the photo context."""
+    if (
+        not isinstance(text, str)
+        or not isinstance(source_context, str)
+        or not _CAMERA_PORTION_CHOICE_COMPONENT_RE.fullmatch(text)
+        or "?" in text
+        or _CAMERA_WHOLE_PORTION_NONFOOD_SUBJECT_RE.search(text)
+        or _CAMERA_UNRELATED_CONTEXT_RE.search(text)
+        or _CLARIFICATION_NEW_MEAL_RE.search(text)
+        or _ANSWER_NEGATED_CONSUMPTION_RE.search(text)
+        or _CAMERA_ANALYSIS_ONLY_QUESTION_RE.search(text)
+    ):
+        return False
+    parts = _CAMERA_COMPOSITION_PARTS_RE.fullmatch(
+        _CAMERA_PORTION_CHOICE_PREFIX_RE.sub("", text.strip(), count=1)
+    )
+    if parts is None:
+        return False
+    context_words = [
+        token.casefold() for token in _CAMERA_COMPOSITION_TOKEN_RE.findall(source_context)
+    ]
+    for component in (parts["left"], parts["right"]):
+        component = _CAMERA_PORTION_CHOICE_PREFIX_RE.sub("", component.strip(), count=1)
+        words = [token.casefold() for token in _CAMERA_COMPOSITION_TOKEN_RE.findall(component)]
+        if not words or not all(
+            any(
+                word == source
+                or (len(word) >= 3 and 0 < len(source) - len(word) <= 3
+                    and source.startswith(word))
+                or (len(source) >= 3 and 0 < len(word) - len(source) <= 3
+                    and word.startswith(source))
+                for source in context_words
+            )
+            for word in words
+        ):
+            return False
+    return True
+
+
+def _camera_contextual_partial_quantity(text: object, source_context: object) -> bool:
+    """Accept a stated partial amount only when its food/container is pictured."""
+    if (
+        not isinstance(text, str)
+        or not isinstance(source_context, str)
+        or "?" in text
+        or _CAMERA_WHOLE_PORTION_NONFOOD_SUBJECT_RE.search(text)
+        or _CAMERA_UNRELATED_CONTEXT_RE.search(text)
+        or _CLARIFICATION_NEW_MEAL_RE.search(text)
+        or _ANSWER_NEGATED_CONSUMPTION_RE.search(text)
+        or _CAMERA_ANALYSIS_ONLY_QUESTION_RE.search(text)
+    ):
+        return False
+    match = _CAMERA_CONTEXTUAL_PARTIAL_QUANTITY_RE.fullmatch(text)
+    if (
+        match is None
+        or _CAMERA_CONTEXTUAL_PARTIAL_NONFOOD_SUBJECT_RE.search(match["subject"])
+        or not _CLARIFICATION_QUANTITY_RE.fullmatch(match["quantity"])
+    ):
+        return False
+    context_words = [
+        token.casefold() for token in _CAMERA_COMPOSITION_TOKEN_RE.findall(source_context)
+    ]
+    subject_words = [
+        token.casefold() for token in _CAMERA_COMPOSITION_TOKEN_RE.findall(match["subject"])
+    ]
+    def inflection_forms(word: str) -> set[tuple[str, str]]:
+        adjective_endings = (
+            "ого", "ому", "ему", "ыми", "ими", "ые", "ие", "ый", "ий", "ая", "яя",
+            "ое", "ее", "ой", "ою", "ею", "ей", "ом", "ем",
+        )
+        noun_endings = (
+            "ами", "ями", "ов", "ев", "ей", "ам", "ям", "ах", "ях", "ом", "ем",
+            "ы", "и", "а", "я", "у", "ю", "е", "о", "s",
+        )
+        forms = {("exact", word)}
+        overlapping_case_endings = set(adjective_endings) & set(noun_endings)
+        if any(
+            len(word) - len(ending) >= 3 and word.endswith(ending)
+            for ending in overlapping_case_endings
+        ):
+            # Endings such as -ом and -ем can be either adjective or noun
+            # inflections. Without stronger evidence, preserve exact matching only.
+            return forms
+        adjective_stems = {
+            word[:-len(ending)]
+            for ending in adjective_endings
+            if len(word) - len(ending) >= 3 and word.endswith(ending)
+        }
+        if adjective_stems:
+            # Prefer a recognized adjective reading over shorter noun suffixes
+            # and the bare-noun fallback (e.g. сырая must not become сыр + а).
+            forms.update(("adjective", stem) for stem in adjective_stems)
+            return forms
+
+        # Only words without a recognized adjective ending can supply a noun
+        # lemma. This keeps сыр (cheese) matchable to сыра, but сырой (raw) apart.
+        forms.add(("noun", word))
+        forms.update(
+            ("noun", word[:-len(ending)])
+            for ending in noun_endings
+            if len(word) - len(ending) >= 3 and word.endswith(ending)
+        )
+        return forms
+
+    return bool(subject_words) and all(
+        any(
+            word == source
+            or bool(inflection_forms(word) & inflection_forms(source))
+            for source in context_words
+        )
+        for word in subject_words
+    )
+
+
 def _camera_affirmation_excluded(
     text: object, *, source_context: object = None, require_composition_source: bool = False
 ) -> bool:
@@ -400,9 +634,16 @@ def _camera_affirmation_excluded(
     )
     if _camera_whole_portion_payload_excluded(text):
         return True
-    if _CAMERA_UNCERTAIN_CONSUMPTION_RE.search(text):
-        return True
     explicit_consumption = _camera_explicit_consumption(text)
+    if _CAMERA_UNCERTAIN_CONSUMPTION_RE.search(text):
+        amount_uncertainty_removed = _CAMERA_AMOUNT_UNCERTAINTY_RE.sub(" ", text)
+        amount_is_the_only_uncertainty = (
+            explicit_consumption
+            and _CAMERA_AMOUNT_UNCERTAINTY_RE.search(text) is not None
+            and _CAMERA_UNCERTAIN_CONSUMPTION_RE.search(amount_uncertainty_removed) is None
+        )
+        if not amount_is_the_only_uncertainty:
+            return True
     if (
         _CAMERA_QUANTITY_LEAD_RE.search(text)
         and not _CLARIFICATION_QUANTITY_RE.fullmatch(text.strip())
@@ -429,7 +670,6 @@ def _native_button_answer_kind(metadata: Mapping[str, object], raw_text: object)
     label = metadata.get("native_keyboard_selected_label")
     data = metadata.get("callback_data")
     question = metadata.get("native_keyboard_question")
-    prompt = metadata.get("native_keyboard_prompt")
     reflection = metadata.get("native_keyboard_reflection_confirmed")
     reflected_text = metadata.get("native_keyboard_reflection")
     if (
@@ -453,25 +693,18 @@ def _native_button_answer_kind(metadata: Mapping[str, object], raw_text: object)
         return None
     if direct == "yes":
         return direct
-    eating_prompt = " ".join(
-        value for value in (question, prompt) if isinstance(value, str)
-    )
     current_question = question if isinstance(question, str) else ""
     if _CAMERA_ANALYSIS_ONLY_QUESTION_RE.search(current_question):
         return None
     if (
         isinstance(question, str)
-        and _CAMERA_CONSUMPTION_QUESTION_RE.search(question)
+        and _camera_question_asks_owner_consumption(question)
         and _ANSWER_ANCHORED_YES_RE.match(label.strip())
         and any(_classify_answer(option, anchored=True) == "no" for option in options)
     ):
         return "yes"
     if (
-        _CAMERA_CONSUMPTION_QUESTION_RE.search(eating_prompt)
-        and (
-            _CAMERA_CONSUMPTION_QUESTION_RE.search(current_question)
-            or _CAMERA_PORTION_QUESTION_RE.search(current_question)
-        )
+        _camera_question_asks_owner_consumption(current_question)
         and (
             _NATIVE_WHOLE_PLATE_RE.fullmatch(label.strip())
             or _NATIVE_WHOLE_PORTION_RE.fullmatch(label.strip())
@@ -482,7 +715,7 @@ def _native_button_answer_kind(metadata: Mapping[str, object], raw_text: object)
         return "yes"
     if (
         isinstance(question, str)
-        and _CAMERA_CONSUMPTION_QUESTION_RE.search(question)
+        and _camera_question_asks_owner_consumption(question)
         and re.match(r"^(?:только|лишь|only|just)\b", label.strip(), re.IGNORECASE)
         and _camera_food_context_hint(label)
     ):
@@ -492,7 +725,7 @@ def _native_button_answer_kind(metadata: Mapping[str, object], raw_text: object)
             metadata.get("_camera_known_consumption_clarification") is CAMERA_AUTHORITY
             or (
                 isinstance(question, str)
-                and _CAMERA_CONSUMPTION_QUESTION_RE.search(question)
+                and _camera_question_asks_owner_consumption(question)
             )
         )
         and _PORTION_BUTTON_RE.fullmatch(label.strip())
@@ -502,14 +735,10 @@ def _native_button_answer_kind(metadata: Mapping[str, object], raw_text: object)
         # unbound. The selected label is still preserved for portion parsing.
         return "yes"
     if (
-        (metadata.get("_camera_known_consumption_clarification") is CAMERA_AUTHORITY
-         or (
-             _CAMERA_CONSUMPTION_QUESTION_RE.search(eating_prompt)
-             and (
-                 _CAMERA_CONSUMPTION_QUESTION_RE.search(current_question)
-                 or _CAMERA_PORTION_QUESTION_RE.search(current_question)
-             )
-         ))
+        (
+            metadata.get("_camera_known_consumption_clarification") is CAMERA_AUTHORITY
+            or _camera_question_asks_owner_consumption(current_question)
+        )
         and _CLARIFICATION_QUANTITY_RE.fullmatch(label.strip())
     ):
         # A selected quantity is meaningful only under a verified eating
@@ -551,7 +780,7 @@ def _attempt_caption(attempt: dict) -> str:
 
 
 def _camera_context_answer_kind(
-    text: object, *, source_context: object = None
+    text: object, *, source_context: object = None, source_question: object = None
 ) -> str | None:
     """Classify concise text answers only while an unambiguous Camera source is active."""
     if (
@@ -569,10 +798,19 @@ def _camera_context_answer_kind(
         return None
     if direct == "yes":
         return direct
+    # An answer such as a food/portion phrase is implicit: it can only answer
+    # a consumption question. A delivered analysis-only question does not
+    # grant that meaning. Explicit consumption statements above remain valid.
+    if isinstance(source_question, str) and _CAMERA_ANALYSIS_ONLY_QUESTION_RE.search(
+        source_question
+    ):
+        return None
     if (
         _NATIVE_WHOLE_PLATE_RE.fullmatch(text.strip())
         or _NATIVE_WHOLE_PORTION_RE.fullmatch(text.strip())
         or _CONTEXTUAL_PARTIAL_PORTION_RE.fullmatch(text.strip())
+        or _camera_contextual_partial_quantity(text, source_context)
+        or _camera_contextual_portion_choice(text, source_context)
         or _CLARIFICATION_QUANTITY_RE.fullmatch(text)
         or _camera_composition_description(
             text, source_context=source_context, require_source_context=True
@@ -593,6 +831,17 @@ def _source_message_id(value: object) -> str | None:
         return None
     rendered = str(value).strip()
     return rendered or None
+
+
+def _camera_displayed_question(message: OutboundMessage) -> str | None:
+    """Use Telegram's own extraction rule for the question it displays."""
+    content = message.content.strip() if isinstance(message.content, str) else ""
+    if not content:
+        return None
+    from openharness.channels.impl.telegram import _current_native_keyboard_question
+
+    question = _current_native_keyboard_question(content)
+    return question if 0 < len(question) <= 2048 else None
 
 
 def _attempt_age_seconds(attempt: dict, now: datetime) -> float:
@@ -631,6 +880,21 @@ def _validate_camera_correction_annotation(value: Mapping[str, object]):
                 raise ValueError("Camera correction contains an unmasked replacement value")
             normalized.pop(field)
     return NutritionAnnotationV2.model_validate(normalized)
+
+
+def _validate_camera_portion_correction_annotation(value: Mapping[str, object]):
+    """Validate a sparse quantity patch that preserves the saved meal status/date."""
+    from ohmo.evals.nutrition_trace import NutritionAnnotationV2
+
+    annotation = NutritionAnnotationV2.model_validate(value)
+    if (
+        annotation.record_type != "meal_correction"
+        or "consumption_status" in annotation.model_fields_set
+        or "items" not in annotation.changed_fields
+        or {"consumption_status", "meal_at", "meal_date"} & set(annotation.changed_fields)
+    ):
+        raise ValueError("Camera portion change must preserve the saved meal status and date")
+    return annotation
 
 
 class CameraCandidateRequest(BaseModel):
@@ -1959,11 +2223,139 @@ class CameraIngress:
         ):
             raise ValueError("Camera denial is not bound to a recovered owner operation")
         attempt["camera_correction"] = "answering"
+        attempt["camera_correction_kind"] = "denial"
         message.metadata.pop("_camera_legacy_reconcile", None)
         message.metadata.pop("_camera_reconcile_then_correction", None)
         message.metadata["_camera_correction"] = CAMERA_AUTHORITY
         message.metadata["_camera_turn_id"] = correction_turn
         self._save_attempts()
+        return correction_turn
+
+    def authorize_recovered_camera_portion_correction(
+        self, message: InboundMessage, candidate_id: str, original_turn: str,
+        receipt: object, selected_label: str,
+    ) -> str:
+        """Bind a changed native portion to a fresh correction operation."""
+        attempt = self._attempts.get(candidate_id)
+        original = attempt.get("camera_commit") if attempt is not None else None
+        metadata = getattr(receipt, "assistant_metadata", None)
+        assistant_id = getattr(receipt, "assistant_message_id", None)
+        assistant_op = getattr(receipt, "assistant_client_op_id", None)
+        trace = metadata.get("decision_trace") if isinstance(metadata, Mapping) else None
+        annotations = trace.get("annotations") if isinstance(trace, Mapping) else None
+        nutrition = annotations.get("nutrition") if isinstance(annotations, Mapping) else None
+        from ohmo.evals.nutrition_trace import NutritionAnnotationV2
+
+        try:
+            validated = NutritionAnnotationV2.model_validate(nutrition)
+        except (TypeError, ValueError):
+            validated = None
+        latest_correction = attempt.get("camera_correction_commit") if attempt else None
+        latest_metadata = metadata if isinstance(metadata, Mapping) else {}
+        latest_turn = (
+            latest_correction.get("client_op_id", "").removesuffix(":assistant")
+            if isinstance(latest_correction, dict) else None
+        )
+        prior_correction = bool(
+            isinstance(original, dict)
+            and isinstance(latest_correction, dict)
+            and latest_correction.get("kind") == "portion"
+            and attempt.get("camera_correction") == "completed"
+            and attempt.get("camera_correction_turn_id") == latest_turn
+            and latest_correction.get("target_event_id") == original.get("event_id")
+            and latest_correction.get("target_source_message_id") == original.get("source_message_id")
+            and latest_correction.get("event_id") == assistant_id
+            and latest_correction.get("client_op_id") == assistant_op
+            and latest_metadata.get("source_message_id") == latest_correction.get("source_message_id")
+            and latest_metadata.get("camera_original_event_id") == original.get("event_id")
+            and latest_metadata.get("camera_correction_bound") is True
+            and latest_metadata.get("camera_answer_bound") == "yes"
+            and latest_metadata.get("reply_to_source_message_id") == original.get("source_message_id")
+            and latest_metadata.get("camera_candidate_id") == candidate_id
+            and latest_metadata.get("camera_operation_id") == candidate_id
+            and latest_metadata.get("tenant_id") == self.config.tenant_id
+            and latest_metadata.get("source_principal") == f"telegram:{self.config.principal}"
+            and latest_metadata.get("ingest_source") == "dropbox_camera"
+            and latest_metadata.get("confirmation_required") is True
+        )
+        if prior_correction:
+            try:
+                _validate_camera_portion_correction_annotation(nutrition)
+            except (TypeError, ValueError):
+                prior_correction = False
+        prior_original = bool(
+            isinstance(original, dict)
+            and original.get("event_id") == assistant_id
+            and original.get("client_op_id") == assistant_op
+            and assistant_op == f"{original_turn}:assistant"
+            and getattr(receipt, "user_client_op_id", None) == f"{original_turn}:user"
+            and isinstance(metadata, Mapping)
+            and metadata.get("logical_turn_id") == original_turn
+            and metadata.get("source_message_id") == original.get("source_message_id")
+            and _source_message_id(message.metadata.get("message_id"))
+            == original.get("source_message_id")
+            and validated is not None
+            and validated.record_type == "meal_observation"
+            and validated.consumption_status == "consumed"
+            and "image" in validated.basis
+            and validated.meal_at == self._attempt_capture_time(attempt)
+            and validated.meal_date is None
+            and not validated.explicit_new_consumption
+        )
+        if (
+            not isinstance(original, dict)
+            or attempt.get("state") != "completed"
+            or attempt.get("finalizer_status") != "committed"
+            or (attempt.get("camera_correction") is not None and not prior_correction)
+            or (isinstance(latest_correction, dict) and not prior_correction)
+            or original.get("candidate_id") != candidate_id
+            or not (prior_original or prior_correction)
+            or not isinstance(metadata, Mapping)
+            or metadata.get("role") != "assistant"
+            or metadata.get("logical_turn_id") != (latest_turn if prior_correction else original_turn)
+            or metadata.get("tenant_id") != self.config.tenant_id
+            or metadata.get("source_principal") != f"telegram:{self.config.principal}"
+            or metadata.get("camera_candidate_id") != candidate_id
+            or metadata.get("camera_operation_id") != candidate_id
+            or metadata.get("camera_answer_bound") != "yes"
+            or not isinstance(getattr(receipt, "user_content", None), str)
+            or receipt.user_content == selected_label
+            or message.metadata.get("_camera_authority") is not CAMERA_AUTHORITY
+            or not (
+                message.metadata.get("_camera_existing_meal_replay") is True
+                or message.metadata.get("_camera_correction_replay") is CAMERA_AUTHORITY
+            )
+            or message.metadata.get("native_keyboard_selected_label") != selected_label
+            or not _CLARIFICATION_QUANTITY_RE.fullmatch(selected_label.strip())
+            or message.metadata.get("native_keyboard_reflection_confirmed") is not True
+            or message.metadata.get("_camera_native_binding")
+            not in {str(attempt.get("photo_id")), *map(str, attempt.get("reply_ids", []))}
+            or not isinstance(message.metadata.get("callback_query_id"), str)
+            or message.metadata.get("callback_query_id") == ""
+            or message.channel != "telegram"
+            or str(message.chat_id) != self.config.chat_id
+            or message.sender_id.split("|", 1)[0] != self.config.principal
+            or validated is None
+        ):
+            raise ValueError("Changed Camera portion is not bound to its saved owner meal")
+
+        correction_turn = uuid4().hex
+        attempt["camera_correction"] = "answering"
+        attempt["camera_correction_turn_id"] = correction_turn
+        attempt["camera_correction_kind"] = "portion"
+        self._save_attempts()
+        message.metadata.pop("_camera_existing_meal_replay", None)
+        message.metadata.pop("_camera_correction_replay", None)
+        message.metadata.pop("_camera_correction_replay_typed", None)
+        message.metadata.update(
+            _camera_candidate_id=candidate_id,
+            _camera_answer="yes",
+            _camera_correction=CAMERA_AUTHORITY,
+            _camera_portion_correction=CAMERA_AUTHORITY,
+            _camera_turn_id=correction_turn,
+            _camera_prior_portion_label=receipt.user_content,
+            _camera_original_event_id=original["event_id"],
+        )
         return correction_turn
 
     def mark_reconciled_meal_ready(self, candidate_id: str, turn_id: str) -> None:
@@ -2022,7 +2414,7 @@ class CameraIngress:
         if (
             not isinstance(metadata, Mapping)
             or not isinstance(original, dict)
-            or attempt.get("camera_correction") != "answering"
+            or attempt.get("camera_correction") not in {"answering", "delivery_unknown"}
             or attempt.get("camera_correction_turn_id") != turn_id
             or not isinstance(assistant_id, str) or not assistant_id
             or not isinstance(assistant_op, str) or not assistant_op
@@ -2035,7 +2427,8 @@ class CameraIngress:
             or metadata.get("source_principal") != f"telegram:{original.get('principal')}"
             or metadata.get("camera_candidate_id") != candidate_id
             or metadata.get("camera_operation_id") != candidate_id
-            or metadata.get("camera_answer_bound") != "no"
+            or metadata.get("camera_answer_bound")
+            != ("yes" if message.metadata.get("_camera_portion_correction") is CAMERA_AUTHORITY else "no")
             or metadata.get("camera_correction_bound") is not True
             or metadata.get("camera_original_event_id") != original.get("event_id")
             or metadata.get("ingest_source") != "dropbox_camera"
@@ -2046,14 +2439,23 @@ class CameraIngress:
         trace = metadata.get("decision_trace")
         annotations = trace.get("annotations") if isinstance(trace, Mapping) else None
         nutrition = annotations.get("nutrition") if isinstance(annotations, Mapping) else None
-        if (
-            not isinstance(nutrition, Mapping)
-            or nutrition.get("record_type") != "meal_correction"
-            or nutrition.get("consumption_status") != "not_consumed"
-            or "consumption_status" not in nutrition.get("changed_fields", [])
-        ):
-            raise ValueError("Camera correction receipt is not a validated denial patch")
-        observed_annotation = _validate_camera_correction_annotation(nutrition)
+        portion_correction = message.metadata.get("_camera_portion_correction") is CAMERA_AUTHORITY
+        changed_fields = nutrition.get("changed_fields", []) if isinstance(nutrition, Mapping) else []
+        valid_patch = (
+            "consumption_status" not in nutrition
+            and "items" in changed_fields
+            and not {"consumption_status", "meal_at", "meal_date"} & set(changed_fields)
+            if portion_correction and isinstance(nutrition, Mapping)
+            else isinstance(nutrition, Mapping)
+            and nutrition.get("consumption_status") == "not_consumed"
+            and "consumption_status" in changed_fields
+        )
+        if not isinstance(nutrition, Mapping) or nutrition.get("record_type") != "meal_correction" or not valid_patch:
+            raise ValueError("Camera correction receipt is not a validated meal patch")
+        observed_annotation = (
+            _validate_camera_portion_correction_annotation(nutrition)
+            if portion_correction else _validate_camera_correction_annotation(nutrition)
+        )
         if expected_nutrition is not None:
             expected_annotation = _validate_camera_correction_annotation(expected_nutrition)
             expected_changes = list(expected_annotation.changed_fields)
@@ -2075,9 +2477,14 @@ class CameraIngress:
             "client_op_id": assistant_op,
             "target_event_id": original["event_id"],
             "target_source_message_id": original["source_message_id"],
+            "kind": "portion" if portion_correction else "denial",
         }
         previous_correction = attempt.get("camera_correction_commit")
-        if isinstance(previous_correction, dict) and previous_correction != correction:
+        if (
+            isinstance(previous_correction, dict)
+            and previous_correction.get("client_op_id") == assistant_op
+            and previous_correction != correction
+        ):
             raise ValueError("Camera operation has conflicting correction commit evidence")
         attempt["camera_correction_commit"] = correction
         attempt["camera_correction"] = "final_queued"
@@ -2103,9 +2510,10 @@ class CameraIngress:
             not isinstance(original, dict)
             or metadata.get("_camera_authority") is not CAMERA_AUTHORITY
             or metadata.get("_camera_correction") is not CAMERA_AUTHORITY
-            or metadata.get("_camera_answer") != "no"
+            or metadata.get("_camera_answer")
+            != ("yes" if metadata.get("_camera_portion_correction") is CAMERA_AUTHORITY else "no")
             or attempt.get("state") not in {"answering", "final_queued", "completed", "delivery_unknown"}
-            or attempt.get("camera_correction") != "answering"
+            or attempt.get("camera_correction") not in {"answering", "delivery_unknown"}
             or attempt.get("camera_correction_turn_id") != turn_id
             or not isinstance(turn_id, str)
             or not turn_id
@@ -2193,6 +2601,40 @@ class CameraIngress:
                 or value.get("photo_delivery_confirmed") is not True
             ):
                 raise ValueError("camera attempt context is invalid")
+            if "confirmed_camera_question" in value and (
+                not isinstance(value["confirmed_camera_question"], str)
+                or not value["confirmed_camera_question"].strip()
+                or len(value["confirmed_camera_question"]) > 2048
+                or "confirmed_camera_context" not in value
+                or value.get("prompt_edit_claimed") is not True
+                or value.get("photo_delivery_confirmed") is not True
+            ):
+                raise ValueError("camera attempt question is invalid")
+            if "confirmed_clarification_question" in value:
+                question = value["confirmed_clarification_question"]
+                reply_ids = {str(item) for item in value.get("reply_ids", [])}
+                if (
+                    not isinstance(question, dict)
+                    or set(question) != {"text", "turn_id", "receipt_ids"}
+                    or not isinstance(question["text"], str)
+                    or not question["text"].strip()
+                    or len(question["text"]) > 2048
+                    or not isinstance(question["turn_id"], str)
+                    or not question["turn_id"]
+                    or question["turn_id"] != value.get("context_question_turn_id")
+                    or value.get("state") != "clarifying"
+                    or value.get("answer_kind") != "context"
+                    or not isinstance(question["receipt_ids"], list)
+                    or not 1 <= len(question["receipt_ids"]) <= 8
+                    or any(
+                        not isinstance(native_id, int)
+                        or isinstance(native_id, bool)
+                        or native_id <= 0
+                        or str(native_id) not in reply_ids
+                        for native_id in question["receipt_ids"]
+                    )
+                ):
+                    raise ValueError("camera clarification question is invalid")
             # Older tombstones have no capture evidence. Keep them, but never
             # infer a meal time from admission or reply arrival.
             if "capture_time" in value or "capture_time_authority" in value:
@@ -3749,6 +4191,38 @@ class CameraIngress:
             intent = None
         if target is None and intent is None:
             intent = _camera_context_answer_kind(raw_text)
+        if not callback and target_matches and intent is None and isinstance(raw_text, str):
+            candidate_id, attempt = target_matches[0]
+            latest = attempt.get("camera_correction_commit")
+            pending_portion = (
+                attempt.get("camera_correction") in {"answering", "final_queued", "delivery_unknown"}
+                and attempt.get("camera_correction_kind") == "portion"
+            )
+            completed_portion = (
+                attempt.get("camera_correction") == "completed"
+                and isinstance(latest, dict)
+                and latest.get("kind") == "portion"
+            )
+            if (
+                _CLARIFICATION_QUANTITY_RE.fullmatch(raw_text.strip())
+                and attempt.get("state") == "completed"
+                and isinstance(attempt.get("camera_commit"), dict)
+                and (pending_portion or completed_portion)
+            ):
+                turn_id = (
+                    attempt.get("camera_correction_turn_id") if pending_portion
+                    else latest.get("client_op_id", "").removesuffix(":assistant")
+                )
+                if isinstance(turn_id, str) and turn_id:
+                    metadata.update(
+                        _camera_authority=CAMERA_AUTHORITY,
+                        _camera_candidate_id=candidate_id,
+                        _camera_answer="yes",
+                        _camera_turn_id=turn_id,
+                        _camera_correction_replay=CAMERA_AUTHORITY,
+                        _camera_correction_replay_typed=True,
+                    )
+                    return
         if intent == "not_food":
             if not callback or len(target_matches) != 1:
                 metadata["_camera_unbound"] = CAMERA_AUTHORITY
@@ -3886,12 +4360,43 @@ class CameraIngress:
                 return False
             correction_state = attempt.get("camera_correction")
             original_turn = attempt.get("answer_turn_id") or attempt.get("final_turn_id")
-            if has_commit and correction_state is None:
+            latest_correction = attempt.get("camera_correction_commit")
+            latest_is_portion = (
+                isinstance(latest_correction, dict)
+                and latest_correction.get("kind") == "portion"
+            )
+            latest_is_denial = (
+                isinstance(latest_correction, dict)
+                and latest_correction.get("kind") == "denial"
+            )
+            if has_commit and correction_state == "completed" and latest_is_denial:
+                correction_turn = latest_correction.get("client_op_id", "").removesuffix(":assistant")
+                metadata.update(
+                    _camera_authority=CAMERA_AUTHORITY,
+                    _camera_candidate_id=candidate_id,
+                    _camera_answer="no",
+                    _camera_correction=CAMERA_AUTHORITY,
+                    _camera_turn_id=correction_turn,
+                    _camera_route=route,
+                    _camera_correction_replay=CAMERA_AUTHORITY,
+                    **({"_camera_correction_replay_typed": True} if not callback else {}),
+                )
+                if target is not None:
+                    metadata["_camera_native_binding"] = str(target)
+                return True
+            if has_commit and (correction_state is None or (
+                correction_state == "completed" and latest_is_portion
+            )):
                 correction_turn = attempt.get("camera_correction_turn_id")
-                if not isinstance(correction_turn, str) or not correction_turn:
+                if (
+                    not isinstance(correction_turn, str)
+                    or not correction_turn
+                    or correction_state == "completed"
+                ):
                     correction_turn = uuid4().hex
                     attempt["camera_correction_turn_id"] = correction_turn
                 attempt["camera_correction"] = "answering"
+                attempt["camera_correction_kind"] = "denial"
                 self._save_attempts()
                 metadata.update(
                     _camera_authority=CAMERA_AUTHORITY,
@@ -4017,7 +4522,125 @@ class CameraIngress:
                     elif bind_denial(candidate_id, attempt, "context"):
                         return
         if intent != "no" and target_matches:
-            _, attempt = target_matches[0]
+            candidate_id, attempt = target_matches[0]
+            completed_typed_yes = intent == "yes" or (
+                intent is None
+                and _camera_context_answer_kind(
+                    raw_text,
+                    source_context=attempt.get("confirmed_camera_context"),
+                ) == "yes"
+            )
+            if (
+                not callback
+                and completed_typed_yes
+                and attempt.get("state") == "completed"
+                and isinstance(attempt.get("camera_commit"), dict)
+                and target is not None
+                and isinstance(attempt.get("answer_turn_id"), str)
+                and attempt.get("finalizer_status") == "committed"
+                and (
+                    attempt.get("camera_correction") is None
+                    or (
+                        attempt.get("camera_correction") == "completed"
+                        and isinstance(attempt.get("camera_correction_commit"), dict)
+                        and attempt["camera_correction_commit"].get("kind") == "portion"
+                    )
+                    or (
+                        attempt.get("camera_correction") in {
+                            "answering", "final_queued", "delivery_unknown"
+                        }
+                        and attempt.get("camera_correction_kind") == "portion"
+                    )
+                )
+            ):
+                # This is only a runtime lookup hint. Runtime compares the
+                # durable user text before acknowledging a repeat; changed
+                # text continues through ordinary receipt/model handling.
+                correction = attempt.get("camera_correction_commit")
+                if isinstance(correction, dict) and correction.get("kind") == "portion":
+                    metadata.update(
+                        _camera_authority=CAMERA_AUTHORITY,
+                        _camera_candidate_id=candidate_id,
+                        _camera_answer="yes",
+                        _camera_turn_id=correction.get("client_op_id", "").removesuffix(":assistant"),
+                        _camera_correction_replay=CAMERA_AUTHORITY,
+                        _camera_correction_replay_typed=True,
+                    )
+                else:
+                    metadata["_camera_typed_replay_candidate"] = candidate_id
+                return
+            if (
+                callback
+                and attempt.get("state") == "completed"
+                and isinstance(attempt.get("camera_commit"), dict)
+                and target is not None
+                and _native_button_answer_kind(metadata, raw_text) == "yes"
+                and isinstance(attempt.get("answer_turn_id"), str)
+                and attempt.get("finalizer_status") == "committed"
+                and _source_message_id(metadata.get("callback_query_id")) is not None
+                and (
+                    attempt.get("camera_correction") is None
+                    or (
+                        attempt.get("camera_correction") == "completed"
+                        and isinstance(attempt.get("camera_correction_commit"), dict)
+                        and attempt["camera_correction_commit"].get("kind") == "portion"
+                    )
+                    or (
+                        attempt.get("camera_correction") in {
+                            "answering", "final_queued", "delivery_unknown"
+                        }
+                        and attempt.get("camera_correction_kind") == "portion"
+                    )
+                )
+            ):
+                # A completed affirmative callback may be a deliberate second
+                # tap of the same portion. Runtime must reconcile the exact
+                # saved exchange and compare its durable user text before
+                # reporting the existing meal; ingress alone cannot assert it.
+                correction = attempt.get("camera_correction_commit")
+                correction_turn = (
+                    correction.get("client_op_id", "").removesuffix(":assistant")
+                    if isinstance(correction, dict) else None
+                )
+                correction_kind = attempt.get("camera_correction_kind")
+                if (
+                    attempt.get("camera_correction") in {
+                        "answering", "final_queued", "delivery_unknown"
+                    }
+                    and correction_kind == "portion"
+                ):
+                    correction_turn = attempt.get("camera_correction_turn_id")
+                elif isinstance(correction, dict) and correction.get("kind") == "portion":
+                    correction_kind = "portion"
+                    correction_turn = correction.get("client_op_id", "").removesuffix(":assistant")
+                if correction_kind == "portion":
+                    metadata.update(
+                        _camera_authority=CAMERA_AUTHORITY,
+                        _camera_candidate_id=candidate_id,
+                        _camera_answer="yes",
+                        _camera_correction=CAMERA_AUTHORITY,
+                        _camera_turn_id=correction_turn,
+                        _camera_route="callback",
+                        _camera_native_binding=str(target),
+                        **(
+                            {"_camera_portion_correction": CAMERA_AUTHORITY}
+                            if correction_kind == "portion" else {}
+                        ),
+                        _camera_correction_replay=CAMERA_AUTHORITY,
+                        _camera_ingress_callback_eligible=True,
+                    )
+                    return
+                metadata.update(
+                    _camera_authority=CAMERA_AUTHORITY,
+                    _camera_candidate_id=candidate_id,
+                    _camera_answer="yes",
+                    _camera_turn_id=attempt["answer_turn_id"],
+                    _camera_route="callback",
+                    _camera_native_binding=str(target),
+                    _camera_existing_meal_replay=True,
+                    _camera_ingress_callback_eligible=True,
+                )
+                return
             if (
                 attempt.get("state") in {"completed", "delivery_unknown"}
                 and (
@@ -4113,6 +4736,7 @@ class CameraIngress:
             metadata["_camera_context_unrelated"] = CAMERA_AUTHORITY
             return
         if attempt["state"] == "clarifying":
+            context_origin = attempt.get("answer_kind") == "context"
             source_id = _source_message_id(metadata.get("message_id"))
             if source_id is not None and source_id == attempt.get("clarification_source_message_id"):
                 metadata.update(
@@ -4130,24 +4754,90 @@ class CameraIngress:
             if _CLARIFICATION_NEW_MEAL_RE.search(text):
                 metadata["_camera_unbound"] = CAMERA_AUTHORITY
                 return
+            clarification_scope = attempt.get("confirmed_clarification_question")
+            current_clarification_question = (
+                clarification_scope.get("text")
+                if context_origin
+                and isinstance(clarification_scope, dict)
+                and clarification_scope.get("turn_id")
+                == attempt.get("context_question_turn_id")
+                and isinstance(clarification_scope.get("receipt_ids"), list)
+                and all(
+                    str(native_id) in {str(item) for item in attempt.get("reply_ids", [])}
+                    for native_id in clarification_scope["receipt_ids"]
+                )
+                else None
+            )
             if callback:
+                if context_origin and not (
+                    isinstance(current_clarification_question, str)
+                    and target is not None
+                    and str(target) in {
+                        str(native_id)
+                        for native_id in clarification_scope.get("receipt_ids", [])
+                    }
+                    and isinstance(metadata.get("native_keyboard_question"), str)
+                    and metadata["native_keyboard_question"].strip().casefold()
+                    == current_clarification_question.strip().casefold()
+                    and _camera_question_asks_owner_consumption(
+                        current_clarification_question
+                    )
+                    and not _CAMERA_ANALYSIS_ONLY_QUESTION_RE.search(
+                        current_clarification_question
+                    )
+                ):
+                    metadata["_camera_unbound"] = CAMERA_AUTHORITY
+                    return
                 # This journal state exists only after a confirmed consumed
-                # answer; it makes portion options safe even when the follow-up
-                # itself asks only which size.
-                metadata["_camera_known_consumption_clarification"] = CAMERA_AUTHORITY
+                # answer; context-only clarification does not establish that.
+                if not context_origin:
+                    metadata["_camera_known_consumption_clarification"] = CAMERA_AUTHORITY
             answer = (
                 _native_button_answer_kind(metadata, raw_text)
                 if callback else _camera_context_answer_kind(
-                    text, source_context=attempt.get("confirmed_camera_context")
+                    text,
+                    source_context=attempt.get("confirmed_camera_context"),
+                    source_question=(
+                        current_clarification_question if context_origin else None
+                    ),
                 )
             )
+            if context_origin and not callback and _classify_answer(text, anchored=False) != "yes" and not (
+                isinstance(current_clarification_question, str)
+                and _camera_question_asks_owner_consumption(
+                    current_clarification_question
+                )
+                and not _CAMERA_ANALYSIS_ONLY_QUESTION_RE.search(current_clarification_question)
+            ):
+                # Implicit quantity binds only to the current delivered consuming
+                # clarification, never merely to an old question or clarifying state.
+                answer = None
             if answer is None:
+                context_question = (
+                    current_clarification_question
+                    if context_origin else attempt.get("confirmed_camera_question")
+                )
+                if (
+                    target is None
+                    and context_origin
+                    and isinstance(context_question, str)
+                    and _CAMERA_ANALYSIS_ONLY_QUESTION_RE.search(
+                        context_question
+                    )
+                    and _camera_contextual_portion_choice(
+                        text, attempt.get("confirmed_camera_context")
+                    )
+                ):
+                    self._bind_context_question(message, candidate_id, attempt)
+                    return
                 if target is None and _camera_food_context_hint(text):
                     self._bind_context_question(message, candidate_id, attempt)
                     return
                 if target is None:
                     self._interrupt_untargeted_camera_context()
                     metadata["_camera_context_unrelated"] = CAMERA_AUTHORITY
+                elif context_origin:
+                    metadata["_camera_unbound"] = CAMERA_AUTHORITY
                 return
             if callback and len(target_matches) == 1:
                 metadata["_camera_ingress_callback_eligible"] = True
@@ -4203,14 +4893,33 @@ class CameraIngress:
             classified = _native_button_answer_kind(metadata, raw_text)
         elif target is not None:
             classified = _camera_context_answer_kind(
-                raw_text, source_context=attempt.get("confirmed_camera_context")
+                raw_text,
+                source_context=attempt.get("confirmed_camera_context"),
+                source_question=attempt.get("confirmed_camera_question"),
             )
         else:
             classified = _camera_context_answer_kind(
-                raw_text, source_context=attempt.get("confirmed_camera_context")
+                raw_text,
+                source_context=attempt.get("confirmed_camera_context"),
+                source_question=attempt.get("confirmed_camera_question"),
             )
         if classified is None:
             if target is None:
+                if (
+                    isinstance(attempt.get("confirmed_camera_question"), str)
+                    and _CAMERA_ANALYSIS_ONLY_QUESTION_RE.search(
+                        attempt["confirmed_camera_question"]
+                    )
+                    and _camera_contextual_portion_choice(
+                        raw_text, attempt.get("confirmed_camera_context")
+                    )
+                ):
+                    # Keep a source-related food/portion phrase in the
+                    # context-only lane when the delivered question asks for
+                    # analysis. It must not become an unrelated turn, or a
+                    # consumption answer.
+                    self._bind_context_question(message, candidate_id, attempt)
+                    return
                 if _camera_food_context_hint(raw_text):
                     self._bind_context_question(message, candidate_id, attempt)
                     return
@@ -4308,14 +5017,35 @@ class CameraIngress:
             and 0 < len(message.content.strip().split("\n\n", 1)[0].strip()) <= 2048
         ):
             # The bridge appends the current question after a blank line. Retain
-            # only the delivered source analysis, so question wording cannot
-            # ground an otherwise arbitrary composition answer.
-            attempt["confirmed_camera_context"] = (
-                message.content.strip().split("\n\n", 1)[0].strip()
+            # the source analysis separately from the question: only source
+            # analysis may ground food terms, while the question controls
+            # whether an implicit answer is authorized.
+            delivered_context, separator, delivered_question = message.content.strip().partition(
+                "\n\n"
             )
+            attempt["confirmed_camera_context"] = delivered_context.strip()
+            if separator and 0 < len(delivered_question.strip()) <= 2048:
+                attempt["confirmed_camera_question"] = delivered_question.strip()
         for native_id in receipt.native_message_ids:
             if native_id not in attempt["reply_ids"]:
                 attempt["reply_ids"].append(native_id)
+        delivered_question = _camera_displayed_question(message)
+        if (
+            message.channel == "telegram"
+            and str(message.chat_id) == self.config.chat_id
+            and message.metadata.get("_camera_final") is CAMERA_AUTHORITY
+            and attempt.get("state") == "clarifying"
+            and attempt.get("answer_kind") == "context"
+            and isinstance(turn_id, str)
+            and turn_id == attempt.get("context_question_turn_id")
+            and isinstance(delivered_question, str)
+            and 1 <= len(receipt.native_message_ids) <= 8
+        ):
+            attempt["confirmed_clarification_question"] = {
+                "text": delivered_question,
+                "turn_id": turn_id,
+                "receipt_ids": list(receipt.native_message_ids),
+            }
         if final and is_correction:
             attempt["camera_correction"] = "completed"
             if attempt["state"] in {"final_queued", "delivery_unknown"}:
@@ -4386,6 +5116,7 @@ class CameraIngress:
                 )
                 if is_context_question:
                     attempt["context_question_turn_id"] = turn_id
+                    attempt.pop("confirmed_clarification_question", None)
                 self._save_attempts()
             return
         if message.metadata.get("_camera_answer") == "no" or recorded:
@@ -4430,6 +5161,7 @@ class CameraIngress:
         answer: str, target: object, route: str,
     ) -> None:
         attempt["state"] = "answering"
+        attempt.pop("confirmed_clarification_question", None)
         attempt["answer_turn_id"] = uuid4().hex
         attempt["answer_kind"] = answer
         attempt["answer_source_message_id"] = _source_message_id(
@@ -4479,6 +5211,7 @@ class CameraIngress:
             finalizer_status="context_question_pending",
             attention_active=False,
         )
+        attempt.pop("confirmed_clarification_question", None)
         try:
             self._save_attempts()
         except OSError:

@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import httpx
 import pytest
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 
 import openharness.mcp.client as client_module
@@ -18,7 +19,7 @@ from openharness.untrusted import UNTRUSTED_BANNER
 
 
 @pytest.mark.asyncio
-async def test_http_mcp_manager_connects_and_executes_in_process_server(monkeypatch):
+async def test_http_mcp_manager_connects_and_executes_in_process_server(monkeypatch, caplog):
     server = FastMCP(
         "demo-http",
         transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
@@ -27,6 +28,11 @@ async def test_http_mcp_manager_connects_and_executes_in_process_server(monkeypa
     @server.tool()
     def hello(name: str) -> str:
         return f"http-hello:{name}"
+
+    @server.tool()
+    def metadata_echo(ctx: Context) -> str:
+        meta = ctx.request_context.meta
+        return str(meta.model_dump(exclude_none=True) if meta is not None else {})
 
     @server.resource("demo://readme")
     def readme() -> str:
@@ -77,6 +83,16 @@ async def test_http_mcp_manager_connects_and_executes_in_process_server(monkeypa
                 ToolExecutionContext(cwd=Path(".")),
             )
             assert hello_result.output == f"{UNTRUSTED_BANNER}\n\nhttp-hello:world"
+
+            signed_token = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ0ZWxlZ3JhbToxMjMifQ.signature123456789"
+            caplog.set_level(logging.DEBUG, logger="mcp.client.streamable_http")
+            meta_result = await manager.call_tool_result(
+                "http-fixture", "metadata_echo", {},
+                meta={"io.telegent/wellness-delegation/v1": signed_token},
+            )
+            assert "io.telegent/wellness-delegation/v1" in meta_result.output
+            assert signed_token in meta_result.output
+            assert signed_token not in caplog.text
 
             resource_tool = registry.get("read_mcp_resource")
             assert resource_tool is not None

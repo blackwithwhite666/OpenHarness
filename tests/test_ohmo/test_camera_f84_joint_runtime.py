@@ -698,7 +698,7 @@ async def runtime():
     )
     assert phrase_final.metadata["nutrition_sync_status"] == "pending"
     assert phrase_final.text == "Изменение сохранено; баланс обновляется."
-    assert "Verified original Telegram photo send time (UTC): 2026-10-01T23:57:12+00:00" in bundle.engine.last_load_output
+    assert "Verified source conversation message received time (UTC): 2026-10-01T23:57:12+00:00" in bundle.engine.last_load_output
     phrase_event = server.rows[-1]
     assert phrase_event["metadata"]["target_meal_id"] == date_event["metadata"]["target_meal_id"]
     assert phrase_event["metadata"]["selected_source"]["source_message_id"] == "legacy-original-photo"

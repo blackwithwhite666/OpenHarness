@@ -81,6 +81,7 @@ class ConversationAppendReceipt:
     assistant_client_op_id: str
     assistant_metadata: Mapping[str, object] | None = None
     assistant_content: str | None = None
+    user_content: str | None = None
 
     @property
     def user_id(self) -> str:
@@ -952,6 +953,7 @@ class ShadowMemoryBackend(MemoryBackend):
                 assistant_client_op_id=assistant_client_op_id,
                 assistant_metadata=dict(assistant.metadata),
                 assistant_content=assistant.content,
+                user_content=user.content,
             )
 
     async def _append_exchange_durable(
@@ -984,6 +986,7 @@ class ShadowMemoryBackend(MemoryBackend):
                     assistant_client_op_id=assistant_op,
                     assistant_metadata=dict(existing_assistant.metadata),
                     assistant_content=existing_assistant.content,
+                    user_content=existing_user.content,
                 )
 
             messages: list[dict[str, object]] = []
@@ -1023,6 +1026,7 @@ class ShadowMemoryBackend(MemoryBackend):
                     assistant_client_op_id=assistant_op,
                     assistant_metadata=dict(created_assistant.metadata),
                     assistant_content=created_assistant.content,
+                    user_content=created_user.content,
                 )
 
             expected_count = len(messages)
@@ -1049,6 +1053,7 @@ class ShadowMemoryBackend(MemoryBackend):
                 assistant_client_op_id=assistant_op,
                 assistant_metadata=dict(assistant_message.metadata),
                 assistant_content=assistant_message.content,
+                user_content=user_message.content,
             )
 
     async def _find_unique_operation(

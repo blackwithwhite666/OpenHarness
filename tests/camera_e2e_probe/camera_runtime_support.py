@@ -28,6 +28,47 @@ SYNTHETIC_OPTIONS = (
 )
 
 
+def _validate_completed_photo_replay(
+    *,
+    replay,
+    candidate_id: str,
+    turn_id: str,
+    delivered,
+    delivery_receipt,
+    existing_event_id: str,
+    original_commit: dict[str, Any],
+    current_commit: dict[str, Any] | None,
+    typed_replay: bool = False,
+) -> str:
+    """Require a delivered saved-state response tied to the immutable event."""
+    if (
+        replay.metadata.get(
+            "_camera_typed_replay" if typed_replay else "_camera_existing_meal_replay"
+        ) is not True
+        or replay.metadata.get("_camera_unbound") is not None
+        or replay.metadata.get("_camera_candidate_id") != candidate_id
+        or replay.metadata.get("_camera_turn_id") != turn_id
+    ):
+        raise AssertionError("completed-photo replay was not bound to the existing saved meal")
+    replay_final = next(
+        (
+            outbound for outbound, _ in reversed(delivered)
+            if outbound.metadata.get("nutrition_append_event_id") is not None
+        ),
+        None,
+    )
+    if (
+        replay_final is None
+        or "уже записана" not in replay_final.content.casefold()
+        or replay_final.metadata.get("nutrition_append_event_id") != existing_event_id
+        or delivery_receipt is None
+    ):
+        raise AssertionError("completed-photo replay did not report its verified existing meal")
+    if current_commit != original_commit or current_commit.get("event_id") != existing_event_id:
+        raise AssertionError("completed-photo replay changed the immutable nutrition observation")
+    return replay_final.content
+
+
 class OfflineCameraBotApi:
     """Synthetic bot transport: asks, then uses TraceTool for a fake meal."""
 
@@ -152,6 +193,75 @@ class OfflineCameraUserApi:
             message=ConversationMessage.from_user_text(self.selected_label),
             usage=UsageSnapshot(input_tokens=1, output_tokens=1),
             stop_reason="end_turn",
+        )
+
+
+class OfflinePersonSourceApi:
+    """Synthetic person-source fixture: one tool call, then a final response."""
+
+    synthetic = True
+
+    def __init__(self, *, outcome: str = "meal", basis: str = "image") -> None:
+        if outcome not in {"meal", "nonfood"}:
+            raise ValueError("offline person-source outcome must be meal or nonfood")
+        self.outcome = outcome
+        if basis not in {"image", "text"}:
+            raise ValueError("offline person-source basis must be image or text")
+        self.basis = basis
+        self.calls = 0
+
+    async def stream_message(self, request: ApiMessageRequest) -> AsyncIterator[ApiMessageCompleteEvent]:
+        del request
+        self.calls += 1
+        if self.outcome == "nonfood":
+            message = ConversationMessage(
+                role="assistant",
+                content=[TextBlock(text="This does not appear to be food, so I did not save a meal.")],
+            )
+            stop_reason = "end_turn"
+        elif self.calls > 1:
+            message = ConversationMessage(
+                role="assistant",
+                content=[TextBlock(text="I recorded the synthetic person-source meal.")],
+            )
+            stop_reason = "end_turn"
+        else:
+            message = ConversationMessage(
+                role="assistant",
+                content=[
+                    ToolUseBlock(
+                        name="trace",
+                        input={
+                            "kind": "trace_finalization",
+                            "payload": {
+                                "schema_version": 1,
+                                "trace_event_id": f"offline-person-source-{self.calls}",
+                                "annotations": {
+                                    "nutrition": {
+                                        "schema_version": 2,
+                                        "record_type": "meal_observation",
+                                        "basis": [self.basis],
+                                        "consumption_status": "consumed",
+                                        "is_estimate": True,
+                                        "energy_kcal_best": 125,
+                                        "items": [{
+                                            "name": "synthetic fixture food",
+                                            "quantity_text": "one fixture serving",
+                                            "energy_kcal_best": 125,
+                                        }],
+                                        "assumptions": ["synthetic fixture; not an estimate"],
+                                    }
+                                },
+                            },
+                        },
+                    )
+                ],
+            )
+            stop_reason = "tool_use"
+        yield ApiMessageCompleteEvent(
+            message=message,
+            usage=UsageSnapshot(input_tokens=1, output_tokens=1),
+            stop_reason=stop_reason,
         )
 
 
@@ -583,6 +693,8 @@ async def run_camera_runtime_trajectory(
             flush=True,
         )
 
+        initial_finalization_proposals = getattr(bot_client, "finalization_proposals", None)
+
         async def replay_callback():
             if action.callback_data is not None:
                 replay = await invoke_issued_callback()
@@ -597,16 +709,31 @@ async def run_camera_runtime_trajectory(
             return replay
 
         replay = await replay_callback()
+        replay_delivered, replay_delivery_receipt, replay_event_id = await process_and_deliver(
+            replay, replay.session_key
+        )
+        current_commit = ingress._attempts[candidate_id].get("camera_commit")
+        replay_status = _validate_completed_photo_replay(
+            replay=replay,
+            candidate_id=candidate_id,
+            turn_id=answer.metadata["_camera_turn_id"],
+            delivered=replay_delivered,
+            delivery_receipt=replay_delivery_receipt,
+            existing_event_id=nutrition_event_id,
+            original_commit=commit,
+            current_commit=current_commit,
+            typed_replay=action.callback_data is None,
+        )
+        if replay_event_id != nutrition_event_id:
+            raise AssertionError("completed-photo replay event identity differs from existing meal")
         if (
-            replay.metadata.get("_camera_answer") is not None
-            or replay.metadata.get("_camera_unbound") is None
+            isinstance(bot_client, OfflineCameraBotApi)
+            and bot_client.finalization_proposals != initial_finalization_proposals
         ):
-            raise AssertionError("completed-photo owner replay was not marked unbound")
-        _, replay_receipt, replay_event_id = await process_and_deliver(replay, replay.session_key)
-        if replay_event_id is not None or replay_receipt is not None:
-            raise AssertionError("completed-photo owner replay produced a second nutrition receipt")
-        if isinstance(bot_client, OfflineCameraBotApi) and bot_client.finalization_proposals < 2:
-            raise AssertionError("synthetic owner replay did not challenge duplicate consumption")
+            raise AssertionError(
+                "completed-photo replay proposed another nutrition observation "
+                f"(before={initial_finalization_proposals}, after={bot_client.finalization_proposals})"
+            )
 
         return {
             "started": first_started,
@@ -623,7 +750,8 @@ async def run_camera_runtime_trajectory(
             "markup": markup,
             "caption": edit.get("caption"),
             "replay_callback": replay_callback,
-            "owner_replay_unbound": True,
+            "owner_replay_saved_status": replay_status,
+            "owner_replay_delivery_confirmed": replay_delivery_receipt is not None,
             "owner_replay_event_id": replay_event_id,
         }
     finally:

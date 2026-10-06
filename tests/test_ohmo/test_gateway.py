@@ -199,6 +199,25 @@ def test_gateway_error_formats_generic_auth_failure():
     assert "Authentication failed" in _format_gateway_error(exc)
 
 
+def test_gateway_error_keeps_authoritative_camera_validation_out_of_auth_class():
+    exc = ValueError("Camera consumed meal requires authoritative meal_at without meal_date")
+    formatted = _format_gateway_error(exc, camera_context=True)
+    assert formatted == "Не удалось подтвердить запись этой порции."
+    assert "Authentication" not in formatted
+    assert "записана" not in formatted.casefold()
+
+
+def test_gateway_error_keeps_real_401_oauth_failures_in_auth_class():
+    for message in (
+        "OAuth token expired",
+        "HTTP 401 unauthorized",
+        "API key missing for current profile",
+    ):
+        assert "Authentication failed" in _format_gateway_error(
+            ValueError(message), camera_context=True
+        )
+
+
 def test_compact_progress_formats_reactive_channel_hint_in_chinese():
     text = _format_channel_progress(
         channel="feishu",

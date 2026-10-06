@@ -9,7 +9,9 @@ import re
 import subprocess
 import tempfile
 import warnings
+from collections.abc import Mapping
 from pathlib import Path
+from types import MappingProxyType
 from uuid import uuid4
 
 from PIL import Image, UnidentifiedImageError
@@ -18,6 +20,55 @@ from ohmo.gateway.camera import CAMERA_AUTHORITY
 
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _GIT_SHA = re.compile(r"[0-9a-f]{40}\Z")
+
+
+def synthetic_wellness_self_scope(user_id: str):
+    """Build explicit in-process self authority for a synthetic owner probe."""
+    from telegent.mcp_simple_auth.wellness import WellnessAuthorizationContext
+    from telegent.mcp_simple_auth.wellness_delegation import AuthorizedWellnessRead
+    from telegent.mcp_simple_auth.wellness_identity import (
+        WellnessParticipant,
+        WellnessParticipantRegistry,
+    )
+
+    registry = WellnessParticipantRegistry(
+        default_participant_id=123,
+        participants={
+            123: WellnessParticipant(123, user_id, "synthetic_owner")
+        },
+    )
+    authorization_context = WellnessAuthorizationContext()
+
+    def authorized_read(body: Mapping[str, object]) -> AuthorizedWellnessRead:
+        params = body.get("params")
+        if not isinstance(params, Mapping):
+            raise ValueError("synthetic wellness probe requires params")
+        frozen_body = MappingProxyType(
+            {"params": MappingProxyType(dict(params))}
+        )
+        return AuthorizedWellnessRead(
+            reader_participant_id=123,
+            target_participant_id=123,
+            target_user_id=user_id,
+            is_self=True,
+            body=frozen_body,
+        )
+
+    return registry, authorization_context, authorized_read
+
+
+async def call_wellness_with_synthetic_self(
+    app,
+    authorization_context,
+    authorized_read,
+    arguments: Mapping[str, object],
+):
+    """Scope one direct helper read and always restore its async-local context."""
+    token = authorization_context.set(authorized_read(arguments))
+    try:
+        return await app.call_tool("get_wellness_data", dict(arguments))
+    finally:
+        authorization_context.reset(token)
 
 
 def create_storage_run_dir(root: Path) -> Path:
@@ -162,6 +213,15 @@ def native_preflight_and_clients(
     return clients, source_bytes
 
 
+def native_person_source_clients(settings, *, scenario: str, resolver=None, codex_client_type=None):
+    """Apply the existing Luna subscription/no-fallback gate to source turns."""
+    if not isinstance(scenario, str) or not scenario.strip():
+        raise NativeClientPreconditionError("native person-source run requires a public scenario")
+    return native_profile_clients(
+        settings, resolver=resolver, codex_client_type=codex_client_type
+    )
+
+
 def unique_honcho_scope() -> tuple[str, str]:
     run_id = uuid4().hex
     return f"camera-joined-{run_id}", f"camera-joined-session-{run_id}"
@@ -189,6 +249,22 @@ def verify_source_worktree(
     if require_clean and dirty:
         raise ValueError("Camera source worktree has tracked or non-ignored untracked changes")
     return head, dirty
+
+
+def verify_source_tree_pin(path: Path, expected_head: str) -> tuple[Path, str, str]:
+    """Return the exact clean caller-selected Git checkout, commit, and tree object."""
+    root = path.resolve(strict=True)
+    head, _dirty = verify_source_worktree(root, expected_head, require_clean=True)
+    tree = subprocess.run(
+        ["git", "rev-parse", "HEAD^{tree}"],
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    if not _GIT_SHA.fullmatch(tree):
+        raise ValueError("source worktree tree object is invalid")
+    return root, head, tree
 
 
 def require_bound_answer(message, candidate_id: str, native_photo_id: int | str = 77) -> str:

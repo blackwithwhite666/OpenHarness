@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import logging
 import os
+import re
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
 from typing import Any
@@ -24,6 +26,35 @@ from openharness.mcp.types import (
 )
 
 log = logging.getLogger(__name__)
+_JWT_LOG_VALUE = re.compile(
+    r"(?<![A-Za-z0-9_-])([A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,})(?![A-Za-z0-9_-])"
+)
+
+
+def _redact_jwts(value: str) -> str:
+    return _JWT_LOG_VALUE.sub("[REDACTED-JWT]", value)
+
+
+class _McpSdkJwtRedactionFilter(logging.Filter):
+    """Prevent SDK DEBUG request dumps from recording signed reader JWTs."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            message = record.getMessage()
+        except Exception:
+            return True
+        redacted = _redact_jwts(message)
+        if redacted != message:
+            record.msg = redacted
+            record.args = ()
+        return True
+
+
+_sdk_jwt_filter = _McpSdkJwtRedactionFilter()
+for _sdk_logger_name in ("mcp.client.streamable_http", "mcp.client.sse"):
+    _sdk_logger = logging.getLogger(_sdk_logger_name)
+    if not any(isinstance(item, _McpSdkJwtRedactionFilter) for item in _sdk_logger.filters):
+        _sdk_logger.addFilter(_sdk_jwt_filter)
 
 # A slow / hung MCP backend must never block a tool call forever: an unanswered
 # tool call leaves a dangling tool_use in the conversation and poisons the whole
@@ -60,7 +91,7 @@ def _describe_mcp_exc(exc: BaseException) -> str:
             status_text = str(status).strip() or type(status).__name__
         except BaseException:
             status_text = "unknown"
-        return f"HTTP {status_text}: {text or type_name}"
+        return _redact_jwts(f"HTTP {status_text}: {text or type_name}")
 
     try:
         inner_exceptions = getattr(exc, "exceptions", ())
@@ -84,7 +115,7 @@ def _describe_mcp_exc(exc: BaseException) -> str:
             except BaseException:
                 pass
 
-    return text or type_name
+    return _redact_jwts(text or type_name)
 
 
 def _mcp_tool_timeout() -> float | None:
@@ -346,18 +377,32 @@ class McpClientManager:
             resources.extend(status.resources)
         return resources
 
-    async def call_tool(self, server_name: str, tool_name: str, arguments: dict[str, Any]) -> str:
+    async def call_tool(
+        self, server_name: str, tool_name: str, arguments: dict[str, Any], *,
+        meta: dict[str, Any] | None = None,
+    ) -> str:
         """Invoke one MCP tool and stringify the result.
 
         Returns the textual body whether or not the tool declared an error;
         use ``call_tool_result`` when the ``isError`` flag matters.
         """
-        return (await self.call_tool_result(server_name, tool_name, arguments)).output
+        if meta is None:
+            result = await self.call_tool_result(server_name, tool_name, arguments)
+        else:
+            result = await self.call_tool_result(
+                server_name, tool_name, arguments, meta=meta
+            )
+        return result.output
 
     async def call_tool_result(
-        self, server_name: str, tool_name: str, arguments: dict[str, Any]
+        self, server_name: str, tool_name: str, arguments: dict[str, Any], *,
+        meta: dict[str, Any] | None = None,
     ) -> McpToolCallResult:
         """Invoke one MCP tool, preserving the tool-level ``isError`` flag."""
+        # Snapshot mutable call data before even a reconnect-lock await.
+        frozen_arguments = copy.deepcopy(arguments)
+        frozen_meta = copy.deepcopy(meta) if meta is not None else None
+        request_kwargs = {"meta": frozen_meta} if frozen_meta is not None else {}
         session = self._sessions.get(server_name)
         if session is None:
             # A peer may have removed the stale session while holding the
@@ -373,14 +418,18 @@ class McpClientManager:
             raise McpServerNotConnectedError(
                 f"MCP server '{server_name}' is not connected: {detail}"
             )
+        # Preserve precisely the same body and per-call metadata through both
+        # timeout retry and reconnect retry paths.
         timeout = _mcp_tool_timeout()
         for attempt in range(2):
             try:
                 if timeout is None:
-                    result: CallToolResult = await session.call_tool(tool_name, arguments)
+                    result: CallToolResult = await session.call_tool(
+                        tool_name, frozen_arguments, **request_kwargs
+                    )
                 else:
                     result = await asyncio.wait_for(
-                        session.call_tool(tool_name, arguments), timeout=timeout
+                        session.call_tool(tool_name, frozen_arguments, **request_kwargs), timeout=timeout
                     )
                 break
             except (asyncio.TimeoutError, TimeoutError) as exc:

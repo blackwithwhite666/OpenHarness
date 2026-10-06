@@ -10,6 +10,12 @@ from pydantic import BaseModel, Field, create_model
 
 from openharness.mcp.client import McpClientManager, McpServerNotConnectedError
 from openharness.mcp.types import McpToolInfo
+from openharness.mcp.wellness_delegation import (
+    META_KEY,
+    TrustedWellnessActor,
+    WellnessDelegationConfig,
+    sign_wellness_call,
+)
 from openharness.tools.base import BaseTool, ToolExecutionContext, ToolResult
 from openharness.untrusted import UNTRUSTED_BANNER
 
@@ -27,43 +33,63 @@ class McpToolAdapter(BaseTool):
         self.input_model = _input_model_from_schema(self.name, tool_info.input_schema)
 
     async def execute(self, arguments: BaseModel, context: ToolExecutionContext) -> ToolResult:
-        del context
-        return await self._execute_payload(arguments.model_dump(mode="json", exclude_none=True))
+        return await self._execute_payload(
+            arguments.model_dump(mode="json", exclude_none=True), context=context
+        )
 
-    async def _execute_payload(self, payload: dict[str, object]) -> ToolResult:
+    async def _execute_payload(
+        self, payload: dict[str, object], *, context: ToolExecutionContext | None = None,
+        meta: dict[str, str] | None = None,
+    ) -> ToolResult:
+        # Freeze the exact final arguments and metadata before entering the async manager.
+        frozen_payload = copy.deepcopy(payload)
+        frozen_meta = dict(meta) if meta is not None else None
         try:
             call_typed = getattr(self._manager, "call_tool_result", None)
             if call_typed is not None:
                 outcome = await call_typed(
                     self._tool_info.server_name,
                     self._tool_info.name,
-                    payload,
+                    frozen_payload,
+                    **({"meta": frozen_meta} if frozen_meta is not None else {}),
                 )
                 output = outcome.output
                 tool_is_error = bool(getattr(outcome, "is_error", False))
             else:
+                if frozen_meta is not None:
+                    return ToolResult(output="wellness data is unavailable: signed metadata transport is unavailable", is_error=True)
                 output = await self._manager.call_tool(
                     self._tool_info.server_name,
                     self._tool_info.name,
-                    payload,
+                    frozen_payload,
                 )
                 tool_is_error = False
         except McpServerNotConnectedError as exc:
-            return ToolResult(output=str(exc), is_error=True)
+            error_text = str(exc)
+            signed_token = frozen_meta.get(META_KEY) if frozen_meta is not None else None
+            if isinstance(signed_token, str):
+                error_text = error_text.replace(signed_token, "[REDACTED-JWT]")
+            return ToolResult(output=error_text, is_error=True)
+        except TypeError:
+            if frozen_meta is not None:
+                return ToolResult(
+                    output="wellness data is unavailable: signed metadata transport is unavailable",
+                    is_error=True,
+                )
+            raise
+        signed_token = frozen_meta.get(META_KEY) if frozen_meta is not None else None
+        if isinstance(output, str) and isinstance(signed_token, str):
+            output = output.replace(signed_token, "[REDACTED-JWT]")
         if not isinstance(output, str) or not output.strip():
             return ToolResult(output=output, is_error=tool_is_error)
         return ToolResult(output=f"{UNTRUSTED_BANNER}\n\n{output}", is_error=tool_is_error)
 
 
 class WellnessLoginInjectingAdapter(BaseTool):
-    """OHMO-scoped wrapper for the worfalomey ``get_wellness_data`` MCP tool.
+    """Sign final wellness arguments with the admitted Telegram reader identity.
 
-    Hides legacy identity fields from the model-visible schema. The trusted
-    gateway binds a Telegram principal and, when available, its contact login
-    for every authorized turn. Owners may select another participant by login;
-    family turns are always pinned to their own trusted contact login.
-    Telegent's response is passed through without translating logins into names
-    or tenants.
+    The server owns self versus delegated-reader authorization. Mutable adapter
+    setters are retained only for compatibility and never establish authority.
     """
 
     _HIDDEN_PARAMS = ("user_id", "health_types", "participant_id")
@@ -77,11 +103,10 @@ class WellnessLoginInjectingAdapter(BaseTool):
         )
         _make_login_optional(schema)
         self.input_model = _input_model_from_schema(self.name, schema)
-        self._trusted_principal: str | None = None
-        self._trusted_login: str | None = None
-        self._trusted_channel: str | None = None
-        self._owner_turn = False
-        self._family_turn = False
+        try:
+            self._delegation_config: WellnessDelegationConfig | None = WellnessDelegationConfig.from_env()
+        except ValueError:
+            self._delegation_config = None
 
     def set_trusted_principal(
         self,
@@ -93,12 +118,8 @@ class WellnessLoginInjectingAdapter(BaseTool):
         family_turn: bool = False,
     ) -> None:
         """Bind the immutable principal and turn role for the next call."""
-        value = str(principal).strip() if principal is not None else ""
-        self._trusted_principal = value or None
-        self._trusted_login = _normalize_login(trusted_login)
-        self._trusted_channel = str(channel).strip().lower() or None
-        self._owner_turn = owner_turn is True
-        self._family_turn = family_turn is True
+        # Kept for source compatibility. Mutable adapter state is never authority.
+        del principal, trusted_login, channel, owner_turn, family_turn
 
     def set_tenant(self, tenant: str | None) -> None:
         """Reject the removed tenant-shaped binding and clear prior identity."""
@@ -106,66 +127,28 @@ class WellnessLoginInjectingAdapter(BaseTool):
         self.set_trusted_principal(None, channel="")
 
     async def execute(self, arguments: BaseModel, context: ToolExecutionContext) -> ToolResult:
-        del context
-        if self._trusted_principal is None:
+        metadata = getattr(context, "metadata", None)
+        actor = metadata.get("wellness_trusted_actor") if isinstance(metadata, dict) else None
+        if type(actor) is not TrustedWellnessActor:
             return ToolResult(
-                output=(
-                    "wellness data is unavailable: no wellness identity is resolved "
-                    "for the current turn"
-                ),
+                output="wellness data is unavailable: no admitted reader identity is present",
                 is_error=True,
             )
-        payload = arguments.model_dump(mode="json", exclude_none=True)
+        if self._delegation_config is None:
+            return ToolResult(output="wellness data is unavailable: delegation is not configured", is_error=True)
+        # Preserve omission versus explicit null for the signed final wire body.
+        payload = arguments.model_dump(mode="json", exclude_unset=True)
         params = payload.get("params")
         injected = dict(params) if isinstance(params, dict) else {}
         injected.pop("user_id", None)
         injected.pop("health_types", None)
         injected.pop("participant_id", None)
-        if self._trusted_principal is not None:
-            if self._trusted_channel != "telegram" or not self._trusted_principal.isdigit():
-                return ToolResult(
-                    output="wellness data is unavailable: trusted Telegram principal is invalid",
-                    is_error=True,
-                )
-            if self._family_turn:
-                if self._trusted_login is None:
-                    return ToolResult(
-                        output=(
-                            "wellness data is unavailable: trusted Telegram contact "
-                            "has no usable username"
-                        ),
-                        is_error=True,
-                    )
-                injected["login"] = self._trusted_login
-            elif self._owner_turn:
-                requested_login = injected.get("login")
-                selected = _normalize_login(requested_login)
-                if (
-                    "login" in injected
-                    and requested_login is not None
-                    and str(requested_login).strip()
-                    and selected is None
-                ):
-                    return ToolResult(
-                        output=(
-                            "wellness data is unavailable: params.login must match "
-                            "^[a-z0-9_]{1,64}$ after normalization"
-                        ),
-                        is_error=True,
-                    )
-                if selected is None:
-                    selected = self._trusted_login
-                if selected is None:
-                    injected.pop("login", None)
-                else:
-                    injected["login"] = selected
-            else:
-                return ToolResult(
-                    output="wellness data is unavailable: no authorized wellness role",
-                    is_error=True,
-                )
         payload["params"] = injected
-        return await self._delegate._execute_payload(payload)
+        try:
+            meta = sign_wellness_call(self._delegation_config, actor, payload)
+        except (TypeError, ValueError):
+            return ToolResult(output="wellness data is unavailable: delegation request is invalid", is_error=True)
+        return await self._delegate._execute_payload(payload, context=context, meta=meta)
 
 
 _JSON_TYPE_MAP: dict[str, type] = {
