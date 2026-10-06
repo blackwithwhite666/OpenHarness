@@ -4266,6 +4266,7 @@ class CameraIngress:
             not callback
             and target is not None
             and len(target_matches) == 1
+            and intent in {None, "yes"}
             and isinstance(raw_text, str)
             and _CAMERA_DATE_CORRECTION_RE.search(raw_text)
         ):

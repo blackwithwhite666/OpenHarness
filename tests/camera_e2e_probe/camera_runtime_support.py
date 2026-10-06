@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from collections.abc import AsyncIterator, Mapping, Sequence
 from typing import Any
 
@@ -26,6 +28,43 @@ SYNTHETIC_OPTIONS = (
     "Нет, не ел(а)",
     "Это не еда",
 )
+
+
+def e5_raw_honcho_row_fingerprint(row: Mapping[str, Any]) -> str:
+    """Fingerprint content and metadata from list_messages_in_window raw rows."""
+    row_id = row.get("id")
+    content = row.get("content")
+    metadata = row.get("metadata")
+    created_at = row.get("created_at")
+    if (
+        not isinstance(row_id, str) or not row_id
+        or not isinstance(content, str)
+        or not isinstance(metadata, Mapping)
+        or not isinstance(created_at, str) or not created_at
+    ):
+        raise AssertionError("E5 immutability check requires a full raw Honcho row")
+    snapshot = {
+        "id": row_id,
+        "content": content,
+        "metadata": metadata,
+        "created_at": created_at,
+    }
+    try:
+        encoded = json.dumps(
+            snapshot, sort_keys=True, ensure_ascii=False, allow_nan=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (RecursionError, TypeError, ValueError) as error:
+        raise AssertionError("E5 raw Honcho row is not stable bounded JSON") from error
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def assert_e5_raw_honcho_row_unchanged(
+    before: Mapping[str, Any], after: Mapping[str, Any]
+) -> None:
+    """Compare actual persisted raw content, metadata, and creation time."""
+    if e5_raw_honcho_row_fingerprint(before) != e5_raw_honcho_row_fingerprint(after):
+        raise AssertionError("E5 immutable original raw Honcho row changed")
 
 
 def validate_e5_date_source_link(
@@ -74,7 +113,8 @@ def validate_e5_denial_receipt(
     honcho_row: Any,
 ) -> str:
     """Resolve a denial append from its Camera receipt and matching Honcho row."""
-    metadata = getattr(honcho_row, "metadata", None)
+    metadata = honcho_row.get("metadata") if isinstance(honcho_row, Mapping) else None
+    row_id = honcho_row.get("id") if isinstance(honcho_row, Mapping) else None
     event_id = correction_commit.get("event_id")
     source_id = correction_commit.get("source_message_id")
     client_op_id = correction_commit.get("client_op_id")
@@ -91,7 +131,7 @@ def validate_e5_denial_receipt(
         or correction_commit.get("target_event_id") != original_event_id
         or correction_commit.get("target_source_message_id") != original_source_id
         or (outbound_event_id is not None and outbound_event_id != event_id)
-        or getattr(honcho_row, "id", None) != event_id
+        or row_id != event_id
         or not isinstance(original_source_id, str) or not original_source_id
         or not isinstance(metadata, Mapping)
         or metadata.get("source_message_id") != source_id

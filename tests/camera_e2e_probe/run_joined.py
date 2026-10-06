@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import json
 import logging
 import os
 import sys
@@ -49,6 +48,8 @@ from camera_runtime_support import (  # noqa: E402
     OfflineTelegramBot,
     OfflineCameraUserApi,
     camera_typed_reply_mode,
+    assert_e5_raw_honcho_row_unchanged,
+    e5_raw_honcho_row_fingerprint,
     run_camera_runtime_trajectory,
     validate_e5_date_source_link,
     validate_e5_denial_receipt,
@@ -301,13 +302,16 @@ async def verify_e5_corrections(
 ) -> None:
     """Join real runtime correction IDs to Honcho and the reopened Rocks projection."""
     async with HonchoClient(url, "local-auth-disabled", workspace) as client:
-        rows = await client.list_recent_message_metadata(
+        rows = await client.list_messages_in_window(
             session, expected_peer_id="ohmo", since=started - timedelta(minutes=1),
             until=datetime.now(timezone.utc) + timedelta(minutes=1),
         )
     events = []
     for row in rows:
-        trace = row.metadata.get("decision_trace")
+        metadata = row.get("metadata")
+        if not isinstance(metadata, dict):
+            raise AssertionError("E5 raw Honcho row has no persisted metadata object")
+        trace = metadata.get("decision_trace")
         nutrition = trace.get("annotations", {}).get("nutrition") if isinstance(trace, dict) else None
         if isinstance(nutrition, dict) and nutrition.get("record_type") in {
             "meal_observation", "meal_correction"
@@ -316,40 +320,40 @@ async def verify_e5_corrections(
     observations = [(row, ann) for row, ann in events if ann["record_type"] == "meal_observation"]
     corrections = [(row, ann) for row, ann in events if ann["record_type"] == "meal_correction"]
     validate_e5_unique_original_event_ids(
-        observed_event_ids=[row.id for row, _ in observations],
+        observed_event_ids=[row["id"] for row, _ in observations],
         expected_original_event_id=original_event_id,
     )
-    if [row.id for row, _ in corrections] != correction_event_ids:
+    if [row["id"] for row, _ in corrections] != correction_event_ids:
         raise AssertionError("E5 correction IDs differ between runtime receipts and full Honcho read")
     original, original_ann = observations[0]
-    observed_original_fingerprint = hashlib.sha256(json.dumps(
-        {
-            "id": original.id,
-            "content": original.content,
-            "metadata": original.metadata,
-            "created_at": original.created_at,
-        },
-        sort_keys=True, default=str, separators=(",", ":"),
-    ).encode("utf-8")).hexdigest()
+    observed_original_fingerprint = e5_raw_honcho_row_fingerprint(original)
     if observed_original_fingerprint != expected_original_fingerprint:
         raise AssertionError("E5 producer/replay changed the immutable original Honcho row")
-    if original.metadata.get("camera_candidate_id") != candidate_id:
+    original_metadata = original.get("metadata")
+    if not isinstance(original_metadata, dict) or original_metadata.get("camera_candidate_id") != candidate_id:
         raise AssertionError("E5 original observation is not bound to this Camera candidate")
     (portion, portion_ann), (date_event, date_ann), (denial, denial_ann) = corrections
+    portion_metadata = portion.get("metadata")
+    date_metadata = date_event.get("metadata")
+    denial_metadata = denial.get("metadata")
+    if not all(isinstance(metadata, dict) for metadata in (
+        portion_metadata, date_metadata, denial_metadata,
+    )):
+        raise AssertionError("E5 raw Honcho correction row has no persisted metadata")
     if (
-        portion.metadata.get("camera_original_event_id") != original_event_id
-        or portion.metadata.get("camera_candidate_id") != candidate_id
+        portion_metadata.get("camera_original_event_id") != original_event_id
+        or portion_metadata.get("camera_candidate_id") != candidate_id
         or not portion_ann_check(portion_ann)
     ):
         raise AssertionError("E5 portion correction does not target the immutable original event")
     validate_e5_date_source_link(
-        date_metadata=date_event.metadata,
-        original_metadata=original.metadata,
+        date_metadata=date_metadata,
+        original_metadata=original_metadata,
         expected_date_source_id=expected_date_source_id,
     )
     if (
-        denial.metadata.get("camera_original_event_id") != original_event_id
-        or denial.metadata.get("camera_candidate_id") != candidate_id
+        denial_metadata.get("camera_original_event_id") != original_event_id
+        or denial_metadata.get("camera_candidate_id") != candidate_id
         or denial_ann["consumption_status"] != "not_consumed"
         or "consumption_status" not in denial_ann["changed_fields"]
     ):
@@ -367,8 +371,8 @@ async def verify_e5_corrections(
     if original_ann.get("meal_at") != expected_capture_time.isoformat() or original_ann.get("meal_date"):
         raise AssertionError("E5 corrections rewrote the immutable original capture time")
     print(
-        f"PASS E5 Honcho IDs original={original_event_id} portion={portion.id} "
-        f"date={date_event.id} denial={denial.id}; explicit_meal_at={expected_meal_at.isoformat()}",
+        f"PASS E5 Honcho IDs original={original_event_id} portion={portion['id']} "
+        f"date={date_event['id']} denial={denial['id']}; explicit_meal_at={expected_meal_at.isoformat()}",
         flush=True,
     )
 
@@ -1342,20 +1346,17 @@ async def main() -> None:
                 from test_camera_ingress import _native_callback
 
                 async with RuntimeHonchoClient(honcho_url, "local-auth-disabled", workspace) as honcho:
-                    before_rows = await honcho.list_recent_message_metadata(
+                    before_rows = await honcho.list_messages_in_window(
                         session, expected_peer_id="ohmo", since=trajectory_started - timedelta(minutes=1),
                         until=datetime.now(timezone.utc) + timedelta(minutes=1),
                     )
-                before_original = next(row for row in before_rows if row.id == immutable_commit["event_id"])
-                original_row_fingerprint = hashlib.sha256(json.dumps(
-                    {
-                        "id": before_original.id,
-                        "content": before_original.content,
-                        "metadata": before_original.metadata,
-                        "created_at": before_original.created_at,
-                    },
-                    sort_keys=True, default=str, separators=(",", ":"),
-                ).encode("utf-8")).hexdigest()
+                before_original = next(
+                    row for row in before_rows if row.get("id") == immutable_commit["event_id"]
+                )
+                original_metadata = before_original.get("metadata")
+                if not isinstance(original_metadata, dict):
+                    raise AssertionError("E5 original raw Honcho row has no persisted metadata")
+                original_row_fingerprint = e5_raw_honcho_row_fingerprint(before_original)
                 api = bot_client
                 correction = {
                     "schema_version": 2, "record_type": "meal_correction",
@@ -1582,13 +1583,13 @@ async def main() -> None:
                 ):
                     raise AssertionError("E5 admitted denial did not produce a matching Camera correction receipt")
                 async with RuntimeHonchoClient(honcho_url, "local-auth-disabled", workspace) as honcho:
-                    denial_rows = await honcho.list_recent_message_metadata(
+                    denial_rows = await honcho.list_messages_in_window(
                         session, expected_peer_id="ohmo",
                         since=trajectory_started - timedelta(minutes=1),
                         until=datetime.now(timezone.utc) + timedelta(minutes=1),
                     )
                 denial_row_matches = [
-                    row for row in denial_rows if row.id == denial_commit.get("event_id")
+                    row for row in denial_rows if row.get("id") == denial_commit.get("event_id")
                 ]
                 if len(denial_row_matches) != 1:
                     raise AssertionError("E5 denial Camera receipt has no unique actual Honcho row")
@@ -1597,7 +1598,7 @@ async def main() -> None:
                     outbound_event_id=denial_outbound_event_id,
                     candidate_id=active_candidate_id,
                     original_event_id=immutable_commit["event_id"],
-                    original_metadata=before_original.metadata,
+                    original_metadata=original_metadata,
                     honcho_row=denial_row_matches[0],
                 )
                 denial_stage = await verify_e5_projection_stage(
@@ -1610,7 +1611,10 @@ async def main() -> None:
                 def nutrition_event_rows(rows):
                     result = []
                     for row in rows:
-                        trace = row.metadata.get("decision_trace")
+                        metadata = row.get("metadata")
+                        if not isinstance(metadata, dict):
+                            raise AssertionError("E5 replay raw Honcho row has no metadata")
+                        trace = metadata.get("decision_trace")
                         nutrition = (
                             trace.get("annotations", {}).get("nutrition")
                             if isinstance(trace, dict) else None
@@ -1618,11 +1622,14 @@ async def main() -> None:
                         if isinstance(nutrition, dict) and nutrition.get("record_type") in {
                             "meal_observation", "meal_correction"
                         }:
-                            result.append((row.id, row.content, row.metadata, row.created_at))
+                            result.append((
+                                row.get("id"), row.get("content"), metadata,
+                                row.get("created_at"),
+                            ))
                     return result
 
                 async with RuntimeHonchoClient(honcho_url, "local-auth-disabled", workspace) as honcho:
-                    before_replay_rows = await honcho.list_recent_message_metadata(
+                    before_replay_rows = await honcho.list_messages_in_window(
                         session, expected_peer_id="ohmo",
                         since=trajectory_started - timedelta(minutes=1),
                         until=datetime.now(timezone.utc) + timedelta(minutes=1),
@@ -1667,17 +1674,14 @@ async def main() -> None:
                 if api._queued_correction is not None:
                     raise AssertionError("E5 runtime did not consume a queued correction through its model turn")
                 async with RuntimeHonchoClient(honcho_url, "local-auth-disabled", workspace) as honcho:
-                    after_rows = await honcho.list_recent_message_metadata(
+                    after_rows = await honcho.list_messages_in_window(
                         session, expected_peer_id="ohmo", since=trajectory_started - timedelta(minutes=1),
                         until=datetime.now(timezone.utc) + timedelta(minutes=1),
                     )
-                after_original = next(row for row in after_rows if row.id == immutable_commit["event_id"])
-                if (
-                    before_original.content != after_original.content
-                    or before_original.metadata != after_original.metadata
-                    or before_original.created_at != after_original.created_at
-                ):
-                    raise AssertionError("E5 correction rewrote original Honcho observation bytes/fields")
+                after_original = next(
+                    row for row in after_rows if row.get("id") == immutable_commit["event_id"]
+                )
+                assert_e5_raw_honcho_row_unchanged(before_original, after_original)
                 if nutrition_event_rows(after_rows) != before_replay_nutrition_rows:
                     raise AssertionError("E5 denial replay duplicated or changed a durable nutrition event")
                 return {

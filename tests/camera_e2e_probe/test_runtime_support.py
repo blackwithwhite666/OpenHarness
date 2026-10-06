@@ -1,10 +1,15 @@
 from __future__ import annotations
 
-import pytest
+from datetime import datetime, timezone
 from types import SimpleNamespace
+
+import httpx
+import pytest
 
 from camera_runtime_support import (
     OfflineCameraBotApi,
+    assert_e5_raw_honcho_row_unchanged,
+    e5_raw_honcho_row_fingerprint,
     isolated_runtime_loaders,
     validate_e5_date_source_link,
     validate_e5_denial_receipt,
@@ -68,6 +73,75 @@ def test_e5_date_source_does_not_pass_when_original_event_is_missing_or_ambiguou
         )
 
 
+@pytest.mark.asyncio
+async def test_e5_immutability_uses_the_full_raw_honcho_reader_shape():
+    from ohmo.memory_service.honcho_client import HonchoClient
+
+    created_at = "2026-10-06T12:00:00+00:00"
+    persisted_row = {
+        "id": "original-meal-1",
+        "peer_id": "ohmo",
+        "session_id": "session-owner-123",
+        "workspace_id": "workspace-1",
+        "created_at": created_at,
+        "content": "Persisted assistant meal text",
+        "metadata": {
+            "gateway_session_id": "session-owner-123",
+            "source_message_id": "77",
+            "decision_trace": {"annotations": {"nutrition": {
+                "record_type": "meal_observation",
+                "consumption_status": "consumed",
+                "energy_kcal_best": 125,
+            }}},
+        },
+    }
+
+    def handler(request):
+        assert request.url.path.endswith("sessions/session-owner-123/messages/list")
+        page = int(request.url.params["page"])
+        size = int(request.url.params["size"])
+        return httpx.Response(200, json={
+            "items": [persisted_row], "page": page, "size": size, "pages": 1, "total": 1,
+        })
+
+    since = datetime(2026, 10, 6, 11, tzinfo=timezone.utc)
+    until = datetime(2026, 10, 6, 13, tzinfo=timezone.utc)
+    client = HonchoClient(
+        "https://honcho.fixture", "synthetic-token", "workspace-1",
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        metadata_rows = await client.list_recent_message_metadata(
+            "session-owner-123", expected_peer_id="ohmo", since=since, until=until,
+        )
+        assert len(metadata_rows) == 1
+        assert not hasattr(metadata_rows[0], "content")
+
+        raw_rows = await client.list_messages_in_window(
+            "session-owner-123", expected_peer_id="ohmo", since=since, until=until,
+        )
+    finally:
+        await client.aclose()
+
+    assert len(raw_rows) == 1
+    assert raw_rows[0] == persisted_row
+    assert raw_rows[0]["content"] == "Persisted assistant meal text"
+    assert raw_rows[0]["metadata"] == persisted_row["metadata"]
+    assert raw_rows[0]["created_at"] == created_at
+    assert e5_raw_honcho_row_fingerprint(raw_rows[0]) == e5_raw_honcho_row_fingerprint(
+        dict(raw_rows[0])
+    )
+    for changed_field, changed_value in (
+        ("content", "changed persisted content"),
+        ("metadata", {"source_message_id": "different"}),
+        ("created_at", "2026-10-06T12:00:01+00:00"),
+    ):
+        changed = dict(raw_rows[0])
+        changed[changed_field] = changed_value
+        with pytest.raises(AssertionError, match="immutable original raw Honcho row"):
+            assert_e5_raw_honcho_row_unchanged(raw_rows[0], changed)
+
+
 @pytest.mark.parametrize(
     ("override", "missing"),
     [
@@ -128,7 +202,15 @@ def _e5_denial_fixture():
             "energy_kcal_best": 0,
         }}},
     }
-    row = SimpleNamespace(id="assistant-denial-8", metadata=metadata)
+    row = {
+        "id": "assistant-denial-8",
+        "peer_id": "ohmo",
+        "session_id": "session-owner-123",
+        "workspace_id": "workspace-1",
+        "created_at": "2026-10-06T12:01:00+00:00",
+        "content": "Persisted denial correction",
+        "metadata": metadata,
+    }
     return original, commit, row
 
 
@@ -173,7 +255,7 @@ def test_e5_denial_receipt_rejects_mismatched_commit_or_honcho_row(
 ):
     original, commit, row = _e5_denial_fixture()
     commit.update(commit_override)
-    row.metadata.update(metadata_override)
+    row["metadata"].update(metadata_override)
 
     with pytest.raises(AssertionError, match="durable Honcho correction"):
         validate_e5_denial_receipt(
