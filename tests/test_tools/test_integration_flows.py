@@ -171,6 +171,12 @@ async def test_agent_send_message_flow_restarts_completed_agent(tmp_path: Path, 
     else:
         raise AssertionError("initial agent output did not become available in time")
 
+    # Stdout is visible before the one-shot child exits; wait for the named
+    # completed-agent contract before sending the follow-up.
+    await _wait_for_terminal_task(task_id)
+    send_status = get_task_manager().get_task(task_id).status
+    assert send_status == "completed", f"controlled send boundary status={send_status}"
+
     send_result = await send_message.execute(
         send_message.input_model(task_id=task_id, message="agent ping"),
         context,
