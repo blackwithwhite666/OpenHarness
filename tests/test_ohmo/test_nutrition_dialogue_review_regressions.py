@@ -40,12 +40,13 @@ class _ScriptedEngine:
         self.messages = []
         self.load_attachment_ids = []
         self.loaded_results = []
+        self.system_prompt = ""
 
     def set_decision_trace_recorder(self, recorder):
         self.decision_trace_recorder = recorder
 
-    def set_system_prompt(self, _prompt):
-        pass
+    def set_system_prompt(self, prompt):
+        self.system_prompt = prompt
 
     async def submit_message(self, user_message):
         self.messages.append(user_message)

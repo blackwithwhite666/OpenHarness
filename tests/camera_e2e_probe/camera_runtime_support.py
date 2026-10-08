@@ -28,6 +28,7 @@ SYNTHETIC_OPTIONS = (
     "Нет, не ел(а)",
     "Это не еда",
 )
+SYNTHETIC_WHOLE_PORTION = "Всю порцию"
 
 
 def e5_raw_honcho_row_fingerprint(row: Mapping[str, Any]) -> str:
@@ -165,11 +166,12 @@ def validate_e5_post_correction_replay(
     *, status: str | None, delivery_receipt: Any, event_id: str | None,
     expected_event_id: str, original_commit: Mapping[str, Any],
     current_commit: Mapping[str, Any] | None,
+    required_phrase: str | None = "исправление уже записано",
 ) -> str:
     """Require replay to report the latest correction without replacing the meal."""
     if (
         not isinstance(status, str)
-        or "исправление уже записано" not in status.casefold()
+        or (required_phrase is not None and required_phrase.casefold() not in status.casefold())
         or delivery_receipt is None
         or not isinstance(expected_event_id, str) or not expected_event_id
         or event_id != expected_event_id
@@ -225,10 +227,11 @@ class OfflineCameraBotApi:
 
     synthetic = True
 
-    def __init__(self) -> None:
+    def __init__(self, *, context_items_date: bool = False) -> None:
         self.calls = 0
         self.finalization_proposals = 0
         self._queued_correction: dict[str, Any] | None = None
+        self.context_items_date = context_items_date
 
     def queue_correction(self, nutrition: dict[str, Any]) -> None:
         """Queue one synthetic trace for the next real runtime correction turn."""
@@ -261,7 +264,10 @@ class OfflineCameraBotApi:
             for message in request.messages[owner_turn_index + 1 :]
             for block in message.content
         )
-        owner_confirmed = owner_turn is not None and SYNTHETIC_BUTTON_LABEL in owner_turn.text
+        accepted_labels = (SYNTHETIC_BUTTON_LABEL, SYNTHETIC_WHOLE_PORTION)
+        owner_confirmed = owner_turn is not None and any(
+            label in owner_turn.text for label in accepted_labels
+        )
         if self._queued_correction is not None and not tool_result_seen:
             nutrition = self._queued_correction
             self._queued_correction = None
@@ -320,8 +326,8 @@ class OfflineCameraBotApi:
                                         "energy_kcal_best": SYNTHETIC_KCAL,
                                         "items": [
                                             {
-                                                "name": "synthetic apple",
-                                                "quantity_text": "1 medium apple (fixture)",
+                                        "name": "rice" if self.context_items_date else "synthetic apple",
+                                        "quantity_text": "100 g" if self.context_items_date else "1 medium apple (fixture)",
                                                 "energy_kcal_best": SYNTHETIC_KCAL,
                                             }
                                         ],
@@ -343,9 +349,15 @@ class OfflineCameraBotApi:
                     TextBlock(
                         text=(
                             "Synthetic offline Camera photo received. "
-                            "[[ask: Did you eat the pictured synthetic item? | "
-                            + " | ".join(SYNTHETIC_OPTIONS)
-                            + "]]"
+                            + (
+                                "[[ask: Сколько риса вы съели? | "
+                                + " | ".join((SYNTHETIC_WHOLE_PORTION, "Половину порции", "Не ел(а)"))
+                                + "]]"
+                                if self.context_items_date
+                                else "[[ask: Did you eat the pictured synthetic item? | "
+                                + " | ".join(SYNTHETIC_OPTIONS)
+                                + "]]"
+                            )
                         )
                     )
                 ],
@@ -497,9 +509,14 @@ class OfflineTelegramBot:
         self.calls.append(("send_chat_action", kwargs))
 
 
-def distinct_offline_clients():
+def distinct_offline_clients(*, context_items_date: bool = False):
     """Create distinct bot/user fake clients for the explicit offline mode."""
-    return OfflineCameraBotApi(), OfflineCameraUserApi()
+    return (
+        OfflineCameraBotApi(context_items_date=context_items_date),
+        OfflineCameraUserApi(
+            SYNTHETIC_WHOLE_PORTION if context_items_date else SYNTHETIC_BUTTON_LABEL
+        ),
+    )
 
 
 def camera_runtime_limits(*, native_mode: bool) -> tuple[int, str]:
@@ -990,7 +1007,8 @@ async def run_camera_runtime_trajectory(
         after_save_result = None
         if after_save is not None:
             after_save_result = await after_save(
-                process_and_deliver, ingress, pool, candidate_id, answer, commit
+                process_and_deliver, ingress, pool, candidate_id, answer, commit,
+                restart_runtime_and_camera,
             )
 
         if restart_before_replay:
@@ -1040,6 +1058,7 @@ async def run_camera_runtime_trajectory(
                 expected_event_id=latest_replay.get("expected_event_id"),
                 original_commit=commit,
                 current_commit=ingress._attempts[candidate_id].get("camera_commit"),
+                required_phrase=latest_replay.get("required_phrase", "исправление уже записано"),
             )
         else:
             replay = await replay_callback()

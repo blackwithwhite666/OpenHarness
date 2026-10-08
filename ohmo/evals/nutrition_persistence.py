@@ -13,6 +13,7 @@ import os
 import sqlite3
 import argparse
 import asyncio
+import re
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Literal
@@ -29,6 +30,21 @@ from openharness.utils.fs import atomic_write_text
 MAX_GOALS = 100
 MAX_MESSAGES = 20_000
 MAX_EPISODES = 500
+
+
+class ExpectedItemQuantity(BaseModel):
+    """One explicitly reviewed item quantity, independent of kcal estimation."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=1, max_length=120)
+    quantity_text: str = Field(min_length=1, max_length=120)
+
+    @model_validator(mode="after")
+    def _bounded_text(self) -> "ExpectedItemQuantity":
+        if not self.name.strip() or not self.quantity_text.strip():
+            raise ValueError("reviewed item name and quantity must be non-empty")
+        return self
 
 
 class Goal(BaseModel):
@@ -56,6 +72,10 @@ class Goal(BaseModel):
     canonical_meal_id: str = Field(min_length=1, max_length=512)
     expected_consumed: bool = Field(strict=True)
     expected_kcal: float | None = Field(default=None, strict=True)
+    expected_items: list[str] | None = Field(default=None, min_length=1, max_length=16)
+    expected_item_quantities: list["ExpectedItemQuantity"] | None = Field(
+        default=None, min_length=1, max_length=16
+    )
     tolerance_fraction: float = Field(default=0.30, ge=0, le=0.30, strict=True)
     expectation_origin: Literal["explicit_fixture", "reviewed_user_dialogue", "frozen_photo_reference"]
     expectation_source: str = Field(min_length=1, max_length=512)
@@ -86,6 +106,16 @@ class Goal(BaseModel):
                 raise ValueError("consumed goal requires finite non-negative expected_kcal")
         elif self.expected_kcal is not None:
             raise ValueError("absence goal must omit expected_kcal")
+        if self.expected_items is not None:
+            if any(not isinstance(item, str) or not item.strip() or len(item) > 120
+                   for item in self.expected_items):
+                raise ValueError("expected_items must contain bounded non-empty item names")
+            if len({item.strip().casefold() for item in self.expected_items}) != len(self.expected_items):
+                raise ValueError("expected_items must be unique")
+        if self.expected_item_quantities is not None and len({
+            item.name.strip().casefold() for item in self.expected_item_quantities
+        }) != len(self.expected_item_quantities):
+            raise ValueError("expected_item_quantities must have unique item names")
         if len(set(self.episode_ids)) != len(self.episode_ids):
             raise ValueError("episode_ids must be unique")
         if self.trace_episode_id not in self.episode_ids:
@@ -232,31 +262,79 @@ def _trusted_context_target(goal: Goal, event: dict[str, Any], turns: list[dict[
               "consumed_source_message_id", "target_meal_id", "original_receipt_event_id",
               "original_operation_id", "current_receipt_event_id", "current_operation_id",
               "current_logical_turn_id", "current_trace_episode_id")
-    if (evidence is None or type(evidence.get("schema_version")) is not int
-            or evidence.get("schema_version") != 1
-            or any(not isinstance(evidence.get(key), str) or not evidence[key] for key in fields)
-            or evidence.get("tenant_id") != goal.owner_id
-            or evidence.get("source_principal") != goal.principal_id
-            or evidence.get("gateway_session_id") != goal.gateway_session_id
-            or evidence.get("current_receipt_event_id") != event.get("event_id")
-            or evidence.get("current_operation_id") != event.get("operation_id")
-            or evidence.get("current_logical_turn_id") != event.get("logical_turn_id")
-            or evidence.get("current_trace_episode_id") != event.get("trace_episode_id")
-            or final.get("nutrition_append_event_id") != event.get("event_id")
-            or execution is None or type(execution.get("schema_version")) is not int
-            or execution.get("schema_version") != 1
-            or committed_annotation is None or proposed_annotation is None
-            or executed_annotation is None
-            or executed_annotation.get("record_type") not in {"meal_correction", "meal_deletion"}
-            or committed_annotation != event.get("annotation")
-            or executed_annotation != proposed_annotation
-            or type(proposal_matches) is not bool
-            or proposal_matches is not (proposed_annotation == committed_annotation)):
+    selected_source = _dict(event.get("metadata", {}).get("selected_source"))
+    legacy_same_session = bool(
+        selected_source is not None
+        and type(selected_source.get("schema_version")) is int
+        and selected_source.get("schema_version") == 1
+    )
+    evidence_checks = [
+        ("evidence", evidence is not None),
+        ("schema", evidence is not None and type(evidence.get("schema_version")) is int and evidence.get("schema_version") == 1),
+        ("fields", evidence is not None and all(isinstance(evidence.get(key), str) and evidence[key] for key in fields)),
+        ("tenant", evidence is not None and evidence.get("tenant_id") == goal.owner_id),
+        ("principal", evidence is not None and evidence.get("source_principal") == goal.principal_id),
+        ("gateway_session", evidence is not None and evidence.get("gateway_session_id") == goal.gateway_session_id),
+        ("current_session", evidence is not None and (
+            evidence.get("current_gateway_session_id") == event.get("gateway_session_id")
+            if not legacy_same_session else event.get("gateway_session_id") == goal.gateway_session_id
+        )),
+        ("current_source", evidence is not None and (
+            evidence.get("current_source_message_id") == event.get("source_message_id")
+            if not legacy_same_session else isinstance(event.get("source_message_id"), str)
+            and bool(event.get("source_message_id"))
+        )),
+        ("current_receipt", evidence is not None and evidence.get("current_receipt_event_id") == event.get("event_id")),
+        ("current_operation", evidence is not None and evidence.get("current_operation_id") == event.get("operation_id")),
+        ("current_logical", evidence is not None and evidence.get("current_logical_turn_id") == event.get("logical_turn_id")),
+        ("current_episode", evidence is not None and evidence.get("current_trace_episode_id") == event.get("trace_episode_id")),
+        ("append_receipt", isinstance(final, dict) and final.get("nutrition_append_event_id") == event.get("event_id")),
+        ("execution", execution is not None and type(execution.get("schema_version")) is int and execution.get("schema_version") == 1),
+        ("annotations", committed_annotation is not None and proposed_annotation is not None and executed_annotation is not None),
+        ("record_type", executed_annotation is not None and executed_annotation.get("record_type") in {"meal_correction", "meal_deletion"}),
+        ("committed", committed_annotation == event.get("annotation")),
+        ("proposed", executed_annotation == proposed_annotation),
+        ("proposal_matches", type(proposal_matches) is bool and proposal_matches is (proposed_annotation == committed_annotation)),
+    ]
+    if not all(passed for _name, passed in evidence_checks):
         return None
     original_rows = [item for item in events if item.get("event_id") == evidence["original_receipt_event_id"]]
     if len(original_rows) != 1:
         return None
     original = original_rows[0]
+    if (
+        selected_source is None
+        or selected_source.get("tenant_id") != goal.owner_id
+        or selected_source.get("source_principal") != goal.principal_id
+        or selected_source.get("gateway_session_id") != goal.gateway_session_id
+        or selected_source.get("source_message_id") != evidence.get("photo_source_message_id")
+        or selected_source.get("is_private") is not True
+        or selected_source.get("is_forwarded") is not False
+        or selected_source.get("is_group") is not False
+    ):
+        return None
+    if type(selected_source.get("schema_version")) is int and selected_source["schema_version"] == 2:
+        if (
+            set(selected_source) != {
+                "schema_version", "tenant_id", "source_principal", "gateway_session_id",
+                "source_message_id", "append_source_message_id", "is_private",
+                "is_forwarded", "is_group", "original_receipt_event_id",
+                "original_receipt_client_op_id",
+            }
+            or selected_source.get("source_message_id") != goal.source_message_id
+            or selected_source.get("append_source_message_id") != goal.source_message_id
+            or selected_source.get("original_receipt_event_id") != evidence.get("original_receipt_event_id")
+            or selected_source.get("original_receipt_client_op_id") != evidence.get("original_operation_id")
+            or original.get("event_id") != selected_source.get("original_receipt_event_id")
+            or original.get("operation_id") != selected_source.get("original_receipt_client_op_id")
+            or original.get("principal_id") != goal.principal_id
+            or original.get("owner_id") != goal.owner_id
+            or original.get("gateway_session_id") != goal.gateway_session_id
+            or original.get("source_message_id") != goal.source_message_id
+        ):
+            return None
+    elif not _same_session_v1_selected_source(goal, event, evidence, selected_source):
+        return None
     try:
         _parse_time(evidence["photo_received_at"])
     except (TypeError, ValueError):
@@ -310,6 +388,32 @@ def _trusted_context_target(goal: Goal, event: dict[str, Any], turns: list[dict[
             ):
         return None
     return evidence["consumed_source_message_id"]
+
+
+def _same_session_v1_selected_source(
+    goal: Goal, event: dict[str, Any], evidence: dict[str, Any],
+    selected_source: dict[str, Any],
+) -> bool:
+    """Retain legacy attachment selection only under its original-session receipt proof."""
+    checks = {
+        "schema": type(selected_source.get("schema_version")) is int
+        and selected_source.get("schema_version") == 1,
+        "keys": set(selected_source) == {
+            "schema_version", "tenant_id", "source_principal", "gateway_session_id",
+            "source_message_id", "append_source_message_id", "is_private",
+            "is_forwarded", "is_group",
+        },
+        "evidence_session": evidence.get("gateway_session_id") == goal.gateway_session_id,
+        "event_session": event.get("gateway_session_id") == goal.gateway_session_id,
+        "tenant": selected_source.get("tenant_id") == goal.owner_id,
+        "principal": selected_source.get("source_principal") == goal.principal_id,
+        "source_session": selected_source.get("gateway_session_id") == goal.gateway_session_id,
+        "photo_source": selected_source.get("source_message_id") == evidence.get("photo_source_message_id"),
+        "private": selected_source.get("is_private") is True,
+        "forwarded": selected_source.get("is_forwarded") is False,
+        "is_group": selected_source.get("is_group") is False,
+    }
+    return all(checks.values())
 
 
 def _is_receipt_reconciled_retry(goal: Goal, event: dict[str, Any], turn: dict[str, Any],
@@ -692,9 +796,31 @@ def _grade_one(goal: Goal, honcho: dict[str, Any], telegent: dict[str, Any], *, 
             context_evidence = context_metadata["nutrition_context_evidence"]
             selected_source = _dict(metadata.get("selected_source"))
             persisted_target = metadata.get("target_meal_id")
+            selected_schema = selected_source.get("schema_version") if selected_source else None
+            selected_v2_valid = bool(
+                selected_source is not None
+                and type(selected_schema) is int and selected_schema == 2
+                and set(selected_source) == {
+                    "schema_version", "tenant_id", "source_principal", "gateway_session_id",
+                    "source_message_id", "append_source_message_id", "is_private",
+                    "is_forwarded", "is_group", "original_receipt_event_id",
+                    "original_receipt_client_op_id",
+                }
+                and selected_source.get("source_message_id") == goal.source_message_id
+                and selected_source.get("append_source_message_id") == goal.source_message_id
+                and selected_source.get("original_receipt_event_id")
+                == context_evidence.get("original_receipt_event_id")
+                and selected_source.get("original_receipt_client_op_id")
+                == context_evidence.get("original_operation_id")
+            )
+            selected_v1_valid = bool(
+                selected_source is not None
+                and _same_session_v1_selected_source(
+                    goal, event, context_evidence, selected_source
+                )
+            )
             if (selected_source is None or not isinstance(persisted_target, str) or not persisted_target
-                    or type(selected_source.get("schema_version")) is not int
-                    or selected_source.get("schema_version") != 1
+                    or not (selected_v1_valid or selected_v2_valid)
                     or selected_source.get("tenant_id") != goal.owner_id
                     or selected_source.get("source_principal") != goal.principal_id
                     or selected_source.get("gateway_session_id") != goal.gateway_session_id
@@ -706,6 +832,12 @@ def _grade_one(goal: Goal, honcho: dict[str, Any], telegent: dict[str, Any], *, 
             if selected_source.get("source_message_id") != context_evidence.get("photo_source_message_id"):
                 return {**base, "a1": "INCONCLUSIVE", "stage": "HONCHO_SOURCE_MISMATCH",
                         "reason": "persisted photo identity conflicts with the independently receipt-proven occurrence"}
+            if (selected_schema == 2 and (selected_source.get("original_receipt_event_id")
+                    != context_evidence.get("original_receipt_event_id")
+                    or selected_source.get("original_receipt_client_op_id")
+                    != context_evidence.get("original_operation_id"))):
+                return {**base, "a1": "INCONCLUSIVE", "stage": "HONCHO_TARGET_UNAVAILABLE",
+                        "reason": "selected source lacks the exact original receipt identity"}
             expected_target_meal_id = derive_meal_id(
                 tenant_id=goal.owner_id, source_principal=goal.principal_id,
                 gateway_session_id=goal.gateway_session_id, source_message_id=contextual_target)
@@ -752,7 +884,8 @@ def _grade_one(goal: Goal, honcho: dict[str, Any], telegent: dict[str, Any], *, 
                 return {**base, "a1": "INCONCLUSIVE", "stage": "HONCHO_TURN_BINDING_MISMATCH",
                         "reason": "goal-linked initial Camera context has contradictory identity"}
             continue
-        if (metadata.get("gateway_session_id") not in (None, goal.gateway_session_id)):
+        if (metadata.get("gateway_session_id") not in (None, goal.gateway_session_id)
+                and contextual_target is None):
             return {**base, "a1": "INCONCLUSIVE", "stage": "HONCHO_SCOPE_MISMATCH",
                     "reason": "goal-relevant persisted message has a different gateway session"}
         relevant_principal = (metadata.get("source_principal") if event.get("unannotated")
@@ -858,7 +991,7 @@ def _grade_one(goal: Goal, honcho: dict[str, Any], telegent: dict[str, Any], *, 
                 and contextual_target != goal.source_message_id):
             continue
         if (event["owner_id"] != goal.owner_id or event["session_id"] != goal.session_id
-                or event["gateway_session_id"] != goal.gateway_session_id
+                or (event["gateway_session_id"] != goal.gateway_session_id and contextual_target is None)
                 or event["workspace_id"] != goal.workspace_id or event["principal_id"] != goal.principal_id
                 or event["peer_id"] != goal.peer_id or event["trace_episode_id"] not in goal.episode_ids
                 or event["nested_trace_episode_id"] != event["trace_episode_id"]
@@ -881,7 +1014,9 @@ def _grade_one(goal: Goal, honcho: dict[str, Any], telegent: dict[str, Any], *, 
                                   if turn.get("source_message_id") == event["source_message_id"]), None)
             if (expected_turn is None or expected_turn.get("logical_turn_id") != event["logical_turn_id"]
                     or expected_turn.get("operation_id") != event["operation_id"]
-                    or expected_turn.get("principal_id") != event["principal_id"]):
+                    or expected_turn.get("principal_id") != event["principal_id"]
+                    or (event["gateway_session_id"] != goal.gateway_session_id
+                        and expected_turn.get("gateway_session_id") != event["gateway_session_id"])):
                 return {**base, "a1": "INCONCLUSIVE", "stage": "HONCHO_TURN_BINDING_MISMATCH",
                         "reason": "persisted turn operation differs from gateway-derived exported identity"}
             camera_context = _dict(expected_turn.get("trusted_camera_context")) or {}
@@ -1025,26 +1160,69 @@ def _grade_one(goal: Goal, honcho: dict[str, Any], telegent: dict[str, Any], *, 
                     "reason": "persisted goal event is projected under a different source or meal edge",
                     "actual_event_ids": [event["event_id"] for event in selected],
                     "actual_latest_event_id": row.get("latest_event_id")}
+    state_failures = []
     if selected and effective["meal_date"] != goal.meal_date.isoformat():
-        return {**base, "a1": "FAIL", "stage": "HONCHO_GOAL_MISMATCH",
-                "reason": "effective persisted meal date differs from reviewed goal",
-                "actual_event_ids": [event["event_id"] for event in selected],
-                "actual_kcal": effective["energy_kcal_best"]}
+        state_failures.append("meal_date")
     if effective["consumed"] != goal.expected_consumed:
-        return {**base, "a1": "FAIL", "stage": "HONCHO_GOAL_MISMATCH",
-                "reason": "effective persisted consumption state differs from reviewed goal",
-                "actual_event_ids": [event["event_id"] for event in selected],
-                "actual_kcal": effective["energy_kcal_best"]}
+        state_failures.append("consumption_status")
+    if goal.expected_items is not None and goal.expected_consumed:
+        actual_item_names = [
+            item.get("name", "").strip().casefold()
+            for item in effective.get("items", []) if isinstance(item, dict)
+        ]
+        for expected_item in goal.expected_items:
+            expected_tokens = set(expected_item.strip().casefold().split())
+            if not any(expected_tokens <= set(actual.split()) for actual in actual_item_names):
+                state_failures.append("items")
+                break
+    if goal.expected_item_quantities is not None and goal.expected_consumed:
+        quantity_uncertain = False
+        for expected_item in goal.expected_item_quantities:
+            expected_name = _normalize_item_text(expected_item.name)
+            expected_quantity = _quantity_identity(expected_item.name, expected_item.quantity_text)
+            actual_items = [
+                item for item in effective.get("items", [])
+                if isinstance(item, dict) and _normalize_item_text(item.get("name")) == expected_name
+            ]
+            if not actual_items:
+                state_failures.append("item_quantities")
+                continue
+            actual_quantities = [
+                _quantity_identity(expected_item.name, item.get("quantity_text"))
+                for item in actual_items
+            ]
+            actual_total = _aggregate_quantity_identities(actual_quantities)
+            if expected_quantity is None or actual_total is None:
+                quantity_uncertain = True
+            elif expected_quantity != actual_total:
+                state_failures.append("item_quantities")
+    else:
+        quantity_uncertain = False
     if goal.expected_consumed:
         expected_kcal = goal.expected_kcal
         actual_kcal = effective["energy_kcal_best"]
         if (expected_kcal is None or not isinstance(actual_kcal, (int, float))
                 or isinstance(actual_kcal, bool)
                 or abs(actual_kcal - expected_kcal) > abs(expected_kcal) * goal.tolerance_fraction):
-            return {**base, "a1": "FAIL", "stage": "HONCHO_GOAL_MISMATCH",
-                    "reason": "effective persisted kcal differs from reviewed goal tolerance",
-                    "actual_event_ids": [event["event_id"] for event in selected],
-                    "actual_kcal": actual_kcal}
+            state_failures.append("energy_kcal_best")
+    if state_failures:
+        labels = {
+            "meal_date": "meal date",
+            "consumption_status": "consumption state",
+            "items": "required meal item",
+            "item_quantities": "reviewed item quantity",
+            "energy_kcal_best": "kcal tolerance",
+        }
+        return {
+            **base,
+            "a1": "FAIL",
+            "stage": "HONCHO_GOAL_MISMATCH",
+            "reason": "effective persisted state differs from reviewed goal: "
+            + ", ".join(labels[item] for item in state_failures),
+            "state_failures": state_failures,
+            "actual_event_ids": [event["event_id"] for event in selected],
+            "actual_kcal": effective["energy_kcal_best"],
+        }
 
     # The canonical API identifies only its latest immutable event.
     canonical = telegent.get("meal")
@@ -1070,6 +1248,7 @@ def _grade_one(goal: Goal, honcho: dict[str, Any], telegent: dict[str, Any], *, 
         return {**base, "a1": "FAIL", "stage": "TELEGENT_MISSING", "reason": "persisted meal is absent from canonical read after grace period",
                 "actual_event_ids": [item["event_id"] for item in selected]}
 
+    canonical_quantity_uncertain = False
     try:
         if not isinstance(canonical, dict) or not _valid_canonical_meal(canonical):
             return {**base, "a1": "INCONCLUSIVE", "stage": "CANONICAL_INVALID",
@@ -1128,6 +1307,28 @@ def _grade_one(goal: Goal, honcho: dict[str, Any], telegent: dict[str, Any], *, 
             raise ValueError("canonical consumption state disagrees with persisted current event")
         if consumed and (kcal is None or canonical.get("energy_kcal_best") != kcal):
             raise ValueError("canonical kcal disagrees with persisted current event")
+        if consumed:
+            honcho_items = _normalized_item_composition(effective.get("items"))
+            canonical_items = _normalized_item_composition(canonical.get("items"))
+            if canonical_items != honcho_items:
+                raise ValueError("canonical item composition disagrees with effective persisted source history")
+            if goal.expected_item_quantities is not None:
+                for expected_item in goal.expected_item_quantities:
+                    expected_name = _normalize_item_text(expected_item.name)
+                    expected_quantity = _quantity_identity(
+                        expected_item.name, expected_item.quantity_text
+                    )
+                    canonical_quantities = [
+                        _quantity_identity(expected_item.name, item.get("quantity_text"))
+                        for item in canonical.get("items", [])
+                        if isinstance(item, dict)
+                        and _normalize_item_text(item.get("name")) == expected_name
+                    ]
+                    canonical_total = _aggregate_quantity_identities(canonical_quantities)
+                    if canonical_total is None or expected_quantity is None:
+                        canonical_quantity_uncertain = True
+                    elif expected_quantity != canonical_total:
+                        raise ValueError("canonical item quantity total differs from reviewed source expectation")
         if consumed != goal.expected_consumed:
             raise ValueError("effective current consumption state differs from expected goal")
         if consumed:
@@ -1140,6 +1341,9 @@ def _grade_one(goal: Goal, honcho: dict[str, Any], telegent: dict[str, Any], *, 
                 "actual_event_ids": [item["event_id"] for item in selected],
                 "actual_latest_event_id": canonical.get("latest_event_id") if isinstance(canonical, dict) else None,
                 "actual_kcal": canonical.get("energy_kcal_best") if isinstance(canonical, dict) else None}
+    if quantity_uncertain or canonical_quantity_uncertain:
+        return {**base, "a1": "INCONCLUSIVE", "stage": "HONCHO_QUANTITY_UNRESOLVED",
+                "reason": "persisted item amount cannot be compared with the reviewed quantity"}
     result = {**base, "a1": "PASS", "stage": "SAME_EVENT_PROJECTED",
               "reason": "same validated persisted latest event is current in canonical meal read",
               "actual_event_ids": [item["event_id"] for item in selected],
@@ -1150,6 +1354,84 @@ def _grade_one(goal: Goal, honcho: dict[str, Any], telegent: dict[str, Any], *, 
                   "wellness read does not expose internal index keys or aggregate balance",
                   "one bounded snapshot cannot prove unrelated meal records stayed unchanged"]}
     return result
+
+
+def _normalize_item_text(value: object) -> str:
+    return " ".join(value.split()).casefold() if isinstance(value, str) else ""
+
+
+def _quantity_identity(name: object, quantity: object) -> tuple[str, float] | None:
+    """Normalize a deliberately small set of count and metric unit forms."""
+    if not isinstance(quantity, str) or len(quantity) > 120:
+        return None
+    value = " ".join(quantity.casefold().strip().split())
+    match = re.fullmatch(r"(\d+(?:[.,]\d+)?|one|один|одна|одно|одну)\s*(.*)", value)
+    if match is None:
+        return None
+    number_text, unit_text = match.groups()
+    if number_text in {"one", "один", "одна", "одно", "одну"}:
+        amount = 1.0
+    else:
+        try:
+            amount = float(number_text.replace(",", "."))
+        except ValueError:
+            return None
+    if not math.isfinite(amount) or amount <= 0:
+        return None
+    unit_text = re.sub(r"[.!]$", "", unit_text).strip()
+    item_name = _normalize_item_text(name)
+    count_units = {
+        "", "шт", "штука", "штуки", "штук", "piece", "pieces", "pc", "pcs",
+        "item", "items", "egg", "eggs",
+    }
+    if unit_text in count_units:
+        return ("count", amount)
+    if unit_text in {"g", "г", "грамм", "грамма", "граммов", "grams", "gram"}:
+        return ("g", amount)
+    if unit_text in {"kg", "кг", "килограмм", "килограмма", "килограммов", "kilogram", "kilograms"}:
+        return ("g", amount * 1000)
+    if unit_text in {"ml", "мл", "миллилитр", "миллилитра", "миллилитров", "milliliter", "milliliters"}:
+        return ("ml", amount)
+    if unit_text in {"l", "л", "литр", "литра", "литров", "liter", "liters"}:
+        return ("ml", amount * 1000)
+    if unit_text and (item_name == unit_text or item_name.startswith(unit_text + " ")):
+        return ("count", amount)
+    return None
+
+
+def _aggregate_quantity_identities(
+    quantities: list[tuple[str, float] | None],
+) -> tuple[str, float] | None:
+    """Sum repeated item rows only when every amount has the same known unit."""
+    if not quantities or any(quantity is None for quantity in quantities):
+        return None
+    known = [quantity for quantity in quantities if quantity is not None]
+    units = {unit for unit, _amount in known}
+    if len(units) != 1:
+        return None
+    return known[0][0], sum(amount for _unit, amount in known)
+
+
+def _normalized_item_composition(value: object) -> list[tuple[str, str]]:
+    if not isinstance(value, list):
+        return []
+    return sorted(
+        (
+            _normalize_item_text(item.get("name")),
+            _normalized_quantity_composition(item.get("name"), item.get("quantity_text")),
+        )
+        for item in value if isinstance(item, dict)
+    )
+
+
+def _normalized_quantity_composition(name: object, quantity: object) -> str:
+    """Compare known units semantically and unknown bounded text literally."""
+    identity = _quantity_identity(name, quantity)
+    if identity is not None:
+        return f"known:{identity[0]}:{identity[1]:.12g}"
+    if isinstance(quantity, str) and len(quantity) <= 120:
+        return "unknown:" + " ".join(quantity.casefold().strip().split())
+    return f"invalid:{type(quantity).__name__}:{str(quantity)[:120]}"
 
 
 def _parse_time(value: object) -> datetime:
@@ -1224,6 +1506,79 @@ def _valid_terminal_failure_marker(value: object, episode_id: str) -> bool:
         and type(marker.get("finish_event_id")) is int
         and marker["finish_event_id"] > marker["exception_event_id"]
         and marker.get("status") == "exception"
+    )
+
+
+def _valid_rotated_camera_context_episode(
+    goal: Goal, item: dict[str, Any], episode_id: str,
+) -> bool:
+    """Prove a contextual correction episode against both immutable receipts."""
+    episode = _dict(item.get("episode")) or {}
+    context = _dict(item.get("trusted_camera_context"))
+    turns = item.get("turn_provenance")
+    if not isinstance(turns, list):
+        return False
+    episode_session = episode.get("session_id")
+    if not isinstance(episode_session, str) or not episode_session:
+        return False
+    matching = [
+        turn for turn in turns
+        if isinstance(turn, dict)
+        and turn.get("episode_id") == episode_id
+        and turn.get("source_message_id")
+        and turn.get("logical_turn_id")
+        and turn.get("operation_id")
+        and turn.get("principal_id") == goal.principal_id
+    ]
+    if len(matching) != 1:
+        return False
+    final = _dict(matching[0].get("gateway_final_metadata")) or {}
+    evidence = _dict(final.get("nutrition_context_evidence")) or {}
+    committed = _validated_nutrition_annotation(final.get("nutrition_committed_annotation"))
+    execution = _dict(final.get("nutrition_finalization")) or {}
+    executed = _validated_nutrition_annotation(execution.get("annotation"))
+    receipt = final.get("nutrition_append_event_id")
+    source_id = evidence.get("current_source_message_id")
+    required = (
+        "schema_version", "tenant_id", "source_principal", "gateway_session_id",
+        "current_gateway_session_id", "current_source_message_id", "photo_source_message_id",
+        "photo_received_at", "consumed_source_message_id",
+        "target_meal_id", "original_receipt_event_id", "original_operation_id",
+        "current_receipt_event_id", "current_operation_id", "current_logical_turn_id",
+        "current_trace_episode_id",
+    )
+    return bool(
+        type(evidence.get("schema_version")) is int
+        and evidence.get("schema_version") == 1
+        and all(isinstance(evidence.get(key), str) and evidence[key] for key in required[1:])
+        and evidence.get("tenant_id") == goal.owner_id
+        and evidence.get("source_principal") == goal.principal_id
+        and evidence.get("gateway_session_id") == goal.gateway_session_id
+        and evidence.get("current_gateway_session_id") == episode_session
+        and evidence.get("current_source_message_id") == matching[0].get("source_message_id")
+        and evidence.get("current_logical_turn_id") == matching[0].get("logical_turn_id")
+        and evidence.get("current_operation_id") == matching[0].get("operation_id")
+        and evidence.get("current_trace_episode_id") == episode_id
+        and evidence.get("photo_source_message_id") == goal.source_message_id
+        and evidence.get("consumed_source_message_id") == goal.source_message_id
+        and evidence.get("target_meal_id") == goal.canonical_meal_id
+        and evidence.get("current_receipt_event_id") == receipt
+        and matching[0].get("gateway_session_id") == episode_session
+        and matching[0].get("source_message_id") == source_id
+        and matching[0].get("operation_id") == f"{matching[0].get('logical_turn_id')}:assistant"
+        and isinstance(receipt, str) and bool(receipt)
+        and committed is not None and committed.get("record_type") == "meal_correction"
+        and executed is not None and executed.get("record_type") == "meal_correction"
+        and (context is None or (
+            context.get("kind") == "owner_turn"
+            and context.get("tenant_id") == goal.owner_id
+            and context.get("recipient_principal") == goal.principal_id
+            and context.get("principal_id") == goal.principal_id
+            and context.get("source_message_id") == source_id
+            and context.get("logical_turn_id") == matching[0].get("logical_turn_id")
+            and context.get("operation_id") == matching[0].get("operation_id")
+            and context.get("gateway_session_id") == episode_session
+        ))
     )
 
 
@@ -1606,6 +1961,7 @@ def _fold_events(events: list[dict[str, Any]], meal_timezone: str = "UTC") -> di
             "meal_date": meal_date,
             "meal_date_field": state.get("meal_date"),
             "energy_kcal_best": state.get("energy_kcal_best"),
+            "items": state.get("items", []),
             "meal_at": state.get("meal_at"), "revision": revision,
             "effective_event_ids": [event["event_id"] for event in effective_events],
             "latest_event_id": latest["event_id"],
@@ -1804,9 +2160,17 @@ def _validated_camera_owner_turns(
     initial_episode_id, initial = matching_initials[0]
     owner_contexts = [context for context in selected_camera_contexts
                       if context.get("kind") == "owner_turn"]
+    contextless_ids = [
+        episode_id for episode_id in goal.episode_ids
+        if episode_id in by_id
+        and _dict(by_id[episode_id].get("trusted_camera_context")) is None
+        and episode_id != initial_episode_id
+    ]
     if (initial_episode_id not in goal.episode_ids
-            or len(owner_contexts) != len(goal.episode_ids) - len(initial_contexts)
-            or len(owner_contexts) + len(initial_contexts) != len(selected_camera_contexts)):
+            or len(owner_contexts) + len(initial_contexts) + len(contextless_ids) != len(goal.episode_ids)
+            or len(owner_contexts) + len(initial_contexts) != len(selected_camera_contexts)
+            or any(not _valid_rotated_camera_context_episode(goal, by_id[item], item)
+                   for item in contextless_ids)):
         return False, "selected Camera provenance is missing an owner-turn context", []
     initial_ids = set()
     initial_identity_fields = (
@@ -2050,10 +2414,14 @@ def validate_dialogue_binding(manifest: Manifest, export: dict[str, Any]) -> dic
                                camera_context.get("recipient_principal") == goal.principal_id
                                and camera_context.get("tenant_id") == goal.owner_id
                                and initial_identity_valid)
+            rotated_context_correction = _valid_rotated_camera_context_episode(
+                goal, by_id[episode_id], episode_id
+            )
             if (by_id[episode_id].get("dialogue_complete") is not True
                     or ("terminal_failure" in by_id[episode_id] and not terminal_failure)
                     or not public_roles_valid
-                    or episode_data.get("session_id") != goal.gateway_session_id
+                    or (episode_data.get("session_id") != goal.gateway_session_id
+                        and not rotated_context_correction)
                     or not principal_valid
                     or (_dict(episode_data.get("metadata")) or {}).get("workspace") != goal.eval_workspace):
                 incomplete.append(episode_id)
@@ -2282,7 +2650,8 @@ def _derive_exported_turn_provenance(episode: dict[str, Any], payload: dict[str,
                 and trusted.get("principal_id") == _inbound_principal(payload)):
             return {key: trusted[key] for key in
                     ("source_message_id", "logical_turn_id", "operation_id", "principal_id")} | {
-                        "episode_id": trusted["episode_id"]}
+                        "episode_id": trusted["episode_id"],
+                        "gateway_session_id": episode.get("session_id")}
         return None
     if initial_camera_context and inbound_metadata and "_camera_turn_id" in inbound_metadata:
         return None
@@ -2330,7 +2699,8 @@ def _derive_exported_turn_provenance(episode: dict[str, Any], payload: dict[str,
             return None
         return {"source_message_id": source_id, "logical_turn_id": logical_turn_id,
                 "operation_id": operation_id, "principal_id": principal_id,
-                "episode_id": episode["episode_id"]}
+                "episode_id": episode["episode_id"],
+                "gateway_session_id": episode.get("session_id")}
     except (KeyError, TypeError, ValueError):
         return None
 

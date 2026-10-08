@@ -199,6 +199,24 @@ _CAMERA_DATE_CORRECTION_RE = re.compile(
     r"november|december)\b",
     re.IGNORECASE,
 )
+_CAMERA_ADD_MEAL_ITEM_RE = re.compile(
+    r"\b(?:добавь|добавить|добавьте|ещё\s+добавь|еще\s+добавь|"
+    r"add|add\s+another|also\s+add)\b",
+    re.IGNORECASE,
+)
+_CAMERA_ADD_NONMEAL_SCOPE_RE = re.compile(
+    r"\b(?:задач\w*|встреч\w*|календар\w*|напомин\w*|спис\w*|покуп\w*|"
+    r"task\w*|meeting\w*|calendar|reminder\w*|list)\b",
+    re.IGNORECASE,
+)
+_CAMERA_CONTEXTUAL_MORNING_RE = re.compile(
+    r"\b(?:утром|morning)\b", re.IGNORECASE,
+)
+_CAMERA_CONTEXTUAL_MEAL_GENERIC_TOKENS = frozenset({
+    "я", "ты", "вы", "он", "она", "мы", "они", "это", "то", "ли",
+    "съел", "съела", "съели", "ела", "ел", "ели", "сегодня", "вчера",
+    "позавчера", "утром", "morning", "today", "yesterday",
+})
 _CAMERA_UNRELATED_CONTEXT_RE = re.compile(
     r"\b(?:weather|погод\w*|спасибо|благодар\w*|thanks?|payment|оплат\w*|перевод\w*|"
     r"деньг\w*|сч[её]т\w*|карт\w*|рубл\w*|валют\w*|invoice|transfer|bank)\b",
@@ -261,7 +279,8 @@ _NATIVE_WHOLE_PLATE_RE = re.compile(
     re.IGNORECASE,
 )
 _NATIVE_WHOLE_PORTION_RE = re.compile(
-    r"^(?:всё|все)\s*:\s*\S.{2,}$",
+    r"^(?:(?:всё|все)\s*:\s*\S.{2,}|(?:всю|целую|полную)\s+порци\w*|"
+    r"(?:whole|the\s+whole|all\s+of\s+the)\s+portion)[.! ]*$",
     re.IGNORECASE,
 )
 _NATIVE_PARTIAL_PORTION_RE = re.compile(
@@ -409,6 +428,7 @@ _DEEPSEEK_ENDPOINT = "deepinfra/fp8"
 _DEEPSEEK_RELEASE = "deepseek-camera-production-v1"
 CAMERA_AUTHORITY = object()
 CAMERA_CONTEXT_QUESTION_AUTHORITY = object()
+_CAMERA_CONTEXT_MEAL_TARGET_AUTHORITY = object()
 COALESCED_ATTACHMENT_PROVENANCE_AUTHORITY = object()
 logger = logging.getLogger(__name__)
 
@@ -797,7 +817,10 @@ def _camera_context_answer_kind(
     if (
         not isinstance(text, str)
         or _CLARIFICATION_NEW_MEAL_RE.search(text)
-        or _CAMERA_DATE_CORRECTION_RE.search(text)
+        or (
+            _CAMERA_DATE_CORRECTION_RE.search(text)
+            and not _camera_explicit_consumption(text)
+        )
     ):
         return None
     direct = _classify_answer(text, anchored=True)
@@ -2212,6 +2235,8 @@ class CameraIngress:
             or (not legacy_reconciliation and metadata.get("confirmation_required") is not True)
             or not isinstance(metadata.get("source_message_id"), str)
             or not metadata["source_message_id"]
+            or not isinstance(metadata.get("gateway_session_id"), str)
+            or not metadata["gateway_session_id"].strip()
         ):
             raise ValueError("Camera commit receipt does not prove the bound owner operation")
         trace = metadata.get("decision_trace")
@@ -2239,24 +2264,232 @@ class CameraIngress:
             or observed_annotation.explicit_new_consumption
         ):
             raise ValueError("Camera commit receipt lacks trusted replay and capture semantics")
+        annotation_snapshot = observed_annotation.model_dump(mode="json", exclude_unset=True)
         commit = {
             "event_id": assistant_id,
             "source_message_id": metadata["source_message_id"],
+            "gateway_session_id": metadata["gateway_session_id"],
             "client_op_id": assistant_op,
             "candidate_id": candidate_id,
             "tenant_id": self.config.tenant_id,
             "principal": self.config.principal,
             "meal_at": nutrition.get("meal_at"),
+            "photo_received_at": self._attempt_capture_time(attempt).isoformat(),
             "record_type": nutrition.get("record_type"),
             "consumption_status": nutrition.get("consumption_status"),
+            "items": annotation_snapshot.get("items", []),
+            "annotation": annotation_snapshot,
         }
         previous_commit = attempt.get("camera_commit")
         if isinstance(previous_commit, dict) and previous_commit != commit:
-            raise ValueError("Camera operation has conflicting durable commit evidence")
+            legacy_fields = {
+                "event_id", "source_message_id", "client_op_id", "candidate_id",
+                "tenant_id", "principal", "meal_at", "record_type", "consumption_status",
+            }
+            if not (
+                legacy_reconciliation
+                and set(previous_commit) == legacy_fields
+                and all(previous_commit.get(key) == commit.get(key) for key in legacy_fields)
+            ):
+                raise ValueError("Camera operation has conflicting durable commit evidence")
         attempt["camera_commit"] = commit
         attempt["finalizer_status"] = "committed"
         self._save_attempts()
         return commit
+
+    def record_contextual_meal_projection(
+        self, message: InboundMessage, candidate_id: str, receipt: object,
+        correction: object,
+    ) -> bool:
+        """Retain verified item context from an immutable ordinary correction."""
+        attempt = self._attempts.get(candidate_id)
+        commit = attempt.get("camera_commit") if isinstance(attempt, dict) else None
+        metadata = getattr(receipt, "assistant_metadata", None)
+        selected = metadata.get("selected_source") if isinstance(metadata, Mapping) else None
+        if isinstance(commit, Mapping):
+            from ohmo.evals.nutrition_persistence import derive_meal_id
+
+            expected_target = derive_meal_id(
+                tenant_id=self.config.tenant_id,
+                source_principal=f"telegram:{self.config.principal}",
+                gateway_session_id=commit.get("gateway_session_id"),
+                source_message_id=commit.get("source_message_id"),
+            )
+        else:
+            expected_target = None
+        checks = (
+            (message.metadata.get("_camera_context_meal_target") is _CAMERA_CONTEXT_MEAL_TARGET_AUTHORITY, "marker"),
+            (message.metadata.get("_camera_context_meal_candidate_id") == candidate_id, "candidate"),
+            (isinstance(attempt, dict) and attempt.get("state") == "completed", "attempt"),
+            (isinstance(attempt, dict) and attempt.get("finalizer_status") == "committed", "finalizer"),
+            (isinstance(commit, Mapping), "commit"),
+            (isinstance(metadata, Mapping), "metadata"),
+            (isinstance(selected, Mapping), "selected"),
+            (isinstance(metadata, Mapping) and metadata.get("role") == "assistant", "role"),
+            (isinstance(metadata, Mapping) and metadata.get("tenant_id") == self.config.tenant_id, "tenant"),
+            (isinstance(metadata, Mapping) and metadata.get("source_principal") == f"telegram:{self.config.principal}", "principal"),
+            (isinstance(metadata, Mapping) and metadata.get("is_group") is False, "group"),
+            (isinstance(metadata, Mapping) and metadata.get("is_forwarded") is False, "forwarded"),
+            (isinstance(selected, Mapping) and selected.get("tenant_id") == self.config.tenant_id, "selected_tenant"),
+            (isinstance(selected, Mapping) and selected.get("source_principal") == f"telegram:{self.config.principal}", "selected_principal"),
+            (isinstance(selected, Mapping) and selected.get("schema_version") == 2, "selected_schema"),
+            (isinstance(selected, Mapping) and isinstance(commit, Mapping) and selected.get("gateway_session_id") == commit.get("gateway_session_id"), "selected_session"),
+            (isinstance(selected, Mapping) and isinstance(commit, Mapping) and selected.get("source_message_id") == commit.get("source_message_id"), "selected_source"),
+            (isinstance(selected, Mapping) and isinstance(commit, Mapping) and selected.get("append_source_message_id") == commit.get("source_message_id"), "selected_append"),
+            (isinstance(selected, Mapping) and isinstance(commit, Mapping) and selected.get("original_receipt_event_id") == commit.get("event_id"), "selected_original_event"),
+            (isinstance(selected, Mapping) and isinstance(commit, Mapping) and selected.get("original_receipt_client_op_id") == commit.get("client_op_id"), "selected_original_operation"),
+            (isinstance(metadata, Mapping) and isinstance(metadata.get("gateway_session_id"), str) and bool(metadata.get("gateway_session_id")), "current_session"),
+            (isinstance(metadata, Mapping) and metadata.get("client_op_id") == f"{metadata.get('logical_turn_id')}:assistant", "current_operation"),
+            (isinstance(metadata, Mapping) and metadata.get("target_meal_id") == expected_target, "target"),
+            (getattr(correction, "record_type", None) == "meal_correction", "record_type"),
+            (bool(getattr(correction, "changed_fields", ())), "changed_fields"),
+            ("consumption_status" not in getattr(correction, "changed_fields", ()), "status"),
+        )
+        rejected = [label for passed, label in checks if not passed]
+        if rejected:
+            return False
+        fields = set(correction.changed_fields)
+        previous = attempt.get("context_meal_projection")
+        if "items" in fields:
+            items = [item.model_dump(mode="json") for item in correction.items]
+        elif isinstance(previous, Mapping) and isinstance(previous.get("items"), list):
+            items = previous["items"]
+        else:
+            items = commit.get("items", [])
+        attempt["context_meal_projection"] = {
+            "tenant_id": self.config.tenant_id,
+            "principal": self.config.principal,
+            "original_gateway_session_id": commit["gateway_session_id"],
+            "source_message_id": commit["source_message_id"],
+            "target_meal_id": expected_target,
+            "items": items,
+            "event_id": getattr(receipt, "assistant_message_id", None),
+            "client_op_id": getattr(receipt, "assistant_client_op_id", None),
+            "user_client_op_id": getattr(receipt, "user_client_op_id", None),
+            "logical_turn_id": metadata.get("logical_turn_id"),
+            "gateway_session_id": metadata.get("gateway_session_id"),
+            "source_message_id_current": metadata.get("source_message_id"),
+            "user_text": message.content,
+            "received_at": metadata.get("received_at"),
+            "tenant_id_receipt": metadata.get("tenant_id"),
+            "source_principal_receipt": metadata.get("source_principal"),
+            "reply_to_source_message_id": metadata.get("reply_to_source_message_id"),
+            "selected_source": dict(selected),
+            "target_meal_id_receipt": metadata.get("target_meal_id"),
+            "decision_trace_episode_id": metadata.get("decision_trace_episode_id"),
+            "nutrition_annotation": (
+                metadata.get("decision_trace", {}).get("annotations", {}).get("nutrition")
+                if isinstance(metadata.get("decision_trace"), Mapping)
+                and isinstance(metadata["decision_trace"].get("annotations"), Mapping)
+                else None
+            ),
+        }
+        self._save_attempts()
+        return True
+
+    def contextual_meal_receipt_evidence(
+        self, message: InboundMessage, candidate_id: str, receipt: object,
+        correction: object,
+    ) -> dict[str, object] | None:
+        """Build grader evidence only from the retained Camera and current append receipts."""
+        attempt = self._attempts.get(candidate_id)
+        commit = attempt.get("camera_commit") if isinstance(attempt, dict) else None
+        metadata = getattr(receipt, "assistant_metadata", None)
+        selected = metadata.get("selected_source") if isinstance(metadata, Mapping) else None
+        if not isinstance(commit, Mapping) or not isinstance(metadata, Mapping) or not isinstance(selected, Mapping):
+            return None
+        from ohmo.evals.nutrition_persistence import derive_meal_id
+
+        original_session = commit.get("gateway_session_id")
+        original_source = commit.get("source_message_id")
+        original_event = commit.get("event_id")
+        original_operation = commit.get("client_op_id")
+        current_event = getattr(receipt, "assistant_message_id", None)
+        current_operation = getattr(receipt, "assistant_client_op_id", None)
+        current_logical = metadata.get("logical_turn_id")
+        current_trace = metadata.get("decision_trace_episode_id")
+        expected_target = derive_meal_id(
+            tenant_id=self.config.tenant_id,
+            source_principal=f"telegram:{self.config.principal}",
+            gateway_session_id=original_session,
+            source_message_id=original_source,
+        )
+        original_annotation = commit.get("annotation")
+        try:
+            from ohmo.evals.nutrition_trace import NutritionAnnotationV2
+
+            observed_original = NutritionAnnotationV2.model_validate(original_annotation)
+            observed_correction = NutritionAnnotationV2.model_validate(
+                metadata.get("decision_trace", {}).get("annotations", {}).get("nutrition")
+                if isinstance(metadata.get("decision_trace"), Mapping)
+                and isinstance(metadata["decision_trace"].get("annotations"), Mapping)
+                else None
+            )
+        except (TypeError, ValueError):
+            return None
+        if (
+            message.metadata.get("_camera_context_meal_target")
+            is not _CAMERA_CONTEXT_MEAL_TARGET_AUTHORITY
+            or message.metadata.get("_camera_context_meal_candidate_id") != candidate_id
+            or attempt.get("state") != "completed"
+            or attempt.get("finalizer_status") != "committed"
+            or metadata.get("role") != "assistant"
+            or metadata.get("tenant_id") != self.config.tenant_id
+            or metadata.get("source_principal") != f"telegram:{self.config.principal}"
+            or metadata.get("is_group") is not False
+            or metadata.get("is_forwarded") is not False
+            or not isinstance(metadata.get("gateway_session_id"), str)
+            or not metadata.get("gateway_session_id")
+            or metadata.get("source_message_id")
+            != _source_message_id(message.metadata.get("message_id"))
+            or selected.get("schema_version") != 2
+            or selected.get("tenant_id") != self.config.tenant_id
+            or selected.get("source_principal") != f"telegram:{self.config.principal}"
+            or selected.get("gateway_session_id") != original_session
+            or selected.get("source_message_id") != original_source
+            or selected.get("append_source_message_id") != original_source
+            or selected.get("original_receipt_event_id") != original_event
+            or selected.get("original_receipt_client_op_id") != original_operation
+            or selected.get("is_private") is not True
+            or selected.get("is_forwarded") is not False
+            or selected.get("is_group") is not False
+            or metadata.get("target_meal_id") != expected_target
+            or not isinstance(current_event, str) or not current_event
+            or not isinstance(current_operation, str) or not current_operation
+            or current_operation != metadata.get("client_op_id")
+            or not isinstance(current_logical, str) or not current_logical
+            or current_operation != f"{current_logical}:assistant"
+            or not isinstance(current_trace, str) or not current_trace
+            or getattr(receipt, "user_client_op_id", None) != f"{current_logical}:user"
+            or observed_original.record_type != "meal_observation"
+            or observed_original.consumption_status != "consumed"
+            or not isinstance(original_event, str) or not original_event
+            or not isinstance(original_operation, str) or not original_operation
+            or observed_correction.record_type != "meal_correction"
+            or observed_correction.explicit_new_consumption
+        ):
+            return None
+        photo_received_at = commit.get("photo_received_at")
+        if not isinstance(photo_received_at, str) or not photo_received_at:
+            return None
+        return {
+            "schema_version": 1,
+            "tenant_id": self.config.tenant_id,
+            "source_principal": f"telegram:{self.config.principal}",
+            "gateway_session_id": original_session,
+            "current_gateway_session_id": metadata["gateway_session_id"],
+            "photo_source_message_id": original_source,
+            "photo_received_at": photo_received_at,
+            "consumed_source_message_id": original_source,
+            "target_meal_id": expected_target,
+            "original_receipt_event_id": original_event,
+            "original_operation_id": original_operation,
+            "current_receipt_event_id": current_event,
+            "current_source_message_id": metadata.get("source_message_id"),
+            "current_operation_id": current_operation,
+            "current_logical_turn_id": current_logical,
+            "current_trace_episode_id": current_trace,
+        }
 
     def mark_finalizer_unknown(self, candidate_id: str, turn_id: str) -> None:
         attempt = self._attempts.get(candidate_id)
@@ -4167,6 +4400,77 @@ class CameraIngress:
             self._save_attempts()
             return True
 
+    def contextual_meal_source_binding(
+        self, message: InboundMessage, *, candidate_id: str, gateway_session_id: str,
+    ) -> dict[str, object] | None:
+        """Resolve an explicit owner follow-up to one retained Camera meal receipt."""
+        if (
+            message.metadata.get("_camera_context_meal_target")
+            is not _CAMERA_CONTEXT_MEAL_TARGET_AUTHORITY
+            or message.metadata.get("_camera_context_meal_candidate_id") != candidate_id
+            or message.channel != "telegram"
+            or message.sender_id.split("|", 1)[0] != self.config.principal
+            or str(message.chat_id) != self.config.chat_id
+            or message.metadata.get("is_group") is True
+            or message.metadata.get("is_forwarded") is True
+            or message.metadata.get("callback_query") is True
+            or not gateway_session_id
+        ):
+            return None
+        attempt = self._attempts.get(candidate_id)
+        commit = attempt.get("camera_commit") if isinstance(attempt, dict) else None
+        source_id = commit.get("source_message_id") if isinstance(commit, dict) else None
+        if (
+            not isinstance(attempt, dict)
+            or attempt.get("state") != "completed"
+            or attempt.get("finalizer_status") != "committed"
+            or attempt.get("context_interrupted") is True
+            or not isinstance(source_id, str) or not source_id.strip()
+            or commit.get("candidate_id") != candidate_id
+            or commit.get("tenant_id") != self.config.tenant_id
+            or commit.get("principal") != self.config.principal
+            or not isinstance(commit.get("gateway_session_id"), str)
+            or not commit["gateway_session_id"].strip()
+        ):
+            return None
+        source_principal = f"telegram:{self.config.principal}"
+        projection = attempt.get("context_meal_projection")
+        context_items = (
+            projection.get("items") if isinstance(projection, Mapping)
+            and isinstance(projection.get("items"), list)
+            else commit.get("annotation", {}).get("items")
+            if isinstance(commit.get("annotation"), Mapping) else None
+        )
+        if not isinstance(context_items, list) or len(context_items) > 16:
+            return None
+        safe_items = []
+        for item in context_items:
+            if not isinstance(item, Mapping):
+                return None
+            name, quantity = item.get("name"), item.get("quantity_text")
+            if (
+                not isinstance(name, str) or not name.strip() or len(name) > 120
+                or not isinstance(quantity, str) or not quantity.strip() or len(quantity) > 120
+            ):
+                return None
+            safe_items.append({"name": name.strip(), "quantity_text": quantity.strip()})
+        return {
+            "schema_version": 1,
+            "tenant_id": self.config.tenant_id,
+            "source_principal": source_principal,
+            "gateway_session_id": commit["gateway_session_id"],
+            "source_message_id": source_id,
+            "append_source_message_id": source_id,
+            "is_private": True,
+            "is_forwarded": False,
+            "is_group": False,
+            "context_items": safe_items,
+            "event_id": commit.get("event_id"),
+            "client_op_id": commit.get("client_op_id"),
+            "original_receipt_event_id": commit.get("event_id"),
+            "original_receipt_client_op_id": commit.get("client_op_id"),
+        }
+
     def process_real_inbound(self, message: InboundMessage) -> None:
         if not self.config.enabled or message.channel != "telegram":
             return
@@ -4191,6 +4495,121 @@ class CameraIngress:
                 str(value.get("photo_id")), *map(str, value.get("reply_ids", []))
             }
         ]
+        text_for_correction = raw_text if isinstance(raw_text, str) else ""
+        is_explicit_new_meal = _CLARIFICATION_NEW_MEAL_RE.search(text_for_correction) is not None
+        is_addition = (
+            _CAMERA_ADD_MEAL_ITEM_RE.search(text_for_correction) is not None
+            and _CAMERA_ADD_NONMEAL_SCOPE_RE.search(text_for_correction) is None
+            and not is_explicit_new_meal
+        )
+        is_dated_consumption = (
+            (
+                _CAMERA_DATE_CORRECTION_RE.search(text_for_correction) is not None
+                or _CAMERA_CONTEXTUAL_MORNING_RE.search(text_for_correction) is not None
+            )
+            and _camera_explicit_consumption(text_for_correction)
+            and not is_explicit_new_meal
+        )
+        if (
+            not callback
+            and not owner_supplied_media
+            and not (target is not None and is_dated_consumption)
+            and metadata.get("is_group") is not True
+            and metadata.get("is_forwarded") is not True
+            and (is_addition or is_dated_consumption)
+        ):
+            def completed_meal(item: dict) -> bool:
+                latest = item.get("camera_correction_commit")
+                return bool(
+                    item.get("state") == "completed"
+                    and item.get("finalizer_status") == "committed"
+                    and isinstance(item.get("camera_commit"), dict)
+                    and item.get("context_interrupted") is not True
+                    and (
+                        item.get("camera_correction") is None
+                        or (
+                            item.get("camera_correction") == "completed"
+                            and isinstance(latest, dict)
+                            and latest.get("kind") == "portion"
+                        )
+                    )
+                )
+
+            if target is not None:
+                candidates = [(key, item) for key, item in target_matches if completed_meal(item)]
+            else:
+                candidates = [
+                    (key, item) for key, item in self._attempts.items()
+                    if completed_meal(item)
+                ]
+                if any(
+                    item.get("state") in {"admitted", "photo_sent", "clarifying", "answering", "final_queued"}
+                    and item.get("attention_active", True)
+                    for item in self._attempts.values()
+                ):
+                    candidates = []
+            if is_dated_consumption and not is_addition:
+                source_tokens = {
+                    token.casefold()
+                    for token in _CAMERA_COMPOSITION_TOKEN_RE.findall(text_for_correction)
+                    if len(token) > 2
+                    and token.casefold() not in _CAMERA_CONTEXTUAL_MEAL_GENERIC_TOKENS
+                }
+                matching_candidates = []
+                for key, item in candidates:
+                    context = (
+                        item.get("confirmed_camera_context")
+                        or item.get("confirmed_camera_question")
+                        or item.get("_camera_caption")
+                        or ""
+                    )
+                    projection = item.get("context_meal_projection")
+                    commit = item.get("camera_commit")
+                    if (
+                        isinstance(projection, Mapping)
+                        and isinstance(commit, Mapping)
+                        and projection.get("tenant_id") == self.config.tenant_id
+                        and projection.get("principal") == self.config.principal
+                        and projection.get("original_gateway_session_id") == commit.get("gateway_session_id")
+                        and projection.get("source_message_id") == commit.get("source_message_id")
+                        and isinstance(projection.get("items"), list)
+                    ):
+                        context += " " + " ".join(
+                            str(entry.get("name", ""))
+                            for entry in projection["items"]
+                            if isinstance(entry, Mapping)
+                        )
+                    context_tokens = {
+                        token.casefold()
+                        for token in _CAMERA_COMPOSITION_TOKEN_RE.findall(context)
+                        if len(token) > 2
+                    }
+                    if isinstance(context, str) and source_tokens & context_tokens:
+                        matching_candidates.append((key, item))
+                if matching_candidates:
+                    candidates = matching_candidates
+                elif (
+                    source_tokens
+                    or not (
+                        _CAMERA_CONTEXTUAL_MORNING_RE.search(text_for_correction)
+                        or _CAMERA_DATE_CORRECTION_RE.search(text_for_correction)
+                    )
+                ):
+                    candidates = []
+            if len(candidates) == 1:
+                candidate_id, _ = candidates[0]
+                target_kind = (
+                    "item_addition" if is_addition else
+                    "dated_composition" if is_dated_consumption and source_tokens
+                    and matching_candidates else
+                    "dated_time"
+                )
+                metadata.update(
+                    _camera_context_meal_target=_CAMERA_CONTEXT_MEAL_TARGET_AUTHORITY,
+                    _camera_context_meal_candidate_id=candidate_id,
+                    _camera_context_meal_target_kind=target_kind,
+                )
+                return
         # Only media present on entry is a new owner source. Camera snapshots
         # attached below for retained context are enrichment, not interruption.
         if owner_supplied_media:
@@ -4454,7 +4873,13 @@ class CameraIngress:
 
         def bind_denial(candidate_id: str, attempt: dict, route: str) -> bool:
             state = attempt.get("state")
-            has_commit = isinstance(attempt.get("camera_commit"), dict)
+            stored_commit = attempt.get("camera_commit")
+            has_commit = bool(
+                isinstance(stored_commit, dict)
+                and isinstance(stored_commit.get("gateway_session_id"), str)
+                and stored_commit.get("gateway_session_id")
+                and isinstance(stored_commit.get("annotation"), dict)
+            )
             has_turn = any(
                 isinstance(attempt.get(name), str) and attempt[name]
                 for name in ("answer_turn_id", "final_turn_id")

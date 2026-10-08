@@ -37,7 +37,7 @@ def gateway_turn_metadata(source, *, reply=None, episode="ep-tea", created=NOW, 
         content="tea update", timestamp=created,
         metadata={"message_id": source, "reply_to_message_id": reply})
     context = build_turn_context(inbound, session_id="session-1")
-    _, _, metadata = _build_conversation_turn_metadata(
+    _, expected, metadata = _build_conversation_turn_metadata(
         turn_ctx=context, message=inbound, scope=MemoryScope(owner, ()))
     metadata.update(role="assistant", decision_trace_episode_id=episode,
                     decision_trace={"episode_id": episode, "annotations": {}})
@@ -141,6 +141,233 @@ def snapshots(events=None, *, canonical=True, status="complete", kcal=25):
 def grade(honcho, telegent, *, kcal=25, now=NOW):
     return grade_manifest(Manifest(schema_version=1, goals=[goal(kcal=kcal)]), honcho, telegent,
                           now=now, grace_seconds=300)[0]
+
+
+def test_a1_checks_telegent_composition_and_reviewed_item_quantity_independently_of_kcal():
+    from ohmo.evals.nutrition_persistence import ExpectedItemQuantity
+
+    rice = {"name": "rice", "quantity_text": "1 serving"}
+    one_egg = {"name": "egg", "quantity_text": "1 item"}
+    two_eggs = {"name": "egg", "quantity_text": "2 items"}
+    expected = goal().model_copy(update={
+        "expected_items": ["rice", "egg"],
+        "expected_item_quantities": [ExpectedItemQuantity(name="egg", quantity_text="1 item")],
+    })
+
+    def grade_composition(honcho_items, canonical_items):
+        event = raw_event(kcal=25)
+        event["metadata"]["decision_trace"]["annotations"]["nutrition"]["items"] = honcho_items
+        honcho, telegent = snapshots([event])
+        telegent["meal"]["items"] = canonical_items
+        return grade_manifest(
+            Manifest(schema_version=1, goals=[expected]), honcho, telegent, now=NOW,
+        )[0]
+
+    valid = grade_composition([rice, one_egg], [rice, one_egg])
+    assert valid["a1"] == "PASS", valid
+
+    canonical_missing_egg = grade_composition([rice, one_egg], [rice])
+    assert canonical_missing_egg["a1"] == "FAIL"
+    assert canonical_missing_egg["stage"] == "CANONICAL_MISMATCH"
+    assert "item composition" in canonical_missing_egg["reason"]
+
+    wrong_quantity = grade_composition([rice, two_eggs], [rice, two_eggs])
+    assert wrong_quantity["a1"] == "FAIL"
+    assert wrong_quantity["stage"] == "HONCHO_GOAL_MISMATCH"
+    assert "item_quantities" in wrong_quantity["state_failures"]
+
+    duplicate_rows = [
+        rice,
+        {"name": "egg", "quantity_text": "1 item"},
+        {"name": "egg", "quantity_text": "1 item"},
+    ]
+    duplicate_total = grade_composition(duplicate_rows, duplicate_rows)
+    assert duplicate_total["a1"] == "FAIL"
+    assert "item_quantities" in duplicate_total["state_failures"]
+
+    partitioned_rows = [
+        rice,
+        {"name": "egg", "quantity_text": "0.5 item"},
+        {"name": "egg", "quantity_text": "0.5 item"},
+    ]
+    partitioned_total = grade_composition(partitioned_rows, partitioned_rows)
+    assert partitioned_total["a1"] == "PASS", partitioned_total
+
+    for actual_quantity in ("one egg", "1 штука", "1 шт."):
+        equivalent = grade_composition(
+            [rice, {"name": "egg", "quantity_text": actual_quantity}],
+            [rice, {"name": "egg", "quantity_text": actual_quantity}],
+        )
+        assert equivalent["a1"] == "PASS", (actual_quantity, equivalent)
+
+    unknown = grade_composition(
+        [rice, {"name": "egg", "quantity_text": "unknown amount"}],
+        [rice, {"name": "egg", "quantity_text": "unknown amount"}],
+    )
+    assert unknown["a1"] == "INCONCLUSIVE"
+    assert unknown["stage"] == "HONCHO_QUANTITY_UNRESOLVED"
+
+    incompatible = grade_composition(
+        [rice, {"name": "egg", "quantity_text": "0.5 item"},
+         {"name": "egg", "quantity_text": "0.5 gram"}],
+        [rice, {"name": "egg", "quantity_text": "0.5 item"},
+         {"name": "egg", "quantity_text": "0.5 gram"}],
+    )
+    assert incompatible["a1"] == "INCONCLUSIVE"
+    assert incompatible["stage"] == "HONCHO_QUANTITY_UNRESOLVED"
+
+
+def test_unknown_honcho_quantity_does_not_mask_canonical_state_failures():
+    from ohmo.evals.nutrition_persistence import ExpectedItemQuantity
+
+    rice = {"name": "rice", "quantity_text": "1 serving"}
+    unknown_egg = {"name": "egg", "quantity_text": "unknown amount"}
+    expected = goal().model_copy(update={
+        "expected_items": ["rice", "egg"],
+        "expected_item_quantities": [ExpectedItemQuantity(name="egg", quantity_text="1 item")],
+    })
+
+    def grade_unknown(canonical_items, *, canonical_day="2026-10-01"):
+        event = raw_event(kcal=25)
+        event["metadata"]["decision_trace"]["annotations"]["nutrition"]["items"] = [rice, unknown_egg]
+        honcho, telegent = snapshots([event])
+        telegent["meal"]["items"] = canonical_items
+        telegent["meal"]["day"] = canonical_day
+        telegent["meal"]["meal_date"] = canonical_day
+        return grade_manifest(Manifest(schema_version=1, goals=[expected]), honcho, telegent, now=NOW)[0]
+
+    unresolved = grade_unknown([rice, unknown_egg])
+    assert unresolved["a1"] == "INCONCLUSIVE"
+    assert unresolved["stage"] == "HONCHO_QUANTITY_UNRESOLVED"
+
+    missing_item = grade_unknown([rice])
+    assert missing_item["a1"] == "FAIL" and missing_item["stage"] == "CANONICAL_MISMATCH"
+
+    known_wrong_quantity = grade_unknown([rice, {"name": "egg", "quantity_text": "2 items"}])
+    assert known_wrong_quantity["a1"] == "FAIL" and known_wrong_quantity["stage"] == "CANONICAL_MISMATCH"
+
+    wrong_date = grade_unknown([rice, unknown_egg], canonical_day="2026-10-02")
+    assert wrong_date["a1"] == "FAIL" and wrong_date["stage"] == "CANONICAL_MISMATCH"
+
+def test_a1_does_not_collapse_different_unknown_canonical_quantities():
+    rice = {"name": "rice", "quantity_text": "1 serving"}
+    event = raw_event(kcal=25)
+    event["metadata"]["decision_trace"]["annotations"]["nutrition"]["items"] = [rice]
+    honcho, telegent = snapshots([event])
+
+    telegent["meal"]["items"] = [{"name": "rice", "quantity_text": "2 servings"}]
+    telegent["canonical_meals"][0]["items"] = [{"name": "rice", "quantity_text": "2 servings"}]
+    different_unknown = grade(honcho, telegent)
+    assert different_unknown["a1"] == "FAIL"
+    assert different_unknown["stage"] == "CANONICAL_MISMATCH"
+    assert "item composition" in different_unknown["reason"]
+
+    same_unknown = [{"name": "rice", "quantity_text": "one bowl"}]
+    event = raw_event(kcal=25)
+    event["metadata"]["decision_trace"]["annotations"]["nutrition"]["items"] = same_unknown
+    honcho, telegent = snapshots([event])
+    telegent["meal"]["items"] = same_unknown
+    telegent["canonical_meals"][0]["items"] = same_unknown
+    identical_unknown = grade(honcho, telegent)
+    assert identical_unknown["a1"] == "PASS", identical_unknown
+
+
+def test_context_camera_writer_uses_v2_original_receipt_and_truthful_current_session():
+    from types import SimpleNamespace
+    from openharness.channels.bus.events import InboundMessage
+    from ohmo.gateway import runtime as runtime_module
+    from ohmo.gateway.memory_gate import MemoryScope
+    from ohmo.gateway.runtime import _build_conversation_turn_metadata
+    from ohmo.gateway.turn_context import build_turn_context
+
+    binding = {
+        "schema_version": 1, "tenant_id": "owner-1", "source_principal": "telegram:123",
+        "gateway_session_id": "original-session", "source_message_id": "photo-source",
+        "append_source_message_id": "photo-source", "is_private": True,
+        "is_forwarded": False, "is_group": False, "attachment_id": "synthetic-attachment",
+        "event_id": "original-event", "client_op_id": "original-turn:assistant",
+        "original_receipt_event_id": "original-event",
+        "original_receipt_client_op_id": "original-turn:assistant",
+    }
+    message = InboundMessage(
+        channel="telegram", sender_id="123", chat_id="123",
+        content="Ate this this morning", timestamp=NOW,
+        metadata={"message_id": "context-source", "chat_type": "private", "is_group": False,
+            "_camera_context_meal_target":
+            runtime_module._CAMERA_CONTEXT_MEAL_TARGET_AUTHORITY,
+            "_camera_context_meal_candidate_id": "candidate-synthetic",
+            "_selected_source_binding": (runtime_module._SELECTED_SOURCE_AUTHORITY, binding)},
+    )
+    context = build_turn_context(message, session_id="current-session", owner_principals=("123",))
+    recorder = SimpleNamespace(
+        validated_nutrition_envelope={
+            "schema_version": 2, "record_type": "meal_correction", "basis": ["user_report"],
+            "changed_fields": ["basis", "meal_date"], "meal_date": "2026-10-01",
+        },
+        decision_trace_status="recorded", nutrition_annotation_status="recorded",
+        episode_id="episode-current", decision_trace_envelope=None,
+    )
+    _, expected, metadata = _build_conversation_turn_metadata(
+        turn_ctx=context, message=message, scope=MemoryScope("owner-1", ()), recorder=recorder,
+    )
+    selected = metadata["selected_source"]
+    assert set(selected) == {
+        "schema_version", "tenant_id", "source_principal", "gateway_session_id",
+        "source_message_id", "append_source_message_id", "is_private", "is_forwarded",
+        "is_group", "original_receipt_event_id", "original_receipt_client_op_id",
+    }
+    assert selected["schema_version"] == 2
+    assert metadata["gateway_session_id"] == "current-session"
+    assert selected["gateway_session_id"] == "original-session"
+    assert selected["original_receipt_event_id"] == "original-event"
+    assert selected["original_receipt_client_op_id"] == "original-turn:assistant"
+    assert metadata["target_meal_id"] == derive_meal_id(
+        tenant_id="owner-1", source_principal="telegram:123",
+        gateway_session_id="original-session", source_message_id="photo-source",
+    )
+    from ohmo.gateway.runtime import _exact_context_receipt_replay
+
+    receipt_metadata = {
+        **metadata, "role": "assistant", "decision_trace_episode_id": "episode-current",
+        "received_at": metadata["received_at"],
+        "decision_trace": {"annotations": {"nutrition": recorder.validated_nutrition_envelope}},
+    }
+    receipt = SimpleNamespace(
+        assistant_message_id="correction-event", assistant_client_op_id=metadata["client_op_id"],
+        user_client_op_id=expected["client_op_id"], assistant_metadata=receipt_metadata,
+        user_content="Ate this this morning",
+    )
+    projection = {
+        "event_id": receipt.assistant_message_id,
+        "client_op_id": receipt.assistant_client_op_id,
+        "user_client_op_id": receipt.user_client_op_id,
+        "logical_turn_id": metadata["logical_turn_id"],
+        "gateway_session_id": metadata["gateway_session_id"],
+        "source_message_id_current": metadata["source_message_id"],
+        "user_text": "Ate this this morning",
+        "received_at": metadata["received_at"],
+        "tenant_id_receipt": metadata["tenant_id"],
+        "source_principal_receipt": metadata["source_principal"],
+        "reply_to_source_message_id": metadata["reply_to_source_message_id"],
+        "selected_source": selected,
+        "target_meal_id_receipt": metadata["target_meal_id"],
+        "decision_trace_episode_id": "episode-current",
+        "nutrition_annotation": recorder.validated_nutrition_envelope,
+        "source_message_id": selected["source_message_id"],
+    }
+    assert _exact_context_receipt_replay(
+        projection, receipt, expected, expected_user_text="Ate this this morning"
+    )
+    assert not _exact_context_receipt_replay(
+        projection, receipt, expected, expected_user_text="Ate something else"
+    )
+    for changed in ("received_at", "client_op_id", "selected_source"):
+        malformed = {**projection}
+        if changed == "selected_source":
+            malformed[changed] = {**selected, "original_receipt_event_id": "foreign-event"}
+        else:
+            malformed[changed] = f"stale-{changed}"
+        assert not _exact_context_receipt_replay(malformed, receipt, expected)
 
 
 def test_missing_honcho_row_fails_even_when_episode_completed_and_trace_is_missing_or_proposal_only():

@@ -33,6 +33,7 @@ from ohmo.evals.camera_calibration import (
     sol_prompt,
     write_report,
     _score_a1_details,
+    _button_click_evidence,
 )
 from ohmo.evals.camera_subscription_results import SubscriptionResults, read_private_json
 from ohmo.evals.nutrition_persistence import Goal, derive_meal_id, export_eval_dialogue
@@ -511,6 +512,65 @@ def test_terminal_camera_exception_grades_real_persistence_and_fails_when_save_i
     assert score_a1(absent, reference())[0] == "FAIL"
 
 
+def _camera_binding_failure_case(tmp_path, *, wrong_state):
+    case = make_case(tmp_path)
+    evidence = case.persistence_evidence
+    exported = evidence["dialogue_export"]["episodes"][0]
+    exported["episode"]["metadata"]["inbound"] = {
+        "channel": "telegram", "sender_id": "owner-1|mutable_name",
+        "chat_id": "chat-product", "timestamp": PERSIST_NOW.isoformat(),
+        "user_text": "I ate this.",
+        "metadata": {"message_id": case.source_message_id, "is_group": False,
+                     "chat_type": "private"},
+    }
+    # Keep the ordinary source turn independently derivable while making the
+    # Camera-specific photo-to-owner binding deliberately incomplete.
+    exported["episode"]["metadata"]["trusted_camera_context"] = {"kind": "owner_turn"}
+    exported["trusted_camera_context"] = {"kind": "owner_turn"}
+    if wrong_state:
+        evidence["goal"]["expected_items"] = ["rice", "egg"]
+        event = evidence["honcho_snapshot"]["messages"][0]
+        nutrition = event["metadata"]["decision_trace"]["annotations"]["nutrition"]
+        nutrition.update(
+            meal_date="2026-09-30", energy_kcal_min=100,
+            energy_kcal_max=100, energy_kcal_best=100,
+            items=[{"name": "rice", "quantity_text": "1 bowl"}],
+        )
+        evidence["goal"]["expected_kcal"] = 400
+        evidence["telegent_snapshot"]["start"] = "2026-09-30T00:00:00+00:00"
+        meal = evidence["telegent_snapshot"]["meals"][0]
+        meal.update(
+            day="2026-09-30", meal_date="2026-09-30",
+            energy_kcal_min=100, energy_kcal_max=100, energy_kcal_best=100,
+            items=[{"name": "rice", "quantity_text": "1 bowl"}],
+        )
+    return case
+
+
+def test_camera_persistence_diagnostic_reports_independent_failures_without_source_binding(
+    tmp_path,
+):
+    case = _camera_binding_failure_case(tmp_path, wrong_state=True)
+    result = _score_a1_details(case, reference())
+    assert result["a1"] == "FAIL"
+    assert result["persistence_stage"] == "HONCHO_GOAL_MISMATCH"
+    assert set(result["state_failures"]) == {"meal_date", "items", "energy_kcal_best"}
+
+
+def test_camera_persistence_binding_failure_never_promotes_correct_state_to_pass(tmp_path):
+    case = _camera_binding_failure_case(tmp_path, wrong_state=False)
+    result = _score_a1_details(case, reference())
+    assert result["a1"] == "INCONCLUSIVE"
+    assert result["persistence_stage"] == "DIALOGUE_BINDING_FAILED"
+
+
+def test_camera_persistence_diagnostic_keeps_missing_source_inconclusive(tmp_path):
+    case = _camera_binding_failure_case(tmp_path, wrong_state=True)
+    case.persistence_evidence["dialogue_export"]["episodes"][0]["source_message_ids"] = []
+    result = _score_a1_details(case, reference())
+    assert result["a1"] == "INCONCLUSIVE"
+
+
 def test_product_a2_refuses_to_fall_back_to_reference_prefix(tmp_path):
     case = make_case(tmp_path)
     case.dialogue = None
@@ -539,12 +599,71 @@ def test_a2_button_bonus_needs_majority_and_caps_score():
     assert not legacy.useful_button_click
 
 
+def test_a2_repeat_confirmation_click_is_excluded_from_evidence_and_bonus(tmp_path):
+    case = make_case(tmp_path)
+    repeated_question = "Сколько риса вы съели?"
+    case.dialogue = [
+        type(case.dialogue[0]).model_validate({"role": "assistant", "text": repeated_question}),
+        type(case.dialogue[0]).model_validate({"role": "user", "text": "Всю порцию"}),
+        type(case.dialogue[0]).model_validate({"role": "assistant", "text": repeated_question}),
+        type(case.dialogue[0]).model_validate({"role": "user", "text": "Всю порцию"}),
+    ]
+    export = case.persistence_evidence["dialogue_export"]["episodes"][0]
+    export["episode"]["metadata"]["inbound"] = {
+        "channel": "telegram", "sender_id": "owner-1", "chat_id": "chat-product",
+        "metadata": {
+            "message_id": "source-1", "native_message_id": 41,
+            "callback_query": True, "callback_query_id": "synthetic-repeat-click",
+            "callback_data": "ask:0", "native_keyboard_options": ["Всю порцию", "Нет"],
+            "native_keyboard_selected_index": 0, "native_keyboard_selected_label": "Всю порцию",
+            "native_keyboard_prompt": repeated_question,
+        },
+    }
+    assert _button_click_evidence(case) == []
+    votes = [
+        A2Vote(score=5, avoidable_turns=2, repeated_questions=1, reason_codes=["repeat"],
+               useful_button_click=True),
+        A2Vote(score=4, avoidable_turns=1, repeated_questions=1, reason_codes=["repeat"],
+               useful_button_click=True),
+        A2Vote(score=3, avoidable_turns=2, repeated_questions=1, reason_codes=["repeat"],
+               useful_button_click=True),
+    ]
+    aggregate = aggregate_votes(votes, click_evidence=bool(_button_click_evidence(case)))
+    assert aggregate["a2_base_score"] == 4
+    assert aggregate["a2_button_bonus"] == 0
+    assert aggregate["a2_scores"] == 4
+    assert aggregate["a2_avoidable_turns"] == 2
+    assert aggregate["a2_repeated_questions"] == 1
+
+
+def test_a2_single_useful_question_click_remains_eligible(tmp_path):
+    case = make_case(tmp_path)
+    prompt_text = "Сколько риса вы съели?"
+    case.dialogue = [
+        type(case.dialogue[0]).model_validate({"role": "assistant", "text": prompt_text}),
+        type(case.dialogue[0]).model_validate({"role": "user", "text": "Всю порцию"}),
+    ]
+    export = case.persistence_evidence["dialogue_export"]["episodes"][0]
+    export["episode"]["metadata"]["inbound"] = {
+        "channel": "telegram", "sender_id": "owner-1", "chat_id": "chat-product",
+        "metadata": {
+            "message_id": "source-1", "native_message_id": 41,
+            "callback_query": True, "callback_query_id": "synthetic-useful-click",
+            "callback_data": "ask:0", "native_keyboard_options": ["Всю порцию", "Нет"],
+            "native_keyboard_selected_index": 0, "native_keyboard_selected_label": "Всю порцию",
+            "native_keyboard_prompt": prompt_text,
+        },
+    }
+    assert len(_button_click_evidence(case)) == 1
+
+
 def test_a2_prompt_has_current_friction_rubric_with_or_without_click_evidence(tmp_path):
     case = make_case(tmp_path)
     expected = (
         "technical progress narration", "duplicate saved acknowledgement", "meaningful ambiguity",
         "known package", "visible-portion estimate", "pending", "seven or more",
         "No valid native callback evidence", "useful_button_click (boolean)",
+        "After the user selects a portion", "reply instruction as useful",
     )
     prompt = a2_prompt(case)
     assert all(text in prompt for text in expected)
@@ -572,7 +691,7 @@ def test_a2_prompt_has_current_friction_rubric_with_or_without_click_evidence(tm
             "operation_id": goal["operation_id"], "episode_id": "ep-product"},
     }
     prompt_with_click = a2_prompt(case)
-    assert all(text in prompt_with_click for text in expected[:-2])
+    assert all(text in prompt_with_click for text in (*expected[:7], *expected[8:-2]))
     assert "Native callback evidence:" in prompt_with_click
     assert "useful_button_click must be false" not in prompt_with_click
 

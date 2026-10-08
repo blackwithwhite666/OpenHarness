@@ -429,6 +429,7 @@ def _observed_camera_meal_receipt(
         "logical_turn_id": turn_id,
         "tenant_id": "marina",
         "source_principal": "telegram:123",
+        "gateway_session_id": "camera-session",
         "camera_candidate_id": candidate_id,
         "camera_operation_id": candidate_id,
         "camera_answer_bound": "yes",
@@ -609,6 +610,27 @@ async def test_frozen_camera_caption_survives_journal_reload_and_prompt_edit(tmp
     assert await reloaded.claim_initial_prompt_edit(prompt, "123")
     await ingress.close()
     await reloaded.close()
+
+
+@pytest.mark.parametrize("label", ["Всю порцию", "Целую порцию"])
+def test_native_consumption_keyboard_accepts_selected_whole_portion(label):
+    metadata = {
+        "callback_query": True,
+        "native_keyboard_options": [label, "Нет, не ела"],
+        "native_keyboard_selected_index": 0,
+        "native_keyboard_selected_label": label,
+        "callback_data": "ask:0",
+        "native_keyboard_question": "Сколько риса вы съели?",
+        "native_keyboard_reflection_confirmed": True,
+        "native_keyboard_reflection": f"✅ {label}",
+    }
+    assert camera_module._native_button_answer_kind(metadata, label) == "yes"
+
+
+def test_explicit_consumption_with_today_morning_is_not_unbound_as_date_context():
+    assert camera_module._camera_context_answer_kind(
+        "Рис и яйцо съели сегодня утром", source_context="На фото рис"
+    ) == "yes"
 
 
 @pytest.mark.asyncio
@@ -6175,7 +6197,7 @@ async def test_not_food_callback_is_durable_classifier_feedback_not_consumption(
     tmp_path: Path,
 ) -> None:
     ingress, root, bus, telegram = _ingress(tmp_path)
-    captured = datetime(2026, 9, 30, 18, 45, tzinfo=timezone.utc)
+    captured = datetime(2026, 10, 7, 18, 45, tzinfo=timezone.utc)
     request = _candidate(root, capture_time=captured)
     assert (await _admit(ingress, root, "Bearer " + "s" * 40, request))[0] == 202
     await asyncio.wait_for(bus.consume_inbound(), timeout=1)
