@@ -283,6 +283,19 @@ def test_e5_replay_oracle_tracks_denial_without_resurrecting_original_meal():
     assert status == "Исправление уже записано."
 
 
+def test_e5_replay_oracle_accepts_context_replay_when_receipt_and_history_are_verified():
+    status = validate_e5_post_correction_replay(
+        status="Изменение сохранено; баланс обновляется.",
+        delivery_receipt=object(),
+        event_id="assistant-context-date-8",
+        expected_event_id="assistant-context-date-8",
+        original_commit={"event_id": "original-meal-1"},
+        current_commit={"event_id": "original-meal-1"},
+        required_phrase=None,
+    )
+    assert status == "Изменение сохранено; баланс обновляется."
+
+
 @pytest.mark.parametrize(
     ("status", "event_id", "delivery_receipt", "current_commit"),
     [

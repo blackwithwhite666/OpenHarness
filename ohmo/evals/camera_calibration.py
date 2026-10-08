@@ -270,6 +270,91 @@ def effective_meal(case: Case) -> tuple[str, float | None]:
     raise ValueError("effective meal state or kcal is unresolved")
 
 
+def _diagnostic_reviewed_turn_binding(
+    goal: Any, export: object,
+) -> tuple[dict[str, list[str]], dict[str, list[dict[str, Any]]]] | None:
+    """Recompute ordinary source turns for a FAIL-only state diagnostic.
+
+    This intentionally does not grant Camera authority or change the primary
+    dialogue-binding result. It lets the persistence grader ignore no source
+    claims: every ordinary turn must be independently reproducible from the
+    exported inbound envelope, and the root must match the reviewed Goal.
+    """
+    from ohmo.evals.nutrition_persistence import _derive_exported_turn_provenance
+
+    if not isinstance(export, dict) or export.get("privacy") != "private":
+        return None
+    raw_episodes = export.get("episodes")
+    if not isinstance(raw_episodes, list):
+        return None
+    by_id: dict[str, dict[str, Any]] = {}
+    for item in raw_episodes:
+        if not isinstance(item, dict) or not isinstance(item.get("episode"), dict):
+            return None
+        episode_id = item["episode"].get("episode_id")
+        if not isinstance(episode_id, str) or episode_id in by_id:
+            return None
+        by_id[episode_id] = item
+
+    sources: dict[str, list[str]] = {}
+    provenance: dict[str, list[dict[str, Any]]] = {}
+    root_matches = 0
+    identity_fields = (
+        "episode_id", "source_message_id", "logical_turn_id", "operation_id", "principal_id",
+    )
+    for episode_id in goal.episode_ids:
+        item = by_id.get(episode_id)
+        if item is None or item.get("dialogue_complete") is not True:
+            return None
+        episode = item["episode"]
+        episode_metadata = episode.get("metadata")
+        if (
+            episode.get("session_id") != goal.gateway_session_id
+            or not isinstance(episode_metadata, dict)
+            or episode_metadata.get("workspace") != goal.eval_workspace
+        ):
+            return None
+        inbound = episode_metadata.get("inbound")
+        derived = _derive_exported_turn_provenance(episode, inbound)
+        exported_turns = item.get("turn_provenance")
+        if (
+            derived is None
+            or not isinstance(exported_turns, list)
+            or len(exported_turns) != 1
+            or not isinstance(exported_turns[0], dict)
+            or any(exported_turns[0].get(key) != derived.get(key) for key in identity_fields)
+        ):
+            return None
+        if (item.get("trusted_camera_context") or {}).get("kind") == "initial_context":
+            # Initial Camera receipts are deliberately not promoted to source
+            # authority here; the ordinary owner turn below must stand alone.
+            continue
+        source_id = derived.get("source_message_id")
+        source_ids = item.get("source_message_ids")
+        if (
+            not isinstance(source_id, str)
+            or not source_id
+            or not isinstance(source_ids, list)
+            or len(source_ids) != 1
+            or source_ids[0] != source_id
+            or derived.get("principal_id") != goal.principal_id
+            or item.get("principal_id") != goal.principal_id
+        ):
+            return None
+        sources[episode_id] = [source_id]
+        provenance[episode_id] = [{key: derived[key] for key in identity_fields}]
+        if episode_id == goal.trace_episode_id:
+            root_matches += int(
+                source_id == goal.source_message_id
+                and derived.get("logical_turn_id") == goal.logical_turn_id
+                and derived.get("operation_id") == goal.operation_id
+                and derived.get("principal_id") == goal.principal_id
+            )
+    if root_matches != 1:
+        return None
+    return sources, provenance
+
+
 def _score_a1_details(case: Case, reference: Reference) -> dict[str, Any]:
     """Require raw persisted evidence; legacy Case commit booleans are historical only."""
     evidence = case.persistence_evidence
@@ -281,7 +366,8 @@ def _score_a1_details(case: Case, reference: Reference) -> dict[str, Any]:
                 "persistence_stage": "REFERENCE_UNCERTAIN"}
     try:
         from ohmo.evals.nutrition_persistence import (
-            Goal, Manifest, _event_from_raw, _fold_events, grade_manifest,
+            Goal, Manifest, _event_from_raw, _fold_events,
+            bind_wellness_snapshot, grade_manifest,
             validate_dialogue_binding,
         )
 
@@ -289,6 +375,43 @@ def _score_a1_details(case: Case, reference: Reference) -> dict[str, Any]:
         manifest = Manifest(schema_version=1, goals=[goal])
         bound = validate_dialogue_binding(manifest, evidence["dialogue_export"])
         if bound[goal.case_id]["complete"] is not True:
+            expected_turns = []
+            for exported in evidence["dialogue_export"]["episodes"]:
+                if exported.get("episode", {}).get("episode_id") in goal.episode_ids:
+                    expected_turns.extend(
+                        {"role": turn["role"], "text": turn["text"]}
+                        for turn in exported.get("dialogue", [])
+                        if turn.get("role") in {"user", "assistant"}
+                    )
+            same_case = (
+                goal.case_id == case.case_id
+                and goal.source_message_id == case.source_message_id
+                and goal.owner_id == case.owner_id
+                and goal.operation_id == case.operation_id
+                and goal.canonical_meal_id == case.meal_id
+            )
+            same_dialogue = case.dialogue is not None and [
+                turn.model_dump() for turn in case.dialogue
+            ] == expected_turns
+            if same_case and same_dialogue:
+                diagnostic_binding = _diagnostic_reviewed_turn_binding(
+                    goal, evidence["dialogue_export"],
+                )
+                if diagnostic_binding is not None:
+                    diagnostic = grade_manifest(
+                        manifest, evidence["honcho_snapshot"],
+                        bind_wellness_snapshot(evidence["telegent_snapshot"], goal=goal),
+                        reviewed_turn_sources=diagnostic_binding[0],
+                        reviewed_turn_provenance=diagnostic_binding[1],
+                    )[0]
+                    if diagnostic.get("a1") == "FAIL" and diagnostic.get("state_failures"):
+                        return {
+                            "a1": "FAIL",
+                            "reason": "scoped persisted nutrition state proves a reviewed goal mismatch "
+                            "although Camera dialogue source binding is incomplete",
+                            "persistence_stage": diagnostic.get("stage"),
+                            "state_failures": diagnostic["state_failures"],
+                        }
             return {"a1": "INCONCLUSIVE", "reason": "reviewed goal is not bound to complete owner dialogue",
                     "persistence_stage": "DIALOGUE_BINDING_FAILED"}
         expected_turns = []
@@ -311,8 +434,6 @@ def _score_a1_details(case: Case, reference: Reference) -> dict[str, Any]:
             return {"a1": "INCONCLUSIVE", "reason": "reviewed nutrition goal does not bind to product Case identity",
                     "persistence_stage": "CASE_BINDING_FAILED"}
         telegent = evidence["telegent_snapshot"]
-        from ohmo.evals.nutrition_persistence import bind_wellness_snapshot
-
         canonical = bind_wellness_snapshot(telegent, goal=goal)
         result = grade_manifest(manifest, evidence["honcho_snapshot"], canonical,
                                 reviewed_turn_sources=bound[goal.case_id]["reviewed_turn_sources"],
@@ -454,7 +575,10 @@ def a2_prompt(case: Case | JudgeCase) -> str:
         "a separate duplicate saved acknowledgement, duplicate questions, and asking for precise grams "
         "again when a useful known-unit or visible-portion estimate is available. repeated_questions "
         "counts the repeated or unnecessary questions already included in avoidable_turns; do not add "
-        "them a second time when choosing the score. Do not count user turns. A necessary Camera owner "
+        "them a second time when choosing the score. After the user selects a portion, asking them to "
+        "confirm that same selection again is avoidable unless new material ambiguity appeared. Do not "
+        "treat a reply instruction as useful when it only works around the bot failing to honor an option "
+        "the user already selected. Do not count user turns. A necessary Camera owner "
         "confirmation or a question that resolves a meaningful ambiguity is not avoidable. Unknown exact "
         "grams alone do not make such a question necessary for a known package. Do not penalize a useful "
         "substantive estimate, receipt, or notice that a balance remains pending; do not treat honest "
@@ -583,11 +707,19 @@ def _button_click_evidence(case: Case | JudgeCase) -> list[dict[str, Any]]:
             camera_caption = isinstance(prompt_text, str) and re.match(
                 r"^\s*Съели ли вы это\?\s*(?:Фото сделано\b|Дата съёмки неизвестна\b)", prompt_text,
             ) is not None
+            normalized_prompt = re.sub(r"\W+", " ", prompt_text.casefold()).strip() \
+                if isinstance(prompt_text, str) else ""
+            repeated_prompt_count = sum(
+                normalized_prompt in re.sub(r"\W+", " ", turn.text.casefold()).strip()
+                for turn in (case.dialogue or [])
+                if turn.role == "assistant" and normalized_prompt
+            ) if isinstance(case, Case) else 0
             if camera_caption and ctx is None and not feedback_binding:
                 camera_callback_facts = False
             if (
                 not common_binding or not bound_native_episode
                 or not camera_callback_facts
+                or repeated_prompt_count > 1
                 or inbound.get("channel") != "telegram"
                 or md.get("callback_query") is not True
                 or type(md.get("native_message_id")) is not int

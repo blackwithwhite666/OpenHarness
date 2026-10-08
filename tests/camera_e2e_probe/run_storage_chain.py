@@ -19,6 +19,7 @@ from mcp.server.fastmcp.server import FastMCP
 from mcp.types import ToolAnnotations
 
 from ohmo.evals.nutrition_trace import NutritionAnnotationV2
+from ohmo.evals.nutrition_persistence import derive_meal_id
 from ohmo.memory_service.honcho_client import HonchoClient
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -60,6 +61,7 @@ async def main() -> None:
     owner = f"camera_synthetic_{run_id}"
     workspace = f"camera-storage-{run_id}"
     session = "nutrition"
+    gateway_session_id = f"synthetic-camera-session-{run_id}"
     source_message_id = f"synthetic-source-{run_id}"
     device_id = f"camera-watch-{run_id}"
     # This fixed window crosses local midnight in Europe/Moscow. The request
@@ -186,30 +188,40 @@ async def main() -> None:
         kcal: int,
         *,
         reply: str | None = None,
+        items: list[dict] | None = None,
+        consumption_status: str = "consumed",
     ):
+        annotation = {
+            "schema_version": 2,
+            "record_type": "meal_observation",
+            "basis": ["image"],
+            "consumption_status": consumption_status,
+            "meal_at": when.isoformat(),
+            "energy_kcal_min": kcal,
+            "energy_kcal_max": kcal,
+            "energy_kcal_best": kcal,
+        }
+        if items is not None:
+            annotation["items"] = items
         return await append(
-            {
-                "schema_version": 2,
-                "record_type": "meal_observation",
-                "basis": ["image"],
-                "consumption_status": "consumed",
-                "meal_at": when.isoformat(),
-                "energy_kcal_min": kcal,
-                "energy_kcal_max": kcal,
-                "energy_kcal_best": kcal,
-            },
+            annotation,
             phase=phase,
             reply=reply,
         )
 
-    def metadata(annotation: dict, *, operation: str, reply: str | None = None) -> dict:
+    def metadata(
+        annotation: dict, *, operation: str, reply: str | None = None,
+        target_source: str | None = None,
+    ) -> dict:
         validated = NutritionAnnotationV2.model_validate(annotation)
         data = {
             "client_op_id": operation,
             "role": "assistant",
             "tenant_id": owner,
             "source_principal": "telegram:synthetic-owner",
-            "gateway_session_id": session,
+            "gateway_session_id": gateway_session_id,
+            "is_forwarded": False,
+            "is_group": False,
             "logical_turn_id": operation,
             "nutrition_annotation_status": "recorded",
             "decision_trace": {
@@ -221,6 +233,25 @@ async def main() -> None:
             data["source_message_id"] = f"{source_message_id}-{operation}"
         else:
             data["reply_to_source_message_id"] = reply
+        if validated.record_type == "meal_correction":
+            original_source = target_source or f"{source_message_id}-{run_id}-observation"
+            data["target_meal_id"] = derive_meal_id(
+                tenant_id=owner,
+                source_principal="telegram:synthetic-owner",
+                gateway_session_id=gateway_session_id,
+                source_message_id=original_source,
+            )
+            data["selected_source"] = {
+                "schema_version": 1,
+                "tenant_id": owner,
+                "source_principal": "telegram:synthetic-owner",
+                "gateway_session_id": gateway_session_id,
+                "source_message_id": original_source,
+                "append_source_message_id": original_source,
+                "is_private": True,
+                "is_forwarded": False,
+                "is_group": False,
+            }
         return data
 
     try:
@@ -232,7 +263,10 @@ async def main() -> None:
 
             set_energy_fixture()
 
-            async def append(annotation: dict, *, phase: str, reply: str | None = None):
+            async def append(
+                annotation: dict, *, phase: str, reply: str | None = None,
+                target_source: str | None = None,
+            ):
                 operation = f"{run_id}-{phase}"
                 created = await client.create_messages(
                     session,
@@ -240,7 +274,10 @@ async def main() -> None:
                         {
                             "content": f"Synthetic {phase} fixture",
                             "peer_id": "ohmo",
-                            "metadata": metadata(annotation, operation=operation, reply=reply),
+                            "metadata": metadata(
+                                annotation, operation=operation, reply=reply,
+                                target_source=target_source,
+                            ),
                         }
                     ],
                 )
@@ -250,11 +287,13 @@ async def main() -> None:
             outside_before = await append_food(
                 "outside-before", start - timedelta(seconds=1), 71
             )
-            observation = await append_food("observation", start, 320)
+            observation = await append_food(
+                "observation", start, 320,
+                items=[{"name": "рис", "quantity_text": "1 порция"}],
+            )
             outside_after = await append_food(
                 "outside-after", end + timedelta(seconds=1), 83
             )
-            observation_source_message_id = f"{source_message_id}-{run_id}-observation"
             first = await sync_nutrition_honcho(credentials=credentials, db=db)
             original = db.get_record_by_event_id(owner, observation.id)
             assert original is not None, (observation.id, first)
@@ -336,28 +375,30 @@ async def main() -> None:
                 interval["basal_sum"] / 4.184 + interval["active_sum"] / 4.184
             )
             assert replay_intake == 320 and isclose(replay_net, 110)
-            print(
-                f"PASS observation replay event={observation.id} "
-                f"intake={replay_intake} kcal net={replay_net} kcal"
-            )
+            print(f"PASS observation replay intake={replay_intake} kcal net={replay_net} kcal")
 
+            corrected_items = [
+                {"name": "рис", "quantity_text": "1 порция"},
+                {"name": "куриное яйцо", "quantity_text": "1 штука"},
+            ]
             correction = await append(
                 {
                     "schema_version": 2,
                     "record_type": "meal_correction",
                     "changed_fields": [
-                        "consumption_status",
+                        "items", "meal_date", "meal_at",
                         "energy_kcal_min",
                         "energy_kcal_max",
                         "energy_kcal_best",
                     ],
-                    "consumption_status": "not_consumed",
-                    "energy_kcal_min": 0,
-                    "energy_kcal_max": 0,
-                    "energy_kcal_best": 0,
+                    "items": corrected_items,
+                    "meal_date": "2026-10-06",
+                    "meal_at": "2026-10-06T00:05:00+03:00",
+                    "energy_kcal_min": 360,
+                    "energy_kcal_max": 360,
+                    "energy_kcal_best": 360,
                 },
                 phase="correction",
-                reply=observation_source_message_id,
             )
             await sync_nutrition_honcho(credentials=credentials, db=db)
             honcho_after_correction = await client.list_messages_in_window(
@@ -385,10 +426,15 @@ async def main() -> None:
             assert meal is not None
             assert meal.event_ids == [observation.id, correction.id], meal
             assert meal.latest_event_id == correction.id
-            assert meal.consumption_status == "not_consumed"
+            assert meal.consumption_status == "consumed"
+            assert meal.meal_date.isoformat() == "2026-10-06"
+            assert meal.meal_at == datetime.fromisoformat("2026-10-06T00:05:00+03:00")
+            assert [item.name for item in meal.items] == ["рис", "куриное яйцо"]
             payload, meals = await balance()
-            assert meals == [], meals
-            corrected_intake = 0
+            assert len(meals) == 1 and meals[0]["latest_event_id"] == correction.id
+            assert [item["name"] for item in meals[0]["items"]] == ["рис", "куриное яйцо"]
+            corrected_intake = sum(item["energy_kcal_best"] for item in meals)
+            assert corrected_intake == 360
             corrected_interval, = payload["energy_intervals"]
             assert corrected_interval == interval_snapshot
             corrected_expenditure = (
@@ -396,10 +442,9 @@ async def main() -> None:
                 + corrected_interval["active_sum"] / 4.184
             )
             corrected_net = corrected_intake - corrected_expenditure
-            assert isclose(corrected_net, -210)
+            assert isclose(corrected_net, 150)
             print(
-                f"PASS correction event={correction.id} original={observation.id} "
-                f"intake={corrected_intake} kcal "
+                f"PASS same-meal correction intake={corrected_intake} kcal "
                 f"expenditure={corrected_expenditure} kcal "
                 f"net={corrected_net} kcal"
             )
@@ -416,17 +461,87 @@ async def main() -> None:
                 db.get_current_meal(owner, original.meal_id).model_dump(mode="json")
                 == correction_meal
             )
-            assert meals == [], meals
+            assert len(meals) == 1 and sum(m["energy_kcal_best"] for m in meals) == 360
             assert payload["energy_intervals"] == [interval_snapshot]
-            assert isclose(corrected_net, -210)
-            print(
-                f"PASS correction replay event={correction.id} "
-                f"intake=0 kcal net={corrected_net} kcal"
+            assert isclose(corrected_net, 150)
+            print(f"PASS correction replay intake={corrected_intake} kcal net={corrected_net} kcal")
+
+            # Preserve the historical consumed -> denied storage regression as
+            # a separate synthetic meal chain. It must disappear from the
+            # current projection while both immutable events remain available.
+            denial_observation = await append_food(
+                "denial-observation", start + timedelta(minutes=2), 90,
+                items=[{"name": "суп", "quantity_text": "1 порция"}],
             )
-            print(
-                f"PASS exact-event chain: observation={observation.id} "
-                f"correction={correction.id} projection={scratch / 'nutrition.db'}"
+            denial_source = f"{source_message_id}-{run_id}-denial-observation"
+            await sync_nutrition_honcho(credentials=credentials, db=db)
+            denial_original = db.get_record_by_event_id(owner, denial_observation.id)
+            assert denial_original is not None
+            denial_original_snapshot = denial_original.model_dump(mode="json")
+            denial_meal_id = denial_original.meal_id
+            denial_meal = db.get_current_meal(owner, denial_meal_id)
+            assert denial_meal is not None and denial_meal.consumption_status == "consumed"
+            denial = await append(
+                {
+                    "schema_version": 2,
+                    "record_type": "meal_correction",
+                    "changed_fields": [
+                        "consumption_status", "energy_kcal_min",
+                        "energy_kcal_max", "energy_kcal_best",
+                    ],
+                    "consumption_status": "not_consumed",
+                    "energy_kcal_min": 0,
+                    "energy_kcal_max": 0,
+                    "energy_kcal_best": 0,
+                },
+                phase="denial-correction",
+                reply=denial_source,
+                target_source=denial_source,
             )
+            await sync_nutrition_honcho(credentials=credentials, db=db)
+            assert db.get_record_by_event_id(owner, denial_observation.id).model_dump(mode="json") == denial_original_snapshot
+            assert db.get_record_by_event_id(owner, denial.id) is not None
+            denied_meal = db.get_current_meal(owner, denial_meal_id)
+            assert denied_meal is not None
+            assert denied_meal.event_ids == [denial_observation.id, denial.id]
+            assert denied_meal.latest_event_id == denial.id
+            assert denied_meal.consumption_status == "not_consumed"
+            assert denied_meal.energy_kcal_best == 0
+            payload, meals = await balance()
+            assert len(meals) == 1
+            assert meals[0]["latest_event_id"] == correction.id
+            assert sum(item["energy_kcal_best"] for item in meals) == 360
+            assert isclose(360 - corrected_expenditure, 150)
+
+            denial_cursor = db.get_cursor(source_id).cursor
+            all_event_ids = sorted(record.event_id for record in db.iter_records(owner))
+            rice_snapshot = db.get_current_meal(owner, original.meal_id).model_dump(mode="json")
+            denial_snapshot = denied_meal.model_dump(mode="json")
+            await sync_nutrition_honcho(credentials=credentials, db=db)
+            payload, meals = await balance()
+            assert db.get_cursor(source_id).cursor == denial_cursor
+            assert sorted(record.event_id for record in db.iter_records(owner)) == all_event_ids
+            assert db.get_current_meal(owner, original.meal_id).model_dump(mode="json") == rice_snapshot
+            assert db.get_current_meal(owner, denial_meal_id).model_dump(mode="json") == denial_snapshot
+            assert len(meals) == 1 and meals[0]["latest_event_id"] == correction.id
+            assert sum(item["energy_kcal_best"] for item in meals) == 360
+            print("PASS consumed-to-denied correction, immutable history, replay, and exclusion from balance")
+
+            final_snapshot = db.get_current_meal(owner, original.meal_id).model_dump(mode="json")
+            denial_final_snapshot = db.get_current_meal(owner, denial_meal_id).model_dump(mode="json")
+            db.close()
+            db = NutritionDataStore(scratch / "nutrition.db")
+            await sync_nutrition_honcho(credentials=credentials, db=db)
+            restarted = db.get_current_meal(owner, original.meal_id)
+            assert restarted is not None
+            assert restarted.model_dump(mode="json") == final_snapshot
+            assert restarted.event_ids == [observation.id, correction.id]
+            payload, meals = await balance()
+            assert len(meals) == 1 and meals[0]["latest_event_id"] == correction.id
+            assert sum(item["energy_kcal_best"] for item in meals) == 360
+            assert isclose(360 - corrected_expenditure, 150)
+            assert db.get_current_meal(owner, denial_meal_id).model_dump(mode="json") == denial_final_snapshot
+            print("PASS same-meal rice+egg/date projection, immutable history, replay, restart, and balance")
     finally:
         health.close()
         db.close()
