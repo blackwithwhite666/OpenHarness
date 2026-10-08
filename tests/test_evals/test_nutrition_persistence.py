@@ -217,6 +217,38 @@ def test_a1_checks_telegent_composition_and_reviewed_item_quantity_independently
     assert incompatible["stage"] == "HONCHO_QUANTITY_UNRESOLVED"
 
 
+def test_unknown_honcho_quantity_does_not_mask_canonical_state_failures():
+    from ohmo.evals.nutrition_persistence import ExpectedItemQuantity
+
+    rice = {"name": "rice", "quantity_text": "1 serving"}
+    unknown_egg = {"name": "egg", "quantity_text": "unknown amount"}
+    expected = goal().model_copy(update={
+        "expected_items": ["rice", "egg"],
+        "expected_item_quantities": [ExpectedItemQuantity(name="egg", quantity_text="1 item")],
+    })
+
+    def grade_unknown(canonical_items, *, canonical_day="2026-10-01"):
+        event = raw_event(kcal=25)
+        event["metadata"]["decision_trace"]["annotations"]["nutrition"]["items"] = [rice, unknown_egg]
+        honcho, telegent = snapshots([event])
+        telegent["meal"]["items"] = canonical_items
+        telegent["meal"]["day"] = canonical_day
+        telegent["meal"]["meal_date"] = canonical_day
+        return grade_manifest(Manifest(schema_version=1, goals=[expected]), honcho, telegent, now=NOW)[0]
+
+    unresolved = grade_unknown([rice, unknown_egg])
+    assert unresolved["a1"] == "INCONCLUSIVE"
+    assert unresolved["stage"] == "HONCHO_QUANTITY_UNRESOLVED"
+
+    missing_item = grade_unknown([rice])
+    assert missing_item["a1"] == "FAIL" and missing_item["stage"] == "CANONICAL_MISMATCH"
+
+    known_wrong_quantity = grade_unknown([rice, {"name": "egg", "quantity_text": "2 items"}])
+    assert known_wrong_quantity["a1"] == "FAIL" and known_wrong_quantity["stage"] == "CANONICAL_MISMATCH"
+
+    wrong_date = grade_unknown([rice, unknown_egg], canonical_day="2026-10-02")
+    assert wrong_date["a1"] == "FAIL" and wrong_date["stage"] == "CANONICAL_MISMATCH"
+
 def test_a1_does_not_collapse_different_unknown_canonical_quantities():
     rice = {"name": "rice", "quantity_text": "1 serving"}
     event = raw_event(kcal=25)

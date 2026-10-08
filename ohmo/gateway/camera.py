@@ -2264,6 +2264,7 @@ class CameraIngress:
             or observed_annotation.explicit_new_consumption
         ):
             raise ValueError("Camera commit receipt lacks trusted replay and capture semantics")
+        annotation_snapshot = observed_annotation.model_dump(mode="json", exclude_unset=True)
         commit = {
             "event_id": assistant_id,
             "source_message_id": metadata["source_message_id"],
@@ -2276,8 +2277,8 @@ class CameraIngress:
             "photo_received_at": self._attempt_capture_time(attempt).isoformat(),
             "record_type": nutrition.get("record_type"),
             "consumption_status": nutrition.get("consumption_status"),
-            "items": nutrition.get("items", []),
-            "annotation": observed_annotation.model_dump(mode="json", exclude_unset=True),
+            "items": annotation_snapshot.get("items", []),
+            "annotation": annotation_snapshot,
         }
         previous_commit = attempt.get("camera_commit")
         if isinstance(previous_commit, dict) and previous_commit != commit:
@@ -4569,7 +4570,7 @@ class CameraIngress:
                         and isinstance(commit, Mapping)
                         and projection.get("tenant_id") == self.config.tenant_id
                         and projection.get("principal") == self.config.principal
-                        and projection.get("gateway_session_id") == commit.get("gateway_session_id")
+                        and projection.get("original_gateway_session_id") == commit.get("gateway_session_id")
                         and projection.get("source_message_id") == commit.get("source_message_id")
                         and isinstance(projection.get("items"), list)
                     ):

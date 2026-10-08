@@ -422,7 +422,36 @@ async def test_contextual_egg_and_dated_meal_corrections_are_durable_and_replay_
     ]
     assert len(honcho.messages) == 10
     assert honcho.messages[-1].id == third.metadata["nutrition_append_event_id"]
-    assert len(honcho.messages) == 10
+
+    named_date_trace = _trace({
+        "schema_version": 2, "record_type": "meal_correction",
+        "changed_fields": ["meal_date"], "meal_date": "2026-10-08",
+    })
+    scripted = _ScriptedEngine(pool, [(named_date_trace, "Обновила дату порции с яйцом.")])
+    scripted.messages = pool._test_bundle.engine.messages
+    pool._test_bundle.engine = scripted
+    named_followup = InboundMessage(
+        channel="telegram", sender_id="123", chat_id="123",
+        content="Яйцо съела сегодня",
+        timestamp=datetime.fromisoformat("2026-10-08T12:00:00+00:00"),
+        metadata={"message_id": "synthetic-named-egg-after-rotation",
+                  "_telegram_raw_text": "Яйцо съела сегодня", "is_group": False,
+                  "chat_type": "private"},
+    )
+    restarted.process_real_inbound(named_followup)
+    assert named_followup.metadata["_camera_context_meal_target"] is _CAMERA_CONTEXT_MEAL_TARGET_AUTHORITY
+    named_result = await runtime_turn(pool, named_followup, restarted)
+    third_receipt = next(message for message in honcho.messages
+                         if message.id == third.metadata["nutrition_append_event_id"])
+    assert named_result.metadata["nutrition_append_event_id"] not in {
+        original_event_id, first.metadata["nutrition_append_event_id"],
+        second.metadata["nutrition_append_event_id"], third.metadata["nutrition_append_event_id"],
+    }
+    assert honcho.messages[-1].metadata["target_meal_id"] == third_receipt.metadata["target_meal_id"]
+    named_prompt = pool._test_bundle.engine.system_prompt
+    assert "куриное яйцо — 1 штука" in named_prompt
+    assert named_result.metadata["nutrition_committed_annotation"]["record_type"] == "meal_correction"
+    assert len(honcho.messages) == 12
     assert original_event["annotation"]["items"] == original_snapshot["items"]
     await restarted.close()
     await ingress.close()

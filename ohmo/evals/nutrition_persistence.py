@@ -257,67 +257,83 @@ def _trusted_context_target(goal: Goal, event: dict[str, Any], turns: list[dict[
         execution.get("annotation") if execution is not None else None
     )
     proposal_matches = final.get("nutrition_proposal_matches_committed") if isinstance(final, dict) else None
-    fields = ("tenant_id", "source_principal", "gateway_session_id", "current_gateway_session_id",
-              "current_source_message_id", "photo_source_message_id",
+    fields = ("tenant_id", "source_principal", "gateway_session_id", "photo_source_message_id",
               "photo_received_at",
               "consumed_source_message_id", "target_meal_id", "original_receipt_event_id",
               "original_operation_id", "current_receipt_event_id", "current_operation_id",
               "current_logical_turn_id", "current_trace_episode_id")
-    if (evidence is None or type(evidence.get("schema_version")) is not int
-            or evidence.get("schema_version") != 1
-            or any(not isinstance(evidence.get(key), str) or not evidence[key] for key in fields)
-            or evidence.get("tenant_id") != goal.owner_id
-            or evidence.get("source_principal") != goal.principal_id
-            or evidence.get("gateway_session_id") != goal.gateway_session_id
-            or evidence.get("current_gateway_session_id") != event.get("gateway_session_id")
-            or evidence.get("current_source_message_id") != event.get("source_message_id")
-            or evidence.get("current_receipt_event_id") != event.get("event_id")
-            or evidence.get("current_operation_id") != event.get("operation_id")
-            or evidence.get("current_logical_turn_id") != event.get("logical_turn_id")
-            or evidence.get("current_trace_episode_id") != event.get("trace_episode_id")
-            or final.get("nutrition_append_event_id") != event.get("event_id")
-            or execution is None or type(execution.get("schema_version")) is not int
-            or execution.get("schema_version") != 1
-            or committed_annotation is None or proposed_annotation is None
-            or executed_annotation is None
-            or executed_annotation.get("record_type") not in {"meal_correction", "meal_deletion"}
-            or committed_annotation != event.get("annotation")
-            or executed_annotation != proposed_annotation
-            or type(proposal_matches) is not bool
-            or proposal_matches is not (proposed_annotation == committed_annotation)):
+    selected_source = _dict(event.get("metadata", {}).get("selected_source"))
+    legacy_same_session = bool(
+        selected_source is not None
+        and type(selected_source.get("schema_version")) is int
+        and selected_source.get("schema_version") == 1
+    )
+    evidence_checks = [
+        ("evidence", evidence is not None),
+        ("schema", evidence is not None and type(evidence.get("schema_version")) is int and evidence.get("schema_version") == 1),
+        ("fields", evidence is not None and all(isinstance(evidence.get(key), str) and evidence[key] for key in fields)),
+        ("tenant", evidence is not None and evidence.get("tenant_id") == goal.owner_id),
+        ("principal", evidence is not None and evidence.get("source_principal") == goal.principal_id),
+        ("gateway_session", evidence is not None and evidence.get("gateway_session_id") == goal.gateway_session_id),
+        ("current_session", evidence is not None and (
+            evidence.get("current_gateway_session_id") == event.get("gateway_session_id")
+            if not legacy_same_session else event.get("gateway_session_id") == goal.gateway_session_id
+        )),
+        ("current_source", evidence is not None and (
+            evidence.get("current_source_message_id") == event.get("source_message_id")
+            if not legacy_same_session else isinstance(event.get("source_message_id"), str)
+            and bool(event.get("source_message_id"))
+        )),
+        ("current_receipt", evidence is not None and evidence.get("current_receipt_event_id") == event.get("event_id")),
+        ("current_operation", evidence is not None and evidence.get("current_operation_id") == event.get("operation_id")),
+        ("current_logical", evidence is not None and evidence.get("current_logical_turn_id") == event.get("logical_turn_id")),
+        ("current_episode", evidence is not None and evidence.get("current_trace_episode_id") == event.get("trace_episode_id")),
+        ("append_receipt", isinstance(final, dict) and final.get("nutrition_append_event_id") == event.get("event_id")),
+        ("execution", execution is not None and type(execution.get("schema_version")) is int and execution.get("schema_version") == 1),
+        ("annotations", committed_annotation is not None and proposed_annotation is not None and executed_annotation is not None),
+        ("record_type", executed_annotation is not None and executed_annotation.get("record_type") in {"meal_correction", "meal_deletion"}),
+        ("committed", committed_annotation == event.get("annotation")),
+        ("proposed", executed_annotation == proposed_annotation),
+        ("proposal_matches", type(proposal_matches) is bool and proposal_matches is (proposed_annotation == committed_annotation)),
+    ]
+    if not all(passed for _name, passed in evidence_checks):
         return None
     original_rows = [item for item in events if item.get("event_id") == evidence["original_receipt_event_id"]]
     if len(original_rows) != 1:
         return None
     original = original_rows[0]
-    selected_source = _dict(event.get("metadata", {}).get("selected_source"))
     if (
         selected_source is None
-        or set(selected_source) != {
-            "schema_version", "tenant_id", "source_principal", "gateway_session_id",
-            "source_message_id", "append_source_message_id", "is_private",
-            "is_forwarded", "is_group", "original_receipt_event_id",
-            "original_receipt_client_op_id",
-        }
-        or type(selected_source.get("schema_version")) is not int
-        or selected_source.get("schema_version") != 2
         or selected_source.get("tenant_id") != goal.owner_id
         or selected_source.get("source_principal") != goal.principal_id
         or selected_source.get("gateway_session_id") != goal.gateway_session_id
-        or selected_source.get("source_message_id") != goal.source_message_id
-        or selected_source.get("append_source_message_id") != goal.source_message_id
+        or selected_source.get("source_message_id") != evidence.get("photo_source_message_id")
         or selected_source.get("is_private") is not True
         or selected_source.get("is_forwarded") is not False
         or selected_source.get("is_group") is not False
-        or selected_source.get("original_receipt_event_id") != evidence.get("original_receipt_event_id")
-        or selected_source.get("original_receipt_client_op_id") != evidence.get("original_operation_id")
-        or original.get("event_id") != selected_source.get("original_receipt_event_id")
-        or original.get("operation_id") != selected_source.get("original_receipt_client_op_id")
-        or original.get("principal_id") != goal.principal_id
-        or original.get("owner_id") != goal.owner_id
-        or original.get("gateway_session_id") != goal.gateway_session_id
-        or original.get("source_message_id") != goal.source_message_id
     ):
+        return None
+    if type(selected_source.get("schema_version")) is int and selected_source["schema_version"] == 2:
+        if (
+            set(selected_source) != {
+                "schema_version", "tenant_id", "source_principal", "gateway_session_id",
+                "source_message_id", "append_source_message_id", "is_private",
+                "is_forwarded", "is_group", "original_receipt_event_id",
+                "original_receipt_client_op_id",
+            }
+            or selected_source.get("source_message_id") != goal.source_message_id
+            or selected_source.get("append_source_message_id") != goal.source_message_id
+            or selected_source.get("original_receipt_event_id") != evidence.get("original_receipt_event_id")
+            or selected_source.get("original_receipt_client_op_id") != evidence.get("original_operation_id")
+            or original.get("event_id") != selected_source.get("original_receipt_event_id")
+            or original.get("operation_id") != selected_source.get("original_receipt_client_op_id")
+            or original.get("principal_id") != goal.principal_id
+            or original.get("owner_id") != goal.owner_id
+            or original.get("gateway_session_id") != goal.gateway_session_id
+            or original.get("source_message_id") != goal.source_message_id
+        ):
+            return None
+    elif not _same_session_v1_selected_source(goal, event, evidence, selected_source):
         return None
     try:
         _parse_time(evidence["photo_received_at"])
@@ -372,6 +388,32 @@ def _trusted_context_target(goal: Goal, event: dict[str, Any], turns: list[dict[
             ):
         return None
     return evidence["consumed_source_message_id"]
+
+
+def _same_session_v1_selected_source(
+    goal: Goal, event: dict[str, Any], evidence: dict[str, Any],
+    selected_source: dict[str, Any],
+) -> bool:
+    """Retain legacy attachment selection only under its original-session receipt proof."""
+    checks = {
+        "schema": type(selected_source.get("schema_version")) is int
+        and selected_source.get("schema_version") == 1,
+        "keys": set(selected_source) == {
+            "schema_version", "tenant_id", "source_principal", "gateway_session_id",
+            "source_message_id", "append_source_message_id", "is_private",
+            "is_forwarded", "is_group",
+        },
+        "evidence_session": evidence.get("gateway_session_id") == goal.gateway_session_id,
+        "event_session": event.get("gateway_session_id") == goal.gateway_session_id,
+        "tenant": selected_source.get("tenant_id") == goal.owner_id,
+        "principal": selected_source.get("source_principal") == goal.principal_id,
+        "source_session": selected_source.get("gateway_session_id") == goal.gateway_session_id,
+        "photo_source": selected_source.get("source_message_id") == evidence.get("photo_source_message_id"),
+        "private": selected_source.get("is_private") is True,
+        "forwarded": selected_source.get("is_forwarded") is False,
+        "is_group": selected_source.get("is_group") is False,
+    }
+    return all(checks.values())
 
 
 def _is_receipt_reconciled_retry(goal: Goal, event: dict[str, Any], turn: dict[str, Any],
@@ -754,15 +796,31 @@ def _grade_one(goal: Goal, honcho: dict[str, Any], telegent: dict[str, Any], *, 
             context_evidence = context_metadata["nutrition_context_evidence"]
             selected_source = _dict(metadata.get("selected_source"))
             persisted_target = metadata.get("target_meal_id")
+            selected_schema = selected_source.get("schema_version") if selected_source else None
+            selected_v2_valid = bool(
+                selected_source is not None
+                and type(selected_schema) is int and selected_schema == 2
+                and set(selected_source) == {
+                    "schema_version", "tenant_id", "source_principal", "gateway_session_id",
+                    "source_message_id", "append_source_message_id", "is_private",
+                    "is_forwarded", "is_group", "original_receipt_event_id",
+                    "original_receipt_client_op_id",
+                }
+                and selected_source.get("source_message_id") == goal.source_message_id
+                and selected_source.get("append_source_message_id") == goal.source_message_id
+                and selected_source.get("original_receipt_event_id")
+                == context_evidence.get("original_receipt_event_id")
+                and selected_source.get("original_receipt_client_op_id")
+                == context_evidence.get("original_operation_id")
+            )
+            selected_v1_valid = bool(
+                selected_source is not None
+                and _same_session_v1_selected_source(
+                    goal, event, context_evidence, selected_source
+                )
+            )
             if (selected_source is None or not isinstance(persisted_target, str) or not persisted_target
-                    or type(selected_source.get("schema_version")) is not int
-                    or selected_source.get("schema_version") != 2
-                    or set(selected_source) != {
-                        "schema_version", "tenant_id", "source_principal", "gateway_session_id",
-                        "source_message_id", "append_source_message_id", "is_private",
-                        "is_forwarded", "is_group", "original_receipt_event_id",
-                        "original_receipt_client_op_id",
-                    }
+                    or not (selected_v1_valid or selected_v2_valid)
                     or selected_source.get("tenant_id") != goal.owner_id
                     or selected_source.get("source_principal") != goal.principal_id
                     or selected_source.get("gateway_session_id") != goal.gateway_session_id
@@ -774,10 +832,10 @@ def _grade_one(goal: Goal, honcho: dict[str, Any], telegent: dict[str, Any], *, 
             if selected_source.get("source_message_id") != context_evidence.get("photo_source_message_id"):
                 return {**base, "a1": "INCONCLUSIVE", "stage": "HONCHO_SOURCE_MISMATCH",
                         "reason": "persisted photo identity conflicts with the independently receipt-proven occurrence"}
-            if (selected_source.get("original_receipt_event_id")
+            if (selected_schema == 2 and (selected_source.get("original_receipt_event_id")
                     != context_evidence.get("original_receipt_event_id")
                     or selected_source.get("original_receipt_client_op_id")
-                    != context_evidence.get("original_operation_id")):
+                    != context_evidence.get("original_operation_id"))):
                 return {**base, "a1": "INCONCLUSIVE", "stage": "HONCHO_TARGET_UNAVAILABLE",
                         "reason": "selected source lacks the exact original receipt identity"}
             expected_target_meal_id = derive_meal_id(
@@ -1166,10 +1224,6 @@ def _grade_one(goal: Goal, honcho: dict[str, Any], telegent: dict[str, Any], *, 
             "actual_kcal": effective["energy_kcal_best"],
         }
 
-    if goal.expected_item_quantities is not None and goal.expected_consumed and quantity_uncertain:
-        return {**base, "a1": "INCONCLUSIVE", "stage": "HONCHO_QUANTITY_UNRESOLVED",
-                "reason": "persisted item amount cannot be compared with the reviewed quantity"}
-
     # The canonical API identifies only its latest immutable event.
     canonical = telegent.get("meal")
     if canonical is None:
@@ -1194,6 +1248,7 @@ def _grade_one(goal: Goal, honcho: dict[str, Any], telegent: dict[str, Any], *, 
         return {**base, "a1": "FAIL", "stage": "TELEGENT_MISSING", "reason": "persisted meal is absent from canonical read after grace period",
                 "actual_event_ids": [item["event_id"] for item in selected]}
 
+    canonical_quantity_uncertain = False
     try:
         if not isinstance(canonical, dict) or not _valid_canonical_meal(canonical):
             return {**base, "a1": "INCONCLUSIVE", "stage": "CANONICAL_INVALID",
@@ -1271,9 +1326,8 @@ def _grade_one(goal: Goal, honcho: dict[str, Any], telegent: dict[str, Any], *, 
                     ]
                     canonical_total = _aggregate_quantity_identities(canonical_quantities)
                     if canonical_total is None or expected_quantity is None:
-                        return {**base, "a1": "INCONCLUSIVE", "stage": "CANONICAL_QUANTITY_UNRESOLVED",
-                                "reason": "canonical item amount cannot be compared with the reviewed quantity"}
-                    if expected_quantity != canonical_total:
+                        canonical_quantity_uncertain = True
+                    elif expected_quantity != canonical_total:
                         raise ValueError("canonical item quantity total differs from reviewed source expectation")
         if consumed != goal.expected_consumed:
             raise ValueError("effective current consumption state differs from expected goal")
@@ -1287,6 +1341,9 @@ def _grade_one(goal: Goal, honcho: dict[str, Any], telegent: dict[str, Any], *, 
                 "actual_event_ids": [item["event_id"] for item in selected],
                 "actual_latest_event_id": canonical.get("latest_event_id") if isinstance(canonical, dict) else None,
                 "actual_kcal": canonical.get("energy_kcal_best") if isinstance(canonical, dict) else None}
+    if quantity_uncertain or canonical_quantity_uncertain:
+        return {**base, "a1": "INCONCLUSIVE", "stage": "HONCHO_QUANTITY_UNRESOLVED",
+                "reason": "persisted item amount cannot be compared with the reviewed quantity"}
     result = {**base, "a1": "PASS", "stage": "SAME_EVENT_PROJECTED",
               "reason": "same validated persisted latest event is current in canonical meal read",
               "actual_event_ids": [item["event_id"] for item in selected],

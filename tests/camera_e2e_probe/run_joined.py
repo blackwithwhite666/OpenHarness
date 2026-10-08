@@ -487,18 +487,28 @@ async def verify_e5_projection_stage(
         replayed = db.get_current_meal("synthetic_owner", meal_id)
         if replayed is None or replayed.model_dump(mode="json") != snapshot:
             raise AssertionError("E5 sync replay changed current meal or immutable event selection")
+        if expected_day is None:
+            raise AssertionError("E5 current meal has no expected day for wellness projection")
+        current_records = (
+            source_records if expected_day == source_day
+            else corrected_records if expected_day == corrected_day
+            else await day_records(expected_day)
+        )
         public_meals = [
-            row for row in corrected_records
+            row for row in current_records
             if row.get("latest_event_id") == latest_event_id
         ]
-        if len(public_meals) != 1:
+        if expected_status == "not_consumed":
+            if public_meals:
+                raise AssertionError("E5 denial event unexpectedly appears in public wellness output")
+        elif len(public_meals) != 1:
             raise AssertionError("Telegent wellness output omitted the exact current correction event")
         return {
             "latest_event_id": latest_event_id, "meal_id": meal_id,
             "meal_day": current_day, "meal_at": current.meal_at.isoformat() if current.meal_at else None,
             "kcal": current.energy_kcal_best, "status": current.consumption_status,
             "items": current_items,
-            "canonical_meal": public_meals[0],
+            "canonical_meal": public_meals[0] if public_meals else None,
             "source_day_intake": source_intake, "corrected_day_intake": corrected_intake,
             "projection": str(directory), "reopened": True, "sync_replay_stable": True,
         }
