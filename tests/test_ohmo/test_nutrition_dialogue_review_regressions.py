@@ -419,7 +419,7 @@ async def test_selected_delivered_photo_uses_capture_time_and_receipt(tmp_path, 
         assert saved["photo_occurrence_source"]["source_message_id"] == str(
             ingress._attempts[request["candidate_id"]]["photo_id"]
         )
-        assert datetime.fromisoformat(saved["decision_trace"]["annotations"]["nutrition"]["meal_at"]) == capture_time
+        assert datetime.fromisoformat(saved["decision_trace"]["annotations"]["nutrition"]["meal_at"].replace("Z", "+00:00")) == capture_time
         assert saved["decision_trace"]["annotations"]["nutrition"]["items"][0]["quantity_text"] == "1 bowl"
         assert ingress._attempts[request["candidate_id"]]["attention_active"] is False
         assert "camera_commit" not in ingress._attempts[request["candidate_id"]]

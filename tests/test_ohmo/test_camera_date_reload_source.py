@@ -161,7 +161,7 @@ async def test_only_explicit_verified_choice_binds_an_owned_photo(
             assert occurrence["attachment_id"] == ref.attachment_id
             assert occurrence["source_message_id"] == source_id
             assert occurrence["append_source_message_id"] == "8102"
-            assert datetime.fromisoformat(meal_at) == source_time
+            assert datetime.fromisoformat(meal_at.replace("Z", "+00:00")) == source_time
         else:
             assert occurrence is None
             assert meal_at is None
