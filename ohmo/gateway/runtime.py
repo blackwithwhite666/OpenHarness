@@ -586,6 +586,7 @@ def _camera_eval_capture_provenance(
         "candidate_id": candidate_id, "native_photo_id": photo_id,
         "tenant_id": scope.private_tenant, "gateway_session_id": turn_ctx.session_id,
         "recipient_principal": principal,
+        "capture_time": _trusted_utc_iso(metadata.get("_camera_capture_time")),
     }
     if message.sender_id == "__camera__":
         source_principal = assistant_metadata.get("source_principal")
@@ -620,6 +621,48 @@ def _nutrition_annotation_metadata(annotation: NutritionAnnotationV2) -> dict[st
     return annotation.model_dump(
         mode="json", exclude_unset=annotation.record_type == "meal_correction"
     )
+
+
+def _confirmed_nutrition_append_receipt(
+    append_receipt: ConversationAppendReceipt,
+    receipt_metadata: Mapping[str, object],
+    annotation: NutritionAnnotationV2,
+) -> dict[str, object] | None:
+    """Export a compact projection of the exact persisted append receipt."""
+    event_id = append_receipt.assistant_message_id
+    op_id = append_receipt.assistant_client_op_id
+    logical = receipt_metadata.get("logical_turn_id")
+    if (
+        not isinstance(event_id, str) or not event_id
+        or not isinstance(op_id, str) or not isinstance(logical, str) or not logical
+        or op_id != f"{logical}:assistant"
+        or append_receipt.user_client_op_id != f"{logical}:user"
+        or receipt_metadata.get("client_op_id") != op_id
+        or receipt_metadata.get("role") != "assistant"
+        or receipt_metadata.get("ingest_source") not in {"telegram", "dropbox_camera"}
+        or not all(isinstance(receipt_metadata.get(key), str) and receipt_metadata.get(key)
+                   for key in ("tenant_id", "source_principal", "gateway_session_id",
+                               "source_message_id", "decision_trace_episode_id"))
+    ):
+        return None
+    receipt: dict[str, object] = {
+        "schema_version": 1,
+        "event_id": event_id,
+        "client_op_id": op_id,
+        "user_client_op_id": append_receipt.user_client_op_id,
+        "logical_turn_id": logical,
+        "trace_episode_id": receipt_metadata["decision_trace_episode_id"],
+        "tenant_id": receipt_metadata["tenant_id"],
+        "source_principal": receipt_metadata["source_principal"],
+        "gateway_session_id": receipt_metadata["gateway_session_id"],
+        "source_message_id": receipt_metadata["source_message_id"],
+        "ingest_source": receipt_metadata["ingest_source"],
+        "annotation": _nutrition_annotation_metadata(annotation),
+    }
+    for key in ("selected_source", "photo_occurrence_source", "target_meal_id"):
+        if key in receipt_metadata:
+            receipt[key] = receipt_metadata[key]
+    return receipt
 
 
 def _committed_nutrition_reply(
@@ -1983,6 +2026,18 @@ class OhmoSessionRuntimePool:
                 metadata={"_session_key": session_key},
             )
             return
+        # A finalized gateway turn can be replayed by the transport after the
+        # engine has already advanced. Reconcile its exact durable operation
+        # before QueryEngine applies its intentionally strict stale-turn rule.
+        if await self._confirmed_exact_owner_replay(
+            bundle=bundle,
+            message=message,
+            user_message=user_message,
+            user_text=message.content or user_prompt,
+            turn_ctx=turn_ctx,
+            memory_scope=memory_scope,
+        ):
+            return
         system_prompt = await self._runtime_system_prompt(
             bundle,
             user_prompt,
@@ -2284,6 +2339,14 @@ class OhmoSessionRuntimePool:
             else None
         )
         if (
+            selected_source is not None
+            and selected_source.get("source_origin") == "dropbox_camera"
+            and selected_source.get("tenant_id") == getattr(memory_scope, "private_tenant", None)
+            and selected_source.get("source_principal")
+            == f"{message.channel}:{canonical_principal(message.channel, turn_ctx.principal)}"
+        ):
+            metadata["nutrition_selected_source_review"] = dict(selected_source)
+        if (
             receipt_matches_turn
             and selected_source is not None
             and selected_source.get("source_origin") == "dropbox_camera"
@@ -2310,6 +2373,9 @@ class OhmoSessionRuntimePool:
             if stored_meal is not None and append_receipt is not None:
                 metadata.update(
                     nutrition_append_event_id=append_receipt.assistant_message_id,
+                    nutrition_actual_append_receipt=_confirmed_nutrition_append_receipt(
+                        append_receipt, receipt_metadata, stored_meal
+                    ),
                     nutrition_sync_status="pending",
                     nutrition_committed_annotation=_nutrition_annotation_metadata(stored_meal),
                     nutrition_model_proposal_annotation=_nutrition_annotation_metadata(finalizer_nutrition),
@@ -2365,6 +2431,9 @@ class OhmoSessionRuntimePool:
             } and append_receipt is not None:
                 metadata.update(
                     nutrition_append_event_id=append_receipt.assistant_message_id,
+                    nutrition_actual_append_receipt=_confirmed_nutrition_append_receipt(
+                        append_receipt, receipt_metadata, stored_correction
+                    ),
                     nutrition_sync_status="pending",
                     nutrition_committed_annotation=_nutrition_annotation_metadata(stored_correction),
                     nutrition_model_proposal_annotation=_nutrition_annotation_metadata(finalizer_nutrition),
@@ -2406,6 +2475,84 @@ class OhmoSessionRuntimePool:
                     exc_info=True,
                 )
 
+    async def _confirmed_exact_owner_replay(
+        self,
+        *,
+        bundle: RuntimeBundle,
+        message: InboundMessage,
+        user_message: ConversationMessage | str,
+        user_text: str,
+        turn_ctx: TurnContext,
+        memory_scope: MemoryScope | None,
+    ) -> bool:
+        """Recognize only a fully matched prior private owner exchange."""
+        source_id = _normalize_source_message_ref((message.metadata or {}).get("message_id"))
+        owner_principal = canonical_principal("telegram", turn_ctx.principal)
+        configured_tenant = self._gateway_config.family_principals.get(owner_principal)
+        if (
+            source_id is None
+            or not isinstance(user_message, ConversationMessage)
+            or message.channel != "telegram"
+            or turn_ctx.channel != "telegram"
+            or (turn_ctx.is_owner is not True
+                and configured_tenant != getattr(memory_scope, "private_tenant", None))
+            or not turn_ctx.is_private
+            or turn_ctx.is_forwarded
+            or not is_private_message(message)
+            or message.sender_id == "__camera__"
+            or (message.metadata or {}).get("is_group") is not False
+            or memory_scope is None
+            or not self._honcho_turn_allowed(turn_ctx, memory_scope)
+        ):
+            return False
+        event_id = user_message.event_id
+        history = getattr(bundle.engine, "messages", [])
+        if not isinstance(event_id, str) or not isinstance(history, list):
+            return False
+        matching = [
+            index for index, prior in enumerate(history)
+            if isinstance(prior, ConversationMessage)
+            and prior.role == "user" and prior.event_id == event_id
+        ]
+        if not matching:
+            return False
+        logical_turn_id = _logical_turn_id_for_conversation(turn_ctx=turn_ctx, message=message)
+        backend = self._shadow_backend_for_scope(memory_scope)
+        if backend is None:
+            return False
+        try:
+            receipt = await backend.reconcile_durable_exchange(
+                f"{logical_turn_id}:user", f"{logical_turn_id}:assistant"
+            )
+        except (ConversationReconciliationError, HonchoError):
+            return False
+        if receipt is None:
+            return False
+        metadata = receipt.assistant_metadata
+        expected_principal = f"telegram:{canonical_principal('telegram', turn_ctx.principal)}"
+        return bool(
+            isinstance(receipt.user_message_id, str)
+            and receipt.user_message_id
+            and isinstance(receipt.assistant_message_id, str)
+            and receipt.assistant_message_id
+            and receipt.user_client_op_id == f"{logical_turn_id}:user"
+            and receipt.assistant_client_op_id == f"{logical_turn_id}:assistant"
+            and isinstance(receipt.user_content, str)
+            and receipt.user_content == user_text
+            and isinstance(receipt.assistant_content, str)
+            and bool(receipt.assistant_content.strip())
+            and metadata.get("role") == "assistant"
+            and metadata.get("logical_turn_id") == logical_turn_id
+            and metadata.get("client_op_id") == receipt.assistant_client_op_id
+            and metadata.get("tenant_id") == memory_scope.private_tenant
+            and metadata.get("source_principal") == expected_principal
+            and metadata.get("gateway_session_id") == turn_ctx.session_id == bundle.session_id
+            and metadata.get("source_message_id") == source_id
+            and metadata.get("is_group") is False
+            and metadata.get("is_forwarded") is False
+            and metadata.get("ingest_source") in {"telegram", "dropbox_camera"}
+        )
+
     async def _append_conversation_turn(
         self,
         *,
@@ -2445,6 +2592,27 @@ class OhmoSessionRuntimePool:
             and selected_binding[0] is _SELECTED_SOURCE_AUTHORITY
             and isinstance(selected_binding[1], Mapping)
         )
+        selected_binding_value = (
+            selected_binding[1]
+            if isinstance(selected_binding, tuple)
+            and len(selected_binding) == 2
+            and selected_binding[0] is _SELECTED_SOURCE_AUTHORITY
+            and isinstance(selected_binding[1], Mapping)
+            else None
+        )
+        if (
+            validated is not None
+            and validated.record_type == "meal_observation"
+            and validated.consumption_status == "consumed"
+            and selected_binding_value is not None
+            and isinstance(selected_binding_value.get("original_receipt_event_id"), str)
+            and selected_binding_value.get("original_receipt_event_id")
+            and validated.explicit_new_consumption is not True
+        ):
+            # A source selection that already resolves to a consumed append is
+            # a duplicate observation unless the structured annotation marks a
+            # separate consumption. Corrections remain eligible below.
+            return None
         if (
             validated is not None
             and validated.record_type in {"meal_correction", "meal_deletion"}

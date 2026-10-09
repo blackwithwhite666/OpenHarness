@@ -961,6 +961,149 @@ async def verify_zero_meals_before_answer(
         db.close()
 
 
+async def verify_actual_camera_grade(
+    *, root: Path, url: str, workspace: str, session: str,
+    started: datetime, answer, capture_time: datetime,
+    expected_consumed: bool, expected_kcal: float | None,
+    expected_latest_event_id: str | None,
+    meal_day: date,
+) -> dict[str, object]:
+    """Grade the recorded Camera owner turn against fresh complete service reads."""
+    import sqlite3
+
+    from mcp.server.fastmcp.server import FastMCP
+    from mcp.types import ToolAnnotations
+    from ohmo.evals.nutrition_persistence import (
+        Goal, Manifest, bind_wellness_snapshot, derive_meal_id,
+        export_eval_dialogue, grade_manifest, read_honcho_messages,
+        validate_dialogue_binding,
+    )
+    from telegent.health_advisor.nutrition.config import NutritionHonchoCredentials
+    from telegent.health_advisor.nutrition.store import NutritionDataStore
+    from telegent.health_advisor.nutrition.sync import sync_nutrition_honcho
+    from telegent.health_advisor.storage import HealthDataStore
+    from telegent.mcp_simple_auth.wellness import register_wellness_tools
+    from probe_support import call_wellness_with_synthetic_self, synthetic_wellness_self_scope
+
+    eval_root = root / "evals"
+    with sqlite3.connect(f"{(eval_root / 'evals.sqlite').as_uri()}?mode=ro", uri=True) as connection:
+        episode_ids = [row[0] for row in connection.execute(
+            "SELECT episode_id FROM episodes ORDER BY created_at, episode_id"
+        ).fetchall()]
+    exported = export_eval_dialogue(eval_root, episode_ids=episode_ids)
+    episode_ids = [item["episode"]["episode_id"] for item in exported["episodes"]
+                   if item.get("trusted_camera_context", {}).get("kind") == "initial_context"
+                   or any("gateway_final_metadata" in turn
+                          for turn in item["turn_provenance"])]
+    exported = export_eval_dialogue(eval_root, episode_ids=episode_ids)
+    source_id = str(answer.metadata["message_id"])
+    owner_episodes = [item for item in exported["episodes"]
+                      if source_id in item["source_message_ids"]
+                      and any(turn.get("source_message_id") == source_id
+                              for turn in item["turn_provenance"])]
+    if not owner_episodes:
+        raise AssertionError("recorder export lacks the ordinary owner turn")
+    owner_episodes.sort(key=lambda item: item["episode"]["created_at"])
+    root_episode = owner_episodes[0]
+    root_turn = next(turn for turn in root_episode["turn_provenance"]
+                     if turn.get("source_message_id") == source_id)
+    gateway_session = root_episode["episode"]["session_id"]
+    as_of = datetime.now(timezone.utc)
+    goal = Goal(
+        case_id="actual-camera-owner", episode_ids=episode_ids,
+        owner_id="synthetic_owner", principal_id="telegram:123",
+        workspace_id=workspace, eval_workspace=str(root), peer_id="ohmo",
+        canonical_owner_id="synthetic_owner", canonical_login="synthetic_owner",
+        session_id=session, gateway_session_id=gateway_session,
+        source_message_id=source_id, meal_date=meal_day, meal_timezone="UTC",
+        trajectory_started_at=started, trajectory_as_of=as_of,
+        logical_turn_id=root_turn["logical_turn_id"],
+        trace_episode_id=root_episode["episode"]["episode_id"],
+        operation_id=root_turn["operation_id"],
+        canonical_meal_id=derive_meal_id(
+            tenant_id="synthetic_owner", source_principal="telegram:123",
+            gateway_session_id=gateway_session, source_message_id=source_id,
+        ),
+        expected_consumed=expected_consumed, expected_kcal=expected_kcal,
+        expectation_origin="explicit_fixture",
+        expectation_source="offline-scripted-owner-and-photo-fixture",
+    )
+    manifest = Manifest(schema_version=1, goals=[goal])
+    binding = validate_dialogue_binding(manifest, exported)[goal.case_id]
+    if not binding["complete"]:
+        raise AssertionError(f"actual recorder source binding incomplete: {binding['reason']}")
+    honcho = await read_honcho_messages(
+        base_url=url, api_key="local-auth-disabled", workspace=workspace,
+        session=session, owner_id=goal.owner_id,
+        since=started - timedelta(minutes=1),
+        until=datetime.now(timezone.utc), peer_id="ohmo",
+    )
+    if honcho.get("complete") is not True:
+        raise AssertionError(f"actual Honcho read incomplete: {honcho}")
+    directory = create_storage_run_dir(ROOT)
+    db = NutritionDataStore(directory / "nutrition.db")
+    health = HealthDataStore(directory / "health.db")
+    credentials = NutritionHonchoCredentials.model_validate({
+        "schema_version": 1, "base_url": url,
+        "sources": [{"user_id": "synthetic_owner", "workspace": workspace,
+                     "session": session, "workspace_jwt": "local-auth-disabled",
+                     "start_at": (started - timedelta(days=2)).isoformat(),
+                     "device_ids": [], "timezone": "UTC"}],
+    })
+    registry, auth_context, authorized = synthetic_wellness_self_scope("synthetic_owner")
+    app = FastMCP(name="camera-actual-grade-probe")
+
+    async def get_health_store():
+        return health
+
+    async def get_nutrition_store():
+        return db
+
+    register_wellness_tools(
+        app, read_only_annotations=ToolAnnotations(readOnlyHint=True),
+        get_health_store=get_health_store, get_nutrition_store=get_nutrition_store,
+        participant_registry=registry, authorization_context=auth_context,
+    )
+    try:
+        await sync_nutrition_honcho(credentials=credentials, db=db)
+        read_start = datetime.combine(min(meal_day, capture_time.date()),
+                                      datetime.min.time(), timezone.utc)
+        read_end = datetime.now(timezone.utc)
+        result = await call_wellness_with_synthetic_self(
+            app, auth_context, authorized,
+            {"params": {"start": read_start.isoformat(), "end": read_end.isoformat()}},
+        )
+        body = result[1]
+        if body.get("nutrition_status") != "complete":
+            raise AssertionError(f"actual Telegent nutrition read incomplete: {body.get('nutrition_status')}")
+        queried = datetime.now(timezone.utc)
+        wellness = bind_wellness_snapshot({
+            "complete": True, "user_id": goal.canonical_owner_id,
+            "login": goal.canonical_login, "start": read_start.isoformat(),
+            "end": read_end.isoformat(), "queried_at": queried.isoformat(),
+            "meals": body["nutrition_records"],
+            "unassigned": body["nutrition_unassigned_records"],
+        }, goal=goal)
+        grade = grade_manifest(
+            manifest, honcho, wellness, now=queried,
+            reviewed_turn_sources=binding["reviewed_turn_sources"],
+            reviewed_turn_provenance=binding["reviewed_turn_provenance"],
+        )[0]
+        expected = (("FAIL", "HONCHO_MISSING_WRITE") if expected_consumed
+                    and expected_latest_event_id is None else
+                    ("PASS", "SAME_EVENT_PROJECTED") if expected_consumed
+                    else ("PASS", "COMPLETE_ABSENCE"))
+        if (grade["a1"], grade["stage"]) != expected:
+            raise AssertionError(f"actual Camera grader mismatch: {grade}")
+        if expected_latest_event_id is not None and grade.get("actual_latest_event_id") != expected_latest_event_id:
+            raise AssertionError(f"grader selected wrong latest event: {grade}")
+        print(f"PASS actual Camera grader a1={grade['a1']} stage={grade['stage']}", flush=True)
+        return grade
+    finally:
+        health.close()
+        db.close()
+
+
 class LocalCameraTransport(httpx.BaseTransport):
     def __init__(self, port: int) -> None:
         self._transport = httpx.HTTPTransport(proxy=None)
@@ -1012,6 +1155,7 @@ async def main() -> None:
     mode = os.environ.get("CAMERA_RUN_MODE", "offline")
     restart_join = os.environ.get("CAMERA_RESTART_JOIN", "")
     correction_join = os.environ.get("CAMERA_CORRECTION_JOIN", "")
+    missing_write_review = os.environ.get("CAMERA_MISSING_WRITE_REVIEW") == "1"
     if restart_join not in {"", "two-photo"}:
         raise RuntimeError("CAMERA_RESTART_JOIN must be two-photo")
     if restart_join and mode != "offline":
@@ -1020,11 +1164,15 @@ async def main() -> None:
         raise RuntimeError("CAMERA_CORRECTION_JOIN must be portion-denial or context-items-date")
     if correction_join and mode != "offline":
         raise RuntimeError("Camera correction join is deterministic and offline-only")
+    if missing_write_review and (mode != "offline" or correction_join or restart_join):
+        raise RuntimeError("missing-write review requires standalone offline mode")
     append_fault = os.environ.get("CAMERA_HONCHO_APPEND_FAULT", "")
     if append_fault not in {"", "before", "timeout-after"}:
         raise RuntimeError("CAMERA_HONCHO_APPEND_FAULT must be before or timeout-after")
     if append_fault and mode != "offline":
         raise RuntimeError("Camera append fault injection is deterministic and offline-only")
+    if append_fault and missing_write_review:
+        raise RuntimeError("missing-write review and append transport fault are separate fixtures")
     if mode not in {"offline", "native"}:
         raise RuntimeError("CAMERA_RUN_MODE must be offline or native")
     if mode == "native" and not acceptance:
@@ -1069,7 +1217,8 @@ async def main() -> None:
         )
     else:
         bot_client, user_client = distinct_offline_clients(
-            context_items_date=correction_join == "context-items-date"
+            context_items_date=correction_join == "context-items-date",
+            omit_nutrition_annotation=missing_write_review,
         )
         user_scenario = "synthetic offline owner selects the exact offered confirmation"
 
@@ -1426,6 +1575,7 @@ async def main() -> None:
                 advance_before_owner_action=bool(restart_join),
                 restart_before_replay=bool(restart_join or correction_join) or append_fault == "timeout-after",
                 expect_append_failure=append_fault == "before",
+                expect_missing_nutrition=missing_write_review,
                 after_save=(
                     append_runtime_corrections if correction_join else None
                 ),
@@ -1444,13 +1594,24 @@ async def main() -> None:
             producer_replay = await asyncio.to_thread(pipeline.run_once)
             if producer_replay.duplicate_suppression != 1:
                 raise AssertionError("producer replay was not suppressed")
-            if append_fault == "before":
-                if event_id is not None or not trajectory["owner_failure_text"]:
-                    raise AssertionError("failed append returned a receipt or no truthful response")
+            if append_fault == "before" or missing_write_review:
+                if event_id is not None or not trajectory.get("final_status_text"):
+                    raise AssertionError("unsaved owner turn returned a receipt or no response")
                 await verify_failed_append_absence(
                     url=honcho_url, workspace=workspace, session=session,
                     started=trajectory["started"],
                 )
+                if missing_write_review:
+                    for reviewed_consumed in (True, False):
+                        await verify_actual_camera_grade(
+                            root=root, url=honcho_url, workspace=workspace,
+                            session=session, started=trajectory["started"],
+                            answer=trajectory["answer"], capture_time=trajectory["capture_time"],
+                            expected_consumed=reviewed_consumed,
+                            expected_kcal=125 if reviewed_consumed else None,
+                            expected_latest_event_id=None,
+                            meal_day=trajectory["capture_time"].date(),
+                        )
             else:
                 if not isinstance(event_id, str) or event_id != trajectory["receipt"]["event_id"]:
                     raise AssertionError("runtime returned no durable event receipt")
@@ -1494,6 +1655,18 @@ async def main() -> None:
                     original_row = next(row for row in nutrition_rows if row["id"] == event_id)
                     if e5_raw_honcho_row_fingerprint(original_row) != corrections["original_row_fingerprint"]:
                         raise AssertionError("replay or correction mutated the original Honcho row")
+                await verify_actual_camera_grade(
+                    root=root, url=honcho_url, workspace=workspace,
+                    session=session, started=trajectory["started"],
+                    answer=trajectory["answer"], capture_time=trajectory["capture_time"],
+                    expected_consumed=correction_join != "portion-denial",
+                    expected_kcal=(225 if correction_join == "context-items-date" else 125)
+                    if correction_join != "portion-denial" else None,
+                    expected_latest_event_id=(corrections["latest_event_id"] if corrections else event_id)
+                    if correction_join != "portion-denial" else None,
+                    meal_day=(trajectory["capture_time"] - timedelta(days=1)).date()
+                    if correction_join == "context-items-date" else trajectory["capture_time"].date(),
+                )
             expected_photo_count = 2 if restart_join == "two-photo" else 1
             if sum(name == "send_photo" for name, _ in fake_bot.calls) != expected_photo_count:
                 raise AssertionError("replay emitted another photo")

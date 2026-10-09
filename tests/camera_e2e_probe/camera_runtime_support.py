@@ -228,11 +228,13 @@ class OfflineCameraBotApi:
 
     synthetic = True
 
-    def __init__(self, *, candidate_id: str | None = None, context_items_date: bool = False) -> None:
+    def __init__(self, *, candidate_id: str | None = None, context_items_date: bool = False,
+                 omit_nutrition_annotation: bool = False) -> None:
         self.calls = 0
         self.finalization_proposals = 0
         self.candidate_id = candidate_id
         self.context_items_date = context_items_date
+        self.omit_nutrition_annotation = omit_nutrition_annotation
         self._queued_correction: dict[str, Any] | None = None
 
     def queue_correction(self, nutrition: dict[str, Any]) -> None:
@@ -301,6 +303,11 @@ class OfflineCameraBotApi:
             )]), "tool_use")
             return
         if len(current_results) == 1:
+            if self.omit_nutrition_annotation:
+                yield self._emit(ConversationMessage(role="assistant", content=[
+                    TextBlock(text="I reviewed the selected image and your portion report.")
+                ]), "end_turn")
+                return
             nutrition = self._queued_correction
             self._queued_correction = None
             if nutrition is None:
@@ -473,10 +480,12 @@ class OfflineTelegramBot:
         self.calls.append(("send_chat_action", kwargs))
 
 
-def distinct_offline_clients(*, context_items_date: bool = False):
+def distinct_offline_clients(*, context_items_date: bool = False,
+                             omit_nutrition_annotation: bool = False):
     """Create distinct bot/user fake clients for the explicit offline mode."""
     return (
-        OfflineCameraBotApi(context_items_date=context_items_date),
+        OfflineCameraBotApi(context_items_date=context_items_date,
+                            omit_nutrition_annotation=omit_nutrition_annotation),
         OfflineCameraUserApi(
             SYNTHETIC_WHOLE_PORTION if context_items_date else SYNTHETIC_BUTTON_LABEL
         ),
@@ -559,6 +568,7 @@ async def run_camera_runtime_trajectory(
     advance_before_owner_action: bool = False,
     restart_before_replay: bool = False,
     expect_append_failure: bool = False,
+    expect_missing_nutrition: bool = False,
     after_save=None,
 ):
     """Run an initial Camera delivery and a generic ordinary owner turn."""
@@ -785,6 +795,16 @@ async def run_camera_runtime_trajectory(
                 "source_candidate_id": candidate_id, "ingress": ingress,
                 "route": "ordinary", "camera_clock_advanced": controlled_now[0] - controlled_clock_start,
             }
+        if expect_missing_nutrition:
+            if event_id is not None or delivery_receipt is not None or not final_text:
+                raise AssertionError("annotation-free owner turn unexpectedly saved nutrition")
+            return {
+                "started": first_started, "answer": answer, "capture_time": capture_time,
+                "event_id": None, "receipt": None, "final_status_text": final_text,
+                "native_photo_id": native_photo, "source_candidate_id": candidate_id,
+                "ingress": ingress, "route": "ordinary",
+                "camera_clock_advanced": controlled_now[0] - controlled_clock_start,
+            }
         if not isinstance(event_id, str) or not event_id or delivery_receipt is None:
             raise AssertionError("ordinary owner turn did not return a durable append and delivery receipt")
 
@@ -802,8 +822,8 @@ async def run_camera_runtime_trajectory(
         replay_delivered, replay_receipt, replay_event_id = await process_and_deliver(
             answer, answer.session_key or "telegram:123"
         )
-        if replay_event_id is not None:
-            raise AssertionError("owner replay appended another nutrition event")
+        if replay_delivered or replay_receipt is not None or replay_event_id is not None:
+            raise AssertionError("exact owner transport replay was not silent")
         if isinstance(bot_client, OfflineCameraBotApi):
             expected_proposals = 1 + (
                 len(after_save_result["correction_event_ids"]) if after_save_result else 0

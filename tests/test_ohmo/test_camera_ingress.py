@@ -17,6 +17,8 @@ import pytest
 
 import ohmo.gateway.camera as camera_module
 from ohmo.gateway.camera import (
+    _attempt_caption,
+    _camera_caption,
     _PENDING_TTL_SECONDS,
     _find_recent_attachment_duplicate,
     CAMERA_AUTHORITY,
@@ -629,6 +631,27 @@ async def test_frozen_camera_caption_survives_journal_reload_and_prompt_edit(tmp
     await reloaded.close()
 
 
+def test_camera_caption_uses_local_factual_time_and_relative_window():
+    from datetime import timedelta
+
+    captured = datetime.fromisoformat("2026-10-09T12:34:56+03:00")
+    delivered = captured + timedelta(minutes=30)
+    assert _camera_caption(captured, delivered) == "Фото сделано 30 минут назад"
+    assert _camera_caption(captured, captured + timedelta(minutes=59, seconds=59)) == (
+        "Фото сделано 59 минут назад"
+    )
+    assert _camera_caption(captured, captured + timedelta(hours=1)) == (
+        "Фото сделано 2026-10-09 12:34"
+    )
+    assert _camera_caption(captured, captured + timedelta(hours=1, seconds=1)) == (
+        "Фото сделано 2026-10-09 12:34"
+    )
+    assert ":56" not in _camera_caption(captured, captured + timedelta(hours=1))
+    assert _camera_caption(None, delivered) == "Фото сделано: время съёмки неизвестно"
+    legacy = "Съели ли вы это? Фото сделано 2026-10-03."
+    assert _attempt_caption({"_camera_caption": legacy}) == legacy
+
+
 @pytest.mark.asyncio
 async def test_two_cup_model_question_edits_the_exact_original_photo_once(tmp_path: Path) -> None:
     from openharness.channels.impl.telegram import TelegramChannel
@@ -823,7 +846,13 @@ async def test_native_preparation_quantity_callback_does_not_authorize_consumpti
     assert receipt.native_message_ids == (77,)
     assert clicked.metadata.get("_camera_answer") is None
     assert clicked.metadata.get("_camera_authority") is not CAMERA_AUTHORITY
-    assert clicked.metadata["_camera_ingress_callback_eligible"] is False
+    assert clicked.metadata["_camera_ingress_callback_eligible"] is True
+    click_receipt = clicked.metadata["_camera_native_click_receipt"]
+    assert click_receipt["kind"] == "issued_model_button"
+    assert click_receipt["selected_label"] == "100 грамм"
+    assert click_receipt["native_photo_id"] == final.metadata["_camera_photo_id"]
+    assert click_receipt["operation_id"].endswith(clicked.metadata["callback_query_id"])
+    assert clicked.metadata.get("_camera_answer") is None
     assert clicked.media == []
     assert ingress._attempts[request["candidate_id"]]["state"] == "photo_sent"
     await ingress.close()

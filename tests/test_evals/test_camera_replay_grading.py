@@ -2,8 +2,12 @@ from __future__ import annotations
 
 from copy import deepcopy
 from datetime import date, datetime, timezone
+import hashlib
+import json
 
 import pytest
+
+from ohmo.evals.camera_calibration import Case, Turn, _button_click_evidence
 
 from ohmo.evals.nutrition_persistence import (
     Goal,
@@ -990,3 +994,74 @@ def test_extra_event_or_duplicate_canonical_row_never_passes(mutation):
     assert result["a1"] != "PASS", result
     if mutation == "duplicate_canonical_row":
         assert result["a1"] == "FAIL" and result["stage"] == "CANONICAL_MISMATCH", result
+
+
+def test_marker_free_ordinary_issued_camera_click_is_bound_to_source_receipt():
+    options = ["Whole portion", "No"]
+    prompt = "Фото сделано 30 минут назад\n\nHow much did you eat?"
+    callback_id = "callback-1"
+    receipt = {
+        "kind": "issued_model_button",
+        "candidate_id": CANDIDATE_ID,
+        "tenant_id": OWNER,
+        "owner_principal": PRINCIPAL,
+        "native_photo_id": PHOTO_ID,
+        "native_message_id": str(PHOTO_ID),
+        "callback_message_id": str(PHOTO_ID),
+        "callback_query_id": callback_id,
+        "issued_keyboard_message_ids": [str(PHOTO_ID)],
+        "issued_prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
+        "issued_options_sha256": hashlib.sha256(json.dumps(
+            options, ensure_ascii=False, separators=(",", ":")
+        ).encode()).hexdigest(),
+        "callback_data": "ask:0",
+        "selected_index": 0,
+        "selected_label": options[0],
+        "operation_id": f"{CANDIDATE_ID}:issued_button:{callback_id}",
+    }
+    initial_context = _camera_context("initial_context", INITIAL_ID)
+    clicked = {
+        "episode": {
+            "episode_id": "ordinary-click",
+            "session_id": SESSION,
+            "metadata": {"inbound": {"channel": "telegram", "metadata": {
+                "callback_query": True, "callback_query_id": callback_id,
+                "callback_data": "ask:0", "native_message_id": PHOTO_ID,
+                "message_id": str(PHOTO_ID), "native_keyboard_options": options,
+                "native_keyboard_selected_index": 0, "native_keyboard_selected_label": options[0],
+                "native_keyboard_prompt": prompt,
+                "_camera_ingress_callback_candidate": CANDIDATE_ID,
+                "_camera_native_click_receipt": receipt,
+            }}},
+        },
+        "principal_id": PRINCIPAL,
+        "trusted_camera_context": None,
+        "turn_provenance": [{
+            "episode_id": "ordinary-click", "source_message_id": str(PHOTO_ID),
+            "logical_turn_id": "ordinary-turn", "operation_id": "ordinary-turn:assistant",
+            "principal_id": PRINCIPAL,
+        }],
+    }
+    initial = {
+        "episode": {"episode_id": INITIAL_ID, "session_id": SESSION},
+        "principal_id": "telegram:__camera__",
+        "trusted_camera_context": initial_context,
+    }
+    case = Case(
+        case_id="ordinary-click", image_path="unused.jpg", image_sha256="a" * 64,
+        prefix=[Turn(role="user", text="I ate a portion")],
+        reviewed_state="consumed", origin="camera", source_message_id=str(PHOTO_ID),
+        owner_id=OWNER, operation_id="ordinary-turn:assistant", meal_id="meal",
+        native_receipt_id="native", native_receipt_validated=True, cutoff_position=0,
+        ledger_snapshot_id="snapshot", ledger_verified_complete=True, events=[],
+        persistence_evidence={"goal": {"episode_ids": [INITIAL_ID, "ordinary-click"],
+            "principal_id": PRINCIPAL, "gateway_session_id": SESSION},
+            "dialogue_export": {"episodes": [initial, clicked]}},
+    )
+    evidence = _button_click_evidence(case)
+    assert len(evidence) == 1
+    assert evidence[0]["selected_label"] == "Whole portion"
+
+    forged = case.model_copy(deep=True)
+    forged.persistence_evidence["dialogue_export"]["episodes"][1]["episode"]["metadata"]["inbound"]["metadata"]["_camera_native_click_receipt"]["native_photo_id"] = 999
+    assert _button_click_evidence(forged) == []

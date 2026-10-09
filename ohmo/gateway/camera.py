@@ -59,10 +59,23 @@ _PENDING_TTL_SECONDS = 30 * 60
 
 def _camera_caption(captured: datetime | None, delivered_at: datetime) -> str:
     """Describe photo timing without asking or implying a nutrition answer."""
-    del delivered_at
     if captured is None:
-        return "Camera photo; capture time unknown."
-    return f"Camera photo captured {captured.astimezone(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}."
+        return "Фото сделано: время съёмки неизвестно"
+    age = (
+        delivered_at.astimezone(timezone.utc) - captured.astimezone(timezone.utc)
+    ).total_seconds()
+    if 0 <= age < 3600:
+        minutes = int(age // 60)
+        if minutes == 0:
+            elapsed = "меньше минуты назад"
+        elif minutes % 10 == 1 and minutes % 100 != 11:
+            elapsed = f"{minutes} минуту назад"
+        elif minutes % 10 in {2, 3, 4} and minutes % 100 not in {12, 13, 14}:
+            elapsed = f"{minutes} минуты назад"
+        else:
+            elapsed = f"{minutes} минут назад"
+        return f"Фото сделано {elapsed}"
+    return f"Фото сделано {captured.strftime('%Y-%m-%d %H:%M')}"
 
 
 def _attempt_caption(attempt: dict) -> str:
@@ -76,6 +89,15 @@ def _attempt_caption(attempt: dict) -> str:
         if captured is not None
         else "Съели ли вы это? Дата съёмки неизвестна."
     )
+
+
+def _native_prompt_sha256(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _native_options_sha256(options: list[str]) -> str:
+    encoded = json.dumps(options, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _source_message_id(value: object) -> str | None:
@@ -1402,6 +1424,31 @@ class CameraIngress:
                 value.get("photo_delivery_confirmed")
             ) is not bool:
                 raise ValueError("camera attempt journal state is invalid")
+            issued_keyboard = value.get("issued_keyboard_receipt")
+            if issued_keyboard is not None:
+                if (
+                    not isinstance(issued_keyboard, dict)
+                    or not isinstance(issued_keyboard.get("options"), list)
+                    or not 2 <= len(issued_keyboard["options"]) <= 8
+                    or any(not isinstance(option, str) or not option.strip()
+                           or len(option) > 60 for option in issued_keyboard["options"])
+                    or not isinstance(issued_keyboard.get("model_options"), list)
+                    or not issued_keyboard["model_options"]
+                    or any(option not in issued_keyboard["options"]
+                           for option in issued_keyboard["model_options"])
+                    or issued_keyboard.get("options_sha256")
+                        != _native_options_sha256(issued_keyboard["options"])
+                    or not isinstance(issued_keyboard.get("prompt_sha256"), str)
+                    or _SHA256.fullmatch(issued_keyboard["prompt_sha256"]) is None
+                    or not isinstance(issued_keyboard.get("native_message_ids"), list)
+                    or not issued_keyboard["native_message_ids"]
+                    or any(not isinstance(item, str) or not item.isdecimal() or int(item) <= 0
+                           for item in issued_keyboard["native_message_ids"])
+                    or any(item not in {str(reply_id) for reply_id in value.get("reply_ids", [])}
+                           for item in issued_keyboard["native_message_ids"])
+                    or value.get("initial_prompt_delivery_confirmed") is not True
+                ):
+                    raise ValueError("camera issued keyboard receipt is invalid")
             if "context_interrupted" in value and type(value["context_interrupted"]) is not bool:
                 raise ValueError("camera attempt context state is invalid")
             request_identity = value.get("request_identity")
@@ -2851,7 +2898,7 @@ class CameraIngress:
         callback_data = metadata.get("callback_data")
         native_source_id = _source_message_id(metadata.get("message_id"))
         callback_id = _source_message_id(metadata.get("callback_query_id"))
-        if (
+        is_not_food_feedback = (
             attempt.get("state") != "photo_sent"
             or attempt.get("photo_delivery_confirmed") is not True
             or attempt.get("classifier_decision") != "ambiguous"
@@ -2866,39 +2913,78 @@ class CameraIngress:
             or native_source_id != str(target)
             or callback_id is None
             or attempt.get("classifier_feedback") is not None
+        ) is False
+        if is_not_food_feedback:
+            receipt = {
+                "candidate_id": candidate_id,
+                "photo_id": attempt.get("photo_id"),
+                "source_id": callback_id,
+                "verdict": "not_food",
+                "owner_id": self.config.principal,
+                "recorded_at": datetime.now(timezone.utc).isoformat(),
+                "classifier": _DEEPSEEK_RELEASE,
+            }
+            attempt["classifier_feedback"] = receipt
+            prior_attention = attempt.get("attention_active", True)
+            attempt["attention_active"] = False
+            try:
+                self._save_attempts()
+            except OSError:
+                attempt.pop("classifier_feedback", None)
+                attempt["attention_active"] = prior_attention
+                return
+            metadata["_camera_ingress_callback_eligible"] = True
+            metadata["_camera_feedback_receipt"] = {
+                "kind": "not_food", "candidate_id": candidate_id,
+                "tenant_id": self.config.tenant_id,
+                "owner_principal": f"telegram:{self.config.principal}",
+                "native_photo_id": attempt["photo_id"],
+                "native_message_id": str(target), "source_message_id": native_source_id,
+                "callback_query_id": callback_id,
+                "operation_id": f"{candidate_id}:classifier_feedback:{callback_id}",
+            }
+            metadata["_camera_classifier_feedback"] = CAMERA_AUTHORITY
+            return
+
+        issued = attempt.get("issued_keyboard_receipt")
+        if (
+            not isinstance(issued, dict)
+            or attempt.get("initial_prompt_delivery_confirmed") is not True
+            or str(target) not in issued.get("native_message_ids", [])
+            or str(target) not in map(str, attempt.get("reply_ids", []))
+            or native_source_id != str(target)
+            or callback_id is None
+            or not isinstance(options, list)
+            or options != issued.get("options")
+            or _native_prompt_sha256(str(metadata.get("native_keyboard_prompt", "")))
+                != issued.get("prompt_sha256")
+            or _native_options_sha256(options) != issued.get("options_sha256")
+            or type(selected_index) is not int
+            or not 0 <= selected_index < len(options)
+            or selected_label != options[selected_index]
+            or selected_label not in issued.get("model_options", [])
+            or callback_data != f"ask:{selected_index}"
         ):
             return
-        receipt = {
-            "candidate_id": candidate_id,
-            "photo_id": attempt.get("photo_id"),
-            "source_id": callback_id,
-            "verdict": "not_food",
-            "owner_id": self.config.principal,
-            "recorded_at": datetime.now(timezone.utc).isoformat(),
-            "classifier": _DEEPSEEK_RELEASE,
-        }
-        attempt["classifier_feedback"] = receipt
-        prior_attention = attempt.get("attention_active", True)
-        attempt["attention_active"] = False
-        try:
-            self._save_attempts()
-        except OSError:
-            attempt.pop("classifier_feedback", None)
-            attempt["attention_active"] = prior_attention
-            return
         metadata["_camera_ingress_callback_eligible"] = True
-        metadata["_camera_feedback_receipt"] = {
-            "kind": "not_food",
+        metadata["_camera_candidate_id"] = candidate_id
+        metadata["_camera_native_click_receipt"] = {
+            "kind": "issued_model_button",
             "candidate_id": candidate_id,
             "tenant_id": self.config.tenant_id,
             "owner_principal": f"telegram:{self.config.principal}",
             "native_photo_id": attempt["photo_id"],
             "native_message_id": str(target),
-            "source_message_id": native_source_id,
+            "callback_message_id": native_source_id,
             "callback_query_id": callback_id,
-            "operation_id": f"{candidate_id}:classifier_feedback:{callback_id}",
+            "issued_keyboard_message_ids": list(issued["native_message_ids"]),
+            "issued_prompt_sha256": issued["prompt_sha256"],
+            "issued_options_sha256": issued["options_sha256"],
+            "callback_data": callback_data,
+            "selected_index": selected_index,
+            "selected_label": selected_label,
+            "operation_id": f"{candidate_id}:issued_button:{callback_id}",
         }
-        metadata["_camera_classifier_feedback"] = CAMERA_AUTHORITY
 
     def note_assistant_receipt(
         self, message: OutboundMessage, receipt: OutboundDeliveryReceipt | None
@@ -2937,6 +3023,19 @@ class CameraIngress:
         for native_id in receipt.native_message_ids:
             if native_id not in attempt["reply_ids"]:
                 attempt["reply_ids"].append(native_id)
+        options = list(message.buttons or [])
+        model_options = [
+            option for option in options
+            if not (attempt.get("classifier_decision") == "ambiguous" and option == "Это не еда")
+        ]
+        prompt = f"{_attempt_caption(attempt)}\n\n{message.content}"
+        attempt["issued_keyboard_receipt"] = {
+            "options": options,
+            "model_options": model_options,
+            "options_sha256": _native_options_sha256(options),
+            "prompt_sha256": _native_prompt_sha256(prompt),
+            "native_message_ids": [str(value) for value in receipt.native_message_ids],
+        }
         attempt["initial_prompt_delivery_confirmed"] = True
         self._save_attempts()
 
