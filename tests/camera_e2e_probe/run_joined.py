@@ -204,7 +204,7 @@ async def verify_finalizer_event(
                 authorization_context=authorization_context,
             )
 
-            async def balance():
+            async def projected_intake():
                 arguments = {
                     "params": {
                         "start": (expected_capture_time - timedelta(days=1)).isoformat(),
@@ -222,7 +222,7 @@ async def verify_finalizer_event(
             if record is None:
                 raise AssertionError("finalizer event did not enter Telegent projection")
             meal = db.get_current_meal("synthetic_owner", record.meal_id)
-            meals, kcal = await balance()
+            meals, kcal = await projected_intake()
             checks = {
                 "current_user": meal is not None and meal.user_id == "synthetic_owner",
                 "event_ids": meal is not None and meal.event_ids == [event.id],
@@ -236,7 +236,7 @@ async def verify_finalizer_event(
                 and meals[0]["latest_event_id"] == event.id,
                 "wellness_kcal": len(meals) == 1
                 and meals[0]["energy_kcal_best"] == validated.energy_kcal_best,
-                "effective_balance_kcal": kcal == validated.energy_kcal_best,
+                "projected_intake_kcal": kcal == validated.energy_kcal_best,
             }
             failed_checks = [name for name, passed in checks.items() if not passed]
             if failed_checks:
@@ -252,7 +252,7 @@ async def verify_finalizer_event(
             health = HealthDataStore(directory / "health.db")
             reopened_record = db.get_record_by_event_id("synthetic_owner", event.id)
             reopened_meal = db.get_current_meal("synthetic_owner", expected_meal_id)
-            reopened_meals, reopened_kcal = await balance()
+            reopened_meals, reopened_kcal = await projected_intake()
             if not (
                 reopened_record is not None
                 and reopened_meal is not None
@@ -269,15 +269,15 @@ async def verify_finalizer_event(
                     "reopened RocksDB projection differs from the runtime event/current meal"
                 )
             await sync_nutrition_honcho(credentials=credentials, db=db)
-            replay_meals, replay_kcal = await balance()
+            replay_meals, replay_kcal = await projected_intake()
             if not (
                 db.get_current_meal("synthetic_owner", record.meal_id).model_dump(mode="json")
                 == snapshot
                 and replay_meals == meals
                 and replay_kcal == kcal
             ):
-                raise AssertionError("replay changed the finalizer meal balance")
-            print(f"PASS finalizer event={event.id} kcal={kcal} replay=stable")
+                raise AssertionError("replay changed the finalizer meal intake")
+            print(f"PASS finalizer event={event.id} intake_kcal={kcal} replay=stable")
             if signed_wire:
                 health.close()
                 db.close()
@@ -956,7 +956,7 @@ async def verify_zero_meals_before_answer(
             raise AssertionError("Telegent shows a meal before owner confirmation")
         print(
             "PASS analysis-only Honcho full read + Telegent sync: "
-            "consumed_events=0 meals=0 balance_kcal=0",
+            "consumed_events=0 meals=0 intake_kcal=0 (expenditure unknown)",
             flush=True,
         )
     finally:
