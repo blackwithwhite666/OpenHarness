@@ -247,6 +247,94 @@ def _trusted_context_target(goal: Goal, event: dict[str, Any], turns: list[dict[
     if len(matches) != 1:
         return None
     final = matches[0].get("gateway_final_metadata")
+    persisted_selected_source = _dict(event.get("metadata", {}).get("selected_source"))
+    if persisted_selected_source is not None and persisted_selected_source.get("schema_version") == 2:
+        actual = _verified_actual_append(matches[0])
+        selected_source = _dict(actual.get("selected_source")) if actual else None
+        if (
+            actual is None
+            or selected_source is None
+            or actual.get("event_id") != event.get("event_id")
+            or actual.get("client_op_id") != event.get("operation_id")
+            or actual.get("tenant_id") != event.get("owner_id")
+            or actual.get("source_principal") != event.get("principal_id")
+            or actual.get("gateway_session_id") != event.get("gateway_session_id")
+            or actual.get("source_message_id") != event.get("source_message_id")
+            or _validated_nutrition_annotation(actual.get("annotation")) != event.get("annotation")
+            or actual.get("target_meal_id") != derive_meal_id(
+                tenant_id=goal.owner_id,
+                source_principal=goal.principal_id,
+                gateway_session_id=str(selected_source.get("gateway_session_id")),
+                source_message_id=str(selected_source.get("append_source_message_id")),
+            )
+        ):
+            return None
+        original_rows = [row for row in events
+                         if row.get("event_id") == selected_source.get("original_receipt_event_id")]
+        if len(original_rows) != 1:
+            return None
+        original_row = original_rows[0]
+        original_turns = [turn for turn in turns
+                          if turn.get("operation_id") == selected_source.get("original_receipt_client_op_id")
+                          and turn.get("source_message_id") == original_row.get("source_message_id")
+                          and turn.get("episode_id") == original_row.get("trace_episode_id")
+                          and turn.get("principal_id") == goal.principal_id]
+        if len(original_turns) != 1:
+            return None
+        original_receipt = _verified_actual_append(original_turns[0])
+        original_annotation = _validated_nutrition_annotation(
+            original_receipt.get("annotation") if original_receipt else None
+        )
+        if (
+            original_receipt is None or original_annotation is None
+            or original_receipt.get("event_id") != original_row.get("event_id")
+            or original_receipt.get("client_op_id") != original_row.get("operation_id")
+            or original_receipt.get("source_message_id") != original_row.get("source_message_id")
+            or original_receipt.get("tenant_id") != goal.owner_id
+            or original_receipt.get("source_principal") != goal.principal_id
+            or original_receipt.get("gateway_session_id") != original_row.get("gateway_session_id")
+            or original_annotation != original_row.get("annotation")
+            or original_annotation.get("record_type") != "meal_observation"
+            or original_annotation.get("consumption_status") != "consumed"
+            or original_row.get("owner_id") != goal.owner_id
+            or original_row.get("principal_id") != goal.principal_id
+            or original_row.get("operation_id") != selected_source.get("original_receipt_client_op_id")
+            or original_row.get("source_message_id") != selected_source.get("append_source_message_id")
+        ):
+            return None
+        occurrence = _dict(original_receipt.get("photo_occurrence_source"))
+        if original_receipt.get("ingest_source") == "telegram":
+            if (
+                occurrence is None
+                or occurrence.get("schema_version") != 1
+                or occurrence.get("source_origin") != "telegram"
+                or occurrence.get("tenant_id") != goal.owner_id
+                or occurrence.get("source_principal") != goal.principal_id
+                or occurrence.get("origin_principal") != goal.principal_id
+                or not isinstance(occurrence.get("source_message_id"), str)
+                or not occurrence["source_message_id"]
+                or occurrence.get("append_source_message_id") != original_row.get("source_message_id")
+                or occurrence != original_row.get("metadata", {}).get("photo_occurrence_source")
+                or not isinstance(occurrence.get("attachment_id"), str)
+                or not occurrence["attachment_id"]
+                or occurrence.get("gateway_session_id") != original_row.get("gateway_session_id")
+                or occurrence.get("is_private") is not True
+                or occurrence.get("is_forwarded") is not False
+                or occurrence.get("is_group") is not False
+                or any(isinstance(turn.get("trusted_camera_initial_context"), dict)
+                       for turn in turns)
+            ):
+                return None
+        elif original_receipt.get("ingest_source") == "dropbox_camera":
+            camera_contexts = [turn["trusted_camera_initial_context"] for turn in turns
+                               if isinstance(turn.get("trusted_camera_initial_context"), dict)
+                               and turn["trusted_camera_initial_context"].get("kind") == "initial_context"]
+            if _marker_free_camera_initial(goal, matches[0], turns, camera_contexts) is None:
+                return None
+        else:
+            return None
+        return selected_source.get("append_source_message_id")
+    selected_source = persisted_selected_source
     evidence = _dict(final.get("nutrition_context_evidence")) if isinstance(final, dict) else None
     committed = _dict(final.get("nutrition_committed_annotation")) if isinstance(final, dict) else None
     proposal = _dict(final.get("nutrition_model_proposal_annotation")) if isinstance(final, dict) else None
@@ -262,7 +350,6 @@ def _trusted_context_target(goal: Goal, event: dict[str, Any], turns: list[dict[
               "consumed_source_message_id", "target_meal_id", "original_receipt_event_id",
               "original_operation_id", "current_receipt_event_id", "current_operation_id",
               "current_logical_turn_id", "current_trace_episode_id")
-    selected_source = _dict(event.get("metadata", {}).get("selected_source"))
     legacy_same_session = bool(
         selected_source is not None
         and type(selected_source.get("schema_version")) is int
@@ -646,7 +733,11 @@ def _grade_one(goal: Goal, honcho: dict[str, Any], telegent: dict[str, Any], *, 
         t_start = _parse_time(telegent.get("start"))
         t_end = _parse_time(telegent.get("end"))
         local_day_start = datetime.combine(goal.meal_date, datetime.min.time(), ZoneInfo(goal.meal_timezone))
-        if (t_start > local_day_start or t_end < goal.trajectory_as_of.astimezone(timezone.utc)
+        local_day_end = local_day_start + timedelta(days=1)
+        required_end = goal.trajectory_as_of.astimezone(timezone.utc)
+        if goal.meal_date != goal.trajectory_as_of.astimezone(ZoneInfo(goal.meal_timezone)).date():
+            required_end = max(required_end, min(now, local_day_end.astimezone(timezone.utc)))
+        if (t_start > local_day_start or t_end < required_end
                 or t_start > t_end):
             raise ValueError
         queried_at = _parse_time(telegent.get("queried_at"))
@@ -793,61 +884,106 @@ def _grade_one(goal: Goal, honcho: dict[str, Any], telegent: dict[str, Any], *, 
                 and turn.get("source_message_id") == event.get("source_message_id")
                 and turn.get("operation_id") == event.get("operation_id"))
             context_metadata = contextual_turn["gateway_final_metadata"]
-            context_evidence = context_metadata["nutrition_context_evidence"]
             selected_source = _dict(metadata.get("selected_source"))
-            persisted_target = metadata.get("target_meal_id")
             selected_schema = selected_source.get("schema_version") if selected_source else None
-            selected_v2_valid = bool(
-                selected_source is not None
-                and type(selected_schema) is int and selected_schema == 2
-                and set(selected_source) == {
-                    "schema_version", "tenant_id", "source_principal", "gateway_session_id",
-                    "source_message_id", "append_source_message_id", "is_private",
-                    "is_forwarded", "is_group", "original_receipt_event_id",
-                    "original_receipt_client_op_id",
-                }
-                and selected_source.get("source_message_id") == goal.source_message_id
-                and selected_source.get("append_source_message_id") == goal.source_message_id
-                and selected_source.get("original_receipt_event_id")
-                == context_evidence.get("original_receipt_event_id")
-                and selected_source.get("original_receipt_client_op_id")
-                == context_evidence.get("original_operation_id")
-            )
-            selected_v1_valid = bool(
-                selected_source is not None
-                and _same_session_v1_selected_source(
-                    goal, event, context_evidence, selected_source
+            if type(selected_schema) is int and selected_schema == 2:
+                actual = _verified_actual_append(contextual_turn)
+                expected_target_meal_id = derive_meal_id(
+                    tenant_id=goal.owner_id, source_principal=goal.principal_id,
+                    gateway_session_id=goal.gateway_session_id,
+                    source_message_id=contextual_target,
                 )
-            )
-            if (selected_source is None or not isinstance(persisted_target, str) or not persisted_target
-                    or not (selected_v1_valid or selected_v2_valid)
+                if (
+                    selected_source is None
+                    or set(selected_source) != {
+                        "schema_version", "tenant_id", "source_principal", "gateway_session_id",
+                        "source_message_id", "append_source_message_id", "is_private",
+                        "is_forwarded", "is_group", "original_receipt_event_id",
+                        "original_receipt_client_op_id",
+                    }
+                    or actual is None
+                    or actual.get("event_id") != event.get("event_id")
+                    or actual.get("client_op_id") != event.get("operation_id")
+                    or actual.get("tenant_id") != goal.owner_id
+                    or actual.get("source_principal") != goal.principal_id
+                    or actual.get("gateway_session_id") != event.get("gateway_session_id")
+                    or actual.get("source_message_id") != event.get("source_message_id")
+                    or _validated_nutrition_annotation(actual.get("annotation")) != event.get("annotation")
                     or selected_source.get("tenant_id") != goal.owner_id
                     or selected_source.get("source_principal") != goal.principal_id
                     or selected_source.get("gateway_session_id") != goal.gateway_session_id
                     or selected_source.get("is_private") is not True
                     or selected_source.get("is_forwarded") is not False
-                    or selected_source.get("is_group") is not False):
-                return {**base, "a1": "INCONCLUSIVE", "stage": "HONCHO_TARGET_UNAVAILABLE",
-                        "reason": "persisted target receipt fields are missing, malformed, or outside the reviewed owner scope"}
-            if selected_source.get("source_message_id") != context_evidence.get("photo_source_message_id"):
-                return {**base, "a1": "INCONCLUSIVE", "stage": "HONCHO_SOURCE_MISMATCH",
-                        "reason": "persisted photo identity conflicts with the independently receipt-proven occurrence"}
-            if (selected_schema == 2 and (selected_source.get("original_receipt_event_id")
-                    != context_evidence.get("original_receipt_event_id")
-                    or selected_source.get("original_receipt_client_op_id")
-                    != context_evidence.get("original_operation_id"))):
-                return {**base, "a1": "INCONCLUSIVE", "stage": "HONCHO_TARGET_UNAVAILABLE",
-                        "reason": "selected source lacks the exact original receipt identity"}
-            expected_target_meal_id = derive_meal_id(
-                tenant_id=goal.owner_id, source_principal=goal.principal_id,
-                gateway_session_id=goal.gateway_session_id, source_message_id=contextual_target)
-            if (contextual_target != goal.source_message_id
-                    or context_evidence.get("target_meal_id") != expected_target_meal_id
-                    or persisted_target != expected_target_meal_id
+                    or selected_source.get("is_group") is not False
+                ):
+                    return {**base, "a1": "INCONCLUSIVE", "stage": "HONCHO_TARGET_UNAVAILABLE",
+                            "reason": "selected source or actual append receipt is missing or outside the reviewed owner scope"}
+                if (
+                    contextual_target != goal.source_message_id
+                    or actual.get("selected_source") != selected_source
                     or selected_source.get("append_source_message_id") != contextual_target
-                    or expected_target_meal_id != goal.canonical_meal_id):
-                return {**base, "a1": "FAIL", "stage": "HONCHO_TARGET_MISMATCH",
-                        "reason": "receipt-proven intended occurrence differs from the persisted target"}
+                    or metadata.get("target_meal_id") != expected_target_meal_id
+                    or actual.get("target_meal_id") != expected_target_meal_id
+                    or expected_target_meal_id != goal.canonical_meal_id
+                ):
+                    return {**base, "a1": "FAIL", "stage": "HONCHO_TARGET_MISMATCH",
+                            "reason": "receipt-proven intended occurrence differs from the persisted target"}
+            else:
+                context_evidence = context_metadata["nutrition_context_evidence"]
+                selected_source = _dict(metadata.get("selected_source"))
+                persisted_target = metadata.get("target_meal_id")
+                selected_schema = selected_source.get("schema_version") if selected_source else None
+                selected_v2_valid = bool(
+                    selected_source is not None
+                    and type(selected_schema) is int and selected_schema == 2
+                    and set(selected_source) == {
+                        "schema_version", "tenant_id", "source_principal", "gateway_session_id",
+                        "source_message_id", "append_source_message_id", "is_private",
+                        "is_forwarded", "is_group", "original_receipt_event_id",
+                        "original_receipt_client_op_id",
+                    }
+                    and selected_source.get("source_message_id") == goal.source_message_id
+                    and selected_source.get("append_source_message_id") == goal.source_message_id
+                    and selected_source.get("original_receipt_event_id")
+                    == context_evidence.get("original_receipt_event_id")
+                    and selected_source.get("original_receipt_client_op_id")
+                    == context_evidence.get("original_operation_id")
+                )
+                selected_v1_valid = bool(
+                    selected_source is not None
+                    and _same_session_v1_selected_source(
+                        goal, event, context_evidence, selected_source
+                    )
+                )
+                if (selected_source is None or not isinstance(persisted_target, str) or not persisted_target
+                        or not (selected_v1_valid or selected_v2_valid)
+                        or selected_source.get("tenant_id") != goal.owner_id
+                        or selected_source.get("source_principal") != goal.principal_id
+                        or selected_source.get("gateway_session_id") != goal.gateway_session_id
+                        or selected_source.get("is_private") is not True
+                        or selected_source.get("is_forwarded") is not False
+                        or selected_source.get("is_group") is not False):
+                    return {**base, "a1": "INCONCLUSIVE", "stage": "HONCHO_TARGET_UNAVAILABLE",
+                            "reason": "persisted target receipt fields are missing, malformed, or outside the reviewed owner scope"}
+                if selected_source.get("source_message_id") != context_evidence.get("photo_source_message_id"):
+                    return {**base, "a1": "INCONCLUSIVE", "stage": "HONCHO_SOURCE_MISMATCH",
+                            "reason": "persisted photo identity conflicts with the independently receipt-proven occurrence"}
+                if (selected_schema == 2 and (selected_source.get("original_receipt_event_id")
+                        != context_evidence.get("original_receipt_event_id")
+                        or selected_source.get("original_receipt_client_op_id")
+                        != context_evidence.get("original_operation_id"))):
+                    return {**base, "a1": "INCONCLUSIVE", "stage": "HONCHO_TARGET_UNAVAILABLE",
+                            "reason": "selected source lacks the exact original receipt identity"}
+                expected_target_meal_id = derive_meal_id(
+                    tenant_id=goal.owner_id, source_principal=goal.principal_id,
+                    gateway_session_id=goal.gateway_session_id, source_message_id=contextual_target)
+                if (contextual_target != goal.source_message_id
+                        or context_evidence.get("target_meal_id") != expected_target_meal_id
+                        or persisted_target != expected_target_meal_id
+                        or selected_source.get("append_source_message_id") != contextual_target
+                        or expected_target_meal_id != goal.canonical_meal_id):
+                    return {**base, "a1": "FAIL", "stage": "HONCHO_TARGET_MISMATCH",
+                            "reason": "receipt-proven intended occurrence differs from the persisted target"}
         if event.get("malformed_annotation"):
             return {**base, "a1": "INCONCLUSIVE", "stage": "HONCHO_INVALID",
                     "reason": "goal-relevant persisted nutrition annotation is malformed"}
@@ -1019,6 +1155,21 @@ def _grade_one(goal: Goal, honcho: dict[str, Any], telegent: dict[str, Any], *, 
                         and expected_turn.get("gateway_session_id") != event["gateway_session_id"])):
                 return {**base, "a1": "INCONCLUSIVE", "stage": "HONCHO_TURN_BINDING_MISMATCH",
                         "reason": "persisted turn operation differs from gateway-derived exported identity"}
+            if (camera_initial_context is not None
+                    and event["trace_episode_id"] == goal.trace_episode_id
+                    and record_type == "meal_observation"
+                    and "nutrition_selected_source_review" in
+                    (_dict(expected_turn.get("gateway_final_metadata")) or {})):
+                actual_root = _verified_actual_append(expected_turn)
+                if (actual_root is None
+                        or actual_root.get("event_id") != event["event_id"]
+                        or actual_root.get("client_op_id") != event["operation_id"]
+                        or actual_root.get("tenant_id") != goal.owner_id
+                        or actual_root.get("source_principal") != goal.principal_id
+                        or _validated_nutrition_annotation(actual_root.get("annotation"))
+                        != event["annotation"]):
+                    return {**base, "a1": "INCONCLUSIVE", "stage": "HONCHO_TURN_BINDING_MISMATCH",
+                            "reason": "Camera root meal lacks its exact confirmed runtime append receipt"}
             camera_context = _dict(expected_turn.get("trusted_camera_context")) or {}
             if (record_type == "meal_correction" and camera_context.get("kind") == "owner_turn"):
                 final = _dict(expected_turn.get("gateway_final_metadata"))
@@ -1112,7 +1263,7 @@ def _grade_one(goal: Goal, honcho: dict[str, Any], telegent: dict[str, Any], *, 
                 - timedelta(microseconds=1)
                 for day in (original_day, corrected_day)
             ]
-            required_end = min(max(day_ends), now.astimezone(ZoneInfo(goal.meal_timezone)))
+            required_end = min(max(day_ends), goal.trajectory_as_of.astimezone(ZoneInfo(goal.meal_timezone)))
             if t_start > min(original_start, corrected_start) or t_end < required_end:
                 return {**base, "a1": "INCONCLUSIVE", "stage": "TELEGENT_BOUNDS_MISMATCH",
                         "reason": "canonical interval does not cover both verified local days through observation time"}
@@ -1134,7 +1285,11 @@ def _grade_one(goal: Goal, honcho: dict[str, Any], telegent: dict[str, Any], *, 
     if any(len(rows) > 1 for rows in selected_event_rows.values()):
         return {**base, "a1": "FAIL", "stage": "CANONICAL_MISMATCH",
                 "reason": "one persisted source event appears under multiple canonical meal rows",
-                "actual_event_ids": [event["event_id"] for event in selected]}
+            "actual_event_ids": [event["event_id"] for event in selected]}
+    if goal.expected_consumed and not selected and not edge_rows:
+        return {**base, "a1": "FAIL", "stage": "HONCHO_MISSING_WRITE",
+                "reason": "complete owner-scoped reads found no saved nutrition event for the reviewed source",
+                "actual_event_ids": []}
     for row in edge_rows:
         if (row.get("meal_id") == goal.canonical_meal_id
                 and row.get("source_message_id") != goal.source_message_id):
@@ -1607,7 +1762,7 @@ _CAMERA_CALLBACK_EXPORT_FIELDS = (
     "native_keyboard_selected_label", "native_keyboard_prompt", "native_keyboard_question",
     "native_keyboard_reflection_confirmed", "native_keyboard_reflection", "_camera_route",
     "_camera_existing_meal_replay", "_camera_ingress_callback_eligible",
-    "_camera_candidate_id", "_camera_native_binding",
+    "_camera_candidate_id", "_camera_native_binding", "_camera_native_click_receipt",
 )
 _CAMERA_CALLBACK_SHAPE_FIELDS = frozenset(_CAMERA_CALLBACK_EXPORT_FIELDS) - {
     "message_id", "_camera_candidate_id",
@@ -1729,9 +1884,15 @@ def _exported_camera_context(episode: dict[str, Any], events: list[dict[str, Any
         logical_turn = context.get("logical_turn_id")
         operation = context.get("operation_id")
         source_principal = context.get("source_principal")
+        capture_time = context.get("capture_time")
+        try:
+            _parse_time(capture_time)
+        except (TypeError, ValueError):
+            return None
         if (payload.get("sender_id") != "__camera__" or channel_metadata.get("_synthetic") is not True
                 or channel_metadata.get("message_id") is not None
-                or channel_metadata.get("_camera_photo_id") != photo_id):
+                or channel_metadata.get("_camera_photo_id") != photo_id
+                or channel_metadata.get("_camera_capture_time") != capture_time):
             return None
         derived = _derive_exported_turn_provenance(episode, payload)
         if (derived is None or not isinstance(logical_turn, str) or not logical_turn
@@ -1744,7 +1905,7 @@ def _exported_camera_context(episode: dict[str, Any], events: list[dict[str, Any
         return {key: context[key] for key in (
             "kind", "episode_id", "candidate_id", "native_photo_id", "tenant_id",
             "gateway_session_id", "recipient_principal", "source_principal",
-            "logical_turn_id", "operation_id")}
+            "logical_turn_id", "operation_id", "capture_time")}
     if context.get("kind") != "owner_turn":
         return None
     recorded_inbound = _dict(episode_metadata.get("inbound")) or {}
@@ -2176,7 +2337,7 @@ def _validated_camera_owner_turns(
     initial_identity_fields = (
         "kind", "episode_id", "candidate_id", "native_photo_id", "tenant_id",
         "gateway_session_id", "recipient_principal", "source_principal",
-        "logical_turn_id", "operation_id",
+        "logical_turn_id", "operation_id", "capture_time",
     )
     for receipt in initial_contexts:
         receipt_id = receipt.get("episode_id")
@@ -2486,8 +2647,20 @@ def validate_dialogue_binding(manifest: Manifest, export: dict[str, Any]) -> dic
                 )
             )
         elif initial_contexts:
-            camera_context_bound = False
-            camera_context_reason = "initial Camera context is not bound to a Camera owner turn"
+            root_context_receipt = None
+            if root_turn is not None:
+                root_context_receipt = _marker_free_camera_initial(
+                    goal, root_turn,
+                    [turn for turns in turn_provenance.values() for turn in turns],
+                    initial_contexts,
+                )
+            camera_context_bound = root_context_receipt is not None
+            if root_context_receipt is not None:
+                matching_initials = [root_context_receipt]
+            else:
+                camera_context_reason = (
+                    "ordinary owner append lacks a matching actual Camera source receipt"
+                )
         else:
             camera_context_bound = True
         good = not missing and not incomplete and source_bound and root_identity_bound and camera_context_bound
@@ -2607,6 +2780,7 @@ def _export_gateway_final_provenance(events: list[dict[str, Any]]) -> dict[str, 
         "nutrition_append_event_id", "nutrition_sync_status", "nutrition_committed_annotation",
         "nutrition_model_proposal_annotation", "nutrition_proposal_matches_committed",
         "nutrition_consumed_occurrence", "nutrition_context_evidence",
+        "nutrition_actual_append_receipt", "nutrition_selected_source_review",
     ):
         if key in metadata:
             exported[key] = metadata[key]
@@ -2628,6 +2802,171 @@ def _export_gateway_final_provenance(events: list[dict[str, Any]]) -> dict[str, 
                 ),
             }
     return exported or None
+
+
+def _verified_actual_append(turn: dict[str, Any]) -> dict[str, Any] | None:
+    """Validate the generic final export against its exact confirmed append identity."""
+    final = _dict(turn.get("gateway_final_metadata")) or {}
+    receipt = _dict(final.get("nutrition_actual_append_receipt"))
+    if receipt is None:
+        return None
+    annotation = _validated_nutrition_annotation(receipt.get("annotation"))
+    committed = _validated_nutrition_annotation(final.get("nutrition_committed_annotation"))
+    proposed = _validated_nutrition_annotation(final.get("nutrition_model_proposal_annotation"))
+    execution = _dict(final.get("nutrition_finalization"))
+    executed = _validated_nutrition_annotation(execution.get("annotation") if execution else None)
+    if (
+        type(receipt.get("schema_version")) is not int or receipt.get("schema_version") != 1
+        or not all(isinstance(receipt.get(key), str) and receipt[key] for key in (
+            "event_id", "client_op_id", "user_client_op_id", "logical_turn_id",
+            "trace_episode_id", "tenant_id", "source_principal", "gateway_session_id",
+            "source_message_id"))
+        or receipt.get("ingest_source") not in {"telegram", "dropbox_camera"}
+        or receipt.get("event_id") != final.get("nutrition_append_event_id")
+        or receipt.get("client_op_id") != turn.get("operation_id")
+        or receipt.get("user_client_op_id") != f"{turn.get('logical_turn_id')}:user"
+        or receipt.get("client_op_id") != f"{receipt.get('logical_turn_id')}:assistant"
+        or receipt.get("logical_turn_id") != turn.get("logical_turn_id")
+        or receipt.get("trace_episode_id") != turn.get("episode_id")
+        or receipt.get("source_message_id") != turn.get("source_message_id")
+        or receipt.get("source_principal") != turn.get("principal_id")
+        or annotation is None or annotation != committed or annotation != executed
+        or annotation != proposed
+        or not isinstance(execution, dict) or execution.get("schema_version") != 1
+        or final.get("nutrition_proposal_matches_committed") is not True
+    ):
+        return None
+    return receipt
+
+
+def _marker_free_camera_initial(
+    goal: Goal,
+    root_turn: dict[str, Any],
+    all_turns: list[dict[str, Any]],
+    initial_contexts: list[dict[str, Any]],
+) -> tuple[str, dict[str, Any]] | None:
+    """Bind an ordinary owner append to one Camera source through actual append receipts."""
+    root = _verified_actual_append(root_turn)
+    if root is None:
+        final = _dict(root_turn.get("gateway_final_metadata")) or {}
+        if "nutrition_actual_append_receipt" in final:
+            return None
+        review = _dict(final.get("nutrition_selected_source_review"))
+        if review is None or len(initial_contexts) != 1:
+            return None
+        context = initial_contexts[0]
+        if (
+            review.get("schema_version") != 1
+            or review.get("tenant_id") != goal.owner_id
+            or review.get("source_principal") != goal.principal_id
+            or review.get("source_origin") != "dropbox_camera"
+            or review.get("origin_principal") != "telegram:__camera__"
+            or review.get("gateway_session_id") != goal.gateway_session_id
+            or review.get("current_gateway_session_id") != goal.gateway_session_id
+            or review.get("photo_gateway_session_id") != goal.gateway_session_id
+            or review.get("source_message_id") != str(context.get("native_photo_id"))
+            or review.get("append_source_message_id") != str(context.get("native_photo_id"))
+            or review.get("native_photo_message_id") != str(context.get("native_photo_id"))
+            or review.get("camera_candidate_id") != context.get("candidate_id")
+            or review.get("received_at") != context.get("capture_time")
+            or review.get("is_private") is not True
+            or review.get("is_forwarded") is not False
+            or review.get("is_group") is not False
+            or not isinstance(review.get("attachment_id"), str)
+            or not review["attachment_id"]
+            or context.get("tenant_id") != goal.owner_id
+            or context.get("recipient_principal") != goal.principal_id
+            or context.get("gateway_session_id") != goal.gateway_session_id
+        ):
+            return None
+        return str(context.get("episode_id")), context
+    if root is None or root.get("tenant_id") != goal.owner_id \
+            or root.get("source_principal") != goal.principal_id:
+        return None
+    annotation = _validated_nutrition_annotation(root.get("annotation"))
+    occurrence = _dict(root.get("photo_occurrence_source"))
+    source_receipt = root
+    if annotation is None:
+        return None
+    if annotation.get("record_type") in {"meal_correction", "meal_deletion"}:
+        selected = _dict(root.get("selected_source"))
+        if selected is None or set(selected) != {
+            "schema_version", "tenant_id", "source_principal", "gateway_session_id",
+            "source_message_id", "append_source_message_id", "is_private", "is_forwarded",
+            "is_group", "original_receipt_event_id", "original_receipt_client_op_id",
+        } or type(selected.get("schema_version")) is not int or selected.get("schema_version") != 2:
+            return None
+        originals = [item for item in all_turns
+                     if (receipt := _verified_actual_append(item)) is not None
+                     and receipt.get("event_id") == selected.get("original_receipt_event_id")
+                     and receipt.get("client_op_id") == selected.get("original_receipt_client_op_id")]
+        if len(originals) != 1:
+            return None
+        original_turn = originals[0]
+        original = _verified_actual_append(original_turn)
+        original_annotation = _validated_nutrition_annotation(original.get("annotation")) if original else None
+        if (
+            original is None or original_annotation is None
+            or original_annotation.get("record_type") != "meal_observation"
+            or original_annotation.get("consumption_status") != "consumed"
+            or selected.get("tenant_id") != goal.owner_id
+            or selected.get("source_principal") != goal.principal_id
+            or selected.get("gateway_session_id") != original.get("gateway_session_id")
+            or selected.get("source_message_id") != original.get("source_message_id")
+            or selected.get("append_source_message_id") != original.get("source_message_id")
+            or selected.get("is_private") is not True
+            or selected.get("is_forwarded") is not False
+            or selected.get("is_group") is not False
+            or original.get("trace_episode_id") != original_turn.get("episode_id")
+        ):
+            return None
+        occurrence = _dict(original.get("photo_occurrence_source"))
+        source_receipt = original
+        target = derive_meal_id(
+            tenant_id=goal.owner_id, source_principal=goal.principal_id,
+            gateway_session_id=str(original.get("gateway_session_id")),
+            source_message_id=str(original.get("source_message_id")),
+        )
+        if root.get("selected_source") != selected or root.get("target_meal_id") != target:
+            return None
+    else:
+        target = None
+    if not isinstance(occurrence, dict):
+        return None
+    expected_ingest_source = (
+        "dropbox_camera" if occurrence.get("source_origin") == "dropbox_camera" else "telegram"
+    )
+    if source_receipt.get("ingest_source") != expected_ingest_source:
+        return None
+    matches = []
+    for context in initial_contexts:
+        try:
+            capture_time = context.get("capture_time")
+            occurrence_time = occurrence.get("received_at")
+            if capture_time is not None:
+                _parse_time(capture_time)
+            if occurrence_time is not None:
+                _parse_time(occurrence_time)
+        except (TypeError, ValueError):
+            continue
+        if (
+            occurrence.get("schema_version") == 1
+            and occurrence.get("source_origin") == "dropbox_camera"
+            and occurrence.get("tenant_id") == goal.owner_id == context.get("tenant_id")
+            and occurrence.get("source_principal") == goal.principal_id
+            and occurrence.get("source_principal") == context.get("recipient_principal") == goal.principal_id
+            and occurrence.get("origin_principal") == "telegram:__camera__"
+            and occurrence.get("camera_candidate_id") == context.get("candidate_id")
+            and occurrence.get("native_photo_message_id") == str(context.get("native_photo_id"))
+            and occurrence.get("source_message_id") == str(context.get("native_photo_id"))
+            and occurrence.get("photo_gateway_session_id") == context.get("gateway_session_id")
+            and occurrence_time == capture_time
+            and occurrence.get("is_private") is True
+            and occurrence.get("is_forwarded") is False
+            and occurrence.get("is_group") is False
+        ):
+            matches.append((str(context.get("episode_id")), context))
+    return matches[0] if len(matches) == 1 else None
 
 
 def _derive_exported_turn_provenance(episode: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any] | None:

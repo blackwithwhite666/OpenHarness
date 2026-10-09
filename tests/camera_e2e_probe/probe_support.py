@@ -4,19 +4,19 @@ from __future__ import annotations
 
 import hashlib
 import io
+import math
 import os
 import re
 import subprocess
 import tempfile
 import warnings
-from collections.abc import Mapping
+from collections.abc import Mapping, MutableMapping
 from pathlib import Path
 from types import MappingProxyType
 from uuid import uuid4
 
 from PIL import Image, UnidentifiedImageError
 
-from ohmo.gateway.camera import CAMERA_AUTHORITY
 
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _GIT_SHA = re.compile(r"[0-9a-f]{40}\Z")
@@ -73,9 +73,9 @@ async def call_wellness_with_synthetic_self(
 
 def create_storage_run_dir(root: Path) -> Path:
     """Keep each projection under the ignored worktree root after the run ends."""
-    parent = root / "tmp" / "camera-native-docker" / "storage-runs"
+    parent = root / "tmp" / "camera-normal-chat-docker" / "storage-runs"
     parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    if parent.resolve() != root.resolve() / "tmp" / "camera-native-docker" / "storage-runs":
+    if parent.resolve() != root.resolve() / "tmp" / "camera-normal-chat-docker" / "storage-runs":
         raise ValueError("storage root escapes the worktree task directory")
     ignored = subprocess.run(
         ["git", "check-ignore", "--quiet", "--", str(parent)],
@@ -138,6 +138,43 @@ class NativeClientPreconditionError(ValueError):
     """Explicit lead-run profile/client requirement without auth fallback."""
 
 
+def native_photo_reference(kcal_text: str | None, source_text: str | None) -> tuple[float, str]:
+    """Validate a lead-frozen reference without passing it to either model."""
+    try:
+        kcal = float(kcal_text) if kcal_text is not None else None
+    except (TypeError, ValueError, OverflowError):
+        kcal = None
+    if kcal is None or not math.isfinite(kcal) or kcal <= 0:
+        raise NativeClientPreconditionError("native Camera requires finite positive CAMERA_REFERENCE_KCAL")
+    if (not isinstance(source_text, str) or not source_text.strip()
+            or len(source_text) > 512 or any(ord(char) < 32 for char in source_text)):
+        raise NativeClientPreconditionError("native Camera requires bounded nonblank CAMERA_REFERENCE_SOURCE")
+    return kcal, source_text.strip()
+
+
+def take_native_photo_reference(environ: MutableMapping[str, str]) -> tuple[float, str]:
+    """Remove the reference from model-visible process environment before client setup."""
+    kcal_text = environ.pop("CAMERA_REFERENCE_KCAL", None)
+    source_text = environ.pop("CAMERA_REFERENCE_SOURCE", None)
+    return native_photo_reference(kcal_text, source_text)
+
+
+def actual_grade_expectation(
+    *, mode: str, reference: tuple[float, str] | None,
+    expected_consumed: bool, offline_kcal: float | None,
+) -> tuple[float | None, str, str]:
+    """Choose the reference for the actual recorder grade, including absence goals."""
+    if mode == "native":
+        if reference is None:
+            raise NativeClientPreconditionError("native Camera requires a frozen photo reference")
+        kcal, source = reference
+        return (kcal if expected_consumed else None, "frozen_photo_reference", source)
+    if mode != "offline":
+        raise ValueError("unknown Camera run mode")
+    return (offline_kcal if expected_consumed else None,
+            "explicit_fixture", "offline-scripted-owner-and-photo-fixture")
+
+
 def require_isolated_native_settings(settings) -> None:
     """Reject configured external runtime surfaces before auth resolution."""
     forbidden = []
@@ -163,6 +200,8 @@ def native_profile_clients(settings, *, resolver=None, codex_client_type=None):
     resolve = resolver or resolve_api_client_from_settings
     expected_type = codex_client_type or CodexApiClient
     require_isolated_native_settings(settings)
+    if getattr(settings, "effort", None) != "medium":
+        raise NativeClientPreconditionError("native Camera requires medium reasoning effort")
     profile_name, profile = settings.resolve_profile()
     model = (profile.last_model or "").strip() or profile.default_model
     if not (
@@ -193,6 +232,7 @@ def native_preflight_and_clients(
     scenario: str,
     source_path: str | None,
     source_sha256: str | None,
+    reference: tuple[float, str] | None = None,
     root: Path,
     resolver=None,
     codex_client_type=None,
@@ -200,6 +240,9 @@ def native_preflight_and_clients(
     """Check all non-auth native inputs before either subscription resolution."""
     if not isinstance(scenario, str) or not scenario.strip():
         raise NativeClientPreconditionError("native Camera requires a non-empty owner scenario")
+    if reference is None or len(reference) != 2:
+        raise NativeClientPreconditionError("native Camera requires a frozen photo reference")
+    reference = native_photo_reference(str(reference[0]), reference[1])
     require_isolated_native_settings(settings)
     try:
         source_bytes = source_jpeg(source_path, source_sha256, root)
@@ -210,7 +253,7 @@ def native_preflight_and_clients(
     clients = native_profile_clients(
         settings, resolver=resolver, codex_client_type=codex_client_type
     )
-    return clients, source_bytes
+    return clients, source_bytes, reference
 
 
 def native_person_source_clients(settings, *, scenario: str, resolver=None, codex_client_type=None):
@@ -267,68 +310,12 @@ def verify_source_tree_pin(path: Path, expected_head: str) -> tuple[Path, str, s
     return root, head, tree
 
 
-def require_bound_answer(
-    message, candidate_id: str, native_photo_id: int | str = 77,
-    *, expected_route: str | None = None, trusted_turn_id: str | None = None,
-) -> str:
-    metadata = message.metadata
-    turn_id = metadata.get("_camera_turn_id")
-    route = metadata.get("_camera_route")
-    trusted_photo_id = metadata.get("_camera_photo_id")
-    common_binding = (
-        metadata.get("_camera_authority") is CAMERA_AUTHORITY
-        and metadata.get("_camera_answer") == "yes"
-        and metadata.get("_camera_candidate_id") == candidate_id
-        and isinstance(turn_id, str)
-        and turn_id
-        and (
-            (expected_route != "context" and trusted_turn_id is None)
-            or (isinstance(trusted_turn_id, str) and turn_id == trusted_turn_id)
-        )
-        and len(message.media) == 1
-    )
-    if expected_route is not None and route != expected_route:
-        raise AssertionError("Camera owner reply used a different route than requested")
-    route_binding = False
-    if route == "context":
-        route_binding = (
-            trusted_photo_id == native_photo_id
-            and "reply_to_message_id" not in metadata
-            and "native_message_id" not in metadata
-            and metadata.get("callback_query") is not True
-        )
-    elif route == "reply":
-        route_binding = (
-            trusted_photo_id == native_photo_id
-            and str(metadata.get("reply_to_message_id")) == str(native_photo_id)
-            and metadata.get("callback_query") is not True
-        )
-    elif route == "callback":
-        route_binding = (
-            metadata.get("callback_query") is True
-            and str(metadata.get("native_message_id")) == str(native_photo_id)
-        )
-    if not (common_binding and route_binding):
-        raise AssertionError("Camera owner reply was not bound to the native photo")
-    return turn_id
-
-
 def select_finalizer_event(
     messages, candidate_id: str, answer_message_id: str, native_photo_id: int | str,
-    *, expected_route: str = "reply", expected_capture_time=None,
+    *, expected_capture_time=None,
     expected_event_id: str | None = None,
 ):
-    """Reject fixture events and unrelated assistant turns before sync."""
-    if expected_route not in {"reply", "context", "callback"}:
-        raise ValueError("Camera finalizer route must be reply, context, or callback")
-
-    def route_binding(metadata):
-        if metadata.get("camera_route") != expected_route:
-            return False
-        binding = metadata.get("camera_reply_to_native_message_id")
-        if expected_route == "context":
-            return "camera_reply_to_native_message_id" not in metadata
-        return binding == str(native_photo_id)
+    """Select one ordinary owner event carrying the exact delivered photo source."""
 
     def capture_matches(metadata):
         if expected_capture_time is None:
@@ -350,11 +337,18 @@ def select_finalizer_event(
         item
         for item in messages
         if item.metadata.get("role") == "assistant"
-        and item.metadata.get("camera_candidate_id") == candidate_id
-        and item.metadata.get("camera_answer_bound") == "yes"
-        and item.metadata.get("camera_operation_id") == candidate_id
-        and route_binding(item.metadata)
+        and item.metadata.get("ingest_source") == "dropbox_camera"
+        and isinstance(item.metadata.get("photo_occurrence_source"), Mapping)
+        and item.metadata["photo_occurrence_source"].get("source_origin") == "dropbox_camera"
+        and item.metadata["photo_occurrence_source"].get("camera_candidate_id") == candidate_id
+        and item.metadata["photo_occurrence_source"].get("native_photo_message_id") == str(native_photo_id)
         and item.metadata.get("source_message_id") == answer_message_id
+        and item.metadata.get("source_principal") == "telegram:123"
+        and item.metadata.get("tenant_id") == "synthetic_owner"
+        and not any(
+            key in item.metadata
+            for key in ("camera_answer_bound", "camera_route", "camera_operation_id")
+        )
         and item.metadata.get("nutrition_annotation_status") == "recorded"
         and capture_matches(item.metadata)
         and (expected_event_id is None or item.id == expected_event_id)

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import io
 import stat
@@ -17,18 +16,108 @@ from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "test_ohmo"))
 
-from test_camera_ingress import _admit, _candidate, _ingress  # noqa: E402
-from openharness.channels.bus.events import InboundMessage  # noqa: E402
-
 from probe_support import (  # noqa: E402
+    NativeClientPreconditionError,
+    actual_grade_expectation,
     create_storage_run_dir,
-    require_bound_answer,
+    native_preflight_and_clients,
+    native_photo_reference,
     select_finalizer_event,
     source_jpeg,
+    take_native_photo_reference,
     call_wellness_with_synthetic_self,
     unique_honcho_scope,
     verify_source_worktree,
 )
+
+
+@pytest.mark.parametrize(
+    ("kcal", "source"),
+    [
+        (None, "frozen review"), ("", "frozen review"),
+        ("nan", "frozen review"), ("inf", "frozen review"),
+        ("-inf", "frozen review"), ("0", "frozen review"),
+        ("-1", "frozen review"), ("125", None),
+        ("125", "  "), ("125", "x" * 513),
+    ],
+)
+def test_native_reference_fails_before_subscription_resolution(
+    tmp_path, monkeypatch, kcal, source,
+):
+    monkeypatch.setattr("probe_support.source_jpeg", lambda *_args: _synthetic_jpeg())
+    with pytest.raises(NativeClientPreconditionError):
+        native_preflight_and_clients(
+            SimpleNamespace(), scenario="synthetic owner scenario",
+            source_path="synthetic.jpg", source_sha256="0" * 64,
+            root=tmp_path, reference=(kcal, source) if kcal is not None else None,
+            resolver=lambda _settings: pytest.fail("subscription resolver was called"),
+        )
+
+
+def test_native_reference_is_consumed_and_propagates_only_to_private_grade(monkeypatch, tmp_path):
+    environment = {
+        "CAMERA_REFERENCE_KCAL": "310.5",
+        "CAMERA_REFERENCE_SOURCE": "  frozen review  ",
+        "CAMERA_USER_SCENARIO": "synthetic owner scenario",
+    }
+    reference = take_native_photo_reference(environment)
+    assert reference == (310.5, "frozen review")
+    assert environment == {"CAMERA_USER_SCENARIO": "synthetic owner scenario"}
+    assert native_photo_reference("310.5", "frozen review") == reference
+
+    class FakeClient:
+        pass
+
+    class Settings:
+        effort = "medium"
+        hooks = None
+        mcp_servers = None
+        enabled_plugins = None
+        allow_project_plugins = False
+        allow_project_skills = False
+        project_skill_dirs = None
+
+        def resolve_profile(self):
+            return "codex", SimpleNamespace(
+                last_model=None, default_model="gpt-6-luna", provider="openai_codex",
+                auth_source="codex_subscription",
+            )
+
+    monkeypatch.setattr("probe_support.source_jpeg", lambda *_args: _synthetic_jpeg())
+    calls = []
+
+    def resolver(settings):
+        calls.append(settings)
+        return FakeClient()
+
+    (bot, virtual_user), photo, accepted = native_preflight_and_clients(
+        Settings(), scenario=environment["CAMERA_USER_SCENARIO"],
+        source_path="synthetic.jpg", source_sha256="0" * 64,
+        root=tmp_path, reference=reference, resolver=resolver,
+        codex_client_type=FakeClient,
+    )
+    assert bot is not virtual_user and len(calls) == 2
+    assert photo == _synthetic_jpeg() and accepted == reference
+    assert "310.5" not in environment["CAMERA_USER_SCENARIO"]
+    assert "frozen review" not in environment["CAMERA_USER_SCENARIO"]
+    assert actual_grade_expectation(
+        mode="native", reference=accepted, expected_consumed=True, offline_kcal=125,
+    ) == (310.5, "frozen_photo_reference", "frozen review")
+    assert actual_grade_expectation(
+        mode="native", reference=accepted, expected_consumed=False, offline_kcal=None,
+    ) == (None, "frozen_photo_reference", "frozen review")
+
+
+@pytest.mark.parametrize("offline_kcal", [125, 225])
+def test_offline_actual_grade_preserves_fixture_reference(offline_kcal):
+    assert actual_grade_expectation(
+        mode="offline", reference=None, expected_consumed=True,
+        offline_kcal=offline_kcal,
+    ) == (offline_kcal, "explicit_fixture", "offline-scripted-owner-and-photo-fixture")
+    assert actual_grade_expectation(
+        mode="offline", reference=None, expected_consumed=False,
+        offline_kcal=None,
+    ) == (None, "explicit_fixture", "offline-scripted-owner-and-photo-fixture")
 
 
 class _ProbeWellnessAuthorizationContext:
@@ -78,7 +167,7 @@ async def test_direct_probe_wellness_read_resets_authority_after_success_and_fai
 
 def test_storage_run_is_persistent_restricted_and_ignored():
     root = Path(__file__).resolve().parents[2]
-    parent = root / "tmp" / "camera-native-docker" / "storage-runs"
+    parent = root / "tmp" / "camera-normal-chat-docker" / "storage-runs"
     run = create_storage_run_dir(root)
     marker = run / "nutrition.db"
     marker.mkdir()
@@ -289,157 +378,65 @@ def test_source_acceptance_allows_ignored_runtime_output(tmp_path):
     assert verify_source_worktree(root, pinned, require_clean=True) == (pinned, "")
 
 
-@pytest.mark.asyncio
-async def test_real_inbound_binding_and_no_fixture_authored_event(tmp_path):
-    ingress, root, bus, _ = _ingress(tmp_path)
-    request = _candidate(root)
-    try:
-        assert (await _admit(ingress, root, "Bearer " + "s" * 40, request))[0] == 202
-        await asyncio.wait_for(bus.consume_inbound(), timeout=1)
-        answer = InboundMessage(
-            channel="telegram",
-            sender_id="123",
-            chat_id="123",
-            content="Я съела 4 сливы",
-            metadata={"message_id": 78, "reply_to_message_id": 77},
-        )
-        ingress.process_real_inbound(answer)
-        assert require_bound_answer(answer, request["candidate_id"])
-        assert answer.session_key == "telegram:123"
-        fixture = SimpleNamespace(
-            id="fixture", metadata={"role": "assistant", "nutrition_annotation_status": "recorded"}
-        )
-        with pytest.raises(AssertionError, match="finalizer meal event"):
-            select_finalizer_event([fixture], request["candidate_id"], "78", 77)
-        real = SimpleNamespace(
-            id="server-event",
-            metadata={
-                "role": "assistant",
-                "nutrition_annotation_status": "recorded",
-                "camera_candidate_id": request["candidate_id"],
-                "camera_operation_id": request["candidate_id"],
-                "camera_answer_bound": "yes",
-                "camera_route": "reply",
-                "camera_reply_to_native_message_id": "77",
-                "source_message_id": "78",
-            },
-        )
-        assert (
-            select_finalizer_event([fixture, real], request["candidate_id"], "78", 77).id
-            == "server-event"
-        )
-        with pytest.raises(AssertionError, match="finalizer meal event"):
-            select_finalizer_event([real], request["candidate_id"], "79", 77)
-    finally:
-        await ingress.close()
 
 
-def test_context_finalizer_event_selection_requires_context_receipt_and_capture():
-    from datetime import datetime, timezone
-
-    capture_time = datetime(2026, 10, 1, 12, 0, tzinfo=timezone.utc)
-    event = SimpleNamespace(
-        id="context-event",
+def _ordinary_camera_event(event_id="event-1", source_id="owner-turn-1", candidate="candidate-1"):
+    return SimpleNamespace(
+        id=event_id,
         metadata={
-            "role": "assistant", "nutrition_annotation_status": "recorded",
-            "camera_candidate_id": "candidate-1", "camera_operation_id": "candidate-1",
-            "camera_answer_bound": "yes", "camera_route": "context",
-            "source_message_id": "owner-source-2", "tenant_id": "synthetic_owner",
+            "role": "assistant",
+            "nutrition_annotation_status": "recorded",
+            "source_message_id": source_id,
             "source_principal": "telegram:123",
-            "source_image_attachment_count": 1,
+            "tenant_id": "synthetic_owner",
+            "ingest_source": "dropbox_camera",
+            "gateway_session_id": "current-session",
+            "source_image_attachment_count": 0,
+            "photo_occurrence_source": {
+                "source_origin": "dropbox_camera",
+                "origin_principal": "telegram:__camera__",
+                "camera_candidate_id": candidate,
+                "native_photo_message_id": "77",
+            },
             "decision_trace": {"annotations": {"nutrition": {
-                "meal_at": capture_time.isoformat(),
+                "meal_at": "2026-10-01T12:00:00+00:00",
             }}},
         },
     )
+
+
+def test_finalizer_selection_uses_unique_ordinary_owned_source_receipt():
+    event = _ordinary_camera_event()
+    fixture = SimpleNamespace(id="fixture", metadata={"role": "assistant"})
     assert select_finalizer_event(
-        [event], "candidate-1", "owner-source-2", 77,
-        expected_route="context", expected_capture_time=capture_time,
-        expected_event_id="context-event",
+        [fixture, event], "candidate-1", "owner-turn-1", 77,
+        expected_event_id="event-1",
     ) is event
-
-    for change in (
-        {"camera_route": "reply", "camera_reply_to_native_message_id": "999"},
-        {"camera_reply_to_native_message_id": "77"},
-        {"source_message_id": "foreign-source"},
-        {"camera_candidate_id": "foreign-candidate"},
+    for changed in (
+        {"source_message_id": "other-owner-turn"},
+        {"source_principal": "telegram:foreign"},
+        {"tenant_id": "foreign-tenant"},
+        {"ingest_source": "telegram"},
+        {"camera_route": "context"},
     ):
-        corrupt = SimpleNamespace(id=event.id, metadata={**event.metadata, **change})
+        bad = SimpleNamespace(id=event.id, metadata={**event.metadata, **changed})
         with pytest.raises(AssertionError, match="finalizer meal event"):
-            select_finalizer_event(
-                [corrupt], "candidate-1", "owner-source-2", 77,
-                expected_route="context", expected_capture_time=capture_time,
-            )
-    with pytest.raises(AssertionError, match="finalizer meal event"):
+            select_finalizer_event([bad], "candidate-1", "owner-turn-1", 77)
+
+
+def test_finalizer_selection_rejects_ambiguous_or_forged_photo_occurrence():
+    event = _ordinary_camera_event()
+    duplicate = _ordinary_camera_event(event_id="event-2")
+    with pytest.raises(AssertionError, match="exactly one"):
         select_finalizer_event(
-            [event], "candidate-1", "owner-source-2", 77,
-            expected_route="context", expected_capture_time=capture_time,
-            expected_event_id="different-event",
+            [event, duplicate], "candidate-1", "owner-turn-1", 77,
         )
-
-
-@pytest.mark.asyncio
-async def test_real_context_answer_binds_trusted_photo_without_reply_target(tmp_path):
-    import copy
-
-    ingress, root, bus, _ = _ingress(tmp_path)
-    request = _candidate(root)
-    try:
-        assert (await _admit(ingress, root, "Bearer " + "s" * 40, request))[0] == 202
-        await asyncio.wait_for(bus.consume_inbound(), timeout=1)
-        answer = InboundMessage(
-            channel="telegram",
-            sender_id="123",
-            chat_id="123",
-            content="Я съела примерно половину порции",
-            metadata={"message_id": 78, "is_group": False, "chat_type": "private"},
+    wrong_source = _ordinary_camera_event()
+    wrong_source.metadata["photo_occurrence_source"] = {
+        **wrong_source.metadata["photo_occurrence_source"],
+        "native_photo_message_id": "999",
+    }
+    with pytest.raises(AssertionError, match="exactly one"):
+        select_finalizer_event(
+            [wrong_source], "candidate-1", "owner-turn-1", 77,
         )
-        ingress.process_real_inbound(answer)
-        assert "reply_to_message_id" not in answer.metadata
-        assert "native_message_id" not in answer.metadata
-        assert answer.metadata["_camera_route"] == "context"
-        assert answer.metadata["_camera_photo_id"] == 77
-        assert answer.metadata["_camera_candidate_id"] == request["candidate_id"]
-        trusted_turn_id = ingress._attempts[request["candidate_id"]]["answer_turn_id"]
-        assert answer.metadata["_camera_turn_id"] == trusted_turn_id
-        assert require_bound_answer(
-            answer, request["candidate_id"], expected_route="context",
-            trusted_turn_id=trusted_turn_id,
-        ) == answer.metadata["_camera_turn_id"]
-        assert len(answer.media) == 1
-        assert ingress.trusted_capture_time_for_answer(answer) == ingress._attempt_capture_time(
-            ingress._attempts[request["candidate_id"]]
-        )
-
-        for key, value in (
-            ("_camera_authority", None),
-            ("_camera_candidate_id", "foreign-candidate"),
-            ("_camera_photo_id", 999),
-            ("_camera_turn_id", "foreign-turn"),
-        ):
-            forged = copy.copy(answer)
-            forged.metadata = dict(answer.metadata)
-            forged.media = list(answer.media)
-            forged.metadata[key] = value
-            with pytest.raises(AssertionError, match="not bound"):
-                require_bound_answer(
-                    forged, request["candidate_id"], expected_route="context",
-                    trusted_turn_id=trusted_turn_id,
-                )
-
-        unsigned = InboundMessage(
-            channel="telegram", sender_id="123", chat_id="123",
-            content=answer.content,
-            metadata={
-                "message_id": 79,
-                "_camera_virtual_media_source_ids": (request["candidate_id"],),
-            },
-        )
-        unsigned.media.append(answer.media[0])
-        with pytest.raises(AssertionError, match="different route|not bound"):
-            require_bound_answer(
-                unsigned, request["candidate_id"], expected_route="context",
-                trusted_turn_id=trusted_turn_id,
-            )
-    finally:
-        await ingress.close()

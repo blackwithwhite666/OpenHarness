@@ -16,11 +16,12 @@ _UNAVAILABLE_MESSAGE = "Conversation image unavailable."
 
 
 class LoadConversationImageInput(BaseModel):
-    """Strict content-addressed identifier; never accepts a filesystem path."""
+    """Content-addressed image lookup with an explicit optional source selection."""
 
     model_config = ConfigDict(extra="forbid")
 
     attachment_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    select_as_nutrition_source: bool = False
 
 
 class LoadConversationImageTool(BaseTool):
@@ -29,7 +30,9 @@ class LoadConversationImageTool(BaseTool):
     name = "load_conversation_image"
     description = (
         "Reopen one image from conversation history by its exact attachment_id. "
-        "This is read-only and accepts no path."
+        "This is read-only and accepts no path. Loads are for comparison by default; "
+        "set select_as_nutrition_source=true only when this is the explicit source "
+        "for a nutrition observation or correction."
     )
     input_model = LoadConversationImageInput
 
@@ -40,11 +43,15 @@ class LoadConversationImageTool(BaseTool):
         is_attachment_allowed: Callable[[str], bool],
         on_load_started: Callable[[str], None] | None = None,
         on_loaded: Callable[[str], str | None] | None = None,
+        on_source_selected: Callable[[str], str | None] | None = None,
+        on_source_selection_started: Callable[[str], None] | None = None,
     ) -> None:
         self._store = store
         self._is_attachment_allowed = is_attachment_allowed
         self._on_load_started = on_load_started
         self._on_loaded = on_loaded
+        self._on_source_selected = on_source_selected
+        self._on_source_selection_started = on_source_selection_started
 
     def is_read_only(self, arguments: BaseModel) -> bool:
         del arguments
@@ -56,6 +63,8 @@ class LoadConversationImageTool(BaseTool):
         context: ToolExecutionContext,
     ) -> ToolResult:
         del context
+        if arguments.select_as_nutrition_source and self._on_source_selection_started is not None:
+            self._on_source_selection_started(arguments.attachment_id)
         if self._on_load_started is not None:
             self._on_load_started(arguments.attachment_id)
         try:
@@ -78,6 +87,18 @@ class LoadConversationImageTool(BaseTool):
         )
         if isinstance(verified_source_time, str) and verified_source_time:
             output += f" Verified source conversation message received time (UTC): {verified_source_time}."
+        selection_time = None
+        if arguments.select_as_nutrition_source:
+            selection_time = (
+                self._on_source_selected(ref.attachment_id)
+                if self._on_source_selected is not None else None
+            )
+            if selection_time is None:
+                return ToolResult(
+                    output="Image loaded for comparison, but no unique owned nutrition source could be verified.",
+                    is_error=True,
+                )
+            output += " This image is the explicitly selected nutrition source, verified against the owner's delivered source; a correction also requires its original append receipt."
         return ToolResult(
             output=output,
             metadata={

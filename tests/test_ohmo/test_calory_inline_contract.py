@@ -57,7 +57,9 @@ def test_bundled_calory_trace_example_survives_default_engine_preview(tmp_path, 
     preview = preview_match.group(1)
     assert preview == result.output[:3000]
     for required_guidance in (
-        "A Camera/source photo needs meaningful affirmative owner confirmation",
+        "A Camera/source photo is assistant-origin context, not an owner consumption claim",
+        "without reply binding, button, or extra confirmation",
+        "trusted photo send date and source identity",
         "Identifiable single unit: count its whole original unit, even if bitten or partly eaten, unless the owner states a partial amount",
         "Estimate visible portions only if no whole unit is identifiable",
         "cooked edible mass or household measure",

@@ -275,6 +275,9 @@ def _lifecycle_runtime(
     engine = FakeEngine()
     runtime = object.__new__(OhmoSessionRuntimePool)
     runtime._todo_store = store
+    # The replay guard runs before the todo lifecycle. Supply the constructor
+    # setting that this deliberately minimal runtime fixture omits.
+    runtime._gateway_config = SimpleNamespace(family_principals={})
     runtime._runtime_system_prompt = lambda *_args, **_kwargs: _resolved("system")
     runtime._maybe_schedule_memory_judge = lambda *_args, **_kwargs: None
 

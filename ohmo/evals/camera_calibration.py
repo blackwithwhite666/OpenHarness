@@ -12,7 +12,6 @@ import hashlib
 import io
 import json
 import math
-import re
 import warnings
 from collections.abc import Awaitable, Callable, Sequence
 from pathlib import Path
@@ -621,6 +620,7 @@ def _button_click_evidence(case: Case | JudgeCase) -> list[dict[str, Any]]:
             camera_callback_candidate = md.get("_camera_ingress_callback_candidate")
             camera_callback_eligible = md.get("_camera_ingress_callback_eligible")
             feedback_receipt = md.get("_camera_feedback_receipt")
+            native_click_receipt = md.get("_camera_native_click_receipt")
             options = md.get("native_keyboard_options")
             idx = md.get("native_keyboard_selected_index")
             label = md.get("native_keyboard_selected_label")
@@ -686,10 +686,53 @@ def _button_click_evidence(case: Case | JudgeCase) -> list[dict[str, Any]]:
                 and "✅ Это не еда" in str(md.get("native_keyboard_reflection") or "")
                 and isinstance(turn_provenance, list)
             )
+            native_click_binding = False
+            if isinstance(native_click_receipt, dict) and provenance_binding:
+                initial_matches = any(
+                    isinstance(initial, dict)
+                    and initial.get("kind") == "initial_context"
+                    and initial.get("candidate_id") == native_click_receipt.get("candidate_id")
+                    and initial.get("native_photo_id") == native_click_receipt.get("native_photo_id")
+                    and initial.get("tenant_id") == native_click_receipt.get("tenant_id") == case.owner_id
+                    and initial.get("recipient_principal") == native_click_receipt.get("owner_principal")
+                        == goal.get("principal_id")
+                    and initial.get("gateway_session_id") == goal.get("gateway_session_id")
+                    for selected in exported if selected.get("episode", {}).get("episode_id") in episode_ids
+                    for initial in [selected.get("trusted_camera_context") or {}]
+                )
+                issued_ids = native_click_receipt.get("issued_keyboard_message_ids")
+                prompt = md.get("native_keyboard_prompt")
+                expected_options_hash = hashlib.sha256(json.dumps(
+                    options, ensure_ascii=False, separators=(",", ":")
+                ).encode("utf-8")).hexdigest() if isinstance(options, list) else ""
+                expected_prompt_hash = hashlib.sha256(prompt.encode("utf-8")).hexdigest() \
+                    if isinstance(prompt, str) else ""
+                native_click_binding = bool(
+                    initial_matches
+                    and native_click_receipt.get("kind") == "issued_model_button"
+                    and native_click_receipt.get("native_message_id") == str(md.get("native_message_id"))
+                    and isinstance(issued_ids, list) and str(md.get("native_message_id")) in issued_ids
+                    and native_click_receipt.get("callback_message_id") == str(md.get("message_id"))
+                    and native_click_receipt.get("callback_query_id") == callback_id
+                    and native_click_receipt.get("owner_principal") == goal.get("principal_id")
+                    and native_click_receipt.get("issued_options_sha256") == expected_options_hash
+                    and native_click_receipt.get("issued_prompt_sha256") == expected_prompt_hash
+                    and native_click_receipt.get("callback_data") == data == f"ask:{idx}"
+                    and native_click_receipt.get("selected_index") == idx
+                    and native_click_receipt.get("selected_label") == label
+                    and native_click_receipt.get("operation_id")
+                        == f"{native_click_receipt.get('candidate_id')}:issued_button:{callback_id}"
+                )
+            camera_callback_without_receipt = (
+                ctx is None
+                and ("_camera_candidate_id" in md or "_camera_native_binding" in md
+                     or camera_callback_candidate is not None)
+                and not native_click_binding
+            )
             bound_native_episode = (
                 camera_binding if ctx is not None
                 else feedback_binding if isinstance(feedback_receipt, dict)
-                else provenance_binding
+                else native_click_binding or (provenance_binding and not camera_callback_without_receipt)
             )
             camera_callback_facts = (
                 camera_callback_candidate is None
@@ -699,27 +742,11 @@ def _button_click_evidence(case: Case | JudgeCase) -> list[dict[str, Any]]:
                     and camera_callback_eligible is True
                 )
                 or feedback_binding
+                or native_click_binding
             )
-            # Camera captions use either a photo-made date or an explicit
-            # unknown-date sentence. Keep both forms behind the same question
-            # prefix so an unbound Camera click cannot fall back to user provenance.
-            prompt_text = md.get("native_keyboard_prompt", "")
-            camera_caption = isinstance(prompt_text, str) and re.match(
-                r"^\s*Съели ли вы это\?\s*(?:Фото сделано\b|Дата съёмки неизвестна\b)", prompt_text,
-            ) is not None
-            normalized_prompt = re.sub(r"\W+", " ", prompt_text.casefold()).strip() \
-                if isinstance(prompt_text, str) else ""
-            repeated_prompt_count = sum(
-                normalized_prompt in re.sub(r"\W+", " ", turn.text.casefold()).strip()
-                for turn in (case.dialogue or [])
-                if turn.role == "assistant" and normalized_prompt
-            ) if isinstance(case, Case) else 0
-            if camera_caption and ctx is None and not feedback_binding:
-                camera_callback_facts = False
             if (
                 not common_binding or not bound_native_episode
                 or not camera_callback_facts
-                or repeated_prompt_count > 1
                 or inbound.get("channel") != "telegram"
                 or md.get("callback_query") is not True
                 or type(md.get("native_message_id")) is not int

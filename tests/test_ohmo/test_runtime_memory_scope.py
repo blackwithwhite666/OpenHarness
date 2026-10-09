@@ -707,11 +707,11 @@ async def test_authorized_family_private_append_gets_gateway_person_provenance()
     assert "confirmation_required" not in forwarded_metadata
 
     camera_ctx = TurnContext(
-        principal="200", is_owner=False, is_private=True, channel="telegram",
+        principal="__camera__", is_owner=False, is_private=True, channel="telegram",
         chat_id="200", session_id="session-200", camera_authorized=True,
     )
     camera_message = InboundMessage(
-        channel="telegram", sender_id="200", chat_id="200", content="Camera observation",
+        channel="telegram", sender_id="__camera__", chat_id="200", content="Camera observation",
         metadata={"_camera_authority": CAMERA_AUTHORITY, "ingest_source": "telegram"},
     )
     await pool._append_conversation_turn(
@@ -721,9 +721,9 @@ async def test_authorized_family_private_append_gets_gateway_person_provenance()
         user_text=camera_message.content,
         assistant_text="What happened?",
     )
-    assert len(calls) == 3
-    assert calls[-1]["assistant_metadata"]["ingest_source"] == "dropbox_camera"
-    assert calls[-1]["assistant_metadata"]["confirmation_required"] is True
+    # The synthetic trigger is transport-only. It cannot impersonate an owner
+    # append or claim Camera source provenance from a marker on a user message.
+    assert len(calls) == 2
 
 
 @pytest.mark.parametrize(

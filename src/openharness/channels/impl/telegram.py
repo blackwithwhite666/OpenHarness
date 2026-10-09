@@ -1381,7 +1381,6 @@ class TelegramChannel(BaseChannel):
             msg.metadata.get("_camera_edit_existing_photo") is not None
             and msg.metadata.get("_camera_final") is not None
             and camera_ingress is not None
-            and keyboard is not None
             and msg.content
         ):
             camera_edit_claimed = await camera_ingress.claim_initial_prompt_edit(msg, chat_id)

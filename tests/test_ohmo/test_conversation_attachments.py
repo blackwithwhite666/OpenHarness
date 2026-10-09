@@ -143,11 +143,13 @@ async def test_load_conversation_image_returns_trusted_transient_content_only(
     ref = store.ingest_bytes(PNG_BYTES, media_type="image/png", label="meal.png")
     attempts: list[str] = []
     loaded: list[str] = []
+    selected: list[str] = []
     tool = LoadConversationImageTool(
         store,
         is_attachment_allowed=lambda attachment_id: attachment_id == ref.attachment_id,
         on_load_started=attempts.append,
         on_loaded=loaded.append,
+        on_source_selected=lambda attachment_id: selected.append(attachment_id) or "2026-10-01T00:00:00+00:00",
     )
 
     result = await tool.execute(
@@ -163,6 +165,17 @@ async def test_load_conversation_image_returns_trusted_transient_content_only(
     assert isinstance(transient, ImageBlock)
     assert transient.data == base64.b64encode(PNG_BYTES).decode("ascii")
     assert "data" not in {key for key in result.metadata if not key.startswith("_")}
+    assert selected == []
+
+    chosen = await tool.execute(
+        LoadConversationImageInput(
+            attachment_id=ref.attachment_id, select_as_nutrition_source=True
+        ),
+        ToolExecutionContext(cwd=tmp_path),
+    )
+    assert chosen.is_error is False
+    assert "explicitly selected nutrition source" in chosen.output
+    assert selected == [ref.attachment_id]
 
 
 @pytest.mark.asyncio
@@ -187,6 +200,65 @@ async def test_load_conversation_image_rejects_nonexistent_id(tmp_path: Path) ->
     assert "_openharness_transient_image" not in result.metadata
     assert attempts == ["0" * 64]
     assert loaded == []
+
+
+@pytest.mark.asyncio
+async def test_failed_explicit_source_attempt_clears_prior_selection_but_comparison_does_not(
+    tmp_path: Path,
+) -> None:
+    import io
+    from PIL import Image
+
+    workspace = initialize_workspace(tmp_path / ".ohmo-home")
+    store = AttachmentStore(workspace)
+    valid = store.ingest_bytes(PNG_BYTES, media_type="image/png")
+    image_bytes = io.BytesIO()
+    Image.new("RGB", (2, 2), "red").save(image_bytes, format="PNG")
+    replacement = store.ingest_bytes(image_bytes.getvalue(), media_type="image/png")
+    unavailable_id = "b" * 64
+    selected = {"attachment_id": None}
+    tool = LoadConversationImageTool(
+        store,
+        is_attachment_allowed=lambda attachment_id: attachment_id in {
+            valid.attachment_id, replacement.attachment_id,
+        },
+        on_source_selection_started=lambda _attachment_id: selected.update(attachment_id=None),
+        on_source_selected=lambda attachment_id: selected.update(attachment_id=attachment_id)
+        or "2026-10-01T00:00:00+00:00",
+    )
+    context = ToolExecutionContext(cwd=tmp_path)
+
+    first = await tool.execute(
+        LoadConversationImageInput(
+            attachment_id=valid.attachment_id, select_as_nutrition_source=True,
+        ), context,
+    )
+    assert first.is_error is False
+    assert selected["attachment_id"] == valid.attachment_id
+
+    comparison = await tool.execute(
+        LoadConversationImageInput(attachment_id=replacement.attachment_id), context,
+    )
+    assert comparison.is_error is False
+    assert selected["attachment_id"] == valid.attachment_id
+
+    changed = await tool.execute(
+        LoadConversationImageInput(
+            attachment_id=replacement.attachment_id, select_as_nutrition_source=True,
+        ), context,
+    )
+    assert changed.is_error is False
+    assert selected["attachment_id"] == replacement.attachment_id
+
+    selected["attachment_id"] = valid.attachment_id
+
+    failed_choice = await tool.execute(
+        LoadConversationImageInput(
+            attachment_id=unavailable_id, select_as_nutrition_source=True,
+        ), context,
+    )
+    assert failed_choice.is_error is True
+    assert selected["attachment_id"] is None
 
 
 @pytest.mark.asyncio

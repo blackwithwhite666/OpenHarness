@@ -44,6 +44,16 @@ def test_ohmo_prompt_includes_persona_and_memory(tmp_path: Path):
     assert "UTC timestamps" in prompt
 
 
+def test_nutrition_prompt_requires_explicit_source_selection_for_observation_and_correction(
+    tmp_path: Path,
+):
+    workspace = initialize_workspace(tmp_path / ".ohmo-home")
+    prompt = build_ohmo_system_prompt(tmp_path, workspace=workspace)
+    assert "initial observation or correction" in prompt
+    assert "select_as_nutrition_source=true" in prompt
+    assert "loading images for comparison does not select a target" in prompt
+
+
 def test_poisoned_soul_is_blocked_in_prompt(tmp_path: Path):
     # Persona files are injected verbatim; a poisoned soul.md (disk-poison via a
     # compromised tool) must be replaced by a placeholder, not injected.
@@ -207,18 +217,23 @@ def test_ohmo_prompt_nutrition_contract_contains_versioned_annotation_rules(tmp_
     assert '"meal_date": null' in prompt
     assert '"meal_at": null' in prompt
     assert (
-        "A directly sent photo from an authenticated configured participant in their own private conversation"
+        "A directly sent owner photo of clearly identifiable food without an accompanying advisory request"
         in prompt
     )
-    assert "is itself a request to log clearly identifiable pictured food as consumed" in prompt
-    assert "the gateway's trusted native photo send time is the default date convention" in prompt
-    assert "An explicit user date/time overrides that default." in prompt
+    assert "A delivered Camera photo alone is not an owner consumption claim" in prompt
+    assert "the gateway's trusted original send time is the default" in prompt
+    assert "its trusted Camera capture time is the default when available" in prompt
+    assert "An explicit owner date/time overrides it." in prompt
     assert "If trusted source time is unavailable, preserve unknown." in prompt
     assert "forwarded source timestamp" in prompt
     assert "receive timestamp" in prompt
     assert "EXIF" in prompt
     assert "model guess" in prompt
     assert "without an accompanying advisory request" in prompt
+    assert "default load is comparison-only" in prompt
+    assert "select_as_nutrition_source=true" in prompt
+    assert "for an initial observation even when no prior meal" in prompt
+    assert "for a correction, the original append receipt" in prompt
     assert (
         "At least one total energy field (`energy_kcal_min|max|best`) is required "
         "only for `meal_observation`." in prompt
@@ -542,8 +557,9 @@ def test_ohmo_prompt_contracts_pre_tool_action_purpose(tmp_path: Path) -> None:
     assert "A separate user-visible line is only for a necessary action outside routine calory work" in prompt
     assert "Use the final reply for the useful estimate or receipt-gated saved result" in prompt
     assert "ask a necessary, meaningful clarification directly" in prompt
-    assert "Camera affirmative confirmation versus the directly sent person-photo default" in prompt
-    assert "uncertainty and meaningful clarification, and receipt-gated saved claims" in prompt
+    assert "initial observation or correction" in prompt
+    assert "select_as_nutrition_source=true" in prompt
+    assert "rules for uncertainty, meaningful clarification, and receipt-gated saved claims" in prompt
     assert "For all other tool calls" in prompt
     # The contract for other tasks: one short user-visible line before tool use.
     assert "before every tool call" in prompt
@@ -584,6 +600,27 @@ def test_ohmo_prompt_nutrition_contract_explicit_new_consumption_rule(
     assert "is a duplicate, not another meal" in prompt
 
 
+def test_calory_skill_and_common_prompt_agree_on_ordinary_camera_source_selection(
+    tmp_path: Path,
+) -> None:
+    workspace = initialize_workspace(tmp_path / ".ohmo-home")
+    common = build_ohmo_system_prompt(tmp_path, workspace=workspace)
+    skill = _calory_skill_body()
+    for text in (
+        "meaningful owner statement",
+        "without reply binding, button, or extra confirmation",
+        "select_as_nutrition_source=true",
+        "comparison-only",
+        "initial observation has no prior meal receipt",
+        "trusted Camera capture time",
+        "delivery time must not replace missing Camera capture time",
+    ):
+        assert text.casefold() in skill.casefold()
+    assert "initial observation or correction" in common
+    assert "select_as_nutrition_source=true" in common
+    assert "loading images for comparison does not select a target" in common
+
+
 def test_ohmo_prompt_wellness_and_nutrition_safety_contract(tmp_path: Path) -> None:
     workspace = tmp_path / ".ohmo-home"
     initialize_workspace(workspace)
@@ -606,15 +643,15 @@ def test_ohmo_prompt_wellness_and_nutrition_safety_contract(tmp_path: Path) -> N
         "Nonfood images, advice, hypothetical, explicit identification/estimate requests, "
         "and image-analysis-only turns do not create a `meal_observation`." in prompt
     )
-    assert "use that known unit as the default amount after meaningful owner confirmation" in prompt
+    assert "use that known unit as the default amount when the full conversation supports consumption" in prompt
     assert "do not ask for exact grams, volume, or macros just because they are unknown" in prompt
     assert "Explicit partial quantities and composition override whole-unit defaults" in prompt
     assert (
         "Ask one useful clarification only when the food/target, whether it was consumed, "
         "or a material amount/composition cannot reasonably be estimated" in prompt
     )
-    assert "Do not infer Camera consumption before meaningful owner confirmation" in prompt
-    assert "explicit consumed/log intent" in prompt
+    assert "A delivered Camera photo alone is not an owner consumption claim" in prompt
+    assert "when the full conversation supports a nutrition record" in prompt
     assert "text as authoritative over ambiguous image inference" in prompt
     assert "ask for clarification before recording" in prompt
     assert "trusted nutrition append receipt" in prompt

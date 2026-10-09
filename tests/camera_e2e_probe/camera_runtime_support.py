@@ -14,6 +14,7 @@ from openharness.api.client import (
 )
 from openharness.api.usage import UsageSnapshot
 from openharness.engine.messages import (
+    AttachmentRefBlock,
     ConversationMessage,
     TextBlock,
     ToolResultBlock,
@@ -223,153 +224,120 @@ def _validate_completed_photo_replay(
 
 
 class OfflineCameraBotApi:
-    """Synthetic bot transport: asks, then uses TraceTool for a fake meal."""
+    """Script ordinary tool sequencing; never infer intent from owner wording."""
 
     synthetic = True
 
-    def __init__(self, *, context_items_date: bool = False) -> None:
+    def __init__(self, *, candidate_id: str | None = None, context_items_date: bool = False,
+                 omit_nutrition_annotation: bool = False) -> None:
         self.calls = 0
         self.finalization_proposals = 0
-        self._queued_correction: dict[str, Any] | None = None
+        self.candidate_id = candidate_id
         self.context_items_date = context_items_date
+        self.omit_nutrition_annotation = omit_nutrition_annotation
+        self._queued_correction: dict[str, Any] | None = None
 
     def queue_correction(self, nutrition: dict[str, Any]) -> None:
-        """Queue one synthetic trace for the next real runtime correction turn."""
         if self._queued_correction is not None:
             raise AssertionError("offline correction queue is already occupied")
         self._queued_correction = nutrition
+
+    @staticmethod
+    def _emit(message: ConversationMessage, stop_reason: str):
+        return ApiMessageCompleteEvent(
+            message=message,
+            usage=UsageSnapshot(input_tokens=1, output_tokens=1),
+            stop_reason=stop_reason,
+        )
 
     async def stream_message(
         self, request: ApiMessageRequest
     ) -> AsyncIterator[ApiMessageCompleteEvent]:
         self.calls += 1
-        owner_turn_index = next(
-            (
-                index
-                for index in range(len(request.messages) - 1, -1, -1)
-                if request.messages[index].role == "user"
-                and not any(
-                    isinstance(block, ToolResultBlock) for block in request.messages[index].content
-                )
-            ),
-            len(request.messages),
+        attachments = [
+            block for message in request.messages
+            for block in message.content if isinstance(block, AttachmentRefBlock)
+        ]
+        current_user_index = next(
+            (i for i in range(len(request.messages) - 1, -1, -1)
+             if request.messages[i].role == "user"
+             and not any(isinstance(block, ToolResultBlock)
+                         for block in request.messages[i].content)),
+            -1,
         )
-        owner_turn = (
-            request.messages[owner_turn_index] if owner_turn_index < len(request.messages) else None
+        current_user = (
+            request.messages[current_user_index] if current_user_index >= 0 else None
         )
-        # Query appends tool results as role=user. Results after this owner turn
-        # finish its turn; results before a fresh replay do not suppress it.
-        tool_result_seen = any(
-            isinstance(block, ToolResultBlock)
-            for message in request.messages[owner_turn_index + 1 :]
-            for block in message.content
-        )
-        accepted_labels = (SYNTHETIC_BUTTON_LABEL, SYNTHETIC_WHOLE_PORTION)
-        owner_confirmed = owner_turn is not None and any(
-            label in owner_turn.text for label in accepted_labels
-        )
-        if self._queued_correction is not None and not tool_result_seen:
+        if current_user is None or any(
+            isinstance(block, AttachmentRefBlock) for block in current_user.content
+        ):
+            yield self._emit(ConversationMessage(role="assistant", content=[
+                TextBlock(text=(
+                    "Photo context received; no owner consumption has been recorded. "
+                    "[[ask: Did you eat the pictured portion? | Yes, all of it | No, none of it]]"
+                ))
+            ]), "end_turn")
+            return
+        if not attachments:
+            yield self._emit(ConversationMessage(role="assistant", content=[
+                TextBlock(text="No owned image source is available for a nutrition record.")
+            ]), "end_turn")
+            return
+        selected = [
+            block for block in attachments
+            if self.candidate_id is not None
+            and isinstance(block.source_provenance, Mapping)
+            and block.source_provenance.get("camera_candidate_id") == self.candidate_id
+        ]
+        if len(selected) != 1:
+            raise AssertionError("fixture must identify exactly one delivered owned source")
+        current_results = [
+            block for message in request.messages[current_user_index + 1:]
+            for block in message.content if isinstance(block, ToolResultBlock)
+        ]
+        if not current_results:
+            yield self._emit(ConversationMessage(role="assistant", content=[ToolUseBlock(
+                name="load_conversation_image",
+                input={"attachment_id": selected[0].attachment_id,
+                       "select_as_nutrition_source": True},
+            )]), "tool_use")
+            return
+        if len(current_results) == 1:
+            if self.omit_nutrition_annotation:
+                yield self._emit(ConversationMessage(role="assistant", content=[
+                    TextBlock(text="I reviewed the selected image and your portion report.")
+                ]), "end_turn")
+                return
             nutrition = self._queued_correction
             self._queued_correction = None
+            if nutrition is None:
+                nutrition = {
+                    "schema_version": 2, "record_type": "meal_observation",
+                    "basis": ["image", "user_statement"], "consumption_status": "consumed",
+                    "is_estimate": True,
+                    "energy_kcal_best": 225 if self.context_items_date else SYNTHETIC_KCAL,
+                    "items": ([
+                        {"name": "cottage cheese", "quantity_text": "125 g package", "energy_kcal_best": 210},
+                        {"name": "berries", "quantity_text": "15 g", "energy_kcal_best": 15},
+                    ] if self.context_items_date else [
+                        {"name": "synthetic apple", "quantity_text": "one fixture serving",
+                         "energy_kcal_best": SYNTHETIC_KCAL},
+                    ]),
+                    "assumptions": ["offline structural fixture; not a model estimate"],
+                }
             self.finalization_proposals += 1
-            message = ConversationMessage(
-                role="assistant",
-                content=[
-                    ToolUseBlock(
-                        name="trace",
-                        input={
-                            "kind": "trace_finalization",
-                            "payload": {
-                                "schema_version": 1,
-                                "trace_event_id": f"offline-camera-correction-{self.calls}",
-                                "annotations": {"nutrition": nutrition},
-                            },
-                        },
-                    )
-                ],
-            )
-            stop_reason = "tool_use"
-        elif tool_result_seen:
-            stop_reason = "end_turn"
-            message = ConversationMessage(
-                role="assistant",
-                content=[
-                    TextBlock(
-                        text=(
-                            "I recorded the synthetic Camera meal from the delivered photo "
-                            "and your explicit confirmation; the stored entry uses the "
-                            "trusted capture date."
-                        )
-                    )
-                ],
-            )
-        elif owner_confirmed:
-            stop_reason = "tool_use"
-            self.finalization_proposals += 1
-            message = ConversationMessage(
-                role="assistant",
-                content=[
-                    ToolUseBlock(
-                        name="trace",
-                        input={
-                            "kind": "trace_finalization",
-                            "payload": {
-                                "schema_version": 1,
-                                "trace_event_id": f"offline-camera-finalization-{self.calls}",
-                                "annotations": {
-                                    "nutrition": {
-                                        "schema_version": 2,
-                                        "record_type": "meal_observation",
-                                        "basis": ["image", "owner_confirmation"],
-                                        "consumption_status": "consumed",
-                                        "is_estimate": True,
-                                        "energy_kcal_best": 225 if self.context_items_date else SYNTHETIC_KCAL,
-                                        "items": [
-                                            *(
-                                                [
-                                                    {"name": "cottage cheese", "quantity_text": "125 g package", "energy_kcal_best": 210},
-                                                    {"name": "berries", "quantity_text": "15 g", "energy_kcal_best": 15},
-                                                ]
-                                                if self.context_items_date else
-                                                [{"name": "synthetic apple", "quantity_text": "1 medium apple (fixture)", "energy_kcal_best": SYNTHETIC_KCAL}]
-                                            )
-                                        ],
-                                        "assumptions": [
-                                            "offline transport fixture; not a model estimate"
-                                        ],
-                                    }
-                                },
-                            },
-                        },
-                    )
-                ],
-            )
-        else:
-            stop_reason = "end_turn"
-            message = ConversationMessage(
-                role="assistant",
-                content=[
-                    TextBlock(
-                        text=(
-                            "Synthetic offline Camera photo received. "
-                            + (
-                                "[[ask: Съели ли вы эту порцию? | "
-                                + " | ".join((SYNTHETIC_WHOLE_PORTION, "Половину порции", "Не ел(а)"))
-                                + "]]"
-                                if self.context_items_date
-                                else "[[ask: Did you eat the pictured synthetic item? | "
-                                + " | ".join(SYNTHETIC_OPTIONS)
-                                + "]]"
-                            )
-                        )
-                    )
-                ],
-            )
-        yield ApiMessageCompleteEvent(
-            message=message,
-            usage=UsageSnapshot(input_tokens=1, output_tokens=1),
-            stop_reason=stop_reason,
-        )
+            yield self._emit(ConversationMessage(role="assistant", content=[ToolUseBlock(
+                name="trace",
+                input={"kind": "trace_finalization", "payload": {
+                    "schema_version": 1,
+                    "trace_event_id": f"offline-ordinary-finalization-{self.calls}",
+                    "annotations": {"nutrition": nutrition},
+                }},
+            )]), "tool_use")
+            return
+        yield self._emit(ConversationMessage(role="assistant", content=[
+            TextBlock(text="Recorded the ordinary owner report after verifying its selected image source.")
+        ]), "end_turn")
 
 
 class OfflineCameraUserApi:
@@ -512,10 +480,12 @@ class OfflineTelegramBot:
         self.calls.append(("send_chat_action", kwargs))
 
 
-def distinct_offline_clients(*, context_items_date: bool = False):
+def distinct_offline_clients(*, context_items_date: bool = False,
+                             omit_nutrition_annotation: bool = False):
     """Create distinct bot/user fake clients for the explicit offline mode."""
     return (
-        OfflineCameraBotApi(context_items_date=context_items_date),
+        OfflineCameraBotApi(context_items_date=context_items_date,
+                            omit_nutrition_annotation=omit_nutrition_annotation),
         OfflineCameraUserApi(
             SYNTHETIC_WHOLE_PORTION if context_items_date else SYNTHETIC_BUTTON_LABEL
         ),
@@ -525,14 +495,6 @@ def distinct_offline_clients(*, context_items_date: bool = False):
 def camera_runtime_limits(*, native_mode: bool) -> tuple[int, str]:
     """Keep model-backed prototype runs bounded without constraining offline fixtures."""
     return (8, "medium") if native_mode else (4, "none")
-
-
-def camera_typed_reply_mode(value: str | None) -> str:
-    """Validate the joined runner's typed route before it creates clients."""
-    mode = "reply" if value is None else value
-    if mode not in {"reply", "context"}:
-        raise ValueError("CAMERA_TYPED_REPLY_MODE must be reply or context")
-    return mode
 
 
 def isolated_runtime_loaders(runtime_module):
@@ -602,23 +564,19 @@ async def run_camera_runtime_trajectory(
     before_answer=None,
     config_dir=None,
     user_scenario: str = "synthetic offline owner selects the exact offered confirmation",
-    typed_reply_mode: str = "reply",
-    before_owner_action=None,
-    restart_before_owner_action: bool = False,
+    before_replay=None,
+    advance_before_owner_action: bool = False,
     restart_before_replay: bool = False,
     expect_append_failure: bool = False,
+    expect_missing_nutrition: bool = False,
     after_save=None,
 ):
-    """Run two actual Ohmo turns and the delivered Telegram callback offline."""
-    import asyncio
-    import json
+    """Run an initial Camera delivery and a generic ordinary owner turn."""
     import os
     from datetime import datetime, timedelta, timezone
-    from types import SimpleNamespace
 
     from openharness.api.codex_client import CodexApiClient
     from openharness.config.paths import get_config_file_path
-    from openharness.evals.session_user_simulator import LlmUserSimulator
     from ohmo.gateway.bridge import OhmoGatewayBridge
     import ohmo.gateway.camera as camera_module
     from ohmo.gateway.camera import CameraIngress
@@ -629,8 +587,6 @@ async def run_camera_runtime_trajectory(
     import openharness.ui.runtime as openharness_runtime
     from probe_support import NativeClientPreconditionError
 
-    if typed_reply_mode not in {"reply", "context"}:
-        raise ValueError("CAMERA_TYPED_REPLY_MODE must be reply or context")
     if bot_client is user_client:
         raise AssertionError("Camera bot and virtual-user clients must be separate")
     native_mode = os.environ.get("CAMERA_RUN_MODE") == "native"
@@ -746,32 +702,6 @@ async def run_camera_runtime_trajectory(
         pool = new_pool(ingress)
         bind_ingress(ingress)
         bridge = OhmoGatewayBridge(bus=bus, runtime_pool=pool, camera_ingress=ingress)
-        simulator = LlmUserSimulator(
-            api_client=user_client,
-            model="gpt-6-luna" if native_mode else "offline-user-synthetic",
-            system_prompt=(
-                "You are the Camera owner described here. Answer as that person, using the "
-                "actual question and choices in the conversation. Preserve denial, amount, "
-                "and time qualifiers. Do not invent details."
-                + (
-                    " Answer in natural typed words, not by repeating an offered label."
-                    if typed_reply_mode == "context" else ""
-                )
-                + "\n\n" + user_scenario
-                if native_mode
-                else (
-                    "You are a synthetic offline owner; answer with a meaningful typed "
-                    "consumption and portion statement, not an exact offered label."
-                    if typed_reply_mode == "context"
-                    else "You are a synthetic offline owner; select the exact offered answer."
-                )
-            ),
-        )
-        from camera_virtual_user import CameraVirtualUser, OfferedCameraChoices
-        from probe_support import require_bound_answer
-
-        virtual_user = CameraVirtualUser(simulator, typed_reply_mode=typed_reply_mode)
-
         async def process_and_deliver(message, session_key):
             await bridge._process_message(message, session_key)
             delivered = []
@@ -792,329 +722,127 @@ async def run_camera_runtime_trajectory(
 
         first_started = datetime.now(timezone.utc)
         first_delivered, _, _ = await process_and_deliver(initial_message, "telegram:123")
-        issued = next((item for item, _ in reversed(first_delivered) if item.buttons), None)
-        if issued is None:
-            raise AssertionError("runtime/bridge did not issue a Camera choice keyboard")
-        edit = next(
-            (
-                kwargs
-                for name, kwargs in fake_bot.calls
-                if name == "edit_message_caption" and kwargs.get("reply_markup") is not None
-            ),
-            None,
-        )
-        if edit is None:
-            raise AssertionError("TelegramChannel did not deliver the Camera keyboard")
-        markup = edit["reply_markup"]
-        buttons = [button for row in markup.inline_keyboard for button in row]
+        if not any(name == "send_photo" for name, _ in fake_bot.calls):
+            raise AssertionError("Camera photo delivery has no native receipt")
         native_photo = ingress._attempts[candidate_id].get("photo_id")
-        if not isinstance(native_photo, int) or native_photo <= 0:
-            raise AssertionError("Camera native photo receipt is missing")
-        if not any(
-            name == "send_photo" and not kwargs.get("reply_markup")
-            for name, kwargs in fake_bot.calls
+        capture_time = ingress._attempt_capture_time(ingress._attempts[candidate_id])
+        if type(native_photo) is not int or native_photo <= 0 or capture_time is None:
+            raise AssertionError("Camera source lacks a confirmed native photo/capture receipt")
+        if (
+            ingress._attempts[candidate_id].get("state") != "photo_sent"
+            or ingress._attempts[candidate_id].get("initial_prompt_delivery_confirmed") is not True
         ):
-            raise AssertionError("initial Camera photo must have no buttons")
-        question = issued.content.rsplit("\n\n", 1)[-1].strip()
-        offered = OfferedCameraChoices(
-            question=question,
-            options=tuple(button.text for button in buttons),
-            callback_ids=tuple(button.callback_data for button in buttons),
-            native_message_id=str(native_photo),
-            media_source_ids=(candidate_id,),
-        )
+            raise AssertionError("Camera initial question lacks a confirmed native prompt receipt")
         if before_answer is not None:
             await before_answer(first_started)
-        if restart_before_owner_action:
+        if advance_before_owner_action:
             controlled_now[0] += timedelta(minutes=31)
             ingress._sweep_expired_attempts()
-        if before_owner_action is not None:
-            await before_owner_action(process_and_deliver, ingress, pool)
-        if restart_before_owner_action:
-            await restart_runtime_and_camera()
-        action = await virtual_user.next_camera_action(
-            offered=offered,
-            transcript=(("assistant", issued.content),),
-            captured_prompts=(user_scenario,),
-            captured_capabilities=(),
-            index=0,
-            last_turn=None,
-        )
-        if action is None:
-            raise AssertionError("Camera virtual user produced no owner action")
-        button_ids = {button.callback_data for button in buttons}
-        if action.callback_data is not None and action.callback_data not in button_ids:
-            raise AssertionError("virtual user selected a callback absent from delivered markup")
 
-        clicked_message = SimpleNamespace(
-            message_id=native_photo,
-            chat_id=123,
-            chat=SimpleNamespace(type="private"),
-            caption=edit.get("caption"),
-            caption_html=None,
-            text=None,
-            text_html=None,
-            reply_markup=markup,
-        )
+        from openharness.channels.bus.events import InboundMessage
 
-        callback_number = 0
+        owner_text = "I ate about half of the pictured portion."
+        if native_mode:
+            from openharness.evals.session_user_simulator import LlmUserSimulator
 
-        async def invoke_issued_callback():
-            nonlocal callback_number
-            callback_number += 1
-
-            class Query:
-                data = action.callback_data
-                id = f"offline-camera-callback-{callback_number}"
-                message = clicked_message
-
-                async def answer(self):
-                    return None
-
-                async def edit_message_caption(self, **kwargs):
-                    fake_bot.calls.append(("callback_edit_caption", kwargs))
-
-                async def edit_message_text(self, **kwargs):
-                    fake_bot.calls.append(("callback_edit_text", kwargs))
-
-                async def edit_message_reply_markup(self, **kwargs):
-                    fake_bot.calls.append(("callback_edit_markup", kwargs))
-
-            await channel._on_callback(
-                SimpleNamespace(
-                    callback_query=Query(),
-                    effective_user=SimpleNamespace(
-                        id=123, username=None, first_name="offline owner"
-                    ),
+            visible_prompt = next(
+                (item.content for item, _ in reversed(first_delivered) if item.content), ""
+            )
+            if not visible_prompt:
+                raise AssertionError("native Camera photo produced no visible prompt for the virtual owner")
+            virtual_user = LlmUserSimulator(
+                api_client=user_client, model="gpt-6-luna",
+                system_prompt=(
+                    "You are the owner in this Camera test. Use the supplied scenario as your facts. "
+                    "Reply in your own words with what portion you actually ate and when. "
+                    "Do not claim a meal you did not eat."
                 ),
-                None,
+                max_tokens=256,
             )
-            return await asyncio.wait_for(bus.consume_inbound(), timeout=2)
-
-        if action.callback_data is not None:
-            answer = await invoke_issued_callback()
-        else:
-            typed_source_id = "offline-camera-typed-1"
-            typed_received_at = (
-                controlled_now[0]
-                if restart_before_owner_action
-                else datetime.now(timezone.utc)
+            virtual_turn = await virtual_user.next_turn(
+                transcript=(("assistant", visible_prompt),),
+                captured_prompts=(user_scenario,), captured_capabilities=(),
+                index=0, last_turn=None,
             )
-            answer = action.to_inbound_message(
-                sender_id="123",
-                chat_id="123",
-                source_message_id=typed_source_id,
-                received_at=typed_received_at,
-            )
-        ingress.process_real_inbound(answer)
-        actual_route = "callback" if action.callback_data is not None else action.typed_reply_mode
-        require_bound_answer(
-            answer, candidate_id, native_photo, expected_route=actual_route,
-            trusted_turn_id=(
-                ingress._attempts[candidate_id].get("answer_turn_id")
-                if actual_route == "context" else None
-            ),
+            if virtual_turn is None or not virtual_turn.text.strip():
+                raise AssertionError("native virtual owner did not produce an ordinary text turn")
+            owner_text = virtual_turn.text.strip()
+        answer = InboundMessage(
+            channel="telegram", sender_id="123", chat_id="123",
+            content=owner_text,
+            timestamp=controlled_now[0],
+            metadata={"message_id": "offline-ordinary-owner-turn-1", "is_group": False,
+                      "chat_type": "private", "_telegram_raw_text":
+                      owner_text},
         )
-        if (
-            (
-                action.callback_data is not None
-                and answer.metadata.get("native_message_id") != native_photo
-            )
-            or (action.callback_data is None and actual_route == "reply"
-                and str(answer.metadata.get("reply_to_message_id")) != str(native_photo))
-            or (action.callback_data is None and actual_route == "context"
-                and ("reply_to_message_id" in answer.metadata
-                     or "native_message_id" in answer.metadata))
-            or (
-                action.callback_data is not None
-                and answer.metadata.get("native_keyboard_options")
-                != [button.text for button in buttons]
-            )
-            or (
-                action.callback_data is not None
-                and answer.metadata.get("native_keyboard_selected_label") != action.text
-            )
-            or (
-                action.callback_data is not None
-                and answer.metadata.get("message_id") != native_photo
-            )
-            or (
-                action.callback_data is not None
-                and answer.metadata.get("callback_query_id") != "offline-camera-callback-1"
-            )
-            or (
-                action.callback_data is None
-                and answer.metadata.get("message_id") != "offline-camera-typed-1"
-            )
-            or not answer.media
-        ):
-            raise AssertionError("actual Telegram callback did not bind the offered Camera source")
-        capture_time = ingress.trusted_capture_time_for_answer(answer)
-        if capture_time is None:
-            raise AssertionError("Camera callback has no trusted capture time")
-        action_observation = root / "camera-virtual-action.json"
-        with action_observation.open("x", encoding="utf-8") as handle:
-            json.dump(
-                {
-                    "question": offered.question,
-                    "offered_labels": list(offered.options),
-                    "action_text": action.text,
-                    "callback_id": action.callback_data,
-                    "route": actual_route,
-                    "typed_reply_mode": action.typed_reply_mode,
-                    "source_message_id": answer.metadata.get("message_id"),
-                    "native_photo_id": answer.metadata.get("_camera_photo_id", native_photo),
-                    "reply_to_message_id_present": "reply_to_message_id" in answer.metadata,
-                    "capture_time": capture_time.isoformat(),
-                },
-                handle,
-                ensure_ascii=False,
-                indent=2,
-            )
-            handle.write("\n")
-        os.chmod(action_observation, 0o600)
-        final_delivered, final_receipt, nutrition_event_id = await process_and_deliver(
-            answer, answer.session_key
+        if any(key in answer.metadata for key in (
+            "reply_to_message_id", "callback_query", "_camera_authority", "_camera_answer",
+        )):
+            raise AssertionError("ordinary owner report carries synthetic Camera answer state")
+        delivered, delivery_receipt, event_id = await process_and_deliver(
+            answer, answer.session_key or "telegram:123"
         )
-        final_text = next(
-            (item.content for item, _ in reversed(final_delivered) if item.content), ""
-        )
+        final_text = next((item.content for item, _ in reversed(delivered) if item.content), "")
         if expect_append_failure:
-            if nutrition_event_id is not None or final_receipt is not None:
+            if event_id is not None or delivery_receipt is not None:
                 raise AssertionError("failed Honcho append returned a saved event or receipt")
-            if any(
-                phrase in final_text.casefold()
-                for phrase in ("записано", "уже записана", "saved", "recorded")
-            ):
-                raise AssertionError("failed Honcho append returned a public Saved claim")
+            if any(word in final_text.casefold() for word in ("saved", "recorded", "записано")):
+                raise AssertionError("failed append returned a public Saved claim")
             return {
-                "started": first_started,
-                "answer": answer,
-                "capture_time": capture_time,
-                "event_id": None,
-                "receipt": None,
-                "owner_failure_text": final_text,
-                "native_photo_id": native_photo,
-                "source_candidate_id": candidate_id,
-                "ingress": ingress,
+                "started": first_started, "answer": answer, "capture_time": capture_time,
+                "event_id": None, "receipt": None, "owner_failure_text": final_text,
+                "final_status_text": final_text, "native_photo_id": native_photo,
+                "source_candidate_id": candidate_id, "ingress": ingress,
+                "route": "ordinary", "camera_clock_advanced": controlled_now[0] - controlled_clock_start,
+            }
+        if expect_missing_nutrition:
+            if event_id is not None or delivery_receipt is not None or not final_text:
+                raise AssertionError("annotation-free owner turn unexpectedly saved nutrition")
+            return {
+                "started": first_started, "answer": answer, "capture_time": capture_time,
+                "event_id": None, "receipt": None, "final_status_text": final_text,
+                "native_photo_id": native_photo, "source_candidate_id": candidate_id,
+                "ingress": ingress, "route": "ordinary",
                 "camera_clock_advanced": controlled_now[0] - controlled_clock_start,
             }
-        if not isinstance(nutrition_event_id, str) or not nutrition_event_id:
-            raise AssertionError("runtime did not return its durable nutrition event ID")
-        commit = ingress._attempts[candidate_id].get("camera_commit")
-        if not isinstance(commit, dict) or commit.get("event_id") != nutrition_event_id:
-            raise AssertionError("runtime nutrition event ID differs from Camera durable receipt")
-        if final_receipt is None:
-            raise AssertionError("owner turn did not deliver a native final receipt")
+        if not isinstance(event_id, str) or not event_id or delivery_receipt is None:
+            raise AssertionError("ordinary owner turn did not return a durable append and delivery receipt")
 
         after_save_result = None
         if after_save is not None:
             after_save_result = await after_save(
-                process_and_deliver, ingress, pool, candidate_id, answer, commit,
-                restart_runtime_and_camera,
+                process_and_deliver, ingress, pool, candidate_id, answer,
+                {"event_id": event_id}, restart_runtime_and_camera,
             )
+        if before_replay is not None:
+            await before_replay(process_and_deliver, ingress, pool)
 
         if restart_before_replay:
             await restart_runtime_and_camera()
-        action_label = "Telegram callback" if action.callback_data is not None else "typed reply"
-        mode_label = "NATIVE OPT-IN" if native_mode else "OFFLINE SYNTHETIC"
+        replay_delivered, replay_receipt, replay_event_id = await process_and_deliver(
+            answer, answer.session_key or "telegram:123"
+        )
+        if replay_delivered or replay_receipt is not None or replay_event_id is not None:
+            raise AssertionError("exact owner transport replay was not silent")
+        if isinstance(bot_client, OfflineCameraBotApi):
+            expected_proposals = 1 + (
+                len(after_save_result["correction_event_ids"]) if after_save_result else 0
+            )
+            if bot_client.finalization_proposals != expected_proposals:
+                raise AssertionError("replay reran a proposal or a new correction lacked one")
         print(
-            f"{mode_label} virtual-user {action_label} route={actual_route} "
-            f"source={answer.metadata.get('message_id')} + real Ohmo finalizer completed; "
-            f"event={nutrition_event_id} capture_date={capture_time.date().isoformat()} "
-            f"bot_calls={getattr(bot_client, 'calls', 'native')} "
-            f"user_calls={getattr(user_client, 'calls', 'native')}",
+            f"{'NATIVE OPT-IN' if native_mode else 'OFFLINE SYNTHETIC'} ordinary owner turn "
+            f"source={answer.metadata['message_id']} event={event_id} "
+            f"capture={capture_time.isoformat()} replay_event={replay_event_id}",
             flush=True,
         )
-
-        initial_finalization_proposals = getattr(bot_client, "finalization_proposals", None)
-
-        async def replay_callback():
-            if action.callback_data is not None:
-                replay = await invoke_issued_callback()
-            else:
-                replay = action.to_inbound_message(
-                    sender_id="123",
-                    chat_id="123",
-                    source_message_id="offline-camera-typed-replay-1",
-                    received_at=datetime.now(timezone.utc),
-                )
-            ingress.process_real_inbound(replay)
-            return replay
-
-        latest_replay = (
-            after_save_result.get("post_correction_replay")
-            if isinstance(after_save_result, dict) else None
-        )
-        if isinstance(latest_replay, dict):
-            # The E5 join has already replayed the most recent denial through
-            # Telegram -> CameraIngress -> runtime. Replaying the original
-            # affirmative response here would test stale state and risk a
-            # fixture-triggered resurrection of the corrected meal.
-            replay_status = latest_replay.get("status")
-            replay_delivery_receipt = latest_replay.get("delivery_receipt")
-            replay_event_id = latest_replay.get("event_id")
-            replay_status = validate_e5_post_correction_replay(
-                status=replay_status,
-                delivery_receipt=replay_delivery_receipt,
-                event_id=replay_event_id,
-                expected_event_id=latest_replay.get("expected_event_id"),
-                original_commit=commit,
-                current_commit=ingress._attempts[candidate_id].get("camera_commit"),
-                required_phrase=latest_replay.get("required_phrase", "исправление уже записано"),
-            )
-        else:
-            replay = await replay_callback()
-            replay_delivered, replay_delivery_receipt, replay_event_id = await process_and_deliver(
-                replay, replay.session_key
-            )
-            current_commit = ingress._attempts[candidate_id].get("camera_commit")
-            replay_status = _validate_completed_photo_replay(
-                replay=replay,
-                candidate_id=candidate_id,
-                turn_id=answer.metadata["_camera_turn_id"],
-                delivered=replay_delivered,
-                delivery_receipt=replay_delivery_receipt,
-                existing_event_id=nutrition_event_id,
-                original_commit=commit,
-                current_commit=current_commit,
-                typed_replay=action.callback_data is None,
-            )
-            if replay_event_id != nutrition_event_id:
-                raise AssertionError("completed-photo replay event identity differs from existing meal")
-        if (
-            isinstance(bot_client, OfflineCameraBotApi)
-            and bot_client.finalization_proposals != initial_finalization_proposals
-        ):
-            raise AssertionError(
-                "completed-photo replay proposed another nutrition observation "
-                f"(before={initial_finalization_proposals}, after={bot_client.finalization_proposals})"
-            )
-
         return {
-            "started": first_started,
-            "answer": answer,
-            "capture_time": capture_time,
-            "event_id": nutrition_event_id,
-            "receipt": commit,
-            "final_status_text": final_text,
-            "native_photo_id": native_photo,
-            "keyboard_message_id": native_photo,
-            "source_candidate_id": candidate_id,
-            "bot": channel,
-            "bot_transport": fake_bot,
-            "action": action,
-            "route": actual_route,
-            "markup": markup,
-            "caption": edit.get("caption"),
-            "replay_callback": replay_callback,
-            "owner_replay_saved_status": replay_status,
-            "owner_replay_delivery_confirmed": replay_delivery_receipt is not None,
+            "started": first_started, "answer": answer, "capture_time": capture_time,
+            "event_id": event_id, "receipt": {"event_id": event_id},
+            "final_status_text": final_text, "native_photo_id": native_photo,
+            "source_candidate_id": candidate_id, "ingress": ingress,
             "owner_replay_event_id": replay_event_id,
-            "ingress": ingress,
-            "restarted_before_owner_action": restart_before_owner_action,
-            "restarted_before_replay": restart_before_replay,
-            "controlled_camera_time": controlled_now[0],
+            "replay_text": next((item.content for item, _ in reversed(replay_delivered) if item.content), ""),
             "camera_clock_advanced": controlled_now[0] - controlled_clock_start,
             "after_save_result": after_save_result,
         }

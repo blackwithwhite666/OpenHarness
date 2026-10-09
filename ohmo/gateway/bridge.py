@@ -19,7 +19,6 @@ from ohmo.gateway.camera import (
     CAMERA_AUTHORITY,
     COALESCED_ATTACHMENT_PROVENANCE_AUTHORITY,
     CameraIngress,
-    _classify_answer,
 )
 from ohmo.gateway.config import load_gateway_config, save_gateway_config
 from ohmo.gateway.router import session_key_for_message
@@ -106,7 +105,7 @@ def _extract_ask(text: str) -> tuple[str, str, list[str]]:
     return clean, question, options[:8]  # Telegram keyboards: keep it sane
 
 
-def _format_gateway_error(exc: Exception, *, camera_context: bool = False) -> str:
+def _format_gateway_error(exc: Exception) -> str:
     """Return a short, user-facing gateway error message."""
     message = str(exc).strip() or exc.__class__.__name__
     lowered = message.lower()
@@ -134,8 +133,6 @@ def _format_gateway_error(exc: Exception, *, camera_context: bool = False) -> st
             "[ohmo gateway error] Authentication failed for the current gateway "
             "profile. Check `oh auth status` and `ohmo config`."
         )
-    if camera_context and isinstance(exc, ValueError) and lowered.startswith("camera "):
-        return "Не удалось подтвердить запись этой порции."
     return f"[ohmo gateway error] {message}"
 
 
@@ -229,7 +226,6 @@ class OhmoGatewayBridge:
                 bool(message.metadata.get("_synthetic"))
                 or message.sender_id == "__scheduler__"
                 or message.metadata.get("_camera_authority") is CAMERA_AUTHORITY
-                or message.metadata.get("_camera_unbound") is CAMERA_AUTHORITY
             )
             is_special = (
                 stripped in ("/stop", "/restart", "/new", "/clear", "/debug", "/quiet", "/verbose")
@@ -814,11 +810,7 @@ class OhmoGatewayBridge:
                 session_key,
                 _content_snippet(message.content),
             )
-            camera_error_context = (
-                message.metadata.get("_camera_authority") is CAMERA_AUTHORITY
-                and message.metadata.get("_camera_answer") == "yes"
-            )
-            reply = _format_gateway_error(exc, camera_context=camera_error_context)
+            reply = _format_gateway_error(exc)
         if not reply:
             if delivered_assistant_updates and not stream_error:
                 await self._bus.publish_outbound(
@@ -848,43 +840,17 @@ class OhmoGatewayBridge:
             message.metadata.get("_camera_authority") is CAMERA_AUTHORITY
             and message.metadata.get("_camera_initial_prompt") is CAMERA_AUTHORITY
         )
-        if initial_camera_prompt and not options:
-            # A model response without a bounded ask still gets the existing
-            # caption's explicit consumption question and native choices.
-            options = ["Я это съел", "Нет, не ел"]
-        if initial_camera_prompt and options:
-            # The admitted manifest, not the model's wording, decides whether
-            # the classifier feedback choice is present.
-            decision = message.metadata.get("_camera_classifier_decision")
-            filtered_options = []
-            seen_options = set()
-            for option in options:
-                normalized = option.strip().casefold()
-                if option == "Это не еда" or normalized in seen_options:
-                    continue
-                seen_options.add(normalized)
-                filtered_options.append(option)
-            if decision == "ambiguous":
-                # Keep the model's first-party choices, but reserve one native
-                # slot for the correction that closes the loop on ambiguity.
-                if not filtered_options:
-                    filtered_options = ["Я это съел(а)", "Нет, не ел(а)"]
-                options = filtered_options[:7]
-                options.append("Это не еда")
-            else:
-                options = filtered_options
-                if len(options) < 2:
-                    if not options:
-                        options = ["Я это съел(а)", "Нет, не ел(а)"]
-                    else:
-                        alternative = (
-                            "Я это съел(а)"
-                            if _classify_answer(options[0], anchored=False) == "no"
-                            else "Нет, не ел(а)"
-                        )
-                        if alternative.casefold() != options[0].strip().casefold():
-                            options.append(alternative)
         if options:
+            # The classifier's explicit feedback control is transport feedback,
+            # not a nutrition answer. Only offer it for an ambiguous result and
+            # only alongside a model-issued question with real choices.
+            if (
+                initial_camera_prompt
+                and message.metadata.get("_camera_classifier_decision") == "ambiguous"
+                and len(options) < 8
+                and "Это не еда" not in options
+            ):
+                options.append("Это не еда")
             # Show the question above the buttons (the visible text may already
             # carry context; append the question so the choices read clearly).
             content = (content + ("\n\n" if content else "") + question).strip()
@@ -936,19 +902,27 @@ class OhmoGatewayBridge:
         # API, which this non-business bot can't use.
         final_meta = {**inbound_meta, **final_metadata, "_session_key": session_key}
         if message.metadata.get("_camera_authority") is CAMERA_AUTHORITY:
-            final_meta["_camera_candidate_id"] = message.metadata["_camera_candidate_id"]
+            for obsolete in (
+                "_camera_turn_id", "camera_answer_bound", "camera_route",
+                "camera_operation_id", "_camera_answer", "_camera_correction",
+            ):
+                final_meta.pop(obsolete, None)
+            # These fields bind the model-selected initial question to the
+            # exact Camera photo whose native delivery was confirmed. They are
+            # transport facts; they do not classify the model's wording or
+            # authorize a nutrition write.
+            final_meta["_camera_candidate_id"] = message.metadata.get("_camera_candidate_id")
             final_meta["_camera_authority"] = CAMERA_AUTHORITY
             final_meta["_camera_final"] = CAMERA_AUTHORITY
-            photo_id = message.metadata.get("_camera_photo_id")
-            if initial_camera_prompt and type(photo_id) is int and photo_id > 0:
-                final_meta["_camera_photo_id"] = photo_id
-                final_meta["_camera_caption"] = message.metadata.get("_camera_caption")
-                final_meta["_camera_edit_existing_photo"] = CAMERA_AUTHORITY
-                final_meta["_camera_initial_prompt"] = CAMERA_AUTHORITY
-            final_meta.pop("_camera_turn_id", None)
-            turn_id = message.metadata.get("_camera_turn_id")
-            if isinstance(turn_id, str):
-                final_meta["_camera_turn_id"] = turn_id
+            if message.metadata.get("_camera_initial_prompt") is CAMERA_AUTHORITY:
+                photo_id = message.metadata.get("_camera_photo_id")
+                if type(photo_id) is int and photo_id > 0:
+                    final_meta.update(
+                        _camera_photo_id=photo_id,
+                        _camera_caption=message.metadata.get("_camera_caption"),
+                        _camera_edit_existing_photo=CAMERA_AUTHORITY,
+                        _camera_initial_prompt=CAMERA_AUTHORITY,
+                    )
         if message.channel == "telegram" and "message_id" in message.metadata:
             final_meta["message_id"] = message.metadata["message_id"]
         await self._bus.publish_outbound(

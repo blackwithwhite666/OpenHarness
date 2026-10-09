@@ -548,123 +548,50 @@ def test_gateway_recorder_accepts_and_persists_sparse_v2_correction(tmp_path: Pa
     assert envelope["annotations"]["nutrition"] == payload["annotations"]["nutrition"]
 
 
-def test_gateway_eval_recorder_nutrition_status_is_missing_when_applicable_without_nutrition(
-    tmp_path: Path,
+@pytest.mark.parametrize(
+    "text",
+    ["Запиши, я съел обед", "Не записывай это", "Это не еда", "Can you estimate lunch?"],
+)
+def test_gateway_eval_recorder_does_not_infer_nutrition_applicability_from_words(
+    tmp_path: Path, text: str,
 ) -> None:
-    recorder, store = _new_recorder(tmp_path)
+    recorder, _ = _new_recorder(tmp_path, episode_id="ep-no-phrase-gate", user_goal=text)
     runtime_recorder = recorder.decision_trace_recorder
 
-    runtime_recorder.trace_requirement_signals("я съела ужин, запиши его")
-
-    runtime_recorder.record(
-        TRACE_FINALIZATION,
-        {"schema_version": 1, "trace_event_id": "trace-final-2"},
-    )
-
-    assert recorder.decision_trace_status == "recorded"
-    assert recorder.nutrition_annotation_status == "missing"
-    [recorded] = list(store.iter_events("ep-recorder"))
-    assert recorded.kind == TRACE_FINALIZATION
-    assert "annotations" not in recorded.payload
-
-
-@pytest.mark.parametrize(
-    "text, expected_signal",
-    [
-        ("посчитай калорийность", False),
-        ("сколько калорий", False),
-        ("Сколько ккал в этом супе", False),
-        ("Сколько белков и жиров в блюде", False),
-        ("Мне важно знать БЖУ этого блюда", False),
-        ("Мне нужен белок и жиры, пожалуйста", False),
-        ("Оцени калорийность овсянки, но не записывай её", False),
-        ("Estimate oatmeal calories without recording it", False),
-        ("я съела суп, запиши его", True),
-        ("I ate oatmeal and log it", True),
-        ("I had oatmeal", True),
-        ("I had a question", False),
-        ("Я сейчас посмотрю фильм", False),
-        ("Сколько белая рубашка стоит?", False),
-    ],
-)
-def test_gateway_eval_recorder_trace_requirement_signals_is_marker_driven(
-    tmp_path: Path,
-    text: str,
-    expected_signal: bool,
-) -> None:
-    recorder, _ = _new_recorder(tmp_path, episode_id="ep-markers")
-    signals = recorder.decision_trace_recorder.trace_requirement_signals(text)
-
-    if expected_signal:
-        assert signals == ("ohmo_nutrition_request",)
-    else:
-        assert signals == ()
-
-
-def test_gateway_eval_recorder_trace_requirement_signals_prefers_user_goal_when_final_text_is_neutral(
-    tmp_path: Path,
-) -> None:
-    recorder, _ = _new_recorder(tmp_path, user_goal="Сколько калорий в обеде сегодня?")
-    signals = recorder.decision_trace_recorder.trace_requirement_signals("можно краткий апдейт?")
-
-    assert signals == ()
+    assert runtime_recorder.trace_requirement_signals(text) == ()
     assert recorder.nutrition_annotation_status == "not_applicable"
 
 
-def test_gateway_eval_recorder_estimate_goal_ignores_record_word_in_final_text(
+def test_gateway_eval_recorder_trusted_photo_time_does_not_force_nutrition_record(
+    tmp_path: Path,
+) -> None:
+    recorder, _ = _new_recorder(tmp_path, episode_id="ep-photo-default-only")
+    recorder.decision_trace_recorder.set_authoritative_nutrition_meal_at(
+        datetime(2026, 10, 1, 12, tzinfo=timezone.utc), preserve_explicit=True
+    )
+    assert recorder.decision_trace_recorder.trace_requirement_signals("Estimate only") == ()
+    assert recorder.nutrition_annotation_status == "not_applicable"
+
+
+def test_gateway_eval_recorder_accepts_structured_annotation_independent_of_wording(
     tmp_path: Path,
 ) -> None:
     recorder, _ = _new_recorder(
-        tmp_path,
-        user_goal="Оцени калорийность овсянки, но не записывай её",
+        tmp_path, episode_id="ep-structured-wins", user_goal="Это не еда"
     )
-    signals = recorder.decision_trace_recorder.trace_requirement_signals(
-        "Это только оценка, еда не записана."
+    recorder.decision_trace_recorder.record(
+        TRACE_FINALIZATION,
+        _finalization_payload({
+            "nutrition": {
+                "schema_version": 2,
+                "record_type": "meal_observation",
+                "consumption_status": "consumed",
+                "energy_kcal_best": 120,
+                "items": [{"name": "soup", "quantity_text": "1 bowl"}],
+            }
+        }),
     )
-
-    assert signals == ()
-    assert recorder.nutrition_annotation_status == "not_applicable"
-
-
-def test_gateway_eval_recorder_explicit_record_goal_requires_annotation(
-    tmp_path: Path,
-) -> None:
-    recorder, _ = _new_recorder(tmp_path, user_goal="Запиши: я съела овсянку")
-    signals = recorder.decision_trace_recorder.trace_requirement_signals("Готово")
-
-    assert signals == ("ohmo_nutrition_request",)
-    assert recorder.nutrition_annotation_status == "missing"
-
-
-def test_gateway_eval_recorder_nutrition_applicability_is_monotonic_within_turn(
-    tmp_path: Path,
-) -> None:
-    recorder, _ = _new_recorder(tmp_path, episode_id="ep-monotonic")
-    runtime_recorder = recorder.decision_trace_recorder
-
-    assert recorder.nutrition_annotation_status == "not_applicable"
-
-    runtime_recorder.trace_requirement_signals("сколько калорий в ужине?")
-    assert recorder.nutrition_annotation_status == "not_applicable"
-
-    runtime_recorder.trace_requirement_signals("я сейчас посмотрю фильм")
-    assert recorder.nutrition_annotation_status == "not_applicable"
-
-
-def test_gateway_eval_recorder_nutrition_applicability_can_be_marked_without_finalization(
-    tmp_path: Path,
-) -> None:
-    recorder, _ = _new_recorder(tmp_path, episode_id="ep-applicability")
-    runtime_recorder = recorder.decision_trace_recorder
-
-    assert recorder.nutrition_annotation_status == "not_applicable"
-    assert runtime_recorder.trace_requirement_signals("подскажи, какой обед был, пожалуйста") == ()
-
-    runtime_recorder.trace_requirement_signals("посчитай калорийность обеда")
-    assert recorder.nutrition_annotation_status == "not_applicable"
-
-    runtime_recorder.trace_requirement_signals("запиши, я съел обед")
-    assert recorder.nutrition_annotation_status == "missing"
+    assert recorder.nutrition_annotation_status == "recorded"
 
 
 def test_gateway_eval_recorder_decision_trace_envelope_is_json_safe_and_immutable(

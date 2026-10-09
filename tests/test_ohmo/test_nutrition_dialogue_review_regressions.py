@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 import base64
-from io import BytesIO
 from datetime import datetime, timedelta, timezone
-from PIL import Image
 
 import pytest
 
@@ -18,8 +16,7 @@ from openharness.tools.base import ToolExecutionContext, ToolRegistry
 from openharness.tools.mcp_tool import McpToolAdapter
 from ohmo.attachment_store import AttachmentStore
 from ohmo.conversation_image_tool import LoadConversationImageInput, LoadConversationImageTool
-from ohmo.gateway.camera import CAMERA_AUTHORITY, CameraIngress
-import ohmo.gateway.runtime as runtime_module
+from ohmo.gateway.camera import CAMERA_AUTHORITY
 from ohmo.gateway.runtime import OhmoSessionRuntimePool, _build_inbound_user_message
 from ohmo.workspace import initialize_workspace
 from tests.test_ohmo.test_camera_ingress import FakeTelegram, _admit, _candidate, _ingress
@@ -38,7 +35,9 @@ class _ScriptedEngine:
         self.decision_trace_recorder = None
         self.tool_metadata = {}
         self.messages = []
+        self.turns = []
         self.load_attachment_ids = []
+        self.select_attachment_ids = set()
         self.loaded_results = []
         self.system_prompt = ""
 
@@ -50,6 +49,7 @@ class _ScriptedEngine:
 
     async def submit_message(self, user_message):
         self.messages.append(user_message)
+        self.turns.append(self.pool._active_message.content)
         payload, answer = self.steps.pop(0)
         self.decision_trace_recorder.trace_requirement_signals(
             self.pool._active_message.content
@@ -58,7 +58,10 @@ class _ScriptedEngine:
             tool = self.pool._test_bundle.tool_registry.get("load_conversation_image")
             assert tool is not None
             result = await tool.execute(
-                LoadConversationImageInput(attachment_id=attachment_id),
+                LoadConversationImageInput(
+                    attachment_id=attachment_id,
+                    select_as_nutrition_source=attachment_id in self.select_attachment_ids,
+                ),
                 ToolExecutionContext(cwd=self.pool._workspace),
             )
             self.loaded_results.append(result)
@@ -142,34 +145,37 @@ async def test_ordinary_success_preserves_answer_and_is_receipt_bound(tmp_path, 
     assert result.metadata["nutrition_append_event_id"] == "honcho-2"
     assert result.metadata["nutrition_sync_status"] == "pending"
     assert answer in result.text
-    assert "не привязан к дате" in result.text
+    assert result.text.endswith("Записано; баланс обновляется.")
     assert answer in honcho.messages[1].content
-    assert "не привязан к дате" in honcho.messages[1].content
+    assert result.metadata["nutrition_actual_append_receipt"]["event_id"] == honcho.messages[1].id
     await ingress.close()
 
 
 @pytest.mark.asyncio
-async def test_storage_status_drops_conflicting_projection_clause_and_preserves_other_answer(
+async def test_storage_status_preserves_model_answer_and_adds_receipt_status(
     tmp_path, monkeypatch
 ):
     ingress, _root, _bus, _telegram = _ingress(tmp_path)
     honcho = _Honcho()
     pool = _pool(tmp_path, ingress, honcho, monkeypatch)
     answer = (
-        "Две порции риса, около 120 ккал (100–140). В проекции пока пусто, "
-        "запись не удалось сохранить. 2+2=4."
+        "Две порции риса, около 120 ккал (100–140). 2+2=4."
     )
-    pool._test_bundle.engine = _ScriptedEngine(pool, [(_consumed_trace(), answer)])
+    rice_trace = _consumed_trace()
+    rice_trace["annotations"]["nutrition"]["items"] = [
+        {"name": "rice", "quantity_text": "2 servings"}
+    ]
+    pool._test_bundle.engine = _ScriptedEngine(pool, [(rice_trace, answer)])
     result = await _turn(pool, _owner_message("Запиши съеденный рис и посчитай 2+2", 8505), ingress)
     assert result.metadata["nutrition_append_event_id"] == honcho.messages[1].id
     assert "120" in result.text and "100–140" in result.text and "2+2=4" in result.text
-    assert "проекции" not in result.text.casefold()
-    assert result.text == honcho.messages[1].content
+    assert result.text.endswith("Записано; баланс обновляется.")
+    assert result.text.startswith(honcho.messages[1].content)
     await ingress.close()
 
 
 @pytest.mark.asyncio
-async def test_retry_renders_authoritative_stored_annotation_and_content(tmp_path, monkeypatch):
+async def test_retry_keeps_authoritative_annotation_without_new_exchange(tmp_path, monkeypatch):
     ingress, _root, _bus, _telegram = _ingress(tmp_path)
     honcho = _Honcho()
     pool = _pool(tmp_path, ingress, honcho, monkeypatch)
@@ -190,15 +196,12 @@ async def test_retry_renders_authoritative_stored_annotation_and_content(tmp_pat
     first = await _turn(pool, source, ingress)
     retry = _owner_message(source.content, 8506)
     retry.timestamp = source.timestamp
-    second = await _turn(pool, retry, ingress)
+    replay_updates = [u async for u in pool.stream_message(retry, ingress.config.session_key)]
     assert len(honcho.messages) == 2
-    assert second.metadata["nutrition_append_event_id"] == first.metadata["nutrition_append_event_id"]
-    assert "120" in second.text and "180" not in second.text
-    assert "не привязан к дате" in second.text
-    assert second.metadata["nutrition_proposal_matches_committed"] is False
-    assert second.metadata["nutrition_model_proposal_annotation"]["items"][0]["name"] == "grapes"
-    assert second.metadata["nutrition_committed_annotation"]["items"][0]["name"] == "pears"
-    assert second.text == honcho.messages[1].content
+    assert not any(update.kind == "final" for update in replay_updates)
+    assert first.metadata["nutrition_append_event_id"] == honcho.messages[1].id
+    assert len(pool._test_bundle.engine.turns) == 1
+    assert honcho.messages[1].metadata["decision_trace"]["annotations"]["nutrition"]["items"][0]["name"] == "pears"
     await ingress.close()
 
 
@@ -237,10 +240,10 @@ async def test_dated_new_meals_stay_ordinary_and_replay_deduplicates(tmp_path, m
 
     replay = _owner_message(first_message.content, 8191)
     replay.timestamp = first_message.timestamp
-    repeated = await _turn(pool, replay, ingress)
-    assert repeated.metadata["nutrition_append_event_id"] == first.metadata["nutrition_append_event_id"]
-    assert repeated.metadata["nutrition_proposal_matches_committed"] is True
+    replay_updates = [u async for u in pool.stream_message(replay, ingress.config.session_key)]
+    assert not any(update.kind == "final" for update in replay_updates)
     assert len(honcho.messages) == 4
+    assert len(pool._test_bundle.engine.turns) == 2
     assert attempt["state"] == "photo_sent"
     assert "camera_commit" not in attempt
     await ingress.close()
@@ -280,20 +283,22 @@ async def test_wellness_projection_read_precedes_append_and_cannot_override_rece
     ))
     answer = (
         "Рис, два кусочка, примерно 120 ккал (100–140). "
-        "В базе этой еды ещё нет, сохранение не получилось. 2+2=4."
+        "2+2=4."
     )
-    engine = _ScriptedEngine(pool, [(_consumed_trace(), answer)])
+    rice_trace = _consumed_trace()
+    rice_trace["annotations"]["nutrition"]["items"] = [
+        {"name": "rice", "quantity_text": "2 pieces"}
+    ]
+    engine = _ScriptedEngine(pool, [(rice_trace, answer)])
     engine.read_wellness = True
     pool._test_bundle.engine = engine
-    result = await _turn(pool, _owner_message("Запиши съеденные груши", 8504), ingress)
+    result = await _turn(pool, _owner_message("Запиши съеденный рис и посчитай 2+2", 8504), ingress)
     assert manager.calls == 1
     assert result.metadata["nutrition_append_event_id"] == "honcho-2"
     for value in (result.text, honcho.messages[1].content):
         assert "Рис" in value and "два кусочка" in value
         assert "120" in value and "100–140" in value and "2+2=4" in value
-        assert "В базе" not in value and "не получилось" not in value
-        assert "не привязан к дате" in value
-    assert result.text == honcho.messages[1].content
+    assert result.text == honcho.messages[1].content + "\nЗаписано; баланс обновляется."
     assert result.metadata["nutrition_sync_status"] == "pending"
     await ingress.close()
 
@@ -320,12 +325,11 @@ async def test_retry_cannot_claim_consumption_from_new_trace_when_receipt_is_unk
     await _turn(pool, original, ingress)
     await pool._shadow_backend_for_scope(None).await_pending()
     retry = _owner_message("Запиши две груши", 8503)
-    result = await _turn(pool, retry, ingress)
+    replay_updates = [u async for u in pool.stream_message(retry, ingress.config.session_key)]
     actual = honcho.messages[1].metadata["decision_trace"]["annotations"]["nutrition"]
     assert actual["consumption_status"] == "unknown"
     assert len(honcho.messages) == 2
-    assert "nutrition_append_event_id" not in result.metadata
-    assert "Записано" not in result.text
+    assert not any(update.kind == "final" for update in replay_updates)
     await ingress.close()
 
 
@@ -333,346 +337,165 @@ async def _open_camera(tmp_path, *, index: int = 811, capture_time=None):
     ingress, root, bus, telegram = _ingress(tmp_path, FakeTelegram())
     request = _candidate(root, index=index, capture_time=capture_time)
     assert (await _admit(ingress, root, "Bearer " + "s" * 40, request))[0] == 202
-    await bus.consume_inbound()
+    ingress._test_photo_event = await bus.consume_inbound()
     return ingress, root, bus, telegram, request
 
 
-@pytest.mark.asyncio
-async def test_clarification_restart_replays_question_receipt_without_new_exchange(
-    tmp_path, monkeypatch
-):
-    ingress, _root, bus, telegram, request = await _open_camera(tmp_path)
-    honcho = _Honcho()
-    pool = _pool(tmp_path, ingress, honcho, monkeypatch)
-    original = _owner_message("Я съела только часть", 8101)
-    ingress.process_real_inbound(original)
-    first = await _turn(pool, original, ingress)
-    assert "Сколько" in first.text
-    assert len(honcho.messages) == 2
-    await ingress.close()
-
-    reopened = CameraIngress(ingress.config, workspace=tmp_path, bus=bus, telegram=telegram)
-    replay = _owner_message("Я съела только часть", 8101)
-    reopened.process_real_inbound(replay)
-    assert replay.metadata["_camera_duplicate_clarification_replay"] is True
-    pool._camera_ingress = reopened
-    updates = [u async for u in pool.stream_message(replay, reopened.config.session_key)]
-    attempt = reopened._attempts[request["candidate_id"]]
-    assert updates == []
-    assert attempt["state"] == "clarifying"
-    assert "camera_commit" not in attempt
-    assert len(honcho.messages) == 2
-    await reopened.close()
+def _install_delivered_photo(pool, ingress):
+    """Keep the delivered assistant-origin photo in ordinary conversation history."""
+    pool._attachment_store = AttachmentStore(pool._workspace)
+    pool._test_bundle.tool_registry = ToolRegistry()
+    del pool._register_conversation_image_tool
+    photo = _build_inbound_user_message(
+        ingress._test_photo_event,
+        pool._attachment_store,
+        session_key=ingress.config.session_key,
+    )
+    for block in photo.content:
+        if isinstance(block, AttachmentRefBlock):
+            block.source_provenance["gateway_session_id"] = pool._test_bundle.session_id
+    pool._test_bundle.engine.messages.append(photo)
+    return next(block for block in photo.content if isinstance(block, AttachmentRefBlock))
 
 
 @pytest.mark.asyncio
-async def test_crash_after_question_append_reconciles_as_clarification(tmp_path, monkeypatch):
-    ingress, _root, bus, telegram, request = await _open_camera(tmp_path, index=812)
-    honcho = _Honcho()
-    pool = _pool(tmp_path, ingress, honcho, monkeypatch)
-    complete = ingress.complete
-
-    def crash_before_state_transition(message, **kwargs):
-        if kwargs.get("clarification"):
-            raise RuntimeError("synthetic crash after durable clarification append")
-        complete(message, **kwargs)
-
-    ingress.complete = crash_before_state_transition
-    original = _owner_message("Я съела только часть", 8201)
-    ingress.process_real_inbound(original)
-    with pytest.raises(RuntimeError, match="synthetic crash"):
-        await _turn(pool, original, ingress)
-    assert len(honcho.messages) == 2
-    assert "decision_trace" not in honcho.messages[1].metadata
-    await ingress.close()
-
-    reopened = CameraIngress(ingress.config, workspace=tmp_path, bus=bus, telegram=telegram)
-    reopened.mark_restart_unknown()
-    pool._camera_ingress = reopened
-    replay = _owner_message("Я съела только часть", 8201)
-    reopened.process_real_inbound(replay)
-    assert replay.metadata["_camera_reconcile_only"] is True
-    updates = [u async for u in pool.stream_message(replay, reopened.config.session_key)]
-    attempt = reopened._attempts[request["candidate_id"]]
-    assert len(updates) == 1 and "Сколько" in updates[0].text
-    assert attempt["state"] == "clarifying"
-    assert "camera_commit" not in attempt
-    assert len(honcho.messages) == 2
-    await reopened.close()
+@pytest.mark.parametrize("text", [
+    "Я съела только часть", "Я не ела", "только фасоль", "2 кусочка",
+    "Спасибо", "Как завтра будет погода?",
+])
+async def test_owner_text_is_not_camera_interpreted(tmp_path, monkeypatch, text):
+    ingress, _root, _bus, _telegram, request = await _open_camera(tmp_path)
+    try:
+        honcho = _Honcho()
+        pool = _pool(tmp_path, ingress, honcho, monkeypatch)
+        answer = _owner_message(text, 8101)
+        ingress.process_real_inbound(answer)
+        assert answer.media == []
+        assert not any(key.startswith("_camera_") for key in answer.metadata)
+        pool._test_bundle.engine = _ScriptedEngine(pool, [(None, "Обычный ответ модели.")])
+        final = await _turn(pool, answer, ingress)
+        await pool._shadow_backend_for_scope(None).await_pending()
+        assert final.text == "Обычный ответ модели."
+        assert "nutrition_append_event_id" not in final.metadata
+        assert len(honcho.messages) == 2
+        assert ingress._attempts[request["candidate_id"]]["state"] == "photo_sent"
+        assert "camera_commit" not in ingress._attempts[request["candidate_id"]]
+    finally:
+        await ingress.close()
 
 
 @pytest.mark.asyncio
-async def test_camera_capture_time_survives_loading_its_image_before_finalization(
-    tmp_path, monkeypatch
-):
-    from ohmo.gateway.runtime import _build_inbound_user_message as build_user_message
-
+async def test_selected_delivered_photo_uses_capture_time_and_receipt(tmp_path, monkeypatch):
     capture_time = datetime.fromisoformat("2026-10-04T08:49:10+03:00")
     ingress, _root, _bus, _telegram, request = await _open_camera(
         tmp_path, index=810, capture_time=capture_time
     )
-    honcho = _Honcho()
-    pool = _pool(tmp_path, ingress, honcho, monkeypatch)
-    pool._attachment_store = AttachmentStore(pool._workspace)
-    pool._test_bundle.tool_registry = ToolRegistry()
-    del pool._register_conversation_image_tool
-    monkeypatch.setattr(runtime_module, "_build_inbound_user_message", build_user_message)
-
-    answer = _owner_message("Да, я это съела", 8102)
-    answer.timestamp = datetime.fromisoformat("2026-10-05T07:49:54+00:00")
-    ingress.process_real_inbound(answer)
-    assert answer.metadata.get("_camera_answer") == "yes"
-    source_user = build_user_message(
-        answer, pool._attachment_store, session_key=ingress.config.session_key
-    )
-    source_ref = next(
-        block for block in source_user.content if isinstance(block, AttachmentRefBlock)
-    )
-
-    nutrition = _consumed_trace()["annotations"]["nutrition"]
-    nutrition.update(
-        basis=["image"], energy_kcal_best=215,
-        items=[{"name": "oatmeal", "quantity_text": "1 bowl"}],
-    )
-    engine = _ScriptedEngine(pool, [(_trace(nutrition), "Записала порцию: 215 ккал.")])
-    engine.load_attachment_ids = [source_ref.attachment_id]
-    pool._test_bundle.engine = engine
-
-    final = await _turn(pool, answer, ingress)
-    attempt = ingress._attempts[request["candidate_id"]]
-    assert len(engine.loaded_results) == 1
-    assert engine.loaded_results[0].is_error is False
-    assert "Verified source conversation message received time (UTC)" in engine.loaded_results[0].output
-    assert final.text == "Записала порцию: 215 ккал.\nЗаписано. Баланс обновляется."
-    event_id = final.metadata["nutrition_append_event_id"]
-    assert attempt["camera_commit"]["event_id"] == event_id
-    assert len(honcho.messages) == 2
-    saved = honcho.messages[-1].metadata["decision_trace"]["annotations"]["nutrition"]
-    assert datetime.fromisoformat(saved["meal_at"]) == capture_time
-    assert saved.get("meal_date") is None
-    assert saved["items"][0]["quantity_text"] == "1 bowl"
-    assert saved["energy_kcal_best"] == 215
-    assert sum(
-        message.metadata.get("client_op_id") == attempt["camera_commit"]["client_op_id"]
-        for message in honcho.messages
-    ) == 1
-    await ingress.close()
-
-
-@pytest.mark.asyncio
-async def test_clarification_denial_and_unrelated_text_never_become_consumed(
-    tmp_path, monkeypatch
-):
-    ingress, _root, bus, _telegram, request = await _open_camera(tmp_path, index=813)
-    honcho = _Honcho()
-    pool = _pool(tmp_path, ingress, honcho, monkeypatch)
-    partial = _owner_message("Я съела только часть", 8301)
-    ingress.process_real_inbound(partial)
-    await _turn(pool, partial, ingress)
-
-    for index, text in enumerate(
-        ("Спасибо", "Как завтра будет погода?", "Я съела новый завтрак, не тот на фото"),
-        start=8302,
-    ):
-        unrelated = _owner_message(text, index)
-        ingress.process_real_inbound(unrelated)
-        assert unrelated.metadata.get("_camera_answer") is None
-
-    denial = _owner_message("Я не ела", 8305)
-    ingress.process_real_inbound(denial)
-    assert denial.metadata.get("_camera_answer") == "no"
-    assert denial.metadata.get("_camera_authority") is CAMERA_AUTHORITY
-    final = await _turn(pool, denial, ingress)
-    assert "nutrition_append_event_id" not in final.metadata
-    assert "camera_commit" not in ingress._attempts[request["candidate_id"]]
-    await ingress.close()
-
-
-@pytest.mark.asyncio
-async def test_clarification_ttl_releases_attention_but_keeps_quantity_binding(
-    tmp_path, monkeypatch
-):
-    ingress, root, bus, _telegram, request = await _open_camera(tmp_path, index=814)
-    honcho = _Honcho()
-    pool = _pool(tmp_path, ingress, honcho, monkeypatch)
-    partial = _owner_message("Я съела только часть", 8401)
-    ingress.process_real_inbound(partial)
-    await _turn(pool, partial, ingress)
-    attempt = ingress._attempts[request["candidate_id"]]
-    attempt["admitted_at"] = (datetime.now(timezone.utc) - timedelta(minutes=115)).isoformat()
-    ingress._sweep_expired_attempts()
-    assert attempt["attention_active"] is False
-
-    followup = _owner_message("2 кусочка", 8402)
-    ingress.process_real_inbound(followup)
-    assert followup.metadata.get("_camera_answer") == "yes"
-    result = await _turn(pool, followup, ingress)
-    assert result.metadata.get("nutrition_append_event_id")
-    assert attempt["camera_commit"]["event_id"] == result.metadata["nutrition_append_event_id"]
-    assert len(honcho.messages) == 4
-    await ingress.close()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("state", ["photo_sent", "clarifying"])
-async def test_generic_food_identification_is_context_not_consumption(
-    tmp_path, monkeypatch, state
-):
-    ingress, _root, bus, telegram, request = await _open_camera(
-        tmp_path, index=816 if state == "photo_sent" else 817
-    )
-    honcho = _Honcho()
-    pool = _pool(tmp_path, ingress, honcho, monkeypatch)
-    if state == "clarifying":
-        partial = _owner_message("Я съела только часть", 8161)
-        ingress.process_real_inbound(partial)
-        await _turn(pool, partial, ingress)
-    attempt = ingress._attempts[request["candidate_id"]]
-    attempt["admitted_at"] = (datetime.now(timezone.utc) - timedelta(minutes=115)).isoformat()
-    ingress._sweep_expired_attempts()
-
-    hint = _owner_message("только фасоль", 8162)
-    ingress.process_real_inbound(hint)
-    assert hint.metadata.get("_camera_context_hint") is CAMERA_AUTHORITY
-    # Keep the original available to semantic model inference without treating
-    # a noun-only food identification as a consumption confirmation.
-    assert hint.metadata.get("_camera_answer") is None
-    assert attempt["snapshot"] in hint.media
-    camera_prompt = OhmoSessionRuntimePool._with_camera_turn_context(
-        "base", hint, ingress.trusted_capture_time_for_answer(hint)
-    )
-    assert "does not confirm eating" in camera_prompt
-    assert "owner's confirmed-consumption turn" not in camera_prompt
-    pool._test_bundle.engine = _ScriptedEngine(pool, [(None, "Если речь о фасоли, уточните количество.")])
-    result = await _turn(pool, hint, ingress)
-    assert "количество" in result.text.casefold()
-    assert "nutrition_append_event_id" not in result.metadata
-    assert "camera_commit" not in attempt
-    await pool._shadow_backend_for_scope(None).await_pending()
-    assert attempt["state"] == "clarifying"
-    assert len(honcho.messages) == (4 if state == "clarifying" else 2)
-    assert honcho.messages[-2].content == hint.content
-    assert honcho.messages[-1].metadata["camera_finalizer_outcome"] == "clarification"
-    assert "decision_trace" not in honcho.messages[-1].metadata
-
-    unrelated = _owner_message("Как завтра будет погода?", 8163)
-    ingress.process_real_inbound(unrelated)
-    assert unrelated.metadata.get("_camera_context_hint") is not CAMERA_AUTHORITY
-    assert unrelated.metadata.get("_camera_answer") is None
-    pool._test_bundle.engine = _ScriptedEngine(pool, [(None, "Прогноз погоды на завтра недоступен.")])
-    unrelated_result = await _turn(pool, unrelated, ingress)
-    assert "Сколько" not in unrelated_result.text
-    assert "nutrition_append_event_id" not in unrelated_result.metadata
-    assert "camera_commit" not in attempt
-    assert attempt["state"] == "clarifying"
-    for message_id, text in ((8164, "Спасибо"), (8165, "Оплати счёт")):
-        off_topic = _owner_message(text, message_id)
-        ingress.process_real_inbound(off_topic)
-        assert off_topic.metadata.get("_camera_context_hint") is not CAMERA_AUTHORITY
-        assert off_topic.metadata.get("_camera_answer") is None
-    await ingress.close()
+    try:
+        honcho = _Honcho()
+        pool = _pool(tmp_path, ingress, honcho, monkeypatch)
+        nutrition = _consumed_trace()["annotations"]["nutrition"]
+        nutrition.update(
+            basis=["image", "owner_statement"], energy_kcal_best=215,
+            items=[{"name": "oatmeal", "quantity_text": "1 bowl"}],
+        )
+        engine = _ScriptedEngine(pool, [(_trace(nutrition), "Записала порцию: 215 ккал.")])
+        pool._test_bundle.engine = engine
+        ref = _install_delivered_photo(pool, ingress)
+        engine.load_attachment_ids = [ref.attachment_id]
+        engine.select_attachment_ids = {ref.attachment_id}
+        answer = _owner_message("На фото моя овсянка; я съела одну миску", 8102)
+        answer.timestamp = datetime.fromisoformat("2026-10-05T07:49:54+00:00")
+        ingress.process_real_inbound(answer)
+        final = await _turn(pool, answer, ingress)
+        assert len(engine.loaded_results) == 1
+        assert engine.loaded_results[0].is_error is False
+        assert "explicitly selected nutrition source" in engine.loaded_results[0].output
+        assert final.text.endswith("Записано; баланс обновляется.")
+        event_id = final.metadata["nutrition_append_event_id"]
+        assert event_id == honcho.messages[-1].id
+        assert len(honcho.messages) == 2
+        saved = honcho.messages[-1].metadata
+        assert saved["photo_occurrence_source"]["camera_candidate_id"] == request["candidate_id"]
+        assert saved["photo_occurrence_source"]["source_message_id"] == str(
+            ingress._attempts[request["candidate_id"]]["photo_id"]
+        )
+        assert datetime.fromisoformat(saved["decision_trace"]["annotations"]["nutrition"]["meal_at"].replace("Z", "+00:00")) == capture_time
+        assert saved["decision_trace"]["annotations"]["nutrition"]["items"][0]["quantity_text"] == "1 bowl"
+        assert ingress._attempts[request["candidate_id"]]["attention_active"] is False
+        assert "camera_commit" not in ingress._attempts[request["candidate_id"]]
+    finally:
+        await ingress.close()
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("quantity", ["полтора яблока", "3 кусочка хлеба", "немного каши"])
-async def test_natural_quantity_after_ttl_finalizes_one_trusted_meal(
+async def test_late_plain_portion_can_be_selected_without_camera_dialogue(
     tmp_path, monkeypatch, quantity
 ):
-    ingress, _root, bus, _telegram, request = await _open_camera(
-        tmp_path, index=818
-    )
-    honcho = _Honcho()
-    pool = _pool(tmp_path, ingress, honcho, monkeypatch)
-    partial = _owner_message("Я съела только часть", 8181)
-    ingress.process_real_inbound(partial)
-    await _turn(pool, partial, ingress)
-    attempt = ingress._attempts[request["candidate_id"]]
-    attempt["admitted_at"] = (datetime.now(timezone.utc) - timedelta(minutes=115)).isoformat()
-    ingress._sweep_expired_attempts()
-
-    trace = _consumed_trace()
-    trace["annotations"]["nutrition"]["basis"] = ["image", "owner_statement"]
-    trace["annotations"]["nutrition"]["items"] = [
-        {"name": "oats", "quantity_text": quantity}
-    ]
-    pool._test_bundle.engine = _ScriptedEngine(pool, [(trace, "Приём учтён." )])
-    answer = _owner_message(quantity, 8182)
-    ingress.process_real_inbound(answer)
-    assert answer.metadata.get("_camera_answer") == "yes"
-    result = await _turn(pool, answer, ingress)
-    assert result.metadata["nutrition_append_event_id"] == attempt["camera_commit"]["event_id"]
-    assert len(honcho.messages) == 4
-    saved = honcho.messages[-1].metadata["decision_trace"]["annotations"]["nutrition"]
-    assert saved["items"][0]["quantity_text"] == quantity
-    await ingress.close()
+    ingress, _root, _bus, _telegram, request = await _open_camera(tmp_path, index=818)
+    try:
+        honcho = _Honcho()
+        pool = _pool(tmp_path, ingress, honcho, monkeypatch)
+        trace = _consumed_trace()
+        trace["annotations"]["nutrition"].update(
+            basis=["image", "owner_statement"],
+            items=[{"name": "oats", "quantity_text": quantity}],
+        )
+        engine = _ScriptedEngine(pool, [(None, "Сколько вы съели?"), (trace, "Приём учтён.")])
+        pool._test_bundle.engine = engine
+        ref = _install_delivered_photo(pool, ingress)
+        partial = _owner_message("Я съела только часть", 8181)
+        await _turn(pool, partial, ingress)
+        await pool._shadow_backend_for_scope(None).await_pending()
+        attempt = ingress._attempts[request["candidate_id"]]
+        attempt["admitted_at"] = (datetime.now(timezone.utc) - timedelta(minutes=115)).isoformat()
+        ingress._sweep_expired_attempts()
+        assert attempt["attention_active"] is False
+        engine.load_attachment_ids = [ref.attachment_id]
+        engine.select_attachment_ids = {ref.attachment_id}
+        answer = _owner_message(quantity, 8182)
+        ingress.process_real_inbound(answer)
+        assert not any(key.startswith("_camera_") for key in answer.metadata)
+        result = await _turn(pool, answer, ingress)
+        assert result.metadata["nutrition_append_event_id"] == honcho.messages[-1].id
+        assert len(honcho.messages) == 4
+        saved = honcho.messages[-1].metadata
+        assert saved["photo_occurrence_source"]["source_message_id"] == str(attempt["photo_id"])
+        assert saved["decision_trace"]["annotations"]["nutrition"]["items"][0]["quantity_text"] == quantity
+    finally:
+        await ingress.close()
 
 
 @pytest.mark.asyncio
-async def test_followup_can_retrieve_original_camera_image_and_source_denial_fails_closed(
+async def test_historical_image_is_readable_but_denied_source_stays_unavailable(
     tmp_path, monkeypatch
 ):
-    output = BytesIO()
-    Image.new("RGB", (12, 9), color=(30, 120, 45)).save(output, format="JPEG")
-    original_bytes = output.getvalue()
-    ingress, root, bus, _telegram = _ingress(tmp_path, FakeTelegram())
-    request = _candidate(root, index=815, image_bytes=original_bytes)
-    assert (await _admit(ingress, root, "Bearer " + "s" * 40, request))[0] == 202
-    await bus.consume_inbound()
-    honcho = _Honcho()
-    pool = _pool(tmp_path, ingress, honcho, monkeypatch)
-    pool._attachment_store = AttachmentStore(pool._workspace)
-    monkeypatch.setattr("ohmo.gateway.runtime._build_inbound_user_message", _build_inbound_user_message)
-    pool._register_conversation_image_tool = OhmoSessionRuntimePool._register_conversation_image_tool.__get__(pool)
-    pool._test_bundle.tool_registry = ToolRegistry()
-
-    partial = _owner_message("Я съела только часть", 8151)
-    ingress.process_real_inbound(partial)
-    await _turn(pool, partial, ingress)
-    attempt = ingress._attempts[request["candidate_id"]]
-    followup = InboundMessage(
-        channel="telegram", sender_id="123", chat_id="123", content="whole plate",
-        metadata={
-            "message_id": 8152,
-            "reply_to_message_id": attempt["reply_ids"][-1],
-            "_telegram_raw_text": "whole plate",
-            "is_group": False,
-        },
-    )
-    ingress.process_real_inbound(followup)
-    assert followup.metadata.get("_camera_answer") == "yes"
-    assert attempt["snapshot"] in followup.media
-    current = _build_inbound_user_message(
-        followup, pool._attachment_store, session_key=ingress.config.session_key
-    )
-    ref = next(block for block in current.content if isinstance(block, AttachmentRefBlock))
-    pool._register_conversation_image_tool(pool._test_bundle, current_message=current)
-    tool = pool._test_bundle.tool_registry.get("load_conversation_image")
-    assert isinstance(tool, LoadConversationImageTool)
-    loaded = await tool.execute(
-        LoadConversationImageInput(attachment_id=ref.attachment_id),
-        ToolExecutionContext(cwd=pool._workspace),
-    )
-    assert loaded.is_error is False
-    assert base64.b64decode(loaded.metadata["_openharness_transient_image"].data) == original_bytes
-
-    pool._register_conversation_image_tool(pool._test_bundle)
-    historical = await tool.execute(
-        LoadConversationImageInput(attachment_id=ref.attachment_id),
-        ToolExecutionContext(cwd=pool._workspace),
-    )
-    assert historical.is_error is False
-    denied_tool = LoadConversationImageTool(
-        pool._attachment_store, is_attachment_allowed=lambda _attachment_id: False
-    )
-    denied = await denied_tool.execute(
-        LoadConversationImageInput(attachment_id=ref.attachment_id),
-        ToolExecutionContext(cwd=pool._workspace),
-    )
-    assert denied.is_error is True
-    assert denied.output == "Conversation image unavailable."
-    assert ref.attachment_id not in denied.output
-    assert attempt.get("camera_commit") is None
-    await ingress.close()
+    ingress, _root, _bus, _telegram, request = await _open_camera(tmp_path, index=815)
+    try:
+        pool = _pool(tmp_path, ingress, _Honcho(), monkeypatch)
+        ref = _install_delivered_photo(pool, ingress)
+        pool._register_conversation_image_tool(pool._test_bundle)
+        tool = pool._test_bundle.tool_registry.get("load_conversation_image")
+        assert isinstance(tool, LoadConversationImageTool)
+        loaded = await tool.execute(
+            LoadConversationImageInput(attachment_id=ref.attachment_id),
+            ToolExecutionContext(cwd=pool._workspace),
+        )
+        assert loaded.is_error is False
+        assert base64.b64decode(loaded.metadata["_openharness_transient_image"].data)
+        denied_tool = LoadConversationImageTool(
+            pool._attachment_store, is_attachment_allowed=lambda _attachment_id: False
+        )
+        denied = await denied_tool.execute(
+            LoadConversationImageInput(attachment_id=ref.attachment_id),
+            ToolExecutionContext(cwd=pool._workspace),
+        )
+        assert denied.is_error is True
+        assert denied.output == "Conversation image unavailable."
+        assert ref.attachment_id not in denied.output
+        assert "camera_commit" not in ingress._attempts[request["candidate_id"]]
+    finally:
+        await ingress.close()
 
 
 def test_arbitrary_media_provenance_metadata_cannot_override_inbound_identity(tmp_path):
@@ -704,36 +527,11 @@ def test_arbitrary_media_provenance_metadata_cannot_override_inbound_identity(tm
     assert ref.source_provenance["received_at"] == timestamp.isoformat()
 
 
-def test_camera_prompt_retrieves_original_image_or_preserves_quantity_uncertainty():
-    prompt = OhmoSessionRuntimePool._with_camera_answer_context(
+def test_photo_context_is_factual_timestamp_without_dialogue_instructions():
+    prompt = OhmoSessionRuntimePool._with_user_photo_context(
         "synthetic prompt", datetime(2026, 10, 1, 8, 30, tzinfo=timezone.utc)
     )
-    assert "load_conversation_image" in prompt
-    assert "original is unavailable" in prompt
-    assert "visible image is only a crop" in prompt
-    assert "preserve the quantity uncertainty" in prompt
-    assert "never treat a partial crop as a confirmed whole plate" in prompt
-    assert "Use the current user's stated food and quantity over ambiguous image inference." in prompt
-    for rule in (
-        "A whole-portion confirmation does not turn a count you guessed in an option "
-        "into an owner-stated quantity.",
-        "Earlier assistant analysis and any count it proposed are provisional, not "
-        "independent image or owner evidence.",
-        "verify each product count against the current original pixels",
-        "distinguish cut sections of one unit from multiple complete units",
-        "Count whole products, not pieces cut from one.",
-        "continuous foods without an owner-stated weight or measure",
-        "served cooked edible mass or household measure from the visible portion",
-        "useful co-visible scale",
-        "matching typical kcal per unit",
-        "Record the estimated quantity and its assumptions and uncertainty in the nutrition trace.",
-        "most likely central portion, not a precautionary upper bound",
-        "Do not assume a maximal portion or added fats.",
-        "use the served cooked weight and matching preparation and unit",
-        "make the total equal the item sum",
-        "identified by readable package labeling",
-        "A readable label may identify hidden package contents",
-        "do not include adjacent unselected packages",
-        "do not include adjacent unselected packages or unseen oil or sauce",
-    ):
-        assert rule in prompt
+    assert "2026-10-01T08:30:00+00:00" in prompt
+    assert "source provenance" in prompt
+    assert "the conversation determines its meaning" in prompt
+    assert "confirm eating" not in prompt
