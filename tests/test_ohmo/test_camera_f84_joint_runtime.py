@@ -1100,7 +1100,8 @@ async def test_native_reply_with_selected_photo_still_requires_context_receipt_p
             row for row in server.rows
             if row["id"] == edit.metadata["nutrition_append_event_id"]
         )
-        assert correction_receipt["metadata"]["reply_to_source_message_id"] == "native-context-photo"
+        assert correction_receipt["metadata"]["reply_to_source_message_id"] is None
+        assert correction_receipt["metadata"]["reply_to_native_message_id"] == "native-context-photo"
         assert correction_receipt["metadata"]["selected_source"]["append_source_message_id"] == "native-context-photo"
         assert edit.metadata["nutrition_actual_append_receipt"]["event_id"] == edit.metadata["nutrition_append_event_id"]
 
@@ -1144,6 +1145,95 @@ async def test_native_reply_with_selected_photo_still_requires_context_receipt_p
         contradicted_row["metadata"]["reply_to_source_message_id"] = "different-photo"
         mismatch = original_grade(manifest, contradicted, wellness, **kwargs)[0]
         assert mismatch["a1"] == "FAIL" and mismatch["stage"] == "HONCHO_TARGET_MISMATCH", mismatch
+    finally:
+        await client.aclose()
+        ROOT = previous_root
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reply_kind", ["source_photo", "saved_ack", "other_context", "none"])
+async def test_late_portion_selected_correction_keeps_native_reply_as_context(tmp_path, reply_kind):
+    global ROOT
+    previous_root, ROOT = ROOT, tmp_path
+    photo = ROOT / "synthetic.png"
+    photo.write_bytes(PNG_BYTES)
+    pool, bundle, server, client = setup(f"late-portion-{reply_kind}")
+    try:
+        source, source_ctx, source_user = inbound(pool, 209, media=[str(photo)])
+        await turn(pool, bundle, source, source_ctx, source_user, None)
+        ref = next(block for block in source_user.content if isinstance(block, AttachmentRefBlock))
+        portion, portion_ctx, portion_user = inbound(
+            pool, 210, "I ate half on October 2", when=BASE + timedelta(days=1)
+        )
+        saved, saved_recorder = await turn(
+            pool, bundle, portion, portion_ctx, portion_user,
+            observation(meal_at="2026-10-02T22:15:00+00:00"),
+            loads=[ref.attachment_id], select_source=True,
+        )
+        original_event = saved.metadata["nutrition_append_event_id"]
+        reply_target = {
+            "source_photo": "209",
+            "none": None,
+        }.get(reply_kind)
+        if reply_kind == "other_context":
+            other, other_ctx, other_user = inbound(
+                pool, 212, "What was in my coffee?", when=BASE + timedelta(days=1, minutes=1)
+            )
+            await turn(pool, bundle, other, other_ctx, other_user, None)
+            reply_target = "212"
+        if reply_kind == "saved_ack":
+            from openharness.channels.bus.events import OutboundMessage
+            from openharness.channels.bus.queue import MessageBus
+            from openharness.channels.impl.telegram import TelegramChannel
+            from openharness.config.schema import TelegramConfig
+
+            class Bot:
+                def __init__(self):
+                    self.calls = []
+
+                async def send_message(self, **kwargs):
+                    self.calls.append(kwargs)
+                    return SimpleNamespace(message_id=211)
+
+            bot = Bot()
+            channel = TelegramChannel(TelegramConfig(token="token", reply_to_message=True),
+                                      MessageBus())
+            channel._app = SimpleNamespace(bot=bot)
+            channel._start_typing = lambda _chat_id: None
+            channel._stop_typing = lambda _chat_id: None
+            ack_receipt = await channel.send(OutboundMessage(
+                channel="telegram", chat_id="123", content=saved.text,
+                metadata={"message_id": 210},
+            ))
+            assert len(bot.calls) == 1
+            assert bot.calls[0]["reply_parameters"].message_id == 210
+            assert ack_receipt.native_message_ids == (211,)
+            reply_target = str(ack_receipt.native_message_ids[0])
+        edit, edit_ctx, edit_user = inbound(
+            pool, "sparse-edit", "It was October 3", when=BASE + timedelta(days=2),
+            metadata_extra={"reply_to_message_id": reply_target} if reply_target else None,
+        )
+        if reply_kind == "other_context":
+            edit.metadata["_native_reply_source_binding"] = (
+                runtime_module._NATIVE_REPLY_SOURCE_AUTHORITY,
+                {"original_source_message_id": "212"},
+            )
+        corrected, correction_recorder = await turn(
+            pool, bundle, edit, edit_ctx, edit_user, correction("2026-10-03"),
+            loads=[ref.attachment_id], select_source=True,
+        )
+        assert corrected.metadata["nutrition_append_event_id"] != original_event
+        row = next(row for row in server.rows if row["id"] == corrected.metadata["nutrition_append_event_id"])
+        assert row["metadata"]["selected_source"]["original_receipt_event_id"] == original_event
+        assert row["metadata"]["selected_source"]["append_source_message_id"] == "210"
+        assert row["metadata"]["reply_to_source_message_id"] is None
+        assert row["metadata"].get("reply_to_native_message_id") == reply_target
+        grade = grade_contextual_receipts(
+            pool, server, saved, corrected, saved_recorder, correction_recorder,
+            source_id="210", meal_day=date(2026, 10, 3),
+            case_id=f"late-portion-{reply_kind}",
+        )
+        assert grade["a1"] == "PASS"
     finally:
         await client.aclose()
         ROOT = previous_root

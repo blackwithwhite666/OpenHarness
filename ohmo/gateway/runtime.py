@@ -447,8 +447,14 @@ def _build_conversation_turn_metadata(
     }
     selected = message.metadata.get("_selected_source_binding")
     native_selected = message.metadata.get("_native_reply_source_binding")
+    explicit_selection = (
+        isinstance(selected, tuple)
+        and len(selected) == 2
+        and selected[0] is _SELECTED_SOURCE_AUTHORITY
+    )
     if (
-        isinstance(native_selected, tuple)
+        not explicit_selection
+        and isinstance(native_selected, tuple)
         and len(native_selected) == 2
         and native_selected[0] is _NATIVE_REPLY_SOURCE_AUTHORITY
         and isinstance(native_selected[1], Mapping)
@@ -494,8 +500,13 @@ def _build_conversation_turn_metadata(
         ):
             return logical_turn_id, {}, {}
         reply_target = base_metadata.get("reply_to_source_message_id")
-        if reply_target is not None and reply_target != original_source:
-            return logical_turn_id, {}, {}
+        if reply_target is not None:
+            base_metadata["reply_to_native_message_id"] = reply_target
+        # Explicit selection uses the reader's contextual receipt path. Its
+        # native reply is context, not an alternative target or a direct-reply
+        # shortcut around the selected original event and operation receipt.
+        if explicit_selection:
+            base_metadata["reply_to_source_message_id"] = None
         evidence = {
             "schema_version": 2,
             "tenant_id": scope.private_tenant,
@@ -2574,6 +2585,13 @@ class OhmoSessionRuntimePool:
             else None
         )
         selected_binding = message.metadata.get("_selected_source_binding")
+        if (
+            isinstance(selected_binding, tuple)
+            and len(selected_binding) == 2
+            and selected_binding[0] is _SELECTED_SOURCE_AUTHORITY
+            and not isinstance(selected_binding[1], Mapping)
+        ):
+            return None
         native_reply_candidate = bool(
             validated is not None
             and validated.record_type in {"meal_correction", "meal_deletion"}

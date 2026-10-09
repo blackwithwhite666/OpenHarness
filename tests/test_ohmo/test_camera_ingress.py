@@ -3305,6 +3305,75 @@ async def test_initial_photo_edit_claim_requires_live_exact_ingress_receipt(tmp_
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("content,buttons", [
+    ("Сколько вы съели?", []),
+    ("На фото видны две чашки кофе.", []),
+    ("Какую чашку вы выпили?", ["Маленькую", "Большую"]),
+])
+async def test_initial_model_text_edits_actual_photo_without_requiring_buttons(
+    tmp_path, content, buttons,
+):
+    from openharness.channels.impl.telegram import TelegramChannel
+    from openharness.config.schema import TelegramConfig
+
+    class Bot:
+        def __init__(self):
+            self.calls = []
+
+        async def edit_message_caption(self, **kwargs):
+            self.calls.append(("edit_message_caption", kwargs))
+
+        async def send_message(self, **kwargs):
+            self.calls.append(("send_message", kwargs))
+            return SimpleNamespace(message_id=78)
+
+    ingress, root, bus, photo_transport = _ingress(tmp_path)
+    request = _candidate(root, classifier_decision="food")
+    assert (await _admit(ingress, root, "Bearer " + "s" * 40, request))[0] == 202
+    await asyncio.wait_for(bus.consume_inbound(), timeout=1)
+    attempt = ingress._attempts[request["candidate_id"]]
+    photo_id = attempt["photo_id"]
+    bot = Bot()
+    channel = TelegramChannel(TelegramConfig(token="token"), bus)
+    channel._app = SimpleNamespace(bot=bot)
+    channel._camera_ingress_authority = ingress
+    channel._start_typing = lambda _chat_id: None
+    channel._stop_typing = lambda _chat_id: None
+    message = OutboundMessage(
+        channel="telegram", chat_id="123", content=content, buttons=buttons,
+        metadata={
+            "_camera_authority": CAMERA_AUTHORITY,
+            "_camera_final": CAMERA_AUTHORITY,
+            "_camera_edit_existing_photo": CAMERA_AUTHORITY,
+            "_camera_initial_prompt": CAMERA_AUTHORITY,
+            "_camera_candidate_id": request["candidate_id"],
+            "_camera_photo_id": photo_id,
+            "_camera_caption": _attempt_caption(attempt),
+        },
+    )
+    receipt = await channel.send(message)
+    ingress.note_assistant_receipt(message, receipt)
+    assert receipt.native_message_ids == (photo_id,)
+    assert [name for name, _ in bot.calls] == ["edit_message_caption"]
+    assert bot.calls[0][1]["message_id"] == photo_id
+    assert (bot.calls[0][1]["reply_markup"] is None) == (not buttons)
+    assert attempt["state"] == "photo_sent"
+    assert attempt["initial_prompt_delivery_confirmed"] is True
+    assert ("issued_keyboard_receipt" in attempt) == bool(buttons)
+    assert len(photo_transport.calls) == 1
+    repeat = await channel.send(message)
+    assert repeat.native_message_ids == ()
+    assert len(bot.calls) == 1
+    reopened = CameraIngress(ingress.config, workspace=tmp_path, bus=MessageBus(), telegram=photo_transport)
+    restored = reopened._attempts[request["candidate_id"]]
+    assert restored["initial_prompt_delivery_confirmed"] is True
+    assert ("issued_keyboard_receipt" in restored) == bool(buttons)
+    assert not await reopened.claim_initial_prompt_edit(message, "123")
+    await ingress.close()
+    await reopened.close()
+
+
+@pytest.mark.asyncio
 async def test_later_camera_answer_final_does_not_edit_initial_photo() -> None:
     class Runtime:
         async def stream_message(self, message, session_key):

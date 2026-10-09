@@ -2852,8 +2852,10 @@ class CameraIngress:
                 or attempt.get("photo_id") != photo_id
                 or md.get("_camera_caption") != expected_caption
                 or not isinstance(message.buttons, list)
-                or not 2 <= len(message.buttons) <= 8
+                or (message.buttons and not 2 <= len(message.buttons) <= 8)
                 or any(not isinstance(option, str) or not option.strip() for option in message.buttons)
+                or not isinstance(message.content, str)
+                or not message.content.strip()
                 or attempt.get("prompt_edit_claimed") is True
             ):
                 return False
@@ -3029,13 +3031,14 @@ class CameraIngress:
             if not (attempt.get("classifier_decision") == "ambiguous" and option == "Это не еда")
         ]
         prompt = f"{_attempt_caption(attempt)}\n\n{message.content}"
-        attempt["issued_keyboard_receipt"] = {
-            "options": options,
-            "model_options": model_options,
-            "options_sha256": _native_options_sha256(options),
-            "prompt_sha256": _native_prompt_sha256(prompt),
-            "native_message_ids": [str(value) for value in receipt.native_message_ids],
-        }
+        if options:
+            attempt["issued_keyboard_receipt"] = {
+                "options": options,
+                "model_options": model_options,
+                "options_sha256": _native_options_sha256(options),
+                "prompt_sha256": _native_prompt_sha256(prompt),
+                "native_message_ids": [str(value) for value in receipt.native_message_ids],
+            }
         attempt["initial_prompt_delivery_confirmed"] = True
         self._save_attempts()
 
