@@ -323,13 +323,16 @@ class OfflineCameraBotApi:
                                         "basis": ["image", "owner_confirmation"],
                                         "consumption_status": "consumed",
                                         "is_estimate": True,
-                                        "energy_kcal_best": SYNTHETIC_KCAL,
+                                        "energy_kcal_best": 225 if self.context_items_date else SYNTHETIC_KCAL,
                                         "items": [
-                                            {
-                                        "name": "rice" if self.context_items_date else "synthetic apple",
-                                        "quantity_text": "100 g" if self.context_items_date else "1 medium apple (fixture)",
-                                                "energy_kcal_best": SYNTHETIC_KCAL,
-                                            }
+                                            *(
+                                                [
+                                                    {"name": "cottage cheese", "quantity_text": "125 g package", "energy_kcal_best": 210},
+                                                    {"name": "berries", "quantity_text": "15 g", "energy_kcal_best": 15},
+                                                ]
+                                                if self.context_items_date else
+                                                [{"name": "synthetic apple", "quantity_text": "1 medium apple (fixture)", "energy_kcal_best": SYNTHETIC_KCAL}]
+                                            )
                                         ],
                                         "assumptions": [
                                             "offline transport fixture; not a model estimate"
@@ -350,7 +353,7 @@ class OfflineCameraBotApi:
                         text=(
                             "Synthetic offline Camera photo received. "
                             + (
-                                "[[ask: Сколько риса вы съели? | "
+                                "[[ask: Съели ли вы эту порцию? | "
                                 + " | ".join((SYNTHETIC_WHOLE_PORTION, "Половину порции", "Не ел(а)"))
                                 + "]]"
                                 if self.context_items_date

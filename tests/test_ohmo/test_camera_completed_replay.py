@@ -163,6 +163,252 @@ async def test_same_meal_correction_gets_only_unique_camera_source_target(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("target_kind", ["saved_ack", "photo", "no_reply"])
+async def test_saved_acknowledgement_binds_label_only_package_correction(
+    tmp_path, monkeypatch, target_kind,
+):
+    from tests.test_ohmo.test_nutrition_dialogue_review_regressions import _ScriptedEngine, _trace
+
+    ingress, _bus, request, pool, honcho, _saved, _final = await _save_callback_portion(
+        tmp_path, monkeypatch
+    )
+    attempt = ingress._attempts[request["candidate_id"]]
+    # The final saved acknowledgement is delivered through the ordinary outbound
+    # receipt path and must be present in the attempt's retained reply IDs.
+    saved_ack_id = str(attempt["reply_ids"][-1])
+    text = "125г в упаковке, в 100г 85,4 ккал"
+    reply_target = (
+        saved_ack_id if target_kind == "saved_ack"
+        else str(attempt["photo_id"]) if target_kind == "photo"
+        else None
+    )
+    correction_metadata = {
+        "message_id": "synthetic-package-label-correction",
+        "_telegram_raw_text": text, "is_group": False,
+        "chat_type": "private",
+    }
+    if reply_target is not None:
+        correction_metadata["reply_to_message_id"] = reply_target
+    correction = InboundMessage(
+        channel="telegram", sender_id="123", chat_id="123", content=text,
+        metadata=correction_metadata,
+    )
+    ingress.process_real_inbound(correction)
+    assert correction.metadata.get("_camera_context_meal_target") is _CAMERA_CONTEXT_MEAL_TARGET_AUTHORITY
+    assert correction.metadata.get("_camera_context_meal_candidate_id") == request["candidate_id"]
+    assert correction.metadata.get("_camera_context_meal_target_kind") == "package_label"
+
+    original = honcho.messages[-1].metadata["decision_trace"]["annotations"]["nutrition"]
+    original_event_id = attempt["camera_commit"]["event_id"]
+    original_date = original["meal_at"]
+    original_items = list(original["items"])
+    corrected_items = [dict(item) for item in original_items]
+    corrected_items[0].update({"quantity_text": "125 г", "energy_kcal_best": 106.75})
+    trace = _trace({
+        "schema_version": 2, "record_type": "meal_correction",
+        "changed_fields": ["items", "energy_kcal_min", "energy_kcal_max", "energy_kcal_best"],
+        "items": corrected_items, "energy_kcal_min": 106.75,
+        "energy_kcal_max": 106.75, "energy_kcal_best": 106.75,
+    })
+    scripted = _ScriptedEngine(pool, [(trace, "Исправила калорийность по упаковке.")])
+    scripted.messages = pool._test_bundle.engine.messages
+    pool._test_bundle.engine = scripted
+    corrected = await runtime_turn(pool, correction, ingress)
+    assert corrected.metadata["nutrition_append_event_id"] != original_event_id
+    assert "meal_at" not in corrected.metadata["nutrition_committed_annotation"]
+    assert corrected.metadata["nutrition_committed_annotation"]["energy_kcal_best"] == 106.75
+    assert len(corrected.metadata["nutrition_committed_annotation"]["items"]) == len(original_items)
+    from ohmo.evals.nutrition_persistence import _event_from_raw, _fold_events
+
+    original_message = next(message for message in honcho.messages if message.id == original_event_id)
+    assert original_message.metadata["decision_trace"]["annotations"]["nutrition"] == original
+    rows = []
+    for message in (original_message, honcho.messages[-1]):
+        row = _event_from_raw({
+            "id": message.id, "peer_id": message.peer_id, "session_id": message.session_id,
+            "workspace_id": message.workspace_id, "created_at": message.created_at.isoformat(),
+            "metadata": dict(message.metadata),
+        })
+        row["_created_at"] = message.created_at
+        rows.append(row)
+    current = _fold_events(rows, "UTC")
+    assert datetime.fromisoformat(current["meal_at"]) == datetime.fromisoformat(original_date)
+    assert current["energy_kcal_best"] == 106.75
+    assert [item["name"] for item in current["items"]] == [
+        item["name"] for item in corrected_items
+    ]
+    selected = honcho.messages[-1].metadata["selected_source"]
+    assert set(selected) == {
+        "schema_version", "tenant_id", "source_principal", "gateway_session_id",
+        "source_message_id", "append_source_message_id", "is_private", "is_forwarded",
+        "is_group", "original_receipt_event_id", "original_receipt_client_op_id",
+    }
+    assert selected["schema_version"] == 2
+    assert selected["gateway_session_id"] == original_message.metadata["gateway_session_id"]
+    assert selected["source_message_id"] == original_message.metadata["source_message_id"]
+    assert selected["original_receipt_event_id"] == original_event_id
+    assert selected["original_receipt_client_op_id"] == original_message.metadata["client_op_id"]
+
+    replay_metadata = {
+        "message_id": "synthetic-package-label-correction",
+        "_telegram_raw_text": text, "is_group": False,
+        "chat_type": "private",
+    }
+    if reply_target is not None:
+        replay_metadata["reply_to_message_id"] = reply_target
+    replay = InboundMessage(
+        channel="telegram", sender_id="123", chat_id="123", content=text,
+        metadata=replay_metadata,
+    )
+    ingress.process_real_inbound(replay)
+    pool._active_message = replay
+    replay_updates = [
+        update async for update in pool.stream_message(replay, ingress.config.session_key)
+    ]
+    assert not any(update.kind == "final" for update in replay_updates)
+    assert len(honcho.messages) == 6
+    assert ingress._attempts[request["candidate_id"]]["context_meal_projection"]["event_id"] == corrected.metadata[
+        "nutrition_append_event_id"
+    ]
+    await ingress.close()
+
+
+@pytest.mark.asyncio
+async def test_package_label_correction_rejects_meal_date_mutation_before_append(
+    tmp_path, monkeypatch,
+):
+    from tests.test_ohmo.test_nutrition_dialogue_review_regressions import _ScriptedEngine, _trace
+
+    ingress, _bus, request, pool, honcho, _saved, _final = await _save_callback_portion(
+        tmp_path, monkeypatch
+    )
+    attempt = ingress._attempts[request["candidate_id"]]
+    text = "125г в упаковке, в 100г 85,4 ккал"
+    label_reply = InboundMessage(
+        channel="telegram", sender_id="123", chat_id="123", content=text,
+        metadata={"message_id": "synthetic-label-with-date-mutation",
+                  "reply_to_message_id": str(attempt["reply_ids"][-1]),
+                  "_telegram_raw_text": text, "is_group": False,
+                  "chat_type": "private"},
+    )
+    ingress.process_real_inbound(label_reply)
+    assert label_reply.metadata.get("_camera_context_meal_target") is _CAMERA_CONTEXT_MEAL_TARGET_AUTHORITY
+    items = [dict(item) for item in honcho.messages[-1].metadata[
+        "decision_trace"]["annotations"]["nutrition"]["items"]]
+    items[0].update({"quantity_text": "125 г", "energy_kcal_best": 106.75})
+    trace = _trace({
+        "schema_version": 2, "record_type": "meal_correction",
+        "changed_fields": ["items", "energy_kcal_best", "meal_at"],
+        "items": items, "energy_kcal_best": 106.75,
+        "meal_at": "2026-10-08T08:00:00Z",
+    })
+    scripted = _ScriptedEngine(pool, [(trace, "Исправила калорийность по упаковке.")])
+    scripted.messages = pool._test_bundle.engine.messages
+    pool._test_bundle.engine = scripted
+    before_count = len(honcho.messages)
+    with pytest.raises(
+        ValueError,
+        match="Camera-context correction must patch the one retained consumed meal",
+    ):
+        await runtime_turn(pool, label_reply, ingress)
+    assert len(honcho.messages) == before_count
+    assert "context_meal_projection" not in attempt
+    await ingress.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("target_kind", ["photo", "no_reply"])
+async def test_package_label_correction_keeps_photo_and_unique_context_routes(
+    tmp_path, monkeypatch, target_kind,
+):
+    ingress, _bus, request, _pool, _honcho, _saved, _final = await _save_callback_portion(
+        tmp_path, monkeypatch
+    )
+    attempt = ingress._attempts[request["candidate_id"]]
+    text = "125г в упаковке, в 100г 85,4 ккал"
+    metadata = {"message_id": f"synthetic-label-{target_kind}",
+                "_telegram_raw_text": text, "is_group": False,
+                "chat_type": "private"}
+    if target_kind == "photo":
+        metadata["reply_to_message_id"] = str(attempt["photo_id"])
+    message = InboundMessage(
+        channel="telegram", sender_id="123", chat_id="123", content=text,
+        metadata=metadata,
+    )
+    ingress.process_real_inbound(message)
+    assert message.metadata.get("_camera_context_meal_target") is _CAMERA_CONTEXT_MEAL_TARGET_AUTHORITY
+    assert message.metadata.get("_camera_context_meal_candidate_id") == request["candidate_id"]
+    assert message.metadata.get("_camera_context_meal_target_kind") == "package_label"
+    await ingress.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("control", [
+    "unknown_ack", "foreign_owner", "group", "forwarded",
+    "new_meal", "nonmeal_reminder", "explicit_denial", "intervening_media",
+    "ambiguous", "no_reply_ambiguous",
+    "no_reply_interrupted", "no_reply_active_attention",
+])
+async def test_package_label_correction_rejects_untrusted_targets_and_sources(
+    tmp_path, monkeypatch, control,
+):
+    ingress, _bus, request, _pool, _honcho, _saved, _final = await _save_callback_portion(
+        tmp_path, monkeypatch
+    )
+    attempt = ingress._attempts[request["candidate_id"]]
+    text = "125г в упаковке, в 100г 85,4 ккал"
+    target = str(attempt["reply_ids"][-1])
+    sender = "123"
+    metadata = {"message_id": f"synthetic-label-control-{control}",
+                "reply_to_message_id": target, "_telegram_raw_text": text,
+                "is_group": False, "chat_type": "private"}
+    media = []
+    if control == "unknown_ack":
+        metadata["reply_to_message_id"] = "unknown-acknowledgement"
+    elif control == "foreign_owner":
+        sender = "foreign-owner"
+    elif control == "group":
+        metadata["is_group"] = True
+    elif control == "forwarded":
+        metadata["is_forwarded"] = True
+    elif control == "new_meal":
+        text = "Добавь новый прием пищи: 125г в упаковке, в 100г 85,4 ккал"
+        metadata["_telegram_raw_text"] = text
+    elif control == "nonmeal_reminder":
+        text = "Добавь напоминание купить творог: 125г в упаковке, в 100г 85,4 ккал"
+        metadata["_telegram_raw_text"] = text
+    elif control == "explicit_denial":
+        text = "Я не ела это. 125г в упаковке, в 100г 85,4 ккал"
+        metadata["reply_to_message_id"] = str(attempt["photo_id"])
+        metadata["_telegram_raw_text"] = text
+    elif control == "intervening_media":
+        media = [attempt["snapshot"]]
+    elif control in {"ambiguous", "no_reply_ambiguous"}:
+        if control.startswith("no_reply"):
+            metadata.pop("reply_to_message_id")
+        ingress._attempts["synthetic-duplicate-candidate"] = dict(attempt)
+    elif control == "no_reply_interrupted":
+        metadata.pop("reply_to_message_id")
+        attempt["context_interrupted"] = True
+    elif control == "no_reply_active_attention":
+        metadata.pop("reply_to_message_id")
+        active = dict(attempt)
+        active.update({"state": "photo_sent", "attention_active": True})
+        ingress._attempts["synthetic-active-context"] = active
+    message = InboundMessage(
+        channel="telegram", sender_id=sender, chat_id="123", content=text,
+        media=media, metadata=metadata,
+    )
+    ingress.process_real_inbound(message)
+    assert message.metadata.get("_camera_context_meal_target") is not _CAMERA_CONTEXT_MEAL_TARGET_AUTHORITY
+    assert message.metadata.get("_selected_source_binding") is None
+    if control == "explicit_denial":
+        assert message.metadata.get("_camera_correction") is CAMERA_AUTHORITY
+        assert message.metadata.get("_camera_answer") == "no"
+    await ingress.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("text", ["Съели утром", "Съели сегодня"])
 async def test_sparse_morning_or_today_phrase_selects_one_committed_camera_meal(
     tmp_path, monkeypatch, text,
@@ -229,6 +475,28 @@ async def test_unlisted_food_addition_offers_context_but_ordinary_reply_stays_or
     assert result.text == "Поняла, добавлю хумус в список покупок."
     assert "nutrition_append_event_id" not in result.metadata
     assert "context_meal_projection" not in ingress._attempts[request["candidate_id"]]
+    await ingress.close()
+
+
+@pytest.mark.asyncio
+async def test_addition_with_package_details_keeps_existing_photo_reply_route(
+    tmp_path, monkeypatch,
+):
+    ingress, _bus, request, _pool, _honcho, _saved, _final = await _save_callback_portion(
+        tmp_path, monkeypatch
+    )
+    attempt = ingress._attempts[request["candidate_id"]]
+    text = "Добавь яйцо; творог 125г в упаковке, в 100г 85,4 ккал"
+    addition = InboundMessage(
+        channel="telegram", sender_id="123", chat_id="123", content=text,
+        metadata={"message_id": "synthetic-addition-with-label-details",
+                  "reply_to_message_id": str(attempt["photo_id"]),
+                  "_telegram_raw_text": text, "is_group": False,
+                  "chat_type": "private"},
+    )
+    ingress.process_real_inbound(addition)
+    assert addition.metadata.get("_camera_context_meal_target") is _CAMERA_CONTEXT_MEAL_TARGET_AUTHORITY
+    assert addition.metadata.get("_camera_context_meal_target_kind") == "item_addition"
     await ingress.close()
 
 

@@ -209,6 +209,13 @@ _CAMERA_ADD_NONMEAL_SCOPE_RE = re.compile(
     r"task\w*|meeting\w*|calendar|reminder\w*|list)\b",
     re.IGNORECASE,
 )
+_CAMERA_PACKAGE_LABEL_CORRECTION_RE = re.compile(
+    r"(?=.*(?:\b\d{1,4}(?:[.,]\d+)?\s*(?:г|гр|грамм\w*)\s+в\s+упаковк\w*|"
+    r"\bв\s+упаковк\w*\s*\d{1,4}(?:[.,]\d+)?\s*(?:г|гр|грамм\w*)))"
+    r"(?=.*\b(?:в|на)\s*100\s*(?:г|гр|грамм\w*)\s*[,=:]?\s*"
+    r"\d{1,4}(?:[.,]\d+)?\s*(?:ккал|kcal)\b).+",
+    re.IGNORECASE,
+)
 _CAMERA_CONTEXTUAL_MORNING_RE = re.compile(
     r"\b(?:утром|morning)\b", re.IGNORECASE,
 )
@@ -4502,6 +4509,14 @@ class CameraIngress:
             and _CAMERA_ADD_NONMEAL_SCOPE_RE.search(text_for_correction) is None
             and not is_explicit_new_meal
         )
+        is_package_label = (
+            _CAMERA_PACKAGE_LABEL_CORRECTION_RE.search(text_for_correction) is not None
+            and not is_explicit_new_meal
+            and _CAMERA_ADD_NONMEAL_SCOPE_RE.search(text_for_correction) is None
+            and _CAMERA_UNRELATED_CONTEXT_RE.search(text_for_correction) is None
+            and _classify_answer(text_for_correction, anchored=target is not None) != "no"
+        )
+        is_label_only_package = is_package_label and not is_addition
         is_dated_consumption = (
             (
                 _CAMERA_DATE_CORRECTION_RE.search(text_for_correction) is not None
@@ -4516,7 +4531,7 @@ class CameraIngress:
             and not (target is not None and is_dated_consumption)
             and metadata.get("is_group") is not True
             and metadata.get("is_forwarded") is not True
-            and (is_addition or is_dated_consumption)
+            and (is_addition or is_dated_consumption or is_label_only_package)
         ):
             def completed_meal(item: dict) -> bool:
                 latest = item.get("camera_correction_commit")
@@ -4599,6 +4614,7 @@ class CameraIngress:
             if len(candidates) == 1:
                 candidate_id, _ = candidates[0]
                 target_kind = (
+                    "package_label" if is_label_only_package else
                     "item_addition" if is_addition else
                     "dated_composition" if is_dated_consumption and source_tokens
                     and matching_candidates else

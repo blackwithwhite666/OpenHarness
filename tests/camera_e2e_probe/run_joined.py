@@ -1393,18 +1393,32 @@ async def main() -> None:
                 original_annotation = original_row["metadata"]["decision_trace"]["annotations"]["nutrition"]
                 if (
                     original_annotation.get("record_type") != "meal_observation"
-                    or original_annotation.get("items", [{}])[0].get("name") != "rice"
+                    or [item.get("name") for item in original_annotation.get("items", [])]
+                    != ["cottage cheese", "berries"]
+                    or original_annotation.get("energy_kcal_best") != 225
                     or immutable_commit.get("event_id") != original_row.get("id")
                 ):
-                    raise AssertionError("context-items-date did not persist the accepted synthetic rice portion")
+                    raise AssertionError("context-items-date did not persist the accepted 225 kcal curds-and-berries meal")
 
-                async def ordinary_owner_text(text, message_id, annotation, *, current_ingress, current_pool):
+                async def ordinary_owner_text(
+                    text, message_id, annotation, *, current_ingress, current_pool,
+                    reply_to_message_id=None,
+                ):
+                    reply_target = None
+                    if reply_to_message_id is not None:
+                        reply_target = SimpleNamespace(
+                            message_id=int(reply_to_message_id), chat_id=123,
+                            chat=SimpleNamespace(type="private"),
+                            from_user=SimpleNamespace(
+                                id=0, is_bot=True, first_name="Camera bot", username=None,
+                            ),
+                        )
                     native_message = SimpleNamespace(
                         message_id=message_id, chat_id=123,
                         chat=SimpleNamespace(type="private"), date=datetime.now(timezone.utc),
                         text=text, caption=None, photo=None, voice=None, audio=None,
                         document=None, location=None, venue=None, forward_origin=None,
-                        reply_to_message=None,
+                        reply_to_message=reply_target,
                         from_user=SimpleNamespace(
                             id=123, is_bot=False, first_name="synthetic owner", username=None,
                         ),
@@ -1416,8 +1430,6 @@ async def main() -> None:
                     )
                     await current_ingress._telegram._on_message(update, None)
                     inbound_message = await asyncio.wait_for(bus.consume_inbound(), timeout=2)
-                    if "reply_to_message_id" in inbound_message.metadata:
-                        raise AssertionError("context-items-date synthetic owner turn unexpectedly has a reply")
                     if inbound_message.metadata.get("_camera_authority") is not None:
                         raise AssertionError("ordinary owner text arrived with forged Camera authority")
                     current_ingress.process_real_inbound(inbound_message)
@@ -1440,14 +1452,69 @@ async def main() -> None:
                         raise AssertionError("runtime correction omitted verified original/current receipt evidence")
                     return inbound_message, delivered, delivery_receipt, event_id, final, update
 
-                rice_items = list(original_annotation["items"])
-                egg_items = rice_items + [{
+                original_items = list(original_annotation["items"])
+                ack_id = active_ingress._attempts[active_candidate_id]["reply_ids"][-1]
+                if str(ack_id) == str(active_ingress._attempts[active_candidate_id]["photo_id"]):
+                    raise AssertionError("saved meal acknowledgement was not registered as a reply target")
+                initial_runtime_session = active_pool._bundles[_answer.session_key].session_id
+                await active_pool.reset_session(_answer.session_key)
+                active_ingress, active_pool = await restart_runtime()
+                label_items = [dict(item) for item in original_items]
+                label_items[0].update({"quantity_text": "125 g", "energy_kcal_best": 106.75})
+                label_annotation = {
+                    "schema_version": 2, "record_type": "meal_correction",
+                    "changed_fields": [
+                        "items", "energy_kcal_min", "energy_kcal_max", "energy_kcal_best",
+                    ],
+                    "items": label_items, "energy_kcal_min": 121.75,
+                    "energy_kcal_max": 121.75, "energy_kcal_best": 121.75,
+                }
+                label_message, _label_delivered, _label_delivery_receipt, label_event_id, label_final, _label_update = (
+                    await ordinary_owner_text(
+                        "125г в упаковке, в 100г 85,4 ккал",
+                        "offline-context-package-label", label_annotation,
+                        current_ingress=active_ingress, current_pool=active_pool,
+                        reply_to_message_id=ack_id,
+                    )
+                )
+                if (
+                    label_message.metadata.get("_camera_context_meal_target_kind") != "package_label"
+                    or label_message.metadata.get("_camera_context_meal_candidate_id") != active_candidate_id
+                    or label_final.metadata["nutrition_committed_annotation"].get("energy_kcal_best") != 121.75
+                    or label_final.metadata.get("gateway_session_id") == initial_runtime_session
+                ):
+                    raise AssertionError("saved acknowledgement did not commit the 121.75 kcal package-label correction")
+                label_stage = await verify_e5_projection_stage(
+                    url=honcho_url, workspace=workspace, session=session,
+                    started=trajectory_started, original_event_id=immutable_commit["event_id"],
+                    latest_event_id=label_event_id, source_day=capture_time.date(),
+                    corrected_day=capture_time.date(), expected_day=capture_time.date(),
+                    expected_kcal=121.75, expected_status="consumed", expected_meal_at=capture_time,
+                    expected_items=[("cottage cheese", "125 g"), ("berries", "15 g")],
+                )
+                await active_ingress._telegram._on_message(_label_update, None)
+                label_replay = await asyncio.wait_for(bus.consume_inbound(), timeout=2)
+                active_ingress.process_real_inbound(label_replay)
+                _label_replay_delivered, _label_replay_receipt, replay_label_event_id = await process_and_deliver(
+                    label_replay, label_replay.session_key
+                )
+                if replay_label_event_id != label_event_id:
+                    raise AssertionError("saved acknowledgement label replay changed its immutable event")
+                label_replay_stage = await verify_e5_projection_stage(
+                    url=honcho_url, workspace=workspace, session=session,
+                    started=trajectory_started, original_event_id=immutable_commit["event_id"],
+                    latest_event_id=label_event_id, source_day=capture_time.date(),
+                    corrected_day=capture_time.date(), expected_day=capture_time.date(),
+                    expected_kcal=121.75, expected_status="consumed", expected_meal_at=capture_time,
+                    expected_items=[("cottage cheese", "125 g"), ("berries", "15 g")],
+                )
+                egg_items = label_items + [{
                     "name": "egg", "quantity_text": "1 egg", "energy_kcal_best": 78,
                 }]
                 egg_annotation = {
                     "schema_version": 2, "record_type": "meal_correction",
                     "changed_fields": ["items", "energy_kcal_best"],
-                    "items": egg_items, "energy_kcal_best": 203,
+                    "items": egg_items, "energy_kcal_best": 199.75,
                 }
                 egg_message, egg_delivered, egg_delivery_receipt, egg_event_id, egg_final, _egg_update = (
                     await ordinary_owner_text(
@@ -1472,9 +1539,10 @@ async def main() -> None:
                     started=trajectory_started, original_event_id=immutable_commit["event_id"],
                     latest_event_id=egg_event_id, source_day=capture_time.date(),
                     corrected_day=capture_time.date(), expected_day=capture_time.date(),
-                    expected_kcal=203, expected_status="consumed", expected_meal_at=capture_time,
+                    expected_kcal=199.75, expected_status="consumed", expected_meal_at=capture_time,
                     expected_items=[
                         (str(egg_items[0]["name"]), str(egg_items[0]["quantity_text"])),
+                        ("berries", "15 g"),
                         ("egg", "1 egg"),
                     ],
                 )
@@ -1510,7 +1578,7 @@ async def main() -> None:
                     )
                 original_after = next(row for row in after_rows if row.get("id") == immutable_commit["event_id"])
                 assert_e5_raw_honcho_row_unchanged(original_row, original_after)
-                correction_ids = [egg_event_id, date_event_id]
+                correction_ids = [label_event_id, egg_event_id, date_event_id]
                 durable_ids = [row.get("id") for row in after_rows if (
                     isinstance(row.get("metadata"), dict)
                     and isinstance(row["metadata"].get("decision_trace"), dict)
@@ -1525,13 +1593,19 @@ async def main() -> None:
                     started=trajectory_started, original_event_id=immutable_commit["event_id"],
                     latest_event_id=date_event_id, source_day=capture_time.date(),
                     corrected_day=capture_time.date(), expected_day=capture_time.date(),
-                    expected_kcal=203, expected_status="consumed", expected_meal_at=corrected_at,
+                    expected_kcal=199.75, expected_status="consumed", expected_meal_at=corrected_at,
                     expected_items=[
                         (str(egg_items[0]["name"]), str(egg_items[0]["quantity_text"])),
+                        ("berries", "15 g"),
                         ("egg", "1 egg"),
                     ],
                 )
-                if not egg_stage.get("sync_replay_stable") or not final_stage.get("reopened"):
+                if (
+                    not label_stage.get("reopened")
+                    or not label_replay_stage.get("sync_replay_stable")
+                    or not egg_stage.get("sync_replay_stable")
+                    or not final_stage.get("reopened")
+                ):
                     raise AssertionError("Telegent projection did not remain stable across reopen and replay")
 
                 from ohmo.evals.nutrition_persistence import (
@@ -1568,7 +1642,7 @@ async def main() -> None:
                 if len(initial_camera_contexts) != 1:
                     raise AssertionError("runtime export lacks one exact initial Camera receipt episode")
                 episode_ids.append(str(initial_camera_contexts[0]["episode_id"]))
-                if len(set(episode_ids)) != 4:
+                if len(set(episode_ids)) != 5:
                     raise AssertionError("runtime did not export distinct source-bound Camera turns")
                 dialogue = export_eval_dialogue(
                     Path(active_pool._workspace) / "evals", episode_ids=episode_ids,
@@ -1597,12 +1671,13 @@ async def main() -> None:
                         gateway_session_id=str(original_meta["gateway_session_id"]),
                         source_message_id=str(evidence["photo_source_message_id"]),
                     ),
-                    expected_consumed=True, expected_kcal=203,
-                    expected_items=["rice", "egg"],
+                    expected_consumed=True, expected_kcal=199.75,
+                    expected_items=["cottage cheese", "berries", "egg"],
                     expected_item_quantities=[
                         ExpectedItemQuantity(
-                            name="rice", quantity_text=str(egg_items[0]["quantity_text"]),
+                            name="cottage cheese", quantity_text=str(egg_items[0]["quantity_text"]),
                         ),
+                        ExpectedItemQuantity(name="berries", quantity_text="15 g"),
                         ExpectedItemQuantity(name="egg", quantity_text="1 egg"),
                     ],
                     expectation_origin="explicit_fixture",
@@ -1641,6 +1716,13 @@ async def main() -> None:
                 )[0]
                 if (grade.get("a1"), grade.get("stage")) != ("PASS", "SAME_EVENT_PROJECTED"):
                     raise AssertionError(f"ordinary grader rejected actual joined receipt evidence: {grade}")
+                print(
+                    "PASS OFFLINE SYNTHETIC saved-ack package-label correction: "
+                    "runtime rotated; original and berries retained; same meal date; "
+                    "Honcho-to-Telegent current balance=121.75 kcal; replay stable; "
+                    "ordinary food A1 grader=PASS",
+                    flush=True,
+                )
 
                 # Replay the exact date update through Telegram -> ingress -> runtime. It must
                 # return the existing receipt and leave Honcho's immutable history unchanged.
@@ -1686,7 +1768,12 @@ async def main() -> None:
                     "expected_meal_at": corrected_at.isoformat(),
                     "date_source_message_id": "offline-context-sparse-date",
                     "original_row_fingerprint": original_fingerprint,
-                    "stages": {"egg": egg_stage, "date": final_stage},
+                    "stages": {
+                        "package_label": label_stage,
+                        "package_label_replay": label_replay_stage,
+                        "egg": egg_stage,
+                        "date": final_stage,
+                    },
                     "post_correction_replay": {
                         "status": replay_status,
                         "delivery_receipt": replay_receipt,
@@ -2248,7 +2335,7 @@ async def main() -> None:
                     f"PASS {label} full functional Camera trajectory; candidate={candidate_id} "
                     f"event={event_id} capture_date={trajectory['capture_time'].date().isoformat()} "
                     f"route={trajectory['route']} source={trajectory['answer'].metadata.get('message_id')} "
-                    f"kcal={125 if mode == 'offline' else 'native'} producer+owner replay stable "
+                    f"kcal={225 if mode == 'offline' and correction_join == 'context-items-date' else 125 if mode == 'offline' else 'native'} producer+owner replay stable "
                     f"producer_image_sha256={hashlib.sha256(source_bytes).hexdigest()} "
                     f"photo_id={trajectory['native_photo_id']} bot_api_calls="
                     f"{getattr(bot_client, 'calls', 'native')} user_api_calls="

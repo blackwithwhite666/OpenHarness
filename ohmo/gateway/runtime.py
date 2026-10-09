@@ -1833,6 +1833,16 @@ class OhmoSessionRuntimePool:
                     "schema-v2 `meal_correction` with `items` in `changed_fields`. Do not "
                     "append another meal observation or alter consumption status."
                 )
+            elif target_kind == "package_label":
+                instruction = (
+                    "The owner supplied the package mass and label kcal per 100 g for this "
+                    "already-saved meal. Correct the matching packaged item from that label "
+                    "and package mass, preserve every other food component and the meal date, "
+                    "and recalculate the meal totals. Finalize a schema-v2 `meal_correction` "
+                    "with `items` and each recalculated energy field in `changed_fields`. "
+                    "Do not ask for another consumption confirmation, create a new meal "
+                    "observation, or alter consumed status."
+                )
             else:
                 instruction = (
                     "The owner explicitly reports when this same meal was eaten. Finalize a "
@@ -3829,6 +3839,13 @@ class OhmoSessionRuntimePool:
             required_change = (
                 "items" in changed_fields
                 if target_kind == "item_addition"
+                else (
+                    "items" in changed_fields
+                    and "energy_kcal_best" in changed_fields
+                    and finalizer_nutrition.energy_kcal_best is not None
+                    and not changed_fields & {"meal_at", "meal_date"}
+                )
+                if target_kind == "package_label"
                 else bool(changed_fields & {"meal_at", "meal_date"})
             )
             if finalizer_nutrition is not None and finalizer_nutrition.record_type in {
