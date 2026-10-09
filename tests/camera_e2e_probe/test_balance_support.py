@@ -18,10 +18,10 @@ def facts(intake: float = 137, basal: float = 836.8, active: float = 41.84):
         "nutrition_status": "complete",
         "nutrition_records": [{"latest_event_id": "native-event", "energy_kcal_best": intake}],
         "interval": {"start": START.isoformat(), "end": END.isoformat()},
-        "energy_snapshot_revision": "revision-1",
+        "energy_snapshot_revision": 0,
         "energy_intervals": [{
             "start": START.isoformat(), "end": END.isoformat(),
-            "device_id": "watch", "timezone": "UTC", "snapshot_revision": "revision-1",
+            "device_id": "watch", "timezone": "UTC", "snapshot_revision": 0,
             "basal_sum": basal, "basal_unit": "kJ", "basal_points": 2,
             "basal_minutes_with_samples": 2,
             "active_sum": active, "active_unit": "kJ", "active_points": 1,
@@ -45,6 +45,12 @@ def test_balance_sign_and_unit_conversion(intake, expected):
     assert result[2] == pytest.approx(expected)
 
 
+def test_real_zero_snapshot_revision_is_present_and_valid():
+    payload = facts()
+    assert payload["energy_snapshot_revision"] == payload["energy_intervals"][0]["snapshot_revision"] == 0
+    assert check(payload)[2] == pytest.approx(-73)
+
+
 def test_zero_with_samples_is_known_but_missing_is_unknown():
     assert check(facts(0, 0, 0)) == (0, 0, 0)
     for mutation in (
@@ -62,7 +68,15 @@ def test_zero_with_samples_is_known_but_missing_is_unknown():
     lambda p: p["interval"].update(start=(START + timedelta(seconds=1)).isoformat()),
     lambda p: p["energy_intervals"][0].update(end=(END - timedelta(seconds=1)).isoformat()),
     lambda p: p["energy_intervals"][0].update(device_id="foreign-watch"),
-    lambda p: p["energy_intervals"][0].update(snapshot_revision="old-revision"),
+    lambda p: p["energy_intervals"][0].update(snapshot_revision=1),
+    lambda p: p.pop("energy_snapshot_revision"),
+    lambda p: p["energy_intervals"][0].pop("snapshot_revision"),
+    lambda p: (p.pop("energy_snapshot_revision"), p["energy_intervals"][0].pop("snapshot_revision")),
+    lambda p: p.update(energy_snapshot_revision="0"),
+    lambda p: p["energy_intervals"][0].update(snapshot_revision=-1),
+    lambda p: p["energy_intervals"][0].update(timezone=""),
+    lambda p: p["energy_intervals"][0].update(timezone="not/a-zone"),
+    lambda p: p["energy_intervals"][0].update(timezone="Europe/Moscow"),
     lambda p: p["nutrition_records"][0].update(latest_event_id="foreign-event"),
     lambda p: p.update(nutrition_status="incomplete"),
     lambda p: p["energy_intervals"][0].update(basal_conflicting_timestamps=1),

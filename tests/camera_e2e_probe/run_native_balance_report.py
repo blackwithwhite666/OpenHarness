@@ -34,7 +34,9 @@ from telegent.mcp_simple_auth.wellness_delegation import (  # noqa: E402
     META_KEY, WellnessDelegationConfig, verify_delegation,
 )
 from balance_support import assert_fixture_balance  # noqa: E402
-from native_balance_config import resolve_native_report_clients  # noqa: E402
+from native_balance_config import (  # noqa: E402
+    admit_native_wellness_read, resolve_native_report_clients,
+)
 from native_balance_guards import (  # noqa: E402
     assert_honcho_report_delta, assert_report_only_traces,
     honcho_row_state, projection_state,
@@ -162,6 +164,7 @@ async def run(grade_dir: Path, projection_dir: Path, output_dir: Path, config_di
             description=tool.description or "Read current wellness data",
             input_schema=tool.inputSchema,
         )))
+        admit_native_wellness_read(bundle)
         return bundle
 
     original_builder = gateway_runtime.build_runtime

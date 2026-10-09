@@ -6,6 +6,7 @@ from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
 from math import isclose, isfinite
 from uuid import uuid4
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
 def write_energy_fixture(health, device_id: str, start: datetime, end: datetime) -> None:
@@ -92,8 +93,19 @@ def observed_balance(
             at = datetime.fromisoformat(raw.replace("Z", "+00:00"))
             if at.tzinfo is None or at != bound:
                 raise AssertionError("energy bounds differ from request")
-    if interval.get("snapshot_revision") != payload.get("energy_snapshot_revision"):
+    revision = payload.get("energy_snapshot_revision")
+    interval_revision = interval.get("snapshot_revision")
+    if (type(revision) is not int or revision < 0
+            or type(interval_revision) is not int or interval_revision < 0
+            or interval_revision != revision):
         raise AssertionError("energy snapshot revision differs")
+    interval_timezone = interval.get("timezone")
+    if not isinstance(interval_timezone, str) or not interval_timezone or interval_timezone != "UTC":
+        raise AssertionError("energy interval timezone differs from UTC fixture")
+    try:
+        ZoneInfo(interval_timezone)
+    except ZoneInfoNotFoundError:
+        raise AssertionError("energy interval timezone is unsupported") from None
     for key in ("basal_conflicting_timestamps", "active_conflicting_timestamps",
                 "unresolved_key_count", "legacy_synthetic_count"):
         if interval.get(key) != 0:
@@ -103,7 +115,7 @@ def observed_balance(
             raise AssertionError(f"missing energy samples: {key}")
     if type(interval.get("basal_minutes_with_samples")) is not int:
         raise AssertionError("basal coverage missing")
-    if "possible_replay_count" not in interval or "timezone" not in interval:
+    if "possible_replay_count" not in interval:
         raise AssertionError("energy provenance missing")
     expenditure = _kcal(interval.get("basal_sum"), interval.get("basal_unit"))
     expenditure += _kcal(interval.get("active_sum"), interval.get("active_unit"))
