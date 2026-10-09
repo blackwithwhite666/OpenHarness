@@ -733,7 +733,11 @@ def _grade_one(goal: Goal, honcho: dict[str, Any], telegent: dict[str, Any], *, 
         t_start = _parse_time(telegent.get("start"))
         t_end = _parse_time(telegent.get("end"))
         local_day_start = datetime.combine(goal.meal_date, datetime.min.time(), ZoneInfo(goal.meal_timezone))
-        if (t_start > local_day_start or t_end < goal.trajectory_as_of.astimezone(timezone.utc)
+        local_day_end = local_day_start + timedelta(days=1)
+        required_end = goal.trajectory_as_of.astimezone(timezone.utc)
+        if goal.meal_date != goal.trajectory_as_of.astimezone(ZoneInfo(goal.meal_timezone)).date():
+            required_end = max(required_end, min(now, local_day_end.astimezone(timezone.utc)))
+        if (t_start > local_day_start or t_end < required_end
                 or t_start > t_end):
             raise ValueError
         queried_at = _parse_time(telegent.get("queried_at"))

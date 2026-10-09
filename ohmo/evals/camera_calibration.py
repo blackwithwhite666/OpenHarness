@@ -723,10 +723,16 @@ def _button_click_evidence(case: Case | JudgeCase) -> list[dict[str, Any]]:
                     and native_click_receipt.get("operation_id")
                         == f"{native_click_receipt.get('candidate_id')}:issued_button:{callback_id}"
                 )
+            camera_callback_without_receipt = (
+                ctx is None
+                and ("_camera_candidate_id" in md or "_camera_native_binding" in md
+                     or camera_callback_candidate is not None)
+                and not native_click_binding
+            )
             bound_native_episode = (
                 camera_binding if ctx is not None
                 else feedback_binding if isinstance(feedback_receipt, dict)
-                else native_click_binding or provenance_binding
+                else native_click_binding or (provenance_binding and not camera_callback_without_receipt)
             )
             camera_callback_facts = (
                 camera_callback_candidate is None

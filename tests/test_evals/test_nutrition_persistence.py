@@ -402,7 +402,7 @@ def test_rotated_gateway_traffic_is_scoped_but_not_mistaken_for_reviewed_goal(an
 
     honcho, telegent = snapshots([unrelated], canonical=False)
     missing = grade(honcho, telegent)
-    assert missing["a1"] == "FAIL" and missing["stage"] == "HONCHO_GOAL_MISMATCH"
+    assert missing["a1"] == "FAIL" and missing["stage"] == "HONCHO_MISSING_WRITE"
 
     valid, canonical = snapshots()
     valid["messages"].append(unrelated)
@@ -504,7 +504,7 @@ def test_valid_context_turns_do_not_mask_missing_root_consumed_event():
     honcho["messages"] = [context, clarification]
     result = grade_manifest(Manifest(schema_version=1, goals=[reviewed]), honcho, telegent, now=NOW,
                             reviewed_turn_sources=sources, reviewed_turn_provenance=provenance)[0]
-    assert result["a1"] == "FAIL" and result["stage"] == "HONCHO_GOAL_MISMATCH", result
+    assert result["a1"] == "FAIL" and result["stage"] == "HONCHO_MISSING_WRITE", result
 
 
 @pytest.mark.parametrize("mutation", ["source", "episode", "logical_turn", "operation", "principal"])
@@ -2256,7 +2256,7 @@ def test_complete_unannotated_gateway_turn_without_trace_fails_known_consumed_go
     })]), honcho, canonical, now=NOW, reviewed_turn_sources=binding["reviewed_turn_sources"],
         reviewed_turn_provenance=binding["reviewed_turn_provenance"])[0]
     assert result["a1"] == "FAIL"
-    assert result["stage"] == "HONCHO_GOAL_MISMATCH"
+    assert result["stage"] == "HONCHO_MISSING_WRITE"
 
 
 def test_unannotated_authorized_camera_context_does_not_break_owner_meal_goal():

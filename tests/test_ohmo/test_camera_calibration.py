@@ -267,24 +267,9 @@ def camera_exception_evidence(case, tmp_path):
 
     owner_message = InboundMessage(channel="telegram", sender_id="owner-1|mutable_name",
         chat_id="chat-product", content="I ate this.", timestamp=PERSIST_NOW,
-        metadata={"message_id": case.source_message_id, "native_message_id": 41,
-                  "_camera_candidate_id": "candidate-1", "_camera_native_binding": "41"})
-    turn_ctx = build_turn_context(owner_message, session_id="gateway-session")
-    logical, _, assistant_metadata = _build_conversation_turn_metadata(
-        turn_ctx=turn_ctx, message=owner_message, scope=MemoryScope("owner-1", ()))
-    provenance = {"source_message_id": case.source_message_id,
-        "principal_id": assistant_metadata["source_principal"], "logical_turn_id": logical,
-        "operation_id": assistant_metadata["client_op_id"]}
-    owner_context = {
-        "kind": "owner_turn", "candidate_id": "candidate-1", "native_photo_id": 41,
-        "tenant_id": "owner-1", "gateway_session_id": "gateway-session",
-        "recipient_principal": "telegram:owner-1", "principal_id": provenance["principal_id"],
-        "source_message_id": case.source_message_id, "logical_turn_id": logical,
-        "operation_id": assistant_metadata["client_op_id"],
-    }
+        metadata={"message_id": case.source_message_id})
     owner_recorder = GatewayEvalRecorder.start(workspace=workspace, bundle=bundle,
-        message=owner_message, session_key="telegram:chat-product", user_text=owner_message.content or "",
-        trusted_turn_provenance=provenance, trusted_camera_context=owner_context)
+        message=owner_message, session_key="telegram:chat-product", user_text=owner_message.content or "")
     owner_recorder.record_gateway_update(text="Checking the save.")
     owner_recorder.record_exception(ValueError("private exception detail"))
     owner_recorder.record_resource_snapshot(workspace=workspace, bundle=bundle, phase="world_after")
@@ -294,14 +279,15 @@ def camera_exception_evidence(case, tmp_path):
         episode_ids=[photo_recorder.episode_id, owner_recorder.episode_id])
     case.persistence_evidence["dialogue_export"] = export
     goal = case.persistence_evidence["goal"]
-    goal["episode_ids"] = [photo_recorder.episode_id, owner_recorder.episode_id]
+    goal["episode_ids"] = [owner_recorder.episode_id]
     goal["trace_episode_id"] = owner_recorder.episode_id
     goal["eval_workspace"] = str(workspace.resolve())
     persisted = case.persistence_evidence["honcho_snapshot"]["messages"][0]
     persisted["metadata"]["decision_trace_episode_id"] = owner_recorder.episode_id
     persisted["metadata"]["decision_trace"]["episode_id"] = owner_recorder.episode_id
     case.dialogue = [type(case.dialogue[0]).model_validate(turn)
-        for episode in export["episodes"] for turn in episode["dialogue"]
+        for episode in export["episodes"] if episode["episode"]["episode_id"] in goal["episode_ids"]
+        for turn in episode["dialogue"]
         if turn["role"] in {"user", "assistant"}]
     return export
 
@@ -497,7 +483,7 @@ def test_terminal_camera_exception_grades_real_persistence_and_fails_when_save_i
     case = make_case(tmp_path)
     exported = camera_exception_evidence(case, tmp_path)
     owner = next(item for item in exported["episodes"]
-                 if item.get("trusted_camera_context", {}).get("kind") == "owner_turn")
+                 if item["episode"]["episode_id"] == case.persistence_evidence["goal"]["trace_episode_id"])
     assert owner["dialogue_complete"] is True
     assert owner["dialogue"] == [
         {"role": "user", "text": "I ate this."},
@@ -599,7 +585,7 @@ def test_a2_button_bonus_needs_majority_and_caps_score():
     assert not legacy.useful_button_click
 
 
-def test_a2_repeat_confirmation_click_is_excluded_from_evidence_and_bonus(tmp_path):
+def test_a2_repeat_confirmation_click_earns_no_bonus_despite_native_evidence(tmp_path):
     case = make_case(tmp_path)
     repeated_question = "Сколько риса вы съели?"
     case.dialogue = [
@@ -619,14 +605,14 @@ def test_a2_repeat_confirmation_click_is_excluded_from_evidence_and_bonus(tmp_pa
             "native_keyboard_prompt": repeated_question,
         },
     }
-    assert _button_click_evidence(case) == []
+    assert len(_button_click_evidence(case)) == 1
     votes = [
         A2Vote(score=5, avoidable_turns=2, repeated_questions=1, reason_codes=["repeat"],
-               useful_button_click=True),
+               useful_button_click=False),
         A2Vote(score=4, avoidable_turns=1, repeated_questions=1, reason_codes=["repeat"],
-               useful_button_click=True),
+               useful_button_click=False),
         A2Vote(score=3, avoidable_turns=2, repeated_questions=1, reason_codes=["repeat"],
-               useful_button_click=True),
+               useful_button_click=False),
     ]
     aggregate = aggregate_votes(votes, click_evidence=bool(_button_click_evidence(case)))
     assert aggregate["a2_base_score"] == 4
@@ -827,12 +813,16 @@ def test_a2_prompt_uses_actual_recorder_export_callback_facts(tmp_path):
     inbound.update(native_message_id=78, _camera_native_binding="78")
     assert '"native_message_id": 78' in a2_prompt(case)
 
-    # A person-origin trajectory also keeps its verified native button facts.
+    # Person-origin native callbacks need no Camera markers or receipt.
     person_case = case.model_copy(update={"origin": "person"})
     exported_episode = evidence["dialogue_export"]["episodes"][0]
     exported_episode.pop("trusted_camera_context")
     inbound["native_keyboard_prompt"] = person_native_prompt
+    assert "Native callback evidence:" not in a2_prompt(person_case)
+    inbound.pop("_camera_candidate_id")
+    inbound.pop("_camera_native_binding")
     assert '"selected_label": "Маленькую чашку"' in a2_prompt(person_case)
+    inbound.update(_camera_candidate_id="candidate-1", _camera_native_binding="78")
     exported_episode["trusted_camera_context"] = context | {"episode_id": recorder.episode_id}
 
     exported_context = evidence["dialogue_export"]["episodes"][0]["trusted_camera_context"]
