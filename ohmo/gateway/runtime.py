@@ -1633,15 +1633,6 @@ class OhmoSessionRuntimePool:
                 "is_group": _is_group_message(message),
                 "tz": message.metadata.get("tz") or "",
             }
-        logger.info(
-            "ohmo runtime processing start channel=%s chat_id=%s session_key=%s session_id=%s content=%r",
-            message.channel,
-            message.chat_id,
-            session_key,
-            bundle.session_id,
-            _content_snippet(user_prompt),
-        )
-
         camera_logical_turn_id, _, camera_turn_metadata = (
             _build_conversation_turn_metadata(turn_ctx=turn_ctx, message=message, scope=memory_scope)
             if camera_authorized
@@ -1697,6 +1688,14 @@ class OhmoSessionRuntimePool:
                         recorder.record_gateway_error(text=update.text, metadata=update.metadata)
                 yield update
 
+        logger.info(
+            "ohmo runtime processing start channel=%s chat_id=%s session_key=%s session_id=%s content=%r",
+            message.channel,
+            message.chat_id,
+            session_key,
+            bundle.session_id,
+            _content_snippet(user_prompt),
+        )
         try:
             command_context: CommandContext | None = None
 
@@ -1825,19 +1824,28 @@ class OhmoSessionRuntimePool:
                 recorder.record_exception(exc)
             raise
         finally:
-            if suspended_todo_tool is not None:
-                registry = getattr(bundle, "tool_registry", None)
-                if registry is not None:
-                    registry.register(suspended_todo_tool)
-            _restore_gateway_decision_trace_recorder(decision_trace_restore)
-            if recorder is not None:
-                try:
-                    recorder.record_resource_snapshot(
-                        workspace=self._workspace, bundle=bundle, phase="world_after"
-                    )
-                except Exception:
-                    logger.exception("ohmo eval world_after snapshot failed")
-                recorder.finish(status=episode_status)
+            try:
+                if suspended_todo_tool is not None:
+                    registry = getattr(bundle, "tool_registry", None)
+                    if registry is not None:
+                        registry.register(suspended_todo_tool)
+                _restore_gateway_decision_trace_recorder(decision_trace_restore)
+                if recorder is not None:
+                    try:
+                        recorder.record_resource_snapshot(
+                            workspace=self._workspace, bundle=bundle, phase="world_after"
+                        )
+                    except Exception:
+                        logger.exception("ohmo eval world_after snapshot failed")
+                    recorder.finish(status=episode_status)
+            finally:
+                logger.info(
+                    "ohmo runtime processing complete channel=%s chat_id=%s session_key=%s session_id=%s",
+                    message.channel,
+                    message.chat_id,
+                    session_key,
+                    bundle.session_id,
+                )
 
     async def _stream_command_result(
         self,

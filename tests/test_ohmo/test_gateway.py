@@ -3382,8 +3382,90 @@ async def test_runtime_pool_logs_session_lifecycle(tmp_path, monkeypatch, caplog
     assert updates[-1].text == "done"
     assert updates[-1].kind == "final"
     assert "ohmo runtime processing start" in caplog.text
+    assert "ohmo runtime processing complete" in caplog.text
+    lifecycle_lines = [
+        record.getMessage()
+        for record in caplog.records
+        if "ohmo runtime processing " in record.getMessage()
+    ]
+    assert len(lifecycle_lines) == 2
+    assert lifecycle_lines[0].startswith("ohmo runtime processing start ")
+    assert lifecycle_lines[1].startswith("ohmo runtime processing complete ")
+    assert "session_id=sess123" in lifecycle_lines[0]
+    assert "session_id=sess123" in lifecycle_lines[1]
     assert "ohmo runtime tool start" in caplog.text
     assert "ohmo runtime saved snapshot" in caplog.text
+
+
+@pytest.mark.parametrize("ending", ["error", "cancel", "close"])
+async def test_runtime_pool_completes_lifecycle_when_stream_ends_abnormally(
+    ending, tmp_path, monkeypatch, caplog
+):
+    workspace = tmp_path / ".ohmo-home"
+    initialize_workspace(workspace)
+    engine_started = asyncio.Event()
+    release_engine = asyncio.Event()
+
+    async def fake_build_runtime(**kwargs):
+        class FakeEngine:
+            messages = []
+            total_usage = UsageSnapshot()
+
+            def set_system_prompt(self, prompt):
+                return None
+
+            async def submit_message(self, content):
+                engine_started.set()
+                if ending == "error":
+                    raise RuntimeError("engine failed")
+                await release_engine.wait()
+                yield AssistantTextDelta(text="done")
+
+        return SimpleNamespace(
+            engine=FakeEngine(),
+            session_id="sess-abnormal",
+            current_settings=lambda: SimpleNamespace(model="gpt-5.4"),
+            commands=SimpleNamespace(lookup=lambda raw: None),
+        )
+
+    async def fake_start_runtime(bundle):
+        return None
+
+    monkeypatch.setattr("ohmo.gateway.runtime.build_runtime", fake_build_runtime)
+    monkeypatch.setattr("ohmo.gateway.runtime.start_runtime", fake_start_runtime)
+    pool = OhmoSessionRuntimePool(cwd=tmp_path, workspace=workspace, provider_profile="codex")
+    message = InboundMessage(channel="feishu", sender_id="u1", chat_id="c1", content="check")
+    caplog.set_level(logging.INFO)
+    stream = pool.stream_message(message, "feishu:c1")
+
+    if ending == "error":
+        with pytest.raises(RuntimeError, match="engine failed"):
+            async for _ in stream:
+                pass
+    elif ending == "cancel":
+        async def consume():
+            async for _ in stream:
+                pass
+
+        task = asyncio.create_task(consume())
+        await asyncio.wait_for(engine_started.wait(), timeout=1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    else:
+        await anext(stream)  # progress update; close before the engine completes
+        await stream.aclose()
+
+    lifecycle_lines = [
+        record.getMessage()
+        for record in caplog.records
+        if "ohmo runtime processing " in record.getMessage()
+    ]
+    assert len(lifecycle_lines) == 2
+    assert lifecycle_lines[0].startswith("ohmo runtime processing start ")
+    assert lifecycle_lines[1].startswith("ohmo runtime processing complete ")
+    assert "session_id=sess-abnormal" in lifecycle_lines[0]
+    assert "session_id=sess-abnormal" in lifecycle_lines[1]
 
 
 def test_gateway_provider_command_uses_ohmo_gateway_profile(tmp_path, monkeypatch):
