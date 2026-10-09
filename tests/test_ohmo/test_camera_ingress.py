@@ -220,7 +220,7 @@ async def _admit(ingress: CameraIngress, root: Path, authorization: str | None, 
     # for the explicit shared BASE; never derive clock time from request data.
     import tests.test_ohmo.test_camera_f84_joint_runtime as joint_runtime
     if (
-        datetime.fromisoformat(str(request["capture_time"])) == joint_runtime.BASE
+        request.get("capture_time") == joint_runtime.BASE.isoformat()
         and camera_module.datetime is datetime
     ):
         class FixtureClockDatetime(datetime):

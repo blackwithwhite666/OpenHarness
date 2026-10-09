@@ -232,7 +232,9 @@ async def test_saved_acknowledgement_binds_label_only_package_correction(
         row["_created_at"] = message.created_at
         rows.append(row)
     current = _fold_events(rows, "UTC")
-    assert datetime.fromisoformat(current["meal_at"]) == datetime.fromisoformat(original_date)
+    assert datetime.fromisoformat(current["meal_at"].replace("Z", "+00:00")) == datetime.fromisoformat(
+        original_date.replace("Z", "+00:00")
+    )
     assert current["energy_kcal_best"] == 106.75
     assert [item["name"] for item in current["items"]] == [
         item["name"] for item in corrected_items
