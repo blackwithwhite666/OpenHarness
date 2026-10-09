@@ -282,9 +282,23 @@ async def test_ordinary_meal_append_is_receipt_bound_and_replay_safe(tmp_path, m
         metadata={"message_id": 801, "is_group": False, "_synthetic": True},
         timestamp=first.timestamp,
     )
-    replay_result = await _turn(pool, replay, ingress)
-    assert replay_result.metadata["nutrition_append_event_id"] == event_id
-    assert len(honcho.messages) == 2
+    engine = pool._test_bundle.engine
+    turns_before = tuple(engine.turns)
+    messages_before = tuple(engine.messages)
+    stored_before = tuple(
+        (row.id, row.content, repr(row.metadata), row.created_at)
+        for row in honcho.messages
+    )
+    updates = [update async for update in pool.stream_message(replay, ingress.config.session_key)]
+    assert updates == []
+    assert tuple(engine.turns) == turns_before
+    assert tuple(engine.messages) == messages_before
+    assert tuple(
+        (row.id, row.content, repr(row.metadata), row.created_at)
+        for row in honcho.messages
+    ) == stored_before
+    assert result.metadata["nutrition_append_event_id"] == event_id
+    assert honcho.messages[1].id == event_id
     assert honcho.messages[1].metadata["received_at"] == first.timestamp.isoformat()
 
     next_day = InboundMessage(
