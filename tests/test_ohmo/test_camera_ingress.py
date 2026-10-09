@@ -117,9 +117,8 @@ def _candidate(
     image_bytes: bytes | None = None, classifier_decision: str = "ambiguous",
 ) -> dict:
     payload = json.loads(FIXTURE.read_text(encoding="utf-8"))
-    payload["normalized_capture_time"] = (
-        capture_time or datetime.now(timezone.utc)
-    ).replace(microsecond=0).isoformat()
+    selected_capture_time = capture_time or camera_module.datetime.now(timezone.utc)
+    payload["normalized_capture_time"] = selected_capture_time.replace(microsecond=0).isoformat()
     payload["exif"]["normalized_capture_time"] = payload["normalized_capture_time"]
     payload["file_id"] = f"id:fake-{index}"
     payload["rev"] = f"rev-{index}"
@@ -216,6 +215,24 @@ async def _admit(ingress: CameraIngress, root: Path, authorization: str | None, 
         "epoch": lease["epoch"],
         "seq": lease["committed_seq"] + 1,
     }
+    # This fixed Oct 1 trajectory remains reproducible after the production
+    # seven-day admission window advances. Activate a pinned test clock only
+    # for the explicit shared BASE; never derive clock time from request data.
+    import tests.test_ohmo.test_camera_f84_joint_runtime as joint_runtime
+    if (
+        request.get("capture_time") == joint_runtime.BASE.isoformat()
+        and camera_module.datetime is datetime
+    ):
+        class FixtureClockDatetime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return (
+                    joint_runtime.BASE.astimezone(tz)
+                    if tz is not None
+                    else joint_runtime.BASE.replace(tzinfo=None)
+                )
+
+        camera_module.datetime = FixtureClockDatetime
     return await ingress.admit(authorization, _upload(root, payload))
 
 
@@ -927,6 +944,18 @@ async def test_small_cup_native_callback_reaches_camera_runtime_as_one_portion(t
     assert runtime.seen.content == "Маленькую чашку"
     assert "Большую чашку" not in runtime.seen.content
     assert runtime.seen.metadata["_camera_answer"] == "yes"
+    await ingress.close()
+
+
+@pytest.mark.asyncio
+async def test_default_candidate_after_fixed_base_uses_current_camera_clock(tmp_path: Path) -> None:
+    ingress, root, _, _ = _ingress(tmp_path)
+    before = datetime.now(timezone.utc).replace(microsecond=0)
+    request = _candidate(root)
+    capture_time = datetime.fromisoformat(request["capture_time"])
+    assert abs((capture_time - before).total_seconds()) < 2
+    status, response = await _admit(ingress, root, "Bearer " + "s" * 40, request)
+    assert status == 202, response
     await ingress.close()
 
 
@@ -4842,6 +4871,59 @@ async def test_stale_capture_time_is_durably_acked_across_restart(tmp_path: Path
     assert fresh_response["ack_seq"] == 2
     assert channel.calls == []  # inbound execution remains asynchronous
     await restarted.close()
+
+
+@pytest.mark.asyncio
+async def test_future_capture_time_remains_outside_admission_window(tmp_path: Path) -> None:
+    ingress, root, _, _ = _ingress(tmp_path)
+    future = _candidate(
+        root, capture_time=datetime.now(timezone.utc).replace(microsecond=0)
+        + timedelta(minutes=6),
+    )
+    status, response = await _admit(ingress, root, "Bearer " + "s" * 40, future)
+    assert status == 422
+    assert response["error"]["code"] == "candidate_capture_time_out_of_window"
+    await ingress.close()
+
+
+@pytest.mark.asyncio
+async def test_window_errors_survive_fixed_base_and_independent_test_clock(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    import tests.test_ohmo.test_camera_f84_joint_runtime as joint_runtime
+
+    ingress, root, _, _ = _ingress(tmp_path)
+    fixed = _candidate(root, capture_time=joint_runtime.BASE)
+    assert (await _admit(ingress, root, "Bearer " + "s" * 40, fixed))[0] == 202
+
+    class ControlledDatetime(datetime):
+        current = joint_runtime.BASE
+
+        @classmethod
+        def now(cls, tz=None):
+            return cls.current.astimezone(tz) if tz is not None else cls.current.replace(tzinfo=None)
+
+    monkeypatch.setattr(camera_module, "datetime", ControlledDatetime)
+    stale = _candidate(
+        root, index=1, capture_time=joint_runtime.BASE - timedelta(days=8),
+    )
+    stale_status, stale_response = await _admit(
+        ingress, root, "Bearer " + "s" * 40, stale,
+    )
+    assert stale_status == 422
+    assert stale_response["error"]["code"] == "candidate_capture_time_out_of_window"
+    assert ControlledDatetime.current == joint_runtime.BASE
+
+    future = _candidate(
+        root, index=2, capture_time=joint_runtime.BASE + timedelta(minutes=6),
+    )
+    future_status, future_response = await _admit(
+        ingress, root, "Bearer " + "s" * 40, future,
+    )
+    assert future_status == 422
+    assert future_response["error"]["code"] == "candidate_capture_time_out_of_window"
+    assert ControlledDatetime.current == joint_runtime.BASE
+    await ingress.close()
 
 
 @pytest.mark.asyncio

@@ -209,6 +209,13 @@ _CAMERA_ADD_NONMEAL_SCOPE_RE = re.compile(
     r"task\w*|meeting\w*|calendar|reminder\w*|list)\b",
     re.IGNORECASE,
 )
+_CAMERA_PACKAGE_LABEL_CORRECTION_RE = re.compile(
+    r"(?=.*(?:\b\d{1,4}(?:[.,]\d+)?\s*(?:г|гр|грамм\w*)\s+в\s+упаковк\w*|"
+    r"\bв\s+упаковк\w*\s*\d{1,4}(?:[.,]\d+)?\s*(?:г|гр|грамм\w*)))"
+    r"(?=.*\b(?:в|на)\s*100\s*(?:г|гр|грамм\w*)\s*[,=:]?\s*"
+    r"\d{1,4}(?:[.,]\d+)?\s*(?:ккал|kcal)\b).+",
+    re.IGNORECASE,
+)
 _CAMERA_CONTEXTUAL_MORNING_RE = re.compile(
     r"\b(?:утром|morning)\b", re.IGNORECASE,
 )
@@ -2350,6 +2357,22 @@ class CameraIngress:
             return False
         fields = set(correction.changed_fields)
         previous = attempt.get("context_meal_projection")
+        history = attempt.get("context_meal_projection_history")
+        if not isinstance(history, list):
+            history = []
+        if (
+            isinstance(previous, Mapping)
+            and previous.get("event_id") != getattr(receipt, "assistant_message_id", None)
+            and not any(
+                isinstance(saved, Mapping)
+                and saved.get("event_id") == previous.get("event_id")
+                for saved in history
+            )
+        ):
+            # Keep the durable operation receipt needed to recognize an exact
+            # replay after this current projection advances to a newer edit.
+            history.append(dict(previous))
+            attempt["context_meal_projection_history"] = history
         if "items" in fields:
             items = [item.model_dump(mode="json") for item in correction.items]
         elif isinstance(previous, Mapping) and isinstance(previous.get("items"), list):
@@ -2370,6 +2393,13 @@ class CameraIngress:
             "gateway_session_id": metadata.get("gateway_session_id"),
             "source_message_id_current": metadata.get("source_message_id"),
             "user_text": message.content,
+            "reply_to_native_message_id": (
+                str(message.metadata["reply_to_message_id"]).strip()
+                if message.metadata.get("reply_to_message_id") is not None
+                and not isinstance(message.metadata.get("reply_to_message_id"), bool)
+                and str(message.metadata["reply_to_message_id"]).strip()
+                else None
+            ),
             "received_at": metadata.get("received_at"),
             "tenant_id_receipt": metadata.get("tenant_id"),
             "source_principal_receipt": metadata.get("source_principal"),
@@ -4502,6 +4532,14 @@ class CameraIngress:
             and _CAMERA_ADD_NONMEAL_SCOPE_RE.search(text_for_correction) is None
             and not is_explicit_new_meal
         )
+        is_package_label = (
+            _CAMERA_PACKAGE_LABEL_CORRECTION_RE.search(text_for_correction) is not None
+            and not is_explicit_new_meal
+            and _CAMERA_ADD_NONMEAL_SCOPE_RE.search(text_for_correction) is None
+            and _CAMERA_UNRELATED_CONTEXT_RE.search(text_for_correction) is None
+            and _classify_answer(text_for_correction, anchored=target is not None) != "no"
+        )
+        is_label_only_package = is_package_label and not is_addition
         is_dated_consumption = (
             (
                 _CAMERA_DATE_CORRECTION_RE.search(text_for_correction) is not None
@@ -4510,13 +4548,26 @@ class CameraIngress:
             and _camera_explicit_consumption(text_for_correction)
             and not is_explicit_new_meal
         )
+        is_date_correction = (
+            _CAMERA_DATE_CORRECTION_RE.search(text_for_correction) is not None
+            or _CAMERA_CONTEXTUAL_MORNING_RE.search(text_for_correction) is not None
+        )
         if (
             not callback
             and not owner_supplied_media
-            and not (target is not None and is_dated_consumption)
+            # Keep the existing retained-reply date route ahead of the new
+            # label-only branch, including accepted date-only wording. Do not
+            # alter the established addition/date priority.
+            and not (
+                target is not None
+                and (
+                    is_dated_consumption
+                    or (is_label_only_package and is_date_correction)
+                )
+            )
             and metadata.get("is_group") is not True
             and metadata.get("is_forwarded") is not True
-            and (is_addition or is_dated_consumption)
+            and (is_addition or is_dated_consumption or is_label_only_package)
         ):
             def completed_meal(item: dict) -> bool:
                 latest = item.get("camera_correction_commit")
@@ -4599,6 +4650,7 @@ class CameraIngress:
             if len(candidates) == 1:
                 candidate_id, _ = candidates[0]
                 target_kind = (
+                    "package_label" if is_label_only_package else
                     "item_addition" if is_addition else
                     "dated_composition" if is_dated_consumption and source_tokens
                     and matching_candidates else
