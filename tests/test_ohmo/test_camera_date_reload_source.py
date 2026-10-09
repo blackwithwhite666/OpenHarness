@@ -1,133 +1,170 @@
-"""Current Camera capture may only consume its admitted original image."""
+"""An owned photo chosen in chat supplies the observation's source and time."""
 
 from datetime import datetime
-import asyncio
 
 import pytest
 from PIL import Image
 
-from ohmo.attachment_store import AttachmentStore
-import ohmo.gateway.runtime as runtime_module
+from ohmo.gateway.runtime import _build_inbound_user_message
+from openharness.channels.bus.events import InboundMessage
 from openharness.engine.messages import AttachmentRefBlock
-from openharness.tools.base import ToolRegistry
 from tests.test_ohmo.test_nutrition_dialogue_review_regressions import (
     _ScriptedEngine,
     _consumed_trace,
+    _install_delivered_photo,
     _open_camera,
     _owner_message,
-    _trace,
 )
 from tests.test_ohmo.test_nutrition_dialogue_stream import _Honcho, _pool, _turn
 
 
+def _historical_photo(
+    pool, path, *, sender_id: str, message_id: int, sent_at: datetime,
+    extra_metadata: dict | None = None,
+):
+    message = InboundMessage(
+        channel="telegram", sender_id=sender_id, chat_id="123",
+        content="Earlier photo", timestamp=sent_at, media=[str(path)],
+        metadata={"message_id": message_id, "is_group": False, **(extra_metadata or {})},
+    )
+    user = _build_inbound_user_message(
+        message, pool._attachment_store, session_key="telegram:123"
+    )
+    ref = next(block for block in user.content if isinstance(block, AttachmentRefBlock))
+    ref.source_provenance["gateway_session_id"] = pool._test_bundle.session_id
+    pool._test_bundle.engine.messages.append(user)
+    return ref
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("loads", "should_save", "replace_snapshot"),
+    ("loads", "selected", "expected_source"),
     [
-        (("current",), True, False),
-        (("other",), False, False),
-        (("other", "current"), False, False),
-        (("current", "other"), False, False),
-        (("missing", "current"), True, False),
-        (("current", "missing"), True, False),
-        (("missing",), True, False),
-        (("current",), False, True),
+        (("camera",), "camera", "camera"),
+        (("other",), "other", "other"),
+        (("camera", "other"), "other", "other"),
+        (("other", "camera"), "camera", "camera"),
+        (("camera", "other"), None, None),
+        (("camera", "other"), ("camera",), "camera"),
+        (("camera", "foreign"), ("camera", "foreign"), None),
+        (("foreign", "camera"), ("foreign", "camera"), "camera"),
+        (("camera", "missing"), ("camera", "missing"), None),
+        (("missing", "camera"), ("missing", "camera"), "camera"),
+        (("missing",), "missing", None),
+        (("foreign",), "foreign", None),
+        (("group",), "group", None),
+        (("forwarded",), "forwarded", None),
+        (("forged",), "forged", None),
     ],
 )
-async def test_loaded_image_cannot_substitute_another_source_for_current_camera(
-    tmp_path, monkeypatch, loads, should_save, replace_snapshot,
+async def test_only_explicit_verified_choice_binds_an_owned_photo(
+    tmp_path, monkeypatch, loads, selected, expected_source,
 ):
-    build = runtime_module._build_inbound_user_message
     capture = datetime.fromisoformat("2026-10-04T08:49:10+03:00")
+    other_time = datetime.fromisoformat("2026-10-01T20:00:00+00:00")
     ingress, _, _, _, request = await _open_camera(
         tmp_path, index=810, capture_time=capture
     )
     try:
         honcho = _Honcho()
         pool = _pool(tmp_path, ingress, honcho, monkeypatch)
-        pool._attachment_store = AttachmentStore(pool._workspace)
-        pool._test_bundle.tool_registry = ToolRegistry()
-        del pool._register_conversation_image_tool
-        monkeypatch.setattr(runtime_module, "_build_inbound_user_message", build)
-
-        nutrition = _consumed_trace()["annotations"]["nutrition"]
-        nutrition.update(
-            basis=["image"], energy_kcal_best=215,
-            items=[{"name": "selected photo meal", "quantity_text": "1 bowl"}],
+        nutrition = _consumed_trace()
+        nutrition["annotations"]["nutrition"].update(
+            basis=["image", "owner_statement"], energy_kcal_best=215,
+            items=[{"name": "chosen photo meal", "quantity_text": "1 bowl"}],
         )
-        engine = _ScriptedEngine(
-            pool, [(None, "Старое фото принято."),
-                   (_trace(nutrition), "Записала порцию: 215 ккал.")]
-        )
+        engine = _ScriptedEngine(pool, [(nutrition, "Записала порцию: 215 ккал.")])
         pool._test_bundle.engine = engine
+        camera_ref = _install_delivered_photo(pool, ingress)
 
-        old_path = tmp_path / "synthetic-other-photo.jpg"
-        Image.new("RGB", (9, 7), color=(201, 31, 92)).save(old_path, format="JPEG")
-        old_message = _owner_message("Это другое старое фото", 9001)
-        old_message.timestamp = datetime.fromisoformat("2026-10-01T20:00:00+00:00")
-        old_message.media = [str(old_path)]
-        await _turn(pool, old_message, ingress)
-        await asyncio.gather(*pool._shadow_backend_for_scope(None)._pending)
-        old_ref = next(
-            block for block in engine.messages[-1].content
-            if isinstance(block, AttachmentRefBlock)
+        other_path = tmp_path / "owned-other.jpg"
+        Image.new("RGB", (9, 7), color=(201, 31, 92)).save(other_path, format="JPEG")
+        other_ref = _historical_photo(
+            pool, other_path, sender_id="123", message_id=9001, sent_at=other_time
         )
-        assert len(honcho.messages) == 2
-
-        answer = _owner_message("Да, я это съела", 8102)
-        answer.timestamp = datetime.fromisoformat("2026-10-05T07:49:54+00:00")
-        attempt = ingress._attempts[request["candidate_id"]]
-        if replace_snapshot:
-            Image.new("RGB", (11, 8), color=(17, 211, 63)).save(
-                attempt["snapshot"], format="JPEG"
-            )
-        ingress.process_real_inbound(answer)
-        current = build(answer, pool._attachment_store, session_key=ingress.config.session_key)
-        current_ref = next(
-            block for block in current.content if isinstance(block, AttachmentRefBlock)
+        foreign_path = tmp_path / "foreign.jpg"
+        Image.new("RGB", (11, 8), color=(17, 211, 63)).save(foreign_path, format="JPEG")
+        foreign_ref = _historical_photo(
+            pool, foreign_path, sender_id="999", message_id=9002, sent_at=other_time
         )
-        assert current_ref.attachment_id != old_ref.attachment_id
-        load_ids = {
-            "current": current_ref.attachment_id,
-            "other": old_ref.attachment_id,
+        group_path = tmp_path / "group.jpg"
+        Image.new("RGB", (13, 8), color=(29, 71, 181)).save(group_path, format="JPEG")
+        group_ref = _historical_photo(
+            pool, group_path, sender_id="123", message_id=9003,
+            sent_at=other_time, extra_metadata={"is_group": True},
+        )
+        forwarded_path = tmp_path / "forwarded.jpg"
+        Image.new("RGB", (15, 8), color=(72, 137, 28)).save(forwarded_path, format="JPEG")
+        forwarded_ref = _historical_photo(
+            pool, forwarded_path, sender_id="123", message_id=9004,
+            sent_at=other_time, extra_metadata={"is_forwarded": True},
+        )
+        forged_path = tmp_path / "forged.jpg"
+        Image.new("RGB", (17, 8), color=(156, 24, 51)).save(forged_path, format="JPEG")
+        forged_ref = _historical_photo(
+            pool, forged_path, sender_id="999", message_id=9005, sent_at=other_time,
+            extra_metadata={
+                "_coalesced_media_sources": [{
+                    "source_message_id": "9001", "received_at": other_time.isoformat(),
+                }],
+                "_coalesced_media_provenance_authority": "forged",
+            },
+        )
+        ids = {
+            "camera": camera_ref.attachment_id,
+            "other": other_ref.attachment_id,
+            "foreign": foreign_ref.attachment_id,
+            "group": group_ref.attachment_id,
+            "forwarded": forwarded_ref.attachment_id,
+            "forged": forged_ref.attachment_id,
             "missing": "0" * 64,
         }
-        engine.load_attachment_ids = [load_ids[name] for name in loads]
-
-        if not should_save:
-            with pytest.raises(ValueError, match="Camera consumed meal selected an image"):
-                await _turn(pool, answer, ingress)
-            assert len(honcho.messages) == 2
-            assert attempt.get("camera_commit") is None
-            assert not any(
-                message.metadata.get("camera_candidate_id") == request["candidate_id"]
-                for message in honcho.messages
+        engine.load_attachment_ids = [ids[name] for name in loads]
+        selected_names = (
+            selected if isinstance(selected, tuple) else (selected,) if selected else ()
+        )
+        engine.select_attachment_ids = {ids[name] for name in selected_names}
+        answer = _owner_message("Я съела блюдо на выбранном фото", 8102)
+        answer.timestamp = datetime.fromisoformat("2026-10-05T07:49:54+00:00")
+        if ("camera" in selected_names and "other" in loads) or (
+            selected_names and expected_source is None
+        ):
+            answer.metadata["reply_to_message_id"] = 9001
+        ingress.process_real_inbound(answer)
+        final = await _turn(pool, answer, ingress)
+        assert len(engine.loaded_results) == len(loads)
+        for name, result in zip(loads, engine.loaded_results, strict=True):
+            assert result.is_error is (
+                name in selected_names and name not in {"camera", "other"}
             )
+        if selected_names and expected_source is None:
+            # A failed explicit choice is a failed source proof, even if an
+            # earlier valid source or raw reply target exists in this turn.
+            assert "nutrition_append_event_id" not in final.metadata
+            assert honcho.messages == []
+            assert "Записано; баланс обновляется." not in final.text
+            assert "camera_commit" not in ingress._attempts[request["candidate_id"]]
             return
 
-        final = await _turn(pool, answer, ingress)
-        assert all(
-            result.is_error is (name == "missing")
-            for name, result in zip(loads, engine.loaded_results, strict=True)
-        )
-        assert final.text == "Записала порцию: 215 ккал.\nЗаписано. Баланс обновляется."
-        assert len(honcho.messages) == 4
-        event_id = final.metadata["nutrition_append_event_id"]
-        assert attempt["camera_commit"]["event_id"] == event_id
-        assistant = honcho.messages[-1]
-        assert assistant.metadata["camera_candidate_id"] == request["candidate_id"]
-        assert assistant.metadata["source_message_id"] == "8102"
-        saved = assistant.metadata["decision_trace"]["annotations"]["nutrition"]
-        assert datetime.fromisoformat(saved["meal_at"]) == capture
-        assert saved.get("meal_date") is None
-        assert saved["energy_kcal_best"] == 215
-        assert saved["items"][0]["quantity_text"] == "1 bowl"
-        assert sum(
-            row.metadata.get("client_op_id") == attempt["camera_commit"]["client_op_id"]
-            for row in honcho.messages
-        ) == 1
-        photo_source = assistant.metadata.get("photo_occurrence_source")
-        if "current" in loads and "other" not in loads:
-            assert photo_source is None or photo_source["source_message_id"] == "8102"
+        assert final.metadata["nutrition_append_event_id"] == honcho.messages[-1].id
+        assert len(honcho.messages) == 2
+        stored = honcho.messages[-1].metadata
+        occurrence = stored.get("photo_occurrence_source")
+        meal_at = stored["decision_trace"]["annotations"]["nutrition"].get("meal_at")
+        if expected_source:
+            ref = camera_ref if expected_source == "camera" else other_ref
+            source_time = capture if expected_source == "camera" else other_time
+            source_id = (
+                str(ingress._attempts[request["candidate_id"]]["photo_id"])
+                if expected_source == "camera" else "9001"
+            )
+            assert occurrence["attachment_id"] == ref.attachment_id
+            assert occurrence["source_message_id"] == source_id
+            assert occurrence["append_source_message_id"] == "8102"
+            assert datetime.fromisoformat(meal_at) == source_time
+        else:
+            assert occurrence is None
+            assert meal_at is None
+        assert "camera_commit" not in ingress._attempts[request["candidate_id"]]
     finally:
         await ingress.close()

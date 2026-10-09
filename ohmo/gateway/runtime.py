@@ -2132,7 +2132,6 @@ class OhmoSessionRuntimePool:
                 ),
             )
             if binding is None:
-                message.metadata.pop("_selected_source_binding", None)
                 return None
             message.metadata["_selected_source_binding"] = (
                 _SELECTED_SOURCE_AUTHORITY, binding
@@ -2149,7 +2148,9 @@ class OhmoSessionRuntimePool:
         def begin_source_selection(_attachment_id: str) -> None:
             # A failed explicit choice cannot leave an earlier target or its
             # trusted default time eligible for finalization.
-            message.metadata.pop("_selected_source_binding", None)
+            message.metadata["_selected_source_binding"] = (
+                _SELECTED_SOURCE_AUTHORITY, None
+            )
             if recorder is not None:
                 recorder.set_authoritative_nutrition_meal_at(None)
         decision_trace_restore = _install_gateway_decision_trace_recorder(
