@@ -34,13 +34,13 @@ from telegent.mcp_simple_auth.wellness_delegation import (  # noqa: E402
     META_KEY, WellnessDelegationConfig, verify_delegation,
 )
 from balance_support import assert_fixture_balance  # noqa: E402
+from native_balance_config import resolve_native_report_clients  # noqa: E402
 from native_balance_guards import (  # noqa: E402
     assert_honcho_report_delta, assert_report_only_traces,
     honcho_row_state, projection_state,
 )
 from probe_support import (  # noqa: E402
-    call_wellness_with_synthetic_self, native_person_source_clients,
-    synthetic_wellness_self_scope,
+    call_wellness_with_synthetic_self, synthetic_wellness_self_scope,
 )
 
 
@@ -54,7 +54,6 @@ async def run(grade_dir: Path, projection_dir: Path, output_dir: Path, config_di
     from openharness.channels.bus.queue import MessageBus
     from openharness.channels.impl.telegram import TelegramChannel
     from openharness.config.schema import TelegramConfig
-    from openharness.config.settings import load_settings
     from openharness.ui.runtime import build_runtime as original_build_runtime
     from camera_runtime_support import OfflineTelegramBot, isolated_runtime_loaders
     import ohmo.gateway.runtime as gateway_runtime
@@ -82,13 +81,7 @@ async def run(grade_dir: Path, projection_dir: Path, output_dir: Path, config_di
             or facts["event_id"] not in snapshot_bytes.decode("utf-8")
             or not snapshot.get("messages")):
         raise AssertionError("retained ordinary dialogue/receipt does not match native event")
-    settings_path = config_dir / "settings.json"
-    if not settings_path.is_file():
-        raise ValueError("lead must supply existing read-only native subscription settings")
-    settings = load_settings(settings_path)
-    (bot_client, _unused_user_client) = native_person_source_clients(
-        settings, scenario="ordinary balance report only",
-    )
+    bot_client, _unused_user_client = resolve_native_report_clients(config_dir)
     output_dir.mkdir(mode=0o700, parents=True)
     workspace = output_dir / "workspace"
     workspace.mkdir(mode=0o700)
@@ -101,10 +94,8 @@ async def run(grade_dir: Path, projection_dir: Path, output_dir: Path, config_di
         enabled_memory_tenants=("synthetic_owner",), memory_backend="file",
         conversation_learning=False, evals_capture=True,
     ), workspace)
-    os.environ["OPENHARNESS_CONFIG_DIR"] = str(config_dir)
     os.environ["OPENHARNESS_DATA_DIR"] = str(output_dir / "openharness-data")
     os.environ["OPENHARNESS_LOGS_DIR"] = str(output_dir / "openharness-logs")
-    os.environ["OPENHARNESS_PROFILE"] = "codex"
     os.environ["OHMO_MEMORY_AUTOINDEX"] = "0"
     os.environ["OHMO_MEMORY_JUDGE"] = "0"
     signing_env = {
