@@ -35,6 +35,7 @@ def test_native_resolver_reads_selected_config_before_creating_output(monkeypatc
         source_kind="codex_auth_json", managed_by="fixture",
     ))
     monkeypatch.setenv("OPENHARNESS_CONFIG_DIR", str(ambient))
+    monkeypatch.setenv("OPENHARNESS_PROFILE", "fixture-ambient")
 
     bot, virtual_user = resolve_native_report_clients(selected)
 
