@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import hashlib
 import io
+import math
 import os
 import re
 import subprocess
 import tempfile
 import warnings
-from collections.abc import Mapping
+from collections.abc import Mapping, MutableMapping
 from pathlib import Path
 from types import MappingProxyType
 from uuid import uuid4
@@ -137,6 +138,43 @@ class NativeClientPreconditionError(ValueError):
     """Explicit lead-run profile/client requirement without auth fallback."""
 
 
+def native_photo_reference(kcal_text: str | None, source_text: str | None) -> tuple[float, str]:
+    """Validate a lead-frozen reference without passing it to either model."""
+    try:
+        kcal = float(kcal_text) if kcal_text is not None else None
+    except (TypeError, ValueError, OverflowError):
+        kcal = None
+    if kcal is None or not math.isfinite(kcal) or kcal <= 0:
+        raise NativeClientPreconditionError("native Camera requires finite positive CAMERA_REFERENCE_KCAL")
+    if (not isinstance(source_text, str) or not source_text.strip()
+            or len(source_text) > 512 or any(ord(char) < 32 for char in source_text)):
+        raise NativeClientPreconditionError("native Camera requires bounded nonblank CAMERA_REFERENCE_SOURCE")
+    return kcal, source_text.strip()
+
+
+def take_native_photo_reference(environ: MutableMapping[str, str]) -> tuple[float, str]:
+    """Remove the reference from model-visible process environment before client setup."""
+    kcal_text = environ.pop("CAMERA_REFERENCE_KCAL", None)
+    source_text = environ.pop("CAMERA_REFERENCE_SOURCE", None)
+    return native_photo_reference(kcal_text, source_text)
+
+
+def actual_grade_expectation(
+    *, mode: str, reference: tuple[float, str] | None,
+    expected_consumed: bool, offline_kcal: float | None,
+) -> tuple[float | None, str, str]:
+    """Choose the reference for the actual recorder grade, including absence goals."""
+    if mode == "native":
+        if reference is None:
+            raise NativeClientPreconditionError("native Camera requires a frozen photo reference")
+        kcal, source = reference
+        return (kcal if expected_consumed else None, "frozen_photo_reference", source)
+    if mode != "offline":
+        raise ValueError("unknown Camera run mode")
+    return (offline_kcal if expected_consumed else None,
+            "explicit_fixture", "offline-scripted-owner-and-photo-fixture")
+
+
 def require_isolated_native_settings(settings) -> None:
     """Reject configured external runtime surfaces before auth resolution."""
     forbidden = []
@@ -194,6 +232,7 @@ def native_preflight_and_clients(
     scenario: str,
     source_path: str | None,
     source_sha256: str | None,
+    reference: tuple[float, str] | None = None,
     root: Path,
     resolver=None,
     codex_client_type=None,
@@ -201,6 +240,9 @@ def native_preflight_and_clients(
     """Check all non-auth native inputs before either subscription resolution."""
     if not isinstance(scenario, str) or not scenario.strip():
         raise NativeClientPreconditionError("native Camera requires a non-empty owner scenario")
+    if reference is None or len(reference) != 2:
+        raise NativeClientPreconditionError("native Camera requires a frozen photo reference")
+    reference = native_photo_reference(str(reference[0]), reference[1])
     require_isolated_native_settings(settings)
     try:
         source_bytes = source_jpeg(source_path, source_sha256, root)
@@ -211,7 +253,7 @@ def native_preflight_and_clients(
     clients = native_profile_clients(
         settings, resolver=resolver, codex_client_type=codex_client_type
     )
-    return clients, source_bytes
+    return clients, source_bytes, reference
 
 
 def native_person_source_clients(settings, *, scenario: str, resolver=None, codex_client_type=None):

@@ -8,6 +8,7 @@ and its route attestation are synthetic fixture data, so this is a partial E2E.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import sys
@@ -31,6 +32,8 @@ from probe_support import (  # noqa: E402
     verify_source_worktree,
     unique_honcho_scope,
     native_preflight_and_clients,
+    actual_grade_expectation,
+    take_native_photo_reference,
 )
 from telegent.health_advisor import test_dropbox_camera_pipeline as fixtures  # noqa: E402
 from telegent.health_advisor.dropbox_camera.camera_submission import CameraSubmissionClient  # noqa: E402
@@ -967,6 +970,7 @@ async def verify_actual_camera_grade(
     expected_consumed: bool, expected_kcal: float | None,
     expected_latest_event_id: str | None,
     meal_day: date,
+    mode: str, reference: tuple[float, str] | None,
 ) -> dict[str, object]:
     """Grade the recorded Camera owner turn against fresh complete service reads."""
     import sqlite3
@@ -1009,6 +1013,10 @@ async def verify_actual_camera_grade(
                      if turn.get("source_message_id") == source_id)
     gateway_session = root_episode["episode"]["session_id"]
     as_of = datetime.now(timezone.utc)
+    grade_kcal, grade_origin, grade_source = actual_grade_expectation(
+        mode=mode, reference=reference, expected_consumed=expected_consumed,
+        offline_kcal=expected_kcal,
+    )
     goal = Goal(
         case_id="actual-camera-owner", episode_ids=episode_ids,
         owner_id="synthetic_owner", principal_id="telegram:123",
@@ -1024,9 +1032,8 @@ async def verify_actual_camera_grade(
             tenant_id="synthetic_owner", source_principal="telegram:123",
             gateway_session_id=gateway_session, source_message_id=source_id,
         ),
-        expected_consumed=expected_consumed, expected_kcal=expected_kcal,
-        expectation_origin="explicit_fixture",
-        expectation_source="offline-scripted-owner-and-photo-fixture",
+        expected_consumed=expected_consumed, expected_kcal=grade_kcal,
+        expectation_origin=grade_origin, expectation_source=grade_source,
     )
     manifest = Manifest(schema_version=1, goals=[goal])
     binding = validate_dialogue_binding(manifest, exported)[goal.case_id]
@@ -1089,6 +1096,22 @@ async def verify_actual_camera_grade(
             reviewed_turn_sources=binding["reviewed_turn_sources"],
             reviewed_turn_provenance=binding["reviewed_turn_provenance"],
         )[0]
+        evidence = root / "actual-grade" / ("consumed" if expected_consumed else "absence")
+        evidence.mkdir(mode=0o700, parents=True, exist_ok=False)
+        for name, value in (
+            ("manifest", manifest.model_dump(mode="json")),
+            ("validated-export", exported),
+            ("dialogue-binding", binding),
+            ("honcho-snapshot", honcho),
+            ("wellness-snapshot", wellness),
+            ("grade-clock", {"now": queried.isoformat()}),
+            ("a1-result", grade),
+        ):
+            path = evidence / f"{name}.json"
+            with path.open("x", encoding="utf-8") as output:
+                os.chmod(path, 0o600)
+                json.dump(value, output, ensure_ascii=False, indent=2)
+                output.write("\n")
         expected = (("FAIL", "HONCHO_MISSING_WRITE") if expected_consumed
                     and expected_latest_event_id is None else
                     ("PASS", "SAME_EVENT_PROJECTED") if expected_consumed
@@ -1185,7 +1208,9 @@ async def main() -> None:
         )
     native_config = None
     native_source_bytes = None
+    native_reference = None
     if mode == "native":
+        native_reference = take_native_photo_reference(os.environ)
         from openharness.config.paths import get_config_file_path
         from openharness.config.settings import load_settings
 
@@ -1208,11 +1233,12 @@ async def main() -> None:
                 "native precondition missing: lead must bind an existing native settings directory"
             )
         settings = load_settings(settings_path)
-        (bot_client, user_client), native_source_bytes = native_preflight_and_clients(
+        (bot_client, user_client), native_source_bytes, native_reference = native_preflight_and_clients(
             settings,
             scenario=user_scenario,
             source_path=os.environ.get("CAMERA_SOURCE_JPEG"),
             source_sha256=os.environ.get("CAMERA_SOURCE_SHA256"),
+            reference=native_reference,
             root=ROOT,
         )
     else:
@@ -1611,6 +1637,7 @@ async def main() -> None:
                             expected_kcal=125 if reviewed_consumed else None,
                             expected_latest_event_id=None,
                             meal_day=trajectory["capture_time"].date(),
+                            mode=mode, reference=native_reference,
                         )
             else:
                 if not isinstance(event_id, str) or event_id != trajectory["receipt"]["event_id"]:
@@ -1661,11 +1688,12 @@ async def main() -> None:
                     answer=trajectory["answer"], capture_time=trajectory["capture_time"],
                     expected_consumed=correction_join != "portion-denial",
                     expected_kcal=(225 if correction_join == "context-items-date" else 125)
-                    if correction_join != "portion-denial" else None,
+                    if mode == "offline" and correction_join != "portion-denial" else None,
                     expected_latest_event_id=(corrections["latest_event_id"] if corrections else event_id)
                     if correction_join != "portion-denial" else None,
                     meal_day=(trajectory["capture_time"] - timedelta(days=1)).date()
                     if correction_join == "context-items-date" else trajectory["capture_time"].date(),
+                    mode=mode, reference=native_reference,
                 )
             expected_photo_count = 2 if restart_join == "two-photo" else 1
             if sum(name == "send_photo" for name, _ in fake_bot.calls) != expected_photo_count:

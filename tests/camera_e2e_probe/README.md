@@ -54,7 +54,7 @@ The direct wellness-helper reads in `run_storage_chain.py` and in `run_joined.py
 
 ## Native subscription acceptance
 
-For native acceptance, configure the existing Codex subscription profile for `gpt-6-luna` with medium reasoning and bind its settings directory read-only. Use a separate native subscription client for the virtual user. `run_joined.py` rejects provider fallback and checks the subscription profile, model, medium effort, and two distinct clients. Also use a lead-selected clean OpenHarness/Telegent pair. Supply the owner scenario and an approved bounded JPEG with its matching SHA-256. The source JPEG must be Git-ignored and inside the OpenHarness worktree.
+For native acceptance, configure the existing Codex subscription profile for `gpt-6-luna` with medium reasoning and bind its settings directory read-only. Use a separate native subscription client for the virtual user. `run_joined.py` rejects provider fallback and checks the subscription profile, model, medium effort, and two distinct clients. Also use a lead-selected clean OpenHarness/Telegent pair. Supply the owner scenario and an approved bounded JPEG with its matching SHA-256. The source JPEG must be Git-ignored and inside the OpenHarness worktree. Before the run, the lead must freeze an independent positive finite calorie reference and a short source label. Set `CAMERA_REFERENCE_KCAL` to that number and `CAMERA_REFERENCE_SOURCE` to a nonblank label of at most 512 characters. The probe removes both variables from its process environment before creating either model client. It grades the recorded meal against this frozen reference with an inclusive 30% tolerance.
 
 ```sh
 export CAMERA_RUN_MODE=native
@@ -62,6 +62,8 @@ export CAMERA_NATIVE_CONFIG_DIR=/read-only/path/to/existing/native-settings
 export CAMERA_USER_SCENARIO='Describe the synthetic or approved meal and confirm the offered portion.'
 export CAMERA_SOURCE_JPEG="$CAMERA_OPENHARNESS_WORKTREE/tmp/<approved-private-image>.jpg"
 export CAMERA_SOURCE_SHA256=REPLACE_WITH_LOWERCASE_SHA256
+export CAMERA_REFERENCE_KCAL=REPLACE_WITH_PREDECLARED_POSITIVE_NUMBER
+export CAMERA_REFERENCE_SOURCE=REPLACE_WITH_PREDECLARED_SOURCE_LABEL
 
 CAMERA_TELEGENT_WORKTREE="$CAMERA_TELEGENT_WORKTREE" \
   CAMERA_OPENHARNESS_SHA="$CAMERA_OPENHARNESS_SHA" \
@@ -71,11 +73,13 @@ CAMERA_TELEGENT_WORKTREE="$CAMERA_TELEGENT_WORKTREE" \
   CAMERA_USER_SCENARIO="$CAMERA_USER_SCENARIO" \
   CAMERA_SOURCE_JPEG="$CAMERA_SOURCE_JPEG" \
   CAMERA_SOURCE_SHA256="$CAMERA_SOURCE_SHA256" \
+  CAMERA_REFERENCE_KCAL="$CAMERA_REFERENCE_KCAL" \
+  CAMERA_REFERENCE_SOURCE="$CAMERA_REFERENCE_SOURCE" \
   CAMERA_HONCHO_URL="$CAMERA_HONCHO_URL" \
   .venv/bin/python tests/camera_e2e_probe/run_joined.py
 ```
 
-The native run uses the already configured Codex subscription and a distinct `gpt-6-luna` virtual user client to produce an ordinary owner text turn from the supplied scenario and visible prompt. Do not add OpenRouter, API-key fallback, or other provider credentials. The runner validates the exact source pair before and after the run, captures server-returned event identity, checks trusted Camera source/capture bindings, and verifies the current meal and wellness projection. Probe outputs and local projections stay under the OpenHarness worktree's ignored `tmp/camera-normal-chat-docker/` tree. Preserve those outputs and existing service volumes for review.
+The native run uses the already configured Codex subscription and a distinct `gpt-6-luna` virtual user client to produce an ordinary owner text turn from the supplied scenario and visible prompt. Do not add OpenRouter, API-key fallback, or other provider credentials. The runner validates the exact source pair before and after the run, captures server-returned event identity, checks trusted Camera source/capture bindings, and verifies the current meal and wellness projection. Probe outputs and local projections stay under the OpenHarness worktree's ignored `tmp/camera-normal-chat-docker/` tree. Each actual-grade directory retains the manifest, validated recorder export, dialogue binding, fresh full Honcho snapshot, bound canonical wellness snapshot, and A1 result for a private repeat grade. Preserve those outputs and existing service volumes for review.
 
 ## Historical evidence
 

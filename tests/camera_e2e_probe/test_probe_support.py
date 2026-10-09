@@ -17,13 +17,107 @@ from PIL import Image
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "test_ohmo"))
 
 from probe_support import (  # noqa: E402
+    NativeClientPreconditionError,
+    actual_grade_expectation,
     create_storage_run_dir,
+    native_preflight_and_clients,
+    native_photo_reference,
     select_finalizer_event,
     source_jpeg,
+    take_native_photo_reference,
     call_wellness_with_synthetic_self,
     unique_honcho_scope,
     verify_source_worktree,
 )
+
+
+@pytest.mark.parametrize(
+    ("kcal", "source"),
+    [
+        (None, "frozen review"), ("", "frozen review"),
+        ("nan", "frozen review"), ("inf", "frozen review"),
+        ("-inf", "frozen review"), ("0", "frozen review"),
+        ("-1", "frozen review"), ("125", None),
+        ("125", "  "), ("125", "x" * 513),
+    ],
+)
+def test_native_reference_fails_before_subscription_resolution(
+    tmp_path, monkeypatch, kcal, source,
+):
+    monkeypatch.setattr("probe_support.source_jpeg", lambda *_args: _synthetic_jpeg())
+    with pytest.raises(NativeClientPreconditionError):
+        native_preflight_and_clients(
+            SimpleNamespace(), scenario="synthetic owner scenario",
+            source_path="synthetic.jpg", source_sha256="0" * 64,
+            root=tmp_path, reference=(kcal, source) if kcal is not None else None,
+            resolver=lambda _settings: pytest.fail("subscription resolver was called"),
+        )
+
+
+def test_native_reference_is_consumed_and_propagates_only_to_private_grade(monkeypatch, tmp_path):
+    environment = {
+        "CAMERA_REFERENCE_KCAL": "310.5",
+        "CAMERA_REFERENCE_SOURCE": "  frozen review  ",
+        "CAMERA_USER_SCENARIO": "synthetic owner scenario",
+    }
+    reference = take_native_photo_reference(environment)
+    assert reference == (310.5, "frozen review")
+    assert environment == {"CAMERA_USER_SCENARIO": "synthetic owner scenario"}
+    assert native_photo_reference("310.5", "frozen review") == reference
+
+    class FakeClient:
+        pass
+
+    class Settings:
+        effort = "medium"
+        hooks = None
+        mcp_servers = None
+        enabled_plugins = None
+        allow_project_plugins = False
+        allow_project_skills = False
+        project_skill_dirs = None
+
+        def resolve_profile(self):
+            return "codex", SimpleNamespace(
+                last_model=None, default_model="gpt-6-luna", provider="openai_codex",
+                auth_source="codex_subscription",
+            )
+
+    monkeypatch.setattr("probe_support.source_jpeg", lambda *_args: _synthetic_jpeg())
+    calls = []
+
+    def resolver(settings):
+        calls.append(settings)
+        return FakeClient()
+
+    (bot, virtual_user), photo, accepted = native_preflight_and_clients(
+        Settings(), scenario=environment["CAMERA_USER_SCENARIO"],
+        source_path="synthetic.jpg", source_sha256="0" * 64,
+        root=tmp_path, reference=reference, resolver=resolver,
+        codex_client_type=FakeClient,
+    )
+    assert bot is not virtual_user and len(calls) == 2
+    assert photo == _synthetic_jpeg() and accepted == reference
+    assert "310.5" not in environment["CAMERA_USER_SCENARIO"]
+    assert "frozen review" not in environment["CAMERA_USER_SCENARIO"]
+    assert actual_grade_expectation(
+        mode="native", reference=accepted, expected_consumed=True, offline_kcal=125,
+    ) == (310.5, "frozen_photo_reference", "frozen review")
+    assert actual_grade_expectation(
+        mode="native", reference=accepted, expected_consumed=False, offline_kcal=None,
+    ) == (None, "frozen_photo_reference", "frozen review")
+
+
+@pytest.mark.parametrize("offline_kcal", [125, 225])
+def test_offline_actual_grade_preserves_fixture_reference(offline_kcal):
+    assert actual_grade_expectation(
+        mode="offline", reference=None, expected_consumed=True,
+        offline_kcal=offline_kcal,
+    ) == (offline_kcal, "explicit_fixture", "offline-scripted-owner-and-photo-fixture")
+    assert actual_grade_expectation(
+        mode="offline", reference=None, expected_consumed=False,
+        offline_kcal=None,
+    ) == (None, "explicit_fixture", "offline-scripted-owner-and-photo-fixture")
 
 
 class _ProbeWellnessAuthorizationContext:
