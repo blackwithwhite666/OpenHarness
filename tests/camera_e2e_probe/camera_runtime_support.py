@@ -270,7 +270,10 @@ class OfflineCameraBotApi:
             isinstance(block, AttachmentRefBlock) for block in current_user.content
         ):
             yield self._emit(ConversationMessage(role="assistant", content=[
-                TextBlock(text="Photo context received; no owner consumption has been recorded.")
+                TextBlock(text=(
+                    "Photo context received; no owner consumption has been recorded. "
+                    "[[ask: Did you eat the pictured portion? | Yes, all of it | No, none of it]]"
+                ))
             ]), "end_turn")
             return
         if not attachments:
@@ -485,14 +488,6 @@ def camera_runtime_limits(*, native_mode: bool) -> tuple[int, str]:
     return (8, "medium") if native_mode else (4, "none")
 
 
-def camera_typed_reply_mode(value: str | None) -> str:
-    """Validate the joined runner's typed route before it creates clients."""
-    mode = "reply" if value is None else value
-    if mode not in {"reply", "context"}:
-        raise ValueError("CAMERA_TYPED_REPLY_MODE must be reply or context")
-    return mode
-
-
 def isolated_runtime_loaders(runtime_module):
     """Fail closed for builder, prompt-skill and ambient-catalog loaders."""
     from contextlib import contextmanager
@@ -560,9 +555,8 @@ async def run_camera_runtime_trajectory(
     before_answer=None,
     config_dir=None,
     user_scenario: str = "synthetic offline owner selects the exact offered confirmation",
-    typed_reply_mode: str = "reply",
-    before_owner_action=None,
-    restart_before_owner_action: bool = False,
+    before_replay=None,
+    advance_before_owner_action: bool = False,
     restart_before_replay: bool = False,
     expect_append_failure: bool = False,
     after_save=None,
@@ -583,8 +577,6 @@ async def run_camera_runtime_trajectory(
     import openharness.ui.runtime as openharness_runtime
     from probe_support import NativeClientPreconditionError
 
-    if typed_reply_mode not in {"reply", "context"}:
-        raise ValueError("CAMERA_TYPED_REPLY_MODE must be reply or context")
     if bot_client is user_client:
         raise AssertionError("Camera bot and virtual-user clients must be separate")
     native_mode = os.environ.get("CAMERA_RUN_MODE") == "native"
@@ -726,25 +718,52 @@ async def run_camera_runtime_trajectory(
         capture_time = ingress._attempt_capture_time(ingress._attempts[candidate_id])
         if type(native_photo) is not int or native_photo <= 0 or capture_time is None:
             raise AssertionError("Camera source lacks a confirmed native photo/capture receipt")
+        if (
+            ingress._attempts[candidate_id].get("state") != "photo_sent"
+            or ingress._attempts[candidate_id].get("initial_prompt_delivery_confirmed") is not True
+        ):
+            raise AssertionError("Camera initial question lacks a confirmed native prompt receipt")
         if before_answer is not None:
             await before_answer(first_started)
-        if restart_before_owner_action:
+        if advance_before_owner_action:
             controlled_now[0] += timedelta(minutes=31)
             ingress._sweep_expired_attempts()
-        if before_owner_action is not None:
-            await before_owner_action(process_and_deliver, ingress, pool)
-        if restart_before_owner_action:
-            await restart_runtime_and_camera()
 
         from openharness.channels.bus.events import InboundMessage
 
+        owner_text = "I ate about half of the pictured portion."
+        if native_mode:
+            from openharness.evals.session_user_simulator import LlmUserSimulator
+
+            visible_prompt = next(
+                (item.content for item, _ in reversed(first_delivered) if item.content), ""
+            )
+            if not visible_prompt:
+                raise AssertionError("native Camera photo produced no visible prompt for the virtual owner")
+            virtual_user = LlmUserSimulator(
+                api_client=user_client, model="gpt-6-luna",
+                system_prompt=(
+                    "You are the owner in this Camera test. Use the supplied scenario as your facts. "
+                    "Reply in your own words with what portion you actually ate and when. "
+                    "Do not claim a meal you did not eat."
+                ),
+                max_tokens=256,
+            )
+            virtual_turn = await virtual_user.next_turn(
+                transcript=(("assistant", visible_prompt),),
+                captured_prompts=(user_scenario,), captured_capabilities=(),
+                index=0, last_turn=None,
+            )
+            if virtual_turn is None or not virtual_turn.text.strip():
+                raise AssertionError("native virtual owner did not produce an ordinary text turn")
+            owner_text = virtual_turn.text.strip()
         answer = InboundMessage(
             channel="telegram", sender_id="123", chat_id="123",
-            content="I ate about half of that portion yesterday morning.",
+            content=owner_text,
             timestamp=controlled_now[0],
             metadata={"message_id": "offline-ordinary-owner-turn-1", "is_group": False,
                       "chat_type": "private", "_telegram_raw_text":
-                      "I ate about half of that portion yesterday morning."},
+                      owner_text},
         )
         if any(key in answer.metadata for key in (
             "reply_to_message_id", "callback_query", "_camera_authority", "_camera_answer",
@@ -769,23 +788,32 @@ async def run_camera_runtime_trajectory(
         if not isinstance(event_id, str) or not event_id or delivery_receipt is None:
             raise AssertionError("ordinary owner turn did not return a durable append and delivery receipt")
 
+        after_save_result = None
+        if after_save is not None:
+            after_save_result = await after_save(
+                process_and_deliver, ingress, pool, candidate_id, answer,
+                {"event_id": event_id}, restart_runtime_and_camera,
+            )
+        if before_replay is not None:
+            await before_replay(process_and_deliver, ingress, pool)
+
         if restart_before_replay:
             await restart_runtime_and_camera()
         replay_delivered, replay_receipt, replay_event_id = await process_and_deliver(
             answer, answer.session_key or "telegram:123"
         )
-        if replay_event_id != event_id:
-            raise AssertionError("ordinary replay did not resolve to the original append receipt")
-        if not replay_receipt:
-            raise AssertionError("ordinary replay final response has no delivery receipt")
-        if isinstance(bot_client, OfflineCameraBotApi) and bot_client.finalization_proposals != 2:
-            raise AssertionError("ordinary replay did not pass through the generic trace finalizer")
-        if not any(item.metadata.get("photo_occurrence_source", {}).get("camera_candidate_id") == candidate_id
-                   for item, _ in delivered if isinstance(item.metadata.get("photo_occurrence_source"), dict)):
-            raise AssertionError("ordinary append lost its exact Camera photo source facts")
+        if replay_event_id is not None:
+            raise AssertionError("owner replay appended another nutrition event")
+        if isinstance(bot_client, OfflineCameraBotApi):
+            expected_proposals = 1 + (
+                len(after_save_result["correction_event_ids"]) if after_save_result else 0
+            )
+            if bot_client.finalization_proposals != expected_proposals:
+                raise AssertionError("replay reran a proposal or a new correction lacked one")
         print(
-            f"OFFLINE SYNTHETIC ordinary owner turn source={answer.metadata['message_id']} "
-            f"event={event_id} capture={capture_time.isoformat()} no-reply replay stable",
+            f"{'NATIVE OPT-IN' if native_mode else 'OFFLINE SYNTHETIC'} ordinary owner turn "
+            f"source={answer.metadata['message_id']} event={event_id} "
+            f"capture={capture_time.isoformat()} replay_event={replay_event_id}",
             flush=True,
         )
         return {
@@ -793,11 +821,10 @@ async def run_camera_runtime_trajectory(
             "event_id": event_id, "receipt": {"event_id": event_id},
             "final_status_text": final_text, "native_photo_id": native_photo,
             "source_candidate_id": candidate_id, "ingress": ingress,
-            "route": "ordinary", "owner_replay_saved_status": final_text,
-            "owner_replay_delivery_confirmed": True, "owner_replay_event_id": replay_event_id,
+            "owner_replay_event_id": replay_event_id,
             "replay_text": next((item.content for item, _ in reversed(replay_delivered) if item.content), ""),
             "camera_clock_advanced": controlled_now[0] - controlled_clock_start,
-            "after_save_result": None,
+            "after_save_result": after_save_result,
         }
     finally:
         try:

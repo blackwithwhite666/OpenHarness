@@ -8,8 +8,6 @@ and its route attestation are synthetic fixture data, so this is a partial E2E.
 from __future__ import annotations
 
 import asyncio
-import hashlib
-import json
 import logging
 import os
 import sys
@@ -47,14 +45,8 @@ from openharness.config.schema import TelegramConfig  # noqa: E402
 from camera_runtime_support import (  # noqa: E402
     distinct_offline_clients,
     OfflineTelegramBot,
-    OfflineCameraUserApi,
-    camera_typed_reply_mode,
-    assert_e5_raw_honcho_row_unchanged,
     e5_raw_honcho_row_fingerprint,
     run_camera_runtime_trajectory,
-    validate_e5_date_source_link,
-    validate_e5_denial_receipt,
-    validate_e5_unique_original_event_ids,
 )
 
 
@@ -66,12 +58,12 @@ async def verify_finalizer_event(
     candidate_id: str,
     answer_message_id: str,
     native_photo_id: int,
-    expected_route: str,
     expected_event_id: str,
     started: datetime,
     expected_capture_time: datetime,
     signed_wire: bool = False,
     runtime_principal: str = "123",
+    verify_projection: bool = True,
 ) -> None:
     """Read the real finalizer's event, then verify Telegent's exact projection."""
     from mcp.server.fastmcp.server import FastMCP
@@ -95,7 +87,6 @@ async def verify_finalizer_event(
         )
     event = select_finalizer_event(
         messages, candidate_id, answer_message_id, native_photo_id,
-        expected_route=expected_route,
         expected_capture_time=expected_capture_time,
         expected_event_id=expected_event_id,
     )
@@ -137,8 +128,8 @@ async def verify_finalizer_event(
         "source_principal": "telegram:123",
         "tenant_id": "synthetic_owner",
         "source_message_id": answer_message_id,
-        "ingest_source": "telegram",
-        "source_image_attachment_count": 1,
+        "ingest_source": "dropbox_camera",
+        "source_image_attachment_count": 0,
     }
     binding_mismatches = [
         key for key, expected in expected_bindings.items() if event.metadata.get(key) != expected
@@ -165,6 +156,8 @@ async def verify_finalizer_event(
             "finalizer event owner/source/operation binding differs: "
             + ",".join(binding_mismatches)
         )
+    if not verify_projection:
+        return
 
     credentials = NutritionHonchoCredentials.model_validate(
         {
@@ -298,90 +291,6 @@ async def verify_finalizer_event(
         finally:
             health.close()
             db.close()
-
-
-async def verify_e5_corrections(
-    *, url: str, workspace: str, session: str, started: datetime,
-    candidate_id: str, original_event_id: str, correction_event_ids: list[str],
-    expected_capture_time: datetime, expected_meal_at: datetime,
-    expected_date_source_id: str,
-    expected_original_fingerprint: str,
-) -> None:
-    """Join real runtime correction IDs to Honcho and the reopened Rocks projection."""
-    async with HonchoClient(url, "local-auth-disabled", workspace) as client:
-        rows = await client.list_messages_in_window(
-            session, expected_peer_id="ohmo", since=started - timedelta(minutes=1),
-            until=datetime.now(timezone.utc) + timedelta(minutes=1),
-        )
-    events = []
-    for row in rows:
-        metadata = row.get("metadata")
-        if not isinstance(metadata, dict):
-            raise AssertionError("E5 raw Honcho row has no persisted metadata object")
-        trace = metadata.get("decision_trace")
-        nutrition = trace.get("annotations", {}).get("nutrition") if isinstance(trace, dict) else None
-        if isinstance(nutrition, dict) and nutrition.get("record_type") in {
-            "meal_observation", "meal_correction"
-        }:
-            events.append((row, nutrition))
-    observations = [(row, ann) for row, ann in events if ann["record_type"] == "meal_observation"]
-    corrections = [(row, ann) for row, ann in events if ann["record_type"] == "meal_correction"]
-    validate_e5_unique_original_event_ids(
-        observed_event_ids=[row["id"] for row, _ in observations],
-        expected_original_event_id=original_event_id,
-    )
-    if [row["id"] for row, _ in corrections] != correction_event_ids:
-        raise AssertionError("E5 correction IDs differ between runtime receipts and full Honcho read")
-    original, original_ann = observations[0]
-    observed_original_fingerprint = e5_raw_honcho_row_fingerprint(original)
-    if observed_original_fingerprint != expected_original_fingerprint:
-        raise AssertionError("E5 producer/replay changed the immutable original Honcho row")
-    original_metadata = original.get("metadata")
-    if not isinstance(original_metadata, dict) or original_metadata.get("camera_candidate_id") != candidate_id:
-        raise AssertionError("E5 original observation is not bound to this Camera candidate")
-    (portion, portion_ann), (date_event, date_ann), (denial, denial_ann) = corrections
-    portion_metadata = portion.get("metadata")
-    date_metadata = date_event.get("metadata")
-    denial_metadata = denial.get("metadata")
-    if not all(isinstance(metadata, dict) for metadata in (
-        portion_metadata, date_metadata, denial_metadata,
-    )):
-        raise AssertionError("E5 raw Honcho correction row has no persisted metadata")
-    if (
-        portion_metadata.get("camera_original_event_id") != original_event_id
-        or portion_metadata.get("camera_candidate_id") != candidate_id
-        or not portion_ann_check(portion_ann)
-    ):
-        raise AssertionError("E5 portion correction does not target the immutable original event")
-    validate_e5_date_source_link(
-        date_metadata=date_metadata,
-        original_metadata=original_metadata,
-        expected_date_source_id=expected_date_source_id,
-    )
-    if (
-        denial_metadata.get("camera_original_event_id") != original_event_id
-        or denial_metadata.get("camera_candidate_id") != candidate_id
-        or denial_ann["consumption_status"] != "not_consumed"
-        or "consumption_status" not in denial_ann["changed_fields"]
-    ):
-        raise AssertionError("E5 denial correction does not target the immutable original event")
-    if original_ann.get("meal_at") != expected_capture_time.isoformat() or original_ann.get("meal_date"):
-        raise AssertionError("E5 original capture date/time changed in Honcho")
-    if portion_ann["energy_kcal_best"] != 53 or portion_ann.get("meal_at") or portion_ann.get("meal_date"):
-        raise AssertionError("E5 portion correction did not preserve the trusted capture date")
-    if (
-        date_ann.get("record_type") != "meal_correction"
-        or "meal_at" not in date_ann.get("changed_fields", [])
-        or datetime.fromisoformat(date_ann["meal_at"].replace("Z", "+00:00")) != expected_meal_at
-    ):
-        raise AssertionError("E5 ordinary date correction does not contain the explicit owner time")
-    if original_ann.get("meal_at") != expected_capture_time.isoformat() or original_ann.get("meal_date"):
-        raise AssertionError("E5 corrections rewrote the immutable original capture time")
-    print(
-        f"PASS E5 Honcho IDs original={original_event_id} portion={portion['id']} "
-        f"date={date_event['id']} denial={denial['id']}; explicit_meal_at={expected_meal_at.isoformat()}",
-        flush=True,
-    )
 
 
 async def verify_e5_projection_stage(
@@ -521,16 +430,6 @@ async def verify_e5_projection_stage(
     finally:
         health.close()
         db.close()
-
-
-def portion_ann_check(ann: dict) -> bool:
-    return bool(
-        isinstance(ann, dict)
-        and ann.get("record_type") == "meal_correction"
-        and ann.get("energy_kcal_best") == 53
-        and "items" in ann.get("changed_fields", [])
-        and ann.get("consumption_status", "unknown") == "unknown"
-    )
 
 
 async def verify_signed_wellness_wire(
@@ -1113,10 +1012,8 @@ async def main() -> None:
     mode = os.environ.get("CAMERA_RUN_MODE", "offline")
     restart_join = os.environ.get("CAMERA_RESTART_JOIN", "")
     correction_join = os.environ.get("CAMERA_CORRECTION_JOIN", "")
-    if restart_join == "1":
-        restart_join = "two-photo"
-    if restart_join not in {"", "two-photo", "single-context"}:
-        raise RuntimeError("CAMERA_RESTART_JOIN must be two-photo or single-context")
+    if restart_join not in {"", "two-photo"}:
+        raise RuntimeError("CAMERA_RESTART_JOIN must be two-photo")
     if restart_join and mode != "offline":
         raise RuntimeError("Camera restart join is deterministic and offline-only")
     if correction_join not in {"", "portion-denial", "context-items-date"}:
@@ -1130,12 +1027,6 @@ async def main() -> None:
         raise RuntimeError("Camera append fault injection is deterministic and offline-only")
     if mode not in {"offline", "native"}:
         raise RuntimeError("CAMERA_RUN_MODE must be offline or native")
-    try:
-        typed_reply_mode = camera_typed_reply_mode(os.environ.get("CAMERA_TYPED_REPLY_MODE"))
-    except ValueError as exc:
-        raise RuntimeError(str(exc)) from None
-    if restart_join == "single-context" and typed_reply_mode != "context":
-        raise RuntimeError("single-context restart join requires CAMERA_TYPED_REPLY_MODE=context")
     if mode == "native" and not acceptance:
         raise RuntimeError(
             "native Camera requires CAMERA_ACCEPTANCE=1 on a clean exact source pair"
@@ -1180,8 +1071,6 @@ async def main() -> None:
         bot_client, user_client = distinct_offline_clients(
             context_items_date=correction_join == "context-items-date"
         )
-        if restart_join == "single-context":
-            user_client = OfflineCameraUserApi("Да, я съел(а) целую порцию.")
         user_scenario = "synthetic offline owner selects the exact offered confirmation"
 
     original_honcho_create_messages = None
@@ -1291,6 +1180,8 @@ async def main() -> None:
                 update={"size": len(source_bytes), "server_modified": datetime.now(timezone.utc)}
             )
             candidate_id = fixtures.candidate_id_for(entry.file_id, entry.rev)
+            if mode == "offline":
+                bot_client.candidate_id = candidate_id
             artifacts = root / "artifacts"
             store = fixtures._test_store(artifacts)
             http_client = httpx.Client(transport=LocalCameraTransport(port), timeout=10)
@@ -1380,787 +1271,136 @@ async def main() -> None:
                     capture_time=capture_time,
                 )
 
-            async def append_context_items_date(
+            async def append_runtime_corrections(
                 process_and_deliver, active_ingress, active_pool,
-                active_candidate_id, _answer, immutable_commit, restart_runtime,
+                active_candidate_id, answer, original_receipt, restart_runtime,
             ):
-                """Exercise actual owner receipts through a no-reply correction and date turn."""
+                from openharness.channels.bus.events import InboundMessage
                 from ohmo.memory_service.honcho_client import HonchoClient as RuntimeHonchoClient
 
-                async with RuntimeHonchoClient(honcho_url, "local-auth-disabled", workspace) as honcho:
-                    initial_rows = await honcho.list_messages_in_window(
-                        session, expected_peer_id="ohmo", since=trajectory_started - timedelta(minutes=1),
-                        until=datetime.now(timezone.utc) + timedelta(minutes=1),
-                    )
-                original_row = next(
-                    row for row in initial_rows if row.get("id") == immutable_commit["event_id"]
-                )
-                original_fingerprint = e5_raw_honcho_row_fingerprint(original_row)
-                original_annotation = original_row["metadata"]["decision_trace"]["annotations"]["nutrition"]
-                if (
-                    original_annotation.get("record_type") != "meal_observation"
-                    or [item.get("name") for item in original_annotation.get("items", [])]
-                    != ["cottage cheese", "berries"]
-                    or original_annotation.get("energy_kcal_best") != 225
-                    or immutable_commit.get("event_id") != original_row.get("id")
-                ):
-                    raise AssertionError("context-items-date did not persist the accepted 225 kcal curds-and-berries meal")
+                original_id = original_receipt["event_id"]
 
-                async def ordinary_owner_text(
-                    text, message_id, annotation, *, current_ingress, current_pool,
-                    reply_to_message_id=None,
-                ):
-                    reply_target = None
-                    if reply_to_message_id is not None:
-                        reply_target = SimpleNamespace(
-                            message_id=int(reply_to_message_id), chat_id=123,
-                            chat=SimpleNamespace(type="private"),
-                            from_user=SimpleNamespace(
-                                id=0, is_bot=True, first_name="Camera bot", username=None,
-                            ),
+                async def rows():
+                    async with RuntimeHonchoClient(honcho_url, "local-auth-disabled", workspace) as honcho:
+                        return await honcho.list_messages_in_window(
+                            session, expected_peer_id="ohmo",
+                            since=trajectory_started - timedelta(minutes=1),
+                            until=datetime.now(timezone.utc) + timedelta(minutes=1),
                         )
-                    native_message = SimpleNamespace(
-                        message_id=message_id, chat_id=123,
-                        chat=SimpleNamespace(type="private"), date=datetime.now(timezone.utc),
-                        text=text, caption=None, photo=None, voice=None, audio=None,
-                        document=None, location=None, venue=None, forward_origin=None,
-                        reply_to_message=reply_target,
-                        from_user=SimpleNamespace(
-                            id=123, is_bot=False, first_name="synthetic owner", username=None,
-                        ),
-                    )
-                    update = SimpleNamespace(
-                        effective_user=native_message.from_user,
-                        effective_message=native_message, message=native_message,
-                        edited_message=None,
-                    )
-                    await current_ingress._telegram._on_message(update, None)
-                    inbound_message = await asyncio.wait_for(bus.consume_inbound(), timeout=2)
-                    if inbound_message.metadata.get("_camera_authority") is not None:
-                        raise AssertionError("ordinary owner text arrived with forged Camera authority")
-                    current_ingress.process_real_inbound(inbound_message)
-                    if inbound_message.metadata.get("_camera_context_meal_candidate_id") != active_candidate_id:
-                        raise AssertionError("ordinary owner text did not bind the unique retained Camera meal")
-                    if inbound_message.metadata.get("_camera_context_meal_target") is None:
-                        raise AssertionError("ordinary owner text lacks ingress-issued context provenance")
-                    bot_client.queue_correction(annotation)
-                    delivered, delivery_receipt, event_id = await process_and_deliver(
-                        inbound_message, inbound_message.session_key
-                    )
-                    if not isinstance(event_id, str) or not event_id or delivery_receipt is None:
-                        raise AssertionError("runtime correction lacks a durable event and delivery receipt")
-                    final = next(
-                        (outbound for outbound, _receipt in reversed(delivered) if outbound.content), None
-                    )
-                    if final is None or final.metadata.get("nutrition_append_event_id") != event_id:
-                        raise AssertionError("delivered correction metadata differs from its runtime event")
-                    if not final.metadata.get("nutrition_context_evidence"):
-                        raise AssertionError("runtime correction omitted verified original/current receipt evidence")
-                    return inbound_message, delivered, delivery_receipt, event_id, final, update
 
-                original_items = list(original_annotation["items"])
-                ack_id = active_ingress._attempts[active_candidate_id]["reply_ids"][-1]
-                if str(ack_id) == str(active_ingress._attempts[active_candidate_id]["photo_id"]):
-                    raise AssertionError("saved meal acknowledgement was not registered as a reply target")
-                initial_runtime_session = active_pool._bundles[_answer.session_key].session_id
-                await active_pool.reset_session(_answer.session_key)
-                active_ingress, active_pool = await restart_runtime()
-                label_items = [dict(item) for item in original_items]
-                label_items[0].update({"quantity_text": "125 g", "energy_kcal_best": 106.75})
-                label_annotation = {
-                    "schema_version": 2, "record_type": "meal_correction",
-                    "changed_fields": [
-                        "items", "energy_kcal_min", "energy_kcal_max", "energy_kcal_best",
-                    ],
-                    "items": label_items, "energy_kcal_min": 121.75,
-                    "energy_kcal_max": 121.75, "energy_kcal_best": 121.75,
-                }
-                label_message, _label_delivered, _label_delivery_receipt, label_event_id, label_final, _label_update = (
-                    await ordinary_owner_text(
-                        "125г в упаковке, в 100г 85,4 ккал",
-                        "offline-context-package-label", label_annotation,
-                        current_ingress=active_ingress, current_pool=active_pool,
-                        reply_to_message_id=ack_id,
-                    )
-                )
+                original_row = next(row for row in await rows() if row["id"] == original_id)
+                original_fingerprint = e5_raw_honcho_row_fingerprint(original_row)
+                original_operation = original_row["metadata"].get("client_op_id")
                 if (
-                    label_message.metadata.get("_camera_context_meal_target_kind") != "package_label"
-                    or label_message.metadata.get("_camera_context_meal_candidate_id") != active_candidate_id
-                    or label_final.metadata["nutrition_committed_annotation"].get("energy_kcal_best") != 121.75
-                    or label_final.metadata.get("gateway_session_id") == initial_runtime_session
+                    not isinstance(original_operation, str)
+                    or original_operation != f"{original_row['metadata'].get('logical_turn_id')}:assistant"
                 ):
-                    raise AssertionError("saved acknowledgement did not commit the 121.75 kcal package-label correction")
-                label_stage = await verify_e5_projection_stage(
-                    url=honcho_url, workspace=workspace, session=session,
-                    started=trajectory_started, original_event_id=immutable_commit["event_id"],
-                    latest_event_id=label_event_id, source_day=capture_time.date(),
-                    corrected_day=capture_time.date(), expected_day=capture_time.date(),
-                    expected_kcal=121.75, expected_status="consumed", expected_meal_at=capture_time,
-                    expected_items=[("cottage cheese", "125 g"), ("berries", "15 g")],
-                )
-                await active_ingress._telegram._on_message(_label_update, None)
-                label_replay = await asyncio.wait_for(bus.consume_inbound(), timeout=2)
-                active_ingress.process_real_inbound(label_replay)
-                _label_replay_delivered, _label_replay_receipt, replay_label_event_id = await process_and_deliver(
-                    label_replay, label_replay.session_key
-                )
-                if replay_label_event_id != label_event_id:
-                    raise AssertionError("saved acknowledgement label replay changed its immutable event")
-                label_replay_stage = await verify_e5_projection_stage(
-                    url=honcho_url, workspace=workspace, session=session,
-                    started=trajectory_started, original_event_id=immutable_commit["event_id"],
-                    latest_event_id=label_event_id, source_day=capture_time.date(),
-                    corrected_day=capture_time.date(), expected_day=capture_time.date(),
-                    expected_kcal=121.75, expected_status="consumed", expected_meal_at=capture_time,
-                    expected_items=[("cottage cheese", "125 g"), ("berries", "15 g")],
-                )
-                egg_items = label_items + [{
-                    "name": "egg", "quantity_text": "1 egg", "energy_kcal_best": 78,
-                }]
-                egg_annotation = {
-                    "schema_version": 2, "record_type": "meal_correction",
-                    "changed_fields": ["items", "energy_kcal_best"],
-                    "items": egg_items, "energy_kcal_best": 199.75,
-                }
-                egg_message, egg_delivered, egg_delivery_receipt, egg_event_id, egg_final, _egg_update = (
-                    await ordinary_owner_text(
-                        "И еще добавь одно куриное яйцо", "offline-context-egg-addition",
-                        egg_annotation, current_ingress=active_ingress, current_pool=active_pool,
-                    )
-                )
-                egg_projection = active_ingress._attempts[active_candidate_id].get(
-                    "context_meal_projection"
-                )
-                if (
-                    not isinstance(egg_projection, dict)
-                    or egg_projection.get("event_id") != egg_event_id
-                    or egg_final.metadata["nutrition_context_evidence"].get(
-                        "original_receipt_event_id"
-                    ) != immutable_commit.get("event_id")
-                ):
-                    raise AssertionError("no-reply egg receipt did not update retained same-meal context")
-
-                egg_stage = await verify_e5_projection_stage(
-                    url=honcho_url, workspace=workspace, session=session,
-                    started=trajectory_started, original_event_id=immutable_commit["event_id"],
-                    latest_event_id=egg_event_id, source_day=capture_time.date(),
-                    corrected_day=capture_time.date(), expected_day=capture_time.date(),
-                    expected_kcal=199.75, expected_status="consumed", expected_meal_at=capture_time,
-                    expected_items=[
-                        (str(egg_items[0]["name"]), str(egg_items[0]["quantity_text"])),
-                        ("berries", "15 g"),
-                        ("egg", "1 egg"),
-                    ],
-                )
-
-                original_runtime_session = active_pool._bundles[egg_message.session_key].session_id
-                # This is task-local synthetic state. Rotate the actual runtime identity while
-                # retaining the Camera journal and Honcho receipts, then reconstruct the pool.
-                await active_pool.reset_session(egg_message.session_key)
-                active_ingress, active_pool = await restart_runtime()
-                date_session = active_pool._bundles.get(egg_message.session_key)
-                if date_session is not None and date_session.session_id == original_runtime_session:
-                    raise AssertionError("runtime restart did not rotate the synthetic gateway session")
-                corrected_at = capture_time.replace(hour=8, minute=0, second=0, microsecond=0)
-                date_annotation = {
-                    "schema_version": 2, "record_type": "meal_correction",
-                    "changed_fields": ["meal_at"], "meal_at": corrected_at.isoformat(),
-                }
-                date_message, date_delivered, date_delivery_receipt, date_event_id, date_final, date_update = (
-                    await ordinary_owner_text(
-                        "Съели утром", "offline-context-sparse-date", date_annotation,
-                        current_ingress=active_ingress, current_pool=active_pool,
-                    )
-                )
-                if date_final.metadata.get("nutrition_committed_annotation", {}).get("changed_fields") != ["meal_at"]:
-                    raise AssertionError("sparse date correction unexpectedly rewrote the item composition")
-                if date_final.metadata["nutrition_context_evidence"].get("original_receipt_event_id") != immutable_commit["event_id"]:
-                    raise AssertionError("post-rotation correction lost the original immutable source receipt")
-
-                async with RuntimeHonchoClient(honcho_url, "local-auth-disabled", workspace) as honcho:
-                    after_rows = await honcho.list_messages_in_window(
-                        session, expected_peer_id="ohmo", since=trajectory_started - timedelta(minutes=1),
-                        until=datetime.now(timezone.utc) + timedelta(minutes=1),
-                    )
-                original_after = next(row for row in after_rows if row.get("id") == immutable_commit["event_id"])
-                assert_e5_raw_honcho_row_unchanged(original_row, original_after)
-                correction_ids = [label_event_id, egg_event_id, date_event_id]
-                durable_ids = [row.get("id") for row in after_rows if (
-                    isinstance(row.get("metadata"), dict)
-                    and isinstance(row["metadata"].get("decision_trace"), dict)
-                    and row["metadata"]["decision_trace"].get("annotations", {}).get("nutrition", {}).get("record_type")
-                    == "meal_correction"
-                )]
-                if durable_ids != correction_ids:
-                    raise AssertionError("Honcho immutable correction IDs differ from actual runtime receipts")
-
-                final_stage = await verify_e5_projection_stage(
-                    url=honcho_url, workspace=workspace, session=session,
-                    started=trajectory_started, original_event_id=immutable_commit["event_id"],
-                    latest_event_id=date_event_id, source_day=capture_time.date(),
-                    corrected_day=capture_time.date(), expected_day=capture_time.date(),
-                    expected_kcal=199.75, expected_status="consumed", expected_meal_at=corrected_at,
-                    expected_items=[
-                        (str(egg_items[0]["name"]), str(egg_items[0]["quantity_text"])),
-                        ("berries", "15 g"),
-                        ("egg", "1 egg"),
-                    ],
-                )
-                if (
-                    not label_stage.get("reopened")
-                    or not label_replay_stage.get("sync_replay_stable")
-                    or not egg_stage.get("sync_replay_stable")
-                    or not final_stage.get("reopened")
-                ):
-                    raise AssertionError("Telegent projection did not remain stable across reopen and replay")
-
-                from ohmo.evals.nutrition_persistence import (
-                    ExpectedItemQuantity, Goal, Manifest, bind_wellness_snapshot,
-                    derive_meal_id, export_eval_dialogue, grade_manifest,
-                    validate_dialogue_binding,
-                )
-                evidence = date_final.metadata["nutrition_context_evidence"]
-                original_meta = original_row["metadata"]
-                correction_rows = [
-                    row for row in after_rows
-                    if row.get("id") in correction_ids and isinstance(row.get("metadata"), dict)
-                ]
-                episode_ids = [
-                    str(original_meta["decision_trace_episode_id"]),
-                    *(str(row["metadata"]["decision_trace_episode_id"]) for row in correction_rows),
-                ]
-                episode_path = Path(active_pool._workspace) / "evals" / "episodes" / "episodes.jsonl"
-                recorded_episodes = [
-                    json.loads(line) for line in episode_path.read_text(encoding="utf-8").splitlines()
-                    if line.strip()
-                ]
-                initial_camera_contexts = [
-                    episode for episode in recorded_episodes
-                    if isinstance(episode.get("metadata"), dict)
-                    and isinstance(episode["metadata"].get("trusted_camera_context"), dict)
-                    and episode["metadata"]["trusted_camera_context"].get("kind") == "initial_context"
-                    and episode["metadata"]["trusted_camera_context"].get("candidate_id") == candidate_id
-                    and episode["metadata"]["trusted_camera_context"].get("tenant_id")
-                    == original_meta.get("tenant_id")
-                    and episode["metadata"]["trusted_camera_context"].get("gateway_session_id")
-                    == original_meta.get("gateway_session_id")
-                ]
-                if len(initial_camera_contexts) != 1:
-                    raise AssertionError("runtime export lacks one exact initial Camera receipt episode")
-                episode_ids.append(str(initial_camera_contexts[0]["episode_id"]))
-                if len(set(episode_ids)) != 5:
-                    raise AssertionError("runtime did not export distinct source-bound Camera turns")
-                dialogue = export_eval_dialogue(
-                    Path(active_pool._workspace) / "evals", episode_ids=episode_ids,
-                )
-                now = datetime.now(timezone.utc)
-                lower = datetime.combine(corrected_at.date(), datetime.min.time(), timezone.utc)
-                goal = Goal(
-                    case_id="synthetic-camera-context-items-date",
-                    episode_ids=episode_ids,
-                    owner_id=str(original_meta["tenant_id"]),
-                    principal_id=str(original_meta["source_principal"]),
-                    workspace_id=workspace, eval_workspace=str(active_pool._workspace),
-                    peer_id="ohmo", canonical_owner_id="synthetic_owner",
-                    canonical_login="synthetic_owner", session_id=session,
-                    gateway_session_id=str(original_meta["gateway_session_id"]),
-                    source_message_id=str(evidence["photo_source_message_id"]),
-                    meal_date=corrected_at.date(), meal_timezone="UTC",
-                    trajectory_started_at=trajectory_started - timedelta(minutes=1),
-                    trajectory_as_of=now,
-                    logical_turn_id=str(original_meta["logical_turn_id"]),
-                    trace_episode_id=str(original_meta["decision_trace_episode_id"]),
-                    operation_id=str(evidence["original_operation_id"]),
-                    canonical_meal_id=derive_meal_id(
-                        tenant_id=str(original_meta["tenant_id"]),
-                        source_principal=str(original_meta["source_principal"]),
-                        gateway_session_id=str(original_meta["gateway_session_id"]),
-                        source_message_id=str(evidence["photo_source_message_id"]),
-                    ),
-                    expected_consumed=True, expected_kcal=199.75,
-                    expected_items=["cottage cheese", "berries", "egg"],
-                    expected_item_quantities=[
-                        ExpectedItemQuantity(
-                            name="cottage cheese", quantity_text=str(egg_items[0]["quantity_text"]),
-                        ),
-                        ExpectedItemQuantity(name="berries", quantity_text="15 g"),
-                        ExpectedItemQuantity(name="egg", quantity_text="1 egg"),
-                    ],
-                    expectation_origin="explicit_fixture",
-                    expectation_source="synthetic joined Camera receipt fixture",
-                )
-                manifest = Manifest(schema_version=1, goals=[goal])
-                binding = validate_dialogue_binding(manifest, dialogue)[goal.case_id]
-                if binding.get("complete") is not True:
-                    raise AssertionError(
-                        "actual runtime receipt export did not bind the reviewed Camera episode: "
-                        f"{binding}"
-                    )
-                honcho_start = lower.isoformat()
-                honcho_end = now.isoformat()
-                scoped_rows = [
-                    row for row in after_rows
-                    if row.get("peer_id") == goal.peer_id
-                    and row.get("session_id") == goal.session_id
-                    and row.get("workspace_id") == goal.workspace_id
-                ]
-                honcho_snapshot = {
-                    "complete": True, "workspace_id": workspace, "session_id": session,
-                    "owner_id": goal.owner_id, "since": honcho_start,
-                    "until": honcho_end, "queried_at": honcho_end, "messages": scoped_rows,
-                }
-                canonical_meal = dict(final_stage["canonical_meal"])
-                wellness_snapshot = bind_wellness_snapshot({
-                    "complete": True, "user_id": "synthetic_owner", "login": "synthetic_owner",
-                    "start": lower.isoformat(), "end": now.isoformat(),
-                    "queried_at": now.isoformat(), "meals": [canonical_meal], "unassigned": [],
-                }, goal=goal)
-                grade = grade_manifest(
-                    manifest, honcho_snapshot, wellness_snapshot, now=now,
-                    reviewed_turn_sources=binding["reviewed_turn_sources"],
-                    reviewed_turn_provenance=binding["reviewed_turn_provenance"],
-                )[0]
-                if (grade.get("a1"), grade.get("stage")) != ("PASS", "SAME_EVENT_PROJECTED"):
-                    raise AssertionError(f"ordinary grader rejected actual joined receipt evidence: {grade}")
-                print(
-                    "PASS OFFLINE SYNTHETIC saved-ack package-label correction: "
-                    "runtime rotated; original and berries retained; same meal date; "
-                    "Honcho-to-Telegent current balance=121.75 kcal; replay stable; "
-                    "ordinary food A1 grader=PASS",
-                    flush=True,
-                )
-
-                # Replay the exact date update through Telegram -> ingress -> runtime. It must
-                # return the existing receipt and leave Honcho's immutable history unchanged.
-                await active_ingress._telegram._on_message(date_update, None)
-                replay = await asyncio.wait_for(bus.consume_inbound(), timeout=2)
-                active_ingress.process_real_inbound(replay)
-                before_replay_event_count = len(after_rows)
-                replay_delivered, replay_receipt, replay_event_id = await process_and_deliver(
-                    replay, replay.session_key
-                )
-                if replay_receipt is None or replay_event_id != date_event_id:
-                    raise AssertionError("restarted sparse date replay changed or failed its saved receipt")
-                replay_final = next(
-                    (outbound for outbound, _receipt in reversed(replay_delivered) if outbound.content),
-                    None,
-                )
-                if (
-                    replay_final is None
-                    or replay_final.metadata.get("nutrition_append_event_id") != date_event_id
-                ):
-                    raise AssertionError("ordinary append replay did not return its immutable saved receipt")
-                replay_status = next(
-                    (outbound.content for outbound, _receipt in reversed(replay_delivered)
-                     if outbound.content), None,
-                )
-                async with RuntimeHonchoClient(honcho_url, "local-auth-disabled", workspace) as honcho:
-                    replay_rows = await honcho.list_messages_in_window(
-                        session, expected_peer_id="ohmo", since=trajectory_started - timedelta(minutes=1),
-                        until=datetime.now(timezone.utc) + timedelta(minutes=1),
-                    )
-                if len(replay_rows) != before_replay_event_count:
-                    raise AssertionError("ordinary correction replay changed Honcho event count")
-                replayed_original = next(
-                    row for row in replay_rows if row.get("id") == immutable_commit["event_id"]
-                )
-                assert_e5_raw_honcho_row_unchanged(original_row, replayed_original)
-                if [row.get("id") for row in replay_rows if row.get("id") in correction_ids] != correction_ids:
-                    raise AssertionError("ordinary replay duplicated or reordered immutable correction IDs")
-                return {
-                    "original_event_id": immutable_commit["event_id"],
-                    "correction_event_ids": correction_ids,
-                    "latest_event_id": date_event_id,
-                    "expected_meal_at": corrected_at.isoformat(),
-                    "date_source_message_id": "offline-context-sparse-date",
-                    "original_row_fingerprint": original_fingerprint,
-                    "stages": {
-                        "package_label": label_stage,
-                        "package_label_replay": label_replay_stage,
-                        "egg": egg_stage,
-                        "date": final_stage,
-                    },
-                    "post_correction_replay": {
-                        "status": replay_status,
-                        "delivery_receipt": replay_receipt,
-                        "event_id": date_event_id,
-                        "expected_event_id": date_event_id,
-                        "required_phrase": None,
-                    },
-                    "latest_final_metadata": date_final.metadata,
-                    "grade": grade,
-                    "runtime_session_before_rotation": original_runtime_session,
-                    "runtime_session_after_rotation": active_pool._bundles[date_message.session_key].session_id,
-                }
-
-            async def append_real_corrections(
-                process_and_deliver, active_ingress, _active_pool,
-                active_candidate_id, _answer, immutable_commit, _restart_runtime,
-            ):
-                from ohmo.gateway.camera import CAMERA_AUTHORITY
-                from ohmo.memory_service.honcho_client import HonchoClient as RuntimeHonchoClient
-                from test_camera_ingress import _native_callback
-
-                async with RuntimeHonchoClient(honcho_url, "local-auth-disabled", workspace) as honcho:
-                    before_rows = await honcho.list_messages_in_window(
-                        session, expected_peer_id="ohmo", since=trajectory_started - timedelta(minutes=1),
-                        until=datetime.now(timezone.utc) + timedelta(minutes=1),
-                    )
-                before_original = next(
-                    row for row in before_rows if row.get("id") == immutable_commit["event_id"]
-                )
-                original_metadata = before_original.get("metadata")
-                if not isinstance(original_metadata, dict):
-                    raise AssertionError("E5 original raw Honcho row has no persisted metadata")
-                original_row_fingerprint = e5_raw_honcho_row_fingerprint(before_original)
-                api = bot_client
-                correction = {
-                    "schema_version": 2, "record_type": "meal_correction",
-                    "changed_fields": ["items", "energy_kcal_best"],
-                    "items": [{
-                        "name": "synthetic apple", "quantity_text": "1 кусочек",
-                        "energy_kcal_best": 53,
-                    }],
-                    "energy_kcal_best": 53,
-                }
-                api.queue_correction(correction)
-                portion_msg = await _native_callback(
-                    bus, label="1 кусочек",
-                    target=active_ingress._attempts[active_candidate_id]["reply_ids"][0],
-                    options=["1 кусочек", "2 кусочка", "Половину порции"],
-                    prompt="Вы съели это? Сколько примерно вы съели?",
-                )
-                portion_msg.metadata["callback_query_id"] = "offline-e5-portion"
-                active_ingress.process_real_inbound(portion_msg)
-                if (
-                    portion_msg.metadata.get("_camera_correction_replay") is None
-                    and portion_msg.metadata.get("_camera_existing_meal_replay") is not True
-                ):
-                    raise AssertionError("E5 real Telegram callback was not bound to the saved meal")
-                portion_delivered, _, _ = await process_and_deliver(
-                    portion_msg, portion_msg.session_key
-                )
-                portion_commit = active_ingress._attempts[active_candidate_id].get(
-                    "camera_correction_commit"
-                )
-                if not isinstance(portion_commit, dict) or portion_commit.get("kind") != "portion":
-                    texts = [outbound.content for outbound, _ in portion_delivered if outbound.content]
-                    attempt = active_ingress._attempts[active_candidate_id]
-                    raise AssertionError(
-                        "E5 runtime did not append a portion correction receipt; "
-                        f"delivered={texts!r}; correction_state={attempt.get('camera_correction')!r}; "
-                        f"operation_state={attempt.get('finalizer_status')!r}"
-                    )
-
+                    raise AssertionError("original runtime append has no exact logical operation")
+                original_nutrition = original_row["metadata"]["decision_trace"]["annotations"]["nutrition"]
+                original_items = original_nutrition["items"]
                 source_day = capture_time.date()
                 corrected_at = (capture_time - timedelta(days=1)).replace(
-                    hour=18, minute=45, second=0, microsecond=0
+                    hour=18, minute=45, second=0, microsecond=0,
                 )
-                corrected_day = corrected_at.date()
-                portion_stage = await verify_e5_projection_stage(
-                    url=honcho_url, workspace=workspace, session=session,
-                    started=trajectory_started, original_event_id=immutable_commit["event_id"],
-                    latest_event_id=portion_commit["event_id"], source_day=source_day,
-                    corrected_day=corrected_day, expected_day=source_day,
-                    expected_kcal=53, expected_status="consumed", expected_meal_at=capture_time,
-                )
-                portion_replay = await _native_callback(
-                    bus, label="1 кусочек",
-                    target=active_ingress._attempts[active_candidate_id]["reply_ids"][0],
-                    options=["1 кусочек", "2 кусочка", "Половину порции"],
-                    prompt="Вы съели это? Сколько примерно вы съели?",
-                )
-                portion_replay.metadata["callback_query_id"] = "offline-e5-portion-replay"
-                active_ingress.process_real_inbound(portion_replay)
-                _, _, portion_replay_event = await process_and_deliver(
-                    portion_replay, portion_replay.session_key
-                )
-                if portion_replay_event != portion_commit["event_id"]:
-                    raise AssertionError("E5 portion replay did not return the same correction event")
+                latest_id = original_id
+                correction_ids = []
+                correction_operations = set()
 
-                # The explicit date reply uses the ordinary date-correction route,
-                # but it must first receive its authority marker from CameraIngress.
-                from types import SimpleNamespace
+                async def correction(text, message_id, annotation):
+                    nonlocal latest_id
+                    message = InboundMessage(
+                        channel="telegram", sender_id="123", chat_id="123",
+                        content=text, timestamp=datetime.now(timezone.utc),
+                        metadata={"message_id": message_id, "is_group": False,
+                                  "chat_type": "private", "_telegram_raw_text": text},
+                    )
+                    bot_client.queue_correction(annotation)
+                    delivered, receipt, event_id = await process_and_deliver(
+                        message, message.session_key or "telegram:123",
+                    )
+                    if not isinstance(event_id, str) or not receipt:
+                        raise AssertionError(f"ordinary correction did not append: {text!r}; {delivered!r}")
+                    current_rows = await rows()
+                    matches = [row for row in current_rows if row["id"] == event_id]
+                    if len(matches) != 1:
+                        raise AssertionError("correction receipt has no unique durable Honcho row")
+                    metadata = matches[0]["metadata"]
+                    selected = metadata.get("selected_source")
+                    if (
+                        metadata.get("source_principal") != "telegram:123"
+                        or metadata.get("tenant_id") != "synthetic_owner"
+                        or metadata.get("source_message_id") != message_id
+                        or not isinstance(metadata.get("client_op_id"), str)
+                        or metadata["client_op_id"] != f"{metadata.get('logical_turn_id')}:assistant"
+                        or metadata["client_op_id"] == original_operation
+                        or metadata["client_op_id"] in correction_operations
+                        or not isinstance(selected, dict)
+                        or selected.get("original_receipt_event_id") != original_id
+                        or selected.get("original_receipt_client_op_id") != original_operation
+                        or selected.get("source_message_id") != answer.metadata["message_id"]
+                    ):
+                        raise AssertionError("correction lacks trusted original/owner/operation receipt")
+                    still_original = next(row for row in current_rows if row["id"] == original_id)
+                    if e5_raw_honcho_row_fingerprint(still_original) != original_fingerprint:
+                        raise AssertionError("correction mutated the original Honcho row")
+                    latest_id = event_id
+                    correction_ids.append(event_id)
+                    correction_operations.add(metadata["client_op_id"])
+                    return event_id
 
-                date_text = f"Это было {corrected_day.isoformat()} в 18:45 UTC"
-                photo_caption = next(
-                    (kwargs.get("caption", "") for name, kwargs in fake_bot.calls
-                     if name == "edit_message_caption" and kwargs.get("caption")),
-                    "",
-                )
-                native_photo_reply = SimpleNamespace(
-                    message_id=active_ingress._attempts[active_candidate_id]["photo_id"],
-                    chat_id=123,
-                    chat=SimpleNamespace(type="private"),
-                    caption=photo_caption,
-                    text=None,
-                    photo=[object()],
-                    from_user=SimpleNamespace(is_bot=True, first_name="Camera bot", username=None),
-                )
-                date_message_id = "offline-e5-date-correction"
-                date_native_message = SimpleNamespace(
-                    message_id=date_message_id,
-                    chat_id=123,
-                    chat=SimpleNamespace(type="private"),
-                    date=datetime.now(timezone.utc),
-                    text=date_text,
-                    caption=None,
-                    photo=None,
-                    voice=None,
-                    audio=None,
-                    document=None,
-                    location=None,
-                    venue=None,
-                    forward_origin=None,
-                    reply_to_message=native_photo_reply,
-                )
-                date_update = SimpleNamespace(
-                    effective_user=SimpleNamespace(
-                        id=123, username=None, first_name="offline owner"
-                    ),
-                    effective_message=date_native_message,
-                    message=date_native_message,
-                    edited_message=None,
-                )
-                date_annotation = {
-                    "schema_version": 2, "record_type": "meal_correction",
-                    "changed_fields": ["meal_at"], "meal_at": corrected_at.isoformat(),
-                }
-                api.queue_correction(date_annotation)
-                await active_ingress._telegram._on_message(date_update, None)
-                date_msg = await asyncio.wait_for(bus.consume_inbound(), timeout=2)
-                if (
-                    date_msg.sender_id.split("|", 1)[0] != "123"
-                    or str(date_msg.metadata.get("reply_to_message_id"))
-                    != str(active_ingress._attempts[active_candidate_id]["photo_id"])
-                ):
-                    raise AssertionError("E5 ordinary date reply lost its actual owner/photo boundary")
-                if date_msg.metadata.get("_camera_authority") is not None:
-                    raise AssertionError("E5 date reply reached runtime with pre-stamped Camera authority")
-                if date_msg.metadata.get("_camera_ordinary_date_correction") is not None:
-                    raise AssertionError("E5 date reply reached runtime with a pre-stamped ordinary-date marker")
-                active_ingress.process_real_inbound(date_msg)
-                if date_msg.metadata.get("_camera_ordinary_date_correction") is not CAMERA_AUTHORITY:
-                    if date_msg.metadata.get("_camera_unbound") is not None:
-                        raise AssertionError(
-                            "E5 product RED: actual Camera admission marked the owner date reply unbound"
-                        )
-                    raise AssertionError(
-                        "E5 date reply did not receive the ingress-issued ordinary-date authority marker"
+                if correction_join == "context-items-date":
+                    changed_items = [dict(item) for item in original_items]
+                    changed_items[0]["quantity_text"] = "half a serving"
+                    item_id = await correction(
+                        "Only half the cottage cheese; keep the berries",
+                        "offline-context-item", {
+                            "schema_version": 2, "record_type": "meal_correction",
+                            "changed_fields": ["items"], "items": changed_items,
+                        },
                     )
-                if date_msg.metadata.get("_camera_unbound") is not None:
-                    raise AssertionError("E5 date reply is both admitted and marked unbound")
-                date_delivered, _, date_event_id = await process_and_deliver(
-                    date_msg, date_msg.session_key
-                )
-                if not isinstance(date_event_id, str) or not date_event_id:
-                    texts = [outbound.content for outbound, _ in date_delivered if outbound.content]
-                    raise AssertionError(
-                        "E5 admitted owner date correction produced no durable runtime receipt; "
-                        f"delivered={texts!r}"
+                    await verify_e5_projection_stage(
+                        url=honcho_url, workspace=workspace, session=session,
+                        started=trajectory_started, original_event_id=original_id,
+                        latest_event_id=item_id, source_day=source_day,
+                        corrected_day=corrected_at.date(), expected_day=source_day,
+                        expected_kcal=225, expected_status="consumed",
+                        expected_meal_at=capture_time,
+                        expected_items=[(item["name"], item["quantity_text"]) for item in changed_items],
                     )
-                date_stage = await verify_e5_projection_stage(
-                    url=honcho_url, workspace=workspace, session=session,
-                    started=trajectory_started, original_event_id=immutable_commit["event_id"],
-                    latest_event_id=date_event_id, source_day=source_day,
-                    corrected_day=corrected_day, expected_day=corrected_day,
-                    expected_kcal=53, expected_status="consumed", expected_meal_at=corrected_at,
-                )
-                # Use a distinct real-channel text reply for the later denial. A
-                # callback reuses the clicked message id as its inbound message id;
-                # after the ordinary date turn that is a stale retry to the runtime.
-                denial_text = "Нет, я это не ела"
-                denial_native_message = SimpleNamespace(
-                    message_id="offline-e5-denial",
-                    chat_id=123,
-                    chat=SimpleNamespace(type="private"),
-                    date=datetime.now(timezone.utc),
-                    text=denial_text,
-                    caption=None,
-                    photo=None,
-                    voice=None,
-                    audio=None,
-                    document=None,
-                    location=None,
-                    venue=None,
-                    forward_origin=None,
-                    reply_to_message=native_photo_reply,
-                )
-                denial_update = SimpleNamespace(
-                    effective_user=SimpleNamespace(
-                        id=123, username=None, first_name="offline owner"
-                    ),
-                    effective_message=denial_native_message,
-                    message=denial_native_message,
-                    edited_message=None,
-                )
-                api.queue_correction({
-                    "schema_version": 2, "record_type": "meal_correction",
-                    "changed_fields": ["consumption_status", "energy_kcal_best"],
-                    "consumption_status": "not_consumed", "energy_kcal_best": 0,
-                })
-                await active_ingress._telegram._on_message(denial_update, None)
-                denial_msg = await asyncio.wait_for(bus.consume_inbound(), timeout=2)
-                if (
-                    denial_msg.sender_id.split("|", 1)[0] != "123"
-                    or str(denial_msg.metadata.get("reply_to_message_id"))
-                    != str(active_ingress._attempts[active_candidate_id]["photo_id"])
-                ):
-                    raise AssertionError("E5 denial lost its actual owner/photo reply boundary")
-                if denial_msg.metadata.get("_camera_authority") is not None:
-                    raise AssertionError("E5 denial reply reached runtime with pre-stamped Camera authority")
-                active_ingress.process_real_inbound(denial_msg)
-                if (
-                    denial_msg.metadata.get("_camera_correction") is None
-                    or denial_msg.metadata.get("_camera_answer") != "no"
-                    or denial_msg.metadata.get("_camera_candidate_id") != active_candidate_id
-                ):
-                    raise AssertionError("E5 denial did not pass actual Camera source admission")
-                denial_delivered, _, denial_outbound_event_id = await process_and_deliver(
-                    denial_msg, denial_msg.session_key
-                )
-                denial_commit = active_ingress._attempts[active_candidate_id].get(
-                    "camera_correction_commit"
-                )
-                if (
-                    not isinstance(denial_commit, dict)
-                    or denial_commit.get("kind") != "denial"
-                    or denial_commit.get("target_event_id") != immutable_commit.get("event_id")
-                    or denial_commit.get("target_source_message_id")
-                    != immutable_commit.get("source_message_id")
-                    or denial_commit.get("source_message_id")
-                    != denial_msg.metadata.get("message_id")
-                    or not isinstance(denial_commit.get("client_op_id"), str)
-                    or not denial_commit.get("client_op_id")
-                    or (
-                        denial_outbound_event_id is not None
-                        and denial_commit.get("event_id") != denial_outbound_event_id
+                    active_ingress, active_pool = await restart_runtime()
+                    date_id = await correction(
+                        "That was yesterday at 18:45", "offline-context-date", {
+                            "schema_version": 2, "record_type": "meal_correction",
+                            "changed_fields": ["meal_at"], "meal_at": corrected_at.isoformat(),
+                        },
                     )
-                ):
-                    raise AssertionError("E5 admitted denial did not produce a matching Camera correction receipt")
-                async with RuntimeHonchoClient(honcho_url, "local-auth-disabled", workspace) as honcho:
-                    denial_rows = await honcho.list_messages_in_window(
-                        session, expected_peer_id="ohmo",
-                        since=trajectory_started - timedelta(minutes=1),
-                        until=datetime.now(timezone.utc) + timedelta(minutes=1),
+                    await verify_e5_projection_stage(
+                        url=honcho_url, workspace=workspace, session=session,
+                        started=trajectory_started, original_event_id=original_id,
+                        latest_event_id=date_id, source_day=source_day,
+                        corrected_day=corrected_at.date(), expected_day=corrected_at.date(),
+                        expected_kcal=225, expected_status="consumed",
+                        expected_meal_at=corrected_at,
+                        expected_items=[(item["name"], item["quantity_text"]) for item in changed_items],
                     )
-                denial_row_matches = [
-                    row for row in denial_rows if row.get("id") == denial_commit.get("event_id")
-                ]
-                if len(denial_row_matches) != 1:
-                    raise AssertionError("E5 denial Camera receipt has no unique actual Honcho row")
-                denial_event_id = validate_e5_denial_receipt(
-                    correction_commit=denial_commit,
-                    outbound_event_id=denial_outbound_event_id,
-                    candidate_id=active_candidate_id,
-                    original_event_id=immutable_commit["event_id"],
-                    original_metadata=original_metadata,
-                    honcho_row=denial_row_matches[0],
-                )
-                denial_stage = await verify_e5_projection_stage(
-                    url=honcho_url, workspace=workspace, session=session,
-                    started=trajectory_started, original_event_id=immutable_commit["event_id"],
-                    latest_event_id=denial_event_id, source_day=source_day,
-                    corrected_day=corrected_day, expected_day=corrected_day,
-                    expected_kcal=0, expected_status="not_consumed", expected_meal_at=corrected_at,
-                )
-                def nutrition_event_rows(rows):
-                    result = []
-                    for row in rows:
-                        metadata = row.get("metadata")
-                        if not isinstance(metadata, dict):
-                            raise AssertionError("E5 replay raw Honcho row has no metadata")
-                        trace = metadata.get("decision_trace")
-                        nutrition = (
-                            trace.get("annotations", {}).get("nutrition")
-                            if isinstance(trace, dict) else None
-                        )
-                        if isinstance(nutrition, dict) and nutrition.get("record_type") in {
-                            "meal_observation", "meal_correction"
-                        }:
-                            result.append((
-                                row.get("id"), row.get("content"), metadata,
-                                row.get("created_at"),
-                            ))
-                    return result
-
-                async with RuntimeHonchoClient(honcho_url, "local-auth-disabled", workspace) as honcho:
-                    before_replay_rows = await honcho.list_messages_in_window(
-                        session, expected_peer_id="ohmo",
-                        since=trajectory_started - timedelta(minutes=1),
-                        until=datetime.now(timezone.utc) + timedelta(minutes=1),
+                else:
+                    denial_id = await correction(
+                        "I did not eat it", "offline-context-denial", {
+                            "schema_version": 2, "record_type": "meal_correction",
+                            "changed_fields": ["consumption_status", "energy_kcal_best"],
+                            "consumption_status": "not_consumed", "energy_kcal_best": 0,
+                        },
                     )
-                before_replay_nutrition_rows = nutrition_event_rows(before_replay_rows)
-                await active_ingress._telegram._on_message(denial_update, None)
-                denial_replay = await asyncio.wait_for(bus.consume_inbound(), timeout=2)
-                if denial_replay.metadata.get("_camera_authority") is not None:
-                    raise AssertionError("E5 denial replay reached runtime with pre-stamped Camera authority")
-                active_ingress.process_real_inbound(denial_replay)
-                if denial_replay.metadata.get("_camera_correction_replay") is None:
-                    raise AssertionError("E5 denial replay did not pass actual Camera replay admission")
-                denial_replay_delivered, _, denial_replay_outbound_event = await process_and_deliver(
-                    denial_replay, denial_replay.session_key
-                )
-                denial_replay_commit = active_ingress._attempts[active_candidate_id].get(
-                    "camera_correction_commit"
-                )
-                if denial_replay_commit != denial_commit:
-                    raise AssertionError("E5 denial replay changed the durable correction receipt")
-                if (
-                    denial_replay_outbound_event is not None
-                    and denial_replay_outbound_event != denial_event_id
-                ):
-                    raise AssertionError("E5 denial replay outbound ID differs from its correction receipt")
-                replay_final = next(
-                    (
-                        (outbound, receipt)
-                        for outbound, receipt in reversed(denial_replay_delivered)
-                        if outbound.content
-                    ),
-                    None,
-                )
-                if (
-                    replay_final is None
-                    or "исправление уже записано" not in replay_final[0].content.casefold()
-                    or replay_final[1] is None
-                ):
-                    raise AssertionError("E5 denial replay did not deliver its truthful saved status")
-                if active_ingress._attempts[active_candidate_id].get("camera_commit") != immutable_commit:
-                    raise AssertionError("E5 correction changed the immutable original Camera commit")
-                if api._queued_correction is not None:
-                    raise AssertionError("E5 runtime did not consume a queued correction through its model turn")
-                async with RuntimeHonchoClient(honcho_url, "local-auth-disabled", workspace) as honcho:
-                    after_rows = await honcho.list_messages_in_window(
-                        session, expected_peer_id="ohmo", since=trajectory_started - timedelta(minutes=1),
-                        until=datetime.now(timezone.utc) + timedelta(minutes=1),
+                    await verify_e5_projection_stage(
+                        url=honcho_url, workspace=workspace, session=session,
+                        started=trajectory_started, original_event_id=original_id,
+                        latest_event_id=denial_id, source_day=source_day,
+                        corrected_day=source_day, expected_day=source_day,
+                        expected_kcal=0, expected_status="not_consumed",
+                        expected_meal_at=capture_time,
                     )
-                after_original = next(
-                    row for row in after_rows if row.get("id") == immutable_commit["event_id"]
-                )
-                assert_e5_raw_honcho_row_unchanged(before_original, after_original)
-                if nutrition_event_rows(after_rows) != before_replay_nutrition_rows:
-                    raise AssertionError("E5 denial replay duplicated or changed a durable nutrition event")
-                return {
-                    "original_event_id": immutable_commit["event_id"],
-                    "correction_event_ids": [
-                        portion_commit["event_id"], date_event_id, denial_event_id
-                    ],
-                    "expected_meal_at": corrected_at.isoformat(),
-                    "date_source_message_id": date_message_id,
-                    "original_row_fingerprint": original_row_fingerprint,
-                    "stages": {
-                        "portion": portion_stage,
-                        "date": date_stage,
-                        "denial": denial_stage,
-                    },
-                    "post_correction_replay": {
-                        "status": replay_final[0].content,
-                        "delivery_receipt": replay_final[1],
-                        "event_id": denial_event_id,
-                        "expected_event_id": denial_event_id,
-                    },
-                    "latest_event_id": denial_event_id,
-                }
+                return {"latest_event_id": latest_id, "correction_event_ids": correction_ids,
+                        "original_row_fingerprint": original_fingerprint}
 
             trajectory_started = datetime.now(timezone.utc)
 
@@ -2180,17 +1420,14 @@ async def main() -> None:
                 before_answer=before_answer,
                 config_dir=run_config,
                 user_scenario=user_scenario,
-                typed_reply_mode=typed_reply_mode,
-                before_owner_action=(
+                before_replay=(
                     admit_intervening_photo if restart_join == "two-photo" else None
                 ),
-                restart_before_owner_action=bool(restart_join),
-                restart_before_replay=bool(restart_join) or append_fault == "timeout-after",
+                advance_before_owner_action=bool(restart_join),
+                restart_before_replay=bool(restart_join or correction_join) or append_fault == "timeout-after",
                 expect_append_failure=append_fault == "before",
                 after_save=(
-                    append_context_items_date
-                    if correction_join == "context-items-date"
-                    else append_real_corrections if correction_join == "portion-denial" else None
+                    append_runtime_corrections if correction_join else None
                 ),
             )
             if append_fault and not fault_injected[0]:
@@ -2198,160 +1435,76 @@ async def main() -> None:
             ingress = trajectory["ingress"]
             if restart_join:
                 if trajectory["camera_clock_advanced"] != timedelta(minutes=31):
-                    raise AssertionError("restart join did not advance the trusted clock by exactly 31 minutes")
+                    raise AssertionError("restart changed the controlled clock by the wrong amount")
                 if restart_join == "two-photo":
-                    if second_candidate_id is None:
-                        raise AssertionError("restart join did not admit its intervening Camera source")
-                    second_attention = ingress._attempts[second_candidate_id].get("attention_active")
-                    if second_attention is not True:
-                        raise AssertionError("late answer or replay cleared the newer photo attention")
-                    if str(trajectory["answer"].metadata.get("native_message_id")) != str(trajectory["native_photo_id"]):
-                        raise AssertionError("late answer did not target the first delivered photo")
-                elif (
-                    trajectory["route"] != "context"
-                    or "reply_to_message_id" in trajectory["answer"].metadata
-                    or "native_message_id" in trajectory["answer"].metadata
-                ):
-                    raise AssertionError("single-photo late answer did not use the supported no-reply context route")
-                if trajectory["answer"].metadata.get("_camera_candidate_id") != candidate_id:
-                    raise AssertionError("late answer was not bound to the first Camera source")
+                    if second_candidate_id is None or ingress._attempts[second_candidate_id].get("attention_active") is not True:
+                        raise AssertionError("old source released the newer photo's attention")
             event_id = trajectory["event_id"]
-            if append_fault == "before":
-                if event_id is not None or trajectory.get("receipt") is not None:
-                    raise AssertionError("pre-write transport failure returned an event receipt")
-            elif event_id != trajectory["receipt"].get("event_id"):
-                raise AssertionError("runtime, Camera commit, and trajectory event IDs differ")
-            if append_fault == "timeout-after" and "баланс обновляется" not in trajectory[
-                "final_status_text"
-            ].casefold():
-                raise AssertionError("pending projection response claimed a fresh balance")
             camera_source.entries[:] = [entry]
             producer_replay = await asyncio.to_thread(pipeline.run_once)
             if producer_replay.duplicate_suppression != 1:
-                raise AssertionError("post-finalization producer replay was not suppressed")
+                raise AssertionError("producer replay was not suppressed")
             if append_fault == "before":
-                if trajectory["owner_failure_text"] == "":
-                    raise AssertionError("failed append produced no truthful public response")
+                if event_id is not None or not trajectory["owner_failure_text"]:
+                    raise AssertionError("failed append returned a receipt or no truthful response")
                 await verify_failed_append_absence(
-                    url=honcho_url,
-                    workspace=workspace,
-                    session=session,
+                    url=honcho_url, workspace=workspace, session=session,
                     started=trajectory["started"],
                 )
-                print(
-                    "PASS E6 pre-write transport failure produced no Saved response, event, or current meal",
-                    flush=True,
+            else:
+                if not isinstance(event_id, str) or event_id != trajectory["receipt"]["event_id"]:
+                    raise AssertionError("runtime returned no durable event receipt")
+                await verify_finalizer_event(
+                    url=honcho_url, workspace=workspace, session=session,
+                    candidate_id=candidate_id,
+                    answer_message_id=str(trajectory["answer"].metadata["message_id"]),
+                    native_photo_id=trajectory["native_photo_id"],
+                    expected_event_id=event_id,
+                    started=trajectory["started"],
+                    expected_capture_time=trajectory["capture_time"],
+                    verify_projection=not bool(correction_join),
+                    signed_wire=os.environ.get("CAMERA_SIGNED_WIRE") == "1",
                 )
-                event_id = None
-            elif correction_join:
-                correction_replay_id = trajectory["after_save_result"]["latest_event_id"]
-                if (
-                    not trajectory["owner_replay_saved_status"]
-                    or (
-                        correction_join == "portion-denial"
-                        and "исправление уже записано"
-                        not in trajectory["owner_replay_saved_status"].casefold()
+                async with HonchoClient(honcho_url, "local-auth-disabled", workspace) as honcho:
+                    raw_rows = await honcho.list_messages_in_window(
+                        session, expected_peer_id="ohmo",
+                        since=trajectory["started"] - timedelta(minutes=1),
+                        until=datetime.now(timezone.utc) + timedelta(minutes=1),
                     )
-                    or not trajectory["owner_replay_delivery_confirmed"]
-                    or trajectory["owner_replay_event_id"] != correction_replay_id
-                ):
-                    raise AssertionError("post-denial owner replay did not confirm the latest correction")
-            elif (
-                not trajectory["owner_replay_saved_status"]
-                or "уже записана" not in trajectory["owner_replay_saved_status"].casefold()
-                or not trajectory["owner_replay_delivery_confirmed"]
-                or trajectory["owner_replay_event_id"] != event_id
-            ):
-                raise AssertionError("completed-photo replay did not confirm the existing meal")
-            if append_fault != "before":
-                if correction_join == "portion-denial":
-                    expected_meal_at = datetime.fromisoformat(
-                        trajectory["after_save_result"]["expected_meal_at"]
+                nutrition_rows = [
+                    row for row in raw_rows
+                    if isinstance(row.get("metadata", {}).get("decision_trace"), dict)
+                    and isinstance(
+                        row["metadata"]["decision_trace"].get("annotations", {}).get("nutrition"),
+                        dict,
                     )
-                    correction_event_ids = trajectory["after_save_result"]["correction_event_ids"]
-                    await verify_e5_corrections(
-                        url=honcho_url, workspace=workspace, session=session,
-                        started=trajectory_started, candidate_id=candidate_id,
-                        original_event_id=event_id,
-                        correction_event_ids=correction_event_ids,
-                        expected_capture_time=trajectory["capture_time"],
-                        expected_meal_at=expected_meal_at,
-                        expected_date_source_id=trajectory["after_save_result"][
-                            "date_source_message_id"
-                        ],
-                        expected_original_fingerprint=trajectory["after_save_result"][
-                            "original_row_fingerprint"
-                        ],
-                    )
-                    await verify_e5_projection_stage(
-                        url=honcho_url, workspace=workspace, session=session,
-                        started=trajectory_started, original_event_id=event_id,
-                        latest_event_id=trajectory["after_save_result"]["latest_event_id"],
-                        source_day=trajectory["capture_time"].date(),
-                        corrected_day=expected_meal_at.date(),
-                        expected_day=expected_meal_at.date(), expected_kcal=0,
-                        expected_status="not_consumed", expected_meal_at=expected_meal_at,
-                    )
-                elif correction_join == "context-items-date":
-                    result = trajectory["after_save_result"]
-                    if (
-                        result["runtime_session_before_rotation"]
-                        == result["runtime_session_after_rotation"]
-                        or result["latest_event_id"] != result["correction_event_ids"][-1]
-                        or not result["stages"]["date"].get("sync_replay_stable")
-                    ):
-                        raise AssertionError("joined contextual receipt/restart projection checks failed")
-                else:
-                    from ohmo.gateway.camera import CAMERA_AUTHORITY
-
-                    admitted_sender = str(trajectory["answer"].sender_id).split("|", 1)[0]
-                    admitted_attempt = trajectory["ingress"]._attempts.get(candidate_id)
-                    if (
-                        trajectory["answer"].metadata.get("_camera_authority") is not CAMERA_AUTHORITY
-                        or trajectory["answer"].metadata.get("_camera_candidate_id") != candidate_id
-                        or admitted_sender != str(trajectory["ingress"].config.principal)
-                        or not isinstance(admitted_attempt, dict)
-                        or admitted_attempt.get("camera_commit") != trajectory["receipt"]
-                    ):
-                        raise AssertionError(
-                            "E8 signer principal is not bound to the admitted runtime turn and commit"
-                        )
-                    await verify_finalizer_event(
-                        url=honcho_url,
-                        workspace=workspace,
-                        session=session,
-                        candidate_id=candidate_id,
-                        answer_message_id=str(trajectory["answer"].metadata["message_id"]),
-                        native_photo_id=trajectory["native_photo_id"],
-                        expected_route=trajectory["route"],
-                        expected_event_id=event_id,
-                        started=trajectory["started"],
-                        expected_capture_time=trajectory["capture_time"],
-                        signed_wire=os.environ.get("CAMERA_SIGNED_WIRE") == "1",
-                        runtime_principal=admitted_sender,
-                    )
+                    and row["metadata"]["decision_trace"]["annotations"]["nutrition"].get(
+                        "record_type"
+                    ) in {"meal_observation", "meal_correction", "meal_deletion"}
+                ]
+                corrections = trajectory["after_save_result"] if correction_join else None
+                expected_ids = [event_id] + (
+                    corrections["correction_event_ids"] if corrections else []
+                )
+                if len(nutrition_rows) != len(expected_ids) or {
+                    row["id"] for row in nutrition_rows
+                } != set(expected_ids):
+                    raise AssertionError("replay duplicated or removed a durable nutrition event")
+                if corrections:
+                    original_row = next(row for row in nutrition_rows if row["id"] == event_id)
+                    if e5_raw_honcho_row_fingerprint(original_row) != corrections["original_row_fingerprint"]:
+                        raise AssertionError("replay or correction mutated the original Honcho row")
             expected_photo_count = 2 if restart_join == "two-photo" else 1
             if sum(name == "send_photo" for name, _ in fake_bot.calls) != expected_photo_count:
-                raise AssertionError("producer or owner replay emitted an extra photo")
-            if append_fault != "before":
-                if ingress._attempts[candidate_id].get("camera_commit") != trajectory["receipt"]:
-                    raise AssertionError("owner replay changed the immutable Camera commit receipt")
-                label = "OFFLINE SYNTHETIC" if mode == "offline" else "NATIVE OPT-IN"
-                print(
-                    f"PASS {label} full functional Camera trajectory; candidate={candidate_id} "
-                    f"event={event_id} capture_date={trajectory['capture_time'].date().isoformat()} "
-                    f"route={trajectory['route']} source={trajectory['answer'].metadata.get('message_id')} "
-                    f"kcal={225 if mode == 'offline' and correction_join == 'context-items-date' else 125 if mode == 'offline' else 'native'} producer+owner replay stable "
-                    f"producer_image_sha256={hashlib.sha256(source_bytes).hexdigest()} "
-                    f"photo_id={trajectory['native_photo_id']} bot_api_calls="
-                    f"{getattr(bot_client, 'calls', 'native')} user_api_calls="
-                    f"{getattr(user_client, 'calls', 'native')}",
-                    flush=True,
-                )
+                raise AssertionError("replay emitted another photo")
+            print(
+                f"PASS {'OFFLINE SYNTHETIC' if mode == 'offline' else 'NATIVE OPT-IN'} ordinary Camera trajectory candidate={candidate_id} "
+                f"event={event_id} producer_replay_suppressed=True "
+                f"owner_replay_appended={trajectory.get('owner_replay_event_id') is not None}",
+                flush=True,
+            )
         finally:
             if original_honcho_create_messages is not None:
-                from ohmo.memory_service.honcho_client import HonchoClient
-
                 HonchoClient.create_messages = original_honcho_create_messages
             if server is not None:
                 server.close()

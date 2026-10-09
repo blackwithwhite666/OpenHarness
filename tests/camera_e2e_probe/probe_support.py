@@ -16,7 +16,6 @@ from uuid import uuid4
 
 from PIL import Image, UnidentifiedImageError
 
-from ohmo.gateway.camera import CAMERA_AUTHORITY
 
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _GIT_SHA = re.compile(r"[0-9a-f]{40}\Z")
@@ -73,9 +72,9 @@ async def call_wellness_with_synthetic_self(
 
 def create_storage_run_dir(root: Path) -> Path:
     """Keep each projection under the ignored worktree root after the run ends."""
-    parent = root / "tmp" / "camera-native-docker" / "storage-runs"
+    parent = root / "tmp" / "camera-normal-chat-docker" / "storage-runs"
     parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    if parent.resolve() != root.resolve() / "tmp" / "camera-native-docker" / "storage-runs":
+    if parent.resolve() != root.resolve() / "tmp" / "camera-normal-chat-docker" / "storage-runs":
         raise ValueError("storage root escapes the worktree task directory")
     ignored = subprocess.run(
         ["git", "check-ignore", "--quiet", "--", str(parent)],
@@ -163,6 +162,8 @@ def native_profile_clients(settings, *, resolver=None, codex_client_type=None):
     resolve = resolver or resolve_api_client_from_settings
     expected_type = codex_client_type or CodexApiClient
     require_isolated_native_settings(settings)
+    if getattr(settings, "effort", None) != "medium":
+        raise NativeClientPreconditionError("native Camera requires medium reasoning effort")
     profile_name, profile = settings.resolve_profile()
     model = (profile.last_model or "").strip() or profile.default_model
     if not (
@@ -267,55 +268,9 @@ def verify_source_tree_pin(path: Path, expected_head: str) -> tuple[Path, str, s
     return root, head, tree
 
 
-def require_bound_answer(
-    message, candidate_id: str, native_photo_id: int | str = 77,
-    *, expected_route: str | None = None, trusted_turn_id: str | None = None,
-) -> str:
-    metadata = message.metadata
-    turn_id = metadata.get("_camera_turn_id")
-    route = metadata.get("_camera_route")
-    trusted_photo_id = metadata.get("_camera_photo_id")
-    common_binding = (
-        metadata.get("_camera_authority") is CAMERA_AUTHORITY
-        and metadata.get("_camera_answer") == "yes"
-        and metadata.get("_camera_candidate_id") == candidate_id
-        and isinstance(turn_id, str)
-        and turn_id
-        and (
-            (expected_route != "context" and trusted_turn_id is None)
-            or (isinstance(trusted_turn_id, str) and turn_id == trusted_turn_id)
-        )
-        and len(message.media) == 1
-    )
-    if expected_route is not None and route != expected_route:
-        raise AssertionError("Camera owner reply used a different route than requested")
-    route_binding = False
-    if route == "context":
-        route_binding = (
-            trusted_photo_id == native_photo_id
-            and "reply_to_message_id" not in metadata
-            and "native_message_id" not in metadata
-            and metadata.get("callback_query") is not True
-        )
-    elif route == "reply":
-        route_binding = (
-            trusted_photo_id == native_photo_id
-            and str(metadata.get("reply_to_message_id")) == str(native_photo_id)
-            and metadata.get("callback_query") is not True
-        )
-    elif route == "callback":
-        route_binding = (
-            metadata.get("callback_query") is True
-            and str(metadata.get("native_message_id")) == str(native_photo_id)
-        )
-    if not (common_binding and route_binding):
-        raise AssertionError("Camera owner reply was not bound to the native photo")
-    return turn_id
-
-
 def select_finalizer_event(
     messages, candidate_id: str, answer_message_id: str, native_photo_id: int | str,
-    *, expected_route: str = "reply", expected_capture_time=None,
+    *, expected_capture_time=None,
     expected_event_id: str | None = None,
 ):
     """Select one ordinary owner event carrying the exact delivered photo source."""
@@ -340,7 +295,7 @@ def select_finalizer_event(
         item
         for item in messages
         if item.metadata.get("role") == "assistant"
-        and item.metadata.get("ingest_source") == "telegram"
+        and item.metadata.get("ingest_source") == "dropbox_camera"
         and isinstance(item.metadata.get("photo_occurrence_source"), Mapping)
         and item.metadata["photo_occurrence_source"].get("source_origin") == "dropbox_camera"
         and item.metadata["photo_occurrence_source"].get("camera_candidate_id") == candidate_id

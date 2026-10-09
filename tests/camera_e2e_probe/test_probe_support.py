@@ -73,7 +73,7 @@ async def test_direct_probe_wellness_read_resets_authority_after_success_and_fai
 
 def test_storage_run_is_persistent_restricted_and_ignored():
     root = Path(__file__).resolve().parents[2]
-    parent = root / "tmp" / "camera-native-docker" / "storage-runs"
+    parent = root / "tmp" / "camera-normal-chat-docker" / "storage-runs"
     run = create_storage_run_dir(root)
     marker = run / "nutrition.db"
     marker.mkdir()
@@ -295,9 +295,9 @@ def _ordinary_camera_event(event_id="event-1", source_id="owner-turn-1", candida
             "source_message_id": source_id,
             "source_principal": "telegram:123",
             "tenant_id": "synthetic_owner",
-            "ingest_source": "telegram",
+            "ingest_source": "dropbox_camera",
             "gateway_session_id": "current-session",
-            "source_image_attachment_count": 1,
+            "source_image_attachment_count": 0,
             "photo_occurrence_source": {
                 "source_origin": "dropbox_camera",
                 "origin_principal": "telegram:__camera__",
@@ -322,7 +322,7 @@ def test_finalizer_selection_uses_unique_ordinary_owned_source_receipt():
         {"source_message_id": "other-owner-turn"},
         {"source_principal": "telegram:foreign"},
         {"tenant_id": "foreign-tenant"},
-        {"ingest_source": "dropbox_camera"},
+        {"ingest_source": "telegram"},
         {"camera_route": "context"},
     ):
         bad = SimpleNamespace(id=event.id, metadata={**event.metadata, **changed})

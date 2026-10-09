@@ -162,7 +162,7 @@ def test_native_person_source_requires_two_distinct_codex_clients_without_fallba
     )
     settings = SimpleNamespace(
         hooks={}, mcp_servers={}, enabled_plugins={}, allow_project_plugins=False,
-        allow_project_skills=False, project_skill_dirs=[],
+        allow_project_skills=False, project_skill_dirs=[], effort="medium",
         resolve_profile=lambda: ("codex", profile),
     )
     resolved = []

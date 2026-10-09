@@ -351,6 +351,16 @@ def test_native_profile_resolves_two_distinct_codex_clients_without_fallback():
     assert bot is not user
 
 
+def test_native_profile_rejects_non_medium_effort_before_resolution():
+    settings = _native_settings().model_copy(update={"effort": "high"})
+    with pytest.raises(NativeClientPreconditionError, match="medium reasoning effort"):
+        native_profile_clients(
+            settings,
+            resolver=lambda _settings: pytest.fail("resolver should not run"),
+            codex_client_type=FakeCodexClient,
+        )
+
+
 @pytest.mark.parametrize(
     "profile",
     [
@@ -526,34 +536,18 @@ def test_native_guard_covers_real_prompt_catalog_route_and_restores_after_failur
 
 
 @pytest.mark.asyncio
-async def test_user_role_tool_result_finishes_owner_turn_without_reasking_for_photo():
+async def test_owner_text_without_selected_image_cannot_finalize_meal():
     client = OfflineCameraBotApi()
     messages = [ConversationMessage.from_user_text("Да, я это съел(а)")]
 
     proposal = [event async for event in client.stream_message(SimpleNamespace(messages=messages))]
-    trace_call = next(
-        block for block in proposal[0].message.content if isinstance(block, ToolUseBlock)
-    )
-    messages.extend(
-        [
-            ConversationMessage(role="assistant", content=[trace_call]),
-            ConversationMessage(
-                role="user",
-                content=[ToolResultBlock(tool_use_id=trace_call.id, content="meal recorded")],
-            ),
-        ]
-    )
-
-    recorded = [event async for event in client.stream_message(SimpleNamespace(messages=messages))]
-
-    response = recorded[0].message.text
-    assert "recorded the synthetic Camera meal" in response
-    assert "[[ask:" not in response
-    assert client.finalization_proposals == 1
+    assert not any(isinstance(block, ToolUseBlock) for block in proposal[0].message.content)
+    assert "No owned image source" in proposal[0].message.text
+    assert client.finalization_proposals == 0
 
 
 @pytest.mark.asyncio
-async def test_old_user_role_tool_result_does_not_suppress_fresh_owner_replay_trace():
+async def test_old_trace_result_cannot_supply_missing_owned_image():
     client = OfflineCameraBotApi()
     request = SimpleNamespace(
         messages=[
@@ -572,5 +566,5 @@ async def test_old_user_role_tool_result_does_not_suppress_fresh_owner_replay_tr
 
     events = [event async for event in client.stream_message(request)]
 
-    assert any(isinstance(block, ToolUseBlock) for block in events[0].message.content)
-    assert client.finalization_proposals == 1
+    assert not any(isinstance(block, ToolUseBlock) for block in events[0].message.content)
+    assert client.finalization_proposals == 0
