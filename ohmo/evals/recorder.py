@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import copy
 import math
-import re
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field, is_dataclass
 from datetime import date, datetime
@@ -331,56 +330,11 @@ class GatewayEvalRecorder:
             historical_photo=historical_photo,
         )
 
-    def mark_trusted_direct_photo_intent(self) -> None:
-        """Treat a verified configured participant photo as a nutrition trace request."""
-        self._runtime_recorder.mark_trusted_direct_photo_intent()
-
-    def forbid_nutrition_record(self) -> None:
-        """Prevent a Camera classification or unbound reply from creating a meal."""
-        self._runtime_recorder.forbid_nutrition_record()
-
-    def forbid_explicit_new_consumption(self) -> None:
-        """Prevent producer echoes from overriding Camera replay identity."""
-        self._runtime_recorder.forbid_explicit_new_consumption()
-
-
 _RUNTIME_STRUCTURAL_SKIP_KINDS = frozenset(
     {
         "model_call",
         "tool_started",
     }
-)
-
-_NUTRITION_REQUIREMENT_SIGNAL = "ohmo_nutrition_request"
-_NUTRITION_CONSUMPTION_INTENT_MARKERS = (
-    re.compile(
-        r"\b(?:я\s+)?(?:съел(?:а|и)?|ел(?:а|и)?|поел(?:а|и)?|"
-        r"выпил(?:а|и)?|употребил(?:а|и)?)\b",
-        re.IGNORECASE,
-    ),
-    re.compile(
-        r"\bi\s+(?:(?:ate|consumed|drank)\b|had\b(?!\s+(?:a\s+)?questions?\b))",
-        re.IGNORECASE,
-    ),
-)
-_NUTRITION_LOG_INTENT_MARKERS = (
-    re.compile(
-        r"\b(?:запиши|записать|записывай|добавь|добавить|занеси|занести|"
-        r"сохрани|сохранить|учти|учесть|логируй|залогируй)\b",
-        re.IGNORECASE,
-    ),
-    re.compile(r"\b(?:record|log|add|save)\b", re.IGNORECASE),
-)
-_NUTRITION_LOG_NEGATION_MARKERS = (
-    re.compile(
-        r"\b(?:не|без)\s+(?:надо\s+)?(?:записывай|записывать|записи|логируй|"
-        r"логировать|сохраняй|сохранять|добавляй|добавлять)\b",
-        re.IGNORECASE,
-    ),
-    re.compile(
-        r"\b(?:do\s+not|don't|without)\s+(?:recording|record|logging|log|saving|save|adding|add)\b",
-        re.IGNORECASE,
-    ),
 )
 
 _DECISION_TRACE_STATUS_DISABLED = "disabled"
@@ -393,15 +347,6 @@ _NUTRITION_ANNOTATION_STATUS_INVALID = "invalid"
 _NUTRITION_ANNOTATION_STATUS_MISSING = "missing"
 _NUTRITION_ANNOTATION_STATUS_NOT_APPLICABLE = "not_applicable"
 _NUTRITION_ANNOTATION_STATUS_RECORDED = "recorded"
-
-
-def _contains_nutrition_record_intent(*texts: str | None) -> bool:
-    haystack = " ".join(text or "" for text in texts)
-    if any(marker.search(haystack) for marker in _NUTRITION_CONSUMPTION_INTENT_MARKERS):
-        return True
-    if any(marker.search(haystack) for marker in _NUTRITION_LOG_NEGATION_MARKERS):
-        return False
-    return any(marker.search(haystack) for marker in _NUTRITION_LOG_INTENT_MARKERS)
 
 
 class _GatewayDecisionTraceRecorderAdapter:
@@ -417,22 +362,9 @@ class _GatewayDecisionTraceRecorderAdapter:
         self._user_goal = user_goal
         self._latest_finalization: EvalEvent | None = None
         self._saw_invalid_finalization = False
-        self._nutrition_applicable = False
-        self._trusted_direct_photo_intent = False
         self._authoritative_nutrition_meal_at: datetime | None = None
         self._preserve_explicit_nutrition_time = False
         self._authoritative_time_is_historical = False
-        self._nutrition_record_forbidden = False
-        self._explicit_new_consumption_forbidden = False
-
-    def forbid_nutrition_record(self) -> None:
-        self._nutrition_record_forbidden = True
-
-    def forbid_explicit_new_consumption(self) -> None:
-        self._explicit_new_consumption_forbidden = True
-
-    def mark_trusted_direct_photo_intent(self) -> None:
-        self._trusted_direct_photo_intent = True
 
     def set_authoritative_nutrition_meal_at(
         self, meal_at: datetime | None, *, preserve_explicit: bool = False,
@@ -454,23 +386,6 @@ class _GatewayDecisionTraceRecorderAdapter:
         is_error: bool = False,
     ) -> EvalEvent | None:
         if kind == TRACE_FINALIZATION:
-            annotations = payload.get("annotations")
-            if (
-                self._nutrition_record_forbidden
-                and isinstance(annotations, Mapping)
-                and "nutrition" in annotations
-            ):
-                self._saw_invalid_finalization = True
-                raise DecisionTraceValidationError(
-                    "Camera meal requires a bound explicit owner answer"
-                )
-            if self._explicit_new_consumption_forbidden and isinstance(annotations, Mapping):
-                nutrition = annotations.get("nutrition")
-                if isinstance(nutrition, Mapping) and nutrition.get("explicit_new_consumption") is True:
-                    self._saw_invalid_finalization = True
-                    raise DecisionTraceValidationError(
-                        "Camera producer observation cannot declare explicit new consumption"
-                    )
             payload = self._stamp_authoritative_nutrition_meal_at(payload)
             try:
                 payload = validate_trace_finalization_annotations(payload)
@@ -516,30 +431,17 @@ class _GatewayDecisionTraceRecorderAdapter:
             )
         ):
             return payload
-        if self._authoritative_time_is_historical and nutrition.get("explicit_new_consumption") is True:
-            return payload
         stamped = copy.deepcopy(dict(payload))
         stamped_annotations = dict(stamped.get("annotations") or {})
         stamped_nutrition = dict(stamped_annotations.get("nutrition") or {})
         stamped_nutrition["meal_at"] = meal_at.isoformat()
         stamped_nutrition.pop("meal_date", None)
-        for field_name in ("assumptions", "warnings"):
-            values = stamped_nutrition.get(field_name)
-            if isinstance(values, list):
-                stamped_nutrition[field_name] = [
-                    value
-                    for value in values
-                    if not (isinstance(value, str) and "exif" in value.casefold())
-                ]
         stamped_annotations["nutrition"] = stamped_nutrition
         stamped["annotations"] = stamped_annotations
         return stamped
 
     def trace_requirement_signals(self, final_text: str) -> tuple[str, ...]:
-        intent_text = self._user_goal if self._user_goal.strip() else final_text
-        if self._trusted_direct_photo_intent or _contains_nutrition_record_intent(intent_text):
-            self._nutrition_applicable = True
-            return (_NUTRITION_REQUIREMENT_SIGNAL,)
+        del final_text
         return ()
 
     @property
@@ -560,8 +462,6 @@ class _GatewayDecisionTraceRecorderAdapter:
         if finalization is None:
             if self._saw_invalid_finalization:
                 return _NUTRITION_ANNOTATION_STATUS_INVALID
-            if self._nutrition_applicable:
-                return _NUTRITION_ANNOTATION_STATUS_MISSING
             return _NUTRITION_ANNOTATION_STATUS_NOT_APPLICABLE
 
         annotations = finalization.payload.get("annotations")

@@ -318,17 +318,7 @@ def select_finalizer_event(
     *, expected_route: str = "reply", expected_capture_time=None,
     expected_event_id: str | None = None,
 ):
-    """Reject fixture events and unrelated assistant turns before sync."""
-    if expected_route not in {"reply", "context", "callback"}:
-        raise ValueError("Camera finalizer route must be reply, context, or callback")
-
-    def route_binding(metadata):
-        if metadata.get("camera_route") != expected_route:
-            return False
-        binding = metadata.get("camera_reply_to_native_message_id")
-        if expected_route == "context":
-            return "camera_reply_to_native_message_id" not in metadata
-        return binding == str(native_photo_id)
+    """Select one ordinary owner event carrying the exact delivered photo source."""
 
     def capture_matches(metadata):
         if expected_capture_time is None:
@@ -350,11 +340,18 @@ def select_finalizer_event(
         item
         for item in messages
         if item.metadata.get("role") == "assistant"
-        and item.metadata.get("camera_candidate_id") == candidate_id
-        and item.metadata.get("camera_answer_bound") == "yes"
-        and item.metadata.get("camera_operation_id") == candidate_id
-        and route_binding(item.metadata)
+        and item.metadata.get("ingest_source") == "telegram"
+        and isinstance(item.metadata.get("photo_occurrence_source"), Mapping)
+        and item.metadata["photo_occurrence_source"].get("source_origin") == "dropbox_camera"
+        and item.metadata["photo_occurrence_source"].get("camera_candidate_id") == candidate_id
+        and item.metadata["photo_occurrence_source"].get("native_photo_message_id") == str(native_photo_id)
         and item.metadata.get("source_message_id") == answer_message_id
+        and item.metadata.get("source_principal") == "telegram:123"
+        and item.metadata.get("tenant_id") == "synthetic_owner"
+        and not any(
+            key in item.metadata
+            for key in ("camera_answer_bound", "camera_route", "camera_operation_id")
+        )
         and item.metadata.get("nutrition_annotation_status") == "recorded"
         and capture_matches(item.metadata)
         and (expected_event_id is None or item.id == expected_event_id)

@@ -132,23 +132,29 @@ async def verify_finalizer_event(
         raise AssertionError("finalizer event has no consumed image meal with kcal")
     if validated.meal_at != expected_capture_time or validated.meal_date is not None:
         raise AssertionError("finalizer meal date differs from admitted Camera capture time")
+    occurrence_source = event.metadata.get("photo_occurrence_source")
     expected_bindings = {
         "source_principal": "telegram:123",
         "tenant_id": "synthetic_owner",
-        "camera_candidate_id": candidate_id,
         "source_message_id": answer_message_id,
-        "camera_operation_id": candidate_id,
-        "camera_route": expected_route,
+        "ingest_source": "telegram",
         "source_image_attachment_count": 1,
     }
     binding_mismatches = [
         key for key, expected in expected_bindings.items() if event.metadata.get(key) != expected
     ]
-    if expected_route == "context":
-        if "camera_reply_to_native_message_id" in event.metadata:
-            binding_mismatches.append("camera_reply_to_native_message_id")
-    elif event.metadata.get("camera_reply_to_native_message_id") != str(native_photo_id):
-        binding_mismatches.append("camera_reply_to_native_message_id")
+    if not isinstance(occurrence_source, dict) or any(
+        occurrence_source.get(key) != value
+        for key, value in {
+            "source_origin": "dropbox_camera",
+            "origin_principal": "telegram:__camera__",
+            "camera_candidate_id": candidate_id,
+            "native_photo_message_id": str(native_photo_id),
+        }.items()
+    ):
+        binding_mismatches.append("photo_occurrence_source")
+    if any(key in event.metadata for key in ("camera_answer_bound", "camera_route", "camera_operation_id")):
+        binding_mismatches.append("camera_answer_authority")
     if (
         not isinstance(event.metadata.get("gateway_session_id"), str)
         or not event.metadata["gateway_session_id"]

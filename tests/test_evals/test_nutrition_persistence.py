@@ -288,14 +288,14 @@ def test_context_camera_writer_uses_v2_original_receipt_and_truthful_current_ses
         "event_id": "original-event", "client_op_id": "original-turn:assistant",
         "original_receipt_event_id": "original-event",
         "original_receipt_client_op_id": "original-turn:assistant",
+        "original_source_message_id": "photo-source",
+        "original_append_source_message_id": "photo-source",
+        "original_gateway_session_id": "original-session",
     }
     message = InboundMessage(
         channel="telegram", sender_id="123", chat_id="123",
         content="Ate this this morning", timestamp=NOW,
         metadata={"message_id": "context-source", "chat_type": "private", "is_group": False,
-            "_camera_context_meal_target":
-            runtime_module._CAMERA_CONTEXT_MEAL_TARGET_AUTHORITY,
-            "_camera_context_meal_candidate_id": "candidate-synthetic",
             "_selected_source_binding": (runtime_module._SELECTED_SOURCE_AUTHORITY, binding)},
     )
     context = build_turn_context(message, session_id="current-session", owner_principals=("123",))
@@ -1515,19 +1515,17 @@ def test_export_marks_malformed_public_turn_payload_incomplete(tmp_path: Path, k
         {"privacy": "private", "episodes": [exported]})["tea"]["complete"]
 
 
-def test_export_retains_gateway_camera_scalar_provenance_from_actual_builder(tmp_path: Path):
+def test_export_retains_gateway_turn_provenance_from_actual_builder(tmp_path: Path):
     from types import SimpleNamespace
     from openharness.channels.bus.events import InboundMessage
     from ohmo.evals.recorder import GatewayEvalRecorder
-    from ohmo.gateway.camera import CAMERA_AUTHORITY
     from ohmo.gateway.memory_gate import MemoryScope
     from ohmo.gateway.runtime import _build_conversation_turn_metadata
     from ohmo.gateway.turn_context import build_turn_context
 
     root = tmp_path / "evals"
     message = InboundMessage(channel="telegram", sender_id="424242", chat_id="chat-1", content="I drank tea",
-        timestamp=NOW, metadata={"message_id": 401, "_camera_authority": CAMERA_AUTHORITY,
-                                 "_camera_turn_id": "camera-retained-401"})
+        timestamp=NOW, metadata={"message_id": 401, "is_group": False})
     turn_ctx = build_turn_context(message, session_id="session-1")
     logical, _, assistant = _build_conversation_turn_metadata(turn_ctx=turn_ctx, message=message,
         scope=MemoryScope("owner-1", ()))
@@ -1539,8 +1537,8 @@ def test_export_retains_gateway_camera_scalar_provenance_from_actual_builder(tmp
     recorder.finish(status="completed")
     exported = export_eval_dialogue(root, episode_ids=[recorder.episode_id])["episodes"][0]
     provenance = exported["turn_provenance"][0]
-    assert provenance["logical_turn_id"] == "camera-retained-401"
-    assert provenance["operation_id"] == "camera-retained-401:assistant"
+    assert provenance["logical_turn_id"] == logical
+    assert provenance["operation_id"] == f"{logical}:assistant"
     assert provenance["episode_id"] == recorder.episode_id
     camera_goal = Goal.model_validate({**goal().model_dump(mode="json"), "episode_ids": [recorder.episode_id],
         "trace_episode_id": recorder.episode_id, "source_message_id": "401", "logical_turn_id": logical,

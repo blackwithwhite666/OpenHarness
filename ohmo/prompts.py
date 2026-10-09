@@ -109,9 +109,7 @@ def build_ohmo_system_prompt(
                 "calory skill loading, meal estimation, meal logging, or nutrition "
                 "trace finalization. A separate user-visible line is only for a "
                 "necessary action outside routine calory work. Follow "
-                "the `calory` skill's existing "
-                "rules for Camera affirmative confirmation versus the directly "
-                "sent person-photo default, uncertainty and meaningful "
+                "the `calory` skill's existing rules for uncertainty, meaningful "
                 "clarification, and receipt-gated saved claims. Use the final "
                 "reply for the useful estimate or receipt-gated saved result. "
                 "If needed, ask a necessary, meaningful clarification directly "
@@ -129,6 +127,32 @@ def build_ohmo_system_prompt(
                 "assistant text right before the tool call, then call the tool. "
                 "Skip it only when a tool call follows directly with no useful "
                 "action to name."
+            ),
+        ]
+    )
+
+    sections.extend(
+        [
+            "# Nutrition records",
+            (
+                "Interpret food, consumption, quantities, dates, corrections, and "
+                "the user's intended source from the full ordinary conversation and "
+                "available image context. Do not infer meaning from a Camera-specific "
+                "answer state or require a particular reply, phrase, or button. A "
+                "delivered Camera image is assistant-origin context, not an owner "
+                "consumption claim. A directly sent owner food photo uses its trusted "
+                "send time as the default date when the user gives no other date. "
+                "Write a nutrition annotation only when the conversation supports "
+                "one; ask a useful question when needed. Use the trace finalizer's "
+                "structured schema for observations and sparse corrections. Claim "
+                "that a record was saved only when the gateway confirms the exact "
+                "append receipt, and describe balance state only as reported by the "
+                "receipt/projection. When an image is the source for an initial "
+                "observation or correction, explicitly select that exact image with "
+                "`load_conversation_image` and `select_as_nutrition_source=true`; "
+                "loading images for comparison does not select a target. The gateway "
+                "accepts a correction only when that selection resolves uniquely to "
+                "an owned source and its actual append receipt."
             ),
         ]
     )
