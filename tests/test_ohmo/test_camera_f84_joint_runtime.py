@@ -262,10 +262,10 @@ def grade_contextual_receipts(pool, server, original_final, correction_final,
     lower_day = min(date.fromisoformat(original_date_value or meal_day.isoformat()), meal_day)
     meal_tz = ZoneInfo(goal.meal_timezone)
     start = datetime.combine(lower_day, datetime.min.time(), meal_tz).isoformat()
-    corrected_day_end = (datetime.combine(
+    next_local_midnight = datetime.combine(
         goal.meal_date + timedelta(days=1), datetime.min.time(), meal_tz
-    ) - timedelta(microseconds=1))
-    wellness_end = max(goal.trajectory_as_of.astimezone(meal_tz), corrected_day_end)
+    )
+    wellness_end = max(goal.trajectory_as_of.astimezone(meal_tz), next_local_midnight)
     queried = (wellness_end + timedelta(seconds=1)).isoformat()
     honcho = {"complete": True, "workspace_id": goal.workspace_id, "session_id": goal.session_id,
         "owner_id": goal.owner_id, "since": goal.trajectory_started_at.isoformat(),
@@ -1122,6 +1122,16 @@ async def test_native_reply_with_selected_photo_still_requires_context_receipt_p
         assert baseline["a1"] == "PASS", baseline
         assert len(captured) == 1
         manifest, honcho, wellness, kwargs = captured[0]
+        wellness_end = datetime.fromisoformat(wellness["end"])
+        short_wellness = {**wellness, "end": (
+            wellness_end - timedelta(microseconds=1)).isoformat()}
+        short_grade = original_grade(manifest, honcho, short_wellness, **kwargs)[0]
+        assert (short_grade["a1"], short_grade["stage"]) == (
+            "INCONCLUSIVE", "TELEGENT_BOUNDS_MISMATCH"), short_grade
+        future_query_grade = original_grade(
+            manifest, honcho, wellness, **{**kwargs, "now": wellness_end})[0]
+        assert (future_query_grade["a1"], future_query_grade["stage"]) == (
+            "INCONCLUSIVE", "TELEGENT_BOUNDS_MISMATCH"), future_query_grade
 
         for mutation in (
             lambda final: final.pop("nutrition_finalization"),

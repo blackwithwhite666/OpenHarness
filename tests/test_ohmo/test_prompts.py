@@ -608,7 +608,7 @@ def test_calory_skill_and_common_prompt_agree_on_ordinary_camera_source_selectio
     skill = _calory_skill_body()
     for text in (
         "meaningful owner statement",
-        "without a reply binding",
+        "without reply binding, button, or extra confirmation",
         "select_as_nutrition_source=true",
         "comparison-only",
         "initial observation has no prior meal receipt",
