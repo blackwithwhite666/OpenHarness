@@ -2357,6 +2357,22 @@ class CameraIngress:
             return False
         fields = set(correction.changed_fields)
         previous = attempt.get("context_meal_projection")
+        history = attempt.get("context_meal_projection_history")
+        if not isinstance(history, list):
+            history = []
+        if (
+            isinstance(previous, Mapping)
+            and previous.get("event_id") != getattr(receipt, "assistant_message_id", None)
+            and not any(
+                isinstance(saved, Mapping)
+                and saved.get("event_id") == previous.get("event_id")
+                for saved in history
+            )
+        ):
+            # Keep the durable operation receipt needed to recognize an exact
+            # replay after this current projection advances to a newer edit.
+            history.append(dict(previous))
+            attempt["context_meal_projection_history"] = history
         if "items" in fields:
             items = [item.model_dump(mode="json") for item in correction.items]
         elif isinstance(previous, Mapping) and isinstance(previous.get("items"), list):
@@ -2377,6 +2393,13 @@ class CameraIngress:
             "gateway_session_id": metadata.get("gateway_session_id"),
             "source_message_id_current": metadata.get("source_message_id"),
             "user_text": message.content,
+            "reply_to_native_message_id": (
+                str(message.metadata["reply_to_message_id"]).strip()
+                if message.metadata.get("reply_to_message_id") is not None
+                and not isinstance(message.metadata.get("reply_to_message_id"), bool)
+                and str(message.metadata["reply_to_message_id"]).strip()
+                else None
+            ),
             "received_at": metadata.get("received_at"),
             "tenant_id_receipt": metadata.get("tenant_id"),
             "source_principal_receipt": metadata.get("source_principal"),
@@ -4525,10 +4548,23 @@ class CameraIngress:
             and _camera_explicit_consumption(text_for_correction)
             and not is_explicit_new_meal
         )
+        is_date_correction = (
+            _CAMERA_DATE_CORRECTION_RE.search(text_for_correction) is not None
+            or _CAMERA_CONTEXTUAL_MORNING_RE.search(text_for_correction) is not None
+        )
         if (
             not callback
             and not owner_supplied_media
-            and not (target is not None and is_dated_consumption)
+            # Keep the existing retained-reply date route ahead of the new
+            # label-only branch, including accepted date-only wording. Do not
+            # alter the established addition/date priority.
+            and not (
+                target is not None
+                and (
+                    is_dated_consumption
+                    or (is_label_only_package and is_date_correction)
+                )
+            )
             and metadata.get("is_group") is not True
             and metadata.get("is_forwarded") is not True
             and (is_addition or is_dated_consumption or is_label_only_package)

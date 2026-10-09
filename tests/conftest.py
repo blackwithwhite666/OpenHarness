@@ -45,6 +45,19 @@ def pytest_sessionstart(session: pytest.Session) -> None:
         _probe_asyncio_self_pipe()
 
 
+@pytest.fixture(autouse=True)
+def _restore_camera_synthetic_clock(request: pytest.FixtureRequest):
+    """Keep the fixed-date Camera test clock local to its pytest test."""
+    if request.path.name not in {"test_camera_ingress.py", "test_camera_replay_eval_capture.py"}:
+        yield
+        return
+    import ohmo.gateway.camera as camera_module
+
+    original_datetime = camera_module.datetime
+    yield
+    camera_module.datetime = original_datetime
+
+
 @pytest_asyncio.fixture(autouse=True)
 async def _reset_background_task_manager():
     yield

@@ -358,6 +358,7 @@ def _normalize_source_message_ref(value: object) -> str | None:
 def _exact_context_receipt_replay(
     projection: object, receipt: object, expected_metadata: Mapping[str, object],
     *, expected_user_text: str | None = None,
+    expected_native_target: str | None = None,
 ) -> bool:
     """Match a retained correction to its exact immutable current-operation envelope."""
     if not isinstance(projection, Mapping):
@@ -397,6 +398,7 @@ def _exact_context_receipt_replay(
         ("current_principal", projection.get("source_principal_receipt") == expected_metadata.get("source_principal")),
         ("stored_reply", projection.get("reply_to_source_message_id") == metadata.get("reply_to_source_message_id")),
         ("current_reply", projection.get("reply_to_source_message_id") == expected_metadata.get("reply_to_source_message_id")),
+        ("native_target", projection.get("reply_to_native_message_id") == expected_native_target),
         ("selected_source", projection.get("selected_source") == metadata.get("selected_source") == selected),
         ("stored_target", projection.get("target_meal_id_receipt") == metadata.get("target_meal_id")),
         ("current_target", metadata.get("target_meal_id") == expected_target),
@@ -3389,42 +3391,54 @@ class OhmoSessionRuntimePool:
                 source_message_id = _normalize_source_message_ref(
                     message.metadata.get("message_id")
                 )
-                if (
-                    isinstance(projection, Mapping)
-                    and projection.get("source_message_id_current") == source_message_id
-                ):
+                projections = [
+                    saved for saved in (
+                        *(attempt.get("context_meal_projection_history", [])
+                          if isinstance(attempt, dict)
+                          and isinstance(attempt.get("context_meal_projection_history"), list)
+                          else []),
+                        projection,
+                    )
+                    if isinstance(saved, Mapping)
+                    and saved.get("source_message_id_current") == source_message_id
+                ]
+                if projections:
                     backend = self._shadow_backend_for_scope(memory_scope)
-                    receipt = None
-                    try:
-                        if backend is not None:
-                            receipt = await backend.reconcile_durable_exchange(
-                                str(projection.get("user_client_op_id") or ""),
-                                str(projection.get("client_op_id") or ""),
-                            )
-                    except (ConversationReconciliationError, TypeError, ValueError):
-                        receipt = None
                     expected_metadata = _build_conversation_turn_metadata(
                         turn_ctx=turn_ctx, message=message, scope=memory_scope,
                         recorder=recorder,
                     )[1]
-                    if (
-                        receipt is not None
-                        and _exact_context_receipt_replay(
-                            projection, receipt, expected_metadata,
-                            expected_user_text=message.content or user_prompt,
-                        )
-                    ):
-                        yield GatewayStreamUpdate(
-                            kind="final",
-                            text=receipt.assistant_content,
-                            metadata={
-                                "_session_key": session_key,
-                                "nutrition_append_event_id": receipt.assistant_message_id,
-                                "nutrition_sync_status": "pending",
-                            },
-                        )
-                        await self._save_snapshot(bundle, session_key, user_prompt)
-                        return
+                    for saved_projection in projections:
+                        receipt = None
+                        try:
+                            if backend is not None:
+                                receipt = await backend.reconcile_durable_exchange(
+                                    str(saved_projection.get("user_client_op_id") or ""),
+                                    str(saved_projection.get("client_op_id") or ""),
+                                )
+                        except (ConversationReconciliationError, TypeError, ValueError):
+                            receipt = None
+                        if (
+                            receipt is not None
+                            and _exact_context_receipt_replay(
+                                saved_projection, receipt, expected_metadata,
+                                expected_user_text=message.content or user_prompt,
+                                expected_native_target=_normalize_source_message_ref(
+                                    message.metadata.get("reply_to_message_id")
+                                ),
+                            )
+                        ):
+                            yield GatewayStreamUpdate(
+                                kind="final",
+                                text=receipt.assistant_content,
+                                metadata={
+                                    "_session_key": session_key,
+                                    "nutrition_append_event_id": receipt.assistant_message_id,
+                                    "nutrition_sync_status": "pending",
+                                },
+                            )
+                            await self._save_snapshot(bundle, session_key, user_prompt)
+                            return
                     yield GatewayStreamUpdate(
                         kind="error",
                         text="Could not verify the saved Camera correction for this message.",
@@ -4106,6 +4120,9 @@ class OhmoSessionRuntimePool:
                 and _exact_context_receipt_replay(
                     context_projection, append_receipt, expected_selected,
                     expected_user_text=message.content or user_prompt,
+                    expected_native_target=_normalize_source_message_ref(
+                        message.metadata.get("reply_to_message_id")
+                    ),
                 )
                 and isinstance(expected_selected.get("selected_source"), Mapping)
                 and context_projection.get("source_message_id")
